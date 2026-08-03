@@ -1,0 +1,536 @@
+"""Lane 1 recall: the two lanes, the score, and every way it is allowed to fail.
+
+Written in Korean on purpose. Recall in English is a solved problem - FTS5 alone
+carries it - and every interesting failure in this module comes from Korean
+morphology meeting a tokenizer that does not know about it. An English test suite
+here would pass while the product did not work.
+
+The load-bearing test is `test_fts5_misses_a_korean_substring_...`: it is the
+evidence for pulling the vector index forward from M2 into M1b (docs/PLAN.md 4.3).
+If it ever starts passing without the vector lane, that decision should be
+revisited.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+from datetime import UTC, datetime, timedelta
+from typing import Literal
+
+import numpy as np
+import pytest
+
+from daemon.llm.base import Embedder, ProviderError
+from daemon.memory.base import LoggedMessage, Recall
+from daemon.memory.recall import HALF_LIFE_DAYS, MemoryRecall, fts_query
+from daemon.memory.store import Store
+
+NOW = datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
+
+
+# --- deterministic fake embedders --------------------------------------------
+
+
+class GramEmbedder:
+    """Hashed character bigrams. Deterministic, offline, no model.
+
+    Not semantic, and not pretending to be: what it does capture is the one thing
+    FTS5 structurally cannot, a substring inside a longer Korean token (`찌개`
+    inside `김치찌개`). blake2b rather than `hash()` because Python's string hash
+    is salted per process, and a test that passes on Tuesday is not a test.
+    """
+
+    name = "fake"
+    model = "fake-gram"
+    dimensions = 64
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[list[str]] = []
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        if self.fail:
+            raise ProviderError("fake embedder was told to fail")
+        return [self._one(text) for text in texts]
+
+    def _one(self, text: str) -> list[float]:
+        vector = np.zeros(self.dimensions, dtype=np.float32)
+        compact = "".join(c for c in text if not c.isspace())
+        for start in range(max(len(compact) - 1, 0)):
+            digest = hashlib.blake2b(compact[start : start + 2].encode(), digest_size=4).digest()
+            vector[int.from_bytes(digest, "big") % self.dimensions] += 1.0
+        norm = float(np.linalg.norm(vector))
+        if norm > 0:
+            vector /= norm
+        return [float(value) for value in vector]
+
+
+class FlatEmbedder:
+    """Every text gets the same unit vector, so every cosine is 1.0 and only
+    recency and importance can reorder anything."""
+
+    name = "flat"
+    model = "flat"
+    dimensions = 4
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+
+class WideEmbedder(FlatEmbedder):
+    """Same name, different width: a model re-tagged under an existing name."""
+
+    dimensions = 8
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in texts]
+
+
+# --- fixtures ----------------------------------------------------------------
+
+
+def message(
+    content: str,
+    *,
+    ts: datetime | None = None,
+    role: Literal["user", "assistant"] = "user",
+) -> LoggedMessage:
+    return LoggedMessage(
+        ts=ts or NOW - timedelta(days=1),
+        role=role,
+        content=content,
+        origin="owner" if role == "user" else "agent",
+        session_kind="interactive",
+        modality="text",
+        channel="telegram",
+        sender_id="42",
+    )
+
+
+@pytest.fixture
+def store(db: sqlite3.Connection) -> Store:
+    return Store(db)
+
+
+def add(store: Store, content: str, *, days_ago: float = 1.0) -> int:
+    return store.insert_message(
+        message(content, ts=NOW - timedelta(days=days_ago)),
+        log_file="memory/log/2026-08-02.md",
+    )
+
+
+async def seed(store: Store, embedder: Embedder | None, *texts: str) -> MemoryRecall:
+    for text in texts:
+        add(store, text)
+    recall = MemoryRecall(store, embedder, now=NOW)
+    await recall.backfill()
+    return recall
+
+
+def contents(items: list) -> list[str]:
+    return [item.content for item in items]
+
+
+# --- the protocol ------------------------------------------------------------
+
+
+def test_satisfies_the_recall_protocol(store: Store) -> None:
+    assert isinstance(MemoryRecall(store), Recall)
+
+
+# --- fts_query: user text is not query syntax --------------------------------
+
+
+def test_fts_query_quotes_every_token() -> None:
+    assert fts_query("어제 김치찌개 먹었어") == '"어제" OR "김치찌개" OR "먹었어"'
+
+
+def test_fts_query_strips_everything_fts5_would_read_as_syntax() -> None:
+    """Each of these is a real thing a user types, and each one is FTS5 syntax."""
+    assert fts_query('어제 "김치찌개" 먹었나?') == '"어제" OR "김치찌개" OR "먹었나"'
+    assert fts_query("C:\\Users 경로 알려줘") == '"C" OR "Users" OR "경로" OR "알려줘"'
+    assert fts_query("NEAR 라는 단어") == '"NEAR" OR "라는" OR "단어"'
+    assert fts_query("3*4 계산해줘") == '"3" OR "4" OR "계산해줘"'
+    assert fts_query("^시작 -빼기 (괄호)") == '"시작" OR "빼기" OR "괄호"'
+
+
+def test_fts_query_is_empty_when_there_is_nothing_to_search() -> None:
+    assert fts_query("") == ""
+    assert fts_query('?! "" *** :::') == ""
+
+
+def test_fts_query_caps_a_pasted_wall_of_text() -> None:
+    query = fts_query(" ".join(f"단어{i}" for i in range(200)))
+    assert query.count(" OR ") == 31  # MAX_QUERY_TOKENS - 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        '어제 "김치찌개" 먹었나?',
+        "C:\\Users 경로",
+        "NEAR AND OR NOT",
+        "김치* 찌개**",
+        "^^^ ::: (((",
+        '"',
+        "*",
+        ":",
+        "",
+        "   ",
+        "김치찌개",
+    ],
+)
+async def test_search_never_raises_on_fts5_syntax_in_the_query(store: Store, query: str) -> None:
+    """FTS5 parses a bound value as query syntax, so an unescaped `:` is an
+    OperationalError in the middle of a conversation. Nothing here may raise."""
+    recall = await seed(store, GramEmbedder(), "어제 저녁에 김치찌개 먹었어", "모카 밥 줬어")
+    await recall.search(query, limit=3)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        '어제 "김치찌개" 먹었나?',
+        "C:\\Users 경로",
+        "NEAR AND OR NOT",
+        "김치* 찌개**",
+        "^^^ ::: (((",
+        '"',
+        "*",
+        ":",
+    ],
+)
+async def test_no_user_input_produces_a_malformed_fts_query(
+    store: Store, query: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`store.search_fts` swallows an OperationalError so a bad query cannot kill
+    a turn, which would also hide a broken query builder. So assert the stronger
+    thing: sqlite never rejects what `fts_query` produces in the first place."""
+    recall = await seed(store, None, "어제 저녁에 김치찌개 먹었어")
+
+    with caplog.at_level("WARNING"):
+        await recall.search(query, limit=3)
+
+    assert "sqlite rejected" not in caplog.text
+
+
+# --- the reason the vector lane exists ---------------------------------------
+
+
+async def test_keyword_lane_finds_a_whole_korean_token(store: Store) -> None:
+    recall = await seed(store, None, "어제 저녁에 김치찌개 먹었어", "오늘은 클라이밍 갔어")
+    items = await recall.search("김치찌개 맛있었어?", limit=3)
+
+    assert contents(items) == ["어제 저녁에 김치찌개 먹었어"]
+    assert items[0].reason == "keyword"
+
+
+@pytest.mark.parametrize("query", ["김치", "찌개", "어제는 뭐 먹었지"])
+async def test_fts5_misses_a_korean_substring_that_the_vector_lane_catches(
+    store: Store, query: str
+) -> None:
+    """The measurement docs/PLAN.md 4.3 rests on, executable.
+
+    `unicode61` splits on non-alphanumerics and knows nothing about Korean
+    morphology, so a token is only ever matched whole: `김치찌개` is one token, and
+    `어제는` and `어제` are two unrelated ones. In English FTS5 alone would carry
+    recall. Here it returns nothing at all, and only the vector lane answers -
+    which is why the vector index moved from M2 into M1b.
+    """
+    stored = "어제 저녁에 김치찌개 먹었어"
+    keyword_only = await seed(store, None, stored, "오늘은 클라이밍 갔어", "모카 밥 줬어")
+    assert await keyword_only.search(query, limit=3) == []
+
+    hybrid = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await hybrid.backfill()
+    items = await hybrid.search(query, limit=3)
+
+    assert stored in contents(items)
+    assert next(item for item in items if item.content == stored).reason == "vector"
+
+
+async def test_reason_is_both_when_the_lanes_agree(store: Store) -> None:
+    recall = await seed(store, GramEmbedder(), "어제 저녁에 김치찌개 먹었어", "모카 밥 줬어")
+    items = await recall.search("김치찌개", limit=3)
+
+    top = items[0]
+    assert top.content == "어제 저녁에 김치찌개 먹었어"
+    assert top.reason == "both"
+
+
+async def test_an_agreed_hit_outranks_a_single_lane_hit(store: Store) -> None:
+    """Summing the lanes is what makes agreement mean something."""
+    recall = await seed(store, GramEmbedder(), "어제 저녁에 김치찌개 먹었어", "김치찌개")
+
+    items = await recall.search("어제 저녁에 김치찌개 먹었어", limit=5)
+
+    assert items[0].content == "어제 저녁에 김치찌개 먹었어"
+    assert items[0].reason == "both"
+
+
+# --- scoring -----------------------------------------------------------------
+
+
+async def test_recency_decay_reorders_identical_similarity(store: Store) -> None:
+    """Same cosine for every message, so only the 30-day decay can order them.
+
+    Inserted out of order on purpose: with equal scores the tie-break is id
+    descending, so insertion order matching recency order would let this pass
+    with no decay at all.
+    """
+    add(store, "최근 얘기", days_ago=0)
+    add(store, "오래된 얘기", days_ago=60)
+    add(store, "중간쯤 얘기", days_ago=30)
+    recall = MemoryRecall(store, FlatEmbedder(), now=NOW)
+    await recall.backfill()
+
+    items = await recall.search("아무거나", limit=3)
+
+    assert contents(items) == ["최근 얘기", "중간쯤 얘기", "오래된 얘기"]
+
+
+async def test_a_half_life_old_memory_scores_half(store: Store) -> None:
+    add(store, "지금 얘기", days_ago=0)
+    add(store, "한 반감기 전 얘기", days_ago=HALF_LIFE_DAYS)
+    recall = MemoryRecall(store, FlatEmbedder(), now=NOW)
+    await recall.backfill()
+
+    fresh, old = await recall.search("아무거나", limit=2)
+
+    assert old.score == pytest.approx(fresh.score / 2, rel=1e-3)
+
+
+async def test_limit_is_respected(store: Store) -> None:
+    recall = await seed(store, FlatEmbedder(), *[f"메시지 {i}" for i in range(30)])
+    assert len(await recall.search("메시지", limit=4)) == 4
+
+
+async def test_nothing_stored_means_nothing_recalled(store: Store) -> None:
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    assert await recall.search("어제 뭐 먹었지", limit=5) == []
+
+
+# --- degrading rather than failing -------------------------------------------
+
+
+async def test_without_an_embedder_the_keyword_lane_still_answers(store: Store) -> None:
+    recall = await seed(store, None, "어제 저녁에 김치찌개 먹었어")
+    items = await recall.search("김치찌개", limit=3)
+
+    assert contents(items) == ["어제 저녁에 김치찌개 먹었어"]
+    assert items[0].reason == "keyword"
+
+
+async def test_an_embedder_that_raises_degrades_to_keyword_only(store: Store) -> None:
+    """The worst place for an exception is the middle of a conversation."""
+    add(store, "어제 저녁에 김치찌개 먹었어")
+    recall = MemoryRecall(store, GramEmbedder(fail=True), now=NOW)
+
+    items = await recall.search("김치찌개", limit=3)
+
+    assert contents(items) == ["어제 저녁에 김치찌개 먹었어"]
+    assert items[0].reason == "keyword"
+
+
+async def test_a_vector_index_of_a_different_width_is_ignored(store: Store) -> None:
+    """A model re-tagged under the same name, or a half-finished backfill.
+    Scoring against the wrong vector space is worse than not scoring."""
+    await seed(store, FlatEmbedder(), "어제 저녁에 김치찌개 먹었어")
+    swapped = MemoryRecall(store, WideEmbedder(), now=NOW)
+
+    items = await swapped.search("김치찌개", limit=3)
+
+    assert [item.reason for item in items] == ["keyword"]
+
+
+async def test_index_failure_never_reaches_the_caller(store: Store) -> None:
+    """`index` runs right after the markdown was written, so the user's words are
+    already safe. Raising here would cost them the reply instead."""
+    message_id = add(store, "어제 저녁에 김치찌개 먹었어")
+    recall = MemoryRecall(store, GramEmbedder(fail=True), now=NOW)
+
+    await recall.index(message_id, "어제 저녁에 김치찌개 먹었어")
+
+    assert store.load_embeddings("fake-gram")[0] == []
+
+
+async def test_backfill_reports_partial_progress_instead_of_raising(store: Store) -> None:
+    for i in range(3):
+        add(store, f"메시지 {i}")
+    recall = MemoryRecall(store, GramEmbedder(fail=True), now=NOW)
+
+    assert await recall.backfill() == 0
+
+
+async def test_backfill_without_an_embedder_is_a_no_op(store: Store) -> None:
+    add(store, "어제 저녁에 김치찌개 먹었어")
+    assert await MemoryRecall(store, None, now=NOW).backfill() == 0
+
+
+# --- indexing ----------------------------------------------------------------
+
+
+async def test_index_makes_a_message_findable_without_a_restart(store: Store) -> None:
+    """The matrix is cached, so a message indexed after the first search has to
+    invalidate it or it stays invisible for the life of the process."""
+    embedder = GramEmbedder()
+    recall = MemoryRecall(store, embedder, now=NOW)
+    assert await recall.search("찌개", limit=3) == []
+
+    message_id = add(store, "어제 저녁에 김치찌개 먹었어")
+    await recall.index(message_id, "어제 저녁에 김치찌개 먹었어")
+
+    assert contents(await recall.search("찌개", limit=3)) == ["어제 저녁에 김치찌개 먹었어"]
+
+
+async def test_index_skips_blank_text(store: Store) -> None:
+    embedder = GramEmbedder()
+    await MemoryRecall(store, embedder, now=NOW).index(add(store, "..."), "   ")
+    assert embedder.calls == []
+
+
+async def test_backfill_only_touches_what_is_missing(store: Store) -> None:
+    recall = await seed(store, GramEmbedder(), "첫 번째", "두 번째")
+    add(store, "세 번째")
+
+    assert await recall.backfill() == 1
+    assert len(store.load_embeddings("fake-gram")[0]) == 3
+
+
+# --- provenance / hygiene ----------------------------------------------------
+
+
+async def test_recalled_rows_are_marked_so_reflection_cannot_re_extract_them(
+    store: Store,
+) -> None:
+    """docs/PLAN.md 4.2 hygiene rule 2."""
+    add(store, "어제 저녁에 김치찌개 먹었어")
+    add(store, "관계없는 얘기")
+    recall = MemoryRecall(store, None, now=NOW)
+
+    await recall.search("김치찌개", limit=3)
+
+    marked = {
+        row["content"]
+        for row in store.conn.execute("SELECT content FROM messages WHERE recalled = 1")
+    }
+    assert marked == {"어제 저녁에 김치찌개 먹었어"}
+
+
+async def test_marking_recalled_does_not_corrupt_the_fts_index(store: Store) -> None:
+    """Updating a row fires the FTS trigger, which deletes and reinserts its
+    entry. A second identical search has to return the same thing."""
+    recall = await seed(store, None, "어제 저녁에 김치찌개 먹었어")
+
+    first = await recall.search("김치찌개", limit=3)
+    second = await recall.search("김치찌개", limit=3)
+
+    assert contents(first) == contents(second) == ["어제 저녁에 김치찌개 먹었어"]
+
+
+async def test_recalled_items_carry_the_timestamp_and_role(store: Store) -> None:
+    store.insert_message(
+        message("맛있었어?", ts=NOW - timedelta(days=2), role="assistant"),
+        log_file="memory/log/2026-08-01.md",
+    )
+    recall = MemoryRecall(store, None, now=NOW)
+
+    item = (await recall.search("맛있었어", limit=1))[0]
+
+    assert item.role == "assistant"
+    assert item.ts == NOW - timedelta(days=2)
+
+
+# --- vector storage ----------------------------------------------------------
+
+
+def test_vector_survives_the_blob_round_trip(store: Store) -> None:
+    message_id = add(store, "어제 저녁에 김치찌개 먹었어")
+    original = np.array([0.6, 0.8, 0.0, 0.0], dtype=np.float32)
+
+    store.upsert_embedding(message_id, "test-model", original)
+    ids, matrix = store.load_embeddings("test-model")
+
+    assert ids == [message_id]
+    assert matrix.dtype == np.float32
+    np.testing.assert_allclose(matrix[0], original, rtol=1e-6)
+
+
+def test_load_embeddings_normalises_so_a_dot_product_is_a_cosine(store: Store) -> None:
+    store.upsert_embedding(add(store, "하나"), "test-model", [3.0, 4.0, 0.0, 0.0])
+
+    _, matrix = store.load_embeddings("test-model")
+
+    assert float(np.linalg.norm(matrix[0])) == pytest.approx(1.0)
+
+
+def test_upsert_replaces_rather_than_duplicates(store: Store) -> None:
+    message_id = add(store, "하나")
+    store.upsert_embedding(message_id, "test-model", [1.0, 0.0])
+    store.upsert_embedding(message_id, "test-model", [0.0, 1.0])
+
+    ids, matrix = store.load_embeddings("test-model")
+
+    assert ids == [message_id]
+    np.testing.assert_allclose(matrix[0], [0.0, 1.0])
+
+
+def test_load_embeddings_drops_rows_of_a_stale_width(store: Store) -> None:
+    """A model re-tagged without renaming: two vector spaces under one key.
+    Reshaping them into one matrix would raise, so the old width is dropped."""
+    narrow = add(store, "옛날 벡터")
+    wide = add(store, "새 벡터")
+    store.upsert_embedding(narrow, "test-model", [1.0, 0.0])
+    store.upsert_embedding(wide, "test-model", [1.0, 0.0, 0.0, 0.0])
+
+    ids, matrix = store.load_embeddings("test-model")
+
+    assert ids == [wide]
+    assert matrix.shape == (1, 4)
+
+
+def test_load_embeddings_of_an_unknown_model_is_empty(store: Store) -> None:
+    ids, matrix = store.load_embeddings("never-used")
+    assert ids == []
+    assert matrix.shape[0] == 0
+
+
+def test_messages_without_embedding_is_per_model(store: Store) -> None:
+    first = add(store, "하나")
+    second = add(store, "둘")
+    store.upsert_embedding(first, "model-a", [1.0, 0.0])
+
+    pending_a = store.messages_without_embedding("model-a", 10)
+    pending_b = store.messages_without_embedding("model-b", 10)
+
+    assert [row["id"] for row in pending_a] == [second]
+    assert [row["id"] for row in pending_b] == [first, second]
+
+
+def test_delete_embeddings_only_drops_its_own_model(store: Store) -> None:
+    first = add(store, "하나")
+    second = add(store, "둘")
+    store.upsert_embedding(first, "model-a", [1.0, 0.0])
+    store.upsert_embedding(second, "model-b", [1.0, 0.0])
+
+    assert store.delete_embeddings("model-a") == 1
+    assert store.load_embeddings("model-a")[0] == []
+    assert store.load_embeddings("model-b")[0] == [second]
+
+
+def test_deleting_a_message_takes_its_vector_with_it(store: Store) -> None:
+    """ON DELETE CASCADE, which needs `PRAGMA foreign_keys` actually on."""
+    message_id = add(store, "하나")
+    store.upsert_embedding(message_id, "test-model", [1.0, 0.0])
+
+    store.conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+    store.conn.commit()
+
+    assert store.load_embeddings("test-model")[0] == []
+
+
+def test_upsert_rejects_an_empty_vector(store: Store) -> None:
+    with pytest.raises(ValueError):
+        store.upsert_embedding(add(store, "하나"), "test-model", [])

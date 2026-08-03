@@ -183,6 +183,75 @@ def test_fallback_to_a_keyless_provider_fails_at_startup() -> None:
         make_settings(preset="offline", fallback_provider="anthropic")
 
 
+# --- M1b fields: recall, voice, residency -----------------------------------
+
+
+def test_recall_and_service_defaults() -> None:
+    settings = make_settings(preset="offline")
+
+    # bge-m3 is multilingual, which is the whole reason vectors are in M1b
+    # (docs/PLAN.md 4.3): FTS5 alone misses inflected Korean.
+    assert settings.embed_model == "bge-m3"
+    assert settings.recall_limit == 6
+    assert settings.recall_half_life_days == 30.0
+    assert settings.service_label == "default"
+    # No guessed native-audio model id: it would fail at the first voice turn
+    # instead of at startup.
+    assert settings.gemini_live_model == ""
+
+
+def test_recall_with_no_embedding_model_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_EMBED_MODEL is empty"):
+        make_settings(preset="offline", embed_model="")
+
+
+def test_a_recall_limit_below_one_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_RECALL_LIMIT"):
+        make_settings(preset="offline", recall_limit=0)
+
+
+def test_a_non_positive_half_life_fails_at_startup() -> None:
+    # Zero or negative makes the recency term undefined rather than aggressive.
+    with pytest.raises(ConfigError, match="DAEMON_RECALL_HALF_LIFE_DAYS"):
+        make_settings(preset="offline", recall_half_life_days=0)
+
+
+def test_enabling_voice_without_a_live_model_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_MODEL is empty"):
+        make_settings(
+            preset="balanced",
+            anthropic_api_key="k",
+            gemini_model="g",
+            gemini_api_key="k",
+            voice_enabled=True,
+        )
+
+
+def test_a_service_label_that_is_really_a_path_is_rejected() -> None:
+    # The label becomes a filename under ~/Library/LaunchAgents.
+    with pytest.raises(ConfigError, match="not a usable label"):
+        make_settings(preset="offline", service_label="../../evil")
+
+
+def test_new_env_vars_are_read_with_their_documented_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_EMBED_MODEL", "nomic-embed-text")
+    monkeypatch.setenv("DAEMON_RECALL_LIMIT", "3")
+    monkeypatch.setenv("DAEMON_RECALL_HALF_LIFE_DAYS", "14")
+    monkeypatch.setenv("DAEMON_SERVICE_LABEL", "second")
+    monkeypatch.setenv("DAEMON_GEMINI_LIVE_MODEL", "gemini-live-x")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.embed_model == "nomic-embed-text"
+    assert settings.recall_limit == 3
+    assert settings.recall_half_life_days == 14.0
+    assert settings.service_label == "second"
+    assert settings.gemini_live_model == "gemini-live-x"
+
+
 # --- misc fields ------------------------------------------------------------
 
 

@@ -63,6 +63,22 @@ class Recall(Protocol):
         make the caller's turn fail if the embedder is down."""
         ...
 
+    async def backfill(self, limit: int = 500) -> int:
+        """Embed whatever has no vector yet, returning how many landed.
+
+        In the protocol rather than left to the implementation because startup
+        cannot be correct without it. A rebuilt sqlite file gives every message a
+        new id and drops `embeddings` by cascade, so the vector lane would stay
+        empty for all history while the health check still said the recall was
+        ready. Measured on the golden set, that silent state is a 50% ceiling for
+        Korean instead of the hybrid number - the worst kind of regression,
+        because nothing fails.
+
+        Reports what it managed rather than raising: a cold embedder at startup
+        must not stop the daemon from serving text.
+        """
+        ...
+
 
 @runtime_checkable
 class MemoryWriter(Protocol):

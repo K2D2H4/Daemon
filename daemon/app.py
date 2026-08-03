@@ -15,6 +15,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -24,8 +25,8 @@ from daemon.channels.base import Channel
 from daemon.config import ANTHROPIC, OLLAMA, ConfigError, Settings
 from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
-from daemon.loop import ConversationLoop
-from daemon.memory.base import MemoryWriter
+from daemon.loop import ConversationLoop, ResolveId
+from daemon.memory.base import MemoryWriter, Recall
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +40,17 @@ def create_app(
     *,
     channel: Channel | None = None,
     memory: MemoryWriter | None = None,
+    recall: Recall | None = None,
 ) -> FastAPI:
-    """Assemble the process. `channel`/`memory` are injection points for tests;
-    normally both are built from settings during startup."""
+    """Assemble the process. `channel`/`memory`/`recall` are injection points for
+    tests; normally all three are built from settings during startup."""
     resolved = settings or Settings()
     app = FastAPI(title="Daemon", version="0.0.1", lifespan=_lifespan)
     app.state.settings = resolved
     app.state.channel = channel
     app.state.memory = memory
+    app.state.recall = recall
+    app.state.recall_status = "injected" if recall is not None else "not started"
     app.state.loop_task = None
 
     @app.get("/health")
@@ -61,6 +65,10 @@ def create_app(
                 for task_key, route in resolved.routing_table().items()
             },
             "conversation_loop": "running" if task is not None and not task.done() else "stopped",
+            # Recall can be absent while the rest of the process is healthy (the
+            # embedder is down, the module is mid-rewrite). Saying so here is the
+            # difference between a degraded daemon and one that quietly forgets.
+            "recall": app.state.recall_status,
         }
 
     return app
@@ -83,24 +91,59 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     channel = app.state.channel
     memory = app.state.memory
+    recall: Recall | None = app.state.recall
+    resolve_id: ResolveId | None = None
     close_io: Callable[[], None] | None = None
+    embedder: Any = None
     if channel is None or memory is None:
         try:
-            channel, memory, close_io = _build_io(settings)
+            io = _build_io(settings)
         except Exception as exc:
             # Loud, not silent: /health will report the loop as stopped.
             logger.error("conversation loop not started: %s", exc)
             channel = memory = None
+            app.state.recall_status = "not started"
+        else:
+            channel, memory = io.channel, io.memory
+            recall, resolve_id, close_io = io.recall, io.resolve_id, io.close
+            embedder = io.embedder
+            app.state.recall = recall
+            app.state.recall_status = io.recall_status
 
     if channel is not None and memory is not None:
         app.state.channel = channel
         app.state.memory = memory
-        loop = ConversationLoop(channel, gateway, memory, data_dir=settings.data_dir)
+        loop = ConversationLoop(
+            channel,
+            gateway,
+            memory,
+            data_dir=settings.data_dir,
+            recall=recall,
+            recall_limit=settings.recall_limit,
+            resolve_id=resolve_id,
+        )
         app.state.loop_task = asyncio.create_task(loop.run(), name="conversation-loop")
+
+    if recall is not None:
+        # Backfill after the loop is already serving, and in the background: a
+        # rebuilt sqlite file gives every message a new id and drops `embeddings`
+        # by cascade, so without this the vector lane stays empty for all history
+        # while /health still says recall is ready. Measured on the golden set,
+        # that silent state is a 50% ceiling for Korean rather than the hybrid
+        # number - a regression where nothing fails. Not awaited, because a cold
+        # embedder must not delay the log clock (docs/PLAN.md 8.1).
+        app.state.backfill_task = asyncio.create_task(
+            _backfill(recall), name="recall-backfill"
+        )
 
     try:
         yield
     finally:
+        backfill = getattr(app.state, "backfill_task", None)
+        if backfill is not None:
+            backfill.cancel()
+            with suppress(asyncio.CancelledError):
+                await backfill
         task = app.state.loop_task
         if task is not None:
             task.cancel()
@@ -113,8 +156,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             with suppress(Exception):
                 close_io()
         scheduler.shutdown(wait=False)
-        for provider in providers.values():
-            closer = getattr(provider, "aclose", None)
+        closeables: list[Any] = [*providers.values()]
+        if embedder is not None:
+            # The embedder holds its own HTTP client, and it is not in `providers`
+            # because embeddings are routed separately (llm/base.py).
+            closeables.append(embedder)
+        for closeable in closeables:
+            closer = getattr(closeable, "aclose", None)
             if closer is not None:
                 with suppress(Exception):
                     await closer()
@@ -144,8 +192,20 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
     return providers
 
 
-def _build_io(settings: Settings) -> tuple[Channel, MemoryWriter, Callable[[], None]]:
-    """Wire the concrete channel and memory writer, plus their teardown.
+@dataclass(frozen=True, slots=True)
+class _IO:
+    channel: Channel
+    memory: MemoryWriter
+    recall: Recall | None
+    recall_status: str
+    resolve_id: ResolveId | None
+    close: Callable[[], None]
+    embedder: Any = None
+    """Held only so the lifespan can close its HTTP client on shutdown."""
+
+
+def _build_io(settings: Settings) -> _IO:
+    """Wire the concrete channel, memory writer and recall, plus their teardown.
 
     TelegramChannel raises on an empty token or an empty allowlist, so those
     checks are deliberately not repeated here.
@@ -172,15 +232,87 @@ def _build_io(settings: Settings) -> tuple[Channel, MemoryWriter, Callable[[], N
         settings.telegram_allowed_user_ids,
         cursor=store,
     )
-    return channel, FileMemoryWriter(settings.data_dir, store), store.close
+    recall, recall_status, embedder = _build_recall(settings, store)
+    return _IO(
+        channel=channel,
+        memory=FileMemoryWriter(settings.data_dir, store),
+        recall=recall,
+        recall_status=recall_status,
+        resolve_id=_id_resolver(store),
+        close=store.close,
+        embedder=embedder,
+    )
+
+
+async def _backfill(recall: Recall) -> None:
+    """Embed history the vector lane is missing. Never fatal: recall degrades to
+    keyword-only, which is worse than the full answer and far better than a dead
+    conversation loop."""
+    try:
+        landed = await recall.backfill()
+        if landed:
+            logger.info("recall backfill embedded %d message(s)", landed)
+    except Exception:
+        logger.exception("recall backfill failed; the vector lane stays partial")
+
+
+def _build_recall(settings: Settings, store: Any) -> tuple[Recall | None, str, Any]:
+    """Assemble Lane 1 recall. Returns (recall, status, embedder).
+
+    Imported here rather than at module scope because a missing or broken recall
+    stack must not stop the process from booting: without this, an embedder that
+    cannot reach Ollama would cost the user their conversation loop as well as
+    their memory, and the log clock (docs/PLAN.md 8.1) is the thing that cannot
+    be caught up later.
+
+    The embedder comes back so the lifespan can close its HTTP client; recall
+    itself owns no connection.
+    """
+    try:
+        from daemon.llm.embedders.ollama import OllamaEmbedder
+        from daemon.memory.recall import MemoryRecall
+    except ImportError as exc:
+        logger.warning("recall unavailable, continuing without it: %s", exc)
+        return None, f"unavailable: {exc}", None
+
+    try:
+        embedder = OllamaEmbedder(settings.ollama_base_url, settings.embed_model)
+        recall = MemoryRecall(
+            store, embedder, half_life_days=settings.recall_half_life_days
+        )
+        return recall, "ready", embedder
+    except Exception as exc:
+        logger.warning("recall could not be built, continuing without it: %s", exc)
+        return None, f"unavailable: {exc}", None
+
+
+def _id_resolver(store: Any) -> ResolveId:
+    """Read back the id of the message that was just recorded.
+
+    `MemoryWriter.record()` is frozen and returns nothing, and the id lives in the
+    mirror, so the loop gets this small closure instead of a widened protocol. The
+    text is compared before the id is handed over: `recent(1)` is "newest by
+    timestamp", and a channel-supplied timestamp that runs behind our own clock
+    would otherwise point at the previous turn's row, silently filing one
+    message's vector under another message's id.
+    """
+
+    def resolve(text: str) -> int | None:
+        rows = store.recent(1)
+        if not rows:
+            return None
+        row = rows[-1]
+        return int(row["id"]) if row["content"] == text.strip() else None
+
+    return resolve
 
 
 def main() -> None:
-    import uvicorn
+    """Entry point for the `daemon` console script (pyproject [project.scripts]).
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    settings = Settings()
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
+    Delegates to the CLI so `daemon` keeps starting the server while `daemon
+    install`, `daemon doctor` and the rest exist alongside it.
+    """
+    from daemon.cli import main as cli_main
+
+    raise SystemExit(cli_main())

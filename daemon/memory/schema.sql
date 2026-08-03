@@ -107,6 +107,14 @@ END;
 -- Regenerable like every other index: drop the rows and re-embed from the
 -- markdown. `model` and `dim` are recorded so a model change invalidates only
 -- its own rows instead of silently mixing vector spaces.
+--
+-- Measured afterwards, and worth knowing before optimising the wrong thing: the
+-- vector lane is the cheap half. At 10k messages it costs 0.22 ms against the
+-- FTS5 lane's 1.9 ms, and at 50k it is 1.29 ms against 9.1 ms - a six-term OR of
+-- common tokens is simply more work than one matmul. Both stay far inside the
+-- voice budget. What actually dominates Lane 1 is neither: the embedder round
+-- trip for the query is ~117 ms, almost all of it fixed overhead rather than
+-- inference (see docs/PLAN.md 4.3.1).
 
 CREATE TABLE IF NOT EXISTS embeddings (
     message_id  INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE,

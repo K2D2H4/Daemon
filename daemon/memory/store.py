@@ -7,19 +7,26 @@ nothing may live here that cannot be reconstructed from the markdown, except the
 provenance columns, which exist precisely because a model must not be able to
 write them in prose (non-negotiable 3).
 
-M1a touches `messages` only. The other tables in schema.sql belong to later
-milestones and are created up front so those milestones need no migration.
+M1a touches `messages` only; M1b adds `embeddings` and the FTS5 read path. The
+other tables in schema.sql belong to later milestones and are created up front so
+those milestones need no migration.
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+
+import numpy as np
 
 from daemon.fs import secure_dir, secure_file
 from daemon.memory.base import LoggedMessage
 from daemon.memory.log import utc_iso
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 SCHEMA_VERSION = 3
@@ -211,3 +218,129 @@ class Store:
         ).fetchall()
         rows.reverse()
         return rows
+
+    def messages_by_ids(self, ids: Sequence[int]) -> dict[int, sqlite3.Row]:
+        """Rows for a set of ids, keyed by id. The vector lane produces ids and
+        needs the text and timestamp back; returning a mapping keeps the caller
+        from re-deriving the order it already knows."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM messages WHERE id IN ({placeholders})", tuple(ids)
+        ).fetchall()
+        return {int(row["id"]): row for row in rows}
+
+    def mark_recalled(self, ids: Sequence[int]) -> None:
+        """Flag rows that recall put in front of the model.
+
+        docs/PLAN.md 4.2 hygiene rule 2: reflection must not re-extract what was
+        recalled, or its own injected context becomes new evidence and the loop
+        amplifies itself. Note that this UPDATE fires `messages_au`, which rewrites
+        the row's FTS entry with identical content - correct, just not free.
+        """
+        if not ids:
+            return
+        self.conn.executemany(
+            "UPDATE messages SET recalled = 1 WHERE id = ? AND recalled = 0",
+            [(int(i),) for i in ids],
+        )
+        self.conn.commit()
+
+    # --- keyword search -----------------------------------------------------
+
+    def search_fts(self, match_query: str, limit: int) -> list[tuple[sqlite3.Row, float]]:
+        """FTS5 hits with their bm25 rank, best first.
+
+        `match_query` must already be valid FTS5 *query syntax*, not raw user
+        text - FTS5 parses bound values as syntax, so quoting is the caller's job
+        (see `recall.fts_query`). A malformed query is an OperationalError, which
+        is caught here rather than allowed to kill a conversation turn: keyword
+        recall going quiet is recoverable, a raised exception mid-turn is not.
+        """
+        try:
+            rows = self.conn.execute(
+                "SELECT m.*, bm25(messages_fts) AS rank FROM messages_fts "
+                "JOIN messages m ON m.id = messages_fts.rowid "
+                "WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?",
+                (match_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            logger.warning("recall: sqlite rejected FTS query %r", match_query)
+            return []
+        return [(row, float(row["rank"])) for row in rows]
+
+    # --- embeddings ---------------------------------------------------------
+
+    def upsert_embedding(self, message_id: int, model: str, vector: Sequence[float]) -> None:
+        """Store one vector as a raw float32 BLOB.
+
+        Normalisation belongs to the embedder (llm/base.py), not here; this method
+        stores what it is given. `load_embeddings` re-normalises on the way out,
+        which is where the dot-product-as-cosine invariant is actually relied on.
+        """
+        array = np.asarray(vector, dtype=np.float32)
+        if array.ndim != 1 or array.size == 0:
+            raise ValueError(f"embedding for message {message_id} has shape {array.shape}")
+        self.conn.execute(
+            "INSERT INTO embeddings (message_id, model, dim, vector, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (message_id) DO UPDATE SET model = excluded.model, "
+            "dim = excluded.dim, vector = excluded.vector, created_at = excluded.created_at",
+            (
+                int(message_id),
+                model,
+                int(array.size),
+                array.tobytes(),
+                utc_iso(datetime.now(UTC)),
+            ),
+        )
+        self.conn.commit()
+
+    def load_embeddings(self, model: str) -> tuple[list[int], np.ndarray]:
+        """Every vector for one model as (message ids, (N, dim) matrix).
+
+        Rows are L2-normalised here so recall can score with a plain dot product.
+        Rows whose width disagrees with the newest row are dropped: re-tagging a
+        model without renaming it would otherwise mix two vector spaces into one
+        matrix, and `frombuffer` would fail on the reshape rather than degrade.
+        """
+        newest = self.conn.execute(
+            "SELECT dim FROM embeddings WHERE model = ? ORDER BY message_id DESC LIMIT 1",
+            (model,),
+        ).fetchone()
+        if newest is None:
+            return [], np.zeros((0, 0), dtype=np.float32)
+
+        dim = int(newest["dim"])
+        rows = self.conn.execute(
+            "SELECT message_id, vector FROM embeddings WHERE model = ? AND dim = ? "
+            "ORDER BY message_id",
+            (model, dim),
+        ).fetchall()
+
+        ids = [int(row["message_id"]) for row in rows]
+        matrix = np.zeros((len(ids), dim), dtype=np.float32)
+        for index, row in enumerate(rows):
+            matrix[index] = np.frombuffer(row["vector"], dtype=np.float32)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        np.divide(matrix, norms, out=matrix, where=norms > 0)
+        return ids, matrix
+
+    def messages_without_embedding(self, model: str, limit: int) -> list[sqlite3.Row]:
+        """Messages this model has not embedded yet, oldest first. The backfill
+        path after a re-index or a model change."""
+        return self.conn.execute(
+            "SELECT m.id, m.content FROM messages m "
+            "LEFT JOIN embeddings e ON e.message_id = m.id AND e.model = ? "
+            "WHERE e.message_id IS NULL ORDER BY m.id LIMIT ?",
+            (model, limit),
+        ).fetchall()
+
+    def delete_embeddings(self, model: str) -> int:
+        """Drop one model's vectors. Safe by construction - the vectors are an
+        index, re-derivable from the markdown - and the way a model change is
+        rolled out without mixing vector spaces."""
+        cursor = self.conn.execute("DELETE FROM embeddings WHERE model = ?", (model,))
+        self.conn.commit()
+        return cursor.rowcount

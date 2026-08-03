@@ -10,6 +10,7 @@ surface as a broken conversation turn three hours later.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,6 +74,12 @@ PRESETS: dict[str, dict[Task, str]] = {
 }
 
 
+SERVICE_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+"""The label becomes both a launchd job name and a filename under
+`~/Library/LaunchAgents`, so it is validated rather than trusted: a label
+containing `/` or `..` would write the plist somewhere else entirely."""
+
+
 class ConfigError(RuntimeError):
     """Bad configuration. Raised at startup, never mid-conversation."""
 
@@ -122,6 +129,32 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="", alias="DAEMON_OPENAI_MODEL")
     gemini_model: str = Field(default="", alias="DAEMON_GEMINI_MODEL")
 
+    embed_model: str = Field(default="bge-m3", alias="DAEMON_EMBED_MODEL")
+    """Embedding model for recall, separate from the chat model even though both
+    run on Ollama: chat may move to a hosted provider while embeddings stay local
+    (Task.EMBED is local in every preset). bge-m3 is multilingual, which the
+    Korean recall path depends on - docs/PLAN.md 4.3 shows FTS5 alone missing
+    inflected Korean, and that is the whole reason vectors were pulled into M1b."""
+
+    recall_limit: int = Field(default=6, alias="DAEMON_RECALL_LIMIT")
+    """Top N recalled items injected per turn. Small on purpose: this text is
+    prepended to every single turn, so the budget is spent here first."""
+
+    recall_half_life_days: float = Field(default=30.0, alias="DAEMON_RECALL_HALF_LIFE_DAYS")
+    """Recency decay in the recall score (docs/PLAN.md 4.3). Exposed because the
+    right value depends on how much someone talks, not because it should be
+    fiddled with casually."""
+
+    gemini_live_model: str = Field(default="", alias="DAEMON_GEMINI_LIVE_MODEL")
+    """Gemini Live (native audio) model id, distinct from DAEMON_GEMINI_MODEL:
+    the text and realtime endpoints do not take the same ids. Deliberately has no
+    default - a guessed model id fails at the first voice turn, which is exactly
+    the kind of late failure this module exists to prevent."""
+
+    service_label: str = Field(default="default", alias="DAEMON_SERVICE_LABEL")
+    """Suffix of the OS service label (`ai.daemon.<label>`). Only interesting for
+    a second instance with its own data dir."""
+
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
@@ -165,6 +198,29 @@ class Settings(BaseSettings):
             problems.append(
                 f"DAEMON_VOICE_ENABLED is on but preset {self.preset!r} routes no voice task; "
                 "voice needs a hosted native-audio provider (docs/PLAN.md 3.2)"
+            )
+        if self.voice_enabled and not self.gemini_live_model:
+            problems.append(
+                "DAEMON_VOICE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
+                "the native-audio endpoint needs its own model id"
+            )
+
+        if not self.embed_model:
+            problems.append("DAEMON_EMBED_MODEL is empty; recall cannot embed anything")
+        if self.recall_limit < 1:
+            problems.append(
+                f"DAEMON_RECALL_LIMIT is {self.recall_limit}; it must be at least 1 "
+                "(to switch recall off, do not configure a recall backend)"
+            )
+        if self.recall_half_life_days <= 0:
+            problems.append(
+                f"DAEMON_RECALL_HALF_LIFE_DAYS is {self.recall_half_life_days}; "
+                "it must be greater than 0 or recency decay is undefined"
+            )
+        if not SERVICE_LABEL_RE.match(self.service_label):
+            problems.append(
+                f"DAEMON_SERVICE_LABEL {self.service_label!r} is not a usable label; "
+                "expected letters, digits, dot, dash or underscore"
             )
 
         # Only tasks that can actually be requested are validated, so an M1a
