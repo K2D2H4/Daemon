@@ -1,0 +1,181 @@
+"""Is every built thing actually reachable from the assembled product?
+
+This exists because of a repeated failure that 470 unit tests could not see. Each
+time, a component was written, satisfied its frozen protocol, shipped with its own
+passing tests - and nothing in the running daemon ever constructed it. Reported as
+done, and broken the moment a person tried it:
+
+  * `daemon run` refused to start, because pairing was implemented and tested but
+    no config selected it and no assembly passed it.
+  * The voice layer was called complete while nothing instantiated a session.
+  * `openai` and `gemini` were nameable in a route and unbuildable in the app, so
+    "provider-agnostic" was true of the config surface and false of the product.
+  * chat_voice had no caller at all.
+
+The pattern is always the same: contract satisfied, unit-tested, unreachable. So
+reachability is asserted here, and anything genuinely not built yet has to be
+declared PENDING with the milestone that owns it. That declaration is the point -
+a gap becomes a line someone chose to write rather than something nobody noticed.
+
+The check runs in both directions. A pending item that turns out to be reachable
+also fails, because a stale PENDING is how this file would quietly stop working.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+
+import pytest
+
+from daemon.config import PROVIDER_KEY_ENV
+from daemon.tasks import Task
+
+DAEMON = pathlib.Path(__file__).resolve().parents[1] / "daemon"
+
+PENDING_PROVIDERS = {
+    # Being implemented now; until they are, a route naming them fails at startup
+    # rather than mid-conversation, which is the correct direction.
+    "openai": "chat provider not written yet",
+    "gemini": "chat provider not written yet (voice uses a separate session)",
+}
+
+PENDING_TASKS = {
+    Task.CHAT_VOICE: "M1b - the voice layer exists but nothing assembles it",
+    Task.RECALL_ESCALATION: "M1b+ - Lane 2 is specified, Lane 1 ships first",
+    Task.PROACTIVE_JUDGE: "M3 - the whole point of M3",
+    Task.REFLECTION: "M2",
+    Task.PERSONA_RULE: "M4",
+}
+
+PENDING_CLASSES = {
+    "GeminiLiveSession": "M1b - voice is not wired into the loop",
+    "SoundDeviceAudio": "M1b - voice is not wired into the loop",
+    "LocalSpeaker": "M3 - proactive speech at the machine (PLAN 6.3)",
+}
+
+WIRED_CLASSES = (
+    "TelegramChannel",
+    "FileMemoryWriter",
+    "MemoryRecall",
+    "OllamaEmbedder",
+    "Pairing",
+)
+
+
+def _sources() -> list[tuple[pathlib.Path, str]]:
+    return [(p, p.read_text(encoding="utf-8")) for p in DAEMON.rglob("*.py")]
+
+
+def _constructed(name: str) -> pathlib.Path | None:
+    """A file under daemon/ that calls `name(...)` without defining it."""
+    for path, text in _sources():
+        if f"class {name}" in text:
+            continue
+        if re.search(rf"\b{re.escape(name)}\s*\(", text):
+            return path
+    return None
+
+
+def _task_callers(task: Task) -> list[pathlib.Path]:
+    """Files that route work to this Task. tasks.py declares them and config.py
+    tabulates them; neither is a caller."""
+    return [
+        path
+        for path, text in _sources()
+        if path.name not in ("tasks.py", "config.py") and f"Task.{task.name}" in text
+    ]
+
+
+# --- providers ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider", sorted(PROVIDER_KEY_ENV))
+def test_every_nameable_provider_can_be_built(provider: str) -> None:
+    """A provider a route may name must be a provider the app can construct.
+    Anything else means a configuration that validates and then dies."""
+    module = DAEMON / "llm" / "providers" / f"{provider}.py"
+    app = (DAEMON / "app.py").read_text(encoding="utf-8")
+    reachable = module.exists() and (provider.upper() in app or f'"{provider}"' in app)
+
+    if provider in PENDING_PROVIDERS:
+        assert not reachable, (
+            f"{provider} is now reachable - remove it from PENDING_PROVIDERS. "
+            "A stale entry here is how this check stops working."
+        )
+        return
+    assert reachable, (
+        f"{provider} is nameable in a route but the app cannot build it. "
+        f"Either implement daemon/llm/providers/{provider}.py and assemble it, or "
+        f"declare it in PENDING_PROVIDERS with the milestone that owns it."
+    )
+
+
+def test_a_route_to_an_unbuildable_provider_fails_at_startup() -> None:
+    """Not mid-conversation. The whole point of validating configuration eagerly."""
+    from daemon.app import _build_providers
+    from daemon.config import ConfigError, Settings
+
+    pending = next(iter(PENDING_PROVIDERS))
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PRESET="offline",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR="/tmp/daemon-reachability",
+        DAEMON_ROUTE_OVERRIDES={"reflection": pending},
+        **{f"{pending}_api_key": "fake", f"{pending}_model": "some-model"},
+    )
+    with pytest.raises(ConfigError, match="no implementation"):
+        _build_providers(settings)
+
+
+# --- tasks -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("task", list(Task))
+def test_every_task_has_a_caller(task: Task) -> None:
+    """A Task nobody routes work to is a table entry pretending to be a feature."""
+    callers = _task_callers(task)
+
+    if task in PENDING_TASKS:
+        assert not callers, (
+            f"{task.value} now has a caller ({callers[0].name}) - remove it from "
+            "PENDING_TASKS."
+        )
+        return
+    assert callers, (
+        f"nothing in daemon/ routes work to {task.value}. Either call it or declare "
+        f"it in PENDING_TASKS with the milestone that owns it."
+    )
+
+
+# --- protocol implementations ------------------------------------------------
+
+
+@pytest.mark.parametrize("name", WIRED_CLASSES)
+def test_wired_implementations_are_constructed_somewhere(name: str) -> None:
+    assert _constructed(name) is not None, (
+        f"{name} is implemented and tested but nothing under daemon/ builds it. "
+        "That is the exact shape of every wiring defect this file exists for."
+    )
+
+
+@pytest.mark.parametrize("name", sorted(PENDING_CLASSES))
+def test_pending_implementations_are_still_pending(name: str) -> None:
+    """The other direction. When voice finally gets wired this fails, which is the
+    reminder to move it into WIRED_CLASSES rather than leave the gap declared."""
+    where = _constructed(name)
+    assert where is None, (
+        f"{name} is now constructed in {where.name} - move it from PENDING_CLASSES "
+        "to WIRED_CLASSES."
+    )
+
+
+def test_the_pending_lists_do_not_overlap_the_wired_list() -> None:
+    assert not set(PENDING_CLASSES) & set(WIRED_CLASSES)
+
+
+def test_every_pending_entry_names_its_milestone() -> None:
+    """A gap without an owner is just a gap."""
+    for label, reason in (*PENDING_TASKS.items(), *PENDING_CLASSES.items()):
+        assert re.search(r"M\d", reason), f"{label} is pending with no milestone: {reason!r}"

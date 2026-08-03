@@ -13,12 +13,28 @@ Three more rules the shape of this module comes from:
   * It asks only what the chosen preset's routing table actually requires
     (docs/PLAN.md 3.2), so an `offline` install is never asked for a hosted key
     and a text-only install is never asked for a voice key.
-  * It reads and writes `./.env` only, never the shell environment. The OS
-    service unit carries no secrets and sees no shell (daemon/service.py), so a
-    key that exists only as an exported variable would work in the terminal and
-    break under launchd - the worst kind of "it worked yesterday".
-  * It never asks for a Telegram user id. Pairing is a channel concern; the
-    wizard takes the token and says how to pair.
+  * Credentials are read from and written to `./.env` only, never the shell
+    environment. The OS service unit carries no secrets and sees no shell
+    (daemon/service.py), so a key that exists only as an exported variable would
+    work in the terminal and break under launchd - the worst kind of "it worked
+    yesterday".
+  * It never asks for a Telegram user id, and it never decides who the owner is.
+    Trust is `channels/pairing.py`'s to grant; the two steps after the file is
+    written only drive it.
+
+Those two steps are why this module does not end at the file. A first run used to
+finish with a written `.env` and two chores left: pair a phone across two
+terminals, and hand-write `persona/seed.md` - which nothing creates, so an
+install that skipped it talked like a stock assistant instead of like anyone
+(docs/PLAN.md 5). Both are onboarding, so both happen here:
+
+  * `persona/seed.md` from three questions, plus the anchor items docs/PLAN.md
+    5.4 fixes there. Human-owned, so an existing file is never rewritten.
+  * pairing, in this process. The pairing code exists to carry an identity
+    between the channel and a terminal the stranger cannot reach; during setup
+    those are the same process, so the code would be transcription with nothing
+    to protect. What still holds is that the numeric id is what gets approved and
+    that `Pairing` decides ownership.
 
 Synchronous on purpose: the rest of the I/O path is async because it shares a
 loop with the conversation, but this module's I/O is a human typing, and one
@@ -33,13 +49,15 @@ need no network, no keys and no browser.
 from __future__ import annotations
 
 import getpass
+import json
 import os
 import sys
+import time
 import webbrowser
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 import httpx
 from pydantic import ValidationError
@@ -54,8 +72,11 @@ from daemon.config import (
     Settings,
     providers_for,
 )
-from daemon.fs import FILE_MODE, secure_file
+from daemon.fs import FILE_MODE, secure_dir, secure_file
 from daemon.tasks import Task
+
+if TYPE_CHECKING:  # imported lazily at runtime - see `Wizard._pair_here`
+    from daemon.channels.pairing import Approval, Pairing
 
 OK = 0
 PROBLEM = 1
@@ -116,7 +137,78 @@ PAIRING_NOTE = (
     "No Telegram allowlist yet, and that is on purpose: nobody is asked for a",
     "numeric user id here. Start the daemon, message your bot, and it answers with",
     "a pairing code. Until you pair, nobody can reach it.",
+    "",
+    "  daemon run                     - in one terminal, then message the bot",
+    "  daemon pairing approve <code>  - in another, with the code it replied",
 )
+"""Printed when pairing did not happen here - declined, timed out, interrupted.
+
+Still the documented route, and still the only one available once this process is
+gone: the wizard's shortcut works because it holds the token and the database at
+the same moment, which nothing else does.
+"""
+
+PAIRING_POLICY = "pairing"
+"""The `DAEMON_TELEGRAM_DM_POLICY` value this step belongs to (see
+`channels/telegram.DM_POLICIES`). Under `allowlist` there is nothing to pair:
+ids come from the file, and an empty list is refused at startup."""
+
+PAIRING_POLL_SECONDS = 20
+"""Server-side long-poll window per `getUpdates` while waiting for the owner.
+Shorter than the channel's 30s so a Ctrl-C is never far away."""
+
+PAIRING_WAIT_SECONDS = 180.0
+"""How long the wizard waits for that first message.
+
+Long enough to pick up a phone, unlock it, search for a bot and type something -
+that is tens of seconds, and three minutes leaves room for the search going
+badly. Not longer: a wizard nobody came back to should hand the terminal back,
+and PAIRING_NOTE loses nothing by being read a minute later."""
+
+DEFAULT_PERSONA_NAME = "Daemon"
+
+VOICE_PRESETS = (
+    "Short and dry. I do not pad answers, and I do not perform enthusiasm.",
+    "Warm and talkative. I say more than the minimum when there is more to say.",
+    "Playful. I take a joke and give one back, and I am not solemn about myself.",
+)
+"""Three examples, because a seed is a seed - a character sheet at first run is
+onboarding fatigue paid before the product has earned any.
+
+The first one is the default deliberately. Left with no seed at all, a small
+local model settles into the eager-helper register ("how may I help you today?"),
+which is the one voice a companion cannot have: it is the voice of software."""
+
+PERSONA_LINE_LIMIT = 200
+"""Characters kept per answer. A seed that is mostly one answer is not a seed,
+and this file is prepended to every single turn."""
+
+SEED_NOTE = """<!--
+This file is yours. Daemon reads it on every turn and never writes to it.
+
+`daemon setup` wrote it once, from three answers. Edit it by hand whenever you
+like - it is re-read per turn, so a change lands on the next message with no
+restart. What Daemon works out about talking to you accumulates separately, in
+persona/learned.md, which is the half you only read. Nothing being able to touch
+this half is what stops a personality from dissolving into whatever the last
+month of conversation happened to imply (docs/PLAN.md 5.1).
+-->"""
+
+SEED_ANCHOR = (
+    "# Constant",
+    "",
+    "Not preferences and not up for revision. Daemon cannot write to this file, so",
+    "nothing it learns later can quietly drop these (docs/PLAN.md 5.4):",
+    "",
+    "- I do not simply agree. When I think the user is wrong, I say so plainly.",
+    "- I am someone with my own view, not a mirror of whoever is talking to me.",
+)
+"""Written into every seed, whatever the answers were.
+
+A quality device before an ethical one: a character that only agrees is dull and
+unconvincing, and the same property is the structural answer to over-fitting to
+one person's opinions. It survives because it is in the file the AI cannot edit -
+no separate feature required."""
 
 
 class Cancelled(Exception):
@@ -134,6 +226,19 @@ class Verdict:
     ok: bool
     detail: str
     hint: str = ""
+    subject: str = ""
+    """Who the provider says the credential belongs to, when it says: the bot's
+    `@username` for Telegram. Not a secret, and not trusted for anything - it is
+    printed so the user knows which bot to message next."""
+
+
+@dataclass(frozen=True, slots=True)
+class Updates:
+    """One `getUpdates` batch, or why there is none."""
+
+    ok: bool
+    updates: tuple[dict[str, Any], ...] = ()
+    detail: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,7 +342,55 @@ def check_telegram(token: str) -> Verdict:
         username = str(result.get("username", ""))
     except ValueError:
         return Verdict(False, "api.telegram.org returned a non-JSON body")
-    return Verdict(True, f"connected to @{username}" if username else "token works")
+    return Verdict(
+        True,
+        f"connected to @{username}" if username else "token works",
+        subject=f"@{username}" if username else "",
+    )
+
+
+def fetch_updates(token: str, offset: int | None, timeout: int) -> Updates:
+    """One long poll of `getUpdates`, for the pairing step below.
+
+    The channel owns the real polling loop (daemon/channels/telegram.py). This is
+    the same endpoint borrowed for the couple of minutes in which the wizard is
+    the only thing holding the token, and it stays here rather than in the channel
+    because there is no channel yet: nothing has been paired, so a TelegramChannel
+    built now would have nobody it is allowed to hear.
+
+    Every update this returns is one the daemon will never be offered - passing
+    `offset` is what confirms the previous batch server-side. `Wizard._pair` is
+    what makes that safe, by saving the cursor.
+    """
+    params: dict[str, Any] = {
+        "timeout": timeout,
+        # A JSON string, not a list: httpx would render a one-element list as
+        # `allowed_updates=message`, which the Bot API refuses to parse.
+        "allowed_updates": json.dumps(["message"]),
+    }
+    if offset is not None:
+        params["offset"] = offset
+    try:
+        response = httpx.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params=params,
+            # Must outlast the server-side wait, or every poll looks like a failure.
+            timeout=timeout + HTTP_TIMEOUT,
+        )
+    except httpx.HTTPError as exc:
+        # Same reason as check_telegram: the token is in the path, so httpx's own
+        # message is not printable.
+        detail = _redact(str(exc), token)
+        return Updates(False, detail=f"lost contact with api.telegram.org: {detail}")
+    if response.status_code != 200:
+        return Updates(False, detail=f"api.telegram.org returned HTTP {response.status_code}")
+    try:
+        result = response.json().get("result")
+    except ValueError:
+        return Updates(False, detail="api.telegram.org returned a non-JSON body")
+    if not isinstance(result, list):
+        return Updates(False, detail="getUpdates answered without a list of updates")
+    return Updates(True, tuple(item for item in result if isinstance(item, dict)))
 
 
 def check_ollama(base_url: str) -> OllamaState:
@@ -267,6 +420,7 @@ class Checks:
     gemini: Callable[[str], Verdict] = check_gemini
     telegram: Callable[[str], Verdict] = check_telegram
     ollama: Callable[[str], OllamaState] = check_ollama
+    updates: Callable[[str, int | None, int], Updates] = fetch_updates
 
 
 def _string_field(response: httpx.Response, container: str, key: str) -> tuple[str, ...]:
@@ -443,13 +597,15 @@ def merge_env(existing: str, updates: Mapping[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_env(path: Path, content: str) -> None:
+def write_private_file(path: Path, content: str) -> None:
     """Owner-only, and atomic.
 
-    Owner-only because this file is a list of API keys, and 0600 from the moment
-    it exists rather than a create-then-chmod window. Atomic because a wizard
+    Owner-only because both files this writes are private - a list of API keys,
+    and the description of a person's companion - and 0600 from the moment the
+    file exists rather than a create-then-chmod window. Atomic because a wizard
     that half-wrote someone's existing `.env` would be worse than one that never
-    ran: the replace either happens or it does not.
+    ran: the replace either happens or it does not. The same property is what
+    makes a Ctrl-C during the persona questions cost nothing.
     """
     temporary = path.with_name(f"{path.name}.daemon-setup")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
@@ -470,6 +626,136 @@ def mask(value: str) -> str:
     if not value:
         return "(empty)"
     return f"...{value[-4:]}" if len(value) > 4 else "(set)"
+
+
+# --- the persona seed ---------------------------------------------------------
+
+
+def seed_markdown(name: str, voice: str, address: str = "") -> str:
+    """The `persona/seed.md` a first run starts from.
+
+    Two sections, and the split is the point: the top is the user's answers, the
+    bottom is `SEED_ANCHOR`, marked as ours and explained in the file itself,
+    because someone who opens this later has to be able to tell what they chose
+    from what the product fixed.
+    """
+    lines = [
+        SEED_NOTE,
+        "",
+        "# Who I am",
+        "",
+        f"- My name is {name}.",
+        f"- How I talk: {voice}",
+    ]
+    if address:
+        # Omitted rather than defaulted: inventing how someone wants to be
+        # addressed is worse than not mentioning it.
+        lines.append(f"- How I address the user: {address}")
+    return "\n".join([*lines, "", *SEED_ANCHOR]) + "\n"
+
+
+def one_line(answer: str, limit: int = PERSONA_LINE_LIMIT) -> str:
+    """An answer, flattened to something that cannot restructure the file.
+
+    This text is pasted into a file that is prepended to every prompt as a system
+    message, so a multi-line answer could open its own heading and write a second
+    `# Constant` section - i.e. edit the anchor by typing into a question about
+    tone. Collapsing whitespace removes that without changing a word of what was
+    actually said. Brackets go the same way: `daemon/loop.py` fences quoted
+    material with bracketed markers, and the seed is trusted text that nothing
+    downstream strips, so a bracket typed here should not be able to pose as one.
+    """
+    flat = " ".join(answer.split()).replace("[", "(").replace("]", ")")
+    return flat[:limit].rstrip() if len(flat) > limit else flat
+
+
+# --- who just messaged the bot ------------------------------------------------
+
+NAME_LIMIT = 48
+"""Characters of display name shown. Enough to recognise yourself, not enough to
+push the numeric id - the part that is actually being approved - off the line."""
+
+
+@dataclass(frozen=True, slots=True)
+class Sender:
+    """Everything the wizard is willing to know about an inbound message."""
+
+    id: str
+    """The numeric Telegram user id, as text. The only thing approval is about."""
+    label: str
+    """Display name and @username, for recognition only. Attacker-chosen."""
+
+
+def sender_of(update: Mapping[str, Any]) -> Sender | None:
+    """Who sent this update - and nothing else about it.
+
+    Deliberately no way to reach the message body from the return value. The body
+    is private (this is someone's first words to their companion, not log
+    material) and it is also the one part of an update a stranger writes: text
+    from an unidentified sender does not belong on the terminal where the owner is
+    answering a yes/no question.
+    """
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return None  # edits, channel posts, callback queries
+    user = message.get("from")
+    if not isinstance(user, dict):
+        return None
+    sender_id = user.get("id")
+    # `isinstance(True, int)` is True, and a malformed body could carry one.
+    if not isinstance(sender_id, int) or isinstance(sender_id, bool):
+        return None
+    name = " ".join(
+        part
+        for part in (str(user.get(key) or "").strip() for key in ("first_name", "last_name"))
+        if part
+    )
+    username = str(user.get("username") or "").strip()
+    label = " ".join(part for part in (name, f"@{username}" if username else "") if part)
+    return Sender(id=str(sender_id), label=printable(label) or "(no name given)")
+
+
+def printable(text: str) -> str:
+    """A display name, made safe to put on a terminal.
+
+    Every character of it was chosen by whoever sent the message, and it is being
+    printed one line above a `y/N` prompt: control characters can rewrite that
+    line, and a name of a thousand spaces can scroll it away. `str.isprintable`
+    keeps Korean, emoji and accents, and drops exactly the escapes and newlines
+    that could redraw the question.
+    """
+    kept = "".join(character for character in text if character.isprintable()).strip()
+    return f"{kept[:NAME_LIMIT]}..." if len(kept) > NAME_LIMIT else kept
+
+
+def approve_sender(pairing: Pairing, sender_id: str) -> Approval | None:
+    """Approve `sender_id` through the ordinary pairing path, code and all.
+
+    `screen()` is what opens a pending request; `approve()` is what turns one into
+    an allowlist entry and, for the first one only and atomically, into ownership.
+    Writing that row here instead would mean this wizard held its own opinion
+    about who the owner is, and "the first approval is the owner, once" would then
+    live in two places - the sort of duplicate that stays correct until it does
+    not. So a code is generated and spent immediately, and nobody reads it aloud.
+
+    None when the sender is already approved: there is nothing left to pair.
+    """
+    from daemon.channels.pairing import PairingError
+
+    if pairing.screen(sender_id).allowed:
+        return None
+    code = next(
+        (request.code for request in pairing.pending() if request.sender_id == sender_id),
+        "",
+    )
+    if not code:
+        # screen() declined to issue one: BOOTSTRAP_MAX_PENDING strangers got
+        # there first, all within the hour.
+        raise PairingError(
+            f"could not open a pairing request for id={sender_id} - too many are "
+            "already waiting. `daemon pairing list` after `daemon run` still works"
+        )
+    return pairing.approve(code)
 
 
 # --- prompting ---------------------------------------------------------------
@@ -538,6 +824,9 @@ class Wizard:
     prompt: Prompt
     checks: Checks = field(default_factory=Checks)
     opener: Callable[[str], object] = webbrowser.open
+    bot_handle: str = field(default="", init=False)
+    """The bot's `@username`, kept from verifying the token so the pairing step
+    can say which bot to message."""
 
     def run(self) -> int:
         existing_text = self.env_path.read_text(encoding="utf-8") if self.env_path.exists() else ""
@@ -567,14 +856,18 @@ class Wizard:
         self._check_ollama(preset, {**merged, **updates})
 
         if not updates:
-            say("Nothing to change - this install is already configured.")
+            say("Nothing to change in .env - this install is already configured.")
             say("`daemon doctor` checks the parts a file cannot tell you about.")
-            return OK
+            # Still goes through _finish: a complete `.env` says nothing about
+            # whether a persona seed exists or whether a phone was ever paired,
+            # and this is the only command that offers either. Returning here is
+            # what made an interrupted first run unrecoverable.
+            return self._finish(env)
         if not self._confirm(updates, env):
             say("Nothing was written.")
             return PROBLEM
 
-        write_env(self.env_path, merge_env(existing_text, updates))
+        write_private_file(self.env_path, merge_env(existing_text, updates))
         say(f"Wrote {self.env_path} (mode 0600).")
         return self._finish({**env, **updates})
 
@@ -680,7 +973,11 @@ class Wizard:
         if need.key == "GEMINI_API_KEY":
             return self.checks.gemini(value)
         if need.key == "TELEGRAM_BOT_TOKEN":
-            return self.checks.telegram(value)
+            verdict = self.checks.telegram(value)
+            # getMe already told us the handle; the pairing step would otherwise
+            # have to ask Telegram a second time for something we were just told.
+            self.bot_handle = verdict.subject or self.bot_handle
+            return verdict
         return Verdict(True, "")
 
     def _check_ollama(self, preset: str, env: Mapping[str, str]) -> None:
@@ -732,13 +1029,8 @@ class Wizard:
     def _finish(self, env: Mapping[str, str]) -> int:
         say = self.prompt.say
         say()
-        if env.get("TELEGRAM_BOT_TOKEN") and not env.get("TELEGRAM_ALLOWED_USER_IDS"):
-            for line in PAIRING_NOTE:
-                say(line)
-            say()
-
         try:
-            Settings(_env_file=self.env_path)
+            settings = Settings(_env_file=self.env_path)
         except (ConfigError, ValidationError) as exc:
             # The same validation `daemon run` does, run here, on the file we just
             # wrote. This is the last chance to fail before "it worked in setup"
@@ -751,11 +1043,199 @@ class Wizard:
             say("Fix it with `daemon setup` again, by editing .env, or ask `daemon doctor`.")
             return PROBLEM
 
+        # Everything below reads settings rather than `env`: the data dir and the
+        # DM policy both have defaults that are not in the file, and both decide
+        # where these two steps write and whether they run at all.
+        unpaired = bool(
+            settings.telegram_bot_token
+            and not settings.telegram_allowed_user_ids
+            and settings.telegram_dm_policy == PAIRING_POLICY
+        )
+        try:
+            self._seed_persona(settings)
+            if unpaired and self._pair_here(settings):
+                unpaired = False
+        except (Cancelled, KeyboardInterrupt):
+            # Both files are written atomically or not at all, so there is nothing
+            # half-done to repair - and run()'s handler must not see this, because
+            # it would print "nothing was written" about a `.env` that is on disk.
+            say()
+            say("Stopped there. Everything already written above stays written.")
+            say()
+        if unpaired:
+            for line in PAIRING_NOTE:
+                say(line)
+            say()
+
         say("Next:")
         say("  daemon doctor     - checks Ollama, the data dir and the schema")
         say("  daemon run        - runs it here, in this terminal")
         say("  daemon install    - keeps it running after you close the terminal or reboot")
         return OK
+
+    # --- the persona seed ----------------------------------------------------
+
+    def _seed_persona(self, settings: Settings) -> None:
+        """Write `persona/seed.md`, unless there is already one.
+
+        Nothing else in Daemon creates this file - `loop.py` reads it if it is
+        there and otherwise sends no persona at all, which is how an install ends
+        up sounding like a stock assistant rather than like anyone (docs/PLAN.md
+        5). So it belongs to first-run, next to the questions the user is already
+        answering, and not to a paragraph of documentation asking them to write
+        markdown before they have said hello.
+        """
+        say = self.prompt.say
+        path = settings.data_dir / "persona" / "seed.md"
+        if path.exists():
+            # Human-owned (docs/PLAN.md 5.1), and re-running setup is not consent
+            # to overwrite a personality someone has been editing for a month.
+            say(f"{path} already exists, so it is left exactly as it is.")
+            say("That file is yours - nothing here and nothing in Daemon rewrites it.")
+            say()
+            return
+
+        say("Who should this be?")
+        say("Three questions, all skippable with Enter, and none of them final:")
+        say(f"they write {path}, which you own and can edit at any time.")
+        say()
+        name = one_line(self.prompt.ask("  Name", default=DEFAULT_PERSONA_NAME))
+        say()
+        say("  How should it talk? A number, or write your own line.")
+        for index, preset in enumerate(VOICE_PRESETS, start=1):
+            say(f"    {index}) {preset}")
+        voice = self._voice(self.prompt.ask("  Voice", default="1"))
+        say()
+        say("  How should it address you? Enter skips this.")
+        say("  In Korean it is half the voice: 반말 or 존댓말, and what to call you.")
+        address = one_line(self.prompt.ask("  Address", default=""))
+
+        secure_dir(path.parent)
+        write_private_file(path, seed_markdown(name or DEFAULT_PERSONA_NAME, voice, address))
+        say()
+        say(f"Wrote {path} (mode 0600).")
+        say("It also carries two fixed lines - that this is someone with a view of")
+        say("their own, who will disagree with you. Those are in the file Daemon")
+        say("cannot write to, which is the only reason they survive (docs/PLAN.md 5.4).")
+        say()
+
+    def _voice(self, answer: str) -> str:
+        """A preset by number, or whatever they typed, or the default."""
+        picked = answer.strip()
+        if picked.isdigit() and 1 <= int(picked) <= len(VOICE_PRESETS):
+            return VOICE_PRESETS[int(picked) - 1]
+        return one_line(picked) or VOICE_PRESETS[0]
+
+    # --- pairing, in this process --------------------------------------------
+
+    def _pair_here(self, settings: Settings) -> bool:
+        """Offer to pair now, and do it. True if someone was approved.
+
+        Raises `Cancelled` (or lets `KeyboardInterrupt` through) if the user leaves
+        mid-wait; `_finish` treats that as "stop asking me things", because by now
+        the only irreversible thing this command does has already happened.
+        """
+        say = self.prompt.say
+        say("Telegram is configured, but Daemon does not know who you are yet -")
+        say("it answers nobody until someone is paired.")
+        say("The documented way to fix that needs two terminals: `daemon run` in")
+        say("one, then `daemon pairing approve` in the other with the code the bot")
+        say("replies. The code exists to carry your id between two processes. This")
+        say("is one process holding both the token and the database, so it can")
+        say("watch for your message and simply ask whether it was you.")
+        if not self.prompt.ask_yes_no("Pair your Telegram account now", default=True):
+            return False
+        return self._pair(settings)
+
+    def _pair(self, settings: Settings) -> bool:
+        # Imported here, not at module scope: `daemon setup` has to run on an
+        # install whose configuration does not load yet, and app.py pulls in the
+        # whole server to be able to name one filename.
+        from daemon.app import DB_FILENAME
+        from daemon.channels.pairing import Pairing, PairingError
+        from daemon.channels.telegram import TelegramChannel
+        from daemon.memory.store import Store
+
+        say = self.prompt.say
+        token = settings.telegram_bot_token
+        handle = self.bot_handle
+        if not handle:
+            # The token was already in the file, so getMe never ran this time.
+            # Worth one call: telling someone to go and message a bot whose token
+            # was revoked would spend the whole wait on a bot that cannot hear.
+            verdict = self.checks.telegram(token)
+            if not verdict.ok:
+                say(f"  {verdict.detail}")
+                return False
+            handle = verdict.subject or "your bot"
+
+        say(f"  Send any message to {handle} from your phone - anything at all.")
+        say(f"  Waiting up to {PAIRING_WAIT_SECONDS / 60:.0f} minute(s). Ctrl-C stops waiting.")
+        say()
+
+        store = Store.open(settings.data_dir / DB_FILENAME)
+        pairing = Pairing(store, TelegramChannel.name)
+        offset: int | None = None
+        refused: set[str] = set()
+        try:
+            deadline = time.monotonic() + PAIRING_WAIT_SECONDS
+            while True:
+                batch = self.checks.updates(token, offset, PAIRING_POLL_SECONDS)
+                if not batch.ok:
+                    # One failure ends it rather than retrying for three minutes:
+                    # the token worked seconds ago, so this is the network, and the
+                    # user should hear that instead of watching a spinner.
+                    say(f"  {batch.detail}")
+                    return False
+                for update in batch.updates:
+                    update_id = update.get("update_id")
+                    if isinstance(update_id, int):
+                        offset = update_id + 1
+                    sender = sender_of(update)
+                    if sender is None or sender.id in refused:
+                        # Asked about them already; further messages from the same
+                        # id are not a second question.
+                        continue
+                    if not self._is_you(sender):
+                        refused.add(sender.id)
+                        say("  Still waiting, then - someone else got there first.")
+                        say()
+                        continue
+                    try:
+                        approval = approve_sender(pairing, sender.id)
+                    except PairingError as exc:
+                        say(f"  {exc}")
+                        return False
+                    if approval is None:
+                        say(f"  id={sender.id} is already paired - nothing to do.")
+                        return True
+                    say(f"  Paired. id={approval.sender_id} may talk to Daemon; nobody else can.")
+                    if not approval.is_owner:
+                        say("  Added as a guest: this channel already had an owner, and")
+                        say("  ownership is granted once and never transferred.")
+                    return True
+                if time.monotonic() >= deadline:
+                    say("  Nothing arrived, so this is not the moment.")
+                    return False
+        finally:
+            if offset is not None:
+                # Not optional. Passing `offset` above is what confirms updates
+                # server-side, so these are spent - but the last batch is not
+                # confirmed until the next call, and a daemon starting with no
+                # cursor asks for everything Telegram still holds. Without this
+                # line the daemon's first act is to answer the message that was
+                # only ever meant to identify you.
+                store.save_cursor(TelegramChannel.name, offset)
+            store.close()
+
+    def _is_you(self, sender: Sender) -> bool:
+        say = self.prompt.say
+        say(f"  A message just arrived from id={sender.id}  (name: {sender.label})")
+        say("  What gets approved is the id. The name is whatever that account")
+        say("  typed into its own profile, so treat it as a hint and not as proof.")
+        say("  What they wrote is not shown: it is not mine to print, and an")
+        say("  unidentified stranger's words have no business on this screen.")
+        return self.prompt.ask_yes_no(f"  Is id={sender.id} you", default=True)
 
 
 def _all_needs() -> list[Need]:

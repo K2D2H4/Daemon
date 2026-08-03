@@ -106,7 +106,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if command == "install":
             return _print_action(service_for(settings).install(force=args.force))
         if command == "uninstall":
-            return _print_action(service_for(settings).uninstall())
+            return _print_action(service_for(settings).uninstall(), verb="removed")
         if command == "status":
             return _print_status(service_for(settings).status())
     except ServiceError as exc:
@@ -331,7 +331,7 @@ def _ollama_checks(settings: Settings) -> list[Check]:
 # --- printing ----------------------------------------------------------------
 
 
-def _print_action(action: ServiceAction) -> int:
+def _print_action(action: ServiceAction, *, verb: str = "installed") -> int:
     if action.changes:
         print(f"changes to {action.unit_path}:")
         for line in action.changes:
@@ -341,7 +341,11 @@ def _print_action(action: ServiceAction) -> int:
     for command in action.commands:
         print(f"ran: {' '.join(command)}")
     if action.applied:
-        print(f"{action.label} installed at {action.unit_path}")
+        # `applied` only says something happened. Printing "installed" for every
+        # outcome meant a successful uninstall reported "ai.daemon.default
+        # installed at ..." - the action was right and the sentence was wrong,
+        # which is worse than a crash because nothing looks broken.
+        print(f"{action.label} {verb}: {action.unit_path}")
         return OK
     # Not applied is not always an error, but "nothing happened" should never
     # look like success to a script.

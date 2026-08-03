@@ -20,6 +20,7 @@ daemon/
   channels/
     base.py           Channel protocol, InboundMessage, OutboundMessage. FROZEN.
     telegram.py
+  tui.py              terminal presentation: colours, boxes, CJK-aware widths
   memory/
     schema.sql        storage contract. FROZEN.
     store.py          sqlite access
@@ -70,6 +71,29 @@ FROZEN means: do not edit without flagging it first.
    Background work runs on the in-process APScheduler.
 
 ## Testing (required, not optional)
+
+**Unit tests are not enough, and we learned that the expensive way.** A milestone
+shipped with 470 passing tests and failed on first contact three separate ways:
+`daemon run` refused to start, the bot never answered, and voice was reported
+complete while nothing could reach it. Every one of those was invisible to unit
+tests and obvious after thirty seconds of actually using the thing. So two more
+kinds of test are required, and a change is not done without them:
+
+- **`tests/test_reachable.py` — is it reachable?** Every `Task` needs a caller,
+  every nameable provider needs to be buildable, every protocol implementation
+  needs something that constructs it. Anything genuinely not built yet must be
+  declared PENDING with the milestone that owns it. The check runs both ways: a
+  stale PENDING fails too, so the file cannot quietly stop working. The recurring
+  defect it exists for is *contract satisfied, unit-tested, unreachable*.
+- **`tests/test_acceptance.py` — does the journey work?** Assemble the app the way
+  the entrypoint does, drive a real conversation through it, and assert the whole
+  chain the product promises: the reply, the markdown, the mirror, the vector, and
+  the recall on the next turn. Fakes stop at the network edge, because the defects
+  live between.
+
+And when you have run the suite, **run the product**. `pytest` passing is not the
+same as it working, and the difference is where every defect above lived.
+
 
 - `pytest` + `pytest-asyncio` (`asyncio_mode = "auto"`, so no decorator needed).
 - **Every module you add ships with tests in the same PR-sized unit of work.**

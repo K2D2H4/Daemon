@@ -259,7 +259,11 @@ class Settings(BaseSettings):
         # Only tasks that can actually be requested are validated, so an M1a
         # text-only install is not forced to hold a voice key it never uses.
         for task in self.active_tasks:
-            problems.extend(self._provider_problems(self.routing[task], f"task {task.value}"))
+            problems.extend(
+                self._provider_problems(
+                    self.routing[task], f"task {task.value}", task=task
+                )
+            )
         if self.fallback_provider is not None:
             problems.extend(
                 self._provider_problems(self.fallback_provider, "DAEMON_FALLBACK_PROVIDER")
@@ -269,13 +273,25 @@ class Settings(BaseSettings):
             raise ConfigError("; ".join(problems))
         return self
 
-    def _provider_problems(self, provider: str, context: str) -> list[str]:
+    def _provider_problems(
+        self, provider: str, context: str, *, task: Task | None = None
+    ) -> list[str]:
         if provider not in PROVIDER_KEY_ENV:
             return [f"{context} names unknown provider {provider!r}"]
         found: list[str] = []
         key_env = PROVIDER_KEY_ENV[provider]
         if key_env is not None and not getattr(self, key_env.lower()):
             found.append(f"{context} routes to {provider!r} but {key_env} is empty")
+
+        # Voice does not use the provider's ordinary model id. The native-audio
+        # endpoint takes its own, and demanding DAEMON_GEMINI_MODEL for a voice
+        # route made enabling voice impossible without setting an unrelated
+        # variable - and once set, that value was never read by anything. The
+        # voice model has its own check in the validator above, so there is
+        # nothing to verify here.
+        if task in VOICE_TASKS:
+            return found
+
         if not getattr(self, f"{provider}_model"):
             found.append(
                 f"{context} routes to {provider!r} but no model is set "
@@ -320,6 +336,10 @@ class Settings(BaseSettings):
             raise ConfigError(
                 f"{task.value} was requested but voice is off (DAEMON_VOICE_ENABLED)"
             )
+        if task in VOICE_TASKS:
+            # The native-audio endpoint takes its own model id, which is why
+            # DAEMON_GEMINI_MODEL is neither required nor read for a voice route.
+            return Route(provider=provider, model=self.gemini_live_model)
         return Route(provider=provider, model=self.provider_model(provider))
 
     def routing_table(self) -> dict[Task, Route]:
