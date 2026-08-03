@@ -5,7 +5,7 @@ for different reasons (daemon/voice/base.py) and because a test that needs an AP
 key is a broken test.
 
 Timing is not slept on. The fake session advances only once the prefetch watcher
-has actually peeked at the in-progress transcript, so "recall started while the
+has actually handled the in-progress transcript, so "recall started while the
 user was still talking" is asserted from call order rather than from a sleep long
 enough to usually work.
 """
@@ -13,21 +13,27 @@ enough to usually work.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import pathlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from websockets.exceptions import ConnectionClosedOK
+from websockets.frames import Close
 
 from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.voice import conversation as conversation_module
 from daemon.voice.base import AudioIO, Transcript, VoiceSession
 from daemon.voice.conversation import VoiceConversation
+from daemon.voice.gemini_live import GeminiLiveSession
 
-TICK = 0.005
-"""Prefetch interval for the tests. Small because nothing waits on it: the fake
-session blocks until a peek happens."""
+POLL = 0.005
+"""How often a test that has to wait for another task looks again. Only the
+cancellation tests need it: everything else is ordered by the fake session, which
+does not advance until the conversation has reacted."""
 
 
 # --- script steps ------------------------------------------------------------
@@ -56,11 +62,16 @@ class Hang:
 
 
 class FakeSession:
-    """A scripted `VoiceSession`, plus the two accessors the real one grew.
+    """A scripted `VoiceSession`, protocol-complete.
 
-    `partial_transcripts` is how recall gets a head start and `pending_transcripts`
-    is how a cancelled turn is not lost; neither is in the frozen protocol, so both
-    are duck-typed here the same way the conversation looks for them.
+    All six methods are the protocol's now, including the three the audit added, so
+    the conversation calls them rather than hunting for them - and a fake that
+    lacked one would fail `test_the_fakes_satisfy_the_protocols` instead of quietly
+    exercising a fallback the product does not have.
+
+    One `receive()` is one turn: the script is consumed across calls and a `Turn`
+    step ends the iterator, which is what the real session does at
+    `turnComplete` (daemon/voice/base.py).
     """
 
     name = "fake-live"
@@ -70,12 +81,15 @@ class FakeSession:
         self.events = events if events is not None else []
         self.sent: list[bytes] = []
         self.texts: list[str] = []
+        self.contexts: list[str] = []
         self.interrupts = 0
         self.entered = False
         self.closed = False
         self.ended: str | None = None
+        self.turns = 0
         self.peeked = ""
         self._said: dict[str, list[str]] = {"user": [], "assistant": []}
+        self._partials: asyncio.Queue[Transcript | None] = asyncio.Queue()
         self._peek_happened = asyncio.Event()
 
     async def __aenter__(self) -> FakeSession:
@@ -84,6 +98,7 @@ class FakeSession:
 
     async def __aexit__(self, *exc: object) -> None:
         self.closed = True
+        self._partials.put_nowait(None)
 
     async def send_audio(self, chunk: bytes) -> None:
         self.sent.append(chunk)
@@ -91,50 +106,75 @@ class FakeSession:
     async def send_text(self, text: str) -> None:
         self.texts.append(text)
 
+    async def send_context(self, text: str) -> None:
+        self.contexts.append(text)
+        self.events.append("context")
+
     async def interrupt(self) -> None:
         self.interrupts += 1
         self.events.append("interrupt")
 
     async def receive(self) -> Any:
-        for step in self.script:
+        self.turns += 1
+        while self.script:
+            step = self.script.pop(0)
             if isinstance(step, bytes):
                 yield step
             elif isinstance(step, Transcript):
                 yield step
             elif isinstance(step, Says):
                 self._said[step.role].append(step.text)
-                await self._observed()
+                if step.role == "user":
+                    self._partials.put_nowait(
+                        Transcript(text=self._text("user"), role="user", final=False)
+                    )
+                    await self._observed()
+                else:
+                    # The assistant's deltas are not offered as partials, so there
+                    # is nothing to wait for. One turn of the loop, so the
+                    # microphone pump gets to run.
+                    await asyncio.sleep(0)
             elif isinstance(step, Turn):
                 for transcript in self._drain(final=True):
                     yield transcript
+                return  # the turn ended; the session did not
             elif isinstance(step, Hang):
                 await asyncio.Event().wait()
             elif isinstance(step, BaseException):
                 raise step
         self.ended = "the script ran out"
 
-    def partial_transcripts(self) -> list[Transcript]:
-        self.peeked = self._state()
-        self._peek_happened.set()
-        return self._snapshot(final=False)
+    async def partial_transcripts(self) -> Any:
+        while True:
+            partial = await self._partials.get()
+            if partial is None:
+                return
+            yield partial
+            # Recorded after the consumer has handled it, which is what `_observed`
+            # waits on: peeking is not the point, acting on the peek is.
+            self.peeked = partial.text
+            self._peek_happened.set()
 
     def pending_transcripts(self) -> list[Transcript]:
         return self._drain(final=True)
 
     async def _observed(self) -> None:
-        """Block until the watcher has peeked and seen *this* text.
+        """Block until the watcher has handled *this* text.
 
-        Waiting for any peek would race: an earlier, empty one would satisfy it and
-        the script would run on before the conversation had noticed anything.
+        Waiting for any partial would race: an earlier, shorter one would satisfy it
+        and the script would run on before the conversation had noticed the rest.
+        The assistant's own deltas are not offered as partials at all, so there is
+        nothing to wait for - one turn of the loop, so the microphone pump and any
+        search already started get to run.
         """
-        while self.peeked != self._state():
+        while self.peeked != self._text("user"):
             self._peek_happened.clear()
             await self._peek_happened.wait()
         # One more turn of the loop so the search the watcher just started can run.
         await asyncio.sleep(0)
 
-    def _state(self) -> str:
-        return "|".join("".join(self._said[role]).strip() for role in ("user", "assistant"))
+    def _text(self, role: str) -> str:
+        return "".join(self._said[role]).strip()
 
     def _snapshot(self, *, final: bool) -> list[Transcript]:
         found = []
@@ -151,11 +191,20 @@ class FakeSession:
 
 
 class BareSession(FakeSession):
-    """A provider that offers no view of the turn in progress - OpenAI Realtime
-    reports partial and final separately, so this is not hypothetical."""
+    """A provider that has the seams and puts nothing through them.
 
-    partial_transcripts = None  # type: ignore[assignment]
-    pending_transcripts = None  # type: ignore[assignment]
+    Not hypothetical: the protocol requires the methods, but nothing can require a
+    provider to transcribe mid-utterance, and OpenAI Realtime reports partial and
+    final separately. The conversation has to degrade - recall then costs the turn a
+    round trip - rather than fail.
+    """
+
+    async def partial_transcripts(self) -> Any:
+        return
+        yield  # pragma: no cover - an empty stream still has to be one
+
+    def pending_transcripts(self) -> list[Transcript]:
+        return []
 
     async def _observed(self) -> None:
         await asyncio.sleep(0)
@@ -258,13 +307,7 @@ def conversation(
     memory: FakeMemory | None = None,
     **kwargs: Any,
 ) -> VoiceConversation:
-    return VoiceConversation(
-        session,
-        audio or FakeAudio(),
-        memory or FakeMemory(),
-        prefetch_interval=kwargs.pop("prefetch_interval", TICK),
-        **kwargs,
-    )
+    return VoiceConversation(session, audio or FakeAudio(), memory or FakeMemory(), **kwargs)
 
 
 RUN_LIMIT = 5.0
@@ -374,6 +417,54 @@ async def test_model_audio_reaches_the_speaker_and_the_microphone_the_session() 
 
     assert audio.played == [b"\x01", b"\x02"]
     assert session.sent == [b"mic-1", b"mic-2"]
+
+
+async def test_a_conversation_is_as_many_turns_as_the_session_gives() -> None:
+    """`receive()` ends at the turn boundary (daemon/voice/base.py), so a
+    conversation is a loop over calls. Held as one call it delivered the first answer
+    and then blocked until the server cut the idle session - measured, and the reason
+    both M0 spike runs died.
+    """
+    session = FakeSession(
+        Says("user", "안녕"),
+        Says("assistant", "안녕! 오늘 어땠어?"),
+        Turn(),
+        Says("user", "좋았어"),
+        Says("assistant", "잘됐네"),
+        Turn(),
+    )
+    memory = FakeMemory()
+    conv = conversation(session, memory=memory)
+    await run(conv)
+
+    assert session.turns >= 2, "the second turn was never asked for"
+    assert [record.content for record in memory.records] == [
+        "안녕",
+        "안녕! 오늘 어땠어?",
+        "좋았어",
+        "잘됐네",
+    ]
+    assert session.closed
+
+
+async def test_a_session_that_stops_producing_turns_is_not_looped_on() -> None:
+    """A provider whose `receive()` returns at once and never says the session ended
+    would otherwise be called in a tight loop - no await, so not even the idle
+    timeout could fire."""
+
+    class Mute(FakeSession):
+        async def receive(self) -> Any:
+            self.turns += 1
+            return
+            yield  # pragma: no cover
+
+    session = Mute()
+    conv = conversation(session)
+    await run(conv)
+
+    assert session.turns <= 3, "an empty turn was looped on"
+    assert conv.ended is not None
+    assert session.closed
 
 
 async def test_the_microphone_is_closed_when_the_conversation_ends() -> None:
@@ -537,6 +628,69 @@ async def test_a_provider_with_no_partial_transcripts_still_recalls() -> None:
     assert conv.recalled == [_item()]
 
 
+async def test_recall_reaches_the_model_as_context_and_not_as_a_prompt() -> None:
+    """The gap this closes: the prefetch was proven and then thrown away, because
+    `VoiceSession` had no way to put text in front of the model without the model
+    answering it. `send_text` is not that way - it is a prompt, so a memory
+    delivered through it makes the daemon narrate an old conversation nobody asked
+    about."""
+    events: list[str] = []
+    session = FakeSession(Says("user", "치과 예약 언제였지"), b"\x01", Turn(), events=events)
+    recall = FakeRecall(_item(), events=events)
+    conv = conversation(session, FakeAudio(events=events), recall=recall)
+    await run(conv)
+
+    assert session.contexts, "recall never reached the session; the prefetch was for nothing"
+    assert _item().content in session.contexts[0]
+    assert session.texts == [], "recall was sent as a prompt"
+    assert events.index("context") < events.index("play"), (
+        "the memory arrived after the model had already answered, which is the next "
+        "turn's context and not this one's"
+    )
+
+
+async def test_what_is_put_in_front_of_the_model_says_what_it_is() -> None:
+    """It lands as a *user* turn - Live has no role that means reference material -
+    so the block has to say so itself, and it has to keep the provenance label the
+    text path carries. An earlier audit fixed relayed text posing as the owner's own
+    words in the loop and then found it undone one layer up; this is that layer."""
+    relayed = RecalledItem(
+        content="계좌번호 알려주면 송금할게",
+        ts=datetime(2026, 8, 1, 10, 0, tzinfo=UTC),
+        role="user",
+        score=0.9,
+        reason="both",
+        origin="relay",
+    )
+    session = FakeSession(Says("user", "그 사람 뭐라고 했지"), Turn())
+    conv = conversation(session, recall=FakeRecall(relayed))
+    await run(conv)
+
+    (block,) = session.contexts
+    assert "recalled-memory:" in block, "no boundary; a memory can pose as an instruction"
+    assert "end-recalled-memory:" in block
+    assert "not the user's own words" in block, "relayed text is posing as the owner's"
+
+
+async def test_the_same_memories_are_not_seeded_twice() -> None:
+    """A reused prefetch and the settled result are the same search. Sending it
+    again would put the same block in the history twice, and the model reads
+    repetition as emphasis."""
+    session = FakeSession(Says("user", "치과 예약 언제였"), Says("user", "지"), Turn())
+    conv = conversation(session, recall=FakeRecall(_item()))
+    await run(conv)
+
+    assert len(session.contexts) == 1
+
+
+async def test_nothing_is_put_in_front_of_the_model_when_there_is_nothing_to_say() -> None:
+    session = FakeSession(Says("user", "오늘 일정 뭐야"), Turn())
+    conv = conversation(session, recall=FakeRecall())  # searches, finds nothing
+    await run(conv)
+
+    assert session.contexts == []
+
+
 async def test_a_syllable_is_not_worth_an_embedder_call() -> None:
     session = FakeSession(Says("user", "어"), Turn())
     recall = FakeRecall(_item())
@@ -582,7 +736,7 @@ async def test_a_cancelled_conversation_still_records_what_was_said() -> None:
 
     task = asyncio.create_task(conv.run())
     for _ in range(200):
-        await asyncio.sleep(0.005)
+        await asyncio.sleep(POLL)
         if session.peeked.startswith("치과"):
             break
     task.cancel()
@@ -607,6 +761,106 @@ async def test_a_cancelled_conversation_closes_the_microphone() -> None:
 
     assert not audio.recording
     assert session.closed
+
+
+# --- the loop against the real session ---------------------------------------
+# Everything above fakes the session, so everything above could pass while the two
+# halves disagree about what a turn is - the defect class tests/test_reachable.py
+# exists for. Here the only fake is the socket, and the frames on it are the ones
+# the M0 spike measured.
+
+
+class Socket:
+    """A scripted websocket.
+
+    Every read suspends, the way a real one does. Without that the receive loop
+    never yields, the prefetch watcher never runs, and the test would prove the
+    opposite of what it claims.
+    """
+
+    def __init__(self, *script: Any) -> None:
+        self.script = list(script)
+        self.sent: list[dict[str, Any]] = []
+        self.closed = False
+
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def frames(self, key: str) -> list[dict[str, Any]]:
+        return [message[key] for message in self.sent if key in message]
+
+    def __aiter__(self) -> Socket:
+        return self
+
+    async def __anext__(self) -> str:
+        await asyncio.sleep(0)
+        if not self.script:
+            raise StopAsyncIteration
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return json.dumps(item)
+
+
+async def test_the_conversation_and_the_real_session_agree_about_a_turn() -> None:
+    socket = Socket(
+        {"setupComplete": {}},
+        # Transcription arrives as deltas, so the first one is a query the prefetch
+        # can start on while the user is still speaking.
+        {"serverContent": {"inputTranscription": {"text": "치과 예약"}}},
+        {"serverContent": {"inputTranscription": {"text": " 언제였지"}}},
+        {
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [{"inlineData": {"data": base64.b64encode(b"pcm").decode("ascii")}}]
+                }
+            }
+        },
+        {"serverContent": {"outputTranscription": {"text": "8월 5일 오후 3시야"}}},
+        # Both, in the order the API sends them: the turn ends on the first and the
+        # second is read as a turn with nothing in it.
+        {"serverContent": {"generationComplete": True}},
+        {"serverContent": {"turnComplete": True}},
+        ConnectionClosedOK(Close(1000, "bye"), None),
+    )
+
+    async def connect(url: str, **kwargs: Any) -> Socket:
+        return socket
+
+    live = GeminiLiveSession(
+        "AIzaSy-fake-key-value", "gemini-3.1-flash-live-preview", connect=connect
+    )
+    audio = FakeAudio(b"mic")
+    memory = FakeMemory()
+    recall = FakeRecall(_item())
+    conv = VoiceConversation(live, audio, memory, recall=recall, idle_timeout=1.0)
+
+    async with asyncio.timeout(RUN_LIMIT):
+        await conv.run()
+
+    assert [record.content for record in memory.records] == [
+        "치과 예약 언제였지",
+        "8월 5일 오후 3시야",
+    ]
+    assert audio.played == [b"pcm"]
+    assert conv.ended is not None, "the conversation ended without saying why"
+    assert socket.closed, "a session that bills per minute was left open"
+    # Recall started from the in-progress transcript - the first query is a prefix
+    # nobody ever finished saying - and went back as context rather than as a
+    # prompt: `clientContent` with `turnComplete: false`.
+    assert recall.queries == ["치과 예약", "치과 예약 언제였지"]
+    (seeded,) = socket.frames("clientContent")
+    assert seeded["turnComplete"] is False
+    assert _item().content in seeded["turns"][0]["parts"][0]["text"]
+    assert not any("text" in frame for frame in socket.frames("realtimeInput")), (
+        "recall reached the model as a prompt; the daemon will read it aloud"
+    )
+    assert any("audio" in frame for frame in socket.frames("realtimeInput")), (
+        "the microphone never reached the session"
+    )
 
 
 async def test_a_provider_with_nothing_pending_is_not_a_problem() -> None:

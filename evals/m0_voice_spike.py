@@ -104,8 +104,11 @@ async def _wrong_key_is_permanent(model: str) -> str:
         async with session:
             return "FAIL: an invalid key was accepted"
     except GeminiLiveError as exc:
+        # No `.status`: GeminiLiveError does not carry one, and reading it raised
+        # an AttributeError from inside this handler - so the one check that was
+        # supposed to report a verdict could only ever report a crash.
         verdict = "ok" if exc.permanent else "FAIL: classified as transient, will retry forever"
-        return f"{verdict} (status={exc.status}, {exc})"
+        return f"{verdict} ({exc})"
     except Exception as exc:  # noqa: BLE001
         return f"FAIL: not normalised to GeminiLiveError - {type(exc).__name__}: {exc}"
 

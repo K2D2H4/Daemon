@@ -81,14 +81,59 @@ DEFAULT_MAX_ATTEMPTS = 4
 here - a voice turn that cannot open should fail and let the caller fall back to
 text, not retry into a per-minute-billed connection forever."""
 
+PARTIAL_BACKLOG = 32
+"""How many unread in-progress transcripts to keep.
+
+Bounded because a caller need not read them at all - a proactive utterance opens
+a session, speaks and closes without ever asking what the user is saying - and an
+unbounded queue nobody drains grows for the length of the session. Dropping the
+oldest costs nothing: each partial is the whole utterance so far, so the newest
+one contains every older one."""
+
 _PERMANENT_STATUS = frozenset({400, 401, 403, 404})
 """Handshake statuses that retrying cannot fix: a bad, revoked or unauthorised
 key, or a wrong endpoint."""
 
-_PERMANENT_CLOSE_CODES = frozenset({1007, 1008})
-"""1008 policy violation is how a rejected or leaked key actually arrives - the
-handshake succeeds and the server closes straight after. 1007 invalid argument
-means our setup JSON is wrong, which is a bug, not weather."""
+_PERMANENT_CLOSE_CODES = frozenset({1007})
+"""1007 invalid argument means our setup JSON is wrong, which is a bug, not
+weather. Measured: hoisting `responseModalities` out of `generationConfig` and
+into the top level of `setup` closes the socket with 1007 "Unknown name"."""
+
+_PERMANENT_CLOSE_REASONS = (
+    # Measured. `gemini-3.1-flash-live-preview` without the `models/` prefix
+    # closes with 1008 "... is not found for API version v1beta". A wrong model id
+    # or API version is config, and no amount of retrying fixes config.
+    "is not found",
+    # Inferred, not measured: the documented text for API_KEY_INVALID, and the
+    # shape a revoked key arrives in. A key the server refuses will be refused
+    # again, and retrying leaves the process alive, healthy-looking and mute.
+    "api key not valid",
+    "api_key_invalid",
+    "reported as leaked",
+)
+"""Substrings that make a 1008 close permanent. Everything else about 1008 is
+treated as weather.
+
+1008 used to be classified permanent on the code alone, which was wrong in the
+direction that costs the most. Measured: an idle session is cut with 1008 "The
+operation was aborted." - a plain idle timeout wearing a policy-violation code.
+Classified permanent, that ends the voice turn with no retry; classified
+transient, a genuinely permanent 1008 costs three retries and 7s of backoff
+before failing with the same message. The asymmetry decides the default."""
+
+
+def _permanent_close(code: int, reason: str) -> bool:
+    """Is this close worth retrying?
+
+    The reason string, not just the code: the two 1008s measured against the live
+    API mean opposite things, and only the reason tells them apart."""
+    if code in _PERMANENT_CLOSE_CODES:
+        return True
+    if code != 1008:
+        return False
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _PERMANENT_CLOSE_REASONS)
+
 
 CA_BUNDLE_ENV = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
 """Where a corporate proxy's own CA bundle is already configured, if it is.
@@ -224,6 +269,16 @@ class GeminiLiveSession:
         # of their own, so completeness is reconstructed here from turn
         # boundaries. See `_decode`.
         self._said: dict[str, list[str]] = {"user": [], "assistant": []}
+        # In-progress user speech, pushed as it arrives for `partial_transcripts`.
+        # A queue rather than a snapshot because the contract is a stream: recall
+        # has to start while the user is still talking, and polling for it would
+        # add up to an interval of silence to every turn.
+        self._partials: asyncio.Queue[Transcript | None] = asyncio.Queue(PARTIAL_BACKLOG)
+        # Set by `_decode` at a turn boundary and cleared by `receive()`, which is
+        # where it ends the iterator. A flag rather than a return value because
+        # `_decode` is a generator: the boundary arrives in the same server event
+        # as the last transcript, and that transcript has to be yielded first.
+        self._turn_over = False
         self._dropping = False
         # Whether the model is mid-generation. `interrupt()` is only allowed to
         # abandon a turn that exists - see `interrupt`.
@@ -278,6 +333,10 @@ class GeminiLiveSession:
 
     async def close(self) -> None:
         ws, self._ws = self._ws, None
+        # Before the socket, and on every exit path including a failed handshake: a
+        # partial-transcript consumer parked on the queue would otherwise outlive
+        # the session it is listening to.
+        self._end_partials()
         for target in self._filtered:
             target.removeFilter(self._log_filter)
         self._filtered = []
@@ -300,6 +359,40 @@ class GeminiLiveSession:
             }
         )
 
+    async def send_context(self, text: str) -> None:
+        """Put text in the model's history without asking it to answer.
+
+        `clientContent` with `turnComplete: false`, measured against the live API
+        rather than inferred from the SDK: the same payload with `turnComplete:
+        true` returned 138 kB of audio and a full transcript, and with `false`
+        returned no audio and no transcript at all. That asymmetry is the whole
+        mechanism - history is seeded and nothing is generated.
+
+        This is the only way recall reaches a voice turn. `send_text` is a prompt,
+        so a memory delivered through it makes the daemon narrate an old
+        conversation the user never asked about.
+
+        Returns as soon as the frame is written. Nothing is awaited afterwards
+        because nothing comes back - a call that waited for a response would hang
+        for as long as the server let the session live.
+        """
+        if not text.strip():
+            logger.debug("gemini-live: nothing to seed; skipping send_context")
+            return
+        await self._send(
+            {
+                "clientContent": {
+                    # `role: "user"` because the two roles Live accepts are "user"
+                    # and "model", and this is not the model's own words. The block
+                    # the caller hands over says what it is - see the recall
+                    # boundary in daemon/loop.py - precisely because the wire has
+                    # no role that means "reference material".
+                    "turns": [{"role": "user", "parts": [{"text": text}]}],
+                    "turnComplete": False,
+                }
+            }
+        )
+
     async def send_text(self, text: str) -> None:
         """Give the model something to say without any user audio.
 
@@ -317,20 +410,35 @@ class GeminiLiveSession:
         await self._send({"realtimeInput": {"text": text}})
 
     async def receive(self) -> AsyncIterator[bytes | Transcript]:
-        """Audio chunks to play, interleaved with completed transcripts.
+        """One turn: audio chunks to play, interleaved with completed transcripts.
 
         Only `final=True` transcripts are ever yielded. Gemini streams
         transcription in fragments - a few syllables at a time - and handing
         those out individually would invite a caller to record half a word as an
         utterance. They are accumulated and released at the turn boundary.
+
+        **Ends at that boundary**, and `ended` stays None when it does: the turn is
+        over, the session is not, and the next turn is the next call. Measured
+        before it ended there - a turn answered in 2.6s, delivered its final
+        transcript, and then this iterator blocked until the server cut the idle
+        session with 1008 "The operation was aborted.". Both spike runs died that
+        way, because `async for` is the only way anyone consumes this.
         """
         ws = self._require_open()
+        # Cleared on the way in, not on the way out: a caller that walks away
+        # mid-flush - `aclose()` between the user's transcript and the assistant's -
+        # leaves the flag set, and the next turn would then end after its first
+        # event with the rest of the answer still on the socket.
+        self._turn_over = False
         closed: GeminiLiveError | None = None
-        self.ended = None
         try:
             async for raw in ws:
                 for item in self._decode(raw):
                     yield item
+                if self._turn_over:
+                    # The turn is over. `ended` is deliberately left alone: nothing
+                    # about the session is.
+                    return
         except ConnectionClosedOK:
             pass
         except ConnectionClosed as exc:
@@ -352,6 +460,9 @@ class GeminiLiveSession:
             if self.going_away
             else "the server closed the stream"
         )
+        # Reaching here means the socket is gone, not the turn, so anyone waiting on
+        # the in-progress transcript is waiting on words that will never arrive.
+        self._end_partials()
         if closed is not None:
             # Raised out here rather than in the handler, so __context__ has no
             # websockets exception to point at - see `_open`.
@@ -391,16 +502,28 @@ class GeminiLiveSession:
         """
         return list(self._flush())
 
-    def partial_transcripts(self) -> list[Transcript]:
-        """A peek at the turn so far, without consuming it.
+    async def partial_transcripts(self) -> AsyncIterator[Transcript]:
+        """The user's utterance as it grows, one item per delta that arrives.
 
-        `final=False`, always: these are deltas, and the flag is what stops a
-        caller recording a syllable as an utterance. Their one purpose is to let
-        recall start embedding while the user is still speaking - the 117 ms
-        round trip is free before the utterance ends and unaffordable after it
-        (docs/PLAN.md 4.3.1).
+        `final=False`, always: the flag is what stops a caller recording a syllable
+        as an utterance. Each item is the whole utterance so far rather than the
+        delta, because the one consumer is recall - it embeds what was said, not
+        what was just added - and because that makes a dropped item free
+        (`PARTIAL_BACKLOG`).
+
+        User only. The assistant's own words are not a query, and the model
+        answering itself is not work that has to start early.
+
+        Ends when the session does, never at a turn boundary: the point of this
+        seam is to be live while `receive()` is yielding nothing (docs/PLAN.md
+        4.3.1 - 117 ms of embedding is free before the utterance ends and is
+        silence after it).
         """
-        return self._snapshot(final=False)
+        while True:
+            partial = await self._partials.get()
+            if partial is None:
+                return
+            yield partial
 
     def _require_open(self) -> Any:
         if self._ws is None:
@@ -573,6 +696,8 @@ class GeminiLiveSession:
             text = (content.get(key) or {}).get("text")
             if isinstance(text, str) and text:
                 self._said[role].append(text)
+                if role == "user":
+                    self._push_partial()
 
         if content.get("generationComplete") or content.get("turnComplete"):
             # An interrupted turn goes interrupted -> turnComplete with no
@@ -584,6 +709,12 @@ class GeminiLiveSession:
             self._dropping = False
             self._generating = False
             yield from self._flush()
+            # Either flag is the boundary. `generationComplete` usually arrives
+            # first and `turnComplete` in the event after it, so a turn that ends
+            # on the former leaves the latter to be read as one more turn that
+            # yields nothing - cheap, and cheaper than guessing which of the two a
+            # given model sends.
+            self._turn_over = True
 
     def _flush(self) -> Iterator[Transcript]:
         """Release the accumulated turn, user first: that is the order it happened
@@ -601,14 +732,29 @@ class GeminiLiveSession:
             if text:
                 yield Transcript(text=text, role=role, final=True)
 
-    def _snapshot(self, *, final: bool) -> list[Transcript]:
-        """The accumulated turn as transcripts, without clearing it."""
-        found: list[Transcript] = []
-        for role in ("user", "assistant"):
-            text = "".join(self._said[role]).strip()
-            if text:
-                found.append(Transcript(text=text, role=role, final=final))
-        return found
+    def _push_partial(self) -> None:
+        """Offer the utterance so far to whoever is listening for it.
+
+        Never blocks and never raises: the socket read loop is what calls this, and
+        a consumer that has stopped reading must not be able to stall the turn.
+        """
+        text = "".join(self._said["user"]).strip()
+        if not text:
+            return
+        self._offer_partial(Transcript(text=text, role="user", final=False))
+
+    def _end_partials(self) -> None:
+        """Close the partial stream so `async for` over it finishes rather than
+        waiting on a session that is gone."""
+        self._offer_partial(None)
+
+    def _offer_partial(self, item: Transcript | None) -> None:
+        while self._partials.full():
+            # Drop the oldest, which the newest already contains in full. Room for
+            # the sentinel matters most of all: without it a consumer would wait
+            # forever on a backlog nobody is reading.
+            self._partials.get_nowait()
+        self._partials.put_nowait(item)
 
     def _closed_error(self, exc: ConnectionClosed) -> GeminiLiveError:
         received = exc.rcvd
@@ -616,7 +762,7 @@ class GeminiLiveSession:
         reason = self._redact(received.reason) if received is not None else ""
         return GeminiLiveError(
             f"connection closed {code}: {reason or 'no reason given'}",
-            permanent=code in _PERMANENT_CLOSE_CODES,
+            permanent=_permanent_close(code, reason),
         )
 
     def _redact(self, text: str) -> str:

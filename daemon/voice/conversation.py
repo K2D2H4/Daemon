@@ -6,19 +6,26 @@ anything else can lose it, and recall never fails a turn. What differs is that i
 voice mode the audio model *is* the brain (docs/PLAN.md 6.5): there is no gateway
 call and no assembled prompt, so the session is the turn.
 
-Three things here are load-bearing rather than incidental:
+Four things here are load-bearing rather than incidental:
 
 1. **Only `final=True` transcripts are recorded.** Gemini streams transcription
    as deltas, so recording anything else would leave single syllables in the log
    as though they were utterances (daemon/voice/base.py).
-2. **Recall is prefetched from partial transcripts.** An embedder round trip is
-   117 ms at p50, ~105 ms of it fixed overhead (docs/PLAN.md 4.3.1) - a cost that
-   is unaffordable after the user stops talking and free while they are still
-   talking. So the search starts on the partial text and the final transcript
-   reuses that result when it covers enough of what was actually said.
+2. **Recall is prefetched from partial transcripts, and delivered from the same
+   place.** An embedder round trip is 117 ms at p50, ~105 ms of it fixed overhead
+   (docs/PLAN.md 4.3.1) - a cost that is unaffordable after the user stops talking
+   and free while they are still talking. So the search starts on the partial text,
+   the final transcript reuses that result when it covers enough of what was
+   actually said, and what came back goes to `send_context` while the user is still
+   mid-sentence: the final transcript only lands after the model has answered, so
+   anything sent then is context for the next turn rather than this one.
 3. **A barge-in does two things or it does nothing.** `session.interrupt()` stops
    the abandoned turn's audio from arriving, `audio.stop_playback()` drops what is
    already queued. Either one alone leaves the daemon talking over the user.
+4. **One `receive()` is one turn, so a conversation is a loop.** `receive()` ends at
+   the turn boundary (daemon/voice/base.py). The single call this replaced delivered
+   the first answer and then blocked until the server cut the idle session with
+   1008 - measured, twice.
 
 The session is opened for one conversation and closed after it, with an idle
 timeout instead of a socket held open between exchanges: Live sessions bill per
@@ -34,9 +41,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 from collections.abc import AsyncIterator
 
 from daemon import clock
+
+# The recall block comes from the text loop, privates included, rather than being
+# rendered again here. It is not formatting: the nonce boundary is what stops a
+# recalled memory posing as an instruction, and `_label` is what stops relayed text
+# posing as the owner's own words - a fix an earlier audit made in the loop and
+# then found undone one layer up. A second copy is a second place for that to
+# happen, and voice is the weaker position to start from: the wire has no role that
+# means "reference material", so the block arrives as a *user* turn.
+from daemon.loop import _label, _one_line, recall_footer, recall_header
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
 from daemon.voice.base import AudioIO, Transcript, VoiceSession
 
@@ -51,9 +68,14 @@ IDLE_TIMEOUT_SECONDS = 30.0
 """How long a session may hear nothing before it is closed. Billing is per
 minute, so silence is spending."""
 
-PREFETCH_INTERVAL_SECONDS = 0.15
-"""How often the in-progress transcript is checked. Just above the 117 ms
-embedder round trip, so a prefetch usually lands before the next check."""
+EMPTY_TURNS_ALLOWED = 1
+"""How many turns in a row may yield nothing before the session is treated as
+over.
+
+One, because one is expected: a turn that ends on `generationComplete` leaves the
+`turnComplete` behind it to be read as an empty turn. Two in a row means
+`receive()` is returning without ever awaiting anything, and looping on that would
+spin the event loop hard enough that even the idle timeout could not fire."""
 
 PREFETCH_MIN_CHARS = 4
 """Below this a query is mostly noise, and one embedder call per syllable buys
@@ -86,7 +108,6 @@ class VoiceConversation:
         recall_limit: int = 6,
         channel: str = VOICE_CHANNEL,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
-        prefetch_interval: float = PREFETCH_INTERVAL_SECONDS,
     ) -> None:
         self._session = session
         self._audio = audio
@@ -95,17 +116,16 @@ class VoiceConversation:
         self._recall_limit = recall_limit
         self._channel = channel
         self._idle_timeout = idle_timeout
-        self._prefetch_interval = prefetch_interval
 
         self.recalled: list[RecalledItem] = []
         """What recall had ready for the last completed utterance.
 
-        Read rather than sent: `VoiceSession` has no way to put text in front of
-        the model without the model answering it - `realtimeInput.text` is a
-        prompt, and `clientContent` (which would seed history silently) is not in
-        the protocol. So the prefetch is proven and exposed here, and the delivery
-        seam is a protocol change, not a workaround. See the report in
-        daemon/voice/base.py on why that file is frozen."""
+        Sent as well as exposed, now that there is a seam for it:
+        `session.send_context` puts it in the model's history without asking for an
+        answer, which `send_text` cannot do - that is a prompt, and a memory
+        delivered through it makes the daemon narrate an old conversation the user
+        never asked about. Still public because it is what a caller inspects to see
+        what the answer was allowed to draw on."""
 
         self.ended: str | None = None
         """Why the conversation finished, for a caller that has to tell "the turn
@@ -115,6 +135,9 @@ class VoiceConversation:
         self.interruptions = 0
         self._playing = False
         self._speculative: tuple[str, asyncio.Task[list[RecalledItem]]] | None = None
+        self._offered: str | None = None
+        """The last block put in front of the model, so a prefetch that is reused
+        rather than redone does not seed the same memories twice."""
 
     async def run(self) -> None:
         """Hold one conversation, then close the session.
@@ -132,9 +155,7 @@ class VoiceConversation:
             pump = asyncio.create_task(
                 self._forward_microphone(session, microphone), name="voice-microphone"
             )
-            watch = asyncio.create_task(
-                self._watch_partials(session), name="voice-prefetch"
-            )
+            watch = asyncio.create_task(self._watch_partials(session), name="voice-prefetch")
             try:
                 await self._receive(session)
             finally:
@@ -155,28 +176,60 @@ class VoiceConversation:
     # --- the two streams ----------------------------------------------------
 
     async def _receive(self, session: VoiceSession) -> None:
-        stream = session.receive()
-        loop = asyncio.get_running_loop()
+        """Take turns until the session ends or the silence does.
+
+        A loop because `receive()` is one turn: it ends at the turn boundary
+        (daemon/voice/base.py), so a conversation is as many calls as there were
+        turns. The single call it replaces is the measured defect - it delivered the
+        first answer and then blocked until the server cut the idle session.
+
+        The idle budget spans the whole conversation rather than each turn: what
+        bills per minute is the session, and the gap between turns is exactly where
+        it is spent on nothing.
+        """
+        empty = 0
         try:
             async with asyncio.timeout(self._idle_timeout) as budget:
-                async for item in stream:
-                    budget.reschedule(loop.time() + self._idle_timeout)
-                    if isinstance(item, bytes):
-                        self._playing = True
-                        await self._audio.play(item)
-                    else:
-                        await self._on_transcript(session, item)
+                while self.ended is None:
+                    if await self._one_turn(session, budget):
+                        empty = 0
+                        continue
+                    empty += 1
+                    if empty > EMPTY_TURNS_ALLOWED and self.ended is None:
+                        self.ended = "the session stopped producing turns"
+                        logger.info("voice: %s", self.ended)
         except TimeoutError:
             self.ended = f"nothing heard for {self._idle_timeout:.0f}s"
             logger.info("voice: %s; closing a session that bills per minute", self.ended)
         finally:
-            await _aclose(stream)
             if self.ended is None:
-                # `getattr` because only the provider knows, and the protocol has
-                # no field for it: a session that ended on `goAway` reads exactly
-                # like one whose turn finished, and a caller that cannot tell them
-                # apart keeps sending audio into a socket that is gone.
-                self.ended = getattr(session, "ended", None) or "the session stream ended"
+                self.ended = "the session stream ended"
+
+    async def _one_turn(self, session: VoiceSession, budget: asyncio.Timeout) -> bool:
+        """One `receive()`. True if anything came out of it.
+
+        Whether the *session* also ended is a separate question and only the
+        provider can answer it - a `goAway` arrives before the session limit and
+        then the stream simply stops, which reads exactly like a turn that
+        finished. `getattr` because that answer is not in the protocol: the three
+        methods this module calls are, `ended` is not.
+        """
+        loop = asyncio.get_running_loop()
+        produced = False
+        stream = session.receive()
+        try:
+            async for item in stream:
+                produced = True
+                budget.reschedule(loop.time() + self._idle_timeout)
+                if isinstance(item, bytes):
+                    self._playing = True
+                    await self._audio.play(item)
+                else:
+                    await self._on_transcript(session, item)
+        finally:
+            await _aclose(stream)
+        self.ended = getattr(session, "ended", None)
+        return produced
 
     async def _forward_microphone(
         self, session: VoiceSession, microphone: AsyncIterator[bytes]
@@ -204,7 +257,7 @@ class VoiceConversation:
         # also the signal that this turn's audio is done.
         self._playing = False
         if transcript.role == "user":
-            await self._settle_recall(transcript.text)
+            await self._settle_recall(session, transcript.text)
         await self._record(transcript)
 
     async def _record(self, transcript: Transcript) -> None:
@@ -236,13 +289,11 @@ class VoiceConversation:
 
         A generator cannot yield from its own `finally`, so a `receive()` cancelled
         mid-turn takes the accumulated transcript with it. The accumulation is
-        therefore drained from outside instead.
+        therefore drained from outside instead - a protocol call, not a hopeful
+        `getattr`: in voice mode the transcript is the only record there is.
         """
-        drain = getattr(session, "pending_transcripts", None)
-        if drain is None:
-            return
         try:
-            for transcript in drain():
+            for transcript in session.pending_transcripts():
                 await self._record(transcript)
         except Exception:
             logger.exception("voice: could not record the unfinished turn")
@@ -256,31 +307,33 @@ class VoiceConversation:
         and the provider's own activity detection is the only thing that knows -
         docs/PLAN.md's reference list is explicit that VAD and endpointing are not
         ours to build.
-        """
-        peek = getattr(session, "partial_transcripts", None)
-        if peek is None:
-            logger.debug(
-                "voice: session %r exposes no partial transcripts; recall will wait "
-                "for the utterance to end and cost the turn a round trip",
-                getattr(session, "name", "?"),
-            )
-            return
-        seen = ""
-        while True:
-            await asyncio.sleep(self._prefetch_interval)
-            said = _role_text(peek(), "user")
-            if said == seen:
-                continue
-            if self._playing and len(said) > len(seen):
-                await self._barge_in(session)
-            seen = said
-            self._prefetch(said)
 
-    def _prefetch(self, query: str) -> None:
+        Pushed, not polled: each item arrives when the provider transcribes another
+        few syllables, so the search starts then rather than up to an interval
+        later, and a barge-in is noticed on the delta that proves it.
+        """
+        seen = ""
+        partials = session.partial_transcripts()
+        try:
+            async for partial in partials:
+                said = partial.text.strip()
+                if said == seen:
+                    continue
+                if self._playing and len(said) > len(seen):
+                    await self._barge_in(session)
+                seen = said
+                self._prefetch(session, said)
+        finally:
+            # Cancelled at the end of every conversation, so the stream is closed
+            # here rather than left to whenever the generator is collected.
+            await _aclose(partials)
+
+    def _prefetch(self, session: VoiceSession, query: str) -> None:
         """Start a search for what has been said so far, if none is running.
 
-        One in flight is enough: it lands in about 117 ms, and replacing it every
-        150 ms would spend a round trip per syllable to arrive at the same answer.
+        One in flight is enough: it lands in about 117 ms, and starting another on
+        every delta would spend a round trip per syllable to arrive at the same
+        answer.
         """
         if self._recall is None or len(query) < PREFETCH_MIN_CHARS:
             return
@@ -288,10 +341,40 @@ class VoiceConversation:
             return
         self._speculative = (
             query,
-            asyncio.create_task(self._search(query), name="voice-recall-prefetch"),
+            asyncio.create_task(self._prepare(session, query), name="voice-recall-prefetch"),
         )
 
-    async def _settle_recall(self, said: str) -> None:
+    async def _prepare(self, session: VoiceSession, query: str) -> list[RecalledItem]:
+        """Search, and put what comes back in front of the model.
+
+        Delivered here - inside the prefetch, while the user is still speaking -
+        because that is the only window where it can reach the answer to *this*
+        question. The final transcript arrives at the turn boundary, and by then the
+        model has already spoken; context that lands then is context for the next
+        turn. The prefetch, at ~117 ms into an utterance, lands before the model
+        starts generating.
+        """
+        items = await self._search(query)
+        await self._offer(session, items)
+        return items
+
+    async def _offer(self, session: VoiceSession, items: list[RecalledItem]) -> None:
+        """Put recalled memory in the model's history without asking for an answer.
+
+        Never fails the turn, for the same reason recall itself does not: in voice
+        mode an exception is silence, and answering with less memory beats not
+        answering.
+        """
+        lines = _recall_lines(items)
+        if not lines or lines == self._offered:
+            return
+        self._offered = lines
+        try:
+            await session.send_context(_delimit(lines))
+        except Exception:
+            logger.exception("voice: recall could not be put in front of the model")
+
+    async def _settle_recall(self, session: VoiceSession, said: str) -> None:
         """Reuse the prefetched search if it was for close enough to this, else
         redo it. Reuse is the whole point - it is what makes recall cost the voice
         turn nothing (docs/PLAN.md 4.3.1)."""
@@ -306,7 +389,10 @@ class VoiceConversation:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-        self.recalled = await self._search(said)
+        # Late for this answer and still worth sending: the utterance the prefetch
+        # missed is the one the user actually made, and its memories are in front of
+        # the model for the next thing they say.
+        self.recalled = await self._prepare(session, said)
 
     async def _search(self, query: str) -> list[RecalledItem]:
         """Lane 1, with the same rule as the text loop: recall never fails a turn.
@@ -347,8 +433,27 @@ class VoiceConversation:
         await self._audio.stop_playback()
 
 
-def _role_text(transcripts: list[Transcript], role: str) -> str:
-    return "".join(t.text for t in transcripts if t.role == role).strip()
+def _recall_lines(items: list[RecalledItem]) -> str:
+    """The recalled memories, one per line, or nothing.
+
+    Separate from the boundary that wraps them because this is what identifies a
+    payload: the nonce is different every time by design, so two blocks carrying the
+    same memories never compare equal.
+    """
+    return "\n".join(
+        f"- {clock.to_iso(item.ts)} {_label(item)}: {_one_line(item.content)}" for item in items
+    )
+
+
+def _delimit(lines: str) -> str:
+    """Wrap the memories in the same boundary the text path uses - see the import.
+
+    The difference is where it lands: Live accepts only "user" and "model" turns, so
+    this arrives as though the user had said it. The header is what corrects that,
+    which is why it is not optional here.
+    """
+    nonce = secrets.token_hex(4)
+    return "\n".join([recall_header(nonce), "", lines, "", recall_footer(nonce)])
 
 
 def _covers(prepared: str, said: str) -> bool:

@@ -16,6 +16,7 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -27,8 +28,13 @@ from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop, ResolveId
 from daemon.memory.base import MemoryWriter, Recall
+from daemon.tasks import Task
 
 logger = logging.getLogger(__name__)
+
+OK = 0
+PROBLEM = 1
+"""Shell exit codes, matching cli.py - `daemon voice` is a command."""
 
 DB_FILENAME = "daemon.sqlite3"
 """Lives inside the data dir. Deleting it must never lose user data - the
@@ -347,6 +353,81 @@ def _build_recall(settings: Settings, store: Any) -> tuple[Recall | None, str, A
     except Exception as exc:
         logger.warning("recall could not be built, continuing without it: %s", exc)
         return None, f"unavailable: {exc}", None
+
+
+async def run_voice(settings: Settings) -> int:
+    """One spoken conversation at this machine, then exit.
+
+    Assembled here rather than inside the daemon's own loop because voice is a
+    thing a person starts, not a thing that happens to them: the session is
+    billed per minute, so holding one open on the chance of being spoken to is
+    pure cost (docs/PLAN.md 6.5). Proactive speech at the machine is the local
+    speaker's job and belongs to M3.
+
+    Returns a shell exit code, because the caller is a CLI command.
+    """
+    from daemon.fs import harden_existing
+    from daemon.memory.reindex import reindex
+    from daemon.memory.store import Store
+    from daemon.memory.writer import FileMemoryWriter
+    from daemon.voice.audio import SoundDeviceAudio
+    from daemon.voice.conversation import VoiceConversation
+    from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
+
+    if not settings.voice_enabled:
+        logger.error("voice is off; set DAEMON_VOICE_ENABLED=true (see `daemon setup`)")
+        return PROBLEM
+    # route_for raises with the specific reason - no voice route in this preset,
+    # voice disabled, no live model id - which is more use than anything this
+    # function could say about it.
+    route = settings.route_for(Task.CHAT_VOICE)
+
+    harden_existing(settings.data_dir)
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    try:
+        reindex(settings.data_dir, store)
+        memory = FileMemoryWriter(settings.data_dir, store)
+        recall, _status, embedder = _build_recall(settings, store)
+        seed = _read_seed(settings.data_dir)
+        audio = SoundDeviceAudio()
+        session = GeminiLiveSession(
+            api_key=settings.gemini_api_key,
+            model=route.model,
+            # The persona is the seed, same as the text path. Without it the model
+            # answers as a generic assistant, which is the one voice PLAN 5 says
+            # this product must not have.
+            system_instruction=seed or None,
+        )
+        conversation = VoiceConversation(
+            session, audio, memory, recall=recall, recall_limit=settings.recall_limit
+        )
+        try:
+            await conversation.run()
+        except GeminiLiveError as exc:
+            logger.error("voice session failed: %s", exc)
+            return PROBLEM
+        finally:
+            with suppress(Exception):
+                await audio.close()
+            if embedder is not None:
+                closer = getattr(embedder, "aclose", None)
+                if closer is not None:
+                    with suppress(Exception):
+                        await closer()
+        if conversation.ended:
+            logger.info("voice session ended: %s", conversation.ended)
+        return OK
+    finally:
+        store.close()
+
+
+def _read_seed(data_dir: Path) -> str:
+    """The human-owned half of the persona. Never written by us (PLAN 5.1)."""
+    path = Path(data_dir) / "persona" / "seed.md"
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def _recall_health(state: Any) -> str:

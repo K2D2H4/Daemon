@@ -40,7 +40,6 @@ PENDING_PROVIDERS: dict[str, str] = {
 }
 
 PENDING_TASKS = {
-    Task.CHAT_VOICE: "M1b - the voice layer exists but nothing assembles it",
     Task.RECALL_ESCALATION: "M1b+ - Lane 2 is specified, Lane 1 ships first",
     Task.PROACTIVE_JUDGE: "M3 - the whole point of M3",
     Task.REFLECTION: "M2",
@@ -48,8 +47,6 @@ PENDING_TASKS = {
 }
 
 PENDING_CLASSES = {
-    "GeminiLiveSession": "M1b - voice is not wired into the loop",
-    "SoundDeviceAudio": "M1b - voice is not wired into the loop",
     "LocalSpeaker": "M3 - proactive speech at the machine (PLAN 6.3)",
 }
 
@@ -59,6 +56,12 @@ WIRED_CLASSES = (
     "MemoryRecall",
     "OllamaEmbedder",
     "Pairing",
+    # Closed when `daemon voice` landed. Both were declared pending while the
+    # voice layer was complete, tested and unreachable - which is the whole
+    # reason this file exists, and this line is what that gap closing looks like.
+    "GeminiLiveSession",
+    "SoundDeviceAudio",
+    "VoiceConversation",
 )
 
 

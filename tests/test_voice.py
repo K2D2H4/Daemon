@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import ssl as ssl_module
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -91,6 +92,22 @@ class FakeConnection:
         return item if isinstance(item, str) else json.dumps(item)
 
 
+class Hanging(FakeConnection):
+    """A connection that delivers its script and then goes quiet, exactly as the
+    real one did: the answer arrives, and nothing after it ever does.
+
+    This is the shape that hung the M0 spike twice. A test whose fake runs out of
+    messages proves nothing about a turn ending, because StopAsyncIteration ends the
+    iterator for it.
+    """
+
+    async def __anext__(self) -> str:
+        if self.scripted:
+            return await super().__anext__()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
 def connector(*connections: Any) -> Any:
     """A stand-in for `websockets.connect`: hands out scripted connections, or
     raises a scripted exception instead of connecting.
@@ -119,8 +136,16 @@ def session(*connections: Any, **kwargs: Any) -> GeminiLiveSession:
 
 
 async def drain(live: GeminiLiveSession) -> list[bytes | Transcript]:
+    """One turn's worth of output. `receive()` ends at the turn boundary, so this
+    returns rather than blocking - and the timeout is what fails the test if that
+    ever stops being true."""
     async with asyncio.timeout(5):
         return [item async for item in live.receive()]
+
+
+async def _collect(stream: AsyncIterator[Transcript], into: list[Transcript]) -> None:
+    async for item in stream:
+        into.append(item)
 
 
 @pytest.fixture(autouse=True)
@@ -264,8 +289,76 @@ async def test_generation_complete_flushes_and_does_not_duplicate_at_turn_comple
     )
     async with session(connection) as live:
         received = await drain(live)
+        # The turn ended on `generationComplete`, so the `turnComplete` behind it
+        # reads as one more turn with nothing in it. Cheaper than guessing which of
+        # the two a given model sends - as long as it stays empty.
+        assert await drain(live) == []
 
     assert [item.text for item in received] == ["다 했어"]
+
+
+# --- the turn boundary -------------------------------------------------------
+# The measured defect. `receive()` delivered the final transcript 2.6 s in and then
+# blocked forever; the server cut the idle session and reported it as close 1008
+# "The operation was aborted." Both M0 spike runs died there, and only when consumed
+# to the end - breaking out after five items hid it completely.
+
+
+async def test_receive_ends_at_turn_complete_rather_than_blocking_forever() -> None:
+    connection = Hanging(
+        SETUP_COMPLETE,
+        said("assistant", "안녕하세요! 반갑습니다. 무슨 재미있는 이야기 있으세요?"),
+        {"serverContent": {"turnComplete": True}},
+    )
+    async with session(connection) as live:
+        try:
+            async with asyncio.timeout(1.0):
+                received = [item async for item in live.receive()]
+        except TimeoutError:
+            pytest.fail(
+                "receive() did not end at turnComplete: `async for` blocked until the "
+                "server aborted the session, which is the M0 spike failure"
+            )
+
+    assert [item.text for item in received] == [
+        "안녕하세요! 반갑습니다. 무슨 재미있는 이야기 있으세요?"
+    ]
+    assert live.ended is None, "the turn ended, not the session; the caller may take another"
+
+
+async def test_receive_ends_at_generation_complete_too() -> None:
+    connection = Hanging(
+        SETUP_COMPLETE,
+        audio_frame(b"\x01"),
+        {"serverContent": {"generationComplete": True}},
+    )
+    async with session(connection) as live:
+        try:
+            async with asyncio.timeout(1.0):
+                assert [item async for item in live.receive()] == [b"\x01"]
+        except TimeoutError:
+            pytest.fail("receive() did not end at generationComplete")
+
+
+async def test_the_next_turn_is_the_next_call_on_the_same_session() -> None:
+    """What the loop above buys: a conversation is turns, and one socket serves all
+    of them - sessions bill per minute, so reopening one per turn would be paying
+    twice for the same minute."""
+    connection = Hanging(
+        SETUP_COMPLETE,
+        said("assistant", "첫 번째"),
+        {"serverContent": {"turnComplete": True}},
+        said("assistant", "두 번째"),
+        {"serverContent": {"turnComplete": True}},
+    )
+    async with session(connection) as live:
+        async with asyncio.timeout(1.0):
+            first = [item async for item in live.receive()]
+            second = [item async for item in live.receive()]
+
+    assert [item.text for item in first] == ["첫 번째"]
+    assert [item.text for item in second] == ["두 번째"]
+    assert live.ended is None
 
 
 async def test_a_dropped_connection_still_yields_what_was_said() -> None:
@@ -329,6 +422,10 @@ async def test_a_session_ending_is_distinguishable_from_a_turn_ending() -> None:
     )
     async with session(connection) as live:
         received = await drain(live)
+        # The turn ended and said nothing about the session, which is the point: the
+        # `goAway` is still ahead, and it arrives in the turn the caller takes next.
+        assert live.ended is None
+        assert await drain(live) == []
 
     assert [item.text for item in received] == ["잠깐만"]
     assert live.going_away
@@ -365,15 +462,6 @@ async def test_a_cancelled_receive_does_not_lose_what_was_said() -> None:
     nor the mirror - and an async generator cannot yield from its own `finally`, so
     the accumulation has to be reachable from outside.
     """
-    forever = asyncio.Event()
-
-    class Hanging(FakeConnection):
-        async def __anext__(self) -> str:
-            if self.scripted:
-                return await super().__anext__()
-            await forever.wait()  # the user has stopped, the turn has not ended
-            raise AssertionError("unreachable")  # pragma: no cover
-
     connection = Hanging(SETUP_COMPLETE, said("user", "치과 예약 언제였지"))
     async with session(connection) as live:
         stream = live.receive()
@@ -414,11 +502,35 @@ async def test_abandoning_the_stream_mid_flush_loses_neither_transcript() -> Non
         ]
 
 
-async def test_partial_transcripts_are_readable_and_never_look_recordable() -> None:
-    """Recall has to start embedding while the user is still talking - 117 ms is
-    free before the utterance ends and unaffordable after it (docs/PLAN.md 4.3.1).
-    The peek is non-destructive and `final=False`, which is what stops it being
-    recorded as an utterance."""
+async def test_a_turn_abandoned_mid_flush_does_not_cut_the_next_one_short() -> None:
+    """Walking away at a boundary leaves the boundary flag set. Read on the way in
+    rather than the way out, or the next turn ends after its first event with the
+    rest of the answer still on the socket."""
+    connection = Hanging(
+        SETUP_COMPLETE,
+        said("user", "질문"),
+        {"serverContent": {"turnComplete": True}},
+        audio_frame(b"\x01"),
+        said("assistant", "대답"),
+        {"serverContent": {"turnComplete": True}},
+    )
+    async with session(connection) as live:
+        stream = live.receive()
+        assert await stream.__anext__() == Transcript(text="질문", role="user", final=True)
+        await stream.aclose()
+
+        async with asyncio.timeout(1.0):
+            assert await drain(live) == [
+                b"\x01",
+                Transcript(text="대답", role="assistant", final=True),
+            ]
+
+
+async def test_partial_transcripts_arrive_while_the_user_is_still_talking() -> None:
+    """Recall has to start embedding before the utterance ends - 117 ms is free
+    while the user is talking and is silence afterwards (docs/PLAN.md 4.3.1). Each
+    item is the utterance so far and `final=False`, which is what stops it being
+    recorded as one."""
     connection = FakeConnection(
         SETUP_COMPLETE,
         said("user", "어제 얘기한"),
@@ -427,17 +539,59 @@ async def test_partial_transcripts_are_readable_and_never_look_recordable() -> N
         {"serverContent": {"turnComplete": True}},
     )
     async with session(connection) as live:
-        stream = live.receive()
-        assert await stream.__anext__() == b"\x01"
+        seen: list[Transcript] = []
+        partials = live.partial_transcripts()
+        watch = asyncio.create_task(_collect(partials, seen))
+        received = await drain(live)
+        await asyncio.sleep(0)
 
-        peeked = live.partial_transcripts()
-        assert peeked == [Transcript(text="어제 얘기한 치과 예약", role="user", final=False)]
-        assert not any(item.final for item in peeked)
-        # A peek must not consume: the turn still has to flush normally.
-        assert live.partial_transcripts() == peeked
-        assert [item async for item in stream] == [
-            Transcript(text="어제 얘기한 치과 예약", role="user", final=True)
+        assert seen == [
+            Transcript(text="어제 얘기한", role="user", final=False),
+            Transcript(text="어제 얘기한 치과 예약", role="user", final=False),
         ]
+        assert not any(item.final for item in seen)
+        # Reading them does not consume the turn: it still flushes normally.
+        assert received == [
+            b"\x01",
+            Transcript(text="어제 얘기한 치과 예약", role="user", final=True),
+        ]
+        watch.cancel()
+        await asyncio.gather(watch, return_exceptions=True)
+
+
+async def test_the_assistants_own_words_are_not_offered_as_partials() -> None:
+    """A partial exists so recall can embed what the user is asking. The model
+    answering itself is not a query, and one that reached the prefetch would search
+    for the daemon's own sentence."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        said("assistant", "여덟 시야"),
+        {"serverContent": {"turnComplete": True}},
+    )
+    async with session(connection) as live:
+        seen: list[Transcript] = []
+        watch = asyncio.create_task(_collect(live.partial_transcripts(), seen))
+        await drain(live)
+        await asyncio.sleep(0)
+
+        assert seen == []
+        watch.cancel()
+        await asyncio.gather(watch, return_exceptions=True)
+
+
+async def test_the_partial_stream_ends_when_the_session_does() -> None:
+    """Otherwise the consumer is a task parked forever on a socket that is gone -
+    the same defect as a `receive()` that never ends, one seam over."""
+    connection = FakeConnection(SETUP_COMPLETE, said("user", "거기"), closed(1011, "internal"))
+    async with session(connection) as live:
+        seen: list[Transcript] = []
+        watch = asyncio.create_task(_collect(live.partial_transcripts(), seen))
+        with pytest.raises(GeminiLiveError):
+            await drain(live)
+
+        async with asyncio.timeout(1.0):
+            await watch  # ends on its own, or this test times out
+        assert [item.text for item in seen] == ["거기"]
 
 
 # --- sending ----------------------------------------------------------------
@@ -467,13 +621,49 @@ async def test_send_text_speaks_without_any_user_audio() -> None:
     assert received == [b"\xaa"]
 
 
-async def test_empty_audio_and_text_are_not_sent() -> None:
+async def test_send_context_seeds_history_without_asking_for_an_answer() -> None:
+    """Measured, and the measurement is the whole design: `clientContent` with
+    `turnComplete: true` came back with 138 kB of audio and a transcript, and the
+    same payload with `false` came back with nothing at all. That is what makes it
+    the only way to hand recall to a voice turn without the daemon reading old
+    conversations aloud."""
+    memory = "[recalled-memory:ab12] 치과 예약은 8월 5일 오후 3시 [end-recalled-memory:ab12]"
+    connection = Hanging(SETUP_COMPLETE)  # the server answers nothing, ever
+    async with session(connection) as live:
+        try:
+            async with asyncio.timeout(1.0):
+                await live.send_context(memory)
+        except TimeoutError:
+            pytest.fail("send_context waited for a response that the protocol never sends")
+
+    (client,) = connection.messages("clientContent")
+    assert client["turnComplete"] is False, "turnComplete: true makes the daemon answer itself"
+    assert client["turns"] == [{"role": "user", "parts": [{"text": memory}]}]
+    # Not the prompt path: `realtimeInput.text` triggers generation.
+    assert connection.messages("realtimeInput") == []
+
+
+async def test_recall_and_a_prompt_do_not_travel_the_same_way() -> None:
+    """Both are text and only one is a request. If they arrived as the same message
+    the daemon would narrate a memory the user never asked about."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection) as live:
+        await live.send_context("어제 치과 얘기를 했다")
+        await live.send_text("자기 전에 물 한 잔 마셔")
+
+    assert len(connection.messages("clientContent")) == 1
+    assert connection.messages("realtimeInput") == [{"text": "자기 전에 물 한 잔 마셔"}]
+
+
+async def test_empty_audio_text_and_context_are_not_sent() -> None:
     connection = FakeConnection(SETUP_COMPLETE)
     async with session(connection) as live:
         await live.send_audio(b"")
         await live.send_text("   ")
+        await live.send_context("  \n ")
 
     assert connection.messages("realtimeInput") == []
+    assert connection.messages("clientContent") == []
 
 
 async def test_korean_text_round_trips_through_a_turn() -> None:
@@ -506,9 +696,11 @@ async def test_interrupt_drops_audio_from_the_abandoned_turn() -> None:
         stream = live.receive()
         assert await stream.__anext__() == b"heard"
         await live.interrupt()
-        # Everything queued behind the interruption is dropped, and the next turn
-        # is heard normally.
-        assert [item async for item in stream] == [b"next turn"]
+        # Everything queued behind the interruption is dropped, and the turn ends
+        # where it would have ended anyway.
+        assert [item async for item in stream] == []
+        # The next turn is the next call, and it is heard normally.
+        assert await drain(live) == [b"next turn"]
 
 
 async def test_interrupting_a_silence_does_not_mute_the_next_answer() -> None:
@@ -600,16 +792,50 @@ async def test_auth_failure_is_raised_immediately_and_never_retried(
 
 
 @pytest.mark.parametrize(
-    ("code", "permanent"),
-    [(1008, True), (1007, True), (1011, False), (1006, False)],
+    ("code", "reason", "permanent"),
+    [
+        # Measured, both of them, against the real API - and 1008 means the opposite
+        # thing in each. Classifying on the code alone got the second one wrong in
+        # the direction that leaves the daemon mute.
+        (1008, f"models/{MODEL} is not found for API version v1beta", True),
+        (1008, "The operation was aborted.", False),
+        (1008, "", False),
+        (1008, "API key not valid. Please pass a valid API key.", True),
+        (1007, 'Unknown name "responseModalities"', True),
+        (1011, "internal error", False),
+        (1006, "", False),
+    ],
 )
-async def test_close_codes_are_classified(code: int, permanent: bool) -> None:
-    connection = FakeConnection(closed(code, "rejected"))
+async def test_close_codes_are_classified_by_code_and_reason(
+    code: int, reason: str, permanent: bool
+) -> None:
+    connection = FakeConnection(closed(code, reason))
     with pytest.raises(GeminiLiveError) as caught:
         async with session(connection, max_attempts=1):
             pass  # pragma: no cover
 
     assert caught.value.permanent is permanent
+
+
+async def test_an_idle_abort_is_retried_and_a_missing_model_is_not(
+    no_real_sleep: list[float],
+) -> None:
+    """The behavioural half of the classification. "The operation was aborted." is
+    an idle timeout wearing a policy-violation code: reconnecting works. A model
+    that is not found is config, and no number of attempts will find it."""
+    with pytest.raises(GeminiLiveError, match="1008"):
+        async with session(closed(1008, "The operation was aborted."), max_attempts=3):
+            pass  # pragma: no cover
+    assert no_real_sleep == [1.0, 2.0], "an idle abort was treated as permanent"
+
+    no_real_sleep.clear()
+    missing = f"models/{MODEL} is not found for API version v1beta"
+    with pytest.raises(GeminiLiveError, match="is not found") as caught:
+        async with session(closed(1008, missing), max_attempts=3):
+            pass  # pragma: no cover
+
+    assert caught.value.permanent
+    assert no_real_sleep == [], "a wrong model id was retried"
 
 
 async def test_backoff_does_not_overflow_after_a_thousand_failures(

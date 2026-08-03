@@ -55,6 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="check configuration, Ollama, data dir and schema")
     sub.add_parser("reindex", help="rebuild the sqlite mirror from the markdown log")
 
+    sub.add_parser("voice", help="hold one spoken conversation at this machine")
+
     pairing = sub.add_parser("pairing", help="see and approve who may talk to Daemon")
     pairing_sub = pairing.add_subparsers(dest="pairing_command", required=True)
     pairing_sub.add_parser("list", help="pending pairing requests and their codes")
@@ -99,6 +101,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         inserted = _reindex(settings)
         print(f"reindexed {inserted} message(s) the mirror was missing")
         return OK
+    if command == "voice":
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+        from daemon.app import run_voice
+
+        return asyncio.run(run_voice(settings))
     if command == "pairing":
         return _pairing(settings, args)
 
