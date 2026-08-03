@@ -18,6 +18,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from daemon.config import OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
@@ -53,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="is the service installed and running")
     sub.add_parser("doctor", help="check configuration, Ollama, data dir and schema")
     sub.add_parser("reindex", help="rebuild the sqlite mirror from the markdown log")
+
+    pairing = sub.add_parser("pairing", help="see and approve who may talk to Daemon")
+    pairing_sub = pairing.add_subparsers(dest="pairing_command", required=True)
+    pairing_sub.add_parser("list", help="pending pairing requests and their codes")
+    approve = pairing_sub.add_parser("approve", help="approve a pairing code")
+    approve.add_argument("code", help="the 8-character code the bot replied with")
     return parser
 
 
@@ -92,6 +99,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         inserted = _reindex(settings)
         print(f"reindexed {inserted} message(s) the mirror was missing")
         return OK
+    if command == "pairing":
+        return _pairing(settings, args)
 
     try:
         if command == "install":
@@ -137,6 +146,47 @@ def _serve(settings: Settings) -> int:
 
     uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
     return OK
+
+
+def _pairing(settings: Settings, args: Any) -> int:
+    """See and approve pairing requests.
+
+    This is the other half of onboarding: the bot hands a stranger a code, and the
+    only place that code can be approved is a terminal on the machine that holds
+    the data. Nothing about approval is reachable from the channel itself, which
+    is what keeps a stranger from approving themselves.
+    """
+    from daemon.app import DB_FILENAME
+    from daemon.channels.pairing import Pairing, PairingError
+    from daemon.channels.telegram import TelegramChannel
+    from daemon.memory.store import Store
+
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    try:
+        pairing = Pairing(store, TelegramChannel.name)
+        if args.pairing_command == "list":
+            requests = pairing.pending()
+            if not requests:
+                print("no pending requests. Message your bot and one appears here.")
+                return OK
+            for request in requests:
+                print(
+                    f"  {request.code}  from id={request.sender_id}  "
+                    f"expires {request.expires_at:%H:%M}"
+                )
+            print(f"\napprove one with: daemon pairing approve {requests[0].code}")
+            return OK
+
+        try:
+            approval = pairing.approve(args.code)
+        except PairingError as exc:
+            print(f"daemon: {exc}", file=sys.stderr)
+            return USAGE
+        who = "owner" if approval.is_owner else "guest"
+        print(f"approved id={approval.sender_id} as {who}. They can talk to Daemon now.")
+        return OK
+    finally:
+        store.close()
 
 
 def _reindex(settings: Settings) -> int:

@@ -219,6 +219,7 @@ def _build_io(settings: Settings) -> _IO:
     TelegramChannel raises on an empty token or an empty allowlist, so those
     checks are deliberately not repeated here.
     """
+    from daemon.channels.pairing import Pairing
     from daemon.channels.telegram import TelegramChannel
     from daemon.fs import harden_existing
     from daemon.memory.reindex import reindex
@@ -236,10 +237,21 @@ def _build_io(settings: Settings) -> _IO:
     # crash between the two writes, or a deleted database. Without this the
     # markdown being the source of truth is a claim nothing acts on.
     reindex(settings.data_dir, store)
+    # Pairing by default: on a first run the env allowlist is empty, and in
+    # `allowlist` mode that refuses to start - correct as a policy, useless as an
+    # onboarding step. The owner's id is captured from their first message
+    # instead of transcribed by hand.
+    pairing = (
+        Pairing(store, TelegramChannel.name)
+        if settings.telegram_dm_policy == "pairing"
+        else None
+    )
     channel = TelegramChannel(
         settings.telegram_bot_token,
         settings.telegram_allowed_user_ids,
         cursor=store,
+        dm_policy=settings.telegram_dm_policy,
+        pairing=pairing,
     )
     recall, recall_status, embedder = _build_recall(settings, store)
     writer = FileMemoryWriter(settings.data_dir, store)

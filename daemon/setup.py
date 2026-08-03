@@ -108,8 +108,8 @@ PRESET_HELP: dict[str, tuple[str, ...]] = {
 GEMINI_STANDARD_KEY_HINT = (
     "This key looks like a Google 'Standard' API key. The Gemini API already "
     "refuses unrestricted Standard keys and will refuse the remaining ones in "
-    "September 2026. Create a new key in AI Studio - keys made there now are "
-    "auth keys, which is what this needs."
+    f"September 2026. Create a new one at {AI_STUDIO_URL} - keys made there now "
+    "are auth keys, which is what this needs."
 )
 
 PAIRING_NOTE = (
@@ -553,9 +553,14 @@ class Wizard:
         preset = self._choose_preset(env, updates)
         voice = self._choose_voice(preset, env, updates)
 
-        merged = {**env, **updates, "DAEMON_PRESET": preset, "DAEMON_VOICE_ENABLED": str(voice)}
+        merged = {
+            **env,
+            **updates,
+            "DAEMON_PRESET": preset,
+            "DAEMON_VOICE_ENABLED": str(voice).lower(),
+        }
         for need in needs_for(merged):
-            value = self._fill(need)
+            value = self._fill(need, merged)
             if value:
                 updates[need.key] = value
 
@@ -617,7 +622,7 @@ class Wizard:
         self.prompt.say()
         return enabled
 
-    def _fill(self, need: Need) -> str:
+    def _fill(self, need: Need, env: Mapping[str, str]) -> str:
         if need.silent:
             return need.default
         self.prompt.say(f"{need.label} ({need.key})")
@@ -641,7 +646,7 @@ class Wizard:
                 self.prompt.say("  This one is required.")
                 continue
 
-            verdict = self._verify(need, value)
+            verdict = self._verify(need, value, env)
             if verdict.ok:
                 if verdict.detail:
                     shown = mask(value) if need.secret else value
@@ -659,7 +664,7 @@ class Wizard:
 
         raise Cancelled(f"{need.key} could not be verified after {MAX_ATTEMPTS} tries")
 
-    def _verify(self, need: Need, value: str) -> Verdict:
+    def _verify(self, need: Need, value: str, env: Mapping[str, str]) -> Verdict:
         """Verify now, so a bad key is a sentence here instead of a broken
         conversation later.
 
@@ -668,7 +673,10 @@ class Wizard:
         the key. An empty detail means "nothing worth printing".
         """
         if need.key == "ANTHROPIC_API_KEY":
-            return self.checks.anthropic(value, _config_default("anthropic_model"))
+            # Their configured model if they have one, so the check is about the
+            # model this install will actually ask for.
+            model = env.get("DAEMON_ANTHROPIC_MODEL") or _config_default("anthropic_model")
+            return self.checks.anthropic(value, model)
         if need.key == "GEMINI_API_KEY":
             return self.checks.gemini(value)
         if need.key == "TELEGRAM_BOT_TOKEN":

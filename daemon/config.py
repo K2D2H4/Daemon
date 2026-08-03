@@ -186,6 +186,12 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
 
+    telegram_dm_policy: str = Field(default="pairing", alias="DAEMON_TELEGRAM_DM_POLICY")
+    """How an unknown sender is handled. `pairing` is the default because the
+    alternative is asking a person to look up their own numeric id in a third bot
+    and paste it into a dotenv - and with `allowlist`, an empty list refuses to
+    start, which is exactly the state a first run is in."""
+
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_allowed_user_ids: tuple[str, ...] = Field(
         default=(), alias="TELEGRAM_ALLOWED_USER_IDS"
