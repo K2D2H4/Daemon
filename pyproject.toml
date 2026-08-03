@@ -29,6 +29,13 @@ voice = [
     # text-only install does not need PortAudio.
     "websockets>=14.0",
     "sounddevice>=0.5",
+    # Declared rather than relied on transitively through httpx, because the voice
+    # session imports it directly. websockets uses ssl.create_default_context(),
+    # which on a python.org framework build has zero CAs unless someone ran
+    # "Install Certificates.command" - measured here: 0 against certifi's 121. So
+    # every such install failed TLS on the first voice turn with an error that
+    # looked like the user's network.
+    "certifi>=2024.0",
 ]
 dev = [
     "pytest>=8.3",
