@@ -1,0 +1,18 @@
+node_modules/
+__pycache__/
+.env
+*.pyc
+.venv/
+dist/
+.DS_Store
+
+# Runtime user data: the markdown source of truth and its sqlite index.
+# Root-anchored on purpose — a bare `memory/` would also swallow the
+# daemon/memory/ source package.
+/data/
+/memory/
+/persona/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
