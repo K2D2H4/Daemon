@@ -43,6 +43,7 @@ def test_offline_preset_routes_everything_local() -> None:
         Task.PROACTIVE_JUDGE: "ollama",
         Task.REFLECTION: "ollama",
         Task.PERSONA_RULE: "ollama",
+        Task.EMBED: "ollama",
     }
 
 
@@ -56,6 +57,7 @@ def test_balanced_preset_keeps_the_proactive_judge_local() -> None:
         Task.PROACTIVE_JUDGE: "ollama",
         Task.REFLECTION: "anthropic",
         Task.PERSONA_RULE: "anthropic",
+        Task.EMBED: "ollama",
     }
 
 
@@ -69,6 +71,7 @@ def test_quality_preset_hosts_the_proactive_judge_too() -> None:
         Task.PROACTIVE_JUDGE: "anthropic",
         Task.REFLECTION: "anthropic",
         Task.PERSONA_RULE: "anthropic",
+        Task.EMBED: "ollama",
     }
 
 

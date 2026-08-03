@@ -94,6 +94,31 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
 END;
 
 -- ---------------------------------------------------------------------------
+-- M1b: vector index for recall
+-- ---------------------------------------------------------------------------
+-- Vectors are stored as raw float32 BLOBs and searched by brute force in numpy,
+-- deliberately *not* through a sqlite extension. Measured on this project's
+-- target machine: 0.18 ms per query over 10k messages, 1.07 ms over 50k - far
+-- inside the voice latency budget at one person's scale. An extension would buy
+-- nothing here and cost portability: this very Python build ships with
+-- enable_load_extension disabled, so sqlite-vec cannot load at all, and the same
+-- failure would hit anyone self-hosting on such a build.
+--
+-- Regenerable like every other index: drop the rows and re-embed from the
+-- markdown. `model` and `dim` are recorded so a model change invalidates only
+-- its own rows instead of silently mixing vector spaces.
+
+CREATE TABLE IF NOT EXISTS embeddings (
+    message_id  INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE,
+    model       TEXT    NOT NULL,
+    dim         INTEGER NOT NULL,
+    vector      BLOB    NOT NULL,   -- float32, L2-normalised
+    created_at  TEXT    NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings (model);
+
+-- ---------------------------------------------------------------------------
 -- M1b/M2: curated memory tier
 -- ---------------------------------------------------------------------------
 -- Small, always injected at session start, gated writes. Body lives in

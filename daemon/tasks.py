@@ -34,3 +34,8 @@ class Task(StrEnum):
 
     PERSONA_RULE = "persona_rule"
     """Weekly: turn accumulated observations into persona rules."""
+
+    EMBED = "embed"
+    """Text -> vector, for recall. Runs on every message and on every recall
+    query, so it sits on the voice latency path and stays local in every preset:
+    a network round trip per turn would cost more than all of Lane 1."""

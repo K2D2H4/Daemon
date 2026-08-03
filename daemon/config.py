@@ -50,6 +50,7 @@ PRESETS: dict[str, dict[Task, str]] = {
         Task.PROACTIVE_JUDGE: OLLAMA,
         Task.REFLECTION: OLLAMA,
         Task.PERSONA_RULE: OLLAMA,
+        Task.EMBED: OLLAMA,
     },
     "balanced": {
         Task.CHAT_TEXT: ANTHROPIC,
@@ -58,6 +59,7 @@ PRESETS: dict[str, dict[Task, str]] = {
         Task.PROACTIVE_JUDGE: OLLAMA,
         Task.REFLECTION: ANTHROPIC,
         Task.PERSONA_RULE: ANTHROPIC,
+        Task.EMBED: OLLAMA,
     },
     "quality": {
         Task.CHAT_TEXT: ANTHROPIC,
@@ -66,6 +68,7 @@ PRESETS: dict[str, dict[Task, str]] = {
         Task.PROACTIVE_JUDGE: ANTHROPIC,
         Task.REFLECTION: ANTHROPIC,
         Task.PERSONA_RULE: ANTHROPIC,
+        Task.EMBED: OLLAMA,
     },
 }
 

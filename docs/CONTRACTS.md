@@ -96,10 +96,28 @@ FROZEN means: do not edit without flagging it first.
 
 ## Milestone scope
 
-Right now we are building **M1a only**:
+M1a is done: a Telegram message gets an answer and the exchange lands in
+`memory/log/YYYY-MM-DD.md`.
 
-> Message it on Telegram, it answers, and the exchange lands in
-> `memory/log/YYYY-MM-DD.md`.
+Now building **M1b**:
 
-No recall, no voice, no reflection, no proactivity. Those tables exist in the
-schema so later milestones need no rewrite — leave them alone for now.
+> It quotes yesterday accurately, it survives a reboot, voice works, and the
+> golden set gives recall a number.
+
+Four pieces, one owner each:
+
+1. **Recall** — Lane 1, `daemon/memory/recall.py`. FTS5 **and** vectors, scored
+   `similarity × recency decay (30d half-life) × importance`. **Zero LLM calls**
+   (an embedder call is fine — local, milliseconds). Vectors are float32 BLOBs in
+   the `embeddings` table, searched brute-force with numpy: no sqlite extension,
+   because this Python build cannot load one and neither can many others.
+2. **Voice** — `daemon/voice/`. Gemini Live first, behind `VoiceSession`.
+   Audio hardware behind `AudioIO` so tests need none. Voice deps live in the
+   `voice` extra.
+3. **Residency** — LaunchAgent / systemd install, so proactivity (M3) has a
+   process to run in after the terminal closes and the machine reboots.
+4. **Golden set** — `evals/`. Recall gets a pass rate that moves when recall
+   changes, so M1b's gate is a number rather than an impression.
+
+Still out of scope: reflection, entity notes, observations, proactivity,
+persona rules. Their tables exist so those milestones need no migration.

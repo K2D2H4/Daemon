@@ -16,9 +16,20 @@ dependencies = [
     "httpx>=0.28",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
+    # Recall's vector search. Brute-force cosine over one person's history:
+    # measured 0.18 ms at 10k messages, 1.07 ms at 50k. Deliberately not a
+    # sqlite extension - this very Python build has enable_load_extension
+    # disabled, so sqlite-vec cannot load, and self-hosters would hit the same.
+    "numpy>=2.0",
 ]
 
 [project.optional-dependencies]
+voice = [
+    # Only needed when DAEMON_VOICE_ENABLED is on. Kept out of the core so a
+    # text-only install does not need PortAudio.
+    "websockets>=14.0",
+    "sounddevice>=0.5",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",

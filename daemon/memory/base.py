@@ -29,6 +29,41 @@ class LoggedMessage:
     external_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RecalledItem:
+    """One thing worth putting back in front of the model."""
+
+    content: str
+    ts: datetime
+    role: str
+    score: float
+    reason: str
+    """Why it surfaced - 'keyword', 'vector', 'both'. Goes in the golden-set
+    report so a recall failure can be attributed instead of guessed at."""
+
+
+@runtime_checkable
+class Recall(Protocol):
+    """Lane 1 (docs/PLAN.md 4.3).
+
+    Hard constraint: **zero LLM calls.** This runs on every turn, including
+    voice turns, where the whole round trip has a sub-second budget. An embedder
+    call for the query is allowed - that is a local model, measured in
+    milliseconds - but nothing that thinks.
+
+    Degrades rather than fails: with no embedder reachable, keyword-only recall
+    is a worse answer than no answer at all, but a raised exception in the middle
+    of a conversation is worse than both.
+    """
+
+    async def search(self, query: str, *, limit: int = 8) -> list[RecalledItem]: ...
+
+    async def index(self, message_id: int, text: str) -> None:
+        """Embed and store one message. Called after it is recorded, and must not
+        make the caller's turn fail if the embedder is down."""
+        ...
+
+
 @runtime_checkable
 class MemoryWriter(Protocol):
     async def record(self, message: LoggedMessage) -> None:

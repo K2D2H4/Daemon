@@ -22,7 +22,7 @@ from daemon.memory.base import LoggedMessage
 from daemon.memory.log import utc_iso
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _INSERT_MESSAGE = """
 INSERT INTO messages
@@ -120,6 +120,7 @@ class Store:
                     self.conn.execute(ddl)
             # The index over external_id is left to schema.sql, which runs next
             # now that the column exists.
+        # v3 adds only new tables, which schema.sql creates on its own.
         self.conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),

@@ -35,6 +35,23 @@ class ProviderError(RuntimeError):
 
 
 @runtime_checkable
+class Embedder(Protocol):
+    """Text -> vector. Separate from `Provider` because the shape is different
+    and because the two are routed independently: chat may be hosted while
+    embeddings stay local.
+
+    Vectors must be returned L2-normalised, so recall can use a dot product and
+    skip the norm per query.
+    """
+
+    name: str
+    dimensions: int
+    model: str
+
+    async def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
+@runtime_checkable
 class Provider(Protocol):
     """A single LLM backend.
 
