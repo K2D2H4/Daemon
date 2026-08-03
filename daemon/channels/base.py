@@ -22,6 +22,11 @@ class InboundMessage:
     """Channel-scoped stable id. Used for the allowlist - never trust display names."""
     received_at: datetime
     channel: str
+    external_id: str | None = None
+    """The channel's own id for this message. Telegram only confirms an update
+    on the *next* getUpdates call, so a restart in between re-delivers it; this
+    is the key that lets a duplicate be recognised before it is appended to the
+    markdown, which is append-only and has nothing to reconcile by."""
     modality: str = "text"
     """'text' or 'voice'. Recorded on memory rows - see schema.sql."""
     authored_by_sender: bool = True
@@ -51,6 +56,19 @@ class OutboundMessage:
     Without it, "who may talk to Daemon" and "who receives everything Daemon
     says" collapse into one list, and widening the first would silently widen
     the second."""
+
+
+@runtime_checkable
+class Cursor(Protocol):
+    """Where a channel's inbound stream got to, across restarts.
+
+    A separate protocol so the channel never imports storage: it is handed
+    something that can remember a number.
+    """
+
+    def load_cursor(self, channel: str) -> int | None: ...
+
+    def save_cursor(self, channel: str, offset: int) -> None: ...
 
 
 @runtime_checkable

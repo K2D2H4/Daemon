@@ -44,13 +44,36 @@ CREATE TABLE IF NOT EXISTS messages (
     channel       TEXT    NOT NULL,
     sender_id     TEXT,
     log_file      TEXT    NOT NULL,   -- relative path of the markdown original
-    recalled      INTEGER NOT NULL DEFAULT 0
+    recalled      INTEGER NOT NULL DEFAULT 0,
                   -- 1 = this row was surfaced by recall. Marked so reflection
                   -- cannot re-extract it and create a self-amplifying loop.
+
+    -- The channel's own id for this message (a Telegram update_id). Telegram
+    -- only confirms an update on the *next* getUpdates, so a restart in that
+    -- window re-delivers it; without a dedup key the append-only markdown would
+    -- gain a duplicate on an ordinary restart, with nothing to reconcile it by.
+    external_id   TEXT,
+
+    -- 1 = provenance was inferred by rebuilding from the markdown, not observed
+    -- when the message arrived. The markdown deliberately carries no provenance
+    -- (it lives in columns so a model cannot forge it), so a rebuild has to
+    -- guess, and reflection must be able to tell a guess from a fact.
+    reindexed     INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages (ts);
 CREATE INDEX IF NOT EXISTS idx_messages_kind ON messages (session_kind, ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_external
+    ON messages (channel, external_id) WHERE external_id IS NOT NULL;
+
+-- Where each channel's inbound stream got to. Written only after a message has
+-- been fully handled: saving on receipt would trade duplicates for silent loss,
+-- and losing what the user said is the worse failure.
+CREATE TABLE IF NOT EXISTS channel_cursor (
+    channel     TEXT    PRIMARY KEY,
+    offset_at   INTEGER NOT NULL,
+    updated_at  TEXT    NOT NULL
+) STRICT;
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5 (
     content,

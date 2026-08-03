@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 
-from daemon.channels.base import InboundMessage, OutboundMessage
+from daemon.channels.base import Cursor, InboundMessage, OutboundMessage
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,8 @@ POLL_TIMEOUT_SECONDS = 30
 
 BACKOFF_START_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
+_BACKOFF_MAX_SHIFT = 6
+"""Caps the doubling at 64s so the exponent cannot overflow."""
 
 
 class TelegramError(Exception):
@@ -45,6 +47,24 @@ class TelegramError(Exception):
     Deliberately not a RuntimeError: listen() treats a bare RuntimeError as
     "the client was closed underneath us", and the two must not be confused.
     """
+
+    def __init__(self, message: str, *, status: int | None = None, retry_after: int | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+    @property
+    def permanent(self) -> bool:
+        """A revoked token, a deleted bot, a bot blocked by the user. Retrying
+        these forever leaves the process alive, healthy-looking, and permanently
+        deaf - the worst possible failure for a companion that is supposed to be
+        listening."""
+        return self.status in (401, 403, 404)
+
+
+class TelegramFatal(RuntimeError):
+    """Raised out of listen() when retrying cannot help. The supervisor should
+    see the daemon die rather than watch it poll a dead token for days."""
 
 
 class _TokenFilter(logging.Filter):
@@ -142,6 +162,7 @@ class TelegramChannel:
         client: httpx.AsyncClient | None = None,
         api_base: str = API_BASE,
         poll_timeout: int = POLL_TIMEOUT_SECONDS,
+        cursor: Cursor | None = None,
     ) -> None:
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN is empty")
@@ -160,7 +181,10 @@ class TelegramChannel:
             # Must outlast the server-side long poll, or every poll looks like a failure.
             timeout=httpx.Timeout(poll_timeout + 10.0, connect=10.0)
         )
-        self._offset: int | None = None
+        self._cursor = cursor
+        # Restored so a restart does not re-receive everything Telegram had not
+        # yet had confirmed - which would append the same turn to the log again.
+        self._offset = cursor.load_cursor(self.name) if cursor is not None else None
         self._closed = False
         self._log_filter = _TokenFilter(token)
         # The token lives in the URL path (Bot API has no other way), and httpx
@@ -176,6 +200,12 @@ class TelegramChannel:
             target.addFilter(self._log_filter)
 
     async def send(self, message: OutboundMessage) -> None:
+        if not message.text.strip():
+            # An empty completion is not rare, and Telegram rejects empty text
+            # with a 400 - which would turn a harmless empty turn into a failed
+            # one, after the empty record was already written to the log.
+            logger.warning("telegram: refusing to send an empty message")
+            return
         keyboard = self._label_keyboard(message)
         parts = _split(message.text)
         # A reply goes only to whoever asked. Falling back to the whole allowlist
@@ -188,13 +218,25 @@ class TelegramChannel:
             targets: list[int] = [int(message.recipient_id)]
         else:
             targets = sorted(self._allowed)
+        failed: list[TelegramError] = []
         for chat_id in targets:
-            for index, part in enumerate(parts):
-                payload: dict[str, Any] = {"chat_id": chat_id, "text": part}
-                # No parse_mode: model output is rendered as plain text, never markup.
-                if keyboard is not None and index == len(parts) - 1:
-                    payload["reply_markup"] = keyboard
-                await self._call("sendMessage", payload)
+            try:
+                for index, part in enumerate(parts):
+                    payload: dict[str, Any] = {"chat_id": chat_id, "text": part}
+                    # No parse_mode: model output is plain text, never markup.
+                    if keyboard is not None and index == len(parts) - 1:
+                        payload["reply_markup"] = keyboard
+                    await self._call("sendMessage", payload)
+            except TelegramError as exc:
+                # One unreachable recipient must not silence the others, and a
+                # part failing mid-way must be visible: loop.handle already wrote
+                # the full text to the log, so silently delivering half of it
+                # would leave the log claiming words the user never saw.
+                logger.error("telegram: send to %s failed after %d part(s): %s",
+                             chat_id, index, exc)
+                failed.append(exc)
+        if failed and len(failed) == len(targets):
+            raise failed[0]
 
     async def listen(self) -> AsyncIterator[InboundMessage]:
         failures = 0
@@ -211,9 +253,27 @@ class TelegramChannel:
             except TelegramError as exc:
                 if self._closed:
                     return
+                if exc.permanent:
+                    raise TelegramFatal(f"telegram rejected us permanently: {exc}") from None
                 failures += 1
-                delay = min(BACKOFF_START_SECONDS * 2 ** (failures - 1), BACKOFF_MAX_SECONDS)
-                logger.warning("telegram: %s; retrying in %.1fs", exc, delay)
+                # Clamp the *exponent*, not just the result. min() bounded the
+                # delay but 2 ** (failures - 1) kept growing, so a long outage -
+                # about 17 hours at the 60s ceiling - overflowed float and threw
+                # OverflowError from inside this handler, killing the generator
+                # and the daemon's whole inbound path exactly when the network
+                # came back.
+                delay = min(
+                    BACKOFF_START_SECONDS * 2 ** min(failures - 1, _BACKOFF_MAX_SHIFT),
+                    BACKOFF_MAX_SECONDS,
+                )
+                if exc.retry_after:
+                    delay = max(delay, float(exc.retry_after))
+                if exc.status == 409:
+                    # Two instances are polling the same bot. Backing off quietly
+                    # would hide a misconfiguration that never resolves itself.
+                    logger.error("telegram: conflict, another instance is polling: %s", exc)
+                else:
+                    logger.warning("telegram: %s; retrying in %.1fs", exc, delay)
                 await _sleep(delay)
                 continue
             except RuntimeError:
@@ -229,8 +289,20 @@ class TelegramChannel:
                     # same update is never handed to us twice.
                     self._offset = update_id + 1
                 inbound = self._to_inbound(update)
-                if inbound is not None:
-                    yield inbound
+                if inbound is None:
+                    # Nothing to hand over, so it is finished: confirm it now.
+                    self._save_cursor()
+                    continue
+                yield inbound
+                # Only now, after the consumer has come back from the yield and
+                # the turn is on disk. Saving before would trade duplicates for
+                # silently losing what the user said, which is the worse half of
+                # the trade.
+                self._save_cursor()
+
+    def _save_cursor(self) -> None:
+        if self._cursor is not None and self._offset is not None:
+            self._cursor.save_cursor(self.name, self._offset)
 
     async def close(self) -> None:
         self._closed = True
@@ -281,9 +353,11 @@ class TelegramChannel:
         # under an allowlisted `from.id`, and vouching for those as the owner's
         # own would launder injected text into origin='owner'.
         relayed = any(message.get(key) for key in ("forward_origin", "forward_from", "via_bot"))
+        update_id = update.get("update_id")
         return InboundMessage(
             text=text,
             sender_id=str(sender_id),
+            external_id=str(update_id) if isinstance(update_id, int) else None,
             received_at=received_at,
             channel=self.name,
             authored_by_sender=not relayed,
@@ -308,10 +382,22 @@ class TelegramChannel:
         if detail is not None:
             raise TelegramError(f"{method} failed: {detail}")
         if response.status_code != 200:
-            raise TelegramError(f"{method} returned HTTP {response.status_code}")
+            retry_after = None
+            try:
+                retry_after = (response.json().get("parameters") or {}).get("retry_after")
+            except ValueError:
+                pass  # not every error response is JSON
+            raise TelegramError(
+                f"{method} returned HTTP {response.status_code}",
+                status=response.status_code,
+                retry_after=retry_after if isinstance(retry_after, int) else None,
+            )
         body = response.json()
         if not body.get("ok"):
-            raise TelegramError(f"{method} rejected: {self._redact(str(body.get('description')))}")
+            raise TelegramError(
+                f"{method} rejected: {self._redact(str(body.get('description')))}",
+                status=body.get("error_code") if isinstance(body.get("error_code"), int) else None,
+            )
         return body.get("result")
 
     def _redact(self, text: str) -> str:

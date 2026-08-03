@@ -61,6 +61,20 @@ class ConversationLoop:
                     logger.exception("could not deliver the failure notice")
 
     async def handle(self, inbound: InboundMessage) -> None:
+        if inbound.external_id is not None and await self._memory.seen(
+            inbound.channel, inbound.external_id
+        ):
+            # A restart can land between handling a message and the channel
+            # confirming it, so the same message arrives twice. The markdown is
+            # append-only, so the duplicate has to be refused here rather than
+            # reconciled later - and answering twice is its own annoyance.
+            logger.info(
+                "skipping already-handled message channel=%s id=%s",
+                inbound.channel,
+                inbound.external_id,
+            )
+            return
+
         session_kind = "voice" if inbound.modality == "voice" else "interactive"
 
         # Recorded before the model is called: if the process dies mid-call the
@@ -79,6 +93,7 @@ class ConversationLoop:
                 modality=inbound.modality,
                 channel=inbound.channel,
                 sender_id=inbound.sender_id,
+                external_id=inbound.external_id,
             )
         )
 

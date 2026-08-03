@@ -36,6 +36,11 @@ class FakeMemory:
     async def record(self, message: LoggedMessage) -> None:
         self.records.append(message)
 
+    async def seen(self, channel: str, external_id: str) -> bool:
+        return any(
+            r.channel == channel and r.external_id == external_id for r in self.records
+        )
+
     async def recent(self, limit: int = 20) -> list[LoggedMessage]:
         return self.records[-limit:]
 

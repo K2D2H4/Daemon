@@ -152,6 +152,7 @@ def _build_io(settings: Settings) -> tuple[Channel, MemoryWriter, Callable[[], N
     """
     from daemon.channels.telegram import TelegramChannel
     from daemon.fs import harden_existing
+    from daemon.memory.reindex import reindex
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
 
@@ -159,8 +160,18 @@ def _build_io(settings: Settings) -> tuple[Channel, MemoryWriter, Callable[[], N
     # conversation logs, and new writes alone would not fix the old files.
     harden_existing(settings.data_dir)
 
-    channel = TelegramChannel(settings.telegram_bot_token, settings.telegram_allowed_user_ids)
+    # Built before the channel: the channel takes the cursor from it, so a
+    # restart does not re-receive and re-answer what it already handled.
     store = Store.open(settings.data_dir / DB_FILENAME)
+    # Repairs a mirror that fell behind its markdown - a failed mirror write, a
+    # crash between the two writes, or a deleted database. Without this the
+    # markdown being the source of truth is a claim nothing acts on.
+    reindex(settings.data_dir, store)
+    channel = TelegramChannel(
+        settings.telegram_bot_token,
+        settings.telegram_allowed_user_ids,
+        cursor=store,
+    )
     return channel, FileMemoryWriter(settings.data_dir, store), store.close
 
 

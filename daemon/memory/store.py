@@ -22,12 +22,13 @@ from daemon.memory.base import LoggedMessage
 from daemon.memory.log import utc_iso
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _INSERT_MESSAGE = """
 INSERT INTO messages
-    (ts, role, content, origin, session_kind, modality, channel, sender_id, log_file)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (ts, role, content, origin, session_kind, modality, channel, sender_id, log_file,
+     external_id, reindexed)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -68,25 +69,109 @@ class Store:
 
     def apply_schema(self) -> None:
         """Idempotent: schema.sql is all `IF NOT EXISTS`, so this also serves as
-        the rebuild path after the sqlite file has been thrown away."""
+        the rebuild path after the sqlite file has been thrown away.
+
+        `IF NOT EXISTS` is also why an existing file needs explicit migration: a
+        table that is already there is skipped, so a column added later would
+        never appear. And a file written by a *newer* version has to be refused
+        rather than opened optimistically - recording the version without ever
+        comparing it would let new code write into an old shape and believe it
+        was current.
+        """
+        found = self.schema_version()
+        if found is not None and found > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema is v{found}, this build understands v{SCHEMA_VERSION}. "
+                "Refusing to open it: markdown under memory/ is the source of truth, "
+                "so a newer file is safer to leave alone than to write into."
+            )
+        # Migrate *before* running schema.sql, not after: schema.sql creates an
+        # index over external_id, and on a pre-existing table that column does
+        # not exist yet, so the whole script would fail before the ALTER ran.
+        if found is not None and found < SCHEMA_VERSION:
+            self._migrate(found)
         self.conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         # WAL is durable in the file header, but foreign_keys is per-connection,
         # so the PRAGMA inside schema.sql only covers the connection that ran it.
         self.conn.execute("PRAGMA foreign_keys = ON")
-        if self.schema_version() is None:
+        # Default 5s: with a second writer on the file (a backup tool, the sqlite
+        # CLI, a stray instance) a single insert would block the whole event loop
+        # for that long, stalling the inbound poll with it.
+        self.conn.execute("PRAGMA busy_timeout = 300")
+        if found is None:
             self.conn.execute(
                 "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
                 (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),
             )
             self.conn.commit()
 
+    def _migrate(self, found: int) -> None:
+        """Bring an older file up to SCHEMA_VERSION, additively."""
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages)")}
+        if found < 2:
+            for column, ddl in (
+                ("external_id", "ALTER TABLE messages ADD COLUMN external_id TEXT"),
+                (
+                    "reindexed",
+                    "ALTER TABLE messages ADD COLUMN reindexed INTEGER NOT NULL DEFAULT 0",
+                ),
+            ):
+                if column not in existing:
+                    self.conn.execute(ddl)
+            # The index over external_id is left to schema.sql, which runs next
+            # now that the column exists.
+        self.conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),
+        )
+        self.conn.commit()
+
+    # --- channel cursor -----------------------------------------------------
+
+    def load_cursor(self, channel: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT offset_at FROM channel_cursor WHERE channel = ?", (channel,)
+        ).fetchone()
+        return None if row is None else int(row["offset_at"])
+
+    def save_cursor(self, channel: str, offset: int) -> None:
+        self.conn.execute(
+            "INSERT INTO channel_cursor (channel, offset_at, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (channel) DO UPDATE SET offset_at = excluded.offset_at, "
+            "updated_at = excluded.updated_at",
+            (channel, offset, utc_iso(datetime.now(UTC))),
+        )
+        self.conn.commit()
+
+    def seen_external(self, channel: str, external_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM messages WHERE channel = ? AND external_id = ? LIMIT 1",
+            (channel, external_id),
+        ).fetchone()
+        return row is not None
+
     def schema_version(self) -> int | None:
+        """None for a database that has no version recorded yet - including a
+        brand new file, where the table itself does not exist so the version has
+        to be read before schema.sql has had a chance to create it."""
+        exists = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone()
+        if exists is None:
+            return None
         row = self.conn.execute("SELECT MAX(version) AS version FROM schema_version").fetchone()
         return None if row["version"] is None else int(row["version"])
 
     # --- messages -----------------------------------------------------------
 
-    def insert_message(self, message: LoggedMessage, *, log_file: str) -> int:
+    def insert_message(
+        self,
+        message: LoggedMessage,
+        *,
+        log_file: str,
+        external_id: str | None = None,
+        reindexed: bool = False,
+    ) -> int:
         """Mirror one already-written markdown record. `log_file` points back at
         the original so a row can always be traced to the file it came from."""
         cursor = self.conn.execute(
@@ -101,10 +186,20 @@ class Store:
                 message.channel,
                 message.sender_id,
                 log_file,
+                external_id,
+                1 if reindexed else 0,
             ),
         )
         self.conn.commit()
         return int(cursor.lastrowid or 0)
+
+    def count_for_log_file(self, log_file: str) -> int:
+        """How many rows this markdown file has been mirrored into. The log is
+        append-only, so the mirror being short always means a missing tail."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE log_file = ?", (log_file,)
+        ).fetchone()
+        return int(row["n"])
 
     def recent(self, limit: int = 20) -> list[sqlite3.Row]:
         """The last `limit` messages, oldest first - i.e. in reading order, ready

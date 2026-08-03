@@ -43,8 +43,11 @@ writer.py) to keep the markdown and the sqlite mirror byte-identical.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
+import os
 import re
+import weakref
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -92,7 +95,13 @@ def from_iso(value: str) -> datetime:
 
 
 def _as_utc(ts: datetime) -> datetime:
-    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
+    if ts.tzinfo is None:
+        # Read as UTC, but say so: a caller passing datetime.now() in KST is off
+        # by nine hours, lands in the wrong day's file, and the markdown records
+        # that silently and permanently.
+        logger.warning("log: naive timestamp %s read as UTC; pass an aware datetime", ts)
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
 
 
 # --- paths ------------------------------------------------------------------
@@ -117,6 +126,22 @@ def log_path(data_dir: Path, ts: datetime) -> Path:
 def render(message: LoggedMessage) -> str:
     """One record, newline-terminated."""
     return f"## {utc_iso(message.ts)} {message.role}\n{_escape(message.content)}\n"
+
+
+def read(path: Path) -> list[LogRecord]:
+    """Read a day's log, surviving a torn tail.
+
+    Decoding is why this helper exists rather than callers using read_text: a
+    write cut mid-record (SIGKILL, ENOSPC, a record over the 8KiB buffer) can
+    split a UTF-8 sequence, and strict decoding then raises for the *whole file*
+    - losing a day of conversation because one record lost its tail. With
+    replacement the damage stays inside the record that was cut, and parse()
+    drops it. The markdown is the source of truth, so there is nothing else to
+    fall back on.
+    """
+    if not path.exists():
+        return []
+    return parse(path.read_bytes().decode("utf-8", errors="replace"))
 
 
 def parse(text: str) -> list[LogRecord]:
@@ -182,15 +207,29 @@ def _unescape(body: str) -> str:
 
 # --- appending --------------------------------------------------------------
 
-_locks: dict[Path, asyncio.Lock] = {}
+_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]]
+_locks = weakref.WeakKeyDictionary()
 
 
 def _lock_for(path: Path) -> asyncio.Lock:
-    """One lock per log file. Single process, single event loop, so a plain dict
-    is enough: there is no await between the lookup and the insert."""
-    lock = _locks.get(path)
+    """One lock per log file, per event loop.
+
+    Keyed by the running loop because an asyncio.Lock binds to the loop it first
+    contends on: a module-level dict outlives the loop, so a second asyncio.run
+    would reuse a lock tied to the dead one - which raises, and worse, leaves it
+    latched so every later append to that path fails. Weak keys let a finished
+    loop's locks go.
+
+    Keyed by the resolved path because Path equality is textual: `data/x`,
+    `/Users/...` vs `/users/...` on case-insensitive APFS, and `a/../b` are three
+    keys for one file, which would silently defeat the serialisation.
+    """
+    loop = asyncio.get_running_loop()
+    per_loop = _locks.setdefault(loop, {})
+    key = str(path.resolve())
+    lock = per_loop.get(key)
     if lock is None:
-        lock = _locks.setdefault(path, asyncio.Lock())
+        lock = per_loop.setdefault(key, asyncio.Lock())
     return lock
 
 
@@ -207,6 +246,37 @@ def _append_blocking(path: Path, record: str, date_header: str) -> None:
     # Owner-only: these are the user's verbatim private conversations, and the
     # default of 0o644 under a 022 umask hands them to every local account.
     secure_dir(path.parent)
-    header = f"# {date_header}\n" if not path.exists() else ""
+    is_new = not path.exists()
     with open_private_append(path) as fh:
+        # The asyncio lock only covers this process. Two instances - overlapping
+        # systemd restarts, a stray second copy, a backfill script - both see
+        # path.exists() as False and both write the date header, and the extra
+        # heading is absorbed into the previous record's body, so the markdown
+        # and the sqlite mirror stop agreeing. O_APPEND makes a single write
+        # under 8KiB atomic but nothing larger.
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        header = f"# {date_header}\n" if is_new and path.stat().st_size == 0 else ""
         fh.write(f"{header}\n{record}")
+        # The mirror is fsynced on every commit (WAL with synchronous=FULL), so
+        # without this the source of truth is *less* durable than its own index:
+        # a power loss inside the page-cache window leaves a row in sqlite whose
+        # record is missing from the markdown. Writing the markdown first would
+        # be call order only, not persistence order.
+        fh.flush()
+        os.fsync(fh.fileno())
+    if is_new:
+        # The file's own fsync does not promise its directory entry survives.
+        _fsync_dir(path.parent)
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)

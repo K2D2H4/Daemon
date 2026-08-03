@@ -34,7 +34,12 @@ class FileMemoryWriter:
         # a mirror nobody can verify.
         message = replace(message, content=message.content.strip())
         log_file = await log.append(self._data_dir, message)
-        self._store.insert_message(message, log_file=log_file)
+        self._store.insert_message(
+            message, log_file=log_file, external_id=message.external_id
+        )
+
+    async def seen(self, channel: str, external_id: str) -> bool:
+        return self._store.seen_external(channel, external_id)
 
     async def recent(self, limit: int = 20) -> list[LoggedMessage]:
         return [_from_row(row) for row in self._store.recent(limit)]

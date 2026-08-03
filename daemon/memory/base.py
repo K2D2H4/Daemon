@@ -26,6 +26,7 @@ class LoggedMessage:
     modality: Modality
     channel: str
     sender_id: str | None = None
+    external_id: str | None = None
 
 
 @runtime_checkable
@@ -34,6 +35,14 @@ class MemoryWriter(Protocol):
         """Append to the markdown log first, then mirror into sqlite.
 
         Must be safe to call concurrently for the same day's log file.
+        """
+        ...
+
+    async def seen(self, channel: str, external_id: str) -> bool:
+        """Has this channel message already been recorded?
+
+        The markdown is append-only, so a duplicate has to be caught before the
+        write rather than reconciled after it.
         """
         ...
 
