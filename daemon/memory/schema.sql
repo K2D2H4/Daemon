@@ -94,6 +94,42 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
 END;
 
 -- ---------------------------------------------------------------------------
+-- Onboarding: channel pairing
+-- ---------------------------------------------------------------------------
+-- How the owner's channel id gets known without anyone copying a numeric id by
+-- hand. An unknown sender's first DM is dropped and answered with a short code;
+-- the owner approves that code from the terminal, and the id is captured from
+-- the message rather than typed.
+--
+-- The shape follows OpenClaw's, which has the security details already worked
+-- out: 8 uppercase characters with the ambiguous ones (0O1I) left out, roughly an
+-- hour of validity, one code per sender per hour, and at most a few pending
+-- requests at a time so the code cannot be guessed by volume. Approval is
+-- per-sender and grants nothing else.
+--
+-- Unlike everything else in this file these rows are NOT rebuildable from the
+-- markdown: they are the allowlist. Losing them means pairing again, which is
+-- recoverable, so the file stays a rebuildable index in spirit.
+
+CREATE TABLE IF NOT EXISTS channel_pairing (
+    channel     TEXT    NOT NULL,
+    sender_id   TEXT    NOT NULL,
+    code        TEXT,                -- NULL once approved; the code is spent
+    state       TEXT    NOT NULL CHECK (state IN ('pending', 'approved')),
+    created_at  TEXT    NOT NULL,
+    expires_at  TEXT,                -- pending only
+    approved_at TEXT,
+    -- The first approval bootstraps the owner. Recorded so it can only happen
+    -- once: later approvals add a guest, they do not hand over ownership.
+    is_owner    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (channel, sender_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_pairing_pending ON channel_pairing (channel, state, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pairing_code
+    ON channel_pairing (channel, code) WHERE code IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
 -- M1b: vector index for recall
 -- ---------------------------------------------------------------------------
 -- Vectors are stored as raw float32 BLOBs and searched by brute force in numpy,

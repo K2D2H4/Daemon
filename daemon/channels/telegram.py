@@ -9,6 +9,16 @@ Anyone can message a Telegram bot, so the numeric allowlist below is the only
 thing standing between a stranger and the user's companion - it is the point of
 this module, not a detail. Presence-based routing between this channel and the
 local speaker lands later (docs/PLAN.md 6.3); this module knows nothing about it.
+
+How that allowlist gets populated is `dm_policy`:
+
+  * `allowlist` - ids come from configuration, and an empty list is a
+    misconfiguration worth refusing to start over.
+  * `pairing` - an unknown sender is answered with a code the owner approves from
+    their terminal (`channels/pairing.py`), so nobody transcribes a numeric id by
+    hand. Here an empty list is the *normal* first-run state: no owner yet.
+
+Either way the decision is made on the numeric id alone.
 """
 
 from __future__ import annotations
@@ -17,12 +27,14 @@ import asyncio
 import logging
 import re
 from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from daemon.channels.base import Cursor, InboundMessage, OutboundMessage
+from daemon.channels.pairing import DENY, Pairing
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +51,19 @@ BACKOFF_START_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
 _BACKOFF_MAX_SHIFT = 6
 """Caps the doubling at 64s so the exponent cannot overflow."""
+
+DM_POLICIES = ("allowlist", "pairing")
+"""What to do with a DM from an id that is not configured. See the module docstring."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PairingNotice:
+    """A code to send back instead of handling the message. Returned out of
+    `_to_inbound` so the sender is screened in one pass, before the message body
+    is ever looked at, let alone logged."""
+
+    recipient_id: str
+    text: str
 
 
 class TelegramError(Exception):
@@ -159,6 +184,8 @@ class TelegramChannel:
         token: str,
         allowed_user_ids: Iterable[int | str] | str,
         *,
+        dm_policy: str = "allowlist",
+        pairing: Pairing | None = None,
         client: httpx.AsyncClient | None = None,
         api_base: str = API_BASE,
         poll_timeout: int = POLL_TIMEOUT_SECONDS,
@@ -166,14 +193,29 @@ class TelegramChannel:
     ) -> None:
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN is empty")
+        if dm_policy not in DM_POLICIES:
+            raise ValueError(
+                f"unknown dm_policy {dm_policy!r}; expected one of {', '.join(DM_POLICIES)}"
+            )
         allowed = _parse_user_ids(allowed_user_ids)
-        if not allowed:
+        if dm_policy == "pairing":
+            if pairing is None:
+                raise ValueError(
+                    "dm_policy='pairing' needs a Pairing instance; without one every "
+                    "unknown sender would be dropped with no way to ever be approved."
+                )
+        elif not allowed:
+            # Under `pairing` an empty list means "no owner yet", which is the
+            # first run. Under `allowlist` it can only mean the configuration is
+            # wrong, and defaulting to allow-all would let anyone who finds the
+            # bot talk to it.
             raise ValueError(
                 "TELEGRAM_ALLOWED_USER_IDS is empty; refusing to start. "
                 "Defaulting to allow-all would let anyone who finds the bot talk to it."
             )
         self._token = token
         self._allowed = allowed
+        self._pairing = pairing if dm_policy == "pairing" else None
         self._api_base = api_base.rstrip("/")
         self._poll_timeout = poll_timeout
         self._owns_client = client is None
@@ -218,6 +260,13 @@ class TelegramChannel:
             targets: list[int] = [int(message.recipient_id)]
         else:
             targets = sorted(self._allowed)
+        if not targets:
+            # Reachable only under dm_policy='pairing' before anyone is approved,
+            # and only for an unaddressed message. Said out loud rather than
+            # dropped quietly: an utterance that goes nowhere looks identical to
+            # one that was never generated.
+            logger.error("telegram: no configured recipient for an unaddressed message")
+            return
         failed: list[TelegramError] = []
         for chat_id in targets:
             try:
@@ -293,12 +342,33 @@ class TelegramChannel:
                     # Nothing to hand over, so it is finished: confirm it now.
                     self._save_cursor()
                     continue
+                if isinstance(inbound, _PairingNotice):
+                    # An unknown sender: the message itself is dropped, and only a
+                    # code goes back. Still finished, so the cursor advances.
+                    await self._send_pairing_notice(inbound)
+                    self._save_cursor()
+                    continue
                 yield inbound
                 # Only now, after the consumer has come back from the yield and
                 # the turn is on disk. Saving before would trade duplicates for
                 # silently losing what the user said, which is the worse half of
                 # the trade.
                 self._save_cursor()
+
+    async def _send_pairing_notice(self, notice: _PairingNotice) -> None:
+        try:
+            await self.send(OutboundMessage(text=notice.text, recipient_id=notice.recipient_id))
+        except TelegramError as exc:
+            # A stranger who messages and then blocks the bot makes this
+            # sendMessage fail with a permanent error. Letting that out of
+            # listen() would hand anyone a two-message kill switch for the
+            # daemon's whole inbound path. The code stays stored, so they also do
+            # not earn a fresh one by retrying.
+            logger.warning(
+                "telegram: could not deliver a pairing code to id=%s: %s",
+                notice.recipient_id,
+                exc,
+            )
 
     def _save_cursor(self) -> None:
         if self._cursor is not None and self._offset is not None:
@@ -330,7 +400,7 @@ class TelegramChannel:
             ]
         }
 
-    def _to_inbound(self, update: dict[str, Any]) -> InboundMessage | None:
+    def _to_inbound(self, update: dict[str, Any]) -> InboundMessage | _PairingNotice | None:
         message = update.get("message")
         if not isinstance(message, dict):
             return None  # edits, channel posts, callback queries: not M1a
@@ -339,9 +409,18 @@ class TelegramChannel:
             logger.warning("telegram: update %s has no numeric sender id", update.get("update_id"))
             return None
         if sender_id not in self._allowed:
-            # Log who tried; never the message body.
-            logger.warning("telegram: dropped message from non-allowlisted sender id=%d", sender_id)
-            return None
+            # Screened on the numeric id alone, and before the text is read: a
+            # display name or username saying "4242" proves nothing, and a
+            # stranger's words must not reach the log even as a dropped record.
+            decision = DENY if self._pairing is None else self._pairing.screen(str(sender_id))
+            if not decision.allowed:
+                # Log who tried; never the message body.
+                logger.warning(
+                    "telegram: dropped message from non-allowlisted sender id=%d", sender_id
+                )
+                if decision.notice is None:
+                    return None
+                return _PairingNotice(recipient_id=str(sender_id), text=decision.notice)
         text = message.get("text")
         if not isinstance(text, str) or not text:
             logger.info("telegram: ignoring non-text message from id=%d", sender_id)

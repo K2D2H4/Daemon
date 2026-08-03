@@ -29,7 +29,7 @@ from daemon.memory.log import utc_iso
 logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _INSERT_MESSAGE = """
 INSERT INTO messages
@@ -127,7 +127,7 @@ class Store:
                     self.conn.execute(ddl)
             # The index over external_id is left to schema.sql, which runs next
             # now that the column exists.
-        # v3 adds only new tables, which schema.sql creates on its own.
+        # v3 and v4 add only new tables, which schema.sql creates on its own.
         self.conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),
@@ -150,6 +150,120 @@ class Store:
             (channel, offset, utc_iso(datetime.now(UTC))),
         )
         self.conn.commit()
+
+    # --- channel pairing ----------------------------------------------------
+    # The one thing in this file that is NOT rebuildable from the markdown: these
+    # rows *are* the allowlist (schema.sql). Losing them costs a pairing round,
+    # not user data, which is why the file is still an index in spirit.
+    #
+    # Every timestamp here is written with `utc_iso` and every comparison happens
+    # against a value written the same way. That is load-bearing: mixing it with
+    # a millisecond form would break the lexicographic ordering the expiry DELETE
+    # relies on, since '.' sorts before 'Z'.
+
+    def is_allowed(self, channel: str, sender_id: str) -> bool:
+        """Whether this sender has been approved. Numeric id only - the caller
+        must never pass a username or display name (see channels/base.py)."""
+        row = self.conn.execute(
+            "SELECT 1 FROM channel_pairing "
+            "WHERE channel = ? AND sender_id = ? AND state = 'approved' LIMIT 1",
+            (channel, sender_id),
+        ).fetchone()
+        return row is not None
+
+    def has_owner(self, channel: str) -> bool:
+        """Whether first-run onboarding is over for this channel.
+
+        Distinguishes "nobody has ever been approved" from "an owner exists and
+        this is a guest request", which is what lets the pending cap be generous
+        exactly once - see channels/pairing.BOOTSTRAP_MAX_PENDING.
+        """
+        row = self.conn.execute(
+            "SELECT 1 FROM channel_pairing WHERE channel = ? AND is_owner = 1 LIMIT 1",
+            (channel,),
+        ).fetchone()
+        return row is not None
+
+    def create_pairing(
+        self,
+        channel: str,
+        sender_id: str,
+        code: str,
+        *,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> bool:
+        """Record a pending request. False when the code collided with a live one
+        (or the sender already has a row), so the caller can retry with a new code
+        instead of an IntegrityError escaping into the inbound poll loop."""
+        try:
+            self.conn.execute(
+                "INSERT INTO channel_pairing "
+                "(channel, sender_id, code, state, created_at, expires_at) "
+                "VALUES (?, ?, ?, 'pending', ?, ?)",
+                (channel, sender_id, code, utc_iso(created_at), utc_iso(expires_at)),
+            )
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            return False
+        self.conn.commit()
+        return True
+
+    def pairing_by_code(self, channel: str, code: str) -> sqlite3.Row | None:
+        """The pending row holding this code. Scoped by channel, and approved rows
+        have their code cleared, so a spent code matches nothing."""
+        return self.conn.execute(
+            "SELECT * FROM channel_pairing WHERE channel = ? AND code = ?",
+            (channel, code),
+        ).fetchone()
+
+    def pending_pairings(self, channel: str) -> list[sqlite3.Row]:
+        """Requests awaiting approval, oldest first. Includes rows whose deadline
+        has passed - call `expire_pairings` first."""
+        return self.conn.execute(
+            "SELECT * FROM channel_pairing WHERE channel = ? AND state = 'pending' "
+            "ORDER BY created_at, sender_id",
+            (channel,),
+        ).fetchall()
+
+    def approve_pairing(
+        self, channel: str, sender_id: str, *, approved_at: datetime
+    ) -> bool | None:
+        """Approve a pending sender permanently. Returns whether this approval
+        bootstrapped the owner, or None if there was nothing pending to approve.
+
+        The owner check and the write are one transaction: two approvals racing on
+        a "is there an owner yet" read would otherwise both see none and mint two
+        owners. `code` is cleared so it cannot be replayed.
+        """
+        with self.conn:  # commit on success, roll back on error
+            owned = self.conn.execute(
+                "SELECT 1 FROM channel_pairing WHERE channel = ? AND is_owner = 1 LIMIT 1",
+                (channel,),
+            ).fetchone()
+            is_owner = owned is None
+            cursor = self.conn.execute(
+                "UPDATE channel_pairing SET state = 'approved', code = NULL, expires_at = NULL, "
+                "approved_at = ?, is_owner = ? WHERE channel = ? AND sender_id = ? "
+                "AND state = 'pending'",
+                (utc_iso(approved_at), 1 if is_owner else 0, channel, sender_id),
+            )
+        return is_owner if cursor.rowcount else None
+
+    def expire_pairings(self, channel: str, *, now: datetime) -> int:
+        """Delete pending requests whose deadline has passed, returning how many.
+
+        Deleting rather than flagging: `state` admits only 'pending'/'approved'
+        (schema.sql is frozen), and a row that is gone is what lets the caller
+        read "a row exists" as "this sender has already been sent a code".
+        """
+        cursor = self.conn.execute(
+            "DELETE FROM channel_pairing WHERE channel = ? AND state = 'pending' "
+            "AND expires_at IS NOT NULL AND expires_at <= ?",
+            (channel, utc_iso(now)),
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     def seen_external(self, channel: str, external_id: str) -> bool:
         row = self.conn.execute(

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 from typing import Any
 
 import httpx
@@ -15,7 +16,13 @@ import pytest
 
 from daemon.channels import telegram
 from daemon.channels.base import Channel, OutboundMessage
+from daemon.channels.pairing import MAX_PENDING, Pairing
 from daemon.channels.telegram import TelegramChannel, TelegramError
+from daemon.clock import now as _clock_now
+from daemon.memory.store import Store
+
+OWNER_AT = _clock_now()
+"""Any instant; this owner is bootstrapped directly, not through a live code."""
 
 TOKEN = "123456:AAHfake-token-value"  # fake shape; no test may need a real one
 OWNER = 4242
@@ -80,6 +87,19 @@ def channel(api: FakeAPI, allowed: Any = (OWNER,)) -> TelegramChannel:
     return TelegramChannel(TOKEN, allowed, client=api.client(), poll_timeout=0)
 
 
+def paired(api: FakeAPI, store: Store, allowed: Any = ()) -> TelegramChannel:
+    """A channel under dm_policy='pairing'. `allowed` is empty by default: that is
+    the first run, before anyone has been approved."""
+    return TelegramChannel(
+        TOKEN,
+        allowed,
+        dm_policy="pairing",
+        pairing=Pairing(store, "telegram"),
+        client=api.client(),
+        poll_timeout=0,
+    )
+
+
 async def drain(ch: TelegramChannel) -> list[Any]:
     """Consume listen() until the fake API runs out of scripted steps."""
     received = []
@@ -137,6 +157,25 @@ def test_empty_allowlist_refuses_to_start() -> None:
     for empty in ([], (), "", "   "):
         with pytest.raises(ValueError, match="refusing to start"):
             TelegramChannel(TOKEN, empty)
+
+
+def test_empty_allowlist_still_refuses_under_the_allowlist_policy(db: sqlite3.Connection) -> None:
+    """Regression: having a Pairing available must not quietly relax the policy
+    that was explicitly asked for."""
+    with pytest.raises(ValueError, match="refusing to start"):
+        TelegramChannel(
+            TOKEN, [], dm_policy="allowlist", pairing=Pairing(Store(db), "telegram")
+        )
+
+
+def test_unknown_dm_policy_is_rejected() -> None:
+    with pytest.raises(ValueError, match="unknown dm_policy"):
+        TelegramChannel(TOKEN, [OWNER], dm_policy="open")
+
+
+def test_pairing_policy_without_a_pairing_is_rejected() -> None:
+    with pytest.raises(ValueError, match="needs a Pairing"):
+        TelegramChannel(TOKEN, [OWNER], dm_policy="pairing")
 
 
 def test_non_numeric_allowlist_entry_is_rejected() -> None:
@@ -338,6 +377,152 @@ async def test_non_text_message_is_ignored() -> None:
     voice["message"]["voice"] = {"file_id": "abc", "duration": 3}
 
     assert await drain(channel(FakeAPI([voice]))) == []
+
+
+# --- dm_policy='pairing' -----------------------------------------------------
+
+
+async def test_an_unknown_sender_is_answered_with_a_code_and_still_not_heard(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = Store(db)
+    api = FakeAPI([message_update(1, sender_id=STRANGER, text="hi, who are you?")])
+    with caplog.at_level(logging.DEBUG):
+        received = await drain(paired(api, store))
+
+    assert received == []  # the message is dropped, not handled
+    (payload,) = api.payloads("sendMessage")
+    assert payload["chat_id"] == STRANGER  # only to them, never to the allowlist
+    (request,) = Pairing(store, "telegram").pending()
+    assert request.code in payload["text"]
+    assert str(STRANGER) in caplog.text  # we want to know someone knocked
+    assert "hi, who are you?" not in caplog.text  # but not what they said
+    assert request.code not in caplog.text  # the code's only copy goes to them
+
+
+async def test_the_same_sender_is_not_sent_a_second_code(db: sqlite3.Connection) -> None:
+    api = FakeAPI(
+        [
+            message_update(1, sender_id=STRANGER, text="hello?"),
+            message_update(2, sender_id=STRANGER, text="hello??"),
+        ],
+        [message_update(3, sender_id=STRANGER, text="anyone there")],
+    )
+    await drain(paired(api, Store(db)))
+
+    assert len(api.payloads("sendMessage")) == 1
+
+
+async def test_a_fourth_pending_stranger_is_ignored(db: sqlite3.Connection) -> None:
+    """The pending cap is what stops a code being guessed by volume - once there
+    is an owner. Before that, first-run onboarding gets a wider ceiling so the
+    owner cannot be crowded out (see pairing.BOOTSTRAP_MAX_PENDING)."""
+    store = Store(db)
+    store.create_pairing(
+        "telegram", "4242", code="OWNERCOD", created_at=OWNER_AT, expires_at=OWNER_AT
+    )
+    store.approve_pairing("telegram", "4242", approved_at=OWNER_AT)
+
+    api = FakeAPI(
+        [message_update(n, sender_id=9000 + n, text="let me in") for n in range(1, 6)]
+    )
+    await drain(paired(api, store))
+
+    assert len(api.payloads("sendMessage")) == MAX_PENDING
+    # Dropped updates still advance the offset, or they are re-fetched forever.
+    assert api.payloads("getUpdates")[-1]["offset"] == 6
+
+
+async def test_an_approved_sender_is_heard_and_never_paired_again(
+    db: sqlite3.Connection,
+) -> None:
+    store = Store(db)
+    first_api = FakeAPI([message_update(1, sender_id=STRANGER, text="hello?")])
+    await drain(paired(first_api, store))
+
+    pairing = Pairing(store, "telegram")
+    (request,) = pairing.pending()
+    assert pairing.approve(request.code).is_owner is True  # first approval = owner
+
+    second_api = FakeAPI([message_update(2, sender_id=STRANGER, text="hello again")])
+    received = await drain(paired(second_api, store))
+
+    assert [m.text for m in received] == ["hello again"]
+    assert [m.sender_id for m in received] == [str(STRANGER)]
+    assert second_api.payloads("sendMessage") == []  # no second pairing notice
+
+
+async def test_a_second_approval_adds_a_guest_without_handing_over_ownership(
+    db: sqlite3.Connection,
+) -> None:
+    store = Store(db)
+    api = FakeAPI(
+        [
+            message_update(1, sender_id=OWNER, text="hi"),
+            message_update(2, sender_id=STRANGER, text="hi"),
+        ]
+    )
+    await drain(paired(api, store))
+
+    pairing = Pairing(store, "telegram")
+    codes = {r.sender_id: r.code for r in pairing.pending()}
+    assert pairing.approve(codes[str(OWNER)]).is_owner is True
+    assert pairing.approve(codes[str(STRANGER)]).is_owner is False
+
+
+async def test_the_static_allowlist_still_works_under_pairing(db: sqlite3.Connection) -> None:
+    api = FakeAPI([message_update(1, sender_id=OWNER, text="hi")])
+    received = await drain(paired(api, Store(db), allowed=(OWNER,)))
+
+    assert [m.text for m in received] == ["hi"]
+    assert api.payloads("sendMessage") == []
+
+
+async def test_a_stranger_who_blocks_the_bot_cannot_kill_the_inbound_loop(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Delivering the notice fails for anyone who messages and then blocks. If
+    that escaped listen(), two messages would be a kill switch for the daemon."""
+    leaky_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
+    class BlockedAPI(FakeAPI):
+        def _handle(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("sendMessage"):
+                self.requests.append(("sendMessage", json.loads(request.content)))
+                raise httpx.ConnectError(f"blocked: {leaky_url}", request=request)
+            return super()._handle(request)
+
+    api = BlockedAPI(
+        [message_update(1, sender_id=STRANGER, text="hi")],
+        [message_update(2, sender_id=OWNER, text="still here")],
+    )
+    with caplog.at_level(logging.DEBUG):
+        received = await drain(paired(api, Store(db), allowed=(OWNER,)))
+
+    assert [m.text for m in received] == ["still here"]
+    assert TOKEN not in caplog.text  # the notice path redacts like every other
+
+
+async def test_the_pairing_notice_round_trips_korean(db: sqlite3.Connection) -> None:
+    api = FakeAPI([message_update(1, sender_id=STRANGER, text="누구세요?")])
+    await drain(paired(api, Store(db)))
+
+    text = api.payloads("sendMessage")[0]["text"]
+    assert "오너에게 전달하면" in text
+    assert "누구세요?" not in text  # nothing the stranger wrote is quoted back
+
+
+async def test_an_unaddressed_message_with_nobody_approved_is_not_sent(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Proactivity (M3) before pairing has happened. Loud rather than silent: an
+    utterance that goes nowhere is indistinguishable from one never generated."""
+    api = FakeAPI()
+    with caplog.at_level(logging.ERROR):
+        await paired(api, Store(db)).send(OutboundMessage(text="thinking of you"))
+
+    assert api.payloads("sendMessage") == []
+    assert "no configured recipient" in caplog.text
 
 
 async def test_token_never_appears_in_logs(caplog: pytest.LogCaptureFixture) -> None:

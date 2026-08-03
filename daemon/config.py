@@ -74,6 +74,13 @@ PRESETS: dict[str, dict[Task, str]] = {
 }
 
 
+ENV_FILE = ".env"
+"""The one file credentials live in. The service unit deliberately carries no
+secrets and only points at the directory holding this file (daemon/service.py),
+which is also why `daemon setup` writes here and reads nothing from the shell
+environment: launchd and systemd would not have it."""
+
+
 SERVICE_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 """The label becomes both a launchd job name and a filename under
 `~/Library/LaunchAgents`, so it is validated rather than trusted: a label
@@ -82,6 +89,26 @@ containing `/` or `..` would write the plist somewhere else entirely."""
 
 class ConfigError(RuntimeError):
     """Bad configuration. Raised at startup, never mid-conversation."""
+
+
+def providers_for(preset: str, *, voice_enabled: bool) -> list[str]:
+    """Providers a preset actually needs, so onboarding asks for those keys only.
+
+    Voice tasks are excluded while voice is off - the same rule as
+    `Settings.active_tasks`. That is what lets a text-only `balanced` install be
+    set up without a hosted voice key (docs/PLAN.md 6.5).
+    """
+    if preset not in PRESETS:
+        raise ConfigError(
+            f"unknown preset {preset!r}; expected one of {', '.join(sorted(PRESETS))}"
+        )
+    return sorted(
+        {
+            provider
+            for task, provider in PRESETS[preset].items()
+            if voice_enabled or task not in VOICE_TASKS
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +127,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,

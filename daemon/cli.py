@@ -35,6 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="run the daemon in the foreground (what the service supervises)")
+    setup = sub.add_parser(
+        "setup", help="first-run onboarding: pick a preset, verify keys, write .env"
+    )
+    setup.add_argument(
+        "--check",
+        action="store_true",
+        help="report what is missing and exit; asks nothing, contacts nobody",
+    )
     install = sub.add_parser("install", help="install the OS service so it survives a reboot")
     install.add_argument(
         "--force",
@@ -62,6 +70,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Doctor is the one command that must survive a configuration it cannot
         # load - explaining the breakage is its whole job.
         return _doctor()
+    if command == "setup":
+        # Same reason, more so: setup exists for the machine that has no usable
+        # configuration yet, so it must not require one to start.
+        return _setup(check_only=args.check)
 
     try:
         settings = Settings()
@@ -110,6 +122,12 @@ def service_for(settings: Settings) -> Service:
         working_dir=Path.cwd(),
         log_dir=settings.data_dir / "logs",
     )
+
+
+def _setup(*, check_only: bool) -> int:
+    from daemon.setup import run
+
+    return run(check_only=check_only)
 
 
 def _serve(settings: Settings) -> int:
