@@ -52,6 +52,16 @@ class OllamaProvider:
             "model": model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
             "stream": False,
+            # No `think` parameter on purpose. Measured on qwen3:4b: `think:
+            # false` does not stop a reasoning model from reasoning, it stops
+            # Ollama from *separating* the reasoning - so the chain of thought
+            # lands in `content` and becomes the reply ("Okay, the user asked
+            # ... which translates to"). Faster (11.8 s vs 24.3 s) and useless.
+            # `think: "low"` was slower still, and Qwen3's own `/no_think`
+            # suffix does not survive Ollama's template. Leaving it unset keeps
+            # the thinking in its own field where it is discarded, and the reply
+            # clean. The real fix for latency is not to use a reasoning model
+            # for conversation - see .env.example.
         }
         if options:
             payload["options"] = options
