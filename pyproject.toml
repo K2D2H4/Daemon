@@ -1,5 +1,10 @@
 [project]
-name = "daemon"
+# The product is "Daemon"; the distributable is "daemon-ai" because `daemon` is
+# long taken on PyPI and npm and collides with the unix sense of the word.
+# The import package stays `daemon`. `heydaemon` is held in reserve - it is free
+# on both registries and unused on GitHub - if a distinct wake word is ever
+# wanted for voice.
+name = "daemon-ai"
 version = "0.0.1"
 description = "An open-source, self-hosted AI companion that you shape - and that reshapes itself around you."
 requires-python = ">=3.13"
