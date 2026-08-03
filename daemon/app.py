@@ -151,8 +151,13 @@ def _build_io(settings: Settings) -> tuple[Channel, MemoryWriter, Callable[[], N
     checks are deliberately not repeated here.
     """
     from daemon.channels.telegram import TelegramChannel
+    from daemon.fs import harden_existing
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
+
+    # Installs created before permissions were pinned still hold world-readable
+    # conversation logs, and new writes alone would not fix the old files.
+    harden_existing(settings.data_dir)
 
     channel = TelegramChannel(settings.telegram_bot_token, settings.telegram_allowed_user_ids)
     store = Store.open(settings.data_dir / DB_FILENAME)

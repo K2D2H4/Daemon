@@ -17,6 +17,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from daemon.fs import secure_dir, secure_file
 from daemon.memory.base import LoggedMessage
 from daemon.memory.log import utc_iso
 
@@ -50,9 +51,14 @@ class Store:
     @classmethod
     def open(cls, path: Path) -> Store:
         """Connect, creating and migrating the file if needed."""
-        path.parent.mkdir(parents=True, exist_ok=True)
+        secure_dir(path.parent)
         store = cls(sqlite3.connect(path))
         store.apply_schema()
+        # sqlite creates the db, -wal and -shm itself, so they have to be
+        # tightened after the fact. -wal holds recent rows in the clear, so
+        # leaving it readable would defeat locking down the db alone.
+        for suffix in ("", "-wal", "-shm"):
+            secure_file(path.with_name(path.name + suffix))
         return store
 
     def close(self) -> None:

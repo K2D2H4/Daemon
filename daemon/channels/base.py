@@ -24,6 +24,15 @@ class InboundMessage:
     channel: str
     modality: str = "text"
     """'text' or 'voice'. Recorded on memory rows - see schema.sql."""
+    authored_by_sender: bool = True
+    """False when an allowlisted sender relayed someone else's words - a
+    forwarded message, an inline-bot result, a quoted third party.
+
+    Without this the channel would launder untrusted text into `origin='owner'`:
+    a stranger sends the user a prompt injection, the user forwards it asking
+    "what is this?", and the schema's forgery-proof origin column records it as
+    something the user said. Reflection then learns it as fact. The channel
+    still does not interpret the text - it only refuses to vouch for it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +43,14 @@ class OutboundMessage:
     controls so the label clock can start (docs/PLAN.md 8.3)."""
     utterance_id: str | None = None
     """Set when labelable, so a label can be attributed back."""
+    recipient_id: str | None = None
+    """Who this is for. A conversational reply names the sender it answers;
+    None means an unsolicited utterance with no request to answer (proactivity),
+    which the channel delivers to its configured owner.
+
+    Without it, "who may talk to Daemon" and "who receives everything Daemon
+    says" collapse into one list, and widening the first would silently widen
+    the second."""
 
 
 @runtime_checkable

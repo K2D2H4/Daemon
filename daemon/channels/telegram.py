@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator, Iterable
 from datetime import UTC, datetime
 from typing import Any
@@ -28,6 +29,8 @@ logger = logging.getLogger(__name__)
 API_BASE = "https://api.telegram.org"
 MAX_TEXT_LEN = 4096
 """Telegram's hard limit on sendMessage text."""
+
+_ASCII_DIGITS = re.compile(r"[0-9]+")
 
 POLL_TIMEOUT_SECONDS = 30
 """Server-side long-poll window; getUpdates returns early when updates exist."""
@@ -73,17 +76,36 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+def _received_at(date: Any) -> datetime:
+    """Telegram's timestamp, or now if it is unusable.
+
+    `isinstance(date, int)` is not a range check - Python ints are unbounded and
+    fromtimestamp raises OverflowError past the platform limit. Telegram sets
+    this field so it should always be sane, but this runs inside listen()'s
+    loop, where an unhandled exception ends the generator and kills the daemon's
+    entire inbound path. A wrong timestamp is worth far less than the loop.
+    """
+    if isinstance(date, int):
+        try:
+            return datetime.fromtimestamp(date, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            logger.warning("telegram: unusable message date, falling back to now")
+    return datetime.now(UTC)
+
+
 def _parse_user_ids(raw: Iterable[int | str] | str) -> frozenset[int]:
     """Numeric ids only. Usernames and display names are user-changeable."""
     items = raw.replace(",", " ").split() if isinstance(raw, str) else raw
     ids = set()
     for item in items:
-        try:
-            ids.add(int(str(item).strip()))
-        except ValueError:
-            raise ValueError(
-                f"TELEGRAM_ALLOWED_USER_IDS must be numeric ids, got {item!r}"
-            ) from None
+        text = str(item).strip()
+        # Not int(): it also accepts '+42', '4_2' and unicode decimal digits like
+        # '٤٢'. Nothing remote reaches here, but a typo silently allowlisting a
+        # *different* account is the failure that matters. Telegram user ids are
+        # always positive ASCII integers.
+        if not _ASCII_DIGITS.fullmatch(text):
+            raise ValueError(f"TELEGRAM_ALLOWED_USER_IDS must be numeric ids, got {item!r}")
+        ids.add(int(text))
     return frozenset(ids)
 
 
@@ -141,15 +163,32 @@ class TelegramChannel:
         self._offset: int | None = None
         self._closed = False
         self._log_filter = _TokenFilter(token)
-        logging.getLogger("httpx").addFilter(self._log_filter)
+        # The token lives in the URL path (Bot API has no other way), and httpx
+        # logs the full request URL at INFO. A filter on the "httpx" logger only
+        # covers records that logger creates: logging runs the *originating*
+        # logger's filters, never an ancestor's, so a child logger such as
+        # httpx._client would bypass it entirely - and httpx is unpinned, so one
+        # minor release moving the logger silently returns the token to the log.
+        # Handler-level scrubbing is the only placement that cannot be bypassed.
+        self._filtered: list[logging.Logger | logging.Handler] = [logging.getLogger("httpx")]
+        self._filtered.extend(logging.getLogger().handlers)
+        for target in self._filtered:
+            target.addFilter(self._log_filter)
 
     async def send(self, message: OutboundMessage) -> None:
         keyboard = self._label_keyboard(message)
         parts = _split(message.text)
-        # OutboundMessage carries no recipient, so the allowlist *is* the audience.
-        # Stateless on purpose: proactive utterances (M3) must be deliverable
-        # before any inbound message has arrived.
-        for chat_id in sorted(self._allowed):
+        # A reply goes only to whoever asked. Falling back to the whole allowlist
+        # would mean adding someone so they *can* talk to Daemon also signs them
+        # up to receive every answer to the owner and every proactive utterance.
+        # An unaddressed message (proactivity, before any inbound exists) still
+        # goes to the allowlist, which for the intended single-user install is
+        # exactly the owner.
+        if message.recipient_id is not None:
+            targets: list[int] = [int(message.recipient_id)]
+        else:
+            targets = sorted(self._allowed)
+        for chat_id in targets:
             for index, part in enumerate(parts):
                 payload: dict[str, Any] = {"chat_id": chat_id, "text": part}
                 # No parse_mode: model output is rendered as plain text, never markup.
@@ -195,7 +234,8 @@ class TelegramChannel:
 
     async def close(self) -> None:
         self._closed = True
-        logging.getLogger("httpx").removeFilter(self._log_filter)
+        for target in self._filtered:
+            target.removeFilter(self._log_filter)
         if self._owns_client:
             await self._client.aclose()
 
@@ -234,23 +274,39 @@ class TelegramChannel:
         if not isinstance(text, str) or not text:
             logger.info("telegram: ignoring non-text message from id=%d", sender_id)
             return None
-        date = message.get("date")
-        received_at = (
-            datetime.fromtimestamp(date, tz=UTC) if isinstance(date, int) else datetime.now(UTC)
-        )
+        received_at = _received_at(message.get("date"))
         # Text is passed through verbatim - untrusted data, never a command.
+        # But record whether the sender actually wrote it: a forward, an
+        # inline-bot result or a quoted third party carries someone else's words
+        # under an allowlisted `from.id`, and vouching for those as the owner's
+        # own would launder injected text into origin='owner'.
+        relayed = any(message.get(key) for key in ("forward_origin", "forward_from", "via_bot"))
         return InboundMessage(
-            text=text, sender_id=str(sender_id), received_at=received_at, channel=self.name
+            text=text,
+            sender_id=str(sender_id),
+            received_at=received_at,
+            channel=self.name,
+            authored_by_sender=not relayed,
         )
 
     async def _call(self, method: str, payload: dict[str, Any]) -> Any:
         url = f"{self._api_base}/bot{self._token}/{method}"
+        detail: str | None = None
         try:
             response = await self._client.post(url, json=payload)
         except httpx.HTTPError as exc:
-            # `from None`: httpx exceptions carry the request URL, and the URL
-            # carries the token. Do not let it ride along on __cause__.
-            raise TelegramError(f"{method} failed: {self._redact(str(exc))}") from None
+            # httpx exceptions carry the request URL, and the URL carries the
+            # token. `raise ... from None` is not enough: it only clears
+            # __cause__, while __context__ keeps the original exception - and
+            # anything that walks the chain unconditionally (an error reporter,
+            # traceback.format_exception(chain=True), a pytest failure report)
+            # would surface the token. A bot token is full account takeover with
+            # no recovery but revocation, so capture the redacted text here and
+            # raise outside the block, where there is no active exception for
+            # __context__ to point at.
+            detail = self._redact(str(exc))
+        if detail is not None:
+            raise TelegramError(f"{method} failed: {detail}")
         if response.status_code != 200:
             raise TelegramError(f"{method} returned HTTP {response.status_code}")
         body = response.json()

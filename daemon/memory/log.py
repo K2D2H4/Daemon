@@ -43,13 +43,17 @@ writer.py) to keep the markdown and the sqlite mirror byte-identical.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from daemon.fs import open_private_append, secure_dir
 from daemon.memory.base import LoggedMessage
+
+logger = logging.getLogger(__name__)
 
 LOG_SUBDIR = Path("memory") / "log"
 
@@ -127,14 +131,31 @@ def parse(text: str) -> list[LogRecord]:
         match = RECORD_RE.match(line)
         if match:
             if heading is not None:
-                records.append(_record(heading, body))
+                _push(records, heading, body)
             heading, body = match, []
         elif heading is not None:
             body.append(line)
 
     if heading is not None:
-        records.append(_record(heading, body))
+        _push(records, heading, body)
     return records
+
+
+def _push(records: list[LogRecord], heading: re.Match[str], body: list[str]) -> None:
+    """Append the record, or drop it if the heading is not actually parseable.
+
+    RECORD_RE is looser than strptime - it accepts `2026-99-99T99:99:99Z` as a
+    heading shape - and parse() promises that a hand-edited or sync-mangled log
+    yields fewer records rather than an exception. Something else can write
+    these files: the user, Obsidian conflict copies, a future importer. The
+    markdown is the source of truth, so a crash here has nothing to fall back
+    on: reflection would fail on that day forever.
+    """
+    try:
+        records.append(_record(heading, body))
+    except ValueError:
+        # Heading only, never the body - the body is private conversation.
+        logger.warning("log: skipping record with unparseable timestamp %r", heading[1])
 
 
 def _record(heading: re.Match[str], body: list[str]) -> LogRecord:
@@ -183,7 +204,9 @@ async def append(data_dir: Path, message: LoggedMessage) -> str:
 
 
 def _append_blocking(path: Path, record: str, date_header: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Owner-only: these are the user's verbatim private conversations, and the
+    # default of 0o644 under a 022 umask hands them to every local account.
+    secure_dir(path.parent)
     header = f"# {date_header}\n" if not path.exists() else ""
-    with path.open("a", encoding="utf-8") as fh:
+    with open_private_append(path) as fh:
         fh.write(f"{header}\n{record}")

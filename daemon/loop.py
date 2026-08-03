@@ -53,7 +53,9 @@ class ConversationLoop:
             except Exception:
                 logger.exception("turn failed sender=%s", inbound.sender_id)
                 try:
-                    await self._channel.send(OutboundMessage(text=FAILURE_NOTICE))
+                    await self._channel.send(
+                        OutboundMessage(text=FAILURE_NOTICE, recipient_id=inbound.sender_id)
+                    )
                 except Exception:
                     # The channel itself is down; nothing left to do but record it.
                     logger.exception("could not deliver the failure notice")
@@ -68,7 +70,11 @@ class ConversationLoop:
                 ts=inbound.received_at,
                 role="user",
                 content=inbound.text,
-                origin="owner",
+                # An allowlisted sender relaying someone else's words - a
+                # forward, an inline-bot result - is not the owner speaking.
+                # Recording it as 'owner' would let injected text reach the
+                # curated tier and, through reflection, persona rules.
+                origin="owner" if inbound.authored_by_sender else "untrusted",
                 session_kind=session_kind,
                 modality=inbound.modality,
                 channel=inbound.channel,
@@ -92,7 +98,9 @@ class ConversationLoop:
                 channel=inbound.channel,
             )
         )
-        await self._channel.send(OutboundMessage(text=completion.text))
+        await self._channel.send(
+            OutboundMessage(text=completion.text, recipient_id=inbound.sender_id)
+        )
 
     async def _assemble(self, inbound: InboundMessage) -> list[Message]:
         """Persona seed as the system turn, then the recent window.
