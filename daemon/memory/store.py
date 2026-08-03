@@ -315,6 +315,15 @@ class Store:
         self.conn.commit()
         return int(cursor.lastrowid or 0)
 
+    def count_embeddings(self, model: str) -> int:
+        """How many vectors this model has. A COUNT, not a load: the point of the
+        number is observability, and reading it off the in-memory cache made it
+        lag behind reality in the one direction that hides progress."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM embeddings WHERE model = ?", (model,)
+        ).fetchone()
+        return int(row["n"])
+
     def count_for_log_file(self, log_file: str) -> int:
         """How many rows this markdown file has been mirrored into. The log is
         append-only, so the mirror being short always means a missing tail."""

@@ -219,7 +219,13 @@ async def test_a_missing_embedder_is_reported_not_just_logged(db: Any) -> None:
     assert "embedder" in recall.vector_lane_status()
 
 
-async def test_an_empty_index_says_backfill_has_not_run(db: Any, monkeypatch) -> None:
+async def test_an_empty_index_is_visible_but_not_reported_as_broken(db: Any) -> None:
+    """An empty index has to be distinguishable from a working one - that was the
+    original finding - but it is a countable fact, not a failure. Remembering it
+    as an error made the status stale the moment the first vector landed, which is
+    how a problem that had already fixed itself kept being reported."""
+    from daemon.app import _recall_health
+
     class Embedder:
         name = "fake"
         model = "fake"
@@ -228,9 +234,37 @@ async def test_an_empty_index_says_backfill_has_not_run(db: Any, monkeypatch) ->
         async def embed(self, texts: list[str]) -> list[list[float]]:
             return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
 
+    class State:
+        pass
+
     recall = MemoryRecall(Store(db), Embedder())
     await recall.search("무엇이든")
-    assert "backfill" in recall.vector_lane_status()
+
+    assert recall.vector_lane_status() == "ok", "an empty index is not a broken lane"
+
+    state = State()
+    state.recall = recall
+    state.recall_status = "ready"
+    assert "nothing indexed" in _recall_health(state)
+
+    # And once something is indexed the count speaks for itself.
+    await recall.index(_seed_message(Store(db)), "김치찌개 먹었어")
+    assert "nothing indexed" not in _recall_health(state)
+
+
+def _seed_message(store: Store) -> int:
+    return store.insert_message(
+        LoggedMessage(
+            ts=datetime(2026, 8, 1, tzinfo=UTC),
+            role="user",
+            content="김치찌개 먹었어",
+            origin="owner",
+            session_kind="interactive",
+            modality="text",
+            channel="telegram",
+        ),
+        log_file="memory/log/2026-08-01.md",
+    )
 
 
 async def test_a_slow_embedder_costs_one_turn_not_thirty_seconds(db: Any) -> None:

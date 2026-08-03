@@ -229,7 +229,11 @@ class MemoryRecall:
 
         ids, matrix = self._embeddings()
         if matrix.shape[0] == 0:
-            self._vector_lane_error = "no vectors indexed yet - backfill has not run"
+            # Not recorded as an error: "the index is empty" is a fact anyone can
+            # count at any time, and remembering it made the status stale the
+            # moment the first vector landed - reporting a problem that had
+            # already fixed itself. Real failures (no embedder, wrong dimension)
+            # stay remembered, because those are not visible from a count.
             return {}
         probe = np.asarray(vectors[0], dtype=np.float32)
         if probe.shape[0] != matrix.shape[1]:
@@ -304,9 +308,16 @@ class MemoryRecall:
         return self._vector_lane_error or "ok"
 
     def vector_count(self) -> int:
-        """How many vectors are loaded. Distinguishes "no embedder" from
-        "embedder fine, backfill unfinished" without reading the log."""
-        return len(self._ids)
+        """How many vectors exist for the current model.
+
+        Counted in sqlite rather than read off `_ids`, which is only as fresh as
+        the last search: after `index()` invalidates the cache the list still held
+        the previous load, so a freshly indexed message looked like no progress at
+        all. Distinguishes "no embedder" from "embedder fine, backfill unfinished".
+        """
+        if self._embedder is None:
+            return 0
+        return self._store.count_embeddings(self._embedder.model)
 
     async def backfill(self, limit: int = 500) -> int:
         """Embed messages this model has no vector for, returning how many landed.

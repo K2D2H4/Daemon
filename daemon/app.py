@@ -362,8 +362,15 @@ def _recall_health(state: Any) -> str:
     if status is None:
         return state.recall_status
     lane = status()
+    if lane != "ok":
+        return f"degraded: {lane}"
     vectors = recall.vector_count()
-    return f"ready, {vectors} vectors" if lane == "ok" else f"degraded: {lane}"
+    if vectors == 0:
+        # Distinguishable from a broken lane on purpose: nothing is wrong, there
+        # is simply nothing indexed yet, and it resolves itself as messages
+        # arrive or when backfill runs.
+        return "ready, nothing indexed yet"
+    return f"ready, {vectors} vectors"
 
 
 def _id_resolver(writer: Any) -> ResolveId:
