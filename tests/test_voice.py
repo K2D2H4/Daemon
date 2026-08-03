@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import logging
+import ssl as ssl_module
 from typing import Any
 
 import pytest
@@ -92,11 +93,18 @@ class FakeConnection:
 
 def connector(*connections: Any) -> Any:
     """A stand-in for `websockets.connect`: hands out scripted connections, or
-    raises a scripted exception instead of connecting."""
+    raises a scripted exception instead of connecting.
+
+    `ssl` is in the signature because the real one is called with it - a trust
+    store we choose rather than the library default. A fake that quietly accepted
+    **kwargs would have let that argument be dropped again unnoticed.
+    """
     queue = list(connections)
 
-    async def connect(url: str, *, additional_headers: dict[str, str]) -> Any:
-        connect.calls.append((url, additional_headers))  # type: ignore[attr-defined]
+    async def connect(
+        url: str, *, additional_headers: dict[str, str], ssl: ssl_module.SSLContext
+    ) -> Any:
+        connect.calls.append((url, additional_headers, ssl))  # type: ignore[attr-defined]
         item = queue.pop(0) if len(queue) > 1 else queue[0]
         if isinstance(item, BaseException):
             raise item
@@ -190,7 +198,7 @@ async def test_api_key_travels_as_a_header_not_in_the_url() -> None:
     async with GeminiLiveSession(KEY, MODEL, connect=connect):
         pass
 
-    (url, headers) = connect.calls[0]
+    (url, headers, _ssl) = connect.calls[0]
     assert headers == {"x-goog-api-key": KEY}
     assert KEY not in url
 
@@ -308,6 +316,130 @@ async def test_go_away_is_reported_rather_than_looking_like_a_bug(
     assert "9.5s" in caplog.text
 
 
+async def test_a_session_ending_is_distinguishable_from_a_turn_ending() -> None:
+    """The audit finding: Live sends `goAway` before the session limit and the
+    stream then just stops, which reads exactly like a finished turn. The caller
+    kept sending audio into a socket that was gone, and from the user's side the
+    daemon stopped answering mid-conversation."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        said("assistant", "잠깐만"),
+        {"serverContent": {"turnComplete": True}},
+        {"goAway": {"timeLeft": "1s"}},
+    )
+    async with session(connection) as live:
+        received = await drain(live)
+
+    assert [item.text for item in received] == ["잠깐만"]
+    assert live.going_away
+    assert live.ended is not None and "goAway" in live.ended
+
+
+async def test_a_stream_that_simply_ends_says_so_too() -> None:
+    """The other side of the same property: no goAway, so the reason must not
+    claim one."""
+    connection = FakeConnection(SETUP_COMPLETE, audio_frame(b"\x01"))
+    async with session(connection) as live:
+        await drain(live)
+
+    assert not live.going_away
+    assert live.ended is not None and "goAway" not in live.ended
+
+
+async def test_the_reason_a_session_ended_is_available_even_when_it_raises() -> None:
+    connection = FakeConnection(SETUP_COMPLETE, closed(1011, "internal error"))
+    async with session(connection) as live:
+        with pytest.raises(GeminiLiveError):
+            await drain(live)
+
+    assert live.ended is not None and "1011" in live.ended
+
+
+# --- transcripts the caller can still get at ---------------------------------
+
+
+async def test_a_cancelled_receive_does_not_lose_what_was_said() -> None:
+    """The audit finding this exists for: the transcript is the *only* record voice
+    mode produces, and it is accumulated until `turnComplete`. A shutdown or an
+    upper-layer timeout arriving first left the utterance in neither the markdown
+    nor the mirror - and an async generator cannot yield from its own `finally`, so
+    the accumulation has to be reachable from outside.
+    """
+    forever = asyncio.Event()
+
+    class Hanging(FakeConnection):
+        async def __anext__(self) -> str:
+            if self.scripted:
+                return await super().__anext__()
+            await forever.wait()  # the user has stopped, the turn has not ended
+            raise AssertionError("unreachable")  # pragma: no cover
+
+    connection = Hanging(SETUP_COMPLETE, said("user", "치과 예약 언제였지"))
+    async with session(connection) as live:
+        stream = live.receive()
+
+        async def pull() -> None:
+            async for _ in stream:  # pragma: no cover - nothing is yielded
+                pass
+
+        task = asyncio.create_task(pull())
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert live.pending_transcripts() == [
+            Transcript(text="치과 예약 언제였지", role="user", final=True)
+        ]
+        # Destructive, so a later flush cannot record the same words twice.
+        assert live.pending_transcripts() == []
+
+
+async def test_abandoning_the_stream_mid_flush_loses_neither_transcript() -> None:
+    """A turn releases the user's words and then the assistant's, and `yield` is a
+    suspension point - so the drain has to be one role at a time. Taken together
+    they are the exchange; either alone is a monologue in the log."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        said("user", "질문"),
+        said("assistant", "대답"),
+        {"serverContent": {"turnComplete": True}},
+    )
+    async with session(connection) as live:
+        stream = live.receive()
+        assert await stream.__anext__() == Transcript(text="질문", role="user", final=True)
+        await stream.aclose()
+
+        assert live.pending_transcripts() == [
+            Transcript(text="대답", role="assistant", final=True)
+        ]
+
+
+async def test_partial_transcripts_are_readable_and_never_look_recordable() -> None:
+    """Recall has to start embedding while the user is still talking - 117 ms is
+    free before the utterance ends and unaffordable after it (docs/PLAN.md 4.3.1).
+    The peek is non-destructive and `final=False`, which is what stops it being
+    recorded as an utterance."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        said("user", "어제 얘기한"),
+        said("user", " 치과 예약"),
+        audio_frame(b"\x01"),
+        {"serverContent": {"turnComplete": True}},
+    )
+    async with session(connection) as live:
+        stream = live.receive()
+        assert await stream.__anext__() == b"\x01"
+
+        peeked = live.partial_transcripts()
+        assert peeked == [Transcript(text="어제 얘기한 치과 예약", role="user", final=False)]
+        assert not any(item.final for item in peeked)
+        # A peek must not consume: the turn still has to flush normally.
+        assert live.partial_transcripts() == peeked
+        assert [item async for item in stream] == [
+            Transcript(text="어제 얘기한 치과 예약", role="user", final=True)
+        ]
+
+
 # --- sending ----------------------------------------------------------------
 
 
@@ -377,6 +509,28 @@ async def test_interrupt_drops_audio_from_the_abandoned_turn() -> None:
         # Everything queued behind the interruption is dropped, and the next turn
         # is heard normally.
         assert [item async for item in stream] == [b"next turn"]
+
+
+async def test_interrupting_a_silence_does_not_mute_the_next_answer() -> None:
+    """The audit finding: `_dropping` outlived the turn it was set for. An
+    interrupt arriving while nothing was being generated dropped the *whole* next
+    answer's audio - and its transcript still accumulated and still flushed, so
+    memory held a reply the user never heard. That is worse than either half."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        audio_frame(b"the answer"),
+        said("assistant", "여덟 시야"),
+        {"serverContent": {"turnComplete": True}},
+    )
+    async with session(connection) as live:
+        # Nobody is talking, and nothing is being generated.
+        await live.interrupt()
+        received = await drain(live)
+
+    assert [item for item in received if isinstance(item, bytes)] == [b"the answer"], (
+        "the next turn went mute while its transcript was still recorded"
+    )
+    assert [item.text for item in received if isinstance(item, Transcript)] == ["여덟 시야"]
 
 
 async def test_server_side_interruption_drops_the_rest_of_the_turn() -> None:
@@ -499,6 +653,108 @@ async def test_a_failed_handshake_does_not_leave_a_connection_open() -> None:
             pass  # pragma: no cover
 
     assert connection.closed
+
+
+# --- TLS trust ---------------------------------------------------------------
+# Voice failed 100% of the time for anyone who installed Python from python.org:
+# those framework builds do not read the system keychain, so
+# `ssl.create_default_context()` holds zero CAs until "Install
+# Certificates.command" is run - and websockets uses exactly that default. Text
+# worked throughout, because httpx bundles certifi. Measured on a fresh 3.13
+# framework build: 0 CAs in the default context, 121 in certifi.
+
+
+@pytest.fixture(autouse=True)
+def fresh_ssl_cache() -> Any:
+    """The context is cached per CA bundle, so a test that changes the bundle must
+    not inherit or leave one."""
+    gemini_live._ssl_context.cache_clear()
+    yield
+    gemini_live._ssl_context.cache_clear()
+
+
+async def test_the_connection_never_relies_on_the_default_trust_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default context is not merely unhelpful here, it is empty. So assert that
+    every context we build names a CA file - an argument-less call is the bug."""
+    empty = ssl_module.create_default_context()
+    empty.load_default_certs()  # whatever this machine has; possibly nothing
+    calls: list[Any] = []
+
+    def spy(*args: Any, **kwargs: Any) -> ssl_module.SSLContext:
+        calls.append(kwargs.get("cafile"))
+        return real(*args, **kwargs)
+
+    real = ssl_module.create_default_context
+    monkeypatch.setattr(ssl_module, "create_default_context", spy)
+
+    connect = connector(FakeConnection(SETUP_COMPLETE))
+    async with GeminiLiveSession(KEY, MODEL, connect=connect):
+        pass
+
+    assert calls and all(cafile for cafile in calls), (
+        "a context was built with no CA file - the python.org build has none"
+    )
+    (_url, _headers, context) = connect.calls[0]
+    assert isinstance(context, ssl_module.SSLContext)
+    assert context.get_ca_certs(), "the trust store we handed websockets is empty"
+    assert context.verify_mode == ssl_module.CERT_REQUIRED
+
+
+def test_the_trust_store_is_certifi_unless_the_environment_names_another(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read from the variables a proxy user has already set for httpx, requests or
+    curl, rather than inventing a Daemon-only setting to get wrong separately."""
+    import certifi
+
+    for name in gemini_live.CA_BUNDLE_ENV:
+        monkeypatch.delenv(name, raising=False)
+    assert gemini_live._ca_bundle() == certifi.where()
+
+    monkeypatch.setenv(gemini_live.CA_BUNDLE_ENV[0], "/etc/corp/ca.pem")
+    assert gemini_live._ca_bundle() == "/etc/corp/ca.pem"
+
+
+async def test_an_injected_context_is_the_one_that_reaches_the_socket() -> None:
+    """A corporate proxy that re-signs TLS needs its own CA, and it must not need a
+    switch that turns verification off to get one."""
+    mine = ssl_module.create_default_context()
+    connect = connector(FakeConnection(SETUP_COMPLETE))
+    async with GeminiLiveSession(KEY, MODEL, connect=connect, ssl_context=mine):
+        pass
+
+    (_url, _headers, context) = connect.calls[0]
+    assert context is mine
+
+
+def test_the_context_is_built_once_and_reused() -> None:
+    """Building one parses a ~200 kB PEM file, and a session is opened per
+    proactive utterance."""
+    first = gemini_live._ssl_context(gemini_live._ca_bundle())
+    assert gemini_live._ssl_context(gemini_live._ca_bundle()) is first
+
+
+async def test_a_tls_failure_says_what_to_do_about_it() -> None:
+    """"could not connect" sent people looking at their own network. The cause is a
+    trust store and the fix is naming a different one, so the message has to say
+    both - and still not say the key."""
+    refused = ssl_module.SSLCertVerificationError(
+        f"[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get "
+        f"local issuer certificate while sending x-goog-api-key: {KEY}"
+    )
+    with pytest.raises(GeminiLiveError) as caught:
+        async with session(refused, max_attempts=1):
+            pass  # pragma: no cover
+
+    message = str(caught.value)
+    assert "TLS verification failed" in message
+    assert "cacert.pem" in message or "ca.pem" in message, "the bundle in use is not named"
+    assert gemini_live.CA_BUNDLE_ENV[0] in message, "no actionable next step"
+    assert KEY not in message
+    assert KEY not in repr(caught.value)
+    assert caught.value.__context__ is None
 
 
 # --- the API key -------------------------------------------------------------

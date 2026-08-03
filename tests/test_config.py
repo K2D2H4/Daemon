@@ -28,6 +28,14 @@ def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def make_settings(**kwargs: Any) -> Settings:
+    """A hosted provider is supplied unless a test is about its absence.
+
+    DAEMON_HOSTED_PROVIDER has no default - a preset that needs a hosted model and
+    has not been told which one fails at startup pointing at `daemon setup`,
+    rather than quietly becoming Claude. That is the behaviour under test in
+    test_a_hosted_preset_without_a_provider_says_to_run_setup; everywhere else it
+    is scaffolding."""
+    kwargs.setdefault("hosted_provider", "anthropic")
     return Settings(_env_file=None, **kwargs)
 
 
@@ -301,3 +309,43 @@ def test_parse_iso_round_trips() -> None:
 
 def test_now_is_timezone_aware_utc() -> None:
     assert clock.now().utcoffset() == timedelta(0)
+
+
+# --- the hosted provider is chosen, never assumed ----------------------------
+
+
+def test_a_hosted_preset_without_a_provider_says_to_run_setup() -> None:
+    """It used to default to anthropic, so a configuration that never chose a
+    provider silently became Claude - and the person who was never asked the
+    question could not tell a choice from a fallback. Onboarding always runs, so
+    the answer always exists by the time it is needed."""
+    with pytest.raises(ConfigError, match="daemon setup"):
+        Settings(_env_file=None, preset="balanced", ollama_model="gemma3:4b")
+
+
+def test_offline_needs_no_hosted_provider() -> None:
+    """Nothing in it is hosted, so the question does not apply."""
+    settings = Settings(_env_file=None, preset="offline", ollama_model="gemma3:4b")
+
+    assert settings.hosted_provider == ""
+    assert set(settings.routing.values()) == {"ollama"}
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai", "gemini"])
+def test_the_chosen_provider_answers_the_hosted_tasks(provider: str) -> None:
+    settings = make_settings(
+        preset="balanced",
+        hosted_provider=provider,
+        ollama_model="gemma3:4b",
+        anthropic_api_key="k",
+        openai_api_key="k",
+        gemini_api_key="k",
+        anthropic_model="m",
+        openai_model="m",
+        gemini_model="m",
+    )
+
+    assert settings.routing[Task.CHAT_TEXT] == provider
+    # The five-minute proactive check stays local whatever was chosen: it runs
+    # whether or not it ever speaks, so hosted cost would accumulate for nothing.
+    assert settings.routing[Task.PROACTIVE_JUDGE] == "ollama"

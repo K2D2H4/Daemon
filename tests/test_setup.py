@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -20,8 +21,8 @@ from typing import Any
 import httpx
 import pytest
 
-from daemon import cli, setup
-from daemon.setup import Checks, OllamaState, Updates, Verdict
+from daemon import cli, setup, tui
+from daemon.setup import EXPAND, Checks, OllamaState, Updates, Verdict
 
 
 @pytest.fixture(autouse=True)
@@ -121,12 +122,19 @@ def drive(
     checks: Checks | None = None,
     opener: Callable[[str], object] | None = None,
     stdin: io.TextIOBase | None = None,
+    stdout: io.TextIOBase | None = None,
 ) -> Run:
-    """Run the whole wizard against `answers`, one per prompt."""
+    """Run the whole wizard against `answers`, one per prompt.
+
+    `stdout` defaults to a plain `StringIO`, which is not a terminal - so the
+    `Theme` the wizard builds from it cannot emit colour, and every assertion
+    below reads text rather than escape sequences. Pass a `FakeTty` to drive the
+    coloured path.
+    """
     env_path = tmp_path / ".env"
     if existing is not None:
         env_path.write_text(existing, encoding="utf-8")
-    out = io.StringIO()
+    out = stdout if stdout is not None else io.StringIO()
     code = setup.run(
         env_path=env_path,
         stdin=stdin if stdin is not None else io.StringIO("".join(f"{a}\n" for a in answers)),
@@ -179,6 +187,32 @@ def checks_with(updates: Callable[[str, int | None, int], Updates]) -> Checks:
     )
 
 
+def flat(rendered: str) -> str:
+    """Output with the layout taken back out.
+
+    A sentence the wizard passed to `tui` comes back wrapped to the width, so
+    asserting on content has to be independent of where the wrapper broke it -
+    otherwise every assertion about wording is secretly an assertion about
+    column 80.
+    """
+    return " ".join(rendered.split())
+
+
+def laid_out(rendered: str, tmp_path: Path) -> list[str]:
+    """The lines whose width this module is responsible for.
+
+    Two exclusions, both artefacts rather than layout. A prompt is written without
+    a trailing newline, so whatever prints next shares its line. And a pytest
+    temporary path is on its own longer than any terminal - a real install says
+    `./.env`, and no wrapper can shorten an absolute path anyway.
+    """
+    return [
+        line
+        for line in rendered.splitlines()
+        if "]: " not in line and "): " not in line and str(tmp_path) not in line
+    ]
+
+
 def seed_path(tmp_path: Path) -> Path:
     return tmp_path / "data" / "persona" / "seed.md"
 
@@ -207,14 +241,39 @@ class InterruptingAfter(io.StringIO):
 # --- what each preset asks for -----------------------------------------------
 
 
-def test_the_preset_menu_says_why_offline_has_no_voice(tmp_path: Path) -> None:
-    # docs/PLAN.md 7 rests on the offline preset being real. If the menu does not
-    # say that voice is the thing being traded away, the user cannot make the
-    # choice the privacy promise is built on.
+def test_the_folded_preset_menu_still_says_voice_is_the_trade(tmp_path: Path) -> None:
+    # docs/PLAN.md 7 rests on the offline preset being real, so the *trade* has to
+    # be legible without expanding anything - a person choosing offline must not
+    # discover afterwards that they gave voice up.
     result = drive(tmp_path, ["1", "gemma3:4b", GOOD_TOKEN, "y"])
 
-    assert "Voice is not available" in result.out
-    assert "privacy promise" in result.out
+    assert "Voice unavailable" in flat(result.out)
+    # And the argument is not printed unasked: folding is what made the menu
+    # short enough to read while choosing.
+    assert "privacy promise" not in result.out
+
+
+def test_the_reasoning_is_one_keypress_away_and_loses_nothing(tmp_path: Path) -> None:
+    # Folding is not omission (daemon/tui.py). The sentence that carries
+    # docs/PLAN.md 7 is the single most load-bearing line in this menu, and `?` has
+    # to be a route to it rather than a shorter paraphrase of it.
+    result = drive(tmp_path, [EXPAND, "1", "gemma3:4b", GOOD_TOKEN, "y"])
+
+    assert result.code == 0
+    flattened = " ".join(result.out.split())
+    assert "privacy promise true instead of aspirational" in flattened
+    assert "docs/PLAN.md 7" in flattened
+    # Every folded summary is still there too, so expanding adds and never replaces.
+    for choice in setup.PRESET_CHOICES:
+        assert choice.summary in flattened
+
+
+def test_an_unusable_answer_at_a_choice_says_what_is_usable(tmp_path: Path) -> None:
+    result = drive(tmp_path, ["cheap", "1", "gemma3:4b", GOOD_TOKEN, "y"])
+
+    assert result.code == 0
+    assert "Pick one of: offline, balanced, quality." in result.out
+    assert f"Or {EXPAND}." in result.out
 
 
 def test_offline_asks_for_no_hosted_key_at_all(tmp_path: Path) -> None:
@@ -750,8 +809,37 @@ def test_check_reports_what_is_missing_and_fails(tmp_path: Path) -> None:
 
     assert code == 1
     assert "missing" in out.getvalue()
-    assert "ANTHROPIC_API_KEY" in out.getvalue()
     assert "TELEGRAM_BOT_TOKEN" in out.getvalue()
+    # The provider, not a vendor's key: nothing has chosen one yet, and naming
+    # Anthropic's key here is precisely how a default nobody was asked about
+    # became invisible. `daemon setup` asks the question this reports.
+    assert "DAEMON_HOSTED_PROVIDER" in out.getvalue()
+    assert "ANTHROPIC_API_KEY" not in out.getvalue()
+
+
+def test_check_reports_the_provider_question_as_blocking(tmp_path: Path) -> None:
+    # Settings refuses to start a hosted preset with no provider, so `--check`'s
+    # exit code has to agree with it. It used to pass, reporting a complete file
+    # for a configuration that could not run.
+    (tmp_path / ".env").write_text(
+        f"DAEMON_PRESET=balanced\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n",
+        encoding="utf-8",
+    )
+    out = io.StringIO()
+
+    assert setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out) == 1
+    assert "missing: DAEMON_HOSTED_PROVIDER" in out.getvalue()
+
+
+def test_check_does_not_ask_offline_for_a_provider(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        f"DAEMON_PRESET=offline\nTELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n", encoding="utf-8"
+    )
+    out = io.StringIO()
+
+    assert setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out) == 0
+    assert "DAEMON_HOSTED_PROVIDER" not in out.getvalue()
 
 
 def test_check_asks_nothing_and_opens_nothing(tmp_path: Path) -> None:
@@ -796,7 +884,8 @@ def test_check_does_not_fail_over_a_key_that_has_a_working_default(tmp_path: Pat
     out = io.StringIO()
 
     assert setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out) == 0
-    assert "[offered] DAEMON_OLLAMA_MODEL" in out.getvalue()
+    assert "warn:" in out.getvalue()
+    assert "DAEMON_OLLAMA_MODEL" in out.getvalue()
 
 
 def test_check_masks_the_keys_it_found(tmp_path: Path) -> None:
@@ -852,7 +941,7 @@ def test_the_three_answers_land_in_the_seed_file(tmp_path: Path) -> None:
     assert result.code == 0
     seed = seed_path(tmp_path).read_text(encoding="utf-8")
     assert "- My name is Rumi." in seed
-    assert setup.VOICE_PRESETS[1] in seed
+    assert setup.VOICE_CHOICES[1].summary in seed
     assert "call me Daehyun, and use 반말" in seed
 
 
@@ -878,7 +967,7 @@ def test_pressing_enter_three_times_still_produces_a_usable_seed(tmp_path: Path)
     assert result.code == 0
     seed = seed_path(tmp_path).read_text(encoding="utf-8")
     assert f"- My name is {setup.DEFAULT_PERSONA_NAME}." in seed
-    assert setup.VOICE_PRESETS[0] in seed
+    assert setup.DEFAULT_VOICE.summary in seed
     # Nothing invented about how to address someone who did not say.
     assert "How I address the user" not in seed
 
@@ -1207,28 +1296,75 @@ def test_a_display_name_cannot_repaint_the_prompt(tmp_path: Path) -> None:
     assert "Owner[2Kid=4242 you" in result.out
 
 
-def test_setup_does_not_mint_a_second_owner(tmp_path: Path) -> None:
-    # Ownership is Pairing's to grant, once. If the wizard wrote the row itself,
-    # "the first approval is the owner" would live in two places.
+def own(tmp_path: Path, sender_id: str) -> None:
+    """Approve `sender_id` the way `daemon pairing approve` would, so a test can
+    start from an install that is already paired."""
     now = datetime.now(UTC)
     store = open_store(tmp_path)
     store.create_pairing(
-        "telegram", "111", "AAAAAAAA", created_at=now, expires_at=now + timedelta(hours=1)
+        "telegram", sender_id, "AAAAAAAA", created_at=now, expires_at=now + timedelta(hours=1)
     )
-    store.approve_pairing("telegram", "111", approved_at=now)
+    store.approve_pairing("telegram", sender_id, approved_at=now)
     store.close()
+
+
+def test_an_install_that_is_already_paired_is_not_asked_again(tmp_path: Path) -> None:
+    # A pairing install keeps its allowlist in sqlite, not in `.env`, so an empty
+    # TELEGRAM_ALLOWED_USER_IDS is *also* what a fully paired install looks like
+    # from the file. Reading only the file, a second `daemon setup` told someone
+    # who had been talking to their Daemon for weeks that it did not know them.
+    own(tmp_path, "5502877373")
     inbox = Inbox([(message(9, 4242, "hi", first_name="Second"),)])
 
-    result = drive(tmp_path, answers_for(pairing=["y", "y"]), checks=checks_with(inbox))
+    result = drive(tmp_path, answers_for(pairing=[]), checks=checks_with(inbox))
 
     assert result.code == 0
-    assert "guest" in result.out
+    assert "already paired" in result.out
+    assert "does not know who you are yet" not in result.out
+    assert inbox.calls == []  # nobody was asked to message anything
+    # And no second owner appeared, because nothing was approved at all.
     store = open_store(tmp_path)
     try:
+        assert not store.is_allowed("telegram", "4242")
+    finally:
+        store.close()
+
+
+def test_approving_someone_when_an_owner_exists_makes_a_guest(tmp_path: Path) -> None:
+    # Ownership is Pairing's to grant, once. The wizard can no longer reach this
+    # path (it does not offer pairing to an install that has an owner), but the
+    # helper it uses must still go through `Pairing.approve` rather than writing
+    # the row itself - otherwise "the first approval is the owner" would live in
+    # two places, and `daemon pairing approve` is the other one.
+    from daemon.channels.pairing import Pairing
+
+    own(tmp_path, "111")
+    store = open_store(tmp_path)
+    try:
+        approval = setup.approve_sender(Pairing(store, "telegram"), "4242")
+
+        assert approval is not None
+        assert approval.is_owner is False
         owners = store.conn.execute(
             "SELECT sender_id FROM channel_pairing WHERE is_owner = 1"
         ).fetchall()
         assert [row["sender_id"] for row in owners] == ["111"]
+    finally:
+        store.close()
+
+
+def test_approving_someone_already_allowed_is_reported_as_nothing_to_do(
+    tmp_path: Path,
+) -> None:
+    # Reachable during the wizard's own wait: a `daemon pairing approve` in another
+    # terminal can land between the message arriving and the answer to "is this
+    # you", and approving twice must not raise.
+    from daemon.channels.pairing import Pairing
+
+    own(tmp_path, "4242")
+    store = open_store(tmp_path)
+    try:
+        assert setup.approve_sender(Pairing(store, "telegram"), "4242") is None
     finally:
         store.close()
 
@@ -1336,20 +1472,22 @@ def test_a_second_message_from_a_refused_sender_is_not_a_second_question(
         store.close()
 
 
-def test_an_already_paired_sender_is_reported_not_re_approved(tmp_path: Path) -> None:
-    now = datetime.now(UTC)
-    store = open_store(tmp_path)
-    store.create_pairing(
-        "telegram", "4242", "BBBBBBBB", created_at=now, expires_at=now + timedelta(hours=1)
-    )
-    store.approve_pairing("telegram", "4242", approved_at=now)
-    store.close()
+def test_a_database_that_cannot_be_read_offers_pairing_rather_than_skipping_it(
+    tmp_path: Path,
+) -> None:
+    # "Is this install already paired" is read from sqlite, and an unreadable answer
+    # has to fall to offering: an offer nobody needed costs one keypress, and a skip
+    # somebody needed leaves a daemon that can hear nobody.
+    from daemon.app import DB_FILENAME
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / DB_FILENAME).write_text("this is not a database", encoding="utf-8")
     inbox = Inbox([(message(8, 4242, "hi", first_name="Owner"),)])
 
-    result = drive(tmp_path, answers_for(pairing=["y", "y"]), checks=checks_with(inbox))
+    result = drive(tmp_path, answers_for(pairing=["n"]), checks=checks_with(inbox))
 
     assert result.code == 0
-    assert "already paired" in result.out
+    assert "Pair your Telegram account now" in result.out
 
 
 def test_a_token_already_in_the_file_is_re_verified_before_the_wait(tmp_path: Path) -> None:
@@ -1607,35 +1745,202 @@ def test_the_openai_key_travels_in_a_header_not_the_url(
     assert seen["headers"] == {"authorization": "Bearer sk-SECRET"}
 
 
-def test_the_hosted_placeholder_is_resolved_before_a_key_is_asked_for() -> None:
-    # config.PRESETS names a HOSTED placeholder, not a provider. Reading it raw
-    # would have the wizard ask for a key for a provider called "hosted"; letting
-    # it default would ask someone who chose Gemini for an Anthropic key.
-    anthropic = {need.key for need in setup.needs_for({"DAEMON_PRESET": "balanced"})}
-    gemini = {
-        need.key
-        for need in setup.needs_for(
-            {"DAEMON_PRESET": "balanced", "DAEMON_HOSTED_PROVIDER": "gemini"}
-        )
-    }
+# --- how it reads ------------------------------------------------------------
 
-    assert "ANTHROPIC_API_KEY" in anthropic
-    assert "GEMINI_API_KEY" not in anthropic
-    assert "GEMINI_API_KEY" in gemini
-    assert "ANTHROPIC_API_KEY" not in gemini
+
+class FakeTty(io.StringIO):
+    """A stream that claims to be a terminal, so the coloured path can be driven
+    without one. `io.StringIO.isatty()` answers False, which is what every other
+    test in this file relies on."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_no_escape_sequence_reaches_a_pipe(tmp_path: Path) -> None:
+    """The guarantee every other assertion in this file rests on.
+
+    `Theme` is built from the stream the wizard prints to, so a piped run cannot
+    emit colour at all. If it could, every string assertion here would silently
+    become an assertion about ANSI.
+    """
+    result = drive(tmp_path, answers_for(persona=("루미", "warm", "형이라고 불러줘")))
+
+    assert result.code == 0
+    assert "\033" not in result.out
+
+
+def test_a_real_terminal_gets_colour_without_changing_the_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from daemon.tui import DEFAULT_WIDTH, display_width
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    result = drive(
+        tmp_path,
+        answers_for(persona=("루미", "warm", "형이라고 불러줘")),
+        stdout=FakeTty(),
+    )
+
+    assert result.code == 0
+    assert "\033[1m" in result.out  # the wordmark and the headings are bold
+    assert "\033[32m" in result.out  # an `ok:` line is green
+    # And the escapes are only paint: nothing they wrap has changed shape.
+    for line in laid_out(_stripped(result.out), tmp_path):
+        assert display_width(line) <= DEFAULT_WIDTH, line
+
+
+def _stripped(rendered: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", rendered)
+
+
+def test_the_wordmark_is_drawn_once(tmp_path: Path) -> None:
+    result = drive(tmp_path, answers_for())
+
+    # The first row of the mark spells both the D and the M with the same corner,
+    # so the row is what gets counted rather than the glyph.
+    assert result.out.count("┌┬┐ ┌─┐ ┌─┐ ┌┬┐ ┌─┐ ┌┐┌") == 1
+    assert result.out.startswith("┌┬┐")
+    for part in tui.TAGLINE:
+        assert part in result.out
+
+
+def test_every_step_is_numbered_out_of_four(tmp_path: Path) -> None:
+    # A wizard that does not say how much is left is a wizard people abandon.
+    inbox = Inbox([(message(3, 4242, "hi", first_name="Owner"),)])
+
+    result = drive(
+        tmp_path, answers_for(pairing=["y", "y"]), checks=checks_with(inbox)
+    )
+
+    assert result.code == 0
+    for step in range(1, 5):
+        assert f"── {step}/4 ─" in result.out
+
+
+def test_nothing_the_wizard_prints_overflows_the_width(tmp_path: Path) -> None:
+    # Korean is where this breaks: every syllable is two columns and `len()` says
+    # one, so a table or box holding a Korean answer is crooked unless every pad
+    # went through `display_width`.
+    from daemon.tui import DEFAULT_WIDTH, display_width
+
+    inbox = Inbox([(message(3, 4242, "안녕", first_name="김대현", username="daze"),)])
+    result = drive(
+        tmp_path,
+        answers_for(persona=("루미", "짧고 건조하게. 빈말은 안 한다.", "형이라고 불러줘, 반말로")),
+        checks=checks_with(inbox),
+    )
+
+    assert result.code == 0
+    for line in laid_out(result.out, tmp_path):
+        assert display_width(line) <= DEFAULT_WIDTH, line
+
+
+def test_the_seed_box_aligns_around_a_korean_answer(tmp_path: Path) -> None:
+    from daemon.tui import display_width
+
+    result = drive(
+        tmp_path,
+        answers_for(persona=("루미", "짧고 건조하게. 빈말은 안 한다.", "형이라고 불러줘, 반말로")),
+    )
+
+    assert result.code == 0
+    box = [line for line in result.out.splitlines() if line.startswith(("╭", "│", "╰"))]
+    assert box, "the seed was not shown back"
+    assert len({display_width(line) for line in box}) == 1, box
+    # And it is the answers, in the words that went into the file.
+    assert "루미" in "\n".join(box)
+    assert "형이라고 불러줘, 반말로" in flat("\n".join(box))
+
+
+def test_the_sender_table_aligns_around_a_korean_display_name(tmp_path: Path) -> None:
+    # The name is the attacker-chosen field *and* the one most likely to be
+    # Korean, so this is where a `len()`-based table would visibly break.
+    inbox = Inbox([(message(3, 4242, "안녕", first_name="김대현", username="daze"),)])
+
+    result = drive(tmp_path, answers_for(pairing=["y", "y"]), checks=checks_with(inbox))
+
+    assert result.code == 0
+    lines = result.out.splitlines()
+    id_line = next(line for line in lines if line.strip().startswith("id "))
+    name_line = next(line for line in lines if line.strip().startswith("name "))
+    assert id_line.index("4242") == name_line.index("김대현")
+
+
+def test_the_change_list_is_a_table_and_still_masks_secrets(tmp_path: Path) -> None:
+    from daemon.tui import display_width
+
+    existing = "DAEMON_PRESET=offline\nDAEMON_DATA_DIR=./데이터\n"
+    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing)
+
+    assert result.code == 0
+    assert "Review" in result.out
+    rows = [
+        line
+        for line in result.out.splitlines()
+        if line.startswith(("  DAEMON_OLLAMA_MODEL  ", "  TELEGRAM_BOT_TOKEN   "))
+    ]
+    assert len(rows) == 2, rows
+    # One value column, whatever the keys were long enough to need.
+    columns = {
+        line.index(value)
+        for line, value in zip(rows, ("gemma3:4b", "...ABCD"), strict=True)
+    }
+    assert len(columns) == 1, rows
+    assert GOOD_TOKEN not in result.out
+    assert all(display_width(line) <= 80 for line in rows)
+
+
+def test_no_vendor_key_is_asked_for_until_a_provider_is_chosen() -> None:
+    # config.PRESETS names a HOSTED placeholder, and DAEMON_HOSTED_PROVIDER has no
+    # default. An unanswered question has to contribute nothing rather than a
+    # guess: the guess used to be Anthropic, so someone who ran setup before this
+    # question existed silently got Claude and could not tell that from a choice.
+    unanswered = {need.key for need in setup.needs_for({"DAEMON_PRESET": "balanced"})}
+
+    assert unanswered == {"DAEMON_HOSTED_PROVIDER", "DAEMON_OLLAMA_MODEL", "TELEGRAM_BOT_TOKEN"}
+
+
+def test_the_chosen_provider_decides_which_key_is_asked_for() -> None:
+    def keys(hosted: str) -> set[str]:
+        return {
+            need.key
+            for need in setup.needs_for(
+                {"DAEMON_PRESET": "balanced", "DAEMON_HOSTED_PROVIDER": hosted}
+            )
+        }
+
+    assert "ANTHROPIC_API_KEY" in keys("anthropic")
+    assert "GEMINI_API_KEY" not in keys("anthropic")
+    assert "GEMINI_API_KEY" in keys("gemini")
+    assert "ANTHROPIC_API_KEY" not in keys("gemini")
+    assert "OPENAI_API_KEY" in keys("openai")
+    # And answering it removes it from the list of things still to answer.
+    for hosted in ("anthropic", "openai", "gemini"):
+        assert "DAEMON_HOSTED_PROVIDER" not in keys(hosted)
+
+
+def test_offline_is_never_asked_for_a_provider() -> None:
+    keys = {need.key for need in setup.needs_for({"DAEMON_PRESET": "offline"})}
+
+    assert "DAEMON_HOSTED_PROVIDER" not in keys
 
 
 def test_needs_come_from_the_preset_table(tmp_path: Path) -> None:
     # One assertion that the routing table in config is what drives the questions,
     # rather than a second copy of it living here.
-    offline = {need.key for need in setup.needs_for({"DAEMON_PRESET": "offline"})}
-    balanced = {need.key for need in setup.needs_for({"DAEMON_PRESET": "balanced"})}
-    voice = {
-        need.key
-        for need in setup.needs_for(
-            {"DAEMON_PRESET": "balanced", "DAEMON_VOICE_ENABLED": "true"}
-        )
-    }
+    def keys(**env: str) -> set[str]:
+        return {need.key for need in setup.needs_for(env)}
+
+    offline = keys(DAEMON_PRESET="offline", DAEMON_HOSTED_PROVIDER="anthropic")
+    balanced = keys(DAEMON_PRESET="balanced", DAEMON_HOSTED_PROVIDER="anthropic")
+    voice = keys(
+        DAEMON_PRESET="balanced",
+        DAEMON_HOSTED_PROVIDER="anthropic",
+        DAEMON_VOICE_ENABLED="true",
+    )
 
     assert "ANTHROPIC_API_KEY" not in offline
     assert "ANTHROPIC_API_KEY" in balanced

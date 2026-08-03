@@ -79,6 +79,19 @@ from daemon.config import (
 )
 from daemon.fs import FILE_MODE, secure_dir, secure_file
 from daemon.tasks import Task
+from daemon.tui import (
+    Choice,
+    Row,
+    Theme,
+    box,
+    choices,
+    heading,
+    status,
+    table,
+    truncate,
+    wordmark,
+    wrap,
+)
 
 if TYPE_CHECKING:  # imported lazily at runtime - see `Wizard._pair_here`
     from daemon.channels.pairing import Approval, Pairing
@@ -116,49 +129,95 @@ ids that do exist, rather than a 404 at the first message."""
 PRESET_ORDER = ("offline", "balanced", "quality")
 DEFAULT_PRESET = "balanced"
 
-HOSTED_HELP: dict[str, tuple[str, ...]] = {
-    "anthropic": (
-        "The default, and what the presets above were measured against. Reads",
-        "long conversations well, which is what the daily reflection does before",
-        "its conclusions propagate into the whole memory graph.",
+PRESET_CHOICES: tuple[Choice, ...] = (
+    Choice(
+        "offline",
+        "Everything on this machine. No keys, no accounts. Voice unavailable.",
+        (
+            "Conversation, the daily reflection and the decision to speak first all "
+            "run here through Ollama. Nothing leaves the machine.",
+            "Voice is not available, and that is the trade rather than a gap: "
+            "native-audio voice means a hosted model is both the brain and the "
+            "voice, and leaving that out is exactly what makes the privacy promise "
+            "true instead of aspirational (docs/PLAN.md 7).",
+            "Needs Ollama and two local models. No API keys and no accounts.",
+        ),
     ),
-    "openai": (
-        "Pick this if it is the account you already pay for. Nothing else about",
-        "Daemon changes - same presets, same memory, same everything.",
+    Choice(
+        "balanced",
+        "Hosted conversation, local proactive check. Voice available.",
+        (
+            "Conversation and the daily reflection go to a hosted model, because "
+            "reflection quality propagates into the whole memory graph.",
+            "The 'should I speak?' check stays local. It runs every five minutes "
+            "whether or not it ever speaks, so hosted cost would accumulate for "
+            "nothing.",
+            "Needs one hosted API key - whose is the next question - plus Ollama "
+            "for the local check and for recall embeddings.",
+        ),
     ),
-    "gemini": (
-        "The one that shares a key with voice: native-audio voice is Google's",
-        "either way, so choosing it here means one key and one bill instead of",
-        "two. Note the Standard-key trap below if you have an older key.",
+    Choice(
+        "quality",
+        "Everything hosted. Best answers, highest bill. Voice available.",
+        (
+            "Including the five-minute proactive check, which is the one that runs "
+            "whether or not it ever speaks.",
+            "Embeddings stay local in every preset, so recall still wants Ollama - "
+            "`daemon doctor` checks that. Needs one hosted API key.",
+        ),
     ),
-}
+)
+"""The three presets as a folded list: one line to choose by, the argument behind
+it one keypress away.
+
+The prose used to be printed in full, six to eight lines per preset, before the
+question - too long to read while choosing, and the part about voice was then
+repeated by the voice question two lines later. Folding is not shortening: every
+sentence is still here, including the one that carries docs/PLAN.md 7, which is
+the whole reason `offline` is a real option rather than a marketing bullet."""
+
+HOSTED_CHOICES: tuple[Choice, ...] = (
+    Choice(
+        "anthropic",
+        "Claude. The default, and what the presets were measured against.",
+        (
+            "Reads long conversations well, which is what the daily reflection does "
+            "before its conclusions propagate into the whole memory graph.",
+        ),
+    ),
+    Choice(
+        "openai",
+        "GPT. Pick this if it is the account you already pay for.",
+        ("Nothing else about Daemon changes - same presets, same memory.",),
+    ),
+    Choice(
+        "gemini",
+        "Gemini. The one that shares a key with voice.",
+        (
+            "Native-audio voice is Google's either way, so choosing it here means "
+            "one key and one bill instead of two.",
+            "If you have an older Google key, note that the Gemini API refuses "
+            "'Standard' keys - the wizard says so if yours is one.",
+        ),
+    ),
+)
 """What separates them, rather than which model ids they publish - ids change
 every few months and are the wrong thing to choose a vendor by."""
 
-PRESET_HELP: dict[str, tuple[str, ...]] = {
-    "offline": (
-        "Everything runs on this machine through Ollama - conversation,",
-        "reflection, and the decision to speak first. Nothing leaves the machine.",
-        "Voice is not available: native-audio voice means a hosted model is both",
-        "the brain and the voice, and leaving that out is exactly what makes the",
-        "privacy promise true instead of aspirational.",
-        "Needs: Ollama and two local models. No API keys, no accounts.",
-    ),
-    "balanced": (
-        "Conversation and the daily reflection go to a hosted model, because",
-        "reflection quality propagates into the whole memory graph. The 'should I",
-        "speak?' check stays local - it runs every five minutes whether or not it",
-        "ever speaks, so hosted cost would accumulate for nothing.",
-        "Voice can be turned on. Needs: one hosted API key (whose is the next",
-        "question), plus Ollama for the local check and for recall embeddings.",
-    ),
-    "quality": (
-        "Everything hosted, including the five-minute proactive check. Best",
-        "quality, highest running cost. Embeddings stay local in every preset,",
-        "so recall still wants Ollama - `daemon doctor` checks that.",
-        "Voice can be turned on. Needs: one hosted API key.",
-    ),
-}
+DEFAULT_HOSTED_CHOICE = HOSTED_CHOICES[0].name
+"""What the provider prompt puts in its brackets for someone who just presses
+Enter.
+
+Deliberately not `config.DEFAULT_HOSTED_PROVIDER`, which is now empty on purpose
+to mean "nobody has answered yet". That absence is the right value for a
+configuration to hold and the wrong thing to put in a prompt: this wizard exists
+to turn the absence into an answer, not to pass it along."""
+
+EXPAND = "?"
+"""Typed at a choice prompt, shows every reason behind every option.
+
+A single character because it is the answer to "I do not know which of these I
+want", which is not a moment to make someone type a word."""
 
 GEMINI_STANDARD_KEY_HINT = (
     "This key looks like a Google 'Standard' API key. The Gemini API already "
@@ -201,17 +260,26 @@ and PAIRING_NOTE loses nothing by being read a minute later."""
 
 DEFAULT_PERSONA_NAME = "Daemon"
 
-VOICE_PRESETS = (
-    "Short and dry. I do not pad answers, and I do not perform enthusiasm.",
-    "Warm and talkative. I say more than the minimum when there is more to say.",
-    "Playful. I take a joke and give one back, and I am not solemn about myself.",
+VOICE_CHOICES: tuple[Choice, ...] = (
+    Choice("dry", "Short and dry. I do not pad answers, and I do not perform enthusiasm."),
+    Choice("warm", "Warm and talkative. I say more than the minimum when there is more to say."),
+    Choice(
+        "playful",
+        "Playful. I take a joke and give one back, and I am not solemn about myself.",
+    ),
 )
 """Three examples, because a seed is a seed - a character sheet at first run is
 onboarding fatigue paid before the product has earned any.
 
-The first one is the default deliberately. Left with no seed at all, a small
-local model settles into the eager-helper register ("how may I help you today?"),
-which is the one voice a companion cannot have: it is the voice of software."""
+The summary is also the line that goes into the file, so there is one copy of it:
+a name to pick by, and the sentence it means. No folded detail, because the
+sentence *is* the detail - and a person can type their own line instead.
+
+`dry` is the default deliberately. Left with no seed at all, a small local model
+settles into the eager-helper register ("how may I help you today?"), which is the
+one voice a companion cannot have: it is the voice of software."""
+
+DEFAULT_VOICE = VOICE_CHOICES[0]
 
 PERSONA_LINE_LIMIT = 200
 """Characters kept per answer. A seed that is mostly one answer is not a seed,
@@ -549,7 +617,9 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
     preset = env.get("DAEMON_PRESET", "") or DEFAULT_PRESET
     # The preset tables hold a HOSTED placeholder, so the chosen provider has to be
     # passed in: defaulting it would ask a user who picked GPT for an Anthropic key,
-    # and reading the table raw would ask them for a key for "hosted".
+    # and reading the table raw would ask them for a key for "hosted". An empty
+    # answer stays empty - `providers_for` then drops the hosted tasks, so no
+    # vendor's key is asked for on a guess.
     hosted = env.get("DAEMON_HOSTED_PROVIDER", "") or DEFAULT_HOSTED_PROVIDER
     providers = providers_for(
         preset,
@@ -558,6 +628,20 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
     )
     needs: list[Need] = []
 
+    if HOSTED in PRESETS[preset].values() and not hosted:
+        # First, because it decides which of the keys below are even asked for -
+        # and reported by `--check`, because Settings refuses to start without it.
+        # Silently reporting a complete file here is what let someone run setup
+        # before this question existed and then wonder why they had Claude.
+        needs.append(
+            Need(
+                key="DAEMON_HOSTED_PROVIDER",
+                label="hosted provider",
+                why=f"This preset sends work to a hosted model; pick whose - one of "
+                f"{', '.join(HOSTED_PROVIDERS)}. There is no default, so that a "
+                "choice is never confused with a fallback.",
+            )
+        )
     if OLLAMA in _chat_providers(preset, hosted):
         needs.append(
             Need(
@@ -660,7 +744,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
     return [need for need in needs if not env.get(need.key)]
 
 
-def _chat_providers(preset: str, hosted: str = DEFAULT_HOSTED_PROVIDER) -> set[str]:
+def _chat_providers(preset: str, hosted: str) -> set[str]:
     """Providers doing real generation, i.e. excluding embeddings.
 
     The distinction matters for exactly one question: whether setup should insist
@@ -668,6 +752,10 @@ def _chat_providers(preset: str, hosted: str = DEFAULT_HOSTED_PROVIDER) -> set[s
     embedding model that is not pulled yet degrades recall rather than blocking
     the first conversation - so it belongs to `daemon doctor`, not to a wizard
     standing between the user and their first message.
+
+    `hosted` is required for the same reason `config.preset_providers` made it
+    required: every caller here runs *after* the question has been answered, so a
+    default would only ever be a way to forget to pass the answer.
     """
     # Through preset_providers, not PRESETS directly: the tables hold a HOSTED
     # placeholder now, and reading them raw would ask the user for a key for a
@@ -775,6 +863,31 @@ def seed_markdown(name: str, voice: str, address: str = "") -> str:
         # addressed is worse than not mentioning it.
         lines.append(f"- How I address the user: {address}")
     return "\n".join([*lines, "", *SEED_ANCHOR]) + "\n"
+
+
+def _seed_summary(name: str, voice: str, address: str) -> list[str]:
+    """The answers as they will read in the file, for showing back in a box.
+
+    Built from the same three values `seed_markdown` writes, not from the rendered
+    file: a summary parsed back out of markdown would be a second reader of a
+    format with one writer.
+
+    Prose lines, not columns. `box` rewraps anything wider than the frame and
+    `wrap` collapses whitespace runs, so a hand-made label column survives on the
+    first line of a long value and vanishes on its continuation - which is worse
+    than no column at all. The frame itself stays square around Korean because
+    every pad in `tui` measures display width.
+    """
+    lines = [f"Name: {name}", f"Voice: {voice}"]
+    if address:
+        lines.append(f"Address: {address}")
+    return [
+        *lines,
+        "",
+        "In every seed, and not editable by Daemon:",
+        "- I do not simply agree. When I think you are wrong, I say so.",
+        "- I am someone with my own view, not a mirror of whoever I talk to.",
+    ]
 
 
 def one_line(answer: str, limit: int = PERSONA_LINE_LIMIT) -> str:
@@ -885,11 +998,18 @@ def approve_sender(pairing: Pairing, sender_id: str) -> Approval | None:
 
 
 class Prompt:
-    """stdin/stdout, behind one object so the flow can be driven by a test."""
+    """stdin/stdout, behind one object so the flow can be driven by a test.
+
+    It also owns the `Theme`, because the theme is a fact about this stream: built
+    once, from the same handle everything is printed to. A second theme built from
+    `sys.stdout` somewhere else in the flow would emit colour into a pipe that this
+    one had correctly decided was not a terminal.
+    """
 
     def __init__(self, stdin: TextIO | None = None, stdout: TextIO | None = None) -> None:
         self._in = stdin if stdin is not None else sys.stdin
         self._out = stdout if stdout is not None else sys.stdout
+        self.theme = Theme.detect(self._out)
 
     def say(self, text: str = "") -> None:
         print(text, file=self._out)
@@ -924,14 +1044,22 @@ class Prompt:
                 return False
             self.say("Please answer y or n.")
 
-    def ask_choice(self, question: str, options: Sequence[str], *, default: str) -> str:
+    def ask_choice(
+        self, question: str, options: Sequence[str], *, default: str, allow: Sequence[str] = ()
+    ) -> str:
+        """A name or its number. `allow` passes extra literal answers straight back
+        to the caller - `?`, which is a request for more text rather than a choice,
+        so the reading of the keyboard stays here and the layout stays out."""
         while True:
             answer = self.ask(question, default=default).strip().lower()
+            if answer in allow:
+                return answer
             if answer in options:
                 return answer
             if answer.isdigit() and 1 <= int(answer) <= len(options):
                 return options[int(answer) - 1]
-            self.say(f"Pick one of: {', '.join(options)}.")
+            extra = f" Or {', '.join(allow)}." if allow else ""
+            self.say(f"Pick one of: {', '.join(options)}.{extra}")
 
 
 # --- the wizard --------------------------------------------------------------
@@ -939,6 +1067,10 @@ class Prompt:
 MAX_ATTEMPTS = 3
 """Tries per credential before giving up. A fourth prompt is not going to help,
 and abandoning the run writes nothing."""
+
+MIN_PROSE_WIDTH = 20
+"""Floor for wrapped prose, so a terminal narrow enough to make the indent bigger
+than the text still gets something rather than one character per line."""
 
 
 @dataclass
@@ -957,14 +1089,16 @@ class Wizard:
         updates: dict[str, str] = {}
         say = self.prompt.say
 
-        say("Daemon setup")
+        say(wordmark(self.prompt.theme))
+        say()
         say("Nothing is written until the end, and nothing is written anywhere but")
         say(f"{self.env_path}.")
         say()
 
+        self._step(1, "How should Daemon think?")
         preset = self._choose_preset(env, updates)
         hosted = self._choose_hosted(preset, env, updates)
-        voice = self._choose_voice(preset, env, updates)
+        voice = self._choose_voice(preset, hosted, env, updates)
 
         merged = {
             **env,
@@ -973,12 +1107,16 @@ class Wizard:
             "DAEMON_HOSTED_PROVIDER": hosted,
             "DAEMON_VOICE_ENABLED": str(voice).lower(),
         }
+        self._step(2, "Keys and tokens")
         for need in needs_for(merged):
             value = self._fill(need, merged)
             if value:
                 updates[need.key] = value
 
-        self._check_ollama(preset, {**merged, **updates})
+        # The answered provider, not a default: `_chat_providers` decides whether a
+        # local chat model is wanted at all, and under `quality` the answer changes
+        # which of these lines is even true.
+        self._check_ollama(preset, hosted, {**merged, **updates})
 
         if not updates:
             say("Nothing to change in .env - this install is already configured.")
@@ -996,6 +1134,50 @@ class Wizard:
         say(f"Wrote {self.env_path} (mode 0600).")
         return self._finish({**env, **updates})
 
+    # --- presentation --------------------------------------------------------
+
+    STEPS = 4
+    """Preset, credentials, persona, pairing. Printed as `2/4` so the question a
+    person has partway through - how much of this is left - has an answer without
+    them having to ask it."""
+
+    def _step(self, number: int, title: str) -> None:
+        self.prompt.say(heading(self.prompt.theme, title, step=(number, self.STEPS)))
+        self.prompt.say()
+
+    def _prose(self, text: str, *, indent: int = 2) -> None:
+        """A paragraph wrapped to this terminal.
+
+        `Need.why` is a sentence in a table, not lines someone broke by hand, and
+        the longest of them is 102 columns - which on an 80-column terminal wrapped
+        wherever the terminal felt like, mid-word, under the question it belonged
+        to. Everything with a measured width goes through `tui`; this is the same
+        rule for the prose between.
+        """
+        for line in wrap(text, max(MIN_PROSE_WIDTH, self.prompt.theme.width - indent)):
+            self.prompt.say(" " * indent + line)
+
+    def _pick(self, question: str, items: Sequence[Choice], *, default: str) -> str:
+        """A folded list, and `?` for everything it folded away.
+
+        The reasoning is one keypress rather than a wall to scroll past, and it is
+        the *same* text either way (`choices(expanded=True)` is a superset), so
+        nothing is only available to whoever read the source.
+        """
+        theme = self.prompt.theme
+        names = tuple(item.name for item in items)
+        self.prompt.say(choices(theme, items))
+        self.prompt.say()
+        self.prompt.say(theme.dim(f"  {EXPAND} for the reasoning behind each one."))
+        while True:
+            answer = self.prompt.ask_choice(question, names, default=default, allow=(EXPAND,))
+            if answer != EXPAND:
+                self.prompt.say()
+                return answer
+            self.prompt.say()
+            self.prompt.say(choices(theme, items, expanded=True))
+            self.prompt.say()
+
     # --- steps ---------------------------------------------------------------
 
     def _choose_preset(self, env: Mapping[str, str], updates: dict[str, str]) -> str:
@@ -1005,17 +1187,9 @@ class Wizard:
             self.prompt.say()
             return current
 
-        self.prompt.say("How should Daemon think? You can change this later.")
-        for index, name in enumerate(PRESET_ORDER, start=1):
-            self.prompt.say(f"  {index}) {name}")
-            for line in PRESET_HELP[name]:
-                self.prompt.say(f"     {line}")
-        self.prompt.say()
-        preset = self.prompt.ask_choice(
-            "Preset", PRESET_ORDER, default=DEFAULT_PRESET
-        )
+        self.prompt.say("Where should the thinking happen? You can change this later.")
+        preset = self._pick("Preset", PRESET_CHOICES, default=DEFAULT_PRESET)
         updates["DAEMON_PRESET"] = preset
-        self.prompt.say()
         return preset
 
     def _choose_hosted(self, preset: str, env: Mapping[str, str], updates: dict[str, str]) -> str:
@@ -1031,6 +1205,11 @@ class Wizard:
             self.prompt.say(f"Nothing in the {preset} preset talks to a hosted model, so there")
             self.prompt.say("is no provider to choose and no API key to paste.")
             self.prompt.say()
+            # Nothing is written either, deliberately. Writing a provider nobody
+            # was asked about would mean that switching to `balanced` later
+            # silently used it - which is exactly the confusion that removing the
+            # default was meant to end. Startup refuses instead, naming this
+            # command, and this command then asks.
             return DEFAULT_HOSTED_PROVIDER
 
         current = env.get("DAEMON_HOSTED_PROVIDER", "")
@@ -1040,22 +1219,20 @@ class Wizard:
             return current
 
         self.prompt.say("Whose model should the hosted work go to? The preset decided where")
-        self.prompt.say("work runs; this decides who runs it. Changeable later, and it is one")
-        self.prompt.say("key either way - Daemon is not a reseller, you bring your own.")
-        for index, name in enumerate(HOSTED_PROVIDERS, start=1):
-            self.prompt.say(f"  {index}) {name}")
-            for line in HOSTED_HELP[name]:
-                self.prompt.say(f"     {line}")
-        self.prompt.say()
-        chosen = self.prompt.ask_choice(
-            "Provider", HOSTED_PROVIDERS, default=DEFAULT_HOSTED_PROVIDER
-        )
+        self.prompt.say("work runs; this decides who runs it. One key either way - Daemon is")
+        self.prompt.say("not a reseller, you bring your own.")
+        chosen = self._pick("Provider", HOSTED_CHOICES, default=DEFAULT_HOSTED_CHOICE)
         updates["DAEMON_HOSTED_PROVIDER"] = chosen
-        self.prompt.say()
         return chosen
 
-    def _choose_voice(self, preset: str, env: Mapping[str, str], updates: dict[str, str]) -> bool:
-        if GEMINI not in providers_for(preset, voice_enabled=True):
+    def _choose_voice(
+        self, preset: str, hosted: str, env: Mapping[str, str], updates: dict[str, str]
+    ) -> bool:
+        # `hosted` is passed even though CHAT_VOICE is pinned to Gemini today: the
+        # question is whether this preset has a voice task at all, and answering it
+        # from a table with an unresolved placeholder in it is how the wrong key
+        # gets asked for the moment that pinning changes.
+        if GEMINI not in providers_for(preset, voice_enabled=True, hosted=hosted):
             self.prompt.say(f"Voice is not part of the {preset} preset: native audio has to")
             self.prompt.say("run on a hosted model, and leaving it out is what makes 'nothing")
             self.prompt.say("leaves this machine' literally true. Text mode is the whole product.")
@@ -1079,42 +1256,49 @@ class Wizard:
     def _fill(self, need: Need, env: Mapping[str, str]) -> str:
         if need.silent:
             return need.default
-        self.prompt.say(f"{need.label} ({need.key})")
-        self.prompt.say(f"  {need.why}")
+        theme = self.prompt.theme
+        say = self.prompt.say
+        say(f"{theme.bold(need.label)} {theme.dim(f'({need.key})')}")
+        self._prose(need.why)
         if need.url:
-            self.prompt.say(f"  Opening {need.url}")
+            say(f"  Opening {need.url}")
             try:
                 self.opener(need.url)
             except Exception:
                 # A headless box, or no browser at all. Not a setup failure: the
                 # URL is on screen either way.
-                self.prompt.say("  (could not open a browser - use the link above)")
+                say("  (could not open a browser - use the link above)")
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             value = self.prompt.ask(f"  {need.key}", default=need.default, secret=need.secret)
             if not value:
                 if need.skippable:
-                    self.prompt.say("  Skipped. `daemon setup` again when you have it.")
-                    self.prompt.say()
+                    say(status(theme, "warn", "Skipped. `daemon setup` again when you have it."))
+                    say()
                     return ""
-                self.prompt.say("  This one is required.")
+                say(status(theme, "missing", "This one is required."))
                 continue
 
             verdict = self._verify(need, value, env)
             if verdict.ok:
                 if verdict.detail:
+                    # Still the last four characters and nothing more. Colour is
+                    # added around `mask`, never instead of it.
                     shown = mask(value) if need.secret else value
-                    self.prompt.say(f"  ok: {verdict.detail} ({shown})")
+                    say(status(theme, "ok", f"{verdict.detail} ({shown})"))
                 if verdict.hint:
-                    self.prompt.say(f"  note: {verdict.hint}")
-                self.prompt.say()
+                    # A hint on a verdict that passed means "this works, but": the
+                    # key is fine and the model id is not, which is a warning and
+                    # not a failure.
+                    say(status(theme, "warn", verdict.hint))
+                say()
                 return value
 
-            self.prompt.say(f"  {verdict.detail}")
+            say(status(theme, "fail", verdict.detail))
             if verdict.hint:
-                self.prompt.say(f"  {verdict.hint}")
+                say(status(theme, "warn", verdict.hint))
             if attempt < MAX_ATTEMPTS:
-                self.prompt.say("  Try again.")
+                say("  Try again.")
 
         raise Cancelled(f"{need.key} could not be verified after {MAX_ATTEMPTS} tries")
 
@@ -1143,8 +1327,8 @@ class Wizard:
             return verdict
         return Verdict(True, "")
 
-    def _check_ollama(self, preset: str, env: Mapping[str, str]) -> None:
-        if OLLAMA not in _chat_providers(preset):
+    def _check_ollama(self, preset: str, hosted: str, env: Mapping[str, str]) -> None:
+        if OLLAMA not in _chat_providers(preset, hosted):
             embed_model = env.get("DAEMON_EMBED_MODEL") or DEFAULT_EMBED_MODEL
             self.prompt.say("Nothing in this preset needs a local chat model. Recall")
             self.prompt.say("embeddings are local in every preset though, so `ollama pull")
@@ -1152,16 +1336,18 @@ class Wizard:
             self.prompt.say()
             return
 
+        theme = self.prompt.theme
+        say = self.prompt.say
         base_url = env.get("DAEMON_OLLAMA_BASE_URL") or _config_default("ollama_base_url")
         state = self.checks.ollama(base_url)
         if not state.reachable:
-            self.prompt.say(f"Ollama: {state.detail}")
-            self.prompt.say("  Install it from https://ollama.com, then run `ollama serve`.")
-            self.prompt.say("  Setup continues; `daemon doctor` re-checks this.")
-            self.prompt.say()
+            say(status(theme, "warn", f"Ollama {state.detail}"))
+            say("  Install it from https://ollama.com, then run `ollama serve`.")
+            say("  Setup continues; `daemon doctor` re-checks this.")
+            say()
             return
 
-        self.prompt.say(f"Ollama: {state.detail}")
+        say(status(theme, "ok", f"Ollama {state.detail}"))
         wanted = [
             env.get("DAEMON_OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL,
             env.get("DAEMON_EMBED_MODEL") or DEFAULT_EMBED_MODEL,
@@ -1169,23 +1355,46 @@ class Wizard:
         missing = [model for model in wanted if not _installed(state.models, model)]
         for model in wanted:
             if model not in missing:
-                self.prompt.say(f"  {model}: installed")
+                say(status(theme, "ok", f"{model}: installed"))
+        for model in missing:
+            say(status(theme, "missing", f"{model}: not pulled yet"))
         if missing:
             # Deliberately not run for them: these are gigabytes, and a wizard
             # should not start a download the user did not ask for.
-            self.prompt.say("  Missing models. Run these yourself (they are large):")
+            say("  Run these yourself (they are large):")
             for model in missing:
-                self.prompt.say(f"    ollama pull {model}")
-        self.prompt.say()
+                say(f"    ollama pull {model}")
+        say()
 
     def _confirm(self, updates: Mapping[str, str], env: Mapping[str, str]) -> bool:
-        self.prompt.say(f"These keys change in {self.env_path}:")
+        """The diff, as a table, before anything is written.
+
+        A table rather than `KEY=value (was ...)` lines because this is the one
+        screen a person is being asked to approve, and the question they are
+        actually answering is "is anything here not what I meant" - which is read
+        down a column, not along a sentence.
+        """
+        theme = self.prompt.theme
         secrets = {need.key for need in _all_needs() if need.secret}
+        rows = []
         for key, value in updates.items():
-            shown = mask(value) if key in secrets else value
             before = env.get(key)
-            was = "" if before is None else f" (was {mask(before) if key in secrets else before})"
-            self.prompt.say(f"  {key}={shown}{was}")
+            rows.append(
+                Row(
+                    key,
+                    # Secrets are still four characters. `Row.value` is only ever
+                    # painted and padded, never re-read, so what `mask` decided is
+                    # what gets printed.
+                    mask(value) if key in secrets else value,
+                    ""
+                    if before is None
+                    else f"was {mask(before) if key in secrets else before}",
+                )
+            )
+        self.prompt.say(heading(theme, f"Review - {self.env_path}"))
+        self.prompt.say()
+        self.prompt.say(table(theme, rows))
+        self.prompt.say()
         self.prompt.say("Everything else in the file is left alone.")
         return self.prompt.ask_yes_no("Write it", default=True)
 
@@ -1200,7 +1409,7 @@ class Wizard:
             # turns into a service that will not start - which is the class of bug
             # this whole module exists to close, so it is not allowed to be a
             # traceback either.
-            say("The file is written, but the configuration is not usable yet:")
+            say(status(self.prompt.theme, "fail", "the file is written, but it is not usable yet:"))
             for line in str(exc).splitlines():
                 say(f"  {line}")
             say("Fix it with `daemon setup` again, by editing .env, or ask `daemon doctor`.")
@@ -1213,11 +1422,22 @@ class Wizard:
             settings.telegram_bot_token
             and not settings.telegram_allowed_user_ids
             and settings.telegram_dm_policy == PAIRING_POLICY
+            # A pairing install keeps its allowlist in sqlite, not in `.env`, so an
+            # empty TELEGRAM_ALLOWED_USER_IDS says nothing about whether anyone is
+            # paired. Without this, a second `daemon setup` told someone who had
+            # been talking to their Daemon for weeks that it did not know them yet.
+            and not _has_owner(settings)
         )
         try:
             self._seed_persona(settings)
+            if settings.telegram_bot_token or unpaired:
+                self._step(4, "Connect your phone")
             if unpaired and self._pair_here(settings):
                 unpaired = False
+            elif not unpaired and settings.telegram_bot_token:
+                say(status(self.prompt.theme, "ok", "Telegram is already paired."))
+                say("`daemon pairing list` shows who, and adds anyone else.")
+                say()
         except (Cancelled, KeyboardInterrupt):
             # Both files are written atomically or not at all, so there is nothing
             # half-done to repair - and run()'s handler must not see this, because
@@ -1249,25 +1469,27 @@ class Wizard:
         markdown before they have said hello.
         """
         say = self.prompt.say
+        theme = self.prompt.theme
         path = settings.data_dir / "persona" / "seed.md"
+        self._step(3, "Who should this be?")
         if path.exists():
             # Human-owned (docs/PLAN.md 5.1), and re-running setup is not consent
             # to overwrite a personality someone has been editing for a month.
-            say(f"{path} already exists, so it is left exactly as it is.")
+            say(status(theme, "ok", f"{path} already exists, so it is left exactly as it is."))
             say("That file is yours - nothing here and nothing in Daemon rewrites it.")
             say()
             return
 
-        say("Who should this be?")
         say("Three questions, all skippable with Enter, and none of them final:")
         say(f"they write {path}, which you own and can edit at any time.")
         say()
-        name = one_line(self.prompt.ask("  Name", default=DEFAULT_PERSONA_NAME))
+        name = one_line(self.prompt.ask("  Name", default=DEFAULT_PERSONA_NAME)) or (
+            DEFAULT_PERSONA_NAME
+        )
         say()
-        say("  How should it talk? A number, or write your own line.")
-        for index, preset in enumerate(VOICE_PRESETS, start=1):
-            say(f"    {index}) {preset}")
-        voice = self._voice(self.prompt.ask("  Voice", default="1"))
+        say("  How should it talk? A name, a number, or write your own line.")
+        say(choices(theme, VOICE_CHOICES))
+        voice = self._voice(self.prompt.ask("  Voice", default=DEFAULT_VOICE.name))
         say()
         say("  How should it address you? Enter skips this.")
         say("  In Korean it is half the voice: 반말 or 존댓말, and what to call you.")
@@ -1275,30 +1497,39 @@ class Wizard:
 
         try:
             secure_dir(path.parent)
-            write_private_file(path, seed_markdown(name or DEFAULT_PERSONA_NAME, voice, address))
+            write_private_file(path, seed_markdown(name, voice, address))
         except OSError as exc:
             # `DAEMON_DATA_DIR` can point somewhere that cannot be created - that is
             # what `daemon doctor` checks for, and this command runs before doctor
             # has ever been useful. A sentence, not a traceback.
             say()
-            say(f"Could not write {path}: {exc}")
+            say(status(theme, "fail", f"Could not write {path}: {exc}"))
             say("Daemon runs without a seed; `daemon setup` writes it once the data")
             say("directory is reachable.")
             say()
             return
         say()
-        say(f"Wrote {path} (mode 0600).")
-        say("It also carries two fixed lines - that this is someone with a view of")
-        say("their own, who will disagree with you. Those are in the file Daemon")
-        say("cannot write to, which is the only reason they survive (docs/PLAN.md 5.4).")
+        say(status(theme, "ok", f"wrote {path} (mode 0600)"))
+        say()
+        # The answers read back, in the words that went into the file: this is the
+        # one screen where a person finds out that "2" meant a whole sentence, and
+        # the box is where a Korean answer has to line up rather than merely fit.
+        say(box(theme, _seed_summary(name, voice, address), title="persona/seed.md"))
+        say()
+        say("The last two lines are ours and are in every seed: that this is someone")
+        say("with a view of their own, who will disagree with you. They survive only")
+        say("because Daemon cannot write to this file (docs/PLAN.md 5.4).")
         say()
 
     def _voice(self, answer: str) -> str:
-        """A preset by number, or whatever they typed, or the default."""
+        """A preset by name or number, or whatever they typed, or the default."""
         picked = answer.strip()
-        if picked.isdigit() and 1 <= int(picked) <= len(VOICE_PRESETS):
-            return VOICE_PRESETS[int(picked) - 1]
-        return one_line(picked) or VOICE_PRESETS[0]
+        if picked.isdigit() and 1 <= int(picked) <= len(VOICE_CHOICES):
+            return VOICE_CHOICES[int(picked) - 1].summary
+        for choice in VOICE_CHOICES:
+            if picked.lower() == choice.name:
+                return choice.summary
+        return one_line(picked) or DEFAULT_VOICE.summary
 
     # --- pairing, in this process --------------------------------------------
 
@@ -1324,7 +1555,7 @@ class Wizard:
         except OSError as exc:
             # Same reason as the seed above: approval is stored in the data dir,
             # and the data dir is configuration that can be wrong.
-            say(f"  Could not open the pairing database: {exc}")
+            say(status(self.prompt.theme, "fail", f"Could not open the pairing database: {exc}"))
             return False
 
     def _pair(self, settings: Settings) -> bool:
@@ -1337,6 +1568,7 @@ class Wizard:
         from daemon.memory.store import Store
 
         say = self.prompt.say
+        theme = self.prompt.theme
         token = settings.telegram_bot_token
         handle = self.bot_handle
         if not handle:
@@ -1345,12 +1577,17 @@ class Wizard:
             # was revoked would spend the whole wait on a bot that cannot hear.
             verdict = self.checks.telegram(token)
             if not verdict.ok:
-                say(f"  {verdict.detail}")
+                say(status(theme, "fail", verdict.detail))
                 return False
             handle = verdict.subject or "your bot"
 
-        say(f"  Send any message to {handle} from your phone - anything at all.")
-        say(f"  Waiting up to {PAIRING_WAIT_SECONDS / 60:.0f} minute(s). Ctrl-C stops waiting.")
+        say(f"  Send any message to {theme.bold(handle)} from your phone - anything at all.")
+        say(
+            theme.dim(
+                f"  Waiting up to {PAIRING_WAIT_SECONDS / 60:.0f} minute(s)."
+                " Ctrl-C stops waiting."
+            )
+        )
         say()
 
         store = Store.open(settings.data_dir / DB_FILENAME)
@@ -1365,7 +1602,7 @@ class Wizard:
                     # One failure ends it rather than retrying for three minutes:
                     # the token worked seconds ago, so this is the network, and the
                     # user should hear that instead of watching a spinner.
-                    say(f"  {batch.detail}")
+                    say(status(theme, "fail", batch.detail))
                     return False
                 for update in batch.updates:
                     update_id = update.get("update_id")
@@ -1378,24 +1615,31 @@ class Wizard:
                         continue
                     if not self._is_you(sender):
                         refused.add(sender.id)
-                        say("  Still waiting, then - someone else got there first.")
+                        say(status(theme, "warn", "Still waiting - someone else got there first."))
                         say()
                         continue
                     try:
                         approval = approve_sender(pairing, sender.id)
                     except PairingError as exc:
-                        say(f"  {exc}")
+                        say(status(theme, "fail", str(exc)))
                         return False
                     if approval is None:
-                        say(f"  id={sender.id} is already paired - nothing to do.")
+                        say(status(theme, "ok", f"id={sender.id} is already paired."))
                         return True
-                    say(f"  Paired. id={approval.sender_id} may talk to Daemon; nobody else can.")
+                    say(
+                        status(
+                            theme,
+                            "ok",
+                            f"paired: id={approval.sender_id} may talk to Daemon,"
+                            " and nobody else can.",
+                        )
+                    )
                     if not approval.is_owner:
                         say("  Added as a guest: this channel already had an owner, and")
                         say("  ownership is granted once and never transferred.")
                     return True
                 if time.monotonic() >= deadline:
-                    say("  Nothing arrived, so this is not the moment.")
+                    say(status(theme, "warn", "Nothing arrived, so this is not the moment."))
                     return False
         finally:
             if offset is not None:
@@ -1410,12 +1654,50 @@ class Wizard:
 
     def _is_you(self, sender: Sender) -> bool:
         say = self.prompt.say
-        say(f"  A message just arrived from id={sender.id}  (name: {sender.label})")
+        theme = self.prompt.theme
+        say("  A message just arrived.")
+        # A table, so the id and the name are visibly two different kinds of fact
+        # rather than one sentence - the id is what gets approved, and the name is
+        # a hint that the sender chose. The name is also where Korean shows up, and
+        # `table` aligns by display width, so a Korean name does not push the
+        # column that follows it out of line.
+        say(table(theme, [Row("id", sender.id), Row("name", sender.label, "self-chosen")]))
+        say()
         say("  What gets approved is the id. The name is whatever that account")
         say("  typed into its own profile, so treat it as a hint and not as proof.")
         say("  What they wrote is not shown: it is not mine to print, and an")
         say("  unidentified stranger's words have no business on this screen.")
         return self.prompt.ask_yes_no(f"  Is id={sender.id} you", default=True)
+
+
+def _has_owner(settings: Settings) -> bool:
+    """Whether this Telegram channel already has an owner, i.e. pairing is done.
+
+    Read from the database only if there is already one. A wizard that had to
+    create a database in order to report that there was nothing to do would leave
+    a file behind as the evidence for its own answer - and on a re-run with a
+    `DAEMON_DATA_DIR` pointing somewhere unwritable, it would fail while checking.
+    Anything unreadable is treated as "not paired", which costs an offer nobody
+    needed and never skips one somebody did.
+    """
+    import sqlite3
+
+    from daemon.app import DB_FILENAME
+    from daemon.channels.telegram import TelegramChannel
+    from daemon.memory.store import Store
+
+    path = settings.data_dir / DB_FILENAME
+    if not path.exists():
+        return False
+    try:
+        store = Store.open(path)
+    except (OSError, sqlite3.Error, RuntimeError):
+        # RuntimeError is Store.open refusing a schema written by a newer build.
+        return False
+    try:
+        return store.has_owner(TelegramChannel.name)
+    finally:
+        store.close()
 
 
 def _all_needs() -> list[Need]:
@@ -1428,7 +1710,10 @@ def _all_needs() -> list[Need]:
     """
     seen: dict[str, Need] = {}
     for preset in PRESET_ORDER:
-        for hosted in HOSTED_PROVIDERS:
+        # The empty string included: it is what a file that has not answered the
+        # provider question holds, and DAEMON_HOSTED_PROVIDER is itself one of the
+        # keys this has to know about.
+        for hosted in ("", *HOSTED_PROVIDERS):
             for need in needs_for(
                 {
                     "DAEMON_PRESET": preset,
@@ -1502,36 +1787,66 @@ def report(path: Path, prompt: Prompt) -> int:
     answers "is this file complete?", which is why liveness - is Ollama up, is
     the schema current - stays with `daemon doctor`.
     """
+    theme = prompt.theme
     env = parse_env(path.read_text(encoding="utf-8")) if path.exists() else {}
-    prompt.say(f"{path}: {'found' if path.exists() else 'missing'}")
+    # No wordmark here. `--check` is the form of this command that runs in CI and
+    # gets pasted into documentation, and a three-line lockup above the answer is
+    # noise in both. The heading gives it a shape without a picture.
+    # The path goes in the status line rather than the heading: a heading truncates
+    # to the width and the path is the answer to "which file did you read", which is
+    # not a thing to lose an end of. `status` wraps instead.
+    prompt.say(heading(theme, "daemon setup --check"))
+    found = path.exists()
+    # Truncated rather than wrapped. `wrap` breaks on whitespace and a path has
+    # none, so a long one was hard-split mid-string into something nobody can
+    # paste - and pasting it is the whole reason it is printed.
+    shown = truncate(str(path), max(20, theme.width - 20))
+    prompt.say(
+        status(theme, "ok" if found else "missing", f"{shown} - {'found' if found else 'no file'}")
+    )
     preset = env.get("DAEMON_PRESET", "") or DEFAULT_PRESET
     if preset not in PRESETS:
-        prompt.say(f"[FAIL] DAEMON_PRESET={preset!r} is not a preset")
+        prompt.say(status(theme, "fail", f"DAEMON_PRESET={preset!r} is not a preset"))
         return PROBLEM
     voice = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
     default_note = "" if env.get("DAEMON_PRESET") else " (default, not set in the file)"
     hosted = env.get("DAEMON_HOSTED_PROVIDER", "") or DEFAULT_HOSTED_PROVIDER
     prompt.say(
-        f"preset: {preset}{default_note}, hosted provider: {hosted}, "
+        f"preset: {preset}{default_note}, "
+        # Named rather than left blank: an empty value here is the whole point of
+        # removing the default, and "hosted provider: " reads like a bug.
+        f"hosted provider: {hosted or 'not chosen yet'}, "
         f"voice {'on' if voice else 'off'}"
     )
+    prompt.say()
 
     missing = needs_for(env)
     for need in _all_needs():
         value = env.get(need.key, "")
         if value:
-            prompt.say(f"[ok]      {need.key} = {mask(value) if need.secret else value}")
+            prompt.say(
+                status(theme, "ok", f"{need.key} = {mask(value) if need.secret else value}")
+            )
     for need in missing:
-        tag = "[missing]" if need.blocking else "[offered]"
-        prompt.say(f"{tag} {need.key} - {need.label}: {need.why}")
+        # `warn` rather than `missing` for a key that has a working built-in
+        # default: the exit code does not fail on those, and a status word that
+        # disagreed with the exit code would be the more confusing of the two.
+        prompt.say(
+            status(
+                theme,
+                "missing" if need.blocking else "warn",
+                f"{need.key} - {need.label}: {need.why}",
+            )
+        )
 
+    prompt.say()
     blocking = [need for need in missing if need.blocking]
     if blocking:
         prompt.say(f"{len(blocking)} item(s) missing. Run `daemon setup` to fill them in.")
         return PROBLEM
     if missing:
         # Everything left has a working built-in default, so this install starts.
-        prompt.say("Nothing missing; `daemon setup` would offer the [offered] items above.")
+        prompt.say("Nothing missing; `daemon setup` would offer the warned items above.")
     else:
         prompt.say("Nothing missing.")
     prompt.say("`daemon doctor` checks Ollama, the data dir and the schema.")

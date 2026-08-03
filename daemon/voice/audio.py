@@ -36,6 +36,26 @@ BLOCK_FRAMES = 480
 """30ms at 16kHz. Small enough that server-side speech detection reacts promptly,
 large enough not to send a websocket frame per millisecond."""
 
+MIC_QUEUE_BLOCKS = 64
+"""About 1.9s of microphone audio. Bounded because in real-time audio an old block
+has negative value: an unbounded queue meant a consumer that fell behind kept
+sending audio from tens of seconds ago, so the session stayed up and the
+transcripts kept coming while the conversation drifted into the past. When it is
+full the *oldest* block goes."""
+
+MIC_DROP_LOG_EVERY = 32
+"""Drops arrive dozens per second when they arrive at all, so they are counted and
+reported periodically rather than logged one by one."""
+
+CLOSE_TIMEOUT_SECONDS = 2.0
+"""How long `close` waits for the speaker to come back before giving up on
+closing the device. See `close`."""
+
+_STOP = b""
+"""Sentinel that ends the playback writer. Safe as a queue value because `play`
+refuses empty chunks, and needed because `to_thread(stream.write)` cannot be
+cancelled - see `close`."""
+
 _INSTALL_HINT = "install with: pip install -e '.[voice]'"
 
 
@@ -81,6 +101,14 @@ class SoundDeviceAudio:
         self._writer: asyncio.Task[None] | None = None
         self._out: Any = None
         self._closed = False
+        self._mute = False
+        # Serialises everything that touches the output device. PortAudio has no
+        # opinion about being aborted or closed from one thread while another is
+        # inside write(); at worst that is a native crash, and `to_thread` cannot
+        # be cancelled, so exclusion is the only lever we have.
+        self._device = asyncio.Lock()
+        self.dropped_blocks = 0
+        """Microphone blocks thrown away because the consumer fell behind."""
 
     def _module(self) -> Any:
         if self._backend is None:
@@ -91,7 +119,23 @@ class SoundDeviceAudio:
         """Microphone PCM, one block at a time, for as long as it is iterated."""
         sd = self._module()
         loop = asyncio.get_running_loop()
-        blocks: asyncio.Queue[bytes] = asyncio.Queue()
+        blocks: asyncio.Queue[bytes] = asyncio.Queue(maxsize=MIC_QUEUE_BLOCKS)
+
+        def enqueue(block: bytes) -> None:
+            # Oldest first, and loudly. Dropping the *newest* would keep feeding
+            # the model stale audio, which is the failure this bound exists for:
+            # the session stays alive and the transcripts keep arriving while the
+            # conversation answers something the user said half a minute ago.
+            if blocks.full():
+                blocks.get_nowait()
+                self.dropped_blocks += 1
+                if self.dropped_blocks % MIC_DROP_LOG_EVERY == 1:
+                    logger.warning(
+                        "audio: microphone queue full, dropped %d block(s) so far; "
+                        "the session is not keeping up with the microphone",
+                        self.dropped_blocks,
+                    )
+            blocks.put_nowait(block)
 
         def on_block(indata: Any, frames: int, time_info: Any, status: Any) -> None:
             # Runs on PortAudio's own thread. `bytes(indata)` copies: the buffer
@@ -99,7 +143,7 @@ class SoundDeviceAudio:
             # provider audio that has already been overwritten.
             if status:
                 logger.warning("audio: input stream reported %s", status)
-            loop.call_soon_threadsafe(blocks.put_nowait, bytes(indata))
+            loop.call_soon_threadsafe(enqueue, bytes(indata))
 
         stream = sd.RawInputStream(
             samplerate=self.sample_rate,
@@ -125,7 +169,11 @@ class SoundDeviceAudio:
         than real time, and blocking here would stall the same loop that has to
         notice the user interrupting.
         """
-        if not chunk or self._closed:
+        # `_mute` as well as `_closed`: once the writer has given up there is
+        # nothing draining this queue, and `put_nowait` kept accepting chunks -
+        # about 48 KB a second at 24 kHz 16-bit, forever, on a process meant to run
+        # for weeks.
+        if not chunk or self._closed or self._mute:
             return
         # Started once and never respawned: the one thing that ends it for good
         # is a missing speaker, and restarting into that would log the same
@@ -142,36 +190,78 @@ class SoundDeviceAudio:
         that rather than playing it out. Without both, the daemon keeps talking
         over the user for as long as the buffers last.
         """
-        while not self._queue.empty():
-            self._queue.get_nowait()
+        self._discard_queued()
         if self._out is not None:
-            await asyncio.to_thread(self._out.abort)
+            # Under the device lock: aborting a stream while the writer thread is
+            # inside write() is a race in C, not in Python. Costs at most one
+            # block's write, and the queue is already empty by here.
+            async with self._device:
+                await asyncio.to_thread(self._out.abort)
 
     async def close(self) -> None:
+        """Stop playing and release the device, cooperatively.
+
+        Cancelling the writer is not enough and is actively dangerous: an
+        in-flight `to_thread(stream.write)` cannot be cancelled, so cancelling
+        only detaches the await and leaves a thread writing into a stream that
+        `close()` then closes underneath it - a crash inside PortAudio in the
+        worst case. So: drop what is queued, ask the writer to stop, and wait for
+        it to come back before touching the device.
+        """
         self._closed = True
         writer, self._writer = self._writer, None
+        stopped = True
         if writer is not None:
-            writer.cancel()
-            # Suppressed rather than raised: close() runs on the shutdown path,
-            # where the cancellation it just caused is not news.
-            await asyncio.gather(writer, return_exceptions=True)
+            self._discard_queued()
+            self._queue.put_nowait(_STOP)
+            try:
+                async with asyncio.timeout(CLOSE_TIMEOUT_SECONDS):
+                    await writer
+            except (TimeoutError, asyncio.CancelledError):
+                stopped = False
+            except Exception:
+                logger.exception("audio: the playback writer ended badly")
         out, self._out = self._out, None
-        if out is not None:
+        if out is None:
+            return
+        if not stopped:
+            # Deliberately leaks the stream. A wedged write means the thread is
+            # still inside PortAudio, and closing the device under it is the one
+            # outcome worse than an unreleased handle on the way out of the
+            # process.
+            logger.warning(
+                "audio: the speaker did not stop within %.0fs; leaving the device "
+                "open rather than closing it under a running write",
+                CLOSE_TIMEOUT_SECONDS,
+            )
+            return
+        async with self._device:
             await asyncio.to_thread(out.close)
+
+    def _discard_queued(self) -> None:
+        while not self._queue.empty():
+            self._queue.get_nowait()
 
     async def _drain(self) -> None:
         while True:
             chunk = await self._queue.get()
+            if chunk == _STOP:
+                return
             try:
                 stream = self._output_stream()
                 if not stream.active:
                     # A previous stop_playback aborted the stream, which leaves
                     # it stopped.
                     stream.start()
-                await asyncio.to_thread(stream.write, chunk)
+                async with self._device:
+                    await asyncio.to_thread(stream.write, chunk)
             except AudioUnavailable as exc:
                 # No speaker at all. Nothing to retry, and the caller is not
-                # waiting on this task, so say so here and stop.
+                # waiting on this task, so say so here and stop - after shutting
+                # the door behind us, or `play` keeps filling a queue that nothing
+                # will ever drain.
+                self._mute = True
+                self._discard_queued()
                 logger.error("audio: playback is unavailable, going mute: %s", exc)
                 return
             except Exception:
@@ -265,6 +355,16 @@ class LocalSpeaker:
         finally:
             if self._process is process:
                 self._process = None
+        if process.returncode and process.returncode < 0:
+            # Killed by a signal, which is how `stop()` ends an utterance -
+            # SIGTERM leaves returncode -15, and reporting that as "the speaker is
+            # broken" fired on the most ordinary use there is: cutting the voice
+            # off because a meeting started (docs/PLAN.md 6.4). Interrupting is
+            # not a fault.
+            logger.debug(
+                "audio: %s was stopped by signal %d", command[0], -process.returncode
+            )
+            return
         if process.returncode:
             raise AudioUnavailable(
                 f"{command[0]} exited {process.returncode}: "
