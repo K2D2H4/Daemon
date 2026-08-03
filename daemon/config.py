@@ -25,14 +25,31 @@ OPENAI = "openai"
 GEMINI = "gemini"
 
 # Env var carrying the API key, or None for a provider that needs no key.
-# Providers listed here are nameable in a route; only the ones with a module
-# under daemon/llm/providers/ can actually be built (M1a: ollama, anthropic).
+# Every name here is buildable: tests/test_reachable.py fails if one is nameable
+# in a route and the app cannot construct it.
 PROVIDER_KEY_ENV: dict[str, str | None] = {
     OLLAMA: None,
     ANTHROPIC: "ANTHROPIC_API_KEY",
     OPENAI: "OPENAI_API_KEY",
     GEMINI: "GEMINI_API_KEY",
 }
+
+HOSTED = "hosted"
+"""Placeholder in the preset tables for "whichever hosted provider was chosen".
+
+The presets used to name ANTHROPIC directly, which made "provider-agnostic
+gateway" true of the config surface and false of the product: a user who wanted
+GPT or Gemini for conversation had no way to say so. Multiplying the presets by
+the providers would have given nine, so the two questions stay separate - a preset
+answers *where the work runs*, and DAEMON_HOSTED_PROVIDER answers *whose model*.
+
+CHAT_VOICE is deliberately not HOSTED: it names GEMINI because Gemini Live is the
+only native-audio session implemented, and pointing it at a provider with no voice
+session would fail at the first voice turn instead of at startup."""
+
+HOSTED_PROVIDERS = ("anthropic", "openai", "gemini")
+"""What DAEMON_HOSTED_PROVIDER accepts. Ollama is not here - "hosted" is the
+opposite of local, and the offline preset never resolves HOSTED at all."""
 
 VOICE_TASKS = frozenset({Task.CHAT_VOICE})
 """Tasks that need a hosted native-audio model. The offline preset has none."""
@@ -54,21 +71,21 @@ PRESETS: dict[str, dict[Task, str]] = {
         Task.EMBED: OLLAMA,
     },
     "balanced": {
-        Task.CHAT_TEXT: ANTHROPIC,
+        Task.CHAT_TEXT: HOSTED,
         Task.CHAT_VOICE: GEMINI,
-        Task.RECALL_ESCALATION: ANTHROPIC,
+        Task.RECALL_ESCALATION: HOSTED,
         Task.PROACTIVE_JUDGE: OLLAMA,
-        Task.REFLECTION: ANTHROPIC,
-        Task.PERSONA_RULE: ANTHROPIC,
+        Task.REFLECTION: HOSTED,
+        Task.PERSONA_RULE: HOSTED,
         Task.EMBED: OLLAMA,
     },
     "quality": {
-        Task.CHAT_TEXT: ANTHROPIC,
+        Task.CHAT_TEXT: HOSTED,
         Task.CHAT_VOICE: GEMINI,
-        Task.RECALL_ESCALATION: ANTHROPIC,
-        Task.PROACTIVE_JUDGE: ANTHROPIC,
-        Task.REFLECTION: ANTHROPIC,
-        Task.PERSONA_RULE: ANTHROPIC,
+        Task.RECALL_ESCALATION: HOSTED,
+        Task.PROACTIVE_JUDGE: HOSTED,
+        Task.REFLECTION: HOSTED,
+        Task.PERSONA_RULE: HOSTED,
         Task.EMBED: OLLAMA,
     },
 }
@@ -91,12 +108,37 @@ class ConfigError(RuntimeError):
     """Bad configuration. Raised at startup, never mid-conversation."""
 
 
-def providers_for(preset: str, *, voice_enabled: bool) -> list[str]:
+DEFAULT_HOSTED_PROVIDER = HOSTED_PROVIDERS[0]
+
+
+def preset_providers(preset: str, hosted: str = DEFAULT_HOSTED_PROVIDER) -> dict[Task, str]:
+    """A preset's table with HOSTED resolved to a real provider name.
+
+    Anything reading PRESETS to decide what a configuration needs has to go
+    through this, or it sees the placeholder and treats "hosted" as a provider.
+    """
+    return {
+        task: (hosted if provider == HOSTED else provider)
+        for task, provider in PRESETS[preset].items()
+    }
+
+
+def providers_for(
+    preset: str,
+    *,
+    voice_enabled: bool,
+    hosted: str = DEFAULT_HOSTED_PROVIDER,
+) -> list[str]:
     """Providers a preset actually needs, so onboarding asks for those keys only.
 
     Voice tasks are excluded while voice is off - the same rule as
     `Settings.active_tasks`. That is what lets a text-only `balanced` install be
     set up without a hosted voice key (docs/PLAN.md 6.5).
+
+    `hosted` resolves the HOSTED placeholder. It defaults so that a caller which
+    has not yet asked the user still behaves as before, but a caller that knows
+    the answer must pass it - otherwise a user who chose GPT is asked for an
+    Anthropic key.
     """
     if preset not in PRESETS:
         raise ConfigError(
@@ -105,7 +147,7 @@ def providers_for(preset: str, *, voice_enabled: bool) -> list[str]:
     return sorted(
         {
             provider
-            for task, provider in PRESETS[preset].items()
+            for task, provider in preset_providers(preset, hosted).items()
             if voice_enabled or task not in VOICE_TASKS
         }
     )
@@ -145,6 +187,10 @@ class Settings(BaseSettings):
     fallback_provider: str | None = Field(default=None, alias="DAEMON_FALLBACK_PROVIDER")
     """Opt-in. When unset, a ProviderError propagates instead of being retried
     somewhere else - a silent switch to a weaker model is worse than an error."""
+
+    hosted_provider: str = Field(default="anthropic", alias="DAEMON_HOSTED_PROVIDER")
+    """Which commercial model answers wherever a preset says "hosted".
+    One of HOSTED_PROVIDERS. Per-task overrides still win over this."""
 
     voice_enabled: bool = Field(default=False, alias="DAEMON_VOICE_ENABLED")
     """docs/PLAN.md 6.5: voice is the user's choice and text mode is a complete
@@ -217,6 +263,12 @@ class Settings(BaseSettings):
             raise ConfigError(
                 f"unknown DAEMON_PRESET {self.preset!r}; expected one of "
                 f"{', '.join(sorted(PRESETS))}"
+            )
+
+        if self.hosted_provider not in HOSTED_PROVIDERS:
+            raise ConfigError(
+                f"unknown DAEMON_HOSTED_PROVIDER {self.hosted_provider!r}; expected one "
+                f"of {', '.join(HOSTED_PROVIDERS)}"
             )
 
         problems: list[str] = []
@@ -292,7 +344,11 @@ class Settings(BaseSettings):
         if task in VOICE_TASKS:
             return found
 
-        if not getattr(self, f"{provider}_model"):
+        # Defaulted, not bare: a provider added to PROVIDER_KEY_ENV without a
+        # matching model field used to raise AttributeError from inside pydantic
+        # validation, which reads as a crash rather than as the configuration
+        # mistake it is.
+        if not getattr(self, f"{provider}_model", ""):
             found.append(
                 f"{context} routes to {provider!r} but no model is set "
                 f"(DAEMON_{provider.upper()}_MODEL)"
@@ -301,8 +357,13 @@ class Settings(BaseSettings):
 
     @property
     def routing(self) -> dict[Task, str]:
-        """Effective Task -> provider name table: preset plus overrides."""
-        return {**PRESETS[self.preset], **self.route_overrides}
+        """Effective Task -> provider name table: preset, then the chosen hosted
+        provider substituted in, then explicit overrides on top."""
+        resolved = {
+            task: (self.hosted_provider if provider == HOSTED else provider)
+            for task, provider in PRESETS[self.preset].items()
+        }
+        return {**resolved, **self.route_overrides}
 
     @property
     def active_tasks(self) -> list[Task]:

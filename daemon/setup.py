@@ -64,12 +64,14 @@ from pydantic import ValidationError
 
 from daemon.config import (
     ANTHROPIC,
+    DEFAULT_HOSTED_PROVIDER,
     ENV_FILE,
     GEMINI,
     OLLAMA,
     PRESETS,
     ConfigError,
     Settings,
+    preset_providers,
     providers_for,
 )
 from daemon.fs import FILE_MODE, secure_dir, secure_file
@@ -477,10 +479,18 @@ class Need:
 def needs_for(env: Mapping[str, str]) -> list[Need]:
     """The keys this configuration is missing an answer for, in asking order."""
     preset = env.get("DAEMON_PRESET", "") or DEFAULT_PRESET
-    providers = providers_for(preset, voice_enabled=_truthy(env.get("DAEMON_VOICE_ENABLED", "")))
+    # The preset tables hold a HOSTED placeholder, so the chosen provider has to be
+    # passed in: defaulting it would ask a user who picked GPT for an Anthropic key,
+    # and reading the table raw would ask them for a key for "hosted".
+    hosted = env.get("DAEMON_HOSTED_PROVIDER", "") or DEFAULT_HOSTED_PROVIDER
+    providers = providers_for(
+        preset,
+        voice_enabled=_truthy(env.get("DAEMON_VOICE_ENABLED", "")),
+        hosted=hosted,
+    )
     needs: list[Need] = []
 
-    if OLLAMA in _chat_providers(preset):
+    if OLLAMA in _chat_providers(preset, hosted):
         needs.append(
             Need(
                 key="DAEMON_OLLAMA_MODEL",
@@ -544,7 +554,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
     return [need for need in needs if not env.get(need.key)]
 
 
-def _chat_providers(preset: str) -> set[str]:
+def _chat_providers(preset: str, hosted: str = DEFAULT_HOSTED_PROVIDER) -> set[str]:
     """Providers doing real generation, i.e. excluding embeddings.
 
     The distinction matters for exactly one question: whether setup should insist
@@ -553,7 +563,14 @@ def _chat_providers(preset: str) -> set[str]:
     the first conversation - so it belongs to `daemon doctor`, not to a wizard
     standing between the user and their first message.
     """
-    return {provider for task, provider in PRESETS[preset].items() if task is not Task.EMBED}
+    # Through preset_providers, not PRESETS directly: the tables hold a HOSTED
+    # placeholder now, and reading them raw would ask the user for a key for a
+    # provider called "hosted".
+    return {
+        provider
+        for task, provider in preset_providers(preset, hosted).items()
+        if task is not Task.EMBED
+    }
 
 
 def _truthy(value: str) -> bool:
@@ -1110,8 +1127,19 @@ class Wizard:
         say("  In Korean it is half the voice: 반말 or 존댓말, and what to call you.")
         address = one_line(self.prompt.ask("  Address", default=""))
 
-        secure_dir(path.parent)
-        write_private_file(path, seed_markdown(name or DEFAULT_PERSONA_NAME, voice, address))
+        try:
+            secure_dir(path.parent)
+            write_private_file(path, seed_markdown(name or DEFAULT_PERSONA_NAME, voice, address))
+        except OSError as exc:
+            # `DAEMON_DATA_DIR` can point somewhere that cannot be created - that is
+            # what `daemon doctor` checks for, and this command runs before doctor
+            # has ever been useful. A sentence, not a traceback.
+            say()
+            say(f"Could not write {path}: {exc}")
+            say("Daemon runs without a seed; `daemon setup` writes it once the data")
+            say("directory is reachable.")
+            say()
+            return
         say()
         say(f"Wrote {path} (mode 0600).")
         say("It also carries two fixed lines - that this is someone with a view of")
@@ -1145,7 +1173,13 @@ class Wizard:
         say("watch for your message and simply ask whether it was you.")
         if not self.prompt.ask_yes_no("Pair your Telegram account now", default=True):
             return False
-        return self._pair(settings)
+        try:
+            return self._pair(settings)
+        except OSError as exc:
+            # Same reason as the seed above: approval is stored in the data dir,
+            # and the data dir is configuration that can be wrong.
+            say(f"  Could not open the pairing database: {exc}")
+            return False
 
     def _pair(self, settings: Settings) -> bool:
         # Imported here, not at module scope: `daemon setup` has to run on an

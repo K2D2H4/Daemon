@@ -33,11 +33,10 @@ from daemon.tasks import Task
 
 DAEMON = pathlib.Path(__file__).resolve().parents[1] / "daemon"
 
-PENDING_PROVIDERS = {
-    # Being implemented now; until they are, a route naming them fails at startup
-    # rather than mid-conversation, which is the correct direction.
-    "openai": "chat provider not written yet",
-    "gemini": "chat provider not written yet (voice uses a separate session)",
+PENDING_PROVIDERS: dict[str, str] = {
+    # Empty, and that is the point: every provider a route may name is now one the
+    # app can build. openai and gemini were listed here, and this file failing when
+    # they landed is the both-directions property doing its job.
 }
 
 PENDING_TASKS = {
@@ -111,19 +110,44 @@ def test_every_nameable_provider_can_be_built(provider: str) -> None:
     )
 
 
-def test_a_route_to_an_unbuildable_provider_fails_at_startup() -> None:
-    """Not mid-conversation. The whole point of validating configuration eagerly."""
+def test_a_route_to_an_unbuildable_provider_fails_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not mid-conversation. The whole point of validating configuration eagerly.
+
+    There is no real unbuildable provider left, so one is invented: the guarantee
+    is that *any* future name added to the config surface without an
+    implementation dies at startup, and that has to stay tested even while the
+    gap it was written for is closed.
+    """
+    from daemon import config as config_module
     from daemon.app import _build_providers
     from daemon.config import ConfigError, Settings
 
-    pending = next(iter(PENDING_PROVIDERS))
+    monkeypatch.setitem(config_module.PROVIDER_KEY_ENV, "imaginary", None)
+
+    # A nameable provider with no model field is a configuration mistake, and it
+    # has to read as one rather than as an AttributeError out of pydantic.
+    with pytest.raises(ConfigError, match="no model is set"):
+        Settings(
+            _env_file=None,
+            DAEMON_PRESET="offline",
+            DAEMON_OLLAMA_MODEL="gemma3:4b",
+            DAEMON_DATA_DIR="/tmp/daemon-reachability",
+            DAEMON_ROUTE_OVERRIDES={"reflection": "imaginary"},
+        )
+
+    # And with a model, it gets as far as assembly and dies there - at startup,
+    # not mid-conversation.
+    monkeypatch.setattr(
+        config_module.Settings, "imaginary_model", "some-model", raising=False
+    )
     settings = Settings(
         _env_file=None,
         DAEMON_PRESET="offline",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR="/tmp/daemon-reachability",
-        DAEMON_ROUTE_OVERRIDES={"reflection": pending},
-        **{f"{pending}_api_key": "fake", f"{pending}_model": "some-model"},
+        DAEMON_ROUTE_OVERRIDES={"reflection": "imaginary"},
     )
     with pytest.raises(ConfigError, match="no implementation"):
         _build_providers(settings)

@@ -22,7 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
 from daemon.channels.base import Channel
-from daemon.config import ANTHROPIC, OLLAMA, ConfigError, Settings
+from daemon.config import ANTHROPIC, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
 from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop, ResolveId
@@ -180,7 +180,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 def _build_providers(settings: Settings) -> dict[str, Provider]:
     """Only the providers the routing table actually names get built."""
     from daemon.llm.providers.anthropic import AnthropicProvider
+    from daemon.llm.providers.gemini import GeminiProvider
     from daemon.llm.providers.ollama import OllamaProvider
+    from daemon.llm.providers.openai import OpenAIProvider
 
     wanted = {route.provider for route in settings.routing_table().values()}
     fallback = settings.fallback_route()
@@ -193,6 +195,10 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
             providers[name] = OllamaProvider(settings.ollama_base_url)
         elif name == ANTHROPIC:
             providers[name] = AnthropicProvider(settings.anthropic_api_key)
+        elif name == OPENAI:
+            providers[name] = OpenAIProvider(settings.openai_api_key)
+        elif name == GEMINI:
+            providers[name] = GeminiProvider(settings.gemini_api_key)
         else:
             raise ConfigError(
                 f"routing names provider {name!r}, which has no implementation yet "

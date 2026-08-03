@@ -1007,6 +1007,42 @@ def test_a_second_setup_can_still_write_the_seed_it_skipped(tmp_path: Path) -> N
     assert "- My name is 루미." in seed_path(tmp_path).read_text(encoding="utf-8")
 
 
+def test_a_data_dir_that_cannot_be_created_is_a_sentence_not_a_traceback(
+    tmp_path: Path,
+) -> None:
+    # DAEMON_DATA_DIR is configuration, so it can be wrong - and this is the
+    # command that runs before `daemon doctor` has ever been useful.
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    existing = f"DAEMON_PRESET=offline\nDAEMON_DATA_DIR={blocked / 'data'}\n"
+
+    result = drive(
+        tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
+    )
+
+    assert result.code == 0
+    assert "Could not write" in result.out
+    assert "daemon run" in result.out  # it still finishes the run
+
+
+def test_a_pairing_database_that_cannot_be_opened_is_reported(tmp_path: Path) -> None:
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    existing = f"DAEMON_PRESET=offline\nDAEMON_DATA_DIR={blocked / 'data'}\n"
+    inbox = Inbox()
+
+    result = drive(
+        tmp_path,
+        ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "y"],
+        existing=existing,
+        checks=checks_with(inbox),
+    )
+
+    assert result.code == 0
+    assert "Could not open the pairing database" in result.out
+    assert "daemon pairing approve <code>" in result.out
+
+
 def test_the_seed_builder_is_the_same_file_the_wizard_writes(tmp_path: Path) -> None:
     # One assertion that the markdown shape lives in a function rather than in the
     # middle of the conversation, so it can be read without driving a wizard.
@@ -1220,6 +1256,23 @@ def test_ctrl_c_while_waiting_keeps_the_written_env(tmp_path: Path) -> None:
     assert f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}" in result.written
     assert "Stopped there" in result.out
     assert "was not touched" not in result.out
+
+
+def test_leaving_mid_wait_still_confirms_what_was_already_consumed(tmp_path: Path) -> None:
+    # The cursor is saved from a `finally`, so an interrupted wait cannot leave the
+    # daemon believing an update it will never be offered is still coming.
+    inbox = Inbox([(message(70, 999, "hello", first_name="Stranger"),)])
+    answers = answers_for(pairing=["y"])  # runs out at "Is id=999 you"
+
+    result = drive(tmp_path, answers, checks=checks_with(inbox))
+
+    assert result.code == 0
+    store = open_store(tmp_path)
+    try:
+        assert store.load_cursor("telegram") == 71
+        assert not store.has_owner("telegram")
+    finally:
+        store.close()
 
 
 def test_the_token_never_appears_while_pairing(tmp_path: Path) -> None:
