@@ -53,6 +53,7 @@ def working_checks() -> Checks:
     return Checks(
         anthropic=lambda key, model: Verdict(True, "key works"),
         gemini=lambda key: Verdict(True, "key works"),
+        openai=lambda key, model: Verdict(True, "key works"),
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
         ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ("gemma3:4b",)),
         updates=no_network,
@@ -64,6 +65,7 @@ class Recorder:
     """Counts probe calls, so a test can assert what setup did *not* do."""
 
     anthropic: list[str] = field(default_factory=list)
+    openai: list[str] = field(default_factory=list)
     gemini: list[str] = field(default_factory=list)
     telegram: list[str] = field(default_factory=list)
     ollama: list[str] = field(default_factory=list)
@@ -72,6 +74,10 @@ class Recorder:
     def checks(self, *, gemini_verdict: Verdict | None = None) -> Checks:
         def anthropic(key: str, model: str) -> Verdict:
             self.anthropic.append(key)
+            return Verdict(True, "key works")
+
+        def openai(key: str, model: str) -> Verdict:
+            self.openai.append(key)
             return Verdict(True, "key works")
 
         def gemini(key: str) -> Verdict:
@@ -88,6 +94,7 @@ class Recorder:
 
         return Checks(
             anthropic=anthropic,
+            openai=openai,
             gemini=gemini,
             telegram=telegram,
             ollama=ollama,
@@ -233,7 +240,7 @@ def test_balanced_asks_for_anthropic_but_not_for_voice(tmp_path: Path) -> None:
     recorder = Recorder()
     result = drive(
         tmp_path,
-        ["2", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
+        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
         checks=recorder.checks(),
     )
 
@@ -248,7 +255,7 @@ def test_voice_asks_for_gemini_and_writes_both_model_ids(tmp_path: Path) -> None
     recorder = Recorder()
     result = drive(
         tmp_path,
-        ["2", "y", "gemma3:4b", GOOD_KEY, "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
+        ["2", "anthropic", "y", "gemma3:4b", GOOD_KEY, "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
         checks=recorder.checks(),
     )
 
@@ -266,7 +273,7 @@ def test_quality_does_not_make_ollama_a_condition_of_finishing(tmp_path: Path) -
     # only affects recall quality.
     recorder = Recorder()
     result = drive(
-        tmp_path, ["3", "n", GOOD_KEY, GOOD_TOKEN, "y"], checks=recorder.checks()
+        tmp_path, ["3", "anthropic", "n", GOOD_KEY, GOOD_TOKEN, "y"], checks=recorder.checks()
     )
 
     assert result.code == 0
@@ -331,7 +338,7 @@ def test_a_rejected_key_is_re_asked_and_the_bad_one_is_never_written(
     )
     result = drive(
         tmp_path,
-        ["2", "n", "gemma3:4b", "sk-ant-TYPO", GOOD_KEY, GOOD_TOKEN, "y"],
+        ["2", "anthropic", "n", "gemma3:4b", "sk-ant-TYPO", GOOD_KEY, GOOD_TOKEN, "y"],
         checks=checks,
     )
 
@@ -359,7 +366,12 @@ def test_the_key_is_checked_against_the_configured_model(tmp_path: Path) -> None
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
     )
     existing = "DAEMON_PRESET=balanced\nDAEMON_ANTHROPIC_MODEL=claude-opus-4-1\n"
-    drive(tmp_path, ["n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"], existing=existing, checks=checks)
+    drive(
+        tmp_path,
+        ["anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=checks,
+    )
 
     assert seen == ["claude-opus-4-1"]
 
@@ -371,7 +383,7 @@ def test_giving_up_on_a_key_writes_nothing(tmp_path: Path) -> None:
         telegram=lambda token: Verdict(True, "ok"),
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
     )
-    answers = ["2", "n", "gemma3:4b", "bad1", "bad2", "bad3", GOOD_TOKEN, "y"]
+    answers = ["2", "anthropic", "n", "gemma3:4b", "bad1", "bad2", "bad3", GOOD_TOKEN, "y"]
     result = drive(tmp_path, answers, checks=checks)
 
     assert result.code == 1
@@ -385,7 +397,8 @@ def test_a_verdict_hint_is_shown_so_the_user_can_act_on_it(tmp_path: Path) -> No
     )
     result = drive(
         tmp_path,
-        ["3", "y", GOOD_KEY, "AIza-STANDARD-KEY", "AIza-AUTH-KEY", "", GOOD_TOKEN, "y"],
+        # quality + voice on: the hosted chat key, then the voice key three times.
+        ["3", "anthropic", "y", GOOD_KEY, "AIza-STANDARD-KEY", "AIza-AUTH-KEY", "", GOOD_TOKEN],
         checks=Recorder().checks(gemini_verdict=verdict),
         opener=recorder.opened.append,
     )
@@ -550,7 +563,10 @@ def test_a_value_already_in_the_file_is_not_asked_for_again(tmp_path: Path) -> N
     recorder = Recorder()
     existing = f"DAEMON_PRESET=balanced\nANTHROPIC_API_KEY={GOOD_KEY}\n"
     result = drive(
-        tmp_path, ["n", "gemma3:4b", GOOD_TOKEN, "y"], existing=existing, checks=recorder.checks()
+        tmp_path,
+        ["anthropic", "n", "gemma3:4b", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=recorder.checks(),
     )
 
     assert result.code == 0
@@ -654,7 +670,7 @@ def test_a_file_that_still_fails_validation_is_explained_not_traced(tmp_path: Pa
 def test_no_secret_is_ever_echoed_back(tmp_path: Path) -> None:
     result = drive(
         tmp_path,
-        ["2", "y", GOOD_KEY, "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
+        ["2", "anthropic", "y", GOOD_KEY, "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
         existing="DAEMON_OLLAMA_MODEL=gemma3:4b\n",
     )
 
@@ -1408,6 +1424,205 @@ def test_the_real_poll_asks_telegram_only_for_messages(
     # A bare list would render as `allowed_updates=message`, which the Bot API
     # refuses to parse.
     assert seen["params"] == {"timeout": 20, "allowed_updates": '["message"]', "offset": 7}
+
+
+# --- whose model, as a separate question --------------------------------------
+
+HOSTED_KEY = {
+    "anthropic": ("ANTHROPIC_API_KEY", GOOD_KEY),
+    "openai": ("OPENAI_API_KEY", "sk-proj-REALOPENAI7777"),
+    "gemini": ("GEMINI_API_KEY", "AIza-REALGEMINI5555"),
+}
+
+
+@pytest.mark.parametrize("provider", list(HOSTED_KEY))
+def test_the_chosen_provider_is_the_one_whose_key_is_asked_for(
+    tmp_path: Path, provider: str
+) -> None:
+    # The defect this closes: the preset table hardcoded Anthropic, so a user who
+    # wanted GPT was asked for an Anthropic key and got a config that could not
+    # start. "provider-agnostic" was true of the config surface and false of the
+    # product (docs/PLAN.md 3.2).
+    key_name, key_value = HOSTED_KEY[provider]
+    recorder = Recorder()
+    # balanced, the chosen provider, voice off, then the model id where one is
+    # asked for (anthropic has a Settings default, so it is not).
+    answers = ["2", provider, "n", "gemma3:4b", key_value]
+    if provider != "anthropic":
+        answers.append("")  # the offered model id
+    answers += [GOOD_TOKEN, "y", "", "", "", "n"]
+
+    result = drive(tmp_path, answers, checks=recorder.checks())
+
+    assert result.code == 0
+    assert f"DAEMON_HOSTED_PROVIDER={provider}" in result.written
+    assert f"{key_name}={key_value}" in result.written
+    # And nobody else's key was asked for.
+    for other, (other_name, _) in HOSTED_KEY.items():
+        if other != provider:
+            assert other_name not in result.written
+    assert getattr(recorder, provider) == [key_value]
+
+
+@pytest.mark.parametrize("provider", list(HOSTED_KEY))
+def test_the_env_the_wizard_writes_loads_and_routes_to_that_provider(
+    tmp_path: Path, provider: str
+) -> None:
+    """The acceptance question for this command: does what it wrote actually start?
+
+    docs/CONTRACTS.md: unit tests were not enough, and a written `.env` that
+    `Settings()` refuses is exactly the shape of failure that keeps getting
+    through - the wizard reports success and `daemon run` reports a broken
+    configuration.
+    """
+    from daemon.config import Settings
+    from daemon.tasks import Task
+
+    _, key_value = HOSTED_KEY[provider]
+    answers = ["2", provider, "n", "gemma3:4b", key_value]
+    if provider != "anthropic":
+        answers.append("")
+    answers += [GOOD_TOKEN, "y", "", "", "", "n"]
+
+    result = drive(tmp_path, answers)
+
+    assert result.code == 0
+    settings = Settings(_env_file=result.env_path)
+    routes = settings.routing_table()
+    assert routes[Task.CHAT_TEXT].provider == provider
+    assert routes[Task.CHAT_TEXT].model  # a provider with no model id cannot start
+    assert routes[Task.REFLECTION].provider == provider
+
+
+def test_offline_is_never_asked_whose_model(tmp_path: Path) -> None:
+    # It resolves no hosted task, so the question would be about a bill nobody is
+    # going to get - and the answer would be written into the file as if it meant
+    # something.
+    result = drive(tmp_path, answers_for())
+
+    assert result.code == 0
+    assert "Whose model" not in result.out
+    assert "DAEMON_HOSTED_PROVIDER" not in result.written
+
+
+def test_gemini_as_the_chat_provider_still_warns_about_standard_keys(
+    tmp_path: Path,
+) -> None:
+    # The trap is a property of the key, not of what it is used for, so choosing
+    # Gemini for text has to reuse the warning voice already had.
+    verdict = Verdict(
+        False, "Google refused the key (HTTP 403).", hint=setup.GEMINI_STANDARD_KEY_HINT
+    )
+    result = drive(
+        tmp_path,
+        ["2", "gemini", "n", "gemma3:4b", "AIza-STANDARD", "AIza-STANDARD", "AIza-STANDARD"],
+        checks=Recorder().checks(gemini_verdict=verdict),
+    )
+
+    assert result.code == 1
+    assert "September 2026" in result.out
+    assert setup.AI_STUDIO_URL in result.out
+
+
+def test_an_openai_key_is_masked_in_the_change_list(tmp_path: Path) -> None:
+    # `_all_needs` decides which keys may be printed, and it used to enumerate
+    # presets only - so a provider reachable only through DAEMON_HOSTED_PROVIDER
+    # was not known to be a secret, and would have been echoed in full.
+    secret = "sk-proj-REALOPENAI7777"
+    result = drive(
+        tmp_path,
+        ["2", "openai", "n", "gemma3:4b", secret, "", GOOD_TOKEN, "y", "", "", "", "n"],
+    )
+
+    assert result.code == 0
+    assert secret not in result.out
+    assert f"...{secret[-4:]}" in result.out
+    assert secret in result.written
+
+
+def test_a_provider_already_chosen_is_not_asked_again(tmp_path: Path) -> None:
+    existing = "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai\n"
+    result = drive(
+        tmp_path,
+        ["n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "", "n"],
+        existing=existing,
+    )
+
+    assert result.code == 0
+    assert "hosted provider: openai (already in .env, keeping it)" in result.out.lower()
+
+
+def test_check_reports_which_provider_the_file_chose(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=gemini\n", encoding="utf-8"
+    )
+    out = io.StringIO()
+
+    setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out)
+
+    assert "hosted provider: gemini" in out.getvalue()
+    # And it reports the keys that choice needs, not Anthropic's.
+    assert "GEMINI_API_KEY" in out.getvalue()
+    assert "ANTHROPIC_API_KEY" not in out.getvalue()
+
+
+def test_openai_reports_a_rejected_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup.httpx, "get", canned(401))
+
+    verdict = setup.check_openai("sk-wrong", "gpt-5.1")
+
+    assert not verdict.ok
+    assert "rejected the key" in verdict.detail
+    assert setup.OPENAI_KEYS_URL in verdict.hint
+
+
+def test_openai_flags_a_model_id_that_is_not_on_the_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The default model id here has no Settings default behind it, so a stale one
+    # has to be caught at setup time rather than at the first message.
+    monkeypatch.setattr(setup.httpx, "get", canned(200, {"data": [{"id": "gpt-4.1"}]}))
+
+    verdict = setup.check_openai("sk-real", setup.DEFAULT_OPENAI_MODEL)
+
+    assert verdict.ok
+    assert "not in your model list" in verdict.detail
+    assert "DAEMON_OPENAI_MODEL" in verdict.hint
+
+
+def test_the_openai_key_travels_in_a_header_not_the_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        seen["url"] = url
+        seen["headers"] = kwargs.get("headers")
+        return httpx.Response(200, json={}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(setup.httpx, "get", get)
+    setup.check_openai("sk-SECRET", "gpt-5.1")
+
+    assert "sk-SECRET" not in str(seen["url"])
+    assert seen["headers"] == {"authorization": "Bearer sk-SECRET"}
+
+
+def test_the_hosted_placeholder_is_resolved_before_a_key_is_asked_for() -> None:
+    # config.PRESETS names a HOSTED placeholder, not a provider. Reading it raw
+    # would have the wizard ask for a key for a provider called "hosted"; letting
+    # it default would ask someone who chose Gemini for an Anthropic key.
+    anthropic = {need.key for need in setup.needs_for({"DAEMON_PRESET": "balanced"})}
+    gemini = {
+        need.key
+        for need in setup.needs_for(
+            {"DAEMON_PRESET": "balanced", "DAEMON_HOSTED_PROVIDER": "gemini"}
+        )
+    }
+
+    assert "ANTHROPIC_API_KEY" in anthropic
+    assert "GEMINI_API_KEY" not in anthropic
+    assert "GEMINI_API_KEY" in gemini
+    assert "ANTHROPIC_API_KEY" not in gemini
 
 
 def test_needs_come_from_the_preset_table(tmp_path: Path) -> None:

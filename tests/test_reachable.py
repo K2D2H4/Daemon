@@ -203,3 +203,59 @@ def test_every_pending_entry_names_its_milestone() -> None:
     """A gap without an owner is just a gap."""
     for label, reason in (*PENDING_TASKS.items(), *PENDING_CLASSES.items()):
         assert re.search(r"M\d", reason), f"{label} is pending with no milestone: {reason!r}"
+
+
+# --- configuration a person can actually write --------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("4242", ("4242",)),
+        ("4242,4243", ("4242", "4243")),
+        ("4242, 4243", ("4242", "4243")),
+        ('["4242"]', ("4242",)),  # still accepted, for anyone who wrote one
+        ("", ()),
+    ],
+)
+def test_the_allowlist_accepts_what_a_person_would_type(
+    raw: str, expected: tuple[str, ...]
+) -> None:
+    """.env.example documents a comma-separated list, and only JSON worked:
+    pydantic-settings decodes a complex field before field validators run, so
+    `4242` raised a ValidationError and `4242,4243` raised a SettingsError. The
+    consequence was not cosmetic - `dm_policy=allowlist` could not be configured
+    at all, and the splitting validator was dead code that looked live.
+
+    This belongs in the reachability file because it is the same defect class:
+    a configuration surface that documents something the product cannot accept.
+    """
+    from daemon.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PRESET="offline",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR="/tmp/daemon-allowlist",
+        TELEGRAM_BOT_TOKEN="fake",
+        TELEGRAM_ALLOWED_USER_IDS=raw,
+    )
+    assert settings.telegram_allowed_user_ids == expected
+
+
+def test_every_documented_env_key_is_a_real_setting() -> None:
+    """.env.example is the only instruction most people will read. A key that
+    exists there and nowhere in the code is a documented no-op."""
+    import re as _re
+
+    from daemon.config import Settings
+
+    example = (DAEMON.parent / ".env.example").read_text(encoding="utf-8")
+    documented = set(_re.findall(r"^([A-Z][A-Z0-9_]+)=", example, _re.MULTILINE))
+    aliases = {
+        field.alias
+        for field in Settings.model_fields.values()
+        if field.alias is not None
+    }
+    unknown = documented - aliases
+    assert not unknown, f".env.example documents keys nothing reads: {sorted(unknown)}"

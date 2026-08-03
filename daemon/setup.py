@@ -67,7 +67,10 @@ from daemon.config import (
     DEFAULT_HOSTED_PROVIDER,
     ENV_FILE,
     GEMINI,
+    HOSTED,
+    HOSTED_PROVIDERS,
     OLLAMA,
+    OPENAI,
     PRESETS,
     ConfigError,
     Settings,
@@ -88,8 +91,14 @@ HTTP_TIMEOUT = 15.0
 the endpoint is unreachable and asks again."""
 
 ANTHROPIC_KEYS_URL = "https://console.anthropic.com/settings/keys"
+OPENAI_KEYS_URL = "https://platform.openai.com/api-keys"
 AI_STUDIO_URL = "https://aistudio.google.com/apikey"
 BOTFATHER_URL = "https://t.me/BotFather"
+
+OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+"""Duplicated from daemon/llm/providers/openai.py rather than imported: nothing
+outside `daemon/llm/providers/` may import a provider (docs/CONTRACTS.md 4), and
+the providers are async while this module is deliberately not."""
 
 DEFAULT_OLLAMA_MODEL = "gemma3:4b"
 """Not a reasoning model, and not `Settings.ollama_model`'s default. docs/PLAN.md
@@ -99,9 +108,32 @@ should land on the usable side of that."""
 DEFAULT_EMBED_MODEL = "bge-m3"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_GEMINI_LIVE_MODEL = "gemini-live-2.5-flash-preview"
+DEFAULT_OPENAI_MODEL = "gpt-5.1"
+"""Offered, then checked against the account's own model list before it is
+written - so a default that goes stale is a sentence here and a hint naming the
+ids that do exist, rather than a 404 at the first message."""
 
 PRESET_ORDER = ("offline", "balanced", "quality")
 DEFAULT_PRESET = "balanced"
+
+HOSTED_HELP: dict[str, tuple[str, ...]] = {
+    "anthropic": (
+        "The default, and what the presets above were measured against. Reads",
+        "long conversations well, which is what the daily reflection does before",
+        "its conclusions propagate into the whole memory graph.",
+    ),
+    "openai": (
+        "Pick this if it is the account you already pay for. Nothing else about",
+        "Daemon changes - same presets, same memory, same everything.",
+    ),
+    "gemini": (
+        "The one that shares a key with voice: native-audio voice is Google's",
+        "either way, so choosing it here means one key and one bill instead of",
+        "two. Note the Standard-key trap below if you have an older key.",
+    ),
+}
+"""What separates them, rather than which model ids they publish - ids change
+every few months and are the wrong thing to choose a vendor by."""
 
 PRESET_HELP: dict[str, tuple[str, ...]] = {
     "offline": (
@@ -113,18 +145,18 @@ PRESET_HELP: dict[str, tuple[str, ...]] = {
         "Needs: Ollama and two local models. No API keys, no accounts.",
     ),
     "balanced": (
-        "Conversation and the daily reflection go to Claude, because reflection",
-        "quality propagates into the whole memory graph. The 'should I speak?'",
-        "check stays local - it runs every five minutes whether or not it ever",
-        "speaks, so hosted cost would accumulate for nothing.",
-        "Voice can be turned on. Needs: an Anthropic key, plus Ollama for the",
-        "local check and for recall embeddings.",
+        "Conversation and the daily reflection go to a hosted model, because",
+        "reflection quality propagates into the whole memory graph. The 'should I",
+        "speak?' check stays local - it runs every five minutes whether or not it",
+        "ever speaks, so hosted cost would accumulate for nothing.",
+        "Voice can be turned on. Needs: one hosted API key (whose is the next",
+        "question), plus Ollama for the local check and for recall embeddings.",
     ),
     "quality": (
         "Everything hosted, including the five-minute proactive check. Best",
         "quality, highest running cost. Embeddings stay local in every preset,",
         "so recall still wants Ollama - `daemon doctor` checks that.",
-        "Voice can be turned on. Needs: an Anthropic key.",
+        "Voice can be turned on. Needs: one hosted API key.",
     ),
 }
 
@@ -287,6 +319,41 @@ def check_anthropic(key: str, model: str) -> Verdict:
     return Verdict(True, "key works")
 
 
+def check_openai(key: str, model: str) -> Verdict:
+    """Validate the key, and the model id, against the account's model list.
+
+    Same call and same reasoning as `check_anthropic`: `GET /v1/models` costs no
+    tokens and is the only cheap way to find out that a model id this install will
+    ask for is not one this account can use.
+    """
+    try:
+        response = httpx.get(
+            OPENAI_MODELS_URL,
+            headers={"authorization": f"Bearer {key}"},
+            timeout=HTTP_TIMEOUT,
+        )
+    except httpx.HTTPError as exc:
+        return Verdict(False, f"could not reach api.openai.com: {exc}")
+
+    if response.status_code in (401, 403):
+        return Verdict(
+            False,
+            f"OpenAI rejected the key (HTTP {response.status_code}).",
+            hint=f"Copy it again from {OPENAI_KEYS_URL} - it starts with 'sk-'.",
+        )
+    if response.status_code != 200:
+        return Verdict(False, f"api.openai.com returned HTTP {response.status_code}")
+
+    ids = _string_field(response, "data", "id")
+    if model and ids and model not in ids:
+        return Verdict(
+            True,
+            f"key works, but {model!r} is not in your model list",
+            hint="Set DAEMON_OPENAI_MODEL in .env to one of: " + ", ".join(sorted(ids)[:5]),
+        )
+    return Verdict(True, "key works")
+
+
 def check_gemini(key: str) -> Verdict:
     """Validate the key, and name the Standard-key trap when that is the cause.
 
@@ -419,6 +486,7 @@ class Checks:
     """The network probes, in one injectable bundle."""
 
     anthropic: Callable[[str, str], Verdict] = check_anthropic
+    openai: Callable[[str, str], Verdict] = check_openai
     gemini: Callable[[str], Verdict] = check_gemini
     telegram: Callable[[str], Verdict] = check_telegram
     ollama: Callable[[str], OllamaState] = check_ollama
@@ -510,34 +578,72 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 secret=True,
             )
         )
-    if GEMINI in providers:
+        # No model question: DAEMON_ANTHROPIC_MODEL is the one hosted model id
+        # Settings has a default for, and `check_anthropic` verifies that default
+        # against the account rather than assuming it.
+    if OPENAI in providers:
         needs.append(
             Need(
-                key="GEMINI_API_KEY",
-                label="Gemini API key",
-                why="Voice is on, so audio goes to Google's native-audio model - with your key.",
-                url=AI_STUDIO_URL,
+                key="OPENAI_API_KEY",
+                label="OpenAI API key",
+                why="You chose GPT for the hosted work. Your key, your account, your bill.",
+                url=OPENAI_KEYS_URL,
                 secret=True,
             )
         )
         needs.append(
             Need(
-                key="DAEMON_GEMINI_LIVE_MODEL",
-                label="Gemini Live model id",
-                why="The realtime audio endpoint takes its own model id, not the text one.",
-                default=DEFAULT_GEMINI_LIVE_MODEL,
+                key="DAEMON_OPENAI_MODEL",
+                label="OpenAI model id",
+                why="Which model answers. Settings has no default here, so an empty "
+                "value would refuse to start.",
+                default=DEFAULT_OPENAI_MODEL,
             )
         )
-        # Settings resolves every routed task's model, and the voice task routes
-        # to gemini, so this must be non-empty even though voice reads the Live id
-        # above. Asking twice for one capability is noise, so it is filled in.
+    if GEMINI in providers:
+        # Gemini can be here for two unrelated reasons - it is the hosted chat
+        # provider, or voice is on and native audio is Google's either way - and
+        # the questions differ, so the reason has to be named rather than assumed.
+        # It was assumed, back when voice was the only way to get here.
+        gemini_chat = hosted == GEMINI and HOSTED in PRESETS[preset].values()
+        voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
+        if gemini_chat and voice_on:
+            why = "One key covers both: Gemini answers, and voice is Google's too."
+        elif gemini_chat:
+            why = "You chose Gemini for the hosted work. Your key, your account, your bill."
+        else:
+            why = "Voice is on, so audio goes to Google's native-audio model - with your key."
+        needs.append(
+            Need(
+                key="GEMINI_API_KEY",
+                label="Gemini API key",
+                why=why,
+                url=AI_STUDIO_URL,
+                secret=True,
+            )
+        )
+        if voice_on:
+            needs.append(
+                Need(
+                    key="DAEMON_GEMINI_LIVE_MODEL",
+                    label="Gemini Live model id",
+                    why="The realtime audio endpoint takes its own model id, not the text one.",
+                    default=DEFAULT_GEMINI_LIVE_MODEL,
+                )
+            )
         needs.append(
             Need(
                 key="DAEMON_GEMINI_MODEL",
                 label="Gemini text model id",
-                why="Required alongside the Live id; not used by voice itself.",
+                why="Which model answers."
+                if gemini_chat
+                else "Required alongside the Live id; not used by voice itself.",
                 default=DEFAULT_GEMINI_MODEL,
-                silent=True,
+                # Settings resolves a model for every routed task, and the voice
+                # task routes to gemini, so this must be non-empty even when only
+                # voice brought us here. Asking twice for one capability is noise,
+                # so in that case it is filled in rather than asked.
+                silent=not gemini_chat,
             )
         )
     needs.append(
@@ -857,12 +963,14 @@ class Wizard:
         say()
 
         preset = self._choose_preset(env, updates)
+        hosted = self._choose_hosted(preset, env, updates)
         voice = self._choose_voice(preset, env, updates)
 
         merged = {
             **env,
             **updates,
             "DAEMON_PRESET": preset,
+            "DAEMON_HOSTED_PROVIDER": hosted,
             "DAEMON_VOICE_ENABLED": str(voice).lower(),
         }
         for need in needs_for(merged):
@@ -909,6 +1017,42 @@ class Wizard:
         updates["DAEMON_PRESET"] = preset
         self.prompt.say()
         return preset
+
+    def _choose_hosted(self, preset: str, env: Mapping[str, str], updates: dict[str, str]) -> str:
+        """Which commercial provider answers wherever the preset says "hosted".
+
+        A second axis rather than nine presets: a preset says *where* work runs,
+        this says *whose model* runs it. Asked right after the preset because it
+        decides which key the next few questions are about - and not asked at all
+        under `offline`, which resolves no hosted task and would be answering a
+        question about a bill nobody is going to get.
+        """
+        if HOSTED not in PRESETS[preset].values():
+            self.prompt.say(f"Nothing in the {preset} preset talks to a hosted model, so there")
+            self.prompt.say("is no provider to choose and no API key to paste.")
+            self.prompt.say()
+            return DEFAULT_HOSTED_PROVIDER
+
+        current = env.get("DAEMON_HOSTED_PROVIDER", "")
+        if current in HOSTED_PROVIDERS:
+            self.prompt.say(f"Hosted provider: {current} (already in .env, keeping it).")
+            self.prompt.say()
+            return current
+
+        self.prompt.say("Whose model should the hosted work go to? The preset decided where")
+        self.prompt.say("work runs; this decides who runs it. Changeable later, and it is one")
+        self.prompt.say("key either way - Daemon is not a reseller, you bring your own.")
+        for index, name in enumerate(HOSTED_PROVIDERS, start=1):
+            self.prompt.say(f"  {index}) {name}")
+            for line in HOSTED_HELP[name]:
+                self.prompt.say(f"     {line}")
+        self.prompt.say()
+        chosen = self.prompt.ask_choice(
+            "Provider", HOSTED_PROVIDERS, default=DEFAULT_HOSTED_PROVIDER
+        )
+        updates["DAEMON_HOSTED_PROVIDER"] = chosen
+        self.prompt.say()
+        return chosen
 
     def _choose_voice(self, preset: str, env: Mapping[str, str], updates: dict[str, str]) -> bool:
         if GEMINI not in providers_for(preset, voice_enabled=True):
@@ -987,6 +1131,8 @@ class Wizard:
             # model this install will actually ask for.
             model = env.get("DAEMON_ANTHROPIC_MODEL") or _config_default("anthropic_model")
             return self.checks.anthropic(value, model)
+        if need.key == "OPENAI_API_KEY":
+            return self.checks.openai(value, env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL)
         if need.key == "GEMINI_API_KEY":
             return self.checks.gemini(value)
         if need.key == "TELEGRAM_BOT_TOKEN":
@@ -1273,12 +1419,24 @@ class Wizard:
 
 
 def _all_needs() -> list[Need]:
-    """Every key any preset can require, deduplicated: used to decide whether a
-    value may be printed, and to list what `--check` found already set."""
+    """Every key any configuration can require, deduplicated: used to decide
+    whether a value may be printed, and to list what `--check` found already set.
+
+    Every hosted provider, not just the default one. Iterating presets alone left
+    `OPENAI_API_KEY` out of the set of keys known to be secret, which is the sort
+    of omission that ends with a key printed in the change list.
+    """
     seen: dict[str, Need] = {}
     for preset in PRESET_ORDER:
-        for need in needs_for({"DAEMON_PRESET": preset, "DAEMON_VOICE_ENABLED": "true"}):
-            seen.setdefault(need.key, need)
+        for hosted in HOSTED_PROVIDERS:
+            for need in needs_for(
+                {
+                    "DAEMON_PRESET": preset,
+                    "DAEMON_HOSTED_PROVIDER": hosted,
+                    "DAEMON_VOICE_ENABLED": "true",
+                }
+            ):
+                seen.setdefault(need.key, need)
     return list(seen.values())
 
 
@@ -1352,7 +1510,11 @@ def report(path: Path, prompt: Prompt) -> int:
         return PROBLEM
     voice = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
     default_note = "" if env.get("DAEMON_PRESET") else " (default, not set in the file)"
-    prompt.say(f"preset: {preset}{default_note}, voice {'on' if voice else 'off'}")
+    hosted = env.get("DAEMON_HOSTED_PROVIDER", "") or DEFAULT_HOSTED_PROVIDER
+    prompt.say(
+        f"preset: {preset}{default_note}, hosted provider: {hosted}, "
+        f"voice {'on' if voice else 'off'}"
+    )
 
     missing = needs_for(env)
     for need in _all_needs():

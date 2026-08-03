@@ -13,9 +13,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from daemon.tasks import Task
 
@@ -239,9 +240,15 @@ class Settings(BaseSettings):
     start, which is exactly the state a first run is in."""
 
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
-    telegram_allowed_user_ids: tuple[str, ...] = Field(
+    telegram_allowed_user_ids: Annotated[tuple[str, ...], NoDecode] = Field(
         default=(), alias="TELEGRAM_ALLOWED_USER_IDS"
     )
+    """NoDecode because pydantic-settings JSON-decodes a complex field *before*
+    field validators run. Without it `4242` raised a ValidationError and
+    `4242,4243` raised a SettingsError, so only `["4242"]` loaded - meaning the
+    comma-separated form documented in .env.example was impossible to write by
+    hand, `dm_policy=allowlist` could not be configured at all, and `_split_ids`
+    below was dead code that looked like it worked."""
 
     data_dir: Path = Field(default=Path("./data"), alias="DAEMON_DATA_DIR")
 
@@ -253,8 +260,20 @@ class Settings(BaseSettings):
     @field_validator("telegram_allowed_user_ids", mode="before")
     @classmethod
     def _split_ids(cls, value: object) -> object:
+        """Accept what a person would actually type: `4242`, `4242,4243`, or with
+        spaces. A JSON list still works, for anyone who already wrote one."""
         if isinstance(value, str):
-            return tuple(part.strip() for part in value.split(",") if part.strip())
+            text = value.strip()
+            if text.startswith("["):
+                import json
+
+                try:
+                    return tuple(str(item).strip() for item in json.loads(text))
+                except (ValueError, TypeError):
+                    return ()
+            return tuple(
+                part.strip() for part in text.replace(",", " ").split() if part.strip()
+            )
         return value
 
     @model_validator(mode="after")
