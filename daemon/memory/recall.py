@@ -43,6 +43,7 @@ result costs the model some context; an exception costs the user their turn.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
@@ -73,6 +74,11 @@ MAX_QUERY_TOKENS = 32
 """A pasted wall of text would otherwise become a 400-term FTS query."""
 
 BACKFILL_BATCH = 32
+
+VECTOR_LANE_BUDGET_SECONDS = 3.0
+"""Wall-clock ceiling for the query embedding. Generous enough for a cold model
+load to sometimes make it, short enough that a stalled Ollama costs one turn of
+keyword-only recall instead of half a minute of silence."""
 
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 """Word characters only, matching what `unicode61` treats as token content.
@@ -128,6 +134,12 @@ class MemoryRecall:
         self._now = now
         self._matrix: np.ndarray | None = None
         self._ids: list[int] = []
+        # The vector lane can die three ways - no embedder reachable, a dimension
+        # mismatch after a model swap, an unfinished backfill - and all three look
+        # identical from outside: no exception, no failure, just Korean recall
+        # quietly capped at the keyword-only ceiling (measured: 50% against 93%).
+        # So the state is recorded rather than only logged, and /health reports it.
+        self._vector_lane_error: str | None = None
 
     # --- search -------------------------------------------------------------
 
@@ -158,6 +170,9 @@ class MemoryRecall:
                         role=row["role"],
                         score=score,
                         reason=_reason(kw > 0, vec > 0),
+                        # Carried, not dropped: the column is unforgeable so the
+                        # renderer can tell relayed text from the owner's own.
+                        origin=row["origin"],
                     ),
                 )
             )
@@ -194,22 +209,35 @@ class MemoryRecall:
     async def _vector_lane(self, query: str, pool: int) -> dict[int, float]:
         """message id -> cosine in [0, 1]. Empty when the lane is unavailable."""
         if self._embedder is None:
+            self._vector_lane_error = "no embedder configured"
             return {}
         try:
-            vectors = await self._embedder.embed([query])
-        except Exception as exc:  # noqa: BLE001 - see the module docstring
+            # Bounded on purpose. The only limit otherwise is httpx's 30 s, and a
+            # cold Ollama reloading an unloaded model is slow rather than broken -
+            # so a lane declared to have a sub-second budget would sit there for
+            # half a minute, in voice mode as pure silence. One keyword-only turn
+            # is the better trade; the next turn finds the model warm.
+            async with asyncio.timeout(VECTOR_LANE_BUDGET_SECONDS):
+                vectors = await self._embedder.embed([query])
+        except (Exception, TimeoutError) as exc:  # noqa: BLE001 - module docstring
+            self._vector_lane_error = f"embedder failed: {type(exc).__name__}"
             logger.warning("recall: vector lane unavailable, keyword only (%s)", exc)
             return {}
         if not vectors:
+            self._vector_lane_error = "embedder returned nothing"
             return {}
 
         ids, matrix = self._embeddings()
         if matrix.shape[0] == 0:
+            self._vector_lane_error = "no vectors indexed yet - backfill has not run"
             return {}
         probe = np.asarray(vectors[0], dtype=np.float32)
         if probe.shape[0] != matrix.shape[1]:
             # A model change that kept the same name, or a half-finished
             # backfill. Silence beats scoring against the wrong vector space.
+            self._vector_lane_error = (
+                f"dimension mismatch: query {probe.shape[0]}, index {matrix.shape[1]}"
+            )
             logger.warning(
                 "recall: query is %d-dim but the index is %d-dim; run backfill",
                 probe.shape[0],
@@ -233,6 +261,9 @@ class MemoryRecall:
             similarity = float(similarities[index])
             if similarity > 0:  # a negative cosine is evidence against, not for
                 found[ids[index]] = min(1.0, similarity)
+        # Cleared only here, on a lane that actually answered, so a stale error
+        # cannot make /health look worse than it is - or better.
+        self._vector_lane_error = None
         return found
 
     def _embeddings(self) -> tuple[list[int], np.ndarray]:
@@ -267,6 +298,15 @@ class MemoryRecall:
             logger.warning("recall: could not index message %d (%s)", message_id, exc)
             return
         self._matrix = None
+
+    def vector_lane_status(self) -> str:
+        """`ok`, or why the vector lane is not answering."""
+        return self._vector_lane_error or "ok"
+
+    def vector_count(self) -> int:
+        """How many vectors are loaded. Distinguishes "no embedder" from
+        "embedder fine, backfill unfinished" without reading the log."""
+        return len(self._ids)
 
     async def backfill(self, limit: int = 500) -> int:
         """Embed messages this model has no vector for, returning how many landed.

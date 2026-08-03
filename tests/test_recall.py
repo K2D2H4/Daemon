@@ -506,7 +506,9 @@ def test_messages_without_embedding_is_per_model(store: Store) -> None:
     pending_b = store.messages_without_embedding("model-b", 10)
 
     assert [row["id"] for row in pending_a] == [second]
-    assert [row["id"] for row in pending_b] == [first, second]
+    # Newest first: recency decay scores recent messages highest, so a backfill
+    # that runs out of budget must have covered those rather than the oldest.
+    assert [row["id"] for row in pending_b] == [second, first]
 
 
 def test_delete_embeddings_only_drops_its_own_model(store: Store) -> None:

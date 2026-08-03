@@ -34,7 +34,13 @@ class FileMemoryWriter:
         # a mirror nobody can verify.
         message = replace(message, content=message.content.strip())
         log_file = await log.append(self._data_dir, message)
-        self._store.insert_message(
+        # Kept so the caller can index this exact row. Reading it back out of
+        # the mirror instead needed "newest by timestamp", and user rows carry a
+        # channel timestamp while assistant rows carry our own clock - so a user
+        # who sent a second message while the model was still thinking pointed the
+        # lookup at the previous reply, and that utterance was never embedded.
+        # Observed happening inside a *passing* test.
+        self.last_inserted_id = self._store.insert_message(
             message, log_file=log_file, external_id=message.external_id
         )
 

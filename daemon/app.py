@@ -68,7 +68,7 @@ def create_app(
             # Recall can be absent while the rest of the process is healthy (the
             # embedder is down, the module is mid-rewrite). Saying so here is the
             # difference between a degraded daemon and one that quietly forgets.
-            "recall": app.state.recall_status,
+            "recall": _recall_health(app.state),
         }
 
     return app
@@ -122,7 +122,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             recall_limit=settings.recall_limit,
             resolve_id=resolve_id,
         )
-        app.state.loop_task = asyncio.create_task(loop.run(), name="conversation-loop")
+        task = asyncio.create_task(loop.run(), name="conversation-loop")
+        # run() only guards individual turns; anything raised by the channel's own
+        # listen() - a revoked bot token surfaces as TelegramFatal - ends the task.
+        # Without this the process stays alive and healthy-looking with no inbound
+        # path and not one line in the log, because app.state holds the reference
+        # so even asyncio's "never retrieved" warning never fires.
+        task.add_done_callback(_report_loop_death)
+        app.state.loop_task = task
 
     if recall is not None:
         # Backfill after the loop is already serving, and in the background: a
@@ -139,16 +146,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        backfill = getattr(app.state, "backfill_task", None)
-        if backfill is not None:
-            backfill.cancel()
-            with suppress(asyncio.CancelledError):
-                await backfill
-        task = app.state.loop_task
-        if task is not None:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        # `suppress(CancelledError)` alone was not enough. A task that had
+        # *already* finished with some other exception re-raises it on await, and
+        # that escaped the finally block - skipping the channel close, the sqlite
+        # close, the scheduler shutdown and every provider aclose below it. A
+        # revoked bot token was enough to leak the lot on every restart.
+        for name in ("backfill_task", "loop_task"):
+            pending = getattr(app.state, name, None)
+            if pending is None:
+                continue
+            pending.cancel()
+            with suppress(Exception, asyncio.CancelledError):
+                await pending
         if channel is not None:
             with suppress(Exception):
                 await channel.close()
@@ -233,27 +242,63 @@ def _build_io(settings: Settings) -> _IO:
         cursor=store,
     )
     recall, recall_status, embedder = _build_recall(settings, store)
+    writer = FileMemoryWriter(settings.data_dir, store)
     return _IO(
         channel=channel,
-        memory=FileMemoryWriter(settings.data_dir, store),
+        memory=writer,
         recall=recall,
         recall_status=recall_status,
-        resolve_id=_id_resolver(store),
+        resolve_id=_id_resolver(writer),
         close=store.close,
         embedder=embedder,
     )
 
 
+BACKFILL_CHUNK = 500
+"""Rows per backfill call. Small enough to yield often, and the loop below keeps
+going until nothing is left."""
+
+
+def _report_loop_death(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.critical(
+            "conversation loop died; the daemon is running but deaf", exc_info=exc
+        )
+
+
 async def _backfill(recall: Recall) -> None:
-    """Embed history the vector lane is missing. Never fatal: recall degrades to
-    keyword-only, which is worse than the full answer and far better than a dead
-    conversation loop."""
+    """Embed history the vector lane is missing, to exhaustion.
+
+    One call was not enough. It stopped at its default 500 rows and never ran
+    again - no retry, no periodic job - so a rebuilt sqlite file over a year of
+    history left the great majority of messages with no vector while /health
+    still reported recall ready. That is the same invisible Korean ceiling the
+    protocol change was meant to prevent, just further along.
+
+    Never fatal: recall degrades to keyword-only, which is worse than the full
+    answer and far better than a dead conversation loop.
+    """
+    total = 0
     try:
-        landed = await recall.backfill()
-        if landed:
-            logger.info("recall backfill embedded %d message(s)", landed)
+        while True:
+            landed = await recall.backfill(BACKFILL_CHUNK)
+            total += landed
+            if landed < BACKFILL_CHUNK:
+                break
+            # Let the conversation loop breathe between batches; this runs in the
+            # background precisely so a long history does not delay serving.
+            await asyncio.sleep(0)
     except Exception:
-        logger.exception("recall backfill failed; the vector lane stays partial")
+        logger.exception(
+            "recall backfill stopped after %d message(s); the vector lane stays partial",
+            total,
+        )
+        return
+    if total:
+        logger.info("recall backfill embedded %d message(s)", total)
 
 
 def _build_recall(settings: Settings, store: Any) -> tuple[Recall | None, str, Any]:
@@ -286,23 +331,39 @@ def _build_recall(settings: Settings, store: Any) -> tuple[Recall | None, str, A
         return None, f"unavailable: {exc}", None
 
 
-def _id_resolver(store: Any) -> ResolveId:
-    """Read back the id of the message that was just recorded.
+def _recall_health(state: Any) -> str:
+    """What recall is actually doing, not whether it was constructed.
 
-    `MemoryWriter.record()` is frozen and returns nothing, and the id lives in the
-    mirror, so the loop gets this small closure instead of a widened protocol. The
-    text is compared before the id is handed over: `recent(1)` is "newest by
-    timestamp", and a channel-supplied timestamp that runs behind our own clock
-    would otherwise point at the previous turn's row, silently filing one
-    message's vector under another message's id.
+    `"ready"` used to be set once, when the object was built - before anything had
+    asked the embedder a question. Three unrelated failures then looked identical
+    from outside: no embedder reachable, a dimension mismatch after a model swap,
+    an unfinished backfill. Each one caps Korean recall at the keyword-only
+    ceiling (measured: 50% where the hybrid reaches 93%) while raising nothing and
+    failing nothing, on a process that stays up for days and whose logs nobody
+    reads. The vector count is included because it separates "no embedder" from
+    "embedder fine, backfill still working".
+    """
+    recall = getattr(state, "recall", None)
+    if recall is None:
+        return state.recall_status
+    status = getattr(recall, "vector_lane_status", None)
+    if status is None:
+        return state.recall_status
+    lane = status()
+    vectors = recall.vector_count()
+    return f"ready, {vectors} vectors" if lane == "ok" else f"degraded: {lane}"
+
+
+def _id_resolver(writer: Any) -> ResolveId:
+    """The id of the row `record()` just wrote.
+
+    `MemoryWriter.record()` is frozen and returns nothing, so the loop gets this
+    closure rather than a widened protocol - but it now reads the id the writer
+    kept from `insert_message`, instead of guessing at "the newest row".
     """
 
-    def resolve(text: str) -> int | None:
-        rows = store.recent(1)
-        if not rows:
-            return None
-        row = rows[-1]
-        return int(row["id"]) if row["content"] == text.strip() else None
+    def resolve(_text: str) -> int | None:
+        return getattr(writer, "last_inserted_id", None)
 
     return resolve
 

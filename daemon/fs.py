@@ -19,23 +19,44 @@ DIR_MODE = 0o700
 FILE_MODE = 0o600
 
 
-def secure_dir(path: Path) -> None:
-    """Create `path` (and parents) owner-only.
+def secure_dir(path: Path, *, stop_at: Path | None = None) -> None:
+    """Create `path` owner-only, tightening only what this call is responsible for.
 
-    `Path.mkdir(mode=...)` applies the mode only to the leaf, so intermediate
-    directories would keep the default. Walk the chain and pin each one.
+    `Path.mkdir(mode=...)` applies the mode only to the leaf, so intermediates it
+    creates would keep the default and have to be tightened too.
+
+    The walk is bounded on purpose. An earlier version climbed every parent until
+    a chmod failed, which was harmless while the data dir was relative (`./data`
+    stopped at the repo root) and became a real side effect once log paths were
+    absolutised: `daemon install` would have walked out to $HOME and set it to
+    0700, cutting off ~/Public and friends and stripping setgid or sticky bits
+    from directories that have nothing to do with us. Nothing outside our own
+    data directory is ours to re-permission.
+
+    `stop_at` is the highest directory this call may touch; it defaults to the
+    directories this call actually created.
     """
+    created: list[Path] = []
+    if not path.exists():
+        for candidate in (path, *path.parents):
+            if candidate.exists():
+                break
+            created.append(candidate)
     path.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
-    for parent in (path, *path.parents):
+
+    targets = [path, *created]
+    if stop_at is not None:
+        # Everything from `path` up to and including `stop_at`.
+        for parent in path.parents:
+            targets.append(parent)
+            if parent == stop_at:
+                break
+    for target in dict.fromkeys(targets):
         try:
-            if parent.stat().st_mode & 0o777 != DIR_MODE:
-                os.chmod(parent, DIR_MODE)
+            if target.stat().st_mode & 0o777 != DIR_MODE:
+                os.chmod(target, DIR_MODE)
         except (OSError, PermissionError):
-            # Reached a directory we do not own (a shared mount, $HOME on a
-            # managed box). Stop rather than fail the write.
-            break
-        if parent.name in ("", os.sep):
-            break
+            continue
 
 
 def open_private_append(path: Path):

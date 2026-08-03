@@ -109,6 +109,21 @@ class _KeyFilter(logging.Filter):
         self._key = key
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # Mapping-style args and a pre-formatted traceback both bypass a
+        # tuple-only scrub, and a formatted exception is exactly where a key
+        # would surface if any third party logs with exc_info=True while one of
+        # ours is active.
+        if isinstance(record.args, dict):
+            record.args = {
+                name: (
+                    str(value).replace(self._key, "<key>")
+                    if self._key in str(value)
+                    else value
+                )
+                for name, value in record.args.items()
+            }
+        if record.exc_text and self._key in record.exc_text:
+            record.exc_text = record.exc_text.replace(self._key, "<key>")
         message = str(record.msg)
         if self._key in message:
             record.msg = message.replace(self._key, "<key>")
@@ -179,6 +194,21 @@ class GeminiLiveSession:
             target.addFilter(self._log_filter)
 
     async def __aenter__(self) -> GeminiLiveSession:
+        # __aexit__ never runs when __aenter__ raises, so cleanup has to happen
+        # on the way out of *every* failure, not only the ones we anticipated.
+        # Catching just GeminiLiveError was not enough: `websockets.connect` can
+        # raise ImportError (a SOCKS proxy in ALL_PROXY without python-socks),
+        # InvalidProxy or InvalidURI, none of which are InvalidHandshake, so they
+        # escaped and left the log filter - which holds the API key in plain text
+        # - installed on the root handlers for the life of the process, one more
+        # copy per attempt.
+        try:
+            return await self._enter()
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _enter(self) -> GeminiLiveSession:
         failures = 0
         while True:
             try:
@@ -186,10 +216,6 @@ class GeminiLiveSession:
             except GeminiLiveError as exc:
                 failures += 1
                 if exc.permanent or failures >= self._max_attempts:
-                    # __aexit__ never runs when __aenter__ raises, so the log
-                    # filter installed in __init__ would otherwise outlive the
-                    # session - still holding the API key.
-                    await self.close()
                     raise
                 delay = _backoff_delay(failures)
                 logger.warning("gemini-live: %s; retrying in %.1fs", exc, delay)
@@ -344,6 +370,14 @@ class GeminiLiveSession:
         except ConnectionClosed as exc:
             error = self._closed_error(exc)
         except (InvalidHandshake, OSError, TimeoutError) as exc:
+            detail = self._redact(f"{type(exc).__name__}: {exc}")
+            error = GeminiLiveError(f"could not connect: {detail}")
+        except Exception as exc:
+            # Deliberately broad. Anything else from the client - a proxy
+            # misconfiguration, a bad URI, an optional dependency missing - is
+            # still a connect failure, and letting it through unwrapped means an
+            # exception whose message or chain may quote the URI escapes
+            # redaction entirely. Non-permanent, so the existing backoff applies.
             detail = self._redact(f"{type(exc).__name__}: {exc}")
             error = GeminiLiveError(f"could not connect: {detail}")
         # Raised out here, with no exception active, for the same reason

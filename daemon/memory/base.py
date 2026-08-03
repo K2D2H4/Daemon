@@ -40,6 +40,14 @@ class RecalledItem:
     reason: str
     """Why it surfaced - 'keyword', 'vector', 'both'. Goes in the golden-set
     report so a recall failure can be attributed instead of guessed at."""
+    origin: str = "owner"
+    """Provenance, carried through from the column that keeps it unforgeable.
+
+    Recall replays arbitrary old text, so an item that arrived from elsewhere - a
+    forwarded message, an inline-bot result - must not be rendered as something
+    the owner said: that is the distinction `messages.origin` exists to protect,
+    and rendering it as a plain `user:` line undid it one layer up. Defaults to
+    "owner" so existing constructors keep working."""
 
 
 @runtime_checkable

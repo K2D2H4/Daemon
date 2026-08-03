@@ -171,6 +171,37 @@ class Service:
 
     # --- rendering ----------------------------------------------------------
 
+    def _require_renderable_paths(self) -> None:
+        """Refuse paths a unit file cannot hold safely.
+
+        The plist writer escapes its values; the systemd writer interpolates them
+        into a line-oriented format where a newline starts a new directive, a
+        space splits ExecStart's argv, and `%` is a specifier. A checkout inside a
+        directory whose name contains a newline therefore turns `daemon install`
+        into arbitrary code that runs at every login, and the far more ordinary
+        case - a space in the path - silently produces an ExecStart pointing at
+        the wrong binary. Only the label was validated; paths were not.
+
+        Refusing is the whole fix. Quoting would also work for the space case but
+        would change the rendered output of every existing install, which the
+        diff in `install()` would then report as a pending change.
+        """
+        for value in (str(self.working_dir), str(self.log_dir), *self.program):
+            bad = next((c for c in value if c in "\n\r\0" or ord(c) < 32), None)
+            if bad is not None:
+                raise ServiceError(
+                    f"refusing to write a unit file for a path containing "
+                    f"{bad!r}: {value!r}. A control character there can inject "
+                    f"directives into the unit file."
+                )
+            if self._platform == LINUX and (" " in value or "%" in value):
+                raise ServiceError(
+                    f"this path cannot be used in a systemd unit: {value!r}. "
+                    "systemd splits ExecStart on spaces and expands '%' as a "
+                    "specifier, so the service would start the wrong thing. "
+                    "Move the checkout somewhere without spaces."
+                )
+
     def render(self) -> str:
         """The unit file, byte for byte. Contains no secrets - see module docs."""
         if self._platform == DARWIN:
@@ -238,6 +269,7 @@ WantedBy=default.target
         their plist should find out from a diff, not from it being gone.
         """
         self._require_supported()
+        self._require_renderable_paths()
         desired = self.render()
         path = self.unit_path
         existing = path.read_text(encoding="utf-8") if path.exists() else None

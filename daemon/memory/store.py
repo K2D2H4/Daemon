@@ -333,7 +333,10 @@ class Store:
         return self.conn.execute(
             "SELECT m.id, m.content FROM messages m "
             "LEFT JOIN embeddings e ON e.message_id = m.id AND e.model = ? "
-            "WHERE e.message_id IS NULL ORDER BY m.id LIMIT ?",
+            # Newest first. Recency decay gives recent messages the highest
+            # scores, so a backfill that stops early must have covered those
+            # rather than the oldest history.
+            "WHERE e.message_id IS NULL ORDER BY m.id DESC LIMIT ?",
             (model, limit),
         ).fetchall()
 
