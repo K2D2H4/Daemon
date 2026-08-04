@@ -2485,3 +2485,175 @@ def test_enter_at_the_voice_question_keeps_it_on(tmp_path: Path) -> None:
     assert "DAEMON_VOICE_ENABLED=true" in result.written
     # Unchanged, so not in the change list either.
     assert "DAEMON_VOICE_ENABLED" not in result.out.split("── Review")[1]
+
+
+# --- a re-install is where the list matters most -------------------------------
+# Reported from a real one: the wizard printed `NO_LIST_NOTE` and skipped the Live
+# question entirely, because both the key and the Live id were already in `.env`.
+
+
+def test_a_saved_key_still_gets_the_account_a_list(tmp_path: Path) -> None:
+    """The list normally rides along on the verdict from *asking* for the key - and
+    a key already in `.env` is never asked for. On a re-install that is the common
+    case, and it was the whole difference between a menu and a built-in default:
+    the probe ran zero times, so there was nothing to show.
+    """
+    recorder = Recorder()
+    existing = (
+        "DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"GEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "n", "1", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=recorder.checks(
+            gemini_verdict=Verdict(
+                True, "key works", models={"DAEMON_GEMINI_MODEL": ("gemini-2.5-pro",)}
+            )
+        ),
+    )
+
+    assert result.code == 0
+    assert recorder.gemini == [GOOD_GEMINI], "the saved key was never used to list"
+    assert "gemini-2.5-pro" in block(result.out, "DAEMON_GEMINI_MODEL")
+    assert "DAEMON_GEMINI_MODEL=gemini-2.5-pro" in result.written
+
+
+def test_one_probe_answers_both_gemini_questions(tmp_path: Path) -> None:
+    """They share a key, so listing twice would be a second call for an answer
+    already in hand."""
+    recorder = Recorder()
+    existing = (
+        f"DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+
+    drive(
+        tmp_path,
+        [KEEP, KEEP, KEEP, "1", "1", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=recorder.checks(
+            gemini_verdict=Verdict(
+                True,
+                "key works",
+                models={
+                    "DAEMON_GEMINI_MODEL": ("gemini-2.5-pro",),
+                    "DAEMON_GEMINI_LIVE_MODEL": ("gemini-3.1-flash-live-preview",),
+                },
+            )
+        ),
+    )
+
+    assert len(recorder.gemini) == 1
+
+
+def test_a_model_id_already_in_the_file_is_still_offered(tmp_path: Path) -> None:
+    """`needs_for` drops a key that `.env` already has, which is right for a
+    credential and wrong for a model id: the Live question vanished entirely, so the
+    only way to change one was to hand-edit the file. Same defect as the preset had,
+    one layer down.
+    """
+    existing = (
+        f"DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+        "DAEMON_GEMINI_LIVE_MODEL=gemini-live-2.5-flash-preview\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, KEEP, "1", "1", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=gemini_listing(
+            live=("gemini-2.5-flash-native-audio",), text=("gemini-2.5-flash",)
+        ),
+    )
+
+    assert result.code == 0
+    assert "(DAEMON_GEMINI_LIVE_MODEL)" in result.out, "the question was skipped again"
+    # And the id the account does not list is named rather than kept.
+    assert "gemini-live-2.5-flash-preview is not in that list." in flat(result.out)
+    assert "DAEMON_GEMINI_LIVE_MODEL=gemini-2.5-flash-native-audio" in result.written
+
+
+def test_a_saved_model_id_is_the_default_not_the_built_in_one(tmp_path: Path) -> None:
+    """Enter has to mean "leave it alone". Defaulting to the built-in value would
+    make a re-run silently replace a model the user chose."""
+    existing = (
+        f"DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"GEMINI_API_KEY={GOOD_GEMINI}\nDAEMON_GEMINI_MODEL=gemini-2.5-pro\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "n", KEEP, GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=gemini_listing(text=("gemini-2.5-flash", "gemini-2.5-pro")),
+    )
+
+    assert result.code == 0
+    assert "DAEMON_GEMINI_MODEL=gemini-2.5-pro" in result.written
+    assert setup.DEFAULT_GEMINI_MODEL not in result.written
+
+
+def test_a_saved_key_that_stopped_working_is_said_out_loud(tmp_path: Path) -> None:
+    """Otherwise the only symptom is a missing menu, and "the account has no models"
+    is a different fact from "your key expired"."""
+    existing = (
+        "DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"GEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "n", "gemini-2.5-flash", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=Recorder().checks(
+            gemini_verdict=Verdict(False, "Google refused the key (HTTP 403).")
+        ),
+    )
+
+    assert result.code == 0
+    assert "GEMINI_API_KEY is in .env but" in flat(result.out)
+    assert "Google refused the key" in flat(result.out)
+
+
+def test_one_probe_even_when_only_one_of_the_two_lists_came_back(
+    tmp_path: Path,
+) -> None:
+    """Where the once-per-credential guard actually earns its place.
+
+    Found by mutation, and it took two attempts to place. With both lists present
+    the guard is redundant: the second question finds its entry in the catalog and
+    never asks to probe. It is also redundant when the *first* question is the one
+    with no list, because that question does the probing anyway.
+
+    It earns its place only when the question asked **second** is the one the
+    account has no list for - Live comes first, so that means an account with Live
+    models and no text models. Without the guard, that second question spends
+    another call to learn what the first already established.
+    """
+    recorder = Recorder()
+    existing = (
+        "DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, KEEP, "1", "gemini-2.5-pro", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=recorder.checks(
+            gemini_verdict=Verdict(
+                True,
+                "key works",
+                models={"DAEMON_GEMINI_LIVE_MODEL": ("gemini-3.1-flash-live-preview",)},
+            )
+        ),
+    )
+
+    assert result.code == 0
+    assert len(recorder.gemini) == 1
+    # The text question still ran, just without a menu - free text is the contract.
+    assert "DAEMON_GEMINI_MODEL=gemini-2.5-pro" in result.written

@@ -779,7 +779,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 label="OpenAI model id",
                 why="Which model answers. Settings has no default here, so an empty "
                 "value would refuse to start.",
-                default=DEFAULT_OPENAI_MODEL,
+                default=env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
                 listed=True,
             )
         )
@@ -811,7 +811,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                     key="DAEMON_GEMINI_LIVE_MODEL",
                     label="Gemini Live model id",
                     why="The realtime audio endpoint takes its own model id, not the text one.",
-                    default=DEFAULT_GEMINI_LIVE_MODEL,
+                    default=env.get("DAEMON_GEMINI_LIVE_MODEL") or DEFAULT_GEMINI_LIVE_MODEL,
                     # The one where the list matters most: two documented Live ids
                     # have already been shut down, and a wrong one here is silent
                     # until the first voice turn (docs/PLAN.md 9).
@@ -825,7 +825,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 why="Which model answers."
                 if gemini_chat
                 else "Required alongside the Live id; not used by voice itself.",
-                default=DEFAULT_GEMINI_MODEL,
+                default=env.get("DAEMON_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
                 # Settings resolves a model for every routed task, and the voice
                 # task routes to gemini, so this must be non-empty even when only
                 # voice brought us here. Asking twice for one capability is noise,
@@ -845,7 +845,17 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
             skippable=True,
         )
     )
-    return [need for need in needs if not env.get(need.key)]
+    # A value already in the file drops out - except a model id, which is asked
+    # again with the current value as its default. The reasoning is the preset's,
+    # one layer down: a decided model id was unreachable, so the only way to change
+    # one was to hand-edit `.env`, and this command exists to remove that. A
+    # *credential* is different - nobody wants to re-paste a working key, and the
+    # question would print a secret back at them.
+    return [
+        need
+        for need in needs
+        if need.listed or not env.get(need.key)
+    ]
 
 
 def _chat_providers(preset: str, hosted: str) -> set[str]:
@@ -1198,6 +1208,24 @@ a menu that scrolled them away would have hidden the half of onboarding nobody
 knows to look for."""
 
 NO_LIST_NOTE = "Nothing listed this account's models, so this is the built-in default."
+
+LISTED_BY = {
+    "DAEMON_OPENAI_MODEL": "OPENAI_API_KEY",
+    "DAEMON_GEMINI_MODEL": "GEMINI_API_KEY",
+    "DAEMON_GEMINI_LIVE_MODEL": "GEMINI_API_KEY",
+}
+"""Which credential can list the ids for each model question.
+
+Needed because the list normally rides along on the verdict from *asking* for that
+credential - and a key already in `.env` is never asked for. On a re-install that is
+the common case, and it was the whole difference between a menu and
+`NO_LIST_NOTE`: the probe ran zero times, so there was nothing to show.
+
+One extra call per credential per run, which the original design avoided on the
+grounds that it made no extra calls. That premise does not survive a re-run: this
+wizard already reaches Ollama, Telegram and any newly pasted key, `models.list`
+costs no tokens, and it re-confirms a saved key still works. Guessing a model id
+because a free call was skipped is the worse trade."""
 EMPTY_LIST_NOTE = "This account lists no model that fits, so this is the built-in default."
 """Two different sentences on purpose. The first means nobody asked - the key was
 already in `.env`, so no probe ran this time. The second means the account
@@ -1237,6 +1265,9 @@ class Wizard:
     bot_handle: str = field(default="", init=False)
     """The bot's `@username`, kept from verifying the token so the pairing step
     can say which bot to message."""
+    _probed: set[str] = field(default_factory=set, init=False)
+    """Credentials already used to list models this run, so two questions sharing
+    one key cost one call."""
     catalog: dict[str, tuple[str, ...]] = field(default_factory=dict, init=False)
     """What the account's own key listed, keyed by the `.env` key it answers.
 
@@ -1344,7 +1375,44 @@ class Wizard:
             self.prompt.say(choices(theme, items, expanded=True))
             self.prompt.say()
 
-    def _offer_models(self, need: Need) -> tuple[str, ...]:
+    def _list_with_saved_key(self, need: Need, env: Mapping[str, str]) -> None:
+        """Fill the catalog for `need` using a credential already in `.env`.
+
+        At most one probe per credential per run: the two Gemini questions share a
+        key, and the first probe answers both. A saved key that no longer works is
+        said out loud rather than swallowed - it is the same late failure this
+        wizard exists to prevent, and the user would otherwise see only
+        `NO_LIST_NOTE` and assume the account has no models.
+        """
+        credential = LISTED_BY.get(need.key)
+        if credential is None or credential in self._probed:
+            return
+        key = env.get(credential, "")
+        if not key:
+            return
+        self._probed.add(credential)
+        try:
+            verdict = (
+                self.checks.gemini(key)
+                if credential == "GEMINI_API_KEY"
+                else self.checks.openai(key, need.default)
+            )
+        except Exception:  # noqa: BLE001 - a listing must not end setup
+            # Silent on purpose: the caller prints NO_LIST_NOTE next, and this
+            # command's own output is a transcript a person reads, not a log.
+            return
+        if verdict.ok:
+            self.catalog.update(verdict.models)
+            return
+        self.prompt.say(
+            status(
+                self.prompt.theme,
+                "warn",
+                f"{credential} is in .env but {verdict.detail}",
+            )
+        )
+
+    def _offer_models(self, need: Need, env: Mapping[str, str]) -> tuple[str, ...]:
         """Print what this account can actually run, folded - and return the order
         the printed numbers refer to.
 
@@ -1355,6 +1423,10 @@ class Wizard:
         """
         theme = self.prompt.theme
         say = self.prompt.say
+        if need.key not in self.catalog:
+            # The key may already be in `.env`, in which case it was never asked
+            # for and never probed - see LISTED_BY.
+            self._list_with_saved_key(need, env)
         if need.key not in self.catalog:
             say(theme.dim(f"  {NO_LIST_NOTE}"))
             return ()
@@ -1516,7 +1588,7 @@ class Wizard:
                 say("  (could not open a browser - use the link above)")
         # Before the loop: the list is a property of the question, not of an
         # attempt, and a model id cannot fail verification anyway.
-        offered = self._offer_models(need) if need.listed else ()
+        offered = self._offer_models(need, env) if need.listed else ()
         # Dropped when the account did not list it - see `_offer_models`.
         default = need.default if not offered or need.default in offered else ""
 
