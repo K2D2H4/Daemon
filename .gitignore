@@ -21,5 +21,6 @@ dist/
 /data-*/
 
 # Tooling caches
+.playwright-mcp/
 .pytest_cache/
 .ruff_cache/
