@@ -24,7 +24,11 @@ spelling out:
 
 The cost is that a rebuild from markdown restores bodies with defaults and
 `origin='system'` - the same trade the message log already makes, and the reason
-rebuilt rows are distinguishable at all.
+rebuilt rows are distinguishable at all. Since reflection started producing trigger
+phrases that trade has a behavioural price: a fact that used to surface on the word
+"이사" stops doing so after a `daemon reindex`, and only the next reflection pass over
+that day puts it back. Recorded rather than fixed, because the alternative is
+letting a model write its own recall multipliers into prose.
 """
 
 from __future__ import annotations
@@ -209,8 +213,9 @@ def rebuild(data_dir: Path, store: Store) -> int:
         restored += 1
     if restored:
         logger.warning(
-            "restored %d curated entry(ies) from core.md; their importance and "
-            "supersession keys are defaults, not what reflection chose",
+            "restored %d curated entry(ies) from core.md; their importance, "
+            "supersession keys and trigger phrases are defaults, not what "
+            "reflection chose - a trigger that used to pull a fact forward is gone",
             restored,
         )
     return restored

@@ -179,7 +179,9 @@ async def test_the_daemons_own_speech_is_not_evidence(data_dir: Path, store: Sto
     record(store, "먼저 건 말", role="assistant", kind="proactive")
 
     result = await pass_for(data_dir, store).run(DAY)
-    assert result.status == "empty"
+    # `nothing`, not `empty`: the mirror has rows for this day, they were just all
+    # ineligible. The day is marked done so it cannot sit in the backlog forever.
+    assert result.status == "nothing"
 
 
 async def test_recalled_messages_are_not_re_extracted(data_dir: Path, store: Store) -> None:
@@ -187,7 +189,7 @@ async def test_recalled_messages_are_not_re_extracted(data_dir: Path, store: Sto
     reused = record(store, "이미 주입된 것")
     store.mark_recalled([reused])
 
-    assert (await pass_for(data_dir, store).run(DAY)).status == "empty"
+    assert (await pass_for(data_dir, store).run(DAY)).status == "nothing"
 
 
 # --- a model that misbehaves -------------------------------------------------
@@ -439,3 +441,138 @@ async def test_facts_without_keys_are_never_deduplicated(
 
     result = await pass_for(data_dir, store, reply).run(DAY)
     assert result.facts == 2
+
+
+async def test_a_day_the_mirror_has_not_caught_up_on_stays_pending(
+    data_dir: Path, store: Store
+) -> None:
+    """Reported by running it: a day with no eligible messages never left the
+    backlog, so doctor nagged about a day `reflect` could not clear. But marking
+    every such day done is just as wrong - an unmirrored day would be skipped
+    permanently, and a deleted mirror is a state the contract calls legitimate.
+    So the mirror decides which case this is.
+    """
+    log_dir = data_dir / "memory" / "log"
+    (log_dir / f"{DAY}.md").write_text(f"# {DAY}\n", encoding="utf-8")
+
+    result = await pass_for(data_dir, store).run(DAY)
+
+    assert result.status == "empty"
+    assert "reindex" in result.detail
+    assert pass_for(data_dir, store).pending_days() == [DAY]
+
+
+async def test_a_mirrored_day_with_nothing_eligible_leaves_the_backlog(
+    data_dir: Path, store: Store
+) -> None:
+    log_dir = data_dir / "memory" / "log"
+    (log_dir / "2026-08-01.md").write_text("# 2026-08-01\n", encoding="utf-8")
+    store.insert_message(
+        LoggedMessage(
+            ts=NOW,
+            role="assistant",
+            content="내가 먼저 건 말",
+            origin="agent",
+            session_kind="proactive",
+            modality="text",
+            channel="telegram",
+            sender_id="42",
+        ),
+        log_file="memory/log/2026-08-01.md",
+    )
+
+    result = await pass_for(data_dir, store).run("2026-08-01")
+
+    assert result.status == "nothing"
+    assert pass_for(data_dir, store).pending_days() == []
+
+
+async def test_catch_up_drops_today_before_applying_the_cap(
+    data_dir: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slicing first meant a run where today was pending processed limit-1 days,
+    so it fell one day further behind on every run."""
+    import daemon.reflection as reflection_module
+
+    log_dir = data_dir / "memory" / "log"
+    for day in ("2026-08-01", "2026-08-02", DAY):
+        (log_dir / f"{day}.md").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(reflection_module, "clock_now", lambda: NOW)
+    results = await pass_for(data_dir, store).catch_up(limit=2, now=NOW)
+
+    assert [result.date for result in results] == ["2026-08-01", "2026-08-02"]
+
+
+# --- trigger phrases --------------------------------------------------------
+
+
+async def test_a_fact_carries_the_trigger_phrases_the_model_proposed(
+    data_dir: Path, store: Store
+) -> None:
+    """Reported by an agent reviewing recall: the matching was implemented, the
+    column accepted a value, and nothing produced one. Complete, tested, and
+    reachable by nothing."""
+    record(store, "연희동으로 이사했어")
+    reply = json.dumps(
+        {"facts": [{"body": "연희동에 산다", "triggers": ["이사", "연희동"]}]},
+        ensure_ascii=False,
+    )
+
+    await pass_for(data_dir, store, reply).run(DAY)
+
+    assert json.loads(store.active_entries()[0]["trigger_phrases"]) == ["이사", "연희동"]
+
+
+async def test_triggers_are_bounded_and_deduplicated(data_dir: Path, store: Store) -> None:
+    """Recall matches every phrase against every query on the voice latency path,
+    and a phrase long enough to be a sentence matches nothing."""
+    record(store, "무슨 말")
+    reply = json.dumps(
+        {
+            "facts": [
+                {
+                    "body": "사실",
+                    "triggers": ["이사", "이사", " 이사 ", "가" * 40, 42, "연희동"],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    await pass_for(data_dir, store, reply).run(DAY)
+
+    assert json.loads(store.active_entries()[0]["trigger_phrases"]) == ["이사", "연희동"]
+
+
+async def test_a_fact_with_no_triggers_still_lands(data_dir: Path, store: Store) -> None:
+    record(store, "무슨 말")
+    reply = json.dumps({"facts": [{"body": "사실"}]}, ensure_ascii=False)
+
+    result = await pass_for(data_dir, store, reply).run(DAY)
+
+    assert result.facts == 1
+    assert json.loads(store.active_entries()[0]["trigger_phrases"]) == []
+
+
+async def test_triggers_that_are_not_a_list_are_reported(data_dir: Path, store: Store) -> None:
+    record(store, "무슨 말")
+    reply = json.dumps({"facts": [{"body": "사실", "triggers": "이사"}]}, ensure_ascii=False)
+
+    result = await pass_for(data_dir, store, reply).run(DAY)
+
+    assert result.facts == 1
+    assert any("triggers was not a list" in problem for problem in result.problems)
+
+
+async def test_the_artifact_shows_the_triggers(data_dir: Path, store: Store) -> None:
+    """They decide when a fact resurfaces, so a human checking the pass has to be
+    able to see them."""
+    record(store, "무슨 말")
+    reply = json.dumps(
+        {"facts": [{"body": "연희동에 산다", "triggers": ["이사"]}]}, ensure_ascii=False
+    )
+
+    await pass_for(data_dir, store, reply).run(DAY)
+
+    assert "triggers: 이사" in artifact_path(data_dir, DAY).read_text(encoding="utf-8")

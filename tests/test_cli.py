@@ -1,22 +1,59 @@
 """The `daemon` command: dispatch, and whether doctor actually finds problems.
 
 Every test chdirs into tmp_path, so no developer `.env` leaks in and no real
-service is touched. Nothing here reaches the network: the Ollama probe is a seam.
+service is touched. Nothing here reaches the network: the Ollama probe is a seam,
+and so is `daemon.app.build_reflection` (which would otherwise build a provider).
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sqlite3
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import FakeProvider
 
+from daemon import app as daemon_app
 from daemon import cli
-from daemon.config import Settings
+from daemon.config import Route, Settings
 from daemon.fs import DIR_MODE
+from daemon.llm.gateway import LLMGateway
+from daemon.memory.base import LoggedMessage
+from daemon.memory.curated import CuratedMemory
+from daemon.memory.entities import EntityNotes
+from daemon.memory.store import Store
+from daemon.memory.writer import FileMemoryWriter
+from daemon.reflection import Reflection, artifact_path
 from daemon.service import ServiceAction, ServiceStatus
+from daemon.tasks import Task
+
+DAY = "2026-08-03"
+NOW = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+"""Midday UTC on purpose: `catch_up` compares against the *local* day, so a
+timestamp near midnight would make the backlog days below "today" in some
+timezones and not others."""
+
+REPLY = json.dumps(
+    {
+        "facts": [{"body": "연희동에 산다", "importance": 8, "key": "home"}],
+        "entities": [
+            {
+                "name": "지현",
+                "kind": "person",
+                "note": "연희동 카페에서 만났다",
+                "links": ["연희동"],
+            }
+        ],
+        "observations": [{"body": "아침에는 짧은 메시지가 낫다", "confidence": 0.7}],
+    },
+    ensure_ascii=False,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +113,82 @@ def service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> FakeService:
     fake = FakeService(tmp_path / "ai.daemon.default.plist")
     monkeypatch.setattr(cli, "service_for", lambda settings: fake)
     return fake
+
+
+def _reflection_for(data_dir: Path, store: Store, provider: FakeProvider) -> Reflection:
+    return Reflection(
+        data_dir,
+        store,
+        LLMGateway({provider.name: provider}, {Task.REFLECTION: Route(provider.name, "m")}),
+    )
+
+
+def _logged_day(data_dir: Path, day: str) -> None:
+    """One day of conversation, in the log and in the mirror.
+
+    Both halves are needed and for different readers: the log file is what makes a
+    day *pending*, the mirror row is what reflection actually reads.
+    """
+    log_dir = data_dir / "memory" / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"{day}.md").write_text(f"# {day}\n", encoding="utf-8")
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        store.insert_message(
+            LoggedMessage(
+                ts=NOW,
+                role="user",
+                content="연희동으로 이사했어",
+                origin="owner",
+                session_kind="interactive",
+                modality="text",
+                channel="telegram",
+                sender_id="42",
+            ),
+            log_file=f"memory/log/{day}.md",
+        )
+    finally:
+        store.close()
+
+
+def _reflected_day(data_dir: Path, day: str = DAY) -> None:
+    """A day the real pass has already been over, so doctor has something to report.
+
+    The pass is the real one with a fake model behind it. Building the mirror by
+    hand here would let doctor print a graph no write path can actually produce.
+    """
+    _logged_day(data_dir, day)
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        asyncio.run(_reflection_for(data_dir, store, FakeProvider(REPLY)).run(day))
+    finally:
+        store.close()
+
+
+@pytest.fixture
+def reflection_seam(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeProvider]:
+    """Replace the one thing in `daemon reflect` that would reach a provider.
+
+    `daemon.app.build_reflection` is the seam the scheduler and the CLI share, so
+    patching it leaves the pass, the store, the markdown and the exit code real -
+    only the model is a fake.
+    """
+
+    def install(reply: str = REPLY, *, fail: bool = False) -> FakeProvider:
+        provider = FakeProvider(reply, fail=fail)
+
+        async def build(settings: Settings) -> tuple[Reflection, Any]:
+            store = Store.open(settings.data_dir / daemon_app.DB_FILENAME)
+
+            async def close() -> None:
+                store.close()
+
+            return _reflection_for(settings.data_dir, store, provider), close
+
+        monkeypatch.setattr(daemon_app, "build_reflection", build)
+        return provider
+
+    return install
 
 
 # --- dispatch ----------------------------------------------------------------
@@ -242,3 +355,216 @@ def test_doctor_accepts_a_data_dir_with_no_database_yet(
     # the source of truth and the mirror is built on first run.
     assert cli.main(["doctor"]) == 0
     assert "no database yet" in capsys.readouterr().out
+
+
+# --- doctor: what reflection built -------------------------------------------
+
+
+def test_doctor_reports_the_memory_reflection_built(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The M2 gate is a graph worth reading, and this is where it is readable
+    without opening sqlite."""
+    _reflected_day(data_dir)
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    # 지현 was noted, 연희동 came in as a link - both are entities, one is a fact.
+    assert "[ok] memory: 1 curated fact(s), 2 entity(ies), 1 observation(s)" in out
+    assert "지현 (1) -> 연희동" in out
+
+
+def test_doctor_reports_a_reflection_backlog_and_what_to_run(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reflection loop that has never run leaves no trace anywhere else, so an
+    untouched month has to be visible here or it is invisible everywhere."""
+    _logged_day(data_dir, "2026-08-01")
+    _logged_day(data_dir, "2026-08-02")
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert "2 day(s) not reflected on yet (oldest 2026-08-01) - run `daemon reflect`" in out
+
+
+def test_doctor_says_nothing_recorded_yet_on_a_fresh_install(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["doctor"]) == 0
+    assert "[ok] memory: nothing recorded yet" in capsys.readouterr().out
+
+
+def test_doctor_survives_a_database_it_cannot_open(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Letting the memory check raise turned the whole of doctor into a traceback -
+    the command whose entire job is to explain what is wrong. The schema check
+    above it carries the real message."""
+    (data_dir / daemon_app.DB_FILENAME).write_bytes(b"this is not a database")
+
+    assert cli.main(["doctor"]) == 1
+
+    out = capsys.readouterr().out
+    assert "[ok] memory: not readable" in out
+    assert "[FAIL] schema" in out
+
+
+# --- reflect -----------------------------------------------------------------
+
+
+def test_reflect_with_no_date_catches_up_and_reports_each_day(
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _logged_day(data_dir, "2026-08-01")
+    _logged_day(data_dir, "2026-08-02")
+    reflection_seam()
+    monkeypatch.setattr("daemon.reflection.clock_now", lambda: NOW)
+
+    assert cli.main(["reflect"]) == 0
+
+    out = capsys.readouterr().out
+    counts = "(1 message(s) -> 1 fact(s), 1 entity(ies), 1 observation(s))"
+    assert f"2026-08-01: written {counts}" in out
+    assert f"2026-08-02: written {counts}" in out
+
+
+def test_reflect_with_a_date_runs_exactly_that_day(
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _logged_day(data_dir, "2026-08-01")
+    _logged_day(data_dir, DAY)
+    reflection_seam()
+
+    assert cli.main(["reflect", "--date", DAY]) == 0
+
+    assert "2026-08-01" not in capsys.readouterr().out
+    assert not artifact_path(data_dir, "2026-08-01").exists()
+
+
+def test_reflect_force_redoes_a_day_that_is_already_done(
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reflected_day(data_dir)
+    reflection_seam()
+
+    assert cli.main(["reflect", "--date", DAY]) == 0
+    assert f"{DAY}: skipped" in capsys.readouterr().out
+
+    assert cli.main(["reflect", "--date", DAY, "--force"]) == 0
+    assert f"{DAY}: written" in capsys.readouterr().out
+
+
+def test_reflect_with_nothing_to_do_says_so(
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No log at all is the first-run case, and it is not a fault."""
+    reflection_seam()
+
+    assert cli.main(["reflect"]) == 0
+    assert "nothing to reflect on" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("reply", "fail", "status"),
+    [("죄송해요, 잘 모르겠어요", False, "unparseable"), ("", True, "unavailable")],
+)
+def test_reflect_exits_nonzero_when_a_day_did_not_land(
+    reply: str,
+    fail: bool,
+    status: str,
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pass that wrote nothing must not look like success to the shell: this is
+    the only way a cron entry or an operator finds out reflection is not running."""
+    _logged_day(data_dir, DAY)
+    reflection_seam(reply, fail=fail)
+
+    assert cli.main(["reflect", "--date", DAY]) == 1
+    assert f"{DAY}: {status}" in capsys.readouterr().out
+
+
+def test_reflect_prints_the_problems_a_written_day_still_hit(
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A partially applied pass is the failure mode reflection is arranged against,
+    so what it dropped has to reach the terminal."""
+    _logged_day(data_dir, DAY)
+    reflection_seam(json.dumps({"facts": "이건 배열이 아님", "observations": [{"body": "관찰"}]}))
+
+    assert cli.main(["reflect", "--date", DAY]) == 0
+    assert "  ! facts was not a list" in capsys.readouterr().out
+
+
+def test_reflect_passes_date_and_force_through(
+    monkeypatch: pytest.MonkeyPatch, data_dir: Path
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake(settings: Settings, *, date: str | None, force: bool) -> int:
+        seen.update(date=date, force=force)
+        return 0
+
+    monkeypatch.setattr(cli, "_reflect", fake)
+
+    assert cli.main(["reflect", "--date", DAY, "--force"]) == 0
+    assert seen == {"date": DAY, "force": True}
+
+
+# --- reindex -----------------------------------------------------------------
+
+
+async def test_reindex_rebuilds_all_three_markdown_tiers(
+    data_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Non-negotiable 1 says throwing the database away must lose nothing. A
+    rebuild that only restored messages silently dropped every curated fact and
+    entity note reflection had concluded, which is the same data loss with a
+    passing test suite in front of it.
+    """
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    await FileMemoryWriter(data_dir, store).record(
+        LoggedMessage(
+            ts=NOW,
+            role="user",
+            content="연희동으로 이사했어",
+            origin="owner",
+            session_kind="interactive",
+            modality="text",
+            channel="telegram",
+            sender_id="42",
+        )
+    )
+    await CuratedMemory(data_dir, store).add("연희동에 산다", importance=8, supersession_key="home")
+    await EntityNotes(data_dir, store).note(
+        "지현", "연희동 카페에서 만났다", kind="person", links=("연희동",), date=DAY
+    )
+    store.close()
+    for suffix in ("", "-wal", "-shm"):
+        (data_dir / f"{daemon_app.DB_FILENAME}{suffix}").unlink(missing_ok=True)
+
+    assert cli.main(["reindex"]) == 0
+    assert "reindexed 1 message(s)" in capsys.readouterr().out
+
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        assert [row["content"] for row in store.recent()] == ["연희동으로 이사했어"]
+        assert [row["body"] for row in store.active_entries()] == ["연희동에 산다"]
+        graph = {name: linked for name, _mentions, linked in EntityNotes(data_dir, store).graph()}
+        assert graph["지현"] == ["연희동"]
+    finally:
+        store.close()

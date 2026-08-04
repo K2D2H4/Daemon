@@ -338,9 +338,21 @@ def _memory_check(settings: Settings) -> Check:
     from daemon.memory.store import Store
     from daemon.reflection import pending_days
 
+    # The backlog comes off the filesystem, so it is known even when the mirror is
+    # not. That ordering is the fix for a real hole: with the sqlite file deleted -
+    # which non-negotiable 1 calls a legitimate state - this reported "nothing
+    # recorded yet" and hid a month of unreflected log behind it.
+    backlog = pending_days(settings.data_dir)
+    behind = (
+        f"{len(backlog)} day(s) not reflected on yet (oldest {backlog[0]})"
+        " - run `daemon reflect`"
+        if backlog
+        else ""
+    )
+
     path = settings.data_dir / DB_FILENAME
     if not path.exists():
-        return Check("memory", True, "nothing recorded yet")
+        return Check("memory", True, behind or "nothing recorded yet")
 
     try:
         store = Store.open(path)
@@ -358,12 +370,8 @@ def _memory_check(settings: Settings) -> Check:
             f"{store.count_entries()} curated fact(s), {len(graph)} entity(ies), "
             f"{store.count_observations()} observation(s)"
         )
-        backlog = pending_days(settings.data_dir)
-        if backlog:
-            detail += (
-                f"; {len(backlog)} day(s) not reflected on yet "
-                f"(oldest {backlog[0]}) - run `daemon reflect`"
-            )
+        if behind:
+            detail += f"; {behind}"
         for name, mentions, linked in graph[:5]:
             arrow = f" -> {', '.join(linked)}" if linked else ""
             detail += f"\n         {name} ({mentions}){arrow}"

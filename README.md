@@ -31,7 +31,7 @@ is finished.
 |---|---|
 | **M1a** ✅ | Text conversation over Telegram, logged to markdown |
 | **M1b** ✅ | Recall (hybrid, 93.3% on the golden set), voice, OS residency |
-| M2 | Reflection, entity notes, observation capture |
+| **M2** ◐ | Reflection pass, entity graph, observations — recall does not read the curated tier yet |
 | M3 | Proactivity — it speaks first |
 | M4 | Persona evolution |
 
@@ -46,14 +46,14 @@ daemon setup
 `daemon setup` asks where the thinking should happen, whose model, and a Telegram
 bot token from [@BotFather](https://t.me/BotFather). Then it waits for you to
 message the bot and asks whether that was you — nobody types a numeric user id.
-Pick `offline` and you need no API key at all, just
-[Ollama](https://ollama.com).
+Pick `offline` and you need no API key at all, just [Ollama](https://ollama.com).
 
 ```bash
 daemon run       # here, in this terminal
 daemon install   # or keep it running after you close it, and after a reboot
 daemon voice     # one spoken conversation
-daemon doctor    # what is configured, reachable and indexed
+daemon reflect   # consolidate a day into memory now, instead of waiting for 04:00
+daemon doctor    # what is configured, reachable, indexed and remembered
 ```
 
 ## How it is put together

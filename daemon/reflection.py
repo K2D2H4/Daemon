@@ -68,6 +68,8 @@ SYSTEM = """너는 하루치 대화를 정리하는 역할이다. 아래 규칙�
 - facts: 앞으로 계속 기억할 가치가 있는 사실. 그날의 잡담은 넣지 않는다.
   importance 는 1~10. key 는 나중에 바뀔 수 있는 사실에만 넣는다
   (예: 사는 곳, 직장, 관계). 같은 key 는 이전 사실을 대체한다.
+  triggers 는 이 사실을 떠올려야 할 때 대화에 나올 만한 단어 2~4개.
+  조사 없이 짧게 (예: "이사", "연희동").
 - entities: 사람 / 장소 / 프로젝트 / 주제. note 는 그 대상에 대해 알게 된 것
   한두 문장. links 는 함께 언급된 다른 대상의 이름.
 - observations: 이 사람을 어떻게 대하면 좋은지에 대한 관찰.
@@ -75,7 +77,7 @@ SYSTEM = """너는 하루치 대화를 정리하는 역할이다. 아래 규칙�
 
 확실하지 않으면 넣지 않는다. 빈 배열도 정답이다. 설명이나 인사말 없이 JSON만.
 
-{"facts": [{"body": "...", "importance": 5, "key": null}],
+{"facts": [{"body": "...", "importance": 5, "key": null, "triggers": ["..."]}],
  "entities": [{"name": "...", "kind": "person", "note": "...", "links": []}],
  "observations": [{"body": "...", "confidence": 0.5}]}"""
 
@@ -85,6 +87,10 @@ class Fact:
     body: str
     importance: int = 5
     key: str | None = None
+    triggers: tuple[str, ...] = ()
+    """Words that should pull this fact forward even when the importance budget
+    would have dropped it. Recall matches them as substrings against the query -
+    see `memory.recall.MemoryRecall._curated_tier`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +127,8 @@ class Result:
     date: str
     status: str
     """`written` · `skipped` (already done) · `empty` (nothing to read) ·
-    `unparseable` · `unavailable` (the model could not be reached)."""
+    `nothing` (looked, nothing eligible, marked done) · `unparseable` ·
+    `unavailable` (the model could not be reached)."""
     messages_read: int = 0
     facts: int = 0
     entities: int = 0
@@ -131,7 +138,7 @@ class Result:
 
     @property
     def ok(self) -> bool:
-        return self.status in {"written", "skipped", "empty"}
+        return self.status in {"written", "skipped", "empty", "nothing"}
 
 
 def artifact_path(data_dir: Path, date: str) -> Path:
@@ -180,7 +187,12 @@ def _clean(raw: dict[str, object]) -> tuple[Conclusion, list[str]]:
             problems.append("a fact with no body")
             continue
         facts.append(
-            Fact(body=body, importance=_int(item, "importance", 5, 1, 10), key=_key(item))
+            Fact(
+                body=body,
+                importance=_int(item, "importance", 5, 1, 10),
+                key=_key(item),
+                triggers=_triggers(item, problems),
+            )
         )
     facts = _one_per_key(facts, problems)
 
@@ -301,6 +313,39 @@ def _key(item: dict[str, object]) -> str | None:
     return narrowed[:40] or None
 
 
+MAX_TRIGGERS = 4
+MAX_TRIGGER_CHARS = 24
+
+
+def _triggers(item: dict[str, object], problems: list[str]) -> tuple[str, ...]:
+    """Trigger phrases, bounded and deduplicated.
+
+    Bounded because recall matches every phrase against every query on the voice
+    latency path, and because a "phrase" that is really a sentence matches nothing:
+    the match is a substring test, so the longer the phrase the narrower it gets,
+    until a fact with a paragraph-long trigger can never be pulled forward at all.
+
+    Without this the column had no producer. Recall implemented the matching and
+    `Store.insert_entry` accepted the value, so the feature was complete, tested,
+    and reachable by nothing - which is the defect shape `tests/test_reachable.py`
+    exists for, one layer below what that file can see.
+    """
+    value = item.get("triggers")
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        problems.append("triggers was not a list")
+        return ()
+    out = []
+    for phrase in value:
+        if not isinstance(phrase, str):
+            continue
+        cleaned = " ".join(phrase.split())
+        if cleaned and len(cleaned) <= MAX_TRIGGER_CHARS:
+            out.append(cleaned)
+    return tuple(dict.fromkeys(out))[:MAX_TRIGGERS]
+
+
 def _links(item: dict[str, object], problems: list[str]) -> tuple[str, ...]:
     value = item.get("links")
     if not isinstance(value, list):
@@ -331,6 +376,8 @@ def render_artifact(date: str, conclusion: Conclusion, *, messages_read: int) ->
         lines += ["## 기억할 사실", ""]
         for fact in conclusion.facts:
             suffix = f" (key: {fact.key})" if fact.key else ""
+            if fact.triggers:
+                suffix += f" · triggers: {', '.join(fact.triggers)}"
             lines.append(f"- [{fact.importance}] {fact.body}{suffix}")
         lines.append("")
     if conclusion.entities:
@@ -388,7 +435,7 @@ class Reflection:
 
         rows = self._store.messages_for_day(date)
         if not rows:
-            return Result(date=date, status="empty", detail="no messages to reflect on")
+            return self._nothing_to_read(date, path)
 
         try:
             completion = await self._gateway.complete(
@@ -428,6 +475,33 @@ class Reflection:
             **applied,
         )
 
+    def _nothing_to_read(self, date: str, path: Path) -> Result:
+        """A day with no eligible messages: either not mirrored yet, or genuinely
+        nothing to reflect on. The two need different answers.
+
+        Reported by running it: a day whose log existed but yielded nothing stayed
+        in `pending_days` forever, so `daemon doctor` nagged about a day that
+        `daemon reflect` could never clear. Marking every such day done is just as
+        wrong - a mirror that has not caught up yet would be skipped permanently,
+        and that is the case non-negotiable 1 calls legitimate.
+
+        So the mirror decides. Rows exist for this log file but none are eligible
+        (all of it was the daemon's own speech, or already recalled) -> we looked,
+        there was nothing, mark it. No rows at all -> `daemon reindex` has work to
+        do first, leave it pending.
+        """
+        if self._store.count_for_log_file(f"memory/log/{date}.md") == 0:
+            return Result(
+                date=date,
+                status="empty",
+                detail="not mirrored yet - run `daemon reindex`",
+            )
+        if date == log.local_date(clock_now()):
+            # Today is still being written to; marking it done loses the evening.
+            return Result(date=date, status="empty", detail="today is not finished")
+        _write_artifact(path, render_artifact(date, Conclusion(), messages_read=0))
+        return Result(date=date, status="nothing", detail="nothing worth recording")
+
     async def _apply(
         self, conclusion: Conclusion, date: str, problems: list[str]
     ) -> dict[str, int]:
@@ -439,6 +513,7 @@ class Reflection:
                     fact.body,
                     importance=fact.importance,
                     supersession_key=fact.key,
+                    trigger_phrases=fact.triggers,
                     session_kind="reflection",
                 )
                 facts += 1
@@ -486,17 +561,14 @@ class Reflection:
         already goes back further than reflection does. Bounded so a first run over
         months of history does not become one unbounded batch of model calls.
         """
-        today = (now or clock_now()).astimezone().strftime("%Y-%m-%d")
-        results = []
-        for date in self.pending_days(now=now)[:limit]:
-            if date == today:
-                # Today is still being written to. Reflecting on a partial day
-                # would mark it done and lose the evening.
-                continue
-            results.append(await self.run(date))
-        return results
+        today = log.local_date(now or clock_now())
+        # Today is dropped *before* the cap, not after: slicing first meant a run
+        # where today was pending processed limit-1 days and silently fell one
+        # behind every time.
+        backlog = [date for date in self.pending_days() if date != today]
+        return [await self.run(date) for date in backlog[:limit]]
 
-    def pending_days(self, *, now: datetime | None = None) -> list[str]:
+    def pending_days(self) -> list[str]:
         """Days with a log file and no reflection artifact, oldest first."""
         return pending_days(self._data_dir)
 
