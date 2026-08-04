@@ -42,7 +42,6 @@ PENDING_PROVIDERS: dict[str, str] = {
 PENDING_TASKS = {
     Task.RECALL_ESCALATION: "M1b+ - Lane 2 is specified, Lane 1 ships first",
     Task.PROACTIVE_JUDGE: "M3 - the whole point of M3",
-    Task.REFLECTION: "M2",
     Task.PERSONA_RULE: "M4",
 }
 
@@ -62,6 +61,13 @@ WIRED_CLASSES = (
     "GeminiLiveSession",
     "SoundDeviceAudio",
     "VoiceConversation",
+    # M2. `Reflection` is the one that matters: the pass is only reachable because
+    # `app.build_reflection` constructs it for both the 04:00 job and
+    # `daemon reflect`, and a scheduled job nobody can run by hand is a job nobody
+    # can verify.
+    "Reflection",
+    "CuratedMemory",
+    "EntityNotes",
 )
 
 

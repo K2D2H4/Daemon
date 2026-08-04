@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +28,7 @@ from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop, ResolveId
 from daemon.memory.base import MemoryWriter, Recall
+from daemon.reflection import Reflection
 from daemon.tasks import Task
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,10 @@ PROBLEM = 1
 DB_FILENAME = "daemon.sqlite3"
 """Lives inside the data dir. Deleting it must never lose user data - the
 markdown log is the original (CONTRACTS.md non-negotiable 1)."""
+
+REFLECT_HOUR = 4
+"""Local hour for the nightly pass. Late enough that the day is over, early enough
+that the morning's first message already sees what it concluded."""
 
 
 def create_app(
@@ -89,9 +94,25 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.gateway = gateway
 
-    # M1a registers no jobs. The seam exists now so the reflection loop (M2) and
-    # the 5-minute proactivity tick (M3) have somewhere to land.
     scheduler = AsyncIOScheduler(timezone="UTC")
+    # Local time, not UTC: "overnight" is a fact about the person asleep next to
+    # the machine, and a UTC 04:00 lands mid-afternoon in KST. The 5-minute
+    # proactivity tick (M3) lands here too.
+    scheduler.add_job(
+        _reflect_tick,
+        "cron",
+        hour=REFLECT_HOUR,
+        minute=0,
+        timezone=None,
+        args=[settings],
+        id="reflection",
+        # A pass that overruns until the next night's must not stack up, and a
+        # machine that was asleep at 04:00 should still reflect when it wakes -
+        # `catch_up` covers every missed day anyway, so one late run is enough.
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=None,
+    )
     scheduler.start()
     app.state.scheduler = scheduler
 
@@ -353,6 +374,64 @@ def _build_recall(settings: Settings, store: Any) -> tuple[Recall | None, str, A
     except Exception as exc:
         logger.warning("recall could not be built, continuing without it: %s", exc)
         return None, f"unavailable: {exc}", None
+
+
+async def build_reflection(settings: Settings) -> tuple[Reflection, Callable[[], Awaitable[None]]]:
+    """A `Reflection` and the coroutine that releases what it holds.
+
+    Assembled here because this is the only file allowed to import concrete
+    providers and writers, and `daemon reflect` needs the same object the
+    scheduler runs. Returning the closer rather than a context manager keeps it
+    usable from both a CLI command and a scheduled job without one of them
+    pretending to be the other.
+    """
+    from daemon.fs import harden_existing
+    from daemon.memory.store import Store
+
+    harden_existing(settings.data_dir)
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    providers = _build_providers(settings)
+    gateway = LLMGateway(providers, settings.routing_table(), fallback=settings.fallback_route())
+
+    async def close() -> None:
+        store.close()
+        for provider in providers.values():
+            closer = getattr(provider, "aclose", None)
+            if closer is not None:
+                with suppress(Exception):
+                    await closer()
+
+    return Reflection(settings.data_dir, store, gateway), close
+
+
+async def _reflect_tick(settings: Settings) -> None:
+    """The scheduled pass. Catches everything: a job that raises inside
+    APScheduler is logged once and then the schedule carries on, which reads as a
+    working reflection loop that has silently done nothing for a month."""
+    try:
+        reflection, close = await build_reflection(settings)
+    except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
+        logger.error("reflection tick could not start: %s", exc)
+        return
+    try:
+        results = await reflection.catch_up()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("reflection tick failed: %s", exc)
+        return
+    finally:
+        with suppress(Exception):
+            await close()
+    for result in results:
+        logger.info(
+            "reflection %s: %s (%d message(s) -> %d fact(s), %d entity(ies), %d observation(s))%s",
+            result.date,
+            result.status,
+            result.messages_read,
+            result.facts,
+            result.entities,
+            result.observations,
+            f" problems={result.problems}" if result.problems else "",
+        )
 
 
 async def run_voice(settings: Settings) -> int:
