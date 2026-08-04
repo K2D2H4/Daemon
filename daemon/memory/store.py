@@ -14,6 +14,7 @@ those milestones need no migration.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Sequence
@@ -470,3 +471,239 @@ class Store:
         cursor = self.conn.execute("DELETE FROM embeddings WHERE model = ?", (model,))
         self.conn.commit()
         return cursor.rowcount
+
+    # --- M2: the curated tier -----------------------------------------------
+
+    def insert_entry(
+        self,
+        *,
+        body: str,
+        importance: int,
+        trigger_phrases: Sequence[str],
+        origin: str,
+        session_kind: str,
+        modality: str,
+        now: datetime,
+        supersession_key: str | None = None,
+        source_file: str | None = None,
+        source_anchor: str | None = None,
+        commit: bool = True,
+    ) -> int:
+        """Add one curated fact and retire whatever it supersedes, in ONE
+        transaction.
+
+        Atomic because the unique index on `supersession_key` only permits one
+        active row per key: as two commits there is a window with no active row for
+        that key, and if the second then fails the fact is gone from the mirror
+        entirely. All of it or none of it.
+
+        The order inside is forced by that same index - retire, insert, then point
+        the retired row at its replacement. Inserting first raises
+        `UNIQUE constraint failed` before anything has been retired, which is the
+        index doing its job.
+
+        `commit=False` leaves the transaction open so the caller can write the
+        markdown *before* the mirror is durable, which is what non-negotiable 1
+        requires. This connection then sees its own uncommitted rows, so the
+        caller can render the file from the post-insert state without
+        reimplementing the ordering. The caller owns the commit and the rollback -
+        see `memory.curated.CuratedMemory.add`.
+        """
+        stamp = utc_iso(now)
+        try:
+            previous = (
+                self.conn.execute(
+                    "SELECT id FROM memory_entries "
+                    "WHERE supersession_key = ? AND status = 'active'",
+                    (supersession_key,),
+                ).fetchone()
+                if supersession_key
+                else None
+            )
+            if previous is not None:
+                self.conn.execute(
+                    "UPDATE memory_entries SET status = 'retired', updated_at = ? WHERE id = ?",
+                    (stamp, int(previous["id"])),
+                )
+
+            cursor = self.conn.execute(
+                "INSERT INTO memory_entries "
+                "(body, importance, trigger_phrases, origin, session_kind, modality,"
+                " created_at, updated_at, supersession_key, source_file, source_anchor) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    body,
+                    importance,
+                    json.dumps(list(trigger_phrases), ensure_ascii=False),
+                    origin,
+                    session_kind,
+                    modality,
+                    stamp,
+                    stamp,
+                    supersession_key,
+                    source_file,
+                    source_anchor,
+                ),
+            )
+            new_id = int(cursor.lastrowid or 0)
+            if previous is not None:
+                self.conn.execute(
+                    "UPDATE memory_entries SET superseded_by = ? WHERE id = ?",
+                    (new_id, int(previous["id"])),
+                )
+        except Exception:
+            # Discards the retire too. Without this a failed insert would leave
+            # the old fact retired and nothing active for its key.
+            self.conn.rollback()
+            raise
+        if commit:
+            self.conn.commit()
+        return new_id
+
+    def active_entries(self, limit: int = 50) -> list[sqlite3.Row]:
+        """The curated tier, most important first, then most recent.
+
+        Ordered by importance rather than recency because this tier is *always*
+        injected under a budget (docs/PLAN.md 4.1): when the budget truncates, it
+        must drop the least important fact, not the oldest one.
+        """
+        return self.conn.execute(
+            "SELECT * FROM memory_entries WHERE status = 'active' "
+            "ORDER BY importance DESC, updated_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def count_entries(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_entries WHERE status = 'active'"
+        ).fetchone()
+        return int(row["n"])
+
+    # --- M2: entity notes ---------------------------------------------------
+
+    def upsert_entity(self, *, name: str, kind: str | None, file: str, now: datetime) -> int:
+        """Create or touch one entity, returning its id and counting the mention.
+
+        `kind` is only ever filled in, never overwritten with NULL: a later pass
+        that mentions someone without classifying them must not erase what an
+        earlier pass worked out.
+        """
+        stamp = utc_iso(now)
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO entities (name, kind, file, created_at, updated_at, mention_count) "
+                "VALUES (?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT (name) DO UPDATE SET "
+                "  kind = COALESCE(excluded.kind, entities.kind), "
+                "  file = excluded.file, "
+                "  updated_at = excluded.updated_at, "
+                "  mention_count = entities.mention_count + 1",
+                (name, kind, file, stamp, stamp),
+            )
+            row = self.conn.execute("SELECT id FROM entities WHERE name = ?", (name,)).fetchone()
+        return int(row["id"])
+
+    def set_mention_count(self, entity_id: int, count: int) -> None:
+        """Overwrite the count rather than increment it. Only the rebuild path uses
+        this: the count is implied by how many dated sections the note has, so a
+        rebuild that incremented would double it on every run."""
+        self.conn.execute(
+            "UPDATE entities SET mention_count = ? WHERE id = ?", (count, entity_id)
+        )
+        self.conn.commit()
+
+    def entity_by_name(self, name: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM entities WHERE name = ?", (name,)).fetchone()
+
+    def entities(self, limit: int = 500) -> list[sqlite3.Row]:
+        """Most-mentioned first - the reading order for a graph nobody curated."""
+        return self.conn.execute(
+            "SELECT * FROM entities ORDER BY mention_count DESC, name ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def link_entities(self, src_id: int, dst_id: int) -> None:
+        """Record that two entities appeared together. Undirected in meaning, so
+        both directions are stored - a graph read from either end shows the edge.
+        Self-links are dropped rather than rejected: the extractor naming the same
+        entity twice in one note is not an error worth failing a reflection over.
+        """
+        if src_id == dst_id:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO entity_links (src_id, dst_id) VALUES (?, ?)",
+                [(src_id, dst_id), (dst_id, src_id)],
+            )
+
+    def links_for(self, entity_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT e.* FROM entity_links l JOIN entities e ON e.id = l.dst_id "
+            "WHERE l.src_id = ? ORDER BY e.name",
+            (entity_id,),
+        ).fetchall()
+
+    # --- M2: observations (append-only) -------------------------------------
+
+    def insert_observation(
+        self,
+        *,
+        body: str,
+        observed_from: str,
+        now: datetime,
+        modality: str = "text",
+        origin: str = "agent",
+        confidence: float = 0.5,
+    ) -> int:
+        """Append one observation about how to deal with this person.
+
+        There is deliberately no update or delete for this table. It is the log
+        clock (docs/PLAN.md 8.1): persona evolution needs weeks of accumulated
+        real observations before it can be judged, and an observation that can be
+        rewritten later is not evidence of anything.
+        """
+        cursor = self.conn.execute(
+            "INSERT INTO observations "
+            "(body, created_at, observed_from, modality, origin, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (body, utc_iso(now), observed_from, modality, origin, confidence),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def unconsumed_observations(self, limit: int = 200) -> list[sqlite3.Row]:
+        """Observations no persona rule has used yet - M4's input, oldest first."""
+        return self.conn.execute(
+            "SELECT * FROM observations WHERE consumed_by IS NULL "
+            "ORDER BY created_at ASC, id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def count_observations(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()
+        return int(row["n"])
+
+    # --- M2: what reflection reads ------------------------------------------
+
+    def messages_for_day(self, date: str) -> list[sqlite3.Row]:
+        """One local day's conversation, in reading order, filtered by the two
+        hygiene rules in docs/PLAN.md 4.2.
+
+        `log_file` is the filter rather than a range over `ts`, because the log is
+        split on the *local* day while timestamps are UTC - a KST day legitimately
+        holds records whose UTC date is the day before, so a BETWEEN on `ts` would
+        silently reflect on a nine-hour-shifted window.
+
+          * rule 1: proactive and reflection sessions are excluded. Their content
+            is the daemon's own speech, and letting that become evidence is the
+            self-amplifying loop the rule exists to block.
+          * rule 2: rows recall already put in front of the model are excluded.
+            They informed a reply once; counting them again turns injected context
+            into new evidence.
+        """
+        return self.conn.execute(
+            "SELECT * FROM messages WHERE log_file = ? "
+            "AND session_kind IN ('interactive', 'voice') AND recalled = 0 "
+            "ORDER BY ts ASC, id ASC",
+            (f"memory/log/{date}.md",),
+        ).fetchall()

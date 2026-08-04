@@ -22,8 +22,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-DOCS = ("README.md", "docs/PLAN.md", "docs/CONTRACTS.md", "CLAUDE.md")
-"""Checked in full. Anything else is prose we do not treat as navigation."""
+DOCS = (
+    "README.md",
+    "docs/PLAN.md",
+    "docs/CONTRACTS.md",
+    "docs/ARCHITECTURE.md",
+    "CLAUDE.md",
+)
+"""Checked in full. Anything else is prose we do not treat as navigation.
+
+ARCHITECTURE.md was missing from this list for its whole existence, which is the
+funnier version of the bug this script exists for: the document whose entire job is
+to say where things live was the one document nobody verified.
+"""
 
 EXTRA_GLOBS = ("**/CLAUDE.md", "**/AGENTS.md", "docs/adr/*.md")
 

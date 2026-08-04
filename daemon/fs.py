@@ -69,6 +69,56 @@ def open_private_append(path: Path):
     return os.fdopen(fd, "a", encoding="utf-8")
 
 
+def write_private_replace(path: Path, content: str) -> None:
+    """Replace `path` wholesale: owner-only, atomic, and durable.
+
+    For the files that are rewritten rather than appended to - the curated memory
+    tier, entity notes, `.env`. Three properties, each load-bearing:
+
+      * **owner-only from creation.** `os.open` with the mode set, so there is no
+        window where a half-written entity note is world-readable.
+      * **atomic.** A reader (Obsidian, the user's editor, a later reflection
+        pass) sees the old content or the new one, never a truncated file. A
+        partially rewritten entity note would be indistinguishable from one the
+        model wrote badly.
+      * **durable.** The temp file is fsynced *before* the rename and the
+        directory after it. Without the first, a power cut can leave the rename
+        applied to an empty file - which is worse than not writing at all,
+        because the previous content is gone too. This is the same reasoning as
+        `log.append`: the markdown is the source of truth, so it must be at least
+        as durable as the sqlite mirror that indexes it.
+    """
+    secure_dir(path.parent)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        # Only reachable when the write or the replace failed; leaving a dotfile
+        # beside a note the user browses in Obsidian is its own small mess.
+        if temporary.exists():
+            temporary.unlink()
+    _fsync_dir(path.parent)
+
+
+def _fsync_dir(path: Path) -> None:
+    """A file's own fsync does not promise its directory entry survives."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def secure_file(path: Path) -> None:
     """Tighten an existing file. For paths a library created for us (sqlite)."""
     try:

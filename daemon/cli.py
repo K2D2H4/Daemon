@@ -54,6 +54,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="is the service installed and running")
     sub.add_parser("doctor", help="check configuration, Ollama, data dir and schema")
     sub.add_parser("reindex", help="rebuild the sqlite mirror from the markdown log")
+    reflect = sub.add_parser(
+        "reflect", help="consolidate a day of conversation into memory and observations"
+    )
+    reflect.add_argument(
+        "--date",
+        help="a local YYYY-MM-DD. Omitted: every unreflected day except today, "
+        "oldest first - today is still being written to.",
+    )
+    reflect.add_argument(
+        "--force", action="store_true", help="redo a day that already has an artifact"
+    )
 
     sub.add_parser("voice", help="hold one spoken conversation at this machine")
 
@@ -101,6 +112,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         inserted = _reindex(settings)
         print(f"reindexed {inserted} message(s) the mirror was missing")
         return OK
+    if command == "reflect":
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+        return asyncio.run(_reflect(settings, date=args.date, force=args.force))
     if command == "voice":
         logging.basicConfig(
             level=logging.INFO,
@@ -201,14 +215,57 @@ def _pairing(settings: Settings, args: Any) -> int:
 
 def _reindex(settings: Settings) -> int:
     from daemon.app import DB_FILENAME
+    from daemon.memory.curated import rebuild as rebuild_curated
+    from daemon.memory.entities import rebuild as rebuild_entities
     from daemon.memory.reindex import reindex
     from daemon.memory.store import Store
 
     store = Store.open(settings.data_dir / DB_FILENAME)
     try:
-        return reindex(settings.data_dir, store)
+        inserted = reindex(settings.data_dir, store)
+        # The other two markdown tiers are mirrors too, and a rebuild that only
+        # restored messages would silently drop every curated fact and entity note
+        # the reflection pass had concluded - which is the thing non-negotiable 1
+        # exists to make impossible.
+        rebuild_curated(settings.data_dir, store)
+        rebuild_entities(settings.data_dir, store)
+        return inserted
     finally:
         store.close()
+
+
+async def _reflect(settings: Settings, *, date: str | None, force: bool) -> int:
+    """Run the reflection pass now. This is also how the pass is verified at all:
+    the scheduler runs it at 04:00 and nobody is awake to read the log."""
+    from daemon.app import build_reflection
+
+    reflection, closing = await build_reflection(settings)
+    try:
+        results = (
+            [await reflection.run(date, force=force)]
+            if date
+            else await reflection.catch_up()
+        )
+    finally:
+        await closing()
+
+    if not results:
+        print("nothing to reflect on: no day has a log without a reflection already.")
+        return OK
+    for result in results:
+        print(
+            f"{result.date}: {result.status}"
+            + (f" - {result.detail}" if result.detail else "")
+            + (
+                f" ({result.messages_read} message(s) -> {result.facts} fact(s), "
+                f"{result.entities} entity(ies), {result.observations} observation(s))"
+                if result.status == "written"
+                else ""
+            )
+        )
+        for problem in result.problems:
+            print(f"  ! {problem}")
+    return OK if all(result.ok for result in results) else PROBLEM
 
 
 async def probe_ollama(settings: Settings) -> tuple[bool, str]:
@@ -251,6 +308,7 @@ def _doctor() -> int:
             ),
             _data_dir_check(settings),
             _schema_check(settings),
+            _memory_check(settings),
             *_ollama_checks(settings),
         ]
 
@@ -264,6 +322,62 @@ def _doctor() -> int:
         sys.stdout.flush()
         print(f"\n{failed} check(s) failed.", file=sys.stderr)
     return PROBLEM if failed else OK
+
+
+def _memory_check(settings: Settings) -> Check:
+    """What reflection has actually built.
+
+    Reported rather than logged because an empty graph and a working one look
+    identical from the outside, and the M2 gate is "an entity graph I did not fix
+    by hand is worth reading" - so it has to be readable without opening sqlite.
+    The backlog is in here for the same reason: a reflection loop that has run
+    zero times leaves no trace anywhere else.
+    """
+    from daemon.app import DB_FILENAME
+    from daemon.memory.entities import EntityNotes
+    from daemon.memory.store import Store
+    from daemon.reflection import pending_days
+
+    # The backlog comes off the filesystem, so it is known even when the mirror is
+    # not. That ordering is the fix for a real hole: with the sqlite file deleted -
+    # which non-negotiable 1 calls a legitimate state - this reported "nothing
+    # recorded yet" and hid a month of unreflected log behind it.
+    backlog = pending_days(settings.data_dir)
+    behind = (
+        f"{len(backlog)} day(s) not reflected on yet (oldest {backlog[0]})"
+        " - run `daemon reflect`"
+        if backlog
+        else ""
+    )
+
+    path = settings.data_dir / DB_FILENAME
+    if not path.exists():
+        return Check("memory", True, behind or "nothing recorded yet")
+
+    try:
+        store = Store.open(path)
+    except Exception as exc:  # noqa: BLE001 - doctor reports state, it does not die
+        # A database from a newer build refuses to open, and the schema check above
+        # already says so with the version numbers. Letting this one raise turned
+        # the whole of `daemon doctor` into a traceback - the command whose entire
+        # job is to explain what is wrong.
+        return Check("memory", True, f"not readable ({exc.__class__.__name__}); see schema above")
+
+    try:
+        notes = EntityNotes(settings.data_dir, store)
+        graph = notes.graph(limit=10_000)
+        detail = (
+            f"{store.count_entries()} curated fact(s), {len(graph)} entity(ies), "
+            f"{store.count_observations()} observation(s)"
+        )
+        if behind:
+            detail += f"; {behind}"
+        for name, mentions, linked in graph[:5]:
+            arrow = f" -> {', '.join(linked)}" if linked else ""
+            detail += f"\n         {name} ({mentions}){arrow}"
+        return Check("memory", True, detail)
+    finally:
+        store.close()
 
 
 def _data_dir_check(settings: Settings) -> Check:

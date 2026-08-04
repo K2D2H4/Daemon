@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import getpass
 import json
-import os
 import sys
 import time
 import webbrowser
@@ -77,7 +76,7 @@ from daemon.config import (
     preset_providers,
     providers_for,
 )
-from daemon.fs import FILE_MODE, secure_dir, secure_file
+from daemon.fs import secure_dir, write_private_replace
 from daemon.tasks import Task
 from daemon.tui import (
     Choice,
@@ -818,17 +817,7 @@ def write_private_file(path: Path, content: str) -> None:
     ran: the replace either happens or it does not. The same property is what
     makes a Ctrl-C during the persona questions cost nothing.
     """
-    temporary = path.with_name(f"{path.name}.daemon-setup")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        secure_file(temporary)
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():  # only reachable if the write or replace failed
-            temporary.unlink()
-    secure_file(path)
+    write_private_replace(path, content)
 
 
 def mask(value: str) -> str:

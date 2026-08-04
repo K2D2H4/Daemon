@@ -53,11 +53,14 @@ from daemon import clock
 # then found undone one layer up. A second copy is a second place for that to
 # happen, and voice is the weaker position to start from: the wire has no role that
 # means "reference material", so the block arrives as a *user* turn.
-from daemon.loop import _label, _one_line, recall_footer, recall_header
+from daemon.loop import render_recall
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
 from daemon.voice.base import AudioIO, Transcript, VoiceSession
 
 logger = logging.getLogger(__name__)
+
+_IDENTITY_NONCE = "same-memories"
+"""Nonce used only to compare two recall payloads for equality, never sent."""
 
 VOICE_CHANNEL = "voice"
 """`channel` for a recorded voice turn. Not the provider's name: the column says
@@ -365,12 +368,16 @@ class VoiceConversation:
         mode an exception is silence, and answering with less memory beats not
         answering.
         """
-        lines = _recall_lines(items)
-        if not lines or lines == self._offered:
+        # Identity is the same rendering under a fixed nonce, never sent. The real
+        # nonce differs every time by design, so comparing sent payloads directly
+        # would make two blocks carrying identical memories always look different -
+        # and the model would be handed the same facts on every partial transcript.
+        identity = render_recall(items, _IDENTITY_NONCE)
+        if not identity or identity == self._offered:
             return
-        self._offered = lines
+        self._offered = identity
         try:
-            await session.send_context(_delimit(lines))
+            await session.send_context(render_recall(items, secrets.token_hex(4)))
         except Exception:
             logger.exception("voice: recall could not be put in front of the model")
 
@@ -431,29 +438,6 @@ class VoiceConversation:
         self._playing = False
         await session.interrupt()
         await self._audio.stop_playback()
-
-
-def _recall_lines(items: list[RecalledItem]) -> str:
-    """The recalled memories, one per line, or nothing.
-
-    Separate from the boundary that wraps them because this is what identifies a
-    payload: the nonce is different every time by design, so two blocks carrying the
-    same memories never compare equal.
-    """
-    return "\n".join(
-        f"- {clock.to_iso(item.ts)} {_label(item)}: {_one_line(item.content)}" for item in items
-    )
-
-
-def _delimit(lines: str) -> str:
-    """Wrap the memories in the same boundary the text path uses - see the import.
-
-    The difference is where it lands: Live accepts only "user" and "model" turns, so
-    this arrives as though the user had said it. The header is what corrects that,
-    which is why it is not optional here.
-    """
-    nonce = secrets.token_hex(4)
-    return "\n".join([recall_header(nonce), "", lines, "", recall_footer(nonce)])
 
 
 def _covers(prepared: str, said: str) -> bool:
