@@ -833,3 +833,126 @@ def test_deleting_a_message_takes_its_vector_with_it(store: Store) -> None:
 def test_upsert_rejects_an_empty_vector(store: Store) -> None:
     with pytest.raises(ValueError):
         store.upsert_embedding(add(store, "하나"), "test-model", [])
+
+
+# --- associate: PLAN 6.1 type E ----------------------------------------------
+# A separate entry point because `search` is wrong for this in two ways, and both
+# of them would fail silently rather than loudly.
+
+
+async def test_associate_finds_an_old_memory_search_would_have_buried(
+    store: Store,
+) -> None:
+    """Recency decay exists to bury old messages. Type E wants exactly those, so a
+    90-day-old memory must outrank nothing and still be returned."""
+    add(store, "제주도에서 본 바다가 아직 기억나", days_ago=90)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    hits = await recall.associate("바다", min_age_days=30)
+
+    assert [item.content for item in hits] == ["제주도에서 본 바다가 아직 기억나"]
+
+
+async def test_associate_never_marks_a_message_as_recalled(store: Store) -> None:
+    """The hazard that kept type E unbuilt.
+
+    `search` marks its hits so reflection does not re-extract what the model was
+    just shown (docs/PLAN.md 4.2 rule 2). From a five-minute background tick that
+    shows nobody anything, and `messages_for_day` would then drop those rows from
+    reflection **permanently** - a generator quietly starving the reflection pass.
+    """
+    message_id = add(store, "제주도에서 본 바다", days_ago=90)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    assert await recall.associate("바다", min_age_days=30)
+
+    row = store.messages_by_ids([message_id])[message_id]
+    assert row["recalled"] == 0
+
+
+async def test_search_still_marks_what_it_showed(store: Store) -> None:
+    """The guard above must not have turned the hygiene rule off for turns."""
+    message_id = add(store, "제주도에서 본 바다", days_ago=1)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    assert await recall.search("바다")
+
+    row = store.messages_by_ids([message_id])[message_id]
+    assert row["recalled"] == 1
+
+
+async def test_associate_excludes_anything_recent(store: Store) -> None:
+    """A memory from this morning is not an association, it is the conversation."""
+    add(store, "오늘 아침에 본 바다", days_ago=1)
+    add(store, "작년에 본 바다", days_ago=200)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    hits = await recall.associate("바다", min_age_days=30)
+
+    assert [item.content for item in hits] == ["작년에 본 바다"]
+
+
+async def test_associate_does_not_penalise_a_memory_for_being_old(store: Store) -> None:
+    """The property that makes this a separate entry point.
+
+    Two identical memories 260 days apart must score the *same*. Under `search` the
+    older one arrives at a fraction of the newer - at a 30-day half-life, 260 days
+    is about 1/400 - so type E would degenerate into a slow version of `search`.
+
+    Asserted on equal text rather than on which of two different texts wins:
+    repetition is not a stronger match in either lane. bm25 normalises for document
+    length and cosine similarity is unchanged by repeating a token, so an
+    "obviously stronger" longer match actually scores *lower*. Learned by writing
+    the wrong test first.
+    """
+    add(store, "제주도 바다", days_ago=300)
+    add(store, "제주도 바다", days_ago=40)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    hits = await recall.associate("바다", min_age_days=30, limit=2)
+
+    assert len(hits) == 2
+    assert hits[0].score == hits[1].score
+
+
+async def test_associate_with_nothing_old_enough_is_empty(store: Store) -> None:
+    add(store, "어제 본 바다", days_ago=1)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    assert await recall.associate("바다", min_age_days=30) == []
+
+
+async def test_associate_with_an_empty_query_makes_no_call(store: Store) -> None:
+    """The tick runs every five minutes; an empty query must not cost an embedder
+    round trip to learn it found nothing."""
+    embedder = GramEmbedder()
+    recall = MemoryRecall(store, embedder, now=NOW)
+    before = len(getattr(embedder, "calls", []))
+
+    assert await recall.associate("   ") == []
+    assert len(getattr(embedder, "calls", [])) == before
+
+
+async def test_associate_degrades_to_the_keyword_lane_like_search_does(
+    store: Store,
+) -> None:
+    """No embedder is a degradation, not a shutdown - the same choice `search`
+    makes.
+
+    Keyword-only association is narrow, because `unicode61` matches a Korean token
+    only whole (docs/PLAN.md 4.3), so an exact word still hits and an inflected one
+    does not. Whether that is worth a proactive utterance is the *generator's*
+    call; recall's job is to return what it can find and score it honestly.
+    """
+    add(store, "제주도 바다", days_ago=90)
+    recall = MemoryRecall(store, None, now=NOW)
+
+    hits = await recall.associate("바다", min_age_days=30)
+
+    assert [item.reason for item in hits] == ["keyword"]
