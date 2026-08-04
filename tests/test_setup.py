@@ -74,11 +74,15 @@ class Recorder:
     opened: list[str] = field(default_factory=list)
 
     def checks(
-        self, *, gemini_verdict: Verdict | None = None, openai_verdict: Verdict | None = None
+        self,
+        *,
+        gemini_verdict: Verdict | None = None,
+        openai_verdict: Verdict | None = None,
+        anthropic_verdict: Verdict | None = None,
     ) -> Checks:
         def anthropic(key: str, model: str) -> Verdict:
             self.anthropic.append(key)
-            return Verdict(True, "key works")
+            return anthropic_verdict or Verdict(True, "key works")
 
         def openai(key: str, model: str) -> Verdict:
             self.openai.append(key)
@@ -312,7 +316,9 @@ def test_balanced_asks_for_anthropic_but_not_for_voice(tmp_path: Path) -> None:
     recorder = Recorder()
     result = drive(
         tmp_path,
-        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
+        # The "" after the key is Enter at the Anthropic model id, which now has a
+        # question of its own.
+        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "", GOOD_TOKEN, "y"],
         checks=recorder.checks(),
     )
 
@@ -327,7 +333,7 @@ def test_voice_asks_for_gemini_and_writes_both_model_ids(tmp_path: Path) -> None
     recorder = Recorder()
     result = drive(
         tmp_path,
-        ["2", "anthropic", "y", "gemma3:4b", GOOD_KEY, "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
+        ["2", "anthropic", "y", "gemma3:4b", GOOD_KEY, "", "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
         checks=recorder.checks(),
     )
 
@@ -345,7 +351,7 @@ def test_quality_does_not_make_ollama_a_condition_of_finishing(tmp_path: Path) -
     # only affects recall quality.
     recorder = Recorder()
     result = drive(
-        tmp_path, ["3", "anthropic", "n", GOOD_KEY, GOOD_TOKEN, "y"], checks=recorder.checks()
+        tmp_path, ["3", "anthropic", "n", GOOD_KEY, "", GOOD_TOKEN, "y"], checks=recorder.checks()
     )
 
     assert result.code == 0
@@ -410,7 +416,7 @@ def test_a_rejected_key_is_re_asked_and_the_bad_one_is_never_written(
     )
     result = drive(
         tmp_path,
-        ["2", "anthropic", "n", "gemma3:4b", "sk-ant-TYPO", GOOD_KEY, GOOD_TOKEN, "y"],
+        ["2", "anthropic", "n", "gemma3:4b", "sk-ant-TYPO", GOOD_KEY, "", GOOD_TOKEN, "y"],
         checks=checks,
     )
 
@@ -545,7 +551,10 @@ def test_anthropic_flags_a_model_id_that_is_not_on_the_account(
 
     assert verdict.ok
     assert "not in your model list" in verdict.detail
-    assert "DAEMON_ANTHROPIC_MODEL" in verdict.hint
+    # Same shape as OpenAI's: there is a `DAEMON_ANTHROPIC_MODEL` question now, so
+    # the hint sends them to it instead of telling them to edit the file.
+    assert "next question" in verdict.hint
+    assert verdict.models["DAEMON_ANTHROPIC_MODEL"] == ("claude-haiku-4",)
 
 
 def test_anthropic_reports_a_rejected_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -636,13 +645,21 @@ def test_a_value_already_in_the_file_is_not_asked_for_again(tmp_path: Path) -> N
     existing = f"DAEMON_PRESET=balanced\nANTHROPIC_API_KEY={GOOD_KEY}\n"
     result = drive(
         tmp_path,
-        [KEEP, "anthropic", "n", "gemma3:4b", GOOD_TOKEN, "y"],
+        [KEEP, "anthropic", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(),
     )
 
     assert result.code == 0
-    assert recorder.anthropic == []  # not re-verified, not re-asked
+    # Never *asked* for: the answer sequence is what proves it. If the key question
+    # had been printed, `GOOD_TOKEN` would have been consumed as the key and the
+    # token question would have got "y".
+    #
+    # Probed once, though, and that is `LISTED_BY` working: the saved key is what
+    # can list the ids for the model question two lines later, and on a re-install
+    # it is the only thing that can - otherwise the menu the wizard grew is exactly
+    # the menu a returning user never sees.
+    assert recorder.anthropic == [GOOD_KEY]
     assert f"ANTHROPIC_API_KEY={GOOD_KEY}" in result.written
     # And absent from the change list, which is where "nothing to do about this
     # one" is visible. The wizard used to say "already in .env, keeping it" and
@@ -750,7 +767,7 @@ def test_a_file_that_still_fails_validation_is_explained_not_traced(tmp_path: Pa
 def test_no_secret_is_ever_echoed_back(tmp_path: Path) -> None:
     result = drive(
         tmp_path,
-        ["2", "anthropic", "y", GOOD_KEY, "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
+        ["2", "anthropic", "y", GOOD_KEY, "", "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
         existing="DAEMON_OLLAMA_MODEL=gemma3:4b\n",
     )
 
@@ -909,6 +926,35 @@ def test_check_does_not_fail_over_a_key_that_has_a_working_default(tmp_path: Pat
     assert setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out) == 0
     assert "warn:" in out.getvalue()
     assert "DAEMON_OLLAMA_MODEL" in out.getvalue()
+
+
+def test_check_does_not_call_a_model_id_missing_while_printing_its_value(
+    tmp_path: Path,
+) -> None:
+    """A complete install has to read as complete.
+
+    `needs_for` keeps a `listed` model id in its list even once the file answers it,
+    because the *wizard* re-asks a decided model id - that is how you change one
+    without editing `.env`. `--check` is answering a different question, and it was
+    reading the same list: on a finished OpenAI install it printed
+    `ok: DAEMON_OPENAI_MODEL = gpt-5.1` and `missing: DAEMON_OPENAI_MODEL` on one
+    screen and exited non-zero. This got worse the moment Claude gained the same
+    kind of question, which is how it was found.
+    """
+    (tmp_path / ".env").write_text(
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai\n"
+        f"OPENAI_API_KEY=sk-real\nDAEMON_OPENAI_MODEL=gpt-5.1\n"
+        f"DAEMON_OLLAMA_MODEL=gemma3:4b\nTELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n",
+        encoding="utf-8",
+    )
+    out = io.StringIO()
+
+    code = setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out)
+
+    assert code == 0
+    assert "ok:      DAEMON_OPENAI_MODEL = gpt-5.1" in out.getvalue()
+    assert "missing:" not in out.getvalue()
+    assert "Nothing missing." in out.getvalue()
 
 
 def test_check_masks_the_keys_it_found(tmp_path: Path) -> None:
@@ -1587,6 +1633,221 @@ def test_the_real_poll_asks_telegram_only_for_messages(
     assert seen["params"] == {"timeout": 20, "allowed_updates": '["message"]', "offset": 7}
 
 
+# --- what Telegram said, not just which number it said it with ----------------
+# A real onboarding run failed at pairing with `fail: api.telegram.org returned
+# HTTP 409` and nothing else, then fell through to "start the daemon in one
+# terminal" - advice that polls the same endpoint and fails the same way. 409 has
+# two causes, one persistent and one transient, and the body says which.
+
+WEBHOOK_409 = {
+    "ok": False,
+    "error_code": 409,
+    "description": (
+        "Conflict: can't use getUpdates method while webhook is active; "
+        "use deleteWebhook to delete the webhook first"
+    ),
+}
+"""Telegram's body for the persistent cause: a webhook is set on the bot."""
+
+OTHER_POLLER_409 = {
+    "ok": False,
+    "error_code": 409,
+    "description": (
+        "Conflict: terminated by other getUpdates request; "
+        "make sure that only one bot instance is running"
+    ),
+}
+"""And for the transient one: something else is polling the same token."""
+
+
+def test_a_409_from_a_webhook_says_it_is_a_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup.httpx, "get", canned(409, WEBHOOK_409))
+
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert not result.ok
+    # Telegram's own words, which are the only thing that distinguishes this from
+    # the other 409.
+    assert "webhook is active" in result.detail
+    assert "409" in result.detail
+
+
+def test_a_409_from_another_poller_says_that_instead(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup.httpx, "get", canned(409, OTHER_POLLER_409))
+
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert not result.ok
+    assert "terminated by other getUpdates request" in result.detail
+    # The two are told apart by the description and by nothing else, so the same
+    # status code must not have produced the same sentence.
+    assert "webhook is active" not in result.detail
+
+
+@pytest.mark.parametrize("body", [WEBHOOK_409, OTHER_POLLER_409, {}])
+def test_a_409_names_both_causes_and_what_to_do_about_each(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, object]
+) -> None:
+    """Both, always - including when the body was unreadable.
+
+    Which cause it is comes from the description, and the description is the part
+    that can be missing. So the hint carries both diagnoses and both actions rather
+    than branching on the text: guessing from a body that may not be there is how a
+    wizard confidently sends someone to delete a webhook that does not exist.
+    """
+    monkeypatch.setattr(setup.httpx, "get", canned(409, body))
+
+    hint = flat("\n".join(setup.fetch_updates(GOOD_TOKEN, None, 1).hint))
+
+    assert "webhook" in hint
+    assert "deleteWebhook" in hint  # the command, for the persistent cause
+    assert "polling this token" in hint  # and the transient one
+    assert "daemon uninstall" in hint  # where the other poller usually is
+    # Named, not run. Deleting a webhook changes something the user may have set on
+    # purpose, and this wizard writes nothing but `.env`.
+    assert "curl -X POST" in hint
+
+
+def test_a_409_with_no_parseable_body_still_reports_the_code_and_the_causes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        # Not JSON at all - a proxy or a gateway in the way, which is exactly when
+        # a wizard must not raise.
+        return httpx.Response(409, text="<html>Conflict</html>", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(setup.httpx, "get", get)
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert not result.ok
+    assert "HTTP 409" in result.detail
+    # No description to quote, so the detail is exactly what it always was - and the
+    # explanation is still there, because it does not depend on the body.
+    assert result.detail.endswith("HTTP 409")
+    assert result.hint
+
+
+def test_a_non_409_poll_failure_still_says_what_telegram_said(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fix is not 409-shaped: every non-200 body carries a description, and
+    # throwing it away was the actual defect.
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(400, {"ok": False, "error_code": 400, "description": "Bad Request: invalid offset"}),
+    )
+
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert not result.ok
+    assert "HTTP 400" in result.detail
+    assert "invalid offset" in result.detail
+    # And no 409 advice, which would be a confident answer to a different question.
+    assert result.hint == ()
+
+
+def test_getme_reports_what_telegram_said_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `check_telegram` had the same status-code-only shape, over a body with the
+    # same field in it.
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(500, {"ok": False, "description": "Internal Server Error: restarting"}),
+    )
+
+    verdict = setup.check_telegram(GOOD_TOKEN)
+
+    assert not verdict.ok
+    assert "HTTP 500" in verdict.detail
+    assert "restarting" in verdict.detail
+
+
+def test_a_description_echoing_the_token_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The body is text off the network on its way to a terminal.
+
+    Telegram does not echo the token today, but the token is in the request path and
+    an error body is the sort of thing that quotes request context. One
+    `_redact` call is cheaper than finding out.
+    """
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(409, {"description": f"Conflict: bot{GOOD_TOKEN} is already polling"}),
+    )
+
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert GOOD_TOKEN not in result.detail
+    assert "<token>" in result.detail
+    # And the placeholder is the same one the copyable commands use, so what is on
+    # screen and what has to be substituted read as the same thing.
+    assert "<token>" in "\n".join(result.hint)
+
+
+def test_a_description_cannot_repaint_the_terminal_or_fill_the_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(409, {"description": "Conflict:\n\x1b[2Jwiped\r " + "x" * 500}),
+    )
+
+    said = setup.fetch_updates(GOOD_TOKEN, None, 1).detail
+
+    assert "\x1b" not in said
+    assert "\n" not in said
+    assert "wiped" in said  # the words survive; only the control codes do not
+    assert tui.display_width(said) <= setup.BODY_LIMIT + 60
+
+
+def test_a_korean_description_is_bounded_by_columns_not_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`BODY_LIMIT` is a terminal width, and Korean is two columns per character.
+
+    Counting characters would let a Korean body take twice the screen it was
+    budgeted, on the one screen where the user is reading a diagnosis.
+    """
+    monkeypatch.setattr(
+        setup.httpx, "get", canned(409, {"description": "웹훅이 이미 설정되어 있습니다. " * 40})
+    )
+
+    said = setup.fetch_updates(GOOD_TOKEN, None, 1).detail
+
+    assert "웹훅이" in said
+    assert tui.display_width(said) <= setup.BODY_LIMIT + 60
+
+
+def test_the_wizard_prints_the_409_diagnosis_where_pairing_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole chain: a real 409 body, the real probe, and the real transcript.
+
+    The unit tests above prove the strings exist. This one proves they reach the
+    screen at the moment the user is looking at it - which is the gap the fakes in
+    this file cannot see, and the gap the original defect lived in.
+    """
+    monkeypatch.setattr(setup.httpx, "get", canned(409, WEBHOOK_409))
+
+    result = drive(
+        tmp_path,
+        answers_for(pairing=["y"]),
+        # The real `getUpdates`, over the canned body. Every other probe is a fake,
+        # so nothing else in this run touches httpx.
+        checks=checks_with(setup.fetch_updates),
+    )
+
+    out = flat(result.out)
+    assert "webhook is active" in out
+    assert "deleteWebhook" in out
+    assert GOOD_TOKEN not in result.out
+    # Still hands back the documented two-terminal route afterwards - it is still
+    # true - but now underneath a reason rather than instead of one.
+    assert "daemon pairing approve" in out
+
+
 # --- whose model, as a separate question --------------------------------------
 
 HOSTED_KEY = {
@@ -1757,7 +2018,11 @@ def test_openai_flags_a_model_id_that_is_not_on_the_account(
 
     assert verdict.ok
     assert "not in your model list" in verdict.detail
-    assert "DAEMON_OPENAI_MODEL" in verdict.hint
+    # The hint points at the question that comes next rather than naming five ids
+    # inline: that question prints the whole list, newest first, and an inline
+    # alphabetical five would contradict the order it shows.
+    assert "next question" in verdict.hint
+    assert verdict.models["DAEMON_OPENAI_MODEL"] == ("gpt-4.1",)
 
 
 def test_the_openai_key_travels_in_a_header_not_the_url(
@@ -1943,20 +2208,31 @@ def test_a_stale_openai_default_is_flagged_and_the_list_still_comes_back(
     assert verdict.models["DAEMON_OPENAI_MODEL"] == ("gpt-4.1",)
 
 
-def test_the_anthropic_model_id_has_no_question_to_offer_a_list_to(
+def test_choosing_claude_lets_you_choose_which_claude(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Why one of the three probes carries no list.
+    """The gap this closes, and why the old shape was wrong.
 
     `DAEMON_ANTHROPIC_MODEL` is the one hosted model id Settings has a default for,
-    so the wizard never asks it and `check_anthropic` verifies that default against
-    the account instead. A list with no question to answer would be a value nobody
-    reads.
+    and that was taken as a reason not to ask - so someone who picked Claude could
+    not choose *which* Claude without hand-editing `.env`, which is the exact chore
+    this module exists to remove. A working default is a reason for the question to
+    be non-blocking, not a reason for it to be absent: `DAEMON_OLLAMA_MODEL` has had
+    that shape all along.
     """
     monkeypatch.setattr(setup.httpx, "get", canned(200, {"data": [{"id": "claude-haiku-4"}]}))
+    need = next(
+        item for item in setup._all_needs() if item.key == "DAEMON_ANTHROPIC_MODEL"
+    )
 
-    assert "DAEMON_ANTHROPIC_MODEL" not in {need.key for need in setup._all_needs()}
-    assert setup.check_anthropic(GOOD_KEY, "claude-haiku-4").models == {}
+    assert need.listed
+    # Settings has a default, so an empty answer still starts. `--check` warns
+    # rather than failing, and its exit code agrees with that.
+    assert not need.blocking
+    # And the probe carries the ids, so the question is a menu rather than a guess.
+    assert setup.check_anthropic(GOOD_KEY, "claude-haiku-4").models == {
+        "DAEMON_ANTHROPIC_MODEL": ("claude-haiku-4",)
+    }
 
 
 @pytest.mark.parametrize(
@@ -2010,9 +2286,306 @@ def test_an_id_with_a_newline_in_it_is_never_offered() -> None:
 
 
 def test_the_default_is_first_so_enter_and_one_mean_the_same_thing() -> None:
+    # And the two undated, unversioned ids keep the order the provider sent them in
+    # - not alphabetical. Alphabetical is what buried `gemini-3.x` under
+    # `antigravity-…`, and there is no reason to believe 'a' before 'b' means
+    # anything about a model.
     ordered = setup.order_models(("b-model", "a-model", "the-default"), "the-default")
 
-    assert ordered == ("the-default", "a-model", "b-model")
+    assert ordered == ("the-default", "b-model", "a-model")
+
+
+# --- newest first, from whatever each provider actually publishes --------------
+# Three providers, two orderings, and the split is theirs rather than a preference:
+# OpenAI dates every model with `created`, Anthropic with `created_at`, and Gemini's
+# `models.list` publishes no creation date at all.
+
+REAL_TEXT_MODELS = (
+    # The 42-model list that started this, trimmed to the shapes that matter and in
+    # the order the alphabetical version printed them.
+    "antigravity-preview-05-2026",
+    "deep-research-max-preview-04-2026",
+    "deep-research-preview-04-2026",
+    "deep-research-pro-preview-12-2025",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-3.1-flash",
+    "gemini-3.2-pro-preview",
+)
+"""Real ids from the run that reported this, including the four that led the menu.
+
+Eleven rather than that run's 42, but keeping its proportions: the great majority of
+a real Gemini catalogue carries a dotted family version, which is what decides
+whether the four that do not fit above the fold."""
+
+
+def test_the_research_and_agent_models_no_longer_lead_the_gemini_menu() -> None:
+    """The reported defect, as a gate.
+
+    All four ids the user was offered first support `generateContent`, so the
+    capability filter passes them correctly - `supportedGenerationMethods` cannot
+    tell a research or agent model from a conversational one. What separates them
+    here is that none of them carries a dotted family version and every Gemini chat
+    model does, so recency alone sinks them below the fold.
+    """
+    ordered = setup.order_models(REAL_TEXT_MODELS, "gemini-2.5-flash")
+    reported = [name for name in REAL_TEXT_MODELS if not name.startswith("gemini-")]
+
+    assert ordered[0] == "gemini-2.5-flash"  # the default, so Enter and `1` agree
+    # Newest family first, and a tie inside 2.5 keeps the order Google sent.
+    assert ordered[1:4] == ("gemini-3.2-pro-preview", "gemini-3.1-flash", "gemini-2.5-flash-lite")
+    # Nothing the user did not mean to pick from is above the fold any more - and
+    # every one of the four is still in the list, just under it.
+    assert len(reported) == 4
+    for name in reported:
+        assert name not in ordered[: setup.MODEL_LIST_FOLD]
+        assert name in ordered
+    # The claim underneath that, which does not depend on where the fold happens to
+    # sit: every dated-by-name id outranks every id without a version in it.
+    assert max(ordered.index(name) for name in ordered if setup.model_version(name)) < min(
+        ordered.index(name) for name in reported
+    )
+
+
+def test_nothing_is_hidden_from_the_gemini_list_either() -> None:
+    """Demoted, not filtered - and this is the deliberate choice, not an oversight.
+
+    Nothing in `models.list` marks a model as not-for-chatting: `displayName` and
+    `description` are prose restating the name, and there is no family or modality
+    field. So narrowing would mean a hard-coded list of name families, which hides a
+    model the account can use the first time Google ships a family this file has not
+    heard of. `?` prints the whole thing instead.
+    """
+    ordered = setup.order_models(REAL_TEXT_MODELS, "gemini-2.5-flash")
+
+    assert set(ordered) == set(REAL_TEXT_MODELS)
+
+
+def test_openai_orders_the_menu_by_the_date_openai_published(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`created`, descending - a real field, not a guess at `gpt-` naming.
+
+    And it does the job a name filter would otherwise be handed: `whisper-1`,
+    `dall-e-3` and `tts-1` are not chat models, this endpoint says nothing to mark
+    them as such, and they are all years older than anything that is.
+    """
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(
+            200,
+            {
+                "data": [
+                    {"id": "whisper-1", "created": 1_677_532_384},
+                    {"id": "gpt-5.1", "created": 1_763_000_000},
+                    {"id": "dall-e-3", "created": 1_698_785_189},
+                    {"id": "gpt-5.2", "created": 1_770_000_000},
+                    {"id": "gpt-4.1", "created": 1_744_316_542},
+                ]
+            },
+        ),
+    )
+
+    ids = setup.check_openai("sk-real", "gpt-5.2").models["DAEMON_OPENAI_MODEL"]
+
+    assert ids == ("gpt-5.2", "gpt-5.1", "gpt-4.1", "dall-e-3", "whisper-1")
+
+
+def test_anthropic_orders_the_menu_by_created_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same idea over a different shape: Anthropic's date is an ISO-8601 string, not
+    # a unix integer, and both are reduced to one number so one code path sorts both.
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(
+            200,
+            {
+                "data": [
+                    {"id": "claude-haiku-4", "created_at": "2025-10-01T00:00:00Z"},
+                    {"id": "claude-opus-5", "created_at": "2026-05-14T00:00:00Z"},
+                    {"id": "claude-sonnet-5", "created_at": "2026-02-19T00:00:00Z"},
+                ]
+            },
+        ),
+    )
+
+    ids = setup.check_anthropic(GOOD_KEY, "claude-opus-5").models["DAEMON_ANTHROPIC_MODEL"]
+
+    assert ids == ("claude-opus-5", "claude-sonnet-5", "claude-haiku-4")
+
+
+def test_a_dated_list_is_not_second_guessed_by_reading_versions_out_of_names() -> None:
+    """Why `order_models` takes `dated` instead of always applying `model_version`.
+
+    `gpt-5` carries no dot and `gpt-4.1` does, so the name heuristic would rank the
+    older model above the newer one - confidently, and on the strength of
+    punctuation. Where the provider published a date, the date wins and this
+    function keeps its hands off the order.
+    """
+    # As `created` descending left it: 5.2, then 5, then the two older ones.
+    newest_first = ("gpt-5.2", "gpt-5", "gpt-4.1", "o3")
+
+    assert setup.order_models(newest_first, "gpt-5.2", dated=True) == newest_first
+    # The same ids read as an undated list, so it is visibly the flag doing this and
+    # not the fixture: the heuristic pulls `gpt-4.1` above `gpt-5` on the strength of
+    # a dot, which is the wrong answer and the reason `dated` exists.
+    assert setup.order_models(newest_first, "gpt-5.2", dated=False) == (
+        "gpt-5.2",
+        "gpt-4.1",
+        "gpt-5",
+        "o3",
+    )
+
+
+def test_which_lists_are_dated_is_settled_by_the_provider_not_by_taste() -> None:
+    # The asymmetry is worth pinning: it is the reason there are two orderings, and
+    # a future reader trying to unify them should fail this test first.
+    assert setup.DATED_LISTS == {"DAEMON_ANTHROPIC_MODEL", "DAEMON_OPENAI_MODEL"}
+    assert "DAEMON_GEMINI_MODEL" not in setup.DATED_LISTS
+    assert "DAEMON_GEMINI_LIVE_MODEL" not in setup.DATED_LISTS
+
+
+def test_a_model_the_provider_did_not_date_keeps_its_place_rather_than_vanishing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A missing field must cost the ordering, not the menu - the same rule
+    # `_gemini_models` follows for a body that changed shape.
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(
+            200,
+            {
+                "data": [
+                    {"id": "gpt-undated"},
+                    {"id": "gpt-old", "created": 1_600_000_000},
+                    {"id": "gpt-new", "created": 1_770_000_000},
+                    {"id": "gpt-nonsense", "created": "the day before yesterday"},
+                ]
+            },
+        ),
+    )
+
+    ids = setup.check_openai("sk-real", "gpt-new").models["DAEMON_OPENAI_MODEL"]
+
+    assert ids == ("gpt-new", "gpt-old", "gpt-undated", "gpt-nonsense")
+
+
+def test_choosing_which_claude_is_a_question_with_a_menu_behind_it(
+    tmp_path: Path,
+) -> None:
+    """End to end, because a `Need` nothing asks is the defect this closes.
+
+    Previously there was no question at all, so `claude-sonnet-5` was whatever
+    `Settings` said and the only way to change it was to edit `.env` by hand.
+    """
+    recorder = Recorder()
+    checks = recorder.checks(
+        anthropic_verdict=Verdict(
+            True,
+            "key works",
+            # Newest first, as `_newest_first` would have left them.
+            models={"DAEMON_ANTHROPIC_MODEL": ("claude-opus-5", "claude-sonnet-5")},
+        ),
+    )
+    # balanced, anthropic, voice off, the local model, the key, then `2` at the model
+    # menu. `1` is the Settings default, because Enter and `1` have to agree.
+    result = drive(
+        tmp_path,
+        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "2", GOOD_TOKEN, "y"],
+        checks=checks,
+    )
+
+    assert result.code == 0
+    offered = block(result.out, "DAEMON_ANTHROPIC_MODEL")
+    assert "1) claude-sonnet-5" in offered  # the default
+    assert "2) claude-opus-5" in offered
+    # Which is a decision the wizard could not previously carry at all.
+    assert "DAEMON_ANTHROPIC_MODEL=claude-opus-5" in result.written
+
+
+def test_an_id_the_account_never_listed_is_still_accepted_for_claude(
+    tmp_path: Path,
+) -> None:
+    # The same contract as the other three model questions: a model released this
+    # morning is in no list, and refusing an id the API would take is a worse dead
+    # end than the one the list removed.
+    recorder = Recorder()
+    checks = recorder.checks(
+        anthropic_verdict=Verdict(
+            True, "key works", models={"DAEMON_ANTHROPIC_MODEL": ("claude-sonnet-5",)}
+        )
+    )
+    result = drive(
+        tmp_path,
+        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "claude-opus-6-20260901", GOOD_TOKEN, "y"],
+        checks=checks,
+    )
+
+    assert result.code == 0
+    assert "DAEMON_ANTHROPIC_MODEL=claude-opus-6-20260901" in result.written
+
+
+def test_a_saved_anthropic_key_still_produces_a_menu_on_a_re_install(
+    tmp_path: Path,
+) -> None:
+    """`LISTED_BY`, for the third credential.
+
+    The list normally rides back on the verdict from *asking* for a key, and a key
+    already in `.env` is never asked for - which on a re-install is the common case
+    and was the whole difference between a menu and "nothing listed this account's
+    models".
+    """
+    recorder = Recorder()
+    checks = recorder.checks(
+        anthropic_verdict=Verdict(
+            True,
+            "key works",
+            models={"DAEMON_ANTHROPIC_MODEL": ("claude-opus-5", "claude-sonnet-5")},
+        )
+    )
+    result = drive(
+        tmp_path,
+        [KEEP, "anthropic", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
+        existing=f"DAEMON_PRESET=balanced\nANTHROPIC_API_KEY={GOOD_KEY}\n",
+        checks=checks,
+    )
+
+    assert result.code == 0
+    assert "claude-opus-5" in block(result.out, "DAEMON_ANTHROPIC_MODEL")
+    assert setup.NO_LIST_NOTE not in result.out
+    # One probe, from the saved key, and never a second one for the same credential.
+    assert recorder.anthropic == [GOOD_KEY]
+
+
+def test_the_expand_key_still_prints_every_id_the_account_has(tmp_path: Path) -> None:
+    """`?` is what makes "demote, never hide" honest.
+
+    A wizard that cannot show what the account has is worse than a noisy one, so the
+    unfolded list has to be complete - all of it, including the research and agent
+    families that recency pushed below the fold.
+    """
+    # The Live id takes Enter, then the text question gets `?` and then Enter.
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, "", EXPAND, "", "", "y"],
+        checks=gemini_listing(
+            live=(setup.DEFAULT_GEMINI_LIVE_MODEL,), text=REAL_TEXT_MODELS
+        ),
+    )
+
+    assert result.code == 0
+    # Not `block`, which stops at the first prompt: the unfolded list is printed
+    # *after* it, in answer to `?`. This is the last model question in the run, so
+    # nothing further down prints a model id.
+    offered = result.out[result.out.index("(DAEMON_GEMINI_MODEL)") :]
+    assert f"{EXPAND} lists the other" in offered  # it was folded first
+    for name in REAL_TEXT_MODELS:
+        assert name in offered, f"{name} was not shown even after {EXPAND}"
 
 
 def test_the_live_id_comes_from_the_account_rather_than_from_a_guess(
