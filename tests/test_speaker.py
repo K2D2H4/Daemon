@@ -511,3 +511,73 @@ async def test_a_process_that_vanishes_before_the_kill_is_not_an_error() -> None
         patch.setattr(speaker_module, "SPEECH_SECONDS_PER_CHAR", 0.0)
         assert await _bounded(speaker.say(UTTERANCE)) is False
     assert not vanished.waited, "there is nothing left to reap"
+
+
+# --- the Linux branch, carried over from the class this one replaced ----------
+# Ported when two `LocalSpeaker` classes collided and the older one - which had a
+# working espeak-ng/spd-say path - was removed. Dropping that path to resolve a
+# name collision would have been a silent regression for self-hosters, and a
+# mutation check showed the ported code had no coverage at all.
+
+
+def test_linux_uses_espeak_ng_when_it_is_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        speaker_module.shutil,
+        "which",
+        lambda name: "/usr/bin/espeak-ng" if name == "espeak-ng" else None,
+    )
+
+    assert LocalSpeaker(platform="linux").command() == ["/usr/bin/espeak-ng", "--stdin"]
+
+
+def test_linux_falls_back_to_spd_say(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two spellings a Linux desktop is likely to already have, tried in order."""
+    monkeypatch.setattr(
+        speaker_module.shutil,
+        "which",
+        lambda name: "/usr/bin/spd-say" if name == "spd-say" else None,
+    )
+
+    assert LocalSpeaker(platform="linux").command() == [
+        "/usr/bin/spd-say",
+        "--wait",
+        "--pipe-mode",
+    ]
+
+
+def test_linux_with_no_synthesiser_has_no_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(speaker_module.shutil, "which", lambda _name: None)
+
+    assert LocalSpeaker(platform="linux").command() is None
+
+
+def test_the_linux_command_also_reads_from_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The property that matters on every platform: a model-authored sentence never
+    reaches argv, so it can be neither shell-interpolated nor parsed as an option."""
+    monkeypatch.setattr(
+        speaker_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name == "espeak-ng" else None,
+    )
+
+    command = LocalSpeaker(platform="linux").command()
+
+    assert command is not None
+    assert "--stdin" in command
+    assert not any(arg.startswith("안녕") for arg in command)
+
+
+async def test_a_machine_with_nothing_to_speak_with_returns_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Answered `False`, never raised: the gate falls back to Telegram, which loses
+    nothing per the failure-cost asymmetry in docs/PLAN.md 6.4."""
+    monkeypatch.setattr(speaker_module.shutil, "which", lambda _name: None)
+    spoke: list[str] = []
+
+    async def spawner(*argv: str, **_kw: object) -> object:  # pragma: no cover - never called
+        spoke.append(argv[0])
+        raise AssertionError("nothing should have been spawned")
+
+    assert await LocalSpeaker(platform="linux", spawn=spawner).say("안녕") is False
+    assert spoke == []

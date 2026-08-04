@@ -172,6 +172,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -246,6 +247,27 @@ class LocalSpeaker:
         self._speaking = asyncio.Lock()
         self._process: Any = None
 
+    def command(self) -> list[str] | None:
+        """The argv for this platform, or `None` if nothing here can speak.
+
+        macOS is the measured path. The Linux branch is carried over from an
+        earlier implementation of this class that lived in `daemon/voice/audio.py`
+        and was removed as a duplicate: dropping it to resolve the name collision
+        would have been a silent regression for self-hosters, and `shutil.which`
+        costs nothing. **It has never been run on a real Linux box** - if a
+        self-hoster reports silence, this branch is the first thing to check.
+
+        Both spellings read the text from stdin, which is the same property `-f -`
+        gives on macOS and the reason no utterance is ever passed in argv.
+        """
+        if self._platform == "darwin":
+            return [SAY, *(("-v", self._voice) if self._voice else ()), "-f", "-"]
+        for name, args in (("espeak-ng", ["--stdin"]), ("spd-say", ["--wait", "--pipe-mode"])):
+            found = shutil.which(name)
+            if found:
+                return [found, *args]
+        return None
+
     async def say(self, text: str) -> bool:
         """Speak one line and wait for it to finish. True if `say` exited cleanly.
 
@@ -263,12 +285,11 @@ class LocalSpeaker:
             logger.debug("speaker: nothing to say")
             return False
 
-        if self._platform != "darwin":
-            # No bundled synthesiser exists elsewhere, and probing for espeak-ng
-            # or spd-say is not this file's call to make: docs/PLAN.md 6.3 routes
-            # by presence, and a machine that cannot speak should be answered with
-            # `False` here so the gate falls back to Telegram - which loses
-            # nothing, per the failure-cost asymmetry in 6.4.
+        argv = self.command()
+        if argv is None:
+            # Nothing to speak with. Answered `False` rather than raised, so the
+            # gate falls back to Telegram - which loses nothing, per the
+            # failure-cost asymmetry in docs/PLAN.md 6.4.
             logger.warning(
                 "speaker: no local synthesiser on platform %r; "
                 "route proactive utterances to a channel instead",
@@ -298,7 +319,7 @@ class LocalSpeaker:
             return False
 
         async with self._speaking:
-            return await self._speak(line)
+            return await self._speak(argv, line)
 
     async def aclose(self) -> None:
         """Cut off anything still speaking.
@@ -313,14 +334,19 @@ class LocalSpeaker:
             return
         await self._reap(process)
 
-    async def _speak(self, line: str) -> bool:
-        """One `say` process, start to finish. Holds `self._speaking`."""
+    async def _speak(self, argv: list[str], line: str) -> bool:
+        """One synthesiser process, start to finish. Holds `self._speaking`.
+
+        `argv` is resolved by the caller so the platform check and the early return
+        happen before the overlap lock is taken - a machine that cannot speak must
+        not be able to hold the lock.
+        """
         # A list going to execve, never a string going to a shell. The text is
         # model-authored, so a shell here would be a command-injection hole; it is
         # not in argv at all, because `say` parses a leading dash as an option (see
         # the module docstring). Both facts are why `-f -` and `create_subprocess_exec`
         # are load-bearing and must not be "simplified".
-        argv = [SAY, *(("-v", self._voice) if self._voice else ()), "-f", "-"]
+
         try:
             process = await self._spawn(
                 *argv,
