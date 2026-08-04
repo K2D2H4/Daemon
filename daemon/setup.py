@@ -6,7 +6,9 @@ product (docs/PLAN.md decision 1), and it fails *late*: nothing checked an API
 key until the first conversation turn needed it, so a key with a trailing space
 looked like a broken companion rather than a typo. **Everything this wizard
 accepts is verified against the provider before it is written**, and the file is
-written once, at the end, after the user has seen which keys change.
+written once, at the end, after the user has seen which keys change. The call
+that verifies a key also carries back what that account can run, so the model-id
+questions offer the ids that exist instead of a hard-coded guess.
 
 Three more rules the shape of this module comes from:
 
@@ -111,6 +113,38 @@ OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
 """Duplicated from daemon/llm/providers/openai.py rather than imported: nothing
 outside `daemon/llm/providers/` may import a provider (docs/CONTRACTS.md 4), and
 the providers are async while this module is deliberately not."""
+
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+GEMINI_PAGE_SIZE = 200
+"""`ListModels` is paged, and its default page is not the whole catalogue.
+
+The ids that fall off the end are the ones voice needs: a previous investigation
+on a real account found all six `bidiGenerateContent` models only at
+`pageSize=200`. A short list is the dangerous shape of wrong here - the menu
+looks healthy and the id the user needs is simply not in it.
+
+One page, and no `nextPageToken` loop: 200 covers the published catalogue with
+room to spare, and walking pages would spend network calls on a question this
+wizard answers from the call it already makes."""
+
+GEMINI_TEXT_METHOD = "generateContent"
+GEMINI_LIVE_METHOD = "bidiGenerateContent"
+"""The two capabilities the two Gemini model questions are actually about.
+
+One list comes back holding embedding models, image models and the realtime
+endpoints together, so a menu that did not filter would offer
+`text-embedding-004` as the model that answers - a worse answer than offering
+nothing, because it looks like an answer."""
+
+MODEL_ID_LIMIT = 64
+"""Longest id this wizard is willing to offer.
+
+Not a guess at Google's naming: these strings arrive over the network and end up
+as a `KEY=value` line in `.env`, so the filter that drops anything with
+whitespace in it is the one that stops a body from writing a line of its own, and
+a length bound is what stops a nonsense name from being printed across a
+terminal. The longest real id today is 45 characters."""
 
 DEFAULT_OLLAMA_MODEL = "gemma3:4b"
 """Not a reasoning model, and not `Settings.ollama_model`'s default. docs/PLAN.md
@@ -331,6 +365,15 @@ class Verdict:
     """Who the provider says the credential belongs to, when it says: the bot's
     `@username` for Telegram. Not a secret, and not trusted for anything - it is
     printed so the user knows which bot to message next."""
+    models: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """What this account may run, keyed by the `.env` key each list answers.
+
+    Every one of these probes already GETs a model list - it is how a key is
+    proved without spending a token - and two of them already read the ids out of
+    it to check one. Returning them costs no second call, and it is what turns
+    "that id is not in your model list, go and edit .env" into a menu (`Wizard.
+    catalog`). Keyed by `.env` key rather than by provider because one Gemini
+    response answers two different questions, filtered two different ways."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,25 +455,36 @@ def check_openai(key: str, model: str) -> Verdict:
         return Verdict(False, f"api.openai.com returned HTTP {response.status_code}")
 
     ids = _string_field(response, "data", "id")
+    # Carried whether or not the configured id checks out: the model question is
+    # the next one asked, and it is the one that can act on this.
+    listed = {"DAEMON_OPENAI_MODEL": ids}
     if model and ids and model not in ids:
         return Verdict(
             True,
             f"key works, but {model!r} is not in your model list",
             hint="Set DAEMON_OPENAI_MODEL in .env to one of: " + ", ".join(sorted(ids)[:5]),
+            models=listed,
         )
-    return Verdict(True, "key works")
+    return Verdict(True, "key works", models=listed)
 
 
 def check_gemini(key: str) -> Verdict:
-    """Validate the key, and name the Standard-key trap when that is the cause.
+    """Validate the key, name the Standard-key trap, and keep the model list.
 
     The key goes in the `x-goog-api-key` header rather than the documented `?key=`
     query parameter: a secret in a URL ends up in proxy logs.
+
+    Two ids come out of this one response - the text model and the realtime one -
+    because they are two capabilities of one catalogue, and `DAEMON_GEMINI_LIVE_
+    MODEL` is the question a real list actually settles: its default is a guess,
+    and a guessed Live id fails at the first voice turn rather than at startup
+    (docs/PLAN.md 9).
     """
     try:
         response = httpx.get(
-            "https://generativelanguage.googleapis.com/v1beta/models",
+            GEMINI_MODELS_URL,
             headers={"x-goog-api-key": key},
+            params={"pageSize": GEMINI_PAGE_SIZE},
             timeout=HTTP_TIMEOUT,
         )
     except httpx.HTTPError as exc:
@@ -450,7 +504,14 @@ def check_gemini(key: str) -> Verdict:
         return Verdict(
             False, f"generativelanguage.googleapis.com returned HTTP {response.status_code}"
         )
-    return Verdict(True, "key works")
+    return Verdict(
+        True,
+        "key works",
+        models={
+            "DAEMON_GEMINI_MODEL": _gemini_models(response, GEMINI_TEXT_METHOD),
+            "DAEMON_GEMINI_LIVE_MODEL": _gemini_models(response, GEMINI_LIVE_METHOD),
+        },
+    )
 
 
 def check_telegram(token: str) -> Verdict:
@@ -572,6 +633,38 @@ def _string_field(response: httpx.Response, container: str, key: str) -> tuple[s
     )
 
 
+def _gemini_models(response: httpx.Response, method: str) -> tuple[str, ...]:
+    """The ids that support `method`, with the `models/` prefix taken off.
+
+    Not `_string_field`: Google's shape is `{"models": [{"name": "models/x",
+    "supportedGenerationMethods": [...]}]}`, and both the filter and the prefix
+    matter. The prefix is wire format - `daemon/llm/providers/gemini.py` and
+    `daemon/voice/gemini_live.py` both accept either form and add it back - so the
+    bare id is what belongs in a menu and in `.env`.
+
+    Anything unexpected reads as an empty list rather than raising: a body that
+    changed shape must cost the menu, not the wizard.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return ()
+    items = body.get("models") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        return ()
+    found: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        methods = item.get("supportedGenerationMethods")
+        if not isinstance(name, str) or not isinstance(methods, list):
+            continue
+        if method in methods:
+            found.append(name.removeprefix("models/"))
+    return tuple(found)
+
+
 def _redact(text: str, secret: str) -> str:
     return text.replace(secret, "<token>") if secret else text
 
@@ -596,6 +689,12 @@ class Need:
     make; the wizard writes `default` without a question. `--check` still reports
     it, so what this command considers complete stays identical to what startup
     considers valid."""
+    listed: bool = False
+    """The provider can say which answers exist, so offer them (`Wizard.catalog`).
+
+    Only the model ids, and only because a key check already fetched the list. It
+    is also what says a *missing* list is worth one printed sentence: for a key or
+    a token there is nothing to list and nothing to explain."""
 
     @property
     def blocking(self) -> bool:
@@ -681,6 +780,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 why="Which model answers. Settings has no default here, so an empty "
                 "value would refuse to start.",
                 default=DEFAULT_OPENAI_MODEL,
+                listed=True,
             )
         )
     if GEMINI in providers:
@@ -712,6 +812,10 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                     label="Gemini Live model id",
                     why="The realtime audio endpoint takes its own model id, not the text one.",
                     default=DEFAULT_GEMINI_LIVE_MODEL,
+                    # The one where the list matters most: two documented Live ids
+                    # have already been shut down, and a wrong one here is silent
+                    # until the first voice turn (docs/PLAN.md 9).
+                    listed=True,
                 )
             )
         needs.append(
@@ -727,6 +831,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 # voice brought us here. Asking twice for one capability is noise,
                 # so in that case it is filled in rather than asked.
                 silent=not gemini_chat,
+                listed=True,
             )
         )
     needs.append(
@@ -764,6 +869,28 @@ def _chat_providers(preset: str, hosted: str) -> set[str]:
         for task, provider in preset_providers(preset, hosted).items()
         if task is not Task.EMBED
     }
+
+
+KEEP_HINT = "Enter keeps it."
+"""Said whenever a step shows an answer already in `.env`.
+
+The wizard used to print "already in .env, keeping it" and move on, which made a
+decided answer unreachable: the only way to change a preset was to hand-edit
+`.env`, and hand-editing config is the thing this command exists to remove - the
+same reason nobody types their own numeric Telegram id. Re-running setup is now
+how you change your mind, and Enter is how you do not.
+"""
+
+
+def _record(updates: dict[str, str], key: str, chosen: str, current: str) -> None:
+    """Queue a write only when the answer actually changed.
+
+    Without the comparison every re-run would rewrite `.env` with the values it
+    already held, and "Nothing to change in .env" - which is the wizard's way of
+    saying a re-run was harmless - would stop being true.
+    """
+    if chosen != current:
+        updates[key] = chosen
 
 
 def _truthy(value: str) -> bool:
@@ -1061,6 +1188,45 @@ MIN_PROSE_WIDTH = 20
 """Floor for wrapped prose, so a terminal narrow enough to make the indent bigger
 than the text still gets something rather than one character per line."""
 
+MODEL_LIST_FOLD = 6
+"""Ids shown before the rest is folded behind `?`.
+
+OpenAI's list is around fifty entries and two of these menus can appear in one run
+(the text id and the Live id), so the ceiling on a screen is what matters rather
+than one list. Steps 3 and 4 - the persona seed and pairing - are below this, and
+a menu that scrolled them away would have hidden the half of onboarding nobody
+knows to look for."""
+
+NO_LIST_NOTE = "Nothing listed this account's models, so this is the built-in default."
+EMPTY_LIST_NOTE = "This account lists no model that fits, so this is the built-in default."
+"""Two different sentences on purpose. The first means nobody asked - the key was
+already in `.env`, so no probe ran this time. The second means the account
+answered and had nothing. Both fall back to exactly the old question, because a
+list that could not be fetched must cost the menu and not the wizard."""
+
+
+def order_models(ids: Sequence[str], default: str) -> tuple[str, ...]:
+    """Offerable ids, `default` first so Enter and `1` agree, then the rest sorted.
+
+    The order is what the printed numbers mean, and it has to survive folding: the
+    shown part is a prefix, so `2` means the same id before and after `?`.
+
+    The filter is not cosmetic. These strings came off the network and a chosen one
+    is written as a `KEY=value` line, so anything carrying whitespace could write a
+    line of its own; anything unprintable could repaint the prompt it is offered
+    at; anything absurdly long is a body that has stopped making sense
+    (`MODEL_ID_LIMIT`).
+    """
+    usable = {
+        name
+        for name in ids
+        if name and len(name) <= MODEL_ID_LIMIT and name.isprintable() and not any(
+            character.isspace() for character in name
+        )
+    }
+    rest = sorted(usable - {default})
+    return (default, *rest) if default in usable else tuple(rest)
+
 
 @dataclass
 class Wizard:
@@ -1071,6 +1237,17 @@ class Wizard:
     bot_handle: str = field(default="", init=False)
     """The bot's `@username`, kept from verifying the token so the pairing step
     can say which bot to message."""
+    catalog: dict[str, tuple[str, ...]] = field(default_factory=dict, init=False)
+    """What the account's own key listed, keyed by the `.env` key it answers.
+
+    Filled in `_fill` from the key check's verdict and read by the model-id
+    question a few prompts later. That works because of an ordering `needs_for`
+    already had for its own reasons - the key comes before the model ids it can
+    list - so the list rides along on `Verdict` instead of being fetched again.
+
+    A key that was already in `.env` is never probed, so its entry is simply
+    absent, and absent says something different from present-and-empty: nobody
+    asked, versus the account has none. Those are two sentences, not one."""
 
     def run(self) -> int:
         existing_text = self.env_path.read_text(encoding="utf-8") if self.env_path.exists() else ""
@@ -1167,18 +1344,101 @@ class Wizard:
             self.prompt.say(choices(theme, items, expanded=True))
             self.prompt.say()
 
+    def _offer_models(self, need: Need) -> tuple[str, ...]:
+        """Print what this account can actually run, folded - and return the order
+        the printed numbers refer to.
+
+        Empty when there is nothing to offer, which costs one dim line and then
+        exactly the question this wizard asked before: the built-in default, as free
+        text. The list improves the question; it is not allowed to become the
+        question, because then a listing outage would make setup unusable.
+        """
+        theme = self.prompt.theme
+        say = self.prompt.say
+        if need.key not in self.catalog:
+            say(theme.dim(f"  {NO_LIST_NOTE}"))
+            return ()
+        ids = order_models(self.catalog[need.key], need.default)
+        if not ids:
+            say(theme.dim(f"  {EMPTY_LIST_NOTE}"))
+            return ()
+        self._show_models(ids, need.default, limit=MODEL_LIST_FOLD)
+        # After the list, because it is about the list; before the affordance line,
+        # because that line is the last thing read before the prompt.
+        if need.default not in ids:
+            # Not substituted - choosing which model someone talks to is not this
+            # wizard's call. But the default is *dropped*, so Enter re-asks instead
+            # of accepting an id the account did not mention: that is the Live-id
+            # failure in docs/PLAN.md 9, and it is silent until the first voice
+            # turn. Leaving a known-absent id as the default would be a decision
+            # too, and the worse one.
+            say(status(theme, "warn", f"{need.default} is not in that list."))
+            say(theme.dim(f"  A number, {EXPAND}, or an id of your own."))
+            return ids
+        say(theme.dim(f"  A number, {EXPAND}, an id of your own, or Enter."))
+        return ids
+
+    def _show_models(
+        self, ids: Sequence[str], default: str, *, limit: int | None = None
+    ) -> None:
+        """The numbered ids, folded to `limit` when there is one.
+
+        Not `choices()`: that folds the *reasoning* behind a handful of options,
+        and a model id has none - what has to fold here is the tail of a fifty-item
+        list. Same `?` key either way, so the gesture is the one the preset menu
+        taught two steps ago.
+        """
+        theme = self.prompt.theme
+        say = self.prompt.say
+        shown = ids if limit is None else ids[:limit]
+        for index, name in enumerate(shown, start=1):
+            say(f"  {index}) {name}" + (theme.dim("  (the default)") if name == default else ""))
+        held_back = len(ids) - len(shown)
+        if held_back:
+            say(theme.dim(f"  {EXPAND} lists the other {held_back}."))
+
+    def _ask_one(self, need: Need, offered: Sequence[str], *, default: str | None = None) -> str:
+        """One answer: a number from `offered`, `?` to unfold the rest, or anything
+        at all typed by hand.
+
+        `_pick` is the other list prompt in this module and is deliberately not
+        reused. It hands `ask_choice` a closed set and re-asks until the answer is
+        inside it, which is right for three presets and wrong for a model id: one
+        released this morning is in no list this wizard can fetch, and refusing an
+        id the API would have accepted is a worse dead end than the one the list was
+        added to remove. So the list is an offer and free text is still the
+        contract.
+        """
+        while True:
+            answer = self.prompt.ask(
+                f"  {need.key}",
+                default=need.default if default is None else default,
+                secret=need.secret,
+            )
+            if not offered:
+                return answer
+            if answer == EXPAND:
+                self.prompt.say()
+                self._show_models(offered, need.default)
+                continue
+            # A bare number is an index - the same bargain `ask_choice` makes when
+            # it takes "2" for `balanced`, and safe for the same reason: no model
+            # id is a bare number.
+            if answer.isdigit() and 1 <= int(answer) <= len(offered):
+                return offered[int(answer) - 1]
+            return answer
+
     # --- steps ---------------------------------------------------------------
 
     def _choose_preset(self, env: Mapping[str, str], updates: dict[str, str]) -> str:
         current = env.get("DAEMON_PRESET", "")
         if current in PRESETS:
-            self.prompt.say(f"Preset: {current} (already in .env, keeping it).")
-            self.prompt.say()
-            return current
-
-        self.prompt.say("Where should the thinking happen? You can change this later.")
-        preset = self._pick("Preset", PRESET_CHOICES, default=DEFAULT_PRESET)
-        updates["DAEMON_PRESET"] = preset
+            self.prompt.say(f"Where should the thinking happen? Currently {current}.")
+            self.prompt.say(KEEP_HINT)
+        else:
+            self.prompt.say("Where should the thinking happen? You can change this later.")
+        preset = self._pick("Preset", PRESET_CHOICES, default=current or DEFAULT_PRESET)
+        _record(updates, "DAEMON_PRESET", preset, current)
         return preset
 
     def _choose_hosted(self, preset: str, env: Mapping[str, str], updates: dict[str, str]) -> str:
@@ -1202,16 +1462,15 @@ class Wizard:
             return DEFAULT_HOSTED_PROVIDER
 
         current = env.get("DAEMON_HOSTED_PROVIDER", "")
-        if current in HOSTED_PROVIDERS:
-            self.prompt.say(f"Hosted provider: {current} (already in .env, keeping it).")
-            self.prompt.say()
-            return current
-
         self.prompt.say("Whose model should the hosted work go to? The preset decided where")
         self.prompt.say("work runs; this decides who runs it. One key either way - Daemon is")
         self.prompt.say("not a reseller, you bring your own.")
-        chosen = self._pick("Provider", HOSTED_CHOICES, default=DEFAULT_HOSTED_CHOICE)
-        updates["DAEMON_HOSTED_PROVIDER"] = chosen
+        if current in HOSTED_PROVIDERS:
+            self.prompt.say(f"Currently {current}. {KEEP_HINT}")
+        chosen = self._pick(
+            "Provider", HOSTED_CHOICES, default=current or DEFAULT_HOSTED_CHOICE
+        )
+        _record(updates, "DAEMON_HOSTED_PROVIDER", chosen, current)
         return chosen
 
     def _choose_voice(
@@ -1228,17 +1487,15 @@ class Wizard:
             self.prompt.say()
             return False
 
-        if env.get("DAEMON_VOICE_ENABLED"):
-            enabled = _truthy(env["DAEMON_VOICE_ENABLED"])
-            self.prompt.say(f"Voice: {'on' if enabled else 'off'} (already in .env, keeping it).")
-            self.prompt.say()
-            return enabled
-
+        raw = env.get("DAEMON_VOICE_ENABLED", "")
+        was = _truthy(raw) if raw else False
         self.prompt.say("Turn voice on? Audio then goes to Google's native-audio model,")
         self.prompt.say("with your own key. Off means no audio ever leaves this machine,")
         self.prompt.say("and text mode loses nothing by it.")
-        enabled = self.prompt.ask_yes_no("Enable voice", default=False)
-        updates["DAEMON_VOICE_ENABLED"] = str(enabled).lower()
+        if raw:
+            self.prompt.say(f"Currently {'on' if was else 'off'}. {KEEP_HINT}")
+        enabled = self.prompt.ask_yes_no("Enable voice", default=was)
+        _record(updates, "DAEMON_VOICE_ENABLED", str(enabled).lower(), raw)
         self.prompt.say()
         return enabled
 
@@ -1257,9 +1514,14 @@ class Wizard:
                 # A headless box, or no browser at all. Not a setup failure: the
                 # URL is on screen either way.
                 say("  (could not open a browser - use the link above)")
+        # Before the loop: the list is a property of the question, not of an
+        # attempt, and a model id cannot fail verification anyway.
+        offered = self._offer_models(need) if need.listed else ()
+        # Dropped when the account did not list it - see `_offer_models`.
+        default = need.default if not offered or need.default in offered else ""
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            value = self.prompt.ask(f"  {need.key}", default=need.default, secret=need.secret)
+            value = self._ask_one(need, offered, default=default)
             if not value:
                 if need.skippable:
                     say(status(theme, "warn", "Skipped. `daemon setup` again when you have it."))
@@ -1270,6 +1532,9 @@ class Wizard:
 
             verdict = self._verify(need, value, env)
             if verdict.ok:
+                # Whatever that key was able to list, for the model questions that
+                # `needs_for` puts after it.
+                self.catalog.update(verdict.models)
                 if verdict.detail:
                     # Still the last four characters and nothing more. Colour is
                     # added around `mask`, never instead of it.
@@ -1295,9 +1560,11 @@ class Wizard:
         """Verify now, so a bad key is a sentence here instead of a broken
         conversation later.
 
-        Model ids are taken at their word: there is no free call that proves a
+        Model ids are still taken at their word: there is no free call that proves a
         Gemini Live id, and the Anthropic model id is checked as part of checking
-        the key. An empty detail means "nothing worth printing".
+        the key. What the key check *can* do is say which ids exist, which is what
+        `Verdict.models` carries into the question after it. An empty detail means
+        "nothing worth printing".
         """
         if need.key == "ANTHROPIC_API_KEY":
             # Their configured model if they have one, so the check is about the

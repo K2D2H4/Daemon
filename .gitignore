@@ -13,6 +13,13 @@ dist/
 /memory/
 /persona/
 
+# ...and any copy of it. `/data/` matches that one path exactly, so the obvious
+# way to set a data dir aside before a reinstall - `mv data data.old-$(date +%F)`
+# - produced a directory git was happy to track. Caught by a credential scan
+# reporting the *contents* of a day's conversation as staged.
+/data.*/
+/data-*/
+
 # Tooling caches
 .pytest_cache/
 .ruff_cache/

@@ -37,6 +37,7 @@ def _sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 GOOD_KEY = "sk-ant-api03-REALKEY9999"
 GOOD_TOKEN = "8012345678:AAH-realtokenABCD"
+GOOD_GEMINI = "AIzaSyFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
 
 
 def no_network(token: str, offset: int | None, timeout: int) -> Updates:
@@ -72,14 +73,16 @@ class Recorder:
     ollama: list[str] = field(default_factory=list)
     opened: list[str] = field(default_factory=list)
 
-    def checks(self, *, gemini_verdict: Verdict | None = None) -> Checks:
+    def checks(
+        self, *, gemini_verdict: Verdict | None = None, openai_verdict: Verdict | None = None
+    ) -> Checks:
         def anthropic(key: str, model: str) -> Verdict:
             self.anthropic.append(key)
             return Verdict(True, "key works")
 
         def openai(key: str, model: str) -> Verdict:
             self.openai.append(key)
-            return Verdict(True, "key works")
+            return openai_verdict or Verdict(True, "key works")
 
         def gemini(key: str) -> Verdict:
             self.gemini.append(key)
@@ -143,6 +146,16 @@ def drive(
         opener=opener if opener is not None else (lambda url: True),
     )
     return Run(code, out.getvalue(), env_path)
+
+
+KEEP = ""
+"""Enter at a step whose answer is already in `.env`.
+
+The wizard used to skip a decided answer entirely, which made it unreachable: the
+only way to change a preset was to hand-edit the file. It now shows the current
+value and asks anyway, so a re-run is how you change your mind - and every test
+that drives a re-run answers one more question than it used to.
+"""
 
 
 def answers_for(*, persona: Sequence[str] = ("", "", ""), pairing: Sequence[str] = ()) -> list[str]:
@@ -427,7 +440,7 @@ def test_the_key_is_checked_against_the_configured_model(tmp_path: Path) -> None
     existing = "DAEMON_PRESET=balanced\nDAEMON_ANTHROPIC_MODEL=claude-opus-4-1\n"
     drive(
         tmp_path,
-        ["anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
+        [KEEP, "anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
         existing=existing,
         checks=checks,
     )
@@ -605,7 +618,7 @@ DAEMON_RECALL_LIMIT=12
 
 
 def test_an_existing_env_is_merged_not_replaced(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y"], existing=EXISTING)
+    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=EXISTING)
 
     assert result.code == 0
     written = result.written
@@ -623,15 +636,19 @@ def test_a_value_already_in_the_file_is_not_asked_for_again(tmp_path: Path) -> N
     existing = f"DAEMON_PRESET=balanced\nANTHROPIC_API_KEY={GOOD_KEY}\n"
     result = drive(
         tmp_path,
-        ["anthropic", "n", "gemma3:4b", GOOD_TOKEN, "y"],
+        [KEEP, "anthropic", "n", "gemma3:4b", GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(),
     )
 
     assert result.code == 0
-    assert "already in .env, keeping it" in result.out
     assert recorder.anthropic == []  # not re-verified, not re-asked
     assert f"ANTHROPIC_API_KEY={GOOD_KEY}" in result.written
+    # And absent from the change list, which is where "nothing to do about this
+    # one" is visible. The wizard used to say "already in .env, keeping it" and
+    # skip the step; keys were never the reason that phrase existed, and the three
+    # steps that were skipped now ask with the current value as the default.
+    assert "ANTHROPIC_API_KEY" not in result.out.split("── Review")[1]
 
 
 def test_an_in_place_update_does_not_duplicate_the_key(tmp_path: Path) -> None:
@@ -657,7 +674,9 @@ def test_a_world_readable_env_is_tightened_when_it_is_touched(tmp_path: Path) ->
     env_path.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
     env_path.chmod(0o644)
 
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n")
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
+    )
 
     assert result.code == 0
     assert result.env_path.stat().st_mode & 0o777 == 0o600
@@ -668,15 +687,17 @@ def test_nothing_left_to_do_is_not_a_rewrite(tmp_path: Path) -> None:
         f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
         f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
     )
-    result = drive(tmp_path, [], existing=existing)
+    result = drive(tmp_path, [KEEP], existing=existing)
 
     assert result.code == 0
     assert "already configured" in result.out
+    # Keeping an answer is not a change, so the file is not rewritten. That is what
+    # `_record` comparing against the current value buys.
     assert result.written == existing
 
 
 def test_declining_the_write_leaves_the_file_alone(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "n"], existing=EXISTING)
+    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "n"], existing=EXISTING)
 
     assert result.code == 1
     assert "Nothing was written." in result.out
@@ -716,7 +737,7 @@ def test_a_file_that_still_fails_validation_is_explained_not_traced(tmp_path: Pa
     # A hand-edited `.env` can be invalid in ways the wizard never asks about.
     # Startup would reject it; setup has to say so in words.
     existing = "DAEMON_PRESET=offline\nDAEMON_RECALL_LIMIT=0\n"
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y"], existing=existing)
+    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=existing)
 
     assert result.code == 1
     assert "not usable yet" in result.out
@@ -746,7 +767,7 @@ def test_no_secret_is_ever_echoed_back(tmp_path: Path) -> None:
 def test_a_replaced_secret_is_masked_in_the_change_list(tmp_path: Path) -> None:
     existing = "DAEMON_PRESET=offline\nTELEGRAM_BOT_TOKEN=1111:OLDTOKENZZZZ\n"
     result = drive(
-        tmp_path, ["gemma3:4b", "y"], existing=existing
+        tmp_path, [KEEP, "gemma3:4b", "y"], existing=existing
     )  # token already set, so only the model is asked
 
     assert result.code == 0
@@ -784,7 +805,9 @@ def test_an_existing_allowlist_suppresses_the_pairing_note(tmp_path: Path) -> No
     # rather than about a configuration that does not load - the parsing itself
     # belongs to daemon/config.py.
     existing = 'DAEMON_PRESET=offline\nTELEGRAM_ALLOWED_USER_IDS=["4242"]\n'
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", ""], existing=existing)
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""], existing=existing
+    )
 
     assert result.code == 0
     assert "pairing code" not in result.out
@@ -1104,7 +1127,7 @@ def test_a_second_setup_can_still_write_the_seed_it_skipped(tmp_path: Path) -> N
         f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
         f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
     )
-    result = drive(tmp_path, ["루미", "1", ""], existing=existing)
+    result = drive(tmp_path, [KEEP, "루미", "1", ""], existing=existing)
 
     assert result.code == 0
     assert "already configured" in result.out
@@ -1122,7 +1145,7 @@ def test_a_data_dir_that_cannot_be_created_is_a_sentence_not_a_traceback(
     existing = f"DAEMON_PRESET=offline\nDAEMON_DATA_DIR={blocked / 'data'}\n"
 
     result = drive(
-        tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
     )
 
     assert result.code == 0
@@ -1138,7 +1161,7 @@ def test_a_pairing_database_that_cannot_be_opened_is_reported(tmp_path: Path) ->
 
     result = drive(
         tmp_path,
-        ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "y"],
+        [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "y"],
         existing=existing,
         checks=checks_with(inbox),
     )
@@ -1179,7 +1202,7 @@ def test_pairing_is_not_offered_when_the_ids_come_from_the_file(tmp_path: Path) 
     inbox = Inbox()
     result = drive(
         tmp_path,
-        ["gemma3:4b", GOOD_TOKEN, "y", "", "", ""],
+        [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""],
         existing=existing,
         checks=checks_with(inbox),
     )
@@ -1501,7 +1524,7 @@ def test_a_token_already_in_the_file_is_re_verified_before_the_wait(tmp_path: Pa
     )
 
     result = drive(
-        tmp_path, ["gemma3:4b", "y", "", "", "", "y"], existing=existing, checks=checks
+        tmp_path, [KEEP, "gemma3:4b", "y", "", "", "", "y"], existing=existing, checks=checks
     )
 
     assert result.code == 0
@@ -1678,16 +1701,25 @@ def test_an_openai_key_is_masked_in_the_change_list(tmp_path: Path) -> None:
     assert secret in result.written
 
 
-def test_a_provider_already_chosen_is_not_asked_again(tmp_path: Path) -> None:
+def test_a_provider_already_chosen_is_offered_again_and_enter_keeps_it(
+    tmp_path: Path,
+) -> None:
+    """It used to be skipped outright, which made a decided answer unreachable: the
+    only way to change a preset or a provider was to hand-edit `.env`, and
+    hand-editing config is what this command exists to remove.
+    """
     existing = "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai\n"
     result = drive(
         tmp_path,
-        ["n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "", "n"],
+        [KEEP, KEEP, "n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "", "n"],
         existing=existing,
     )
 
     assert result.code == 0
-    assert "hosted provider: openai (already in .env, keeping it)" in result.out.lower()
+    assert "currently openai" in result.out.lower()
+    assert "enter keeps it" in result.out.lower()
+    # Kept, not rewritten.
+    assert "DAEMON_HOSTED_PROVIDER=openai" in result.written
 
 
 def test_check_reports_which_provider_the_file_chose(tmp_path: Path) -> None:
@@ -1743,6 +1775,419 @@ def test_the_openai_key_travels_in_a_header_not_the_url(
 
     assert "sk-SECRET" not in str(seen["url"])
     assert seen["headers"] == {"authorization": "Bearer sk-SECRET"}
+
+
+# --- the model id, offered from the account's own list -------------------------
+# Every one of these probes already fetches a model list - it is how a key is
+# proved without spending a token - and the ids were being thrown away, so the
+# wizard offered a hard-coded default and, when it was wrong, told the user to go
+# and edit `.env`. That is the dead end the preset question had before it started
+# offering itself again.
+
+GEMINI_BODY: dict[str, object] = {
+    "models": [
+        {
+            "name": "models/gemini-3.1-flash-live-preview",
+            "supportedGenerationMethods": ["bidiGenerateContent"],
+        },
+        {
+            "name": "models/gemini-2.5-flash",
+            "supportedGenerationMethods": ["generateContent", "countTokens"],
+        },
+        {
+            # The reason the filter exists: one list holds every capability.
+            "name": "models/text-embedding-004",
+            "supportedGenerationMethods": ["embedContent"],
+        },
+    ]
+}
+
+
+def block(rendered: str, key: str) -> str:
+    """What the wizard printed for one question: its header down to its prompt.
+
+    The whole transcript is the wrong haystack for "was this offered here" - the
+    preset menu prints `1) offline` two steps earlier, and every model list in the
+    run would otherwise count as an answer to every model question.
+    """
+    start = rendered.index(f"({key})")
+    # Either spelling of the prompt line ends the block. A question whose default
+    # the account did not list has no `[default]` at all - that is the point of
+    # dropping it, so Enter cannot accept an id the account never mentioned.
+    ends = [
+        rendered.find(marker, start) for marker in (f"  {key} [", f"  {key}:")
+    ]
+    end = min(pos for pos in ends if pos != -1)
+    return rendered[start:end]
+
+
+def gemini_listing(
+    live: Sequence[str] = (), text: Sequence[str] = (), **rest: object
+) -> Checks:
+    """A verified Gemini key that carried these lists back, through the seam the
+    real `check_gemini` uses."""
+    return Recorder().checks(
+        gemini_verdict=Verdict(
+            True,
+            "key works",
+            models={
+                "DAEMON_GEMINI_LIVE_MODEL": tuple(live),
+                "DAEMON_GEMINI_MODEL": tuple(text),
+            },
+            **rest,
+        )
+    )
+
+
+VOICE_ANSWERS = ["2", "gemini", "y", "gemma3:4b", GOOD_GEMINI]
+"""balanced, Gemini for the hosted work, voice on, the local model, the key.
+
+The next two questions are the Live id and the text id, in that order, and the key
+comes first - which is what makes a list available by the time either is asked.
+"""
+
+
+def test_the_gemini_key_check_brings_back_both_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    # One response, two questions, two different filters.
+    monkeypatch.setattr(setup.httpx, "get", canned(200, GEMINI_BODY))
+
+    verdict = setup.check_gemini(GOOD_GEMINI)
+
+    assert verdict.ok
+    assert verdict.models["DAEMON_GEMINI_LIVE_MODEL"] == ("gemini-3.1-flash-live-preview",)
+    assert verdict.models["DAEMON_GEMINI_MODEL"] == ("gemini-2.5-flash",)
+
+
+def test_a_text_model_is_not_offered_as_the_realtime_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `bidiGenerateContent` filter, on its own.
+
+    `DAEMON_GEMINI_LIVE_MODEL` is the id that fails at the first voice turn rather
+    than at startup (docs/PLAN.md 9), so offering it a model that cannot open a
+    realtime session would reproduce exactly the failure this list is here to end -
+    and it would look like a considered answer while doing it.
+    """
+    monkeypatch.setattr(setup.httpx, "get", canned(200, GEMINI_BODY))
+
+    live = setup.check_gemini(GOOD_GEMINI).models["DAEMON_GEMINI_LIVE_MODEL"]
+
+    assert "gemini-2.5-flash" not in live
+    assert "text-embedding-004" not in live
+    assert live == ("gemini-3.1-flash-live-preview",)
+
+
+def test_an_embedding_model_is_offered_as_neither(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup.httpx, "get", canned(200, GEMINI_BODY))
+
+    everything = setup.check_gemini(GOOD_GEMINI).models
+
+    assert not [name for ids in everything.values() for name in ids if "embedding" in name]
+
+
+def test_the_models_prefix_is_stripped_before_it_is_offered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `models/x` is wire format. Both consumers accept either form and add it back
+    # (daemon/llm/providers/gemini.py, daemon/voice/gemini_live.py), so the bare id
+    # is what belongs in a menu and in `.env`.
+    monkeypatch.setattr(setup.httpx, "get", canned(200, GEMINI_BODY))
+
+    offered = [name for ids in setup.check_gemini(GOOD_GEMINI).models.values() for name in ids]
+
+    assert offered
+    assert not [name for name in offered if name.startswith("models/")]
+
+
+def test_the_model_list_is_asked_for_a_full_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`ListModels` pages, and the default page is short.
+
+    A previous investigation on a real account found all six `bidiGenerateContent`
+    ids only at `pageSize=200`; without it the Live list is silently missing the
+    entries a voice install needs, and nothing in a short list says it is short.
+    """
+    seen: dict[str, object] = {}
+
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        seen.update(kwargs)
+        return httpx.Response(200, json=GEMINI_BODY, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(setup.httpx, "get", get)
+    setup.check_gemini(GOOD_GEMINI)
+
+    assert seen["params"] == {"pageSize": 200}
+
+
+def test_the_openai_key_check_brings_back_the_ids_it_already_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        setup.httpx, "get", canned(200, {"data": [{"id": "gpt-5.1"}, {"id": "gpt-4.1"}]})
+    )
+
+    verdict = setup.check_openai("sk-real", setup.DEFAULT_OPENAI_MODEL)
+
+    assert verdict.models["DAEMON_OPENAI_MODEL"] == ("gpt-5.1", "gpt-4.1")
+
+
+def test_a_stale_openai_default_is_flagged_and_the_list_still_comes_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The two halves belong together: the warning is only useful because the next
+    # question can act on it.
+    monkeypatch.setattr(setup.httpx, "get", canned(200, {"data": [{"id": "gpt-4.1"}]}))
+
+    verdict = setup.check_openai("sk-real", setup.DEFAULT_OPENAI_MODEL)
+
+    assert "not in your model list" in verdict.detail
+    assert verdict.models["DAEMON_OPENAI_MODEL"] == ("gpt-4.1",)
+
+
+def test_the_anthropic_model_id_has_no_question_to_offer_a_list_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Why one of the three probes carries no list.
+
+    `DAEMON_ANTHROPIC_MODEL` is the one hosted model id Settings has a default for,
+    so the wizard never asks it and `check_anthropic` verifies that default against
+    the account instead. A list with no question to answer would be a value nobody
+    reads.
+    """
+    monkeypatch.setattr(setup.httpx, "get", canned(200, {"data": [{"id": "claude-haiku-4"}]}))
+
+    assert "DAEMON_ANTHROPIC_MODEL" not in {need.key for need in setup._all_needs()}
+    assert setup.check_anthropic(GOOD_KEY, "claude-haiku-4").models == {}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"models": "surprise"},
+        {"models": [{"name": 7, "supportedGenerationMethods": ["generateContent"]}]},
+        {"models": [{"name": "models/gemini-2.5-flash"}]},
+        {"models": [{"name": "models/x", "supportedGenerationMethods": "generateContent"}]},
+        {"models": ["gemini-2.5-flash"]},
+    ],
+)
+def test_a_malformed_list_costs_the_menu_and_not_the_wizard(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, object]
+) -> None:
+    monkeypatch.setattr(setup.httpx, "get", canned(200, body))
+
+    verdict = setup.check_gemini(GOOD_GEMINI)
+
+    # The key still works - that is what this call was for - and there is simply
+    # nothing to offer.
+    assert verdict.ok
+    assert verdict.models == {"DAEMON_GEMINI_MODEL": (), "DAEMON_GEMINI_LIVE_MODEL": ()}
+
+
+def test_a_body_that_is_not_even_an_object_is_no_list_either(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, json=["gemini-2.5-flash"], request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(setup.httpx, "get", get)
+
+    verdict = setup.check_gemini(GOOD_GEMINI)
+
+    assert verdict.ok
+    assert verdict.models["DAEMON_GEMINI_LIVE_MODEL"] == ()
+
+
+def test_an_id_with_a_newline_in_it_is_never_offered() -> None:
+    """A chosen id is written as a `KEY=value` line, so one carrying a newline
+    could write a line of its own into `.env` - and this list comes off the
+    network, not off the keyboard."""
+    offered = setup.order_models(
+        ("gemini-2.5-flash", "x\nDAEMON_DATA_DIR=/tmp/theirs", "y z", "a" * 200, "ok-1"),
+        "gemini-2.5-flash",
+    )
+
+    assert offered == ("gemini-2.5-flash", "ok-1")
+
+
+def test_the_default_is_first_so_enter_and_one_mean_the_same_thing() -> None:
+    ordered = setup.order_models(("b-model", "a-model", "the-default"), "the-default")
+
+    assert ordered == ("the-default", "a-model", "b-model")
+
+
+def test_the_live_id_comes_from_the_account_rather_than_from_a_guess(
+    tmp_path: Path,
+) -> None:
+    # The open item in docs/PLAN.md 9: the default was left a guess because a
+    # guessed Live id fails at the first voice turn, and two documented ids are
+    # already shut down. A list from the account is the actual fix.
+    live = ("gemini-3.1-flash-live-preview", "gemini-live-3-pro")
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, "2", "", "", "y"],
+        checks=gemini_listing(live=live, text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    assert "DAEMON_GEMINI_LIVE_MODEL=gemini-live-3-pro" in result.written
+    for name in live:
+        assert name in block(result.out, "DAEMON_GEMINI_LIVE_MODEL")
+
+
+def test_the_two_gemini_questions_are_offered_two_different_lists(tmp_path: Path) -> None:
+    # One response answers both, so the only thing keeping them apart is which key
+    # each list was filed under.
+    result = drive(
+        tmp_path,
+        # "1" for each, because neither hard-coded default is in these lists and a
+        # dropped default makes Enter re-ask.
+        [*VOICE_ANSWERS, "1", "1", "", "", "y"],
+        checks=gemini_listing(live=("live-a", "live-b"), text=("text-a", "text-b")),
+    )
+
+    assert result.code == 0
+    live_block = block(result.out, "DAEMON_GEMINI_LIVE_MODEL")
+    text_block = block(result.out, "DAEMON_GEMINI_MODEL")
+    assert "live-a" in live_block and "text-a" not in live_block
+    assert "text-a" in text_block and "live-a" not in text_block
+
+
+def test_the_openai_list_reaches_the_openai_question(tmp_path: Path) -> None:
+    verdict = Verdict(True, "key works", models={"DAEMON_OPENAI_MODEL": ("gpt-4.1", "o3-mini")})
+    result = drive(
+        tmp_path,
+        ["2", "openai", "n", "gemma3:4b", "sk-proj-REALOPENAI7777", "1", "", "y"],
+        checks=Recorder().checks(openai_verdict=verdict),
+    )
+
+    assert result.code == 0
+    # Sorted after the default, which this account does not have - so "1" is the
+    # first id it does have.
+    assert "DAEMON_OPENAI_MODEL=gpt-4.1" in result.written
+
+
+def test_an_id_of_your_own_is_taken_even_when_the_list_never_heard_of_it(
+    tmp_path: Path,
+) -> None:
+    """A model released this morning is in no list this wizard can fetch, and a
+    wizard that refused an id the API would have accepted would be a worse dead end
+    than the one with no list at all. So the list is an offer, not a gate."""
+    mine = "gemini-4.0-flash-live-preview-11-2026"
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, mine, "", "", "y"],
+        checks=gemini_listing(live=("gemini-3.1-flash-live-preview",), text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    assert f"DAEMON_GEMINI_LIVE_MODEL={mine}" in result.written
+
+
+def test_the_folded_tail_is_one_keypress_away_and_the_numbers_do_not_move(
+    tmp_path: Path,
+) -> None:
+    # A list of fifty would scroll the persona and pairing steps off the screen, so
+    # it folds - and a number has to mean the same id before and after `?`, or the
+    # fold has quietly changed the answer.
+    live = tuple(f"live-{index:02d}" for index in range(1, 21))
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, EXPAND, "9", "", "", "y"],
+        checks=gemini_listing(live=live, text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    shown = block(result.out, "DAEMON_GEMINI_LIVE_MODEL")
+    assert f"{setup.MODEL_LIST_FOLD}) live-{setup.MODEL_LIST_FOLD:02d}" in shown
+    assert f"live-{setup.MODEL_LIST_FOLD + 1:02d}" not in shown
+    assert f"{EXPAND} lists the other {20 - setup.MODEL_LIST_FOLD}." in shown
+    # Expanded, then the ninth - which is the ninth of the same order.
+    assert "live-20" in result.out
+    assert "DAEMON_GEMINI_LIVE_MODEL=live-09" in result.written
+
+
+def test_a_default_the_account_did_not_list_is_said_out_loud(tmp_path: Path) -> None:
+    """Named, not silently replaced - and the default is dropped so Enter cannot
+    take it.
+
+    Substituting a listed id would be the wizard deciding which model someone talks
+    to. But leaving a known-absent id as the default is a decision too, and the
+    worse one: `docs/PLAN.md` 9 records that a guessed Live id fails at the *first
+    voice turn*, not at startup, and that two documented ids are already shut down.
+    So the id is named, the default goes away, and Enter re-asks.
+    """
+    empty_then_choose = ["", "1"]
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, *empty_then_choose, "", "", "y"],
+        checks=gemini_listing(live=("gemini-live-3-pro",), text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    assert f"{setup.DEFAULT_GEMINI_LIVE_MODEL} is not in that list." in flat(result.out)
+    # Enter was refused rather than accepted...
+    assert "This one is required" in flat(result.out)
+    # ...and what landed is what the account actually lists.
+    assert "DAEMON_GEMINI_LIVE_MODEL=gemini-live-3-pro" in result.written
+    assert setup.DEFAULT_GEMINI_LIVE_MODEL not in result.written
+
+
+def test_no_list_falls_back_to_the_question_it_always_asked(tmp_path: Path) -> None:
+    # A listing that fails must cost the menu and not the wizard. `Recorder`'s
+    # default Gemini verdict carries no lists at all, which is also what a key
+    # already sitting in `.env` produces: nothing probed it this run.
+    result = drive(tmp_path, [*VOICE_ANSWERS, "", "", "", "y"], checks=Recorder().checks())
+
+    assert result.code == 0
+    assert setup.NO_LIST_NOTE in flat(result.out)
+    assert f"DAEMON_GEMINI_LIVE_MODEL={setup.DEFAULT_GEMINI_LIVE_MODEL}" in result.written
+    assert f"DAEMON_GEMINI_MODEL={setup.DEFAULT_GEMINI_MODEL}" in result.written
+
+
+def test_an_account_with_nothing_that_fits_says_that_instead(tmp_path: Path) -> None:
+    # A different sentence from the one above, because it is a different fact:
+    # the account answered, and had nothing.
+    result = drive(tmp_path, [*VOICE_ANSWERS, "", "", "", "y"], checks=gemini_listing())
+
+    assert result.code == 0
+    assert setup.EMPTY_LIST_NOTE in flat(result.out)
+    assert setup.NO_LIST_NOTE not in flat(result.out)
+    assert f"DAEMON_GEMINI_LIVE_MODEL={setup.DEFAULT_GEMINI_LIVE_MODEL}" in result.written
+
+
+def test_a_rejected_key_offers_no_list_and_fails_the_way_it_did_before(
+    tmp_path: Path,
+) -> None:
+    verdict = Verdict(
+        False, "Google refused the key (HTTP 403).", hint=setup.GEMINI_STANDARD_KEY_HINT
+    )
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, "AIza-2", "AIza-3"],
+        checks=Recorder().checks(gemini_verdict=verdict),
+    )
+
+    assert result.code == 1
+    assert not result.env_path.exists()
+    assert "September 2026" in result.out
+    # No model question was reached, so neither fallback sentence belongs here.
+    assert setup.NO_LIST_NOTE not in result.out
+    assert setup.EMPTY_LIST_NOTE not in result.out
+
+
+def test_a_long_model_list_still_fits_the_terminal(tmp_path: Path) -> None:
+    from daemon.tui import DEFAULT_WIDTH, display_width
+
+    live = tuple(f"gemini-{index}-flash-native-audio-preview-12-2026" for index in range(20))
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, EXPAND, "1", "", "", "y"],
+        checks=gemini_listing(live=live, text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    for line in laid_out(result.out, tmp_path):
+        assert display_width(line) <= DEFAULT_WIDTH, line
 
 
 # --- how it reads ------------------------------------------------------------
@@ -1873,7 +2318,9 @@ def test_the_change_list_is_a_table_and_still_masks_secrets(tmp_path: Path) -> N
     from daemon.tui import display_width
 
     existing = "DAEMON_PRESET=offline\nDAEMON_DATA_DIR=./데이터\n"
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing)
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
+    )
 
     assert result.code == 0
     assert "Review" in result.out
@@ -1946,3 +2393,95 @@ def test_needs_come_from_the_preset_table(tmp_path: Path) -> None:
     assert "ANTHROPIC_API_KEY" in balanced
     assert "GEMINI_API_KEY" not in balanced
     assert "GEMINI_API_KEY" in voice
+
+
+# --- changing your mind -------------------------------------------------------
+# The wizard used to print "already in .env, keeping it" and move on, which made a
+# decided answer unreachable: the only way to switch preset was to hand-edit .env,
+# and hand-editing config is exactly what this command exists to remove - the same
+# reason nobody types their own numeric Telegram id. Reported from a real re-install.
+
+
+def test_a_decided_preset_is_offered_again(tmp_path: Path) -> None:
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
+    )
+
+    assert result.code == 0
+    assert "currently offline" in result.out.lower()
+    assert "enter keeps it" in result.out.lower()
+
+
+def test_a_preset_can_actually_be_changed_by_re_running(tmp_path: Path) -> None:
+    """The thing that was impossible. `offline` -> `balanced` through the wizard,
+    with no editor involved."""
+    result = drive(
+        tmp_path,
+        # Order matters and is the product: preset, provider, voice, then the
+        # credentials the chosen preset actually needs.
+        ["balanced", "gemini", "n", "gemma3:4b", GOOD_GEMINI, "", GOOD_TOKEN, "y"],
+        existing="DAEMON_PRESET=offline\n",
+    )
+
+    assert result.code == 0
+    assert "DAEMON_PRESET=balanced" in result.written
+    assert "DAEMON_HOSTED_PROVIDER=gemini" in result.written
+
+
+def test_keeping_every_answer_writes_nothing(tmp_path: Path) -> None:
+    """A re-run that changes nothing must stay harmless. `_record` compares against
+    the current value precisely so "already configured" keeps being true."""
+    existing = (
+        f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
+    )
+    result = drive(tmp_path, [KEEP], existing=existing)
+
+    assert result.code == 0
+    assert result.written == existing
+
+
+def test_voice_can_be_turned_off_again(tmp_path: Path) -> None:
+    """The switch has to work in both directions, and the failure costs are not
+    symmetric: someone turning voice off is withdrawing consent for audio to leave
+    the machine, and a wizard that cannot express that is worse than no wizard.
+    """
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "n", "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
+        existing=existing,
+    )
+
+    assert result.code == 0
+    assert "currently on" in result.out.lower()
+    assert "DAEMON_VOICE_ENABLED=false" in result.written
+
+
+def test_enter_at_the_voice_question_keeps_it_on(tmp_path: Path) -> None:
+    """The default has to be the *current* state, not `False`.
+
+    Added because a mutation survived: `test_voice_can_be_turned_off_again` answers
+    the question explicitly, so it could not tell a correct default from a wrong
+    one. With the default hard-coded to off, Enter would silently switch voice off
+    on every re-run - a setting the user turned on, withdrawn by pressing return.
+    """
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+        "DAEMON_GEMINI_LIVE_MODEL=gemini-3.1-flash-live-preview\n"
+    )
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, KEEP, "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
+        existing=existing,
+    )
+
+    assert result.code == 0
+    assert "currently on" in result.out.lower()
+    assert "DAEMON_VOICE_ENABLED=true" in result.written
+    # Unchanged, so not in the change list either.
+    assert "DAEMON_VOICE_ENABLED" not in result.out.split("── Review")[1]
