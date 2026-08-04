@@ -766,6 +766,28 @@ def _chat_providers(preset: str, hosted: str) -> set[str]:
     }
 
 
+KEEP_HINT = "Enter keeps it."
+"""Said whenever a step shows an answer already in `.env`.
+
+The wizard used to print "already in .env, keeping it" and move on, which made a
+decided answer unreachable: the only way to change a preset was to hand-edit
+`.env`, and hand-editing config is the thing this command exists to remove - the
+same reason nobody types their own numeric Telegram id. Re-running setup is now
+how you change your mind, and Enter is how you do not.
+"""
+
+
+def _record(updates: dict[str, str], key: str, chosen: str, current: str) -> None:
+    """Queue a write only when the answer actually changed.
+
+    Without the comparison every re-run would rewrite `.env` with the values it
+    already held, and "Nothing to change in .env" - which is the wizard's way of
+    saying a re-run was harmless - would stop being true.
+    """
+    if chosen != current:
+        updates[key] = chosen
+
+
 def _truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -1172,13 +1194,12 @@ class Wizard:
     def _choose_preset(self, env: Mapping[str, str], updates: dict[str, str]) -> str:
         current = env.get("DAEMON_PRESET", "")
         if current in PRESETS:
-            self.prompt.say(f"Preset: {current} (already in .env, keeping it).")
-            self.prompt.say()
-            return current
-
-        self.prompt.say("Where should the thinking happen? You can change this later.")
-        preset = self._pick("Preset", PRESET_CHOICES, default=DEFAULT_PRESET)
-        updates["DAEMON_PRESET"] = preset
+            self.prompt.say(f"Where should the thinking happen? Currently {current}.")
+            self.prompt.say(KEEP_HINT)
+        else:
+            self.prompt.say("Where should the thinking happen? You can change this later.")
+        preset = self._pick("Preset", PRESET_CHOICES, default=current or DEFAULT_PRESET)
+        _record(updates, "DAEMON_PRESET", preset, current)
         return preset
 
     def _choose_hosted(self, preset: str, env: Mapping[str, str], updates: dict[str, str]) -> str:
@@ -1202,16 +1223,15 @@ class Wizard:
             return DEFAULT_HOSTED_PROVIDER
 
         current = env.get("DAEMON_HOSTED_PROVIDER", "")
-        if current in HOSTED_PROVIDERS:
-            self.prompt.say(f"Hosted provider: {current} (already in .env, keeping it).")
-            self.prompt.say()
-            return current
-
         self.prompt.say("Whose model should the hosted work go to? The preset decided where")
         self.prompt.say("work runs; this decides who runs it. One key either way - Daemon is")
         self.prompt.say("not a reseller, you bring your own.")
-        chosen = self._pick("Provider", HOSTED_CHOICES, default=DEFAULT_HOSTED_CHOICE)
-        updates["DAEMON_HOSTED_PROVIDER"] = chosen
+        if current in HOSTED_PROVIDERS:
+            self.prompt.say(f"Currently {current}. {KEEP_HINT}")
+        chosen = self._pick(
+            "Provider", HOSTED_CHOICES, default=current or DEFAULT_HOSTED_CHOICE
+        )
+        _record(updates, "DAEMON_HOSTED_PROVIDER", chosen, current)
         return chosen
 
     def _choose_voice(
@@ -1228,17 +1248,15 @@ class Wizard:
             self.prompt.say()
             return False
 
-        if env.get("DAEMON_VOICE_ENABLED"):
-            enabled = _truthy(env["DAEMON_VOICE_ENABLED"])
-            self.prompt.say(f"Voice: {'on' if enabled else 'off'} (already in .env, keeping it).")
-            self.prompt.say()
-            return enabled
-
+        raw = env.get("DAEMON_VOICE_ENABLED", "")
+        was = _truthy(raw) if raw else False
         self.prompt.say("Turn voice on? Audio then goes to Google's native-audio model,")
         self.prompt.say("with your own key. Off means no audio ever leaves this machine,")
         self.prompt.say("and text mode loses nothing by it.")
-        enabled = self.prompt.ask_yes_no("Enable voice", default=False)
-        updates["DAEMON_VOICE_ENABLED"] = str(enabled).lower()
+        if raw:
+            self.prompt.say(f"Currently {'on' if was else 'off'}. {KEEP_HINT}")
+        enabled = self.prompt.ask_yes_no("Enable voice", default=was)
+        _record(updates, "DAEMON_VOICE_ENABLED", str(enabled).lower(), raw)
         self.prompt.say()
         return enabled
 

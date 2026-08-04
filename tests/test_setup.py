@@ -37,6 +37,7 @@ def _sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 GOOD_KEY = "sk-ant-api03-REALKEY9999"
 GOOD_TOKEN = "8012345678:AAH-realtokenABCD"
+GOOD_GEMINI = "AIzaSyFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
 
 
 def no_network(token: str, offset: int | None, timeout: int) -> Updates:
@@ -143,6 +144,16 @@ def drive(
         opener=opener if opener is not None else (lambda url: True),
     )
     return Run(code, out.getvalue(), env_path)
+
+
+KEEP = ""
+"""Enter at a step whose answer is already in `.env`.
+
+The wizard used to skip a decided answer entirely, which made it unreachable: the
+only way to change a preset was to hand-edit the file. It now shows the current
+value and asks anyway, so a re-run is how you change your mind - and every test
+that drives a re-run answers one more question than it used to.
+"""
 
 
 def answers_for(*, persona: Sequence[str] = ("", "", ""), pairing: Sequence[str] = ()) -> list[str]:
@@ -427,7 +438,7 @@ def test_the_key_is_checked_against_the_configured_model(tmp_path: Path) -> None
     existing = "DAEMON_PRESET=balanced\nDAEMON_ANTHROPIC_MODEL=claude-opus-4-1\n"
     drive(
         tmp_path,
-        ["anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
+        [KEEP, "anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
         existing=existing,
         checks=checks,
     )
@@ -605,7 +616,7 @@ DAEMON_RECALL_LIMIT=12
 
 
 def test_an_existing_env_is_merged_not_replaced(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y"], existing=EXISTING)
+    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=EXISTING)
 
     assert result.code == 0
     written = result.written
@@ -623,15 +634,19 @@ def test_a_value_already_in_the_file_is_not_asked_for_again(tmp_path: Path) -> N
     existing = f"DAEMON_PRESET=balanced\nANTHROPIC_API_KEY={GOOD_KEY}\n"
     result = drive(
         tmp_path,
-        ["anthropic", "n", "gemma3:4b", GOOD_TOKEN, "y"],
+        [KEEP, "anthropic", "n", "gemma3:4b", GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(),
     )
 
     assert result.code == 0
-    assert "already in .env, keeping it" in result.out
     assert recorder.anthropic == []  # not re-verified, not re-asked
     assert f"ANTHROPIC_API_KEY={GOOD_KEY}" in result.written
+    # And absent from the change list, which is where "nothing to do about this
+    # one" is visible. The wizard used to say "already in .env, keeping it" and
+    # skip the step; keys were never the reason that phrase existed, and the three
+    # steps that were skipped now ask with the current value as the default.
+    assert "ANTHROPIC_API_KEY" not in result.out.split("── Review")[1]
 
 
 def test_an_in_place_update_does_not_duplicate_the_key(tmp_path: Path) -> None:
@@ -657,7 +672,9 @@ def test_a_world_readable_env_is_tightened_when_it_is_touched(tmp_path: Path) ->
     env_path.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
     env_path.chmod(0o644)
 
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n")
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
+    )
 
     assert result.code == 0
     assert result.env_path.stat().st_mode & 0o777 == 0o600
@@ -668,15 +685,17 @@ def test_nothing_left_to_do_is_not_a_rewrite(tmp_path: Path) -> None:
         f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
         f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
     )
-    result = drive(tmp_path, [], existing=existing)
+    result = drive(tmp_path, [KEEP], existing=existing)
 
     assert result.code == 0
     assert "already configured" in result.out
+    # Keeping an answer is not a change, so the file is not rewritten. That is what
+    # `_record` comparing against the current value buys.
     assert result.written == existing
 
 
 def test_declining_the_write_leaves_the_file_alone(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "n"], existing=EXISTING)
+    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "n"], existing=EXISTING)
 
     assert result.code == 1
     assert "Nothing was written." in result.out
@@ -716,7 +735,7 @@ def test_a_file_that_still_fails_validation_is_explained_not_traced(tmp_path: Pa
     # A hand-edited `.env` can be invalid in ways the wizard never asks about.
     # Startup would reject it; setup has to say so in words.
     existing = "DAEMON_PRESET=offline\nDAEMON_RECALL_LIMIT=0\n"
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y"], existing=existing)
+    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=existing)
 
     assert result.code == 1
     assert "not usable yet" in result.out
@@ -746,7 +765,7 @@ def test_no_secret_is_ever_echoed_back(tmp_path: Path) -> None:
 def test_a_replaced_secret_is_masked_in_the_change_list(tmp_path: Path) -> None:
     existing = "DAEMON_PRESET=offline\nTELEGRAM_BOT_TOKEN=1111:OLDTOKENZZZZ\n"
     result = drive(
-        tmp_path, ["gemma3:4b", "y"], existing=existing
+        tmp_path, [KEEP, "gemma3:4b", "y"], existing=existing
     )  # token already set, so only the model is asked
 
     assert result.code == 0
@@ -784,7 +803,9 @@ def test_an_existing_allowlist_suppresses_the_pairing_note(tmp_path: Path) -> No
     # rather than about a configuration that does not load - the parsing itself
     # belongs to daemon/config.py.
     existing = 'DAEMON_PRESET=offline\nTELEGRAM_ALLOWED_USER_IDS=["4242"]\n'
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", ""], existing=existing)
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""], existing=existing
+    )
 
     assert result.code == 0
     assert "pairing code" not in result.out
@@ -1104,7 +1125,7 @@ def test_a_second_setup_can_still_write_the_seed_it_skipped(tmp_path: Path) -> N
         f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
         f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
     )
-    result = drive(tmp_path, ["루미", "1", ""], existing=existing)
+    result = drive(tmp_path, [KEEP, "루미", "1", ""], existing=existing)
 
     assert result.code == 0
     assert "already configured" in result.out
@@ -1122,7 +1143,7 @@ def test_a_data_dir_that_cannot_be_created_is_a_sentence_not_a_traceback(
     existing = f"DAEMON_PRESET=offline\nDAEMON_DATA_DIR={blocked / 'data'}\n"
 
     result = drive(
-        tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
     )
 
     assert result.code == 0
@@ -1138,7 +1159,7 @@ def test_a_pairing_database_that_cannot_be_opened_is_reported(tmp_path: Path) ->
 
     result = drive(
         tmp_path,
-        ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "y"],
+        [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "y"],
         existing=existing,
         checks=checks_with(inbox),
     )
@@ -1179,7 +1200,7 @@ def test_pairing_is_not_offered_when_the_ids_come_from_the_file(tmp_path: Path) 
     inbox = Inbox()
     result = drive(
         tmp_path,
-        ["gemma3:4b", GOOD_TOKEN, "y", "", "", ""],
+        [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""],
         existing=existing,
         checks=checks_with(inbox),
     )
@@ -1501,7 +1522,7 @@ def test_a_token_already_in_the_file_is_re_verified_before_the_wait(tmp_path: Pa
     )
 
     result = drive(
-        tmp_path, ["gemma3:4b", "y", "", "", "", "y"], existing=existing, checks=checks
+        tmp_path, [KEEP, "gemma3:4b", "y", "", "", "", "y"], existing=existing, checks=checks
     )
 
     assert result.code == 0
@@ -1678,16 +1699,25 @@ def test_an_openai_key_is_masked_in_the_change_list(tmp_path: Path) -> None:
     assert secret in result.written
 
 
-def test_a_provider_already_chosen_is_not_asked_again(tmp_path: Path) -> None:
+def test_a_provider_already_chosen_is_offered_again_and_enter_keeps_it(
+    tmp_path: Path,
+) -> None:
+    """It used to be skipped outright, which made a decided answer unreachable: the
+    only way to change a preset or a provider was to hand-edit `.env`, and
+    hand-editing config is what this command exists to remove.
+    """
     existing = "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai\n"
     result = drive(
         tmp_path,
-        ["n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "", "n"],
+        [KEEP, KEEP, "n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "", "n"],
         existing=existing,
     )
 
     assert result.code == 0
-    assert "hosted provider: openai (already in .env, keeping it)" in result.out.lower()
+    assert "currently openai" in result.out.lower()
+    assert "enter keeps it" in result.out.lower()
+    # Kept, not rewritten.
+    assert "DAEMON_HOSTED_PROVIDER=openai" in result.written
 
 
 def test_check_reports_which_provider_the_file_chose(tmp_path: Path) -> None:
@@ -1873,7 +1903,9 @@ def test_the_change_list_is_a_table_and_still_masks_secrets(tmp_path: Path) -> N
     from daemon.tui import display_width
 
     existing = "DAEMON_PRESET=offline\nDAEMON_DATA_DIR=./데이터\n"
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing)
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
+    )
 
     assert result.code == 0
     assert "Review" in result.out
@@ -1946,3 +1978,95 @@ def test_needs_come_from_the_preset_table(tmp_path: Path) -> None:
     assert "ANTHROPIC_API_KEY" in balanced
     assert "GEMINI_API_KEY" not in balanced
     assert "GEMINI_API_KEY" in voice
+
+
+# --- changing your mind -------------------------------------------------------
+# The wizard used to print "already in .env, keeping it" and move on, which made a
+# decided answer unreachable: the only way to switch preset was to hand-edit .env,
+# and hand-editing config is exactly what this command exists to remove - the same
+# reason nobody types their own numeric Telegram id. Reported from a real re-install.
+
+
+def test_a_decided_preset_is_offered_again(tmp_path: Path) -> None:
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
+    )
+
+    assert result.code == 0
+    assert "currently offline" in result.out.lower()
+    assert "enter keeps it" in result.out.lower()
+
+
+def test_a_preset_can_actually_be_changed_by_re_running(tmp_path: Path) -> None:
+    """The thing that was impossible. `offline` -> `balanced` through the wizard,
+    with no editor involved."""
+    result = drive(
+        tmp_path,
+        # Order matters and is the product: preset, provider, voice, then the
+        # credentials the chosen preset actually needs.
+        ["balanced", "gemini", "n", "gemma3:4b", GOOD_GEMINI, "", GOOD_TOKEN, "y"],
+        existing="DAEMON_PRESET=offline\n",
+    )
+
+    assert result.code == 0
+    assert "DAEMON_PRESET=balanced" in result.written
+    assert "DAEMON_HOSTED_PROVIDER=gemini" in result.written
+
+
+def test_keeping_every_answer_writes_nothing(tmp_path: Path) -> None:
+    """A re-run that changes nothing must stay harmless. `_record` compares against
+    the current value precisely so "already configured" keeps being true."""
+    existing = (
+        f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
+    )
+    result = drive(tmp_path, [KEEP], existing=existing)
+
+    assert result.code == 0
+    assert result.written == existing
+
+
+def test_voice_can_be_turned_off_again(tmp_path: Path) -> None:
+    """The switch has to work in both directions, and the failure costs are not
+    symmetric: someone turning voice off is withdrawing consent for audio to leave
+    the machine, and a wizard that cannot express that is worse than no wizard.
+    """
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "n", "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
+        existing=existing,
+    )
+
+    assert result.code == 0
+    assert "currently on" in result.out.lower()
+    assert "DAEMON_VOICE_ENABLED=false" in result.written
+
+
+def test_enter_at_the_voice_question_keeps_it_on(tmp_path: Path) -> None:
+    """The default has to be the *current* state, not `False`.
+
+    Added because a mutation survived: `test_voice_can_be_turned_off_again` answers
+    the question explicitly, so it could not tell a correct default from a wrong
+    one. With the default hard-coded to off, Enter would silently switch voice off
+    on every re-run - a setting the user turned on, withdrawn by pressing return.
+    """
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+        "DAEMON_GEMINI_LIVE_MODEL=gemini-3.1-flash-live-preview\n"
+    )
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, KEEP, "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
+        existing=existing,
+    )
+
+    assert result.code == 0
+    assert "currently on" in result.out.lower()
+    assert "DAEMON_VOICE_ENABLED=true" in result.written
+    # Unchanged, so not in the change list either.
+    assert "DAEMON_VOICE_ENABLED" not in result.out.split("── Review")[1]
