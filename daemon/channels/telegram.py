@@ -18,7 +18,10 @@ How that allowlist gets populated is `dm_policy`:
     their terminal (`channels/pairing.py`), so nobody transcribes a numeric id by
     hand. Here an empty list is the *normal* first-run state: no owner yet.
 
-Either way the decision is made on the numeric id alone.
+Either way the decision is made on the numeric id alone - and that includes the
+👍/👎 taps on a proactive utterance (docs/PLAN.md 8.3), which arrive as
+`callback_query` updates carrying their *own* sender id: whoever pressed the
+button, not whoever the message was sent to.
 """
 
 from __future__ import annotations
@@ -30,10 +33,11 @@ import time
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
+from daemon import clock
 from daemon.channels.base import Cursor, InboundMessage, OutboundMessage
 from daemon.channels.pairing import DENY, Pairing
 
@@ -71,6 +75,82 @@ _BACKOFF_MAX_SHIFT = 6
 DM_POLICIES = ("allowlist", "pairing")
 """What to do with a DM from an id that is not configured. See the module docstring."""
 
+LABEL_PREFIX = "label"
+"""First field of the `callback_data` `_label_keyboard` puts on the buttons."""
+
+_LABEL_VERDICTS = {"up": "good", "down": "bad"}
+"""Button verb -> the two values `proactive_utterances.label` admits.
+
+A *mapping* rather than a pass-through, because the column has a CHECK constraint:
+handing sqlite a forged verb would raise an IntegrityError from inside the poll
+loop instead of being quietly ignored, which is the wrong end to find out at.
+"""
+
+_LABEL_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+"""The charset an `utterance_id` we ourselves emit can use - a uuid, and nothing
+wider than one. Narrow and bounded on purpose: a forged id is rejected before it
+reaches storage or a log line, and Telegram caps the whole `callback_data` at 64
+bytes, so nothing legitimate is longer than this either."""
+
+LABEL_ANSWERS = {
+    "good": "\U0001f44d 좋았다고 기록했어. 고마워. / Noted as good.",
+    "bad": "\U0001f44e 방해였다고 기록했어. / Noted as bad.",
+}
+LABEL_UNKNOWN = (
+    "이 발화를 찾을 수 없어서 기록하지 못했어. / No such utterance; nothing was recorded."
+)
+LABEL_UNUSABLE = (
+    "알 수 없는 버튼이라 아무것도 기록하지 않았어. / Unrecognised button; nothing was recorded."
+)
+LABEL_NO_STORE = "지금은 라벨을 저장할 수 없어. / Labels are not being stored right now."
+LABEL_FAILED = "저장하다가 문제가 생겼어. 기록되지 않았어. / Storing the label failed."
+"""What the tap says back. Telegram caps this text at 200 characters.
+
+The failing ones are shown as an alert rather than a toast (`show_alert`), because
+the difference between "counted" and "lost" must not be a notification the user
+happened to miss - a label the owner believes is in the precision numbers and is
+not is worse than no label at all.
+"""
+
+
+@runtime_checkable
+class LabelStore(Protocol):
+    """The storage a label needs - see `daemon/memory/store.py`.
+
+    A protocol for the same reason as `base.Cursor` and `pairing.PairingStore`:
+    the channel is handed something that can remember a verdict rather than
+    importing storage.
+
+    `is_allowed` is here rather than reusing `Pairing.screen()` because screen()
+    *mints a pairing code* for an unknown sender. A button press is an
+    unauthenticated update, so three forged presses would fill the pending cap and
+    lock the real owner out of onboarding for an hour. This reads the same
+    `channel_pairing` rows pairing writes - not a second allowlist.
+    """
+
+    def is_allowed(self, channel: str, sender_id: str) -> bool: ...
+
+    def label_utterance(self, utterance_id: str, label: str, *, now: datetime) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _LabelPress:
+    """A 👍/👎 tap, on its way from the poll loop to the store.
+
+    Returned out of `_to_inbound` next to `_PairingNotice`, and for both of the
+    same reasons. The sender is screened in one pass, before the payload is parsed.
+    And `Channel.listen()` is frozen: it yields `InboundMessage`, which is
+    conversation - a label is not something the owner *said*, and handing one over
+    as a message would append a button press to the log as their words.
+
+    `data` is left raw: it is remote input, and parsing it is `_handle_label`'s job,
+    after the sender has already been found acceptable.
+    """
+
+    query_id: str
+    sender_id: str
+    data: Any
+
 
 @dataclass(frozen=True, slots=True)
 class _PairingNotice:
@@ -101,6 +181,23 @@ class TelegramError(Exception):
         deaf - the worst possible failure for a companion that is supposed to be
         listening."""
         return self.status in (401, 403, 404)
+
+
+class TelegramNoRecipient(TelegramError):
+    """Nothing was sent, because nobody is configured to receive it.
+
+    Its own class so `TelegramError`'s docstring stays true - no Bot API call was
+    attempted here, this is a configuration state - and a *subclass* so everything
+    already catching `TelegramError` keeps working unchanged.
+
+    Raised rather than logged, and that distinction cost something to learn: a
+    `logger.error` is not a signal a caller can act on. Proactivity is the caller
+    that has to act. `ProactiveDelivery` deletes the utterance row and leaves the
+    candidate live when a send fails, which is the difference between "not said"
+    and "said, spent one of the day's three, and left an utterance nobody can
+    label". With a quiet return it recorded a delivered utterance and marked the
+    candidate fired while the words reached no one.
+    """
 
 
 class TelegramFatal(RuntimeError):
@@ -195,6 +292,30 @@ def _split(text: str, limit: int = MAX_TEXT_LEN) -> list[str]:
     return parts
 
 
+def _parse_label(data: Any) -> tuple[str, str] | None:
+    """`label:up:<utterance_id>` -> `(utterance_id, 'good')`, or None.
+
+    Validates rather than destructures, because this is the one place remote input
+    picks a database write. A missing field, a wrong verb, a 200-character id, one
+    that is not a uuid: each is a None, never an exception - the caller is inside
+    the poll loop.
+
+    `maxsplit=2` keeps a payload with extra colons in one piece, where the id
+    charset then rejects it, instead of silently reading the first 36 characters.
+    """
+    if not isinstance(data, str):
+        return None
+    parts = data.split(":", 2)
+    if len(parts) != 3 or parts[0] != LABEL_PREFIX:
+        return None
+    verdict = _LABEL_VERDICTS.get(parts[1])
+    if verdict is None:
+        return None
+    if not _LABEL_ID.fullmatch(parts[2]):
+        return None
+    return parts[2], verdict
+
+
 class TelegramChannel:
     """Implements the `Channel` protocol in daemon/channels/base.py."""
 
@@ -211,6 +332,7 @@ class TelegramChannel:
         api_base: str = API_BASE,
         poll_timeout: int = POLL_TIMEOUT_SECONDS,
         cursor: Cursor | None = None,
+        labels: LabelStore | None = None,
     ) -> None:
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN is empty")
@@ -245,6 +367,10 @@ class TelegramChannel:
             timeout=httpx.Timeout(poll_timeout + 10.0, connect=10.0)
         )
         self._cursor = cursor
+        # Optional so a channel can be built without storage (tests, `daemon
+        # doctor`). When it is missing a press is answered honestly rather than
+        # thanked for - see `_handle_label`.
+        self._labels = labels
         # Restored so a restart does not re-receive everything Telegram had not
         # yet had confirmed - which would append the same turn to the log again.
         self._offset = cursor.load_cursor(self.name) if cursor is not None else None
@@ -283,11 +409,11 @@ class TelegramChannel:
             targets = sorted(self._allowed)
         if not targets:
             # Reachable only under dm_policy='pairing' before anyone is approved,
-            # and only for an unaddressed message. Said out loud rather than
-            # dropped quietly: an utterance that goes nowhere looks identical to
-            # one that was never generated.
-            logger.error("telegram: no configured recipient for an unaddressed message")
-            return
+            # and only for an unaddressed message. Raised rather than logged: an
+            # utterance that goes nowhere looks identical to one that was never
+            # generated, and only the caller knows what to undo. Nothing has been
+            # sent at this point, so there is nothing to half-abandon.
+            raise TelegramNoRecipient("no configured recipient for an unaddressed message")
         failed: list[TelegramError] = []
         for chat_id in targets:
             try:
@@ -305,6 +431,10 @@ class TelegramChannel:
                 logger.error("telegram: send to %s failed after %d part(s): %s",
                              chat_id, index, exc)
                 failed.append(exc)
+        # Only when *every* target failed. Partial delivery is a success on
+        # purpose: the words are in somebody's chat, so a caller that undid the
+        # send would retry into a duplicate for them, and proactivity would delete
+        # the utterance row out from under a label button they can still press.
         if failed and len(failed) == len(targets):
             raise failed[0]
 
@@ -317,7 +447,11 @@ class TelegramChannel:
                     "getUpdates",
                     {
                         "timeout": self._poll_timeout,
-                        "allowed_updates": ["message"],
+                        # callback_query is not optional decoration: this filter is
+                        # server-side, so without it Telegram never delivers a
+                        # button press at all and the label clock (PLAN 8.1) reads
+                        # as "nobody ever labels anything".
+                        "allowed_updates": ["message", "callback_query"],
                         **({} if self._offset is None else {"offset": self._offset}),
                     },
                 )
@@ -370,6 +504,15 @@ class TelegramChannel:
                     # Nothing to hand over, so it is finished: confirm it now.
                     self._save_cursor()
                     continue
+                if isinstance(inbound, _LabelPress):
+                    # Handled here rather than yielded: the consumer of listen()
+                    # runs the conversation, and a label is not a turn in it.
+                    # Cursor after handling, like the notice below - a press
+                    # re-delivered because we died mid-handling only repeats the
+                    # same UPDATE.
+                    await self._handle_label(inbound)
+                    self._save_cursor()
+                    continue
                 if isinstance(inbound, _PairingNotice):
                     # An unknown sender: the message itself is dropped, and only a
                     # code goes back. Still finished, so the cursor advances.
@@ -409,10 +552,75 @@ class TelegramChannel:
         if self._owns_client:
             await self._client.aclose()
 
+    async def _handle_label(self, press: _LabelPress) -> None:
+        """Record a verdict, and tell Telegram the query is answered.
+
+        **Every exit answers the callback.** An unanswered `callback_query` leaves
+        the spinner turning on the user's button until their client gives up, which
+        is exactly what a dead daemon looks like from the outside.
+
+        Nothing here may raise: this runs inside `listen()`, where an exception ends
+        the generator and leaves a process that is alive, healthy-looking and
+        completely deaf.
+
+        The buttons are deliberately left in place, so a second press overwrites the
+        first. 👍 and 👎 are adjacent targets on a phone, the label clock wants the
+        verdict the owner meant rather than the one their thumb landed on, and
+        correcting a mis-tap has to cost one tap - removing the keyboard after the
+        first press would freeze the wrong answer into the precision numbers.
+        """
+        parsed = _parse_label(press.data)
+        if parsed is None:
+            # Forged, truncated, or a verb we never emitted. Logged without the
+            # payload: it is remote text, and a long callback_data in a log line is
+            # somebody else writing our logs.
+            logger.warning("telegram: unusable label callback from id=%s", press.sender_id)
+            await self._answer_callback(press.query_id, LABEL_UNUSABLE, alert=True)
+            return
+        utterance_id, verdict = parsed
+        if self._labels is None:
+            # Loud: a label that vanishes is the M3 gate quietly losing its only
+            # source of truth, and the daemon would look perfectly healthy.
+            logger.error("telegram: a label arrived with no label store wired; dropping it")
+            await self._answer_callback(press.query_id, LABEL_NO_STORE, alert=True)
+            return
+        try:
+            recorded = self._labels.label_utterance(utterance_id, verdict, now=clock.now())
+        except Exception:
+            # A locked or full sqlite is plausible, and must cost one label rather
+            # than the whole inbound path.
+            logger.exception("telegram: could not record a label from id=%s", press.sender_id)
+            await self._answer_callback(press.query_id, LABEL_FAILED, alert=True)
+            return
+        if not recorded:
+            # No such row: a forged id, or an utterance deleted because nothing was
+            # ever delivered. Said out loud rather than thanked for - the owner
+            # believing a label was counted when it was not is the worse failure.
+            logger.warning(
+                "telegram: label for an unknown utterance from id=%s", press.sender_id
+            )
+            await self._answer_callback(press.query_id, LABEL_UNKNOWN, alert=True)
+            return
+        logger.info("telegram: recorded a %s label from id=%s", verdict, press.sender_id)
+        await self._answer_callback(press.query_id, LABEL_ANSWERS[verdict])
+
+    async def _answer_callback(self, query_id: str, text: str, *, alert: bool = False) -> None:
+        try:
+            await self._call(
+                "answerCallbackQuery",
+                {"callback_query_id": query_id, "text": text, "show_alert": alert},
+            )
+        except TelegramError as exc:
+            # A query id is only good for about a minute, so answering a stale one
+            # fails. The label is already stored by then; letting this out of
+            # listen() would trade the daemon's inbound path for a spinner.
+            logger.warning("telegram: could not answer a callback query: %s", exc)
+
     def _label_keyboard(self, message: OutboundMessage) -> dict[str, Any] | None:
         """Thumbs up/down for proactive utterances (docs/PLAN.md 8.3).
 
-        Handling the callback query is M3; attaching the buttons now is free.
+        The press comes back as a `callback_query` and is handled by
+        `_handle_label`; `_parse_label` must keep accepting whatever this emits.
         """
         if not message.labelable:
             return None
@@ -428,10 +636,15 @@ class TelegramChannel:
             ]
         }
 
-    def _to_inbound(self, update: dict[str, Any]) -> InboundMessage | _PairingNotice | None:
+    def _to_inbound(
+        self, update: dict[str, Any]
+    ) -> InboundMessage | _PairingNotice | _LabelPress | None:
         message = update.get("message")
         if not isinstance(message, dict):
-            return None  # edits, channel posts, callback queries: not M1a
+            callback = update.get("callback_query")
+            if isinstance(callback, dict):
+                return self._to_label_press(callback, update.get("update_id"))
+            return None  # edits, channel posts, inline queries: not ours
         sender_id = (message.get("from") or {}).get("id")
         if not isinstance(sender_id, int):
             logger.warning("telegram: update %s has no numeric sender id", update.get("update_id"))
@@ -469,6 +682,55 @@ class TelegramChannel:
             channel=self.name,
             authored_by_sender=not relayed,
         )
+
+    def _to_label_press(self, callback: dict[str, Any], update_id: Any) -> _LabelPress | None:
+        """Screen a button press. `callback_data` is not looked at here."""
+        sender_id = (callback.get("from") or {}).get("id")
+        if not isinstance(sender_id, int):
+            logger.warning("telegram: callback query in update %s has no numeric sender id",
+                           update_id)
+            return None
+        if not self._may_label(sender_id):
+            # The allowlist boundary, and the reason it is *here*: a callback_query
+            # carries its own `from` id - whoever pressed the button, not whoever
+            # the message was addressed to - and anyone who can reach the bot can
+            # send arbitrary callback_data. Screened on the numeric id alone and
+            # before the payload is parsed, for the same reason as a message body.
+            #
+            # Nothing is sent back, not even an empty answer: a press we did not
+            # authorise is indistinguishable from a forgery, and answering would
+            # let an unauthenticated update make us call the API on demand. The
+            # spinner is on a button they should not be holding.
+            logger.warning(
+                "telegram: dropped a label from non-allowlisted sender id=%d", sender_id
+            )
+            return None
+        query_id = callback.get("id")
+        if not isinstance(query_id, str) or not query_id:
+            # There is nothing to answer, so there is nothing worth going on for.
+            logger.warning("telegram: callback query from id=%d has no id", sender_id)
+            return None
+        return _LabelPress(query_id=query_id, sender_id=str(sender_id), data=callback.get("data"))
+
+    def _may_label(self, sender_id: int) -> bool:
+        """Whether this id is one Daemon listens to.
+
+        Under `allowlist` the configured ids are the whole answer, exactly as in
+        `_to_inbound`. Under `pairing` the approved set lives in storage, so it is
+        read - see `LabelStore` for why it is read rather than asked of
+        `Pairing.screen()`.
+        """
+        if sender_id in self._allowed:
+            return True
+        if self._pairing is None or self._labels is None:
+            return False
+        try:
+            return self._labels.is_allowed(self.name, str(sender_id))
+        except Exception:
+            # Fail closed, and stay alive: a storage error here must not decide the
+            # allowlist, and must not end the poll loop either.
+            logger.exception("telegram: could not check whether id=%d may label", sender_id)
+            return False
 
     async def _call(self, method: str, payload: dict[str, Any]) -> Any:
         url = f"{self._api_base}/bot{self._token}/{method}"

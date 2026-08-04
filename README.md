@@ -16,11 +16,10 @@ a canned line when you open the app. A background loop asks whether there is a
 reason to say something now, whether now is a bad moment, and whether it has
 already talked too much today — and stays silent unless all three line up.
 
-Everything else — the memory graph, the reflection pass, recall scoring — is
-table stakes we borrow rather than claim. Design notes, including what we took
-from whom and why: **[docs/PLAN.md](docs/PLAN.md)** (Korean). Architecture:
-**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. Decisions and the measurements
-that overturned some of them: **[docs/adr/](docs/adr/)**.
+Everything else — the memory graph, the reflection pass, recall scoring — is table stakes we
+borrow rather than claim. Design notes, including what we took from whom and why:
+**[docs/PLAN.md](docs/PLAN.md)** (Korean). Architecture: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+Decisions and the measurements that overturned some of them: **[docs/adr/](docs/adr/)**.
 
 ## Status
 
@@ -31,8 +30,8 @@ is finished.
 |---|---|
 | **M1a** ✅ | Text conversation over Telegram, logged to markdown |
 | **M1b** ✅ | Recall (hybrid, 93.3% on the golden set), voice, OS residency |
-| **M2** ◐ | Reflection pass, entity graph, observations — recall does not read the curated tier yet |
-| M3 | Proactivity — it speaks first |
+| **M2** ✅ | Reflection pass, entity graph, observations, and recall reads the curated tier |
+| **M3** ◐ | Proactivity — it speaks first, on a five-minute loop that mostly decides not to. Off until you switch it on; the speaker is a second switch. Tuning waits on labels |
 | M4 | Persona evolution |
 
 ## Try it
@@ -53,6 +52,7 @@ daemon run       # here, in this terminal
 daemon install   # or keep it running after you close it, and after a reboot
 daemon voice     # one spoken conversation
 daemon reflect   # consolidate a day into memory now, instead of waiting for 04:00
+daemon proactive # one round of "is there a reason to speak?", and what it decided
 daemon doctor    # what is configured, reachable, indexed and remembered
 ```
 

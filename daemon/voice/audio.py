@@ -7,7 +7,10 @@ module is reachable from config and startup code that runs whether or not voice
 is on, and an ImportError at the top would turn "voice is off" into "the daemon
 does not start".
 
-`LocalSpeaker` is separate from `SoundDeviceAudio` and shares nothing with it.
+Proactive speech at the machine used to live here too, as a second
+`LocalSpeaker`. It moved to `daemon/proactivity/speaker.py`, where the rest of
+proactivity is: two classes of the same name made `tests/test_reachable.py`
+unable to say which one anything constructed, and this one was the dead half.
 It is the delivery path from docs/PLAN.md 6.3 - when the user is at the machine, a
 proactive utterance goes out of the local speaker, and nothing leaves the device.
 On macOS that needs no dependency at all: /usr/bin/say ships with Korean voices.
@@ -17,8 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
-import sys
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -277,111 +278,3 @@ class SoundDeviceAudio:
                 samplerate=self.playback_sample_rate, channels=CHANNELS, dtype=DTYPE
             )
         return self._out
-
-
-class LocalSpeaker:
-    """Say text on this machine's speaker, with no session and no network.
-
-    The path docs/PLAN.md 6.3 routes to when the user is present: it costs
-    nothing per minute, and the utterance never leaves the device - which is the
-    one privacy claim in docs/PLAN.md 7 that survives voice being switched on.
-
-    Text is written to the process's stdin, never placed in argv: an utterance
-    starting with '-' would otherwise be read as an option.
-    """
-
-    SAY = "/usr/bin/say"
-
-    def __init__(self, *, voice: str | None = None, platform: str | None = None) -> None:
-        self._voice = voice
-        """A ko_KR voice such as Yuna or Eddy. macOS ships nine of them, so the
-        Korean path needs nothing installed."""
-        self._platform = platform if platform is not None else sys.platform
-        self._process: asyncio.subprocess.Process | None = None
-
-    def command(self) -> list[str]:
-        """The argv for this platform, or an error naming what to install."""
-        if self._platform == "darwin":
-            # -f - reads the text from stdin. Verified: -f /dev/stdin does not
-            # work on macOS ("Bad file descriptor"), so this spelling matters.
-            return [self.SAY, *(["-v", self._voice] if self._voice else []), "-f", "-"]
-        # Not macOS: no bundled synthesiser exists, so probe for the two a Linux
-        # desktop is likely to already have before giving up. Both spellings read
-        # the text from stdin; neither is verified on a real Linux box yet, so
-        # this branch is the one to check first if a self-hoster reports silence.
-        for name, args in (("espeak-ng", ["--stdin"]), ("spd-say", ["--wait", "--pipe-mode"])):
-            found = shutil.which(name)
-            if found:
-                return [found, *args]
-        raise AudioUnavailable(
-            f"no local text-to-speech on platform {self._platform!r}; "
-            "install speech-dispatcher (spd-say) or espeak-ng, "
-            "or route proactive utterances to a channel instead"
-        )
-
-    @property
-    def available(self) -> bool:
-        """Whether speaking would work at all - checked before choosing this
-        route, so presence routing can fall back to a channel instead of
-        discovering the speaker is missing at the moment it wants to talk."""
-        try:
-            command = self.command()
-        except AudioUnavailable:
-            return False
-        return shutil.which(command[0]) is not None
-
-    async def say(self, text: str) -> None:
-        """Speak, and wait until it is finished.
-
-        Sequential on purpose: two overlapping utterances out of one speaker are
-        not two messages, they are noise.
-        """
-        if not text.strip():
-            return
-        command = self.command()
-        await self.stop()
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        self._process = process
-        try:
-            _, stderr = await process.communicate(text.encode("utf-8"))
-        except asyncio.CancelledError:
-            await self.stop()
-            raise
-        finally:
-            if self._process is process:
-                self._process = None
-        if process.returncode and process.returncode < 0:
-            # Killed by a signal, which is how `stop()` ends an utterance -
-            # SIGTERM leaves returncode -15, and reporting that as "the speaker is
-            # broken" fired on the most ordinary use there is: cutting the voice
-            # off because a meeting started (docs/PLAN.md 6.4). Interrupting is
-            # not a fault.
-            logger.debug(
-                "audio: %s was stopped by signal %d", command[0], -process.returncode
-            )
-            return
-        if process.returncode:
-            raise AudioUnavailable(
-                f"{command[0]} exited {process.returncode}: "
-                f"{stderr.decode('utf-8', 'replace').strip() or 'no output'}"
-            )
-
-    async def stop(self) -> None:
-        """Cut the utterance off mid-word.
-
-        docs/PLAN.md 6.4: a voice coming out of the speaker during a meeting is
-        an accident, so being able to stop one is not a nicety.
-        """
-        process, self._process = self._process, None
-        if process is None or process.returncode is not None:
-            return
-        try:
-            process.terminate()
-        except ProcessLookupError:
-            return  # finished between the check and the signal
-        await process.wait()

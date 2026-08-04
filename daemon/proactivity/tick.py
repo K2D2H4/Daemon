@@ -1,14 +1,14 @@
-"""The five-minute tick: generate, mirror, gate. M3a - it does not speak yet.
+"""The five-minute tick: all three stages of docs/PLAN.md 6.1, wired together.
 
-The three stages of docs/PLAN.md 6.1 wired together, stopping short of the one
-LLM call and the delivery. That boundary is deliberate and it is the order PLAN
-6.4 asks for: *"게이트 없이 음성을 켜지 않는다"* - do not turn the voice on
-without the gate. An ignored notification costs nothing and a voice in a meeting
-is an accident, so the deterministic half ships first and gets checked by a human
-reading what it *would* have said.
+    generate ──► mirror ──► probe once ──► gate each ──► judge ──► deliver
+    no model     sqlite     one Reading    deterministic   1 call   at most once
 
-    generate ──► mirror ──► probe once ──► gate each ──► [M3b: judge, speak]
-    no model     sqlite     one Reading    deterministic
+The judge and the delivery are **optional**, and a tick without them still runs
+everything to the left of them. That is not a debugging convenience: PLAN 6.4 asks
+for the gate to be trustworthy *before* anything is wired to a speaker - an ignored
+notification costs nothing and a voice in a meeting is an accident - so
+`daemon proactive` assembles a tick where speaking is structurally impossible and
+prints what it *would* have said. `daemon proactive --speak` adds the other two.
 
 ## One reading, N candidates
 
@@ -37,8 +37,16 @@ from daemon.clock import now as clock_now
 from daemon.config import Settings
 from daemon.memory.log import from_iso
 from daemon.memory.store import Store
-from daemon.proactivity.base import Candidate, Presence, Reading, Verdict
+from daemon.proactivity.base import (
+    Candidate,
+    Judgement,
+    Presence,
+    Reading,
+    Utterance,
+    Verdict,
+)
 from daemon.proactivity.candidates import generate_candidates
+from daemon.proactivity.delivery import Delivered, ProactiveDelivery
 from daemon.proactivity.gate import Gate
 
 logger = logging.getLogger(__name__)
@@ -46,10 +54,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class Considered:
-    """One candidate and what the gate said about it."""
+    """One candidate, what the gate said, and what became of it.
+
+    `utterance` and `delivered` stay `None` when the tick was assembled without a
+    judge, and `delivered` alone stays `None` when the judge declined - which is
+    the common case and not a failure.
+    """
 
     candidate: Candidate
     verdict: Verdict
+    utterance: Utterance | None = None
+    delivered: Delivered | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +80,11 @@ class TickResult:
     expired: int = 0
     considered: tuple[Considered, ...] = ()
     disabled: bool = False
+    spoke: int = 0
+    declined: int = 0
+    """Allowed by the gate, and the judge still had nothing worth saying. Counted
+    separately because it is the healthy case: docs/CONTRACTS.md 7 makes silence
+    the default, and a judge that never declines is one nobody should trust."""
 
     @property
     def allowed(self) -> tuple[Considered, ...]:
@@ -95,11 +115,17 @@ class ProactiveTick:
         presence: Presence,
         *,
         gate: Gate | None = None,
+        judge: Judgement | None = None,
+        delivery: ProactiveDelivery | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         self._presence = presence
         self._gate = gate or Gate(settings, store)
+        # Both or neither. With one of them missing the tick can still gate, which
+        # is what `daemon proactive` does to show its verdicts without speaking.
+        self._judge = judge
+        self._delivery = delivery
 
     async def run(self, *, now: datetime | None = None) -> TickResult:
         moment = now or clock_now()
@@ -127,21 +153,42 @@ class ProactiveTick:
             )
 
         considered = []
+        spoke = declined = 0
         for row in self._store.due_candidates(now=moment):
             candidate = row_candidate(row)
-            considered.append(
-                Considered(
-                    candidate=candidate,
-                    verdict=self._gate.judge(candidate, reading, now=moment),
-                )
-            )
+            verdict = self._gate.judge(candidate, reading, now=moment)
+            utterance: Utterance | None = None
+            delivered: Delivered | None = None
+
+            if verdict.allowed and self._judge is not None and self._delivery is not None:
+                utterance = await self._judge.decide(candidate)
+                if utterance:
+                    delivered = await self._delivery.deliver(
+                        candidate, utterance, verdict, now=moment
+                    )
+                else:
+                    declined += 1
+
+            considered.append(Considered(candidate, verdict, utterance, delivered))
+            if delivered:
+                spoke += 1
+                # One utterance per tick, and the loop stops here. The gate counts
+                # the daily budget from rows already stored, so a second delivery
+                # in the same tick would read the same pre-tick count and overshoot
+                # it - and PLAN 6.2's budget of three is the brake the whole design
+                # leans on. Anything still due is reconsidered five minutes later.
+                break
+
         return TickResult(
             at=moment,
             reading=reading,
             generated=len(fresh),
             expired=expired,
             considered=tuple(considered),
+            spoke=spoke,
+            declined=declined,
         )
+
 
 
 def row_candidate(row: sqlite3.Row) -> Candidate:

@@ -41,12 +41,13 @@ PENDING_PROVIDERS: dict[str, str] = {
 
 PENDING_TASKS = {
     Task.RECALL_ESCALATION: "M1b+ - Lane 2 is specified, Lane 1 ships first",
-    Task.PROACTIVE_JUDGE: "M3 - the whole point of M3",
     Task.PERSONA_RULE: "M4",
 }
 
-PENDING_CLASSES = {
-    "LocalSpeaker": "M3 - proactive speech at the machine (PLAN 6.3)",
+PENDING_CLASSES: dict[str, str] = {
+    # Empty. `LocalSpeaker` was the last entry and closing it is what M3b is: the
+    # thing that speaks at the machine now exists and `app.build_proactive_tick`
+    # constructs it.
 }
 
 WIRED_CLASSES = (
@@ -75,11 +76,21 @@ WIRED_CLASSES = (
     "ProactiveTick",
     "Gate",
     "MachinePresence",
+    # M3b: the one model call, the voice at the machine, and what records both.
+    "Judge",
+    "LocalSpeaker",
+    "ProactiveDelivery",
 )
 
 
 def _sources() -> list[tuple[pathlib.Path, str]]:
     return [(p, p.read_text(encoding="utf-8")) for p in DAEMON.rglob("*.py")]
+
+
+def _defining(name: str) -> list[pathlib.Path]:
+    """Files under daemon/ that define `class name`."""
+    pattern = rf"^class {re.escape(name)}\b"
+    return [path for path, text in _sources() if re.search(pattern, text, re.M)]
 
 
 def _constructed(name: str) -> pathlib.Path | None:
@@ -275,3 +286,34 @@ def test_every_documented_env_key_is_a_real_setting() -> None:
     }
     unknown = documented - aliases
     assert not unknown, f".env.example documents keys nothing reads: {sorted(unknown)}"
+
+
+# --- the check that was itself unreachable -----------------------------------
+
+
+def test_no_name_this_file_reasons_about_is_defined_twice() -> None:
+    """A duplicated class name makes the checks above ambiguous.
+
+    Found by an agent that had just added `LocalSpeaker` to
+    `daemon/proactivity/speaker.py` while a dead one of the same name sat in
+    `daemon/voice/audio.py`. `_constructed` skips any file that *defines* the name
+    and returns the first that *calls* it, so with two definitions it can only say
+    "something builds a LocalSpeaker" - never which. A dead implementation with a
+    hundred lines of tests was being reported as wired.
+
+    Scoped to the names this file actually reasons about rather than every class
+    under `daemon/`. The broader rule would fail today on `Verdict`
+    (`daemon/setup.py` and `daemon/proactivity/base.py`), and that pair is a
+    readability question, not a hole in a gate - widening a check until it needs an
+    allowlist is how a check stops being run.
+    """
+    watched = set(WIRED_CLASSES) | set(PENDING_CLASSES)
+    duplicates = {
+        name: sorted(path.name for path in _defining(name))
+        for name in sorted(watched)
+        if len(_defining(name)) > 1
+    }
+    assert not duplicates, (
+        "these names are checked above and defined in more than one module under "
+        f"daemon/, so the checks cannot tell which one they found: {duplicates}"
+    )
