@@ -52,11 +52,13 @@ from __future__ import annotations
 
 import getpass
 import json
+import re
 import sys
 import time
 import webbrowser
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
@@ -103,6 +105,18 @@ PROBLEM = 1
 HTTP_TIMEOUT = 15.0
 """Short. A wizard waiting on a hung endpoint is worse than a wizard that says
 the endpoint is unreachable and asks again."""
+
+HTTP_CONFLICT = 409
+"""The one Bot API status code this module explains rather than merely reports.
+
+`getUpdates` answers 409 for two unrelated reasons that need opposite actions, and
+the number distinguishes neither - see `TELEGRAM_CONFLICT_HINT`."""
+
+BODY_LIMIT = 200
+"""Longest slice of a provider's error body this module will print.
+
+Same reasoning as `MODEL_ID_LIMIT`: text that arrived over the network is on its
+way to a terminal, and how much screen a body gets is not the body's decision."""
 
 ANTHROPIC_KEYS_URL = "https://console.anthropic.com/settings/keys"
 OPENAI_KEYS_URL = "https://platform.openai.com/api-keys"
@@ -274,6 +288,32 @@ gone: the wizard's shortcut works because it holds the token and the database at
 the same moment, which nothing else does.
 """
 
+TELEGRAM_CONFLICT_HINT = (
+    "Both causes of a 409 are below, and Telegram's own description above says",
+    "which one this is.",
+    "",
+    "  A webhook is set on this bot. Persistent: every poll fails until it is gone,",
+    "  including the daemon's own. Not deleted for you - a webhook is something you",
+    "  may have set on purpose, and this command writes nothing but .env.",
+    "    curl https://api.telegram.org/bot<token>/getWebhookInfo",
+    "    curl -X POST https://api.telegram.org/bot<token>/deleteWebhook",
+    "",
+    "  Another process is polling this token. Transient: stop the other `daemon run`,",
+    "  or the installed service (`daemon uninstall` removes it), and try again.",
+    "",
+    "  <token> is TELEGRAM_BOT_TOKEN from .env - nothing here exports it to a shell.",
+)
+"""What a 409 from `getUpdates` means, printed under Telegram's own description.
+
+A real onboarding run failed with `fail: api.telegram.org returned HTTP 409` and
+nothing else, then fell through to `PAIRING_NOTE` - which tells you to run the
+daemon, and the daemon polls the same endpoint and fails the same way. The status
+code alone cannot tell the two causes apart; the description can, and one of them
+is a persistent setting while the other clears itself when a process exits.
+
+A block rather than a sentence because it is two diagnoses, two actions and two
+commands to copy. Deliberately no `deleteWebhook` call from here."""
+
 PAIRING_POLICY = "pairing"
 """The `DAEMON_TELEGRAM_DM_POLICY` value this step belongs to (see
 `channels/telegram.DM_POLICIES`). Under `allowlist` there is nothing to pair:
@@ -383,6 +423,13 @@ class Updates:
     ok: bool
     updates: tuple[dict[str, Any], ...] = ()
     detail: str = ""
+    hint: tuple[str, ...] = ()
+    """Lines to print under `detail` when the failure has a known cause and a known
+    action - today only `TELEGRAM_CONFLICT_HINT`.
+
+    A tuple, unlike `Verdict.hint`, because the one thing that needs it is two
+    diagnoses and two commands to copy rather than one sentence, and `status()`
+    collapses whitespace, which would run the commands into the prose."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,14 +466,18 @@ def check_anthropic(key: str, model: str) -> Verdict:
     if response.status_code != 200:
         return Verdict(False, f"api.anthropic.com returned HTTP {response.status_code}")
 
-    ids = _string_field(response, "data", "id")
+    # `created_at`, so the menu opens on the newest Claude rather than on whichever
+    # id sorts first alphabetically - see `_newest_first`.
+    ids = _newest_first(response, "created_at")
+    listed = {"DAEMON_ANTHROPIC_MODEL": ids}
     if model and ids and model not in ids:
         return Verdict(
             True,
             f"key works, but {model!r} is not in your model list",
-            hint="Set DAEMON_ANTHROPIC_MODEL in .env to one of: " + ", ".join(sorted(ids)[:5]),
+            hint="The next question offers the ids that do exist.",
+            models=listed,
         )
-    return Verdict(True, "key works")
+    return Verdict(True, "key works", models=listed)
 
 
 def check_openai(key: str, model: str) -> Verdict:
@@ -454,7 +505,11 @@ def check_openai(key: str, model: str) -> Verdict:
     if response.status_code != 200:
         return Verdict(False, f"api.openai.com returned HTTP {response.status_code}")
 
-    ids = _string_field(response, "data", "id")
+    # `created`, for the same reason as Anthropic's `created_at`: it is a real
+    # publication date, so it orders the menu without guessing at `gpt-` naming - and
+    # it sinks `whisper-1`, `dall-e-3` and `tts-1`, which this endpoint lists with
+    # nothing to mark them as not-for-chatting (`_newest_first`).
+    ids = _newest_first(response, "created")
     # Carried whether or not the configured id checks out: the model question is
     # the next one asked, and it is the one that can act on this.
     listed = {"DAEMON_OPENAI_MODEL": ids}
@@ -462,7 +517,10 @@ def check_openai(key: str, model: str) -> Verdict:
         return Verdict(
             True,
             f"key works, but {model!r} is not in your model list",
-            hint="Set DAEMON_OPENAI_MODEL in .env to one of: " + ", ".join(sorted(ids)[:5]),
+            # Not five ids inline any more: there is a question directly after this
+            # one and it offers the whole list, newest first. Naming five
+            # alphabetically here would contradict the order it prints.
+            hint="The next question offers the ids that do exist.",
             models=listed,
         )
     return Verdict(True, "key works", models=listed)
@@ -532,7 +590,7 @@ def check_telegram(token: str) -> Verdict:
             hint=f"Ask @BotFather for it again at {BOTFATHER_URL} (/mybots -> API Token).",
         )
     if response.status_code != 200:
-        return Verdict(False, f"api.telegram.org returned HTTP {response.status_code}")
+        return Verdict(False, _telegram_detail(response, token))
 
     try:
         result = response.json().get("result") or {}
@@ -580,7 +638,13 @@ def fetch_updates(token: str, offset: int | None, timeout: int) -> Updates:
         detail = _redact(str(exc), token)
         return Updates(False, detail=f"lost contact with api.telegram.org: {detail}")
     if response.status_code != 200:
-        return Updates(False, detail=f"api.telegram.org returned HTTP {response.status_code}")
+        return Updates(
+            False,
+            detail=_telegram_detail(response, token),
+            # Only 409 gets an explanation, because it is the only code here whose
+            # two causes need two different actions from the person reading it.
+            hint=TELEGRAM_CONFLICT_HINT if response.status_code == HTTP_CONFLICT else (),
+        )
     try:
         result = response.json().get("result")
     except ValueError:
@@ -633,6 +697,59 @@ def _string_field(response: httpx.Response, container: str, key: str) -> tuple[s
     )
 
 
+def _stamp_value(raw: object) -> float | None:
+    """One comparable number out of either shape of "when was this published".
+
+    OpenAI sends `created` as a unix integer, Anthropic sends `created_at` as an
+    ISO-8601 string, and both answer the same question - so they are reduced to one
+    number here rather than to two sort keys. `None` for anything else, which is
+    what puts an entry in the "no date" group instead of raising.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _newest_first(response: httpx.Response, stamp: str) -> tuple[str, ...]:
+    """`data[].id`, ordered by the provider's own publication date, newest first.
+
+    **A real field, not a guess at the name.** OpenAI and Anthropic both date every
+    model they list, so "newest" here is what the provider says rather than what an
+    id looks like - which is the whole difference between this and `model_version`
+    (see `order_models` for why Gemini cannot have this).
+
+    It also does the work a name filter would otherwise be asked to do: `whisper-1`,
+    `dall-e-3` and `tts-1` are not chat models, and they are also years older than
+    every model that is, so recency puts them at the bottom without this module
+    holding a list of families to hide.
+
+    Entries the provider did not date keep the order it sent them in, after the
+    dated ones: a missing field must cost the ordering, not the menu.
+    """
+    try:
+        items = response.json().get("data") or []
+    except ValueError:
+        return ()
+    rows = [
+        (item["id"], _stamp_value(item.get(stamp)))
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    ]
+    dated = sorted(
+        ((name, when) for name, when in rows if when is not None),
+        key=lambda row: row[1],
+        reverse=True,
+    )
+    return (*(name for name, _ in dated), *(name for name, when in rows if when is None))
+
+
 def _gemini_models(response: httpx.Response, method: str) -> tuple[str, ...]:
     """The ids that support `method`, with the `models/` prefix taken off.
 
@@ -663,6 +780,42 @@ def _gemini_models(response: httpx.Response, method: str) -> tuple[str, ...]:
         if method in methods:
             found.append(name.removeprefix("models/"))
     return tuple(found)
+
+
+def _telegram_said(response: httpx.Response, token: str) -> str:
+    """Telegram's own `description` for a failed call. Empty when there is none.
+
+    Worth parsing because on a 409 the description *is* the diagnosis: a webhook
+    and a second poller produce the same status code and need opposite actions.
+    Discarding it is what left a real onboarding run with a bare `HTTP 409`.
+
+    Untrusted text on its way to a terminal, so three things happen to it. The
+    token is redacted, because an error body may echo request context and for the
+    Bot API the token is in the path. Control characters go, because an escape
+    sequence here would repaint the prompt printed after it. And it is bounded, for
+    the same reason `MODEL_ID_LIMIT` exists.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    description = body.get("description") if isinstance(body, dict) else None
+    if not isinstance(description, str):
+        return ""
+    collapsed = " ".join(_redact(description, token).split())
+    return truncate("".join(char for char in collapsed if char.isprintable()), BODY_LIMIT)
+
+
+def _telegram_detail(response: httpx.Response, token: str) -> str:
+    """`HTTP <code>`, plus what Telegram said about it when it said anything.
+
+    One helper for both Bot API probes: the status code was all either of them
+    reported, and the sentence that names the actual cause was in the body both of
+    them already had.
+    """
+    detail = f"api.telegram.org returned HTTP {response.status_code}"
+    said = _telegram_said(response, token)
+    return f"{detail}: {said}" if said else detail
 
 
 def _redact(text: str, secret: str) -> str:
@@ -760,9 +913,23 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 secret=True,
             )
         )
-        # No model question: DAEMON_ANTHROPIC_MODEL is the one hosted model id
-        # Settings has a default for, and `check_anthropic` verifies that default
-        # against the account rather than assuming it.
+        needs.append(
+            Need(
+                key="DAEMON_ANTHROPIC_MODEL",
+                label="Anthropic model id",
+                why="Which Claude answers. Settings has a working default, so Enter "
+                "is a real answer here - but which Claude is still a choice, and it "
+                "was previously only changeable by hand-editing .env.",
+                default=env.get("DAEMON_ANTHROPIC_MODEL") or _config_default("anthropic_model"),
+                listed=True,
+            )
+        )
+        # Non-blocking, unlike the other two model ids: `Need.blocking` reads
+        # Settings, Settings has a default for this one, and `--check` therefore
+        # warns rather than failing. `DAEMON_OLLAMA_MODEL` is the same shape and for
+        # the same reason - a default that works is not a reason to hide the
+        # question, because the default going stale is exactly what this wizard
+        # exists to catch before the first conversation does.
     if OPENAI in providers:
         needs.append(
             Need(
@@ -1210,6 +1377,7 @@ knows to look for."""
 NO_LIST_NOTE = "Nothing listed this account's models, so this is the built-in default."
 
 LISTED_BY = {
+    "DAEMON_ANTHROPIC_MODEL": "ANTHROPIC_API_KEY",
     "DAEMON_OPENAI_MODEL": "OPENAI_API_KEY",
     "DAEMON_GEMINI_MODEL": "GEMINI_API_KEY",
     "DAEMON_GEMINI_LIVE_MODEL": "GEMINI_API_KEY",
@@ -1233,11 +1401,62 @@ answered and had nothing. Both fall back to exactly the old question, because a
 list that could not be fetched must cost the menu and not the wizard."""
 
 
-def order_models(ids: Sequence[str], default: str) -> tuple[str, ...]:
-    """Offerable ids, `default` first so Enter and `1` agree, then the rest sorted.
+DATED_LISTS = frozenset({"DAEMON_ANTHROPIC_MODEL", "DAEMON_OPENAI_MODEL"})
+"""Which lists arrive already in a real newest-first order (`_newest_first`).
+
+The asymmetry is the provider's, not a preference: Anthropic dates every model with
+`created_at` and OpenAI with `created`, and Gemini's `models.list` publishes no
+creation date at all. So two of the three menus are ordered by a fact and the third
+falls back to reading a version out of the id (`model_version`). Worth naming here
+because the next reader will otherwise try to unify them and find there is nothing
+to unify them with."""
+
+
+MODEL_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
+"""A dotted family version inside a model id, the way Google names them:
+`gemini-3.1-flash-live-preview` -> `(3, 1)`.
+
+The dot is required, and that is what keeps a date out of it:
+`deep-research-preview-04-2026` carries numbers and no version, and reading `04` as
+one would rank a research preview above `gemini-3.5`."""
+
+
+def model_version(name: str) -> tuple[int, int] | None:
+    match = MODEL_VERSION_RE.search(name)
+    return (int(match[1]), int(match[2])) if match else None
+
+
+def order_models(ids: Sequence[str], default: str, *, dated: bool = False) -> tuple[str, ...]:
+    """Offerable ids, `default` first so Enter and `1` agree, then newest first.
 
     The order is what the printed numbers mean, and it has to survive folding: the
     shown part is a prefix, so `2` means the same id before and after `?`.
+
+    **Newest first, not alphabetical.** Alphabetical was the first version and it
+    buried the thing anyone is looking for. On a real account with 42 text models and
+    six shown, the fold opened with `antigravity-…` and three `deep-research-…`
+    because 'a' and 'd' precede 'g' - and every `gemini-3.x` sorted *after* every
+    `gemini-2.x`, so nothing newer than 2.0 appeared above the fold. A folded list
+    then reads as a stale one, which is worse than no list: it looks authoritative.
+
+    **`dated` says where "newest" comes from**, and it is one function rather than
+    three because that is the only thing that differs. `dated=True` means the probe
+    already ordered the list by a publication date the provider itself published
+    (`_newest_first`, `DATED_LISTS`), so arrival order *is* newest-first and nothing
+    here may second-guess it - reading versions out of `gpt-4.1` and `gpt-5` would
+    put the dotted one first and be wrong about which is newer. `dated=False` is
+    Gemini, which publishes no such date, so an id carrying a dotted version sorts
+    by it, descending. Either way the undated remainder keeps the order the provider
+    sent - the provider's own choice beats one invented here - which is why the
+    dedup below is order-keeping rather than a set.
+
+    **Nothing is hidden, for any provider.** Every list here mixes families the
+    user did not mean to pick from - Gemini's `deep-research-…`, OpenAI's
+    `whisper-1` - and no response distinguishes those as data (`_newest_first`,
+    `_gemini_models`). Narrowing them out would mean a list of name families, which
+    would hide a model the account can use the first time a vendor ships one this
+    file has not heard of. Recency demotes them below the fold instead, and `?`
+    still prints all of them.
 
     The filter is not cosmetic. These strings came off the network and a chosen one
     is written as a `KEY=value` line, so anything carrying whitespace could write a
@@ -1245,14 +1464,26 @@ def order_models(ids: Sequence[str], default: str) -> tuple[str, ...]:
     at; anything absurdly long is a body that has stopped making sense
     (`MODEL_ID_LIMIT`).
     """
-    usable = {
-        name
-        for name in ids
-        if name and len(name) <= MODEL_ID_LIMIT and name.isprintable() and not any(
-            character.isspace() for character in name
+    usable = tuple(
+        dict.fromkeys(
+            name
+            for name in ids
+            if name and len(name) <= MODEL_ID_LIMIT and name.isprintable() and not any(
+                character.isspace() for character in name
+            )
         )
-    }
-    rest = sorted(usable - {default})
+    )
+    rest = [name for name in usable if name != default]
+    if not dated:
+        rest.sort(
+            key=lambda name: (
+                # Versioned ids first, newest among them, and everything else in the
+                # order the provider sent.
+                model_version(name) is None,
+                tuple(-part for part in (model_version(name) or (0, 0))),
+                usable.index(name),
+            )
+        )
     return (default, *rest) if default in usable else tuple(rest)
 
 
@@ -1391,12 +1622,13 @@ class Wizard:
         if not key:
             return
         self._probed.add(credential)
+        probe = {
+            "GEMINI_API_KEY": lambda: self.checks.gemini(key),
+            "ANTHROPIC_API_KEY": lambda: self.checks.anthropic(key, need.default),
+            "OPENAI_API_KEY": lambda: self.checks.openai(key, need.default),
+        }[credential]
         try:
-            verdict = (
-                self.checks.gemini(key)
-                if credential == "GEMINI_API_KEY"
-                else self.checks.openai(key, need.default)
-            )
+            verdict = probe()
         except Exception:  # noqa: BLE001 - a listing must not end setup
             # Silent on purpose: the caller prints NO_LIST_NOTE next, and this
             # command's own output is a transcript a person reads, not a log.
@@ -1430,7 +1662,9 @@ class Wizard:
         if need.key not in self.catalog:
             say(theme.dim(f"  {NO_LIST_NOTE}"))
             return ()
-        ids = order_models(self.catalog[need.key], need.default)
+        ids = order_models(
+            self.catalog[need.key], need.default, dated=need.key in DATED_LISTS
+        )
         if not ids:
             say(theme.dim(f"  {EMPTY_LIST_NOTE}"))
             return ()
@@ -1931,6 +2165,13 @@ class Wizard:
                     # the token worked seconds ago, so this is the network, and the
                     # user should hear that instead of watching a spinner.
                     say(status(theme, "fail", batch.detail))
+                    for line in batch.hint:
+                        # Plain lines rather than `status`: a hint carrying a command
+                        # to copy has to keep the indentation it was written with,
+                        # and `status` wraps on whitespace.
+                        say(line)
+                    if batch.hint:
+                        say()
                     return False
                 for update in batch.updates:
                     update_id = update.get("update_id")
@@ -2148,7 +2389,14 @@ def report(path: Path, prompt: Prompt) -> int:
     )
     prompt.say()
 
-    missing = needs_for(env)
+    # `needs_for` keeps a `listed` model id in its list even once the file answers
+    # it, because the *wizard* re-asks a decided model id so it can be changed
+    # without hand-editing `.env`. `--check` is answering a different question -
+    # is this file complete - and a key with a value in it is not missing. Without
+    # this line, `--check` on a finished OpenAI install printed
+    # `ok: DAEMON_OPENAI_MODEL = gpt-5.1` and `missing: DAEMON_OPENAI_MODEL` on the
+    # same screen and exited non-zero.
+    missing = [need for need in needs_for(env) if not env.get(need.key)]
     for need in _all_needs():
         value = env.get(need.key, "")
         if value:
