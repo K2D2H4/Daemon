@@ -53,9 +53,9 @@ FROZEN means: do not edit without flagging it first.
    Nothing outside `daemon/channels/` imports a channel implementation.
    Callers use `LLMGateway.complete(task, ...)` and the `Channel` protocol.
 
-5. **`persona/seed.md` is human-owned. Code must never write to it.**
+5. **`data/persona/seed.md` is human-owned. Code must never write to it.**
    That asymmetry is the anchor that prevents personality collapse.
-   `persona/learned.md` is AI-owned; humans only read it or request deletion.
+   `data/persona/learned.md` is AI-owned; humans only read it or request deletion.
 
 6. **`observations` is append-only.** No UPDATE, no DELETE. Only `consumed_by`
    may be set later.
@@ -121,7 +121,7 @@ same as it working, and the difference is where every defect above lived.
 ## Milestone scope
 
 M1a is done: a Telegram message gets an answer and the exchange lands in
-`memory/log/YYYY-MM-DD.md`.
+`data/memory/log/YYYY-MM-DD.md`.
 
 Now building **M1b**:
 

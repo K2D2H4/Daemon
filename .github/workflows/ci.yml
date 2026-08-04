@@ -1,0 +1,44 @@
+name: ci
+
+# The repo had 727 tests, a linter, a reachability check and a docs check, and
+# nothing ran any of them automatically. Every regression this project has hit was
+# found by someone remembering to look.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # `voice` too: the voice tests import the module, and a missing extra there
+      # would pass locally on a machine that happens to have it.
+      - run: pip install -e ".[dev,voice]"
+
+      - name: lint
+        run: python3 -m ruff check .
+
+      # No network, no API key, no microphone - asserted by the tests themselves.
+      # A test that needs any of those is a broken test (docs/CONTRACTS.md).
+      - name: tests
+        run: python3 -m pytest
+
+      # Separate steps so a failure names the thing that broke rather than "tests".
+      # Reachability catches "built, contract satisfied, unreachable"; the docs
+      # check catches a path in backticks that does not exist. Both have caught
+      # real defects that the unit tests could not see.
+      - name: reachability
+        run: python3 -m pytest tests/test_reachable.py -q
+
+      - name: acceptance
+        run: python3 -m pytest tests/test_acceptance.py -q
+
+      - name: documented paths exist
+        run: python3 scripts/check_docs.py

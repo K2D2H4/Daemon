@@ -71,7 +71,7 @@ from pathlib import Path
 
 import numpy as np
 
-from daemon.clock import parse_iso
+from daemon.clock import now_iso, parse_iso
 from daemon.llm.base import Embedder
 from daemon.memory import log as memory_log
 from daemon.memory.base import Recall, RecalledItem
@@ -83,6 +83,12 @@ FIXTURES = Path(__file__).parent / "fixtures"
 QUESTIONS = FIXTURES / "questions.json"
 
 DEEP_LIMIT = 100
+BACKFILL_LIMIT = 10_000
+"""Embed the whole fixture set. Production defaults to 500, once, oldest-first -
+a pass rate measured here is an upper bound on what a real install gets until its
+backfill has actually caught up, which is why the number is recorded alongside
+the score."""
+RESULTS = Path(__file__).resolve().parent / "agent-results.json"
 """Limit used only to attribute a failure: was the answer recalled at all, and by
 which lane? Never what the daemon itself asks for."""
 
@@ -180,6 +186,21 @@ class Report:
     def pass_rate(self) -> float:
         return len(self.passed) / len(self.scored) if self.scored else 0.0
 
+    def as_record(self) -> dict[str, object]:
+        """The run as data, so a quoted pass rate carries its conditions with it."""
+        return {
+            "measured_at": now_iso(),
+            "embedder": self.embedder,
+            "top_n": self.top_n,
+            "pass_rate": round(self.pass_rate, 4),
+            "passed": len(self.passed),
+            "scored": len(self.scored),
+            "broken": len(self.results) - len(self.scored),
+            "vectors_indexed": self.vectors,
+            "backfill_limit": BACKFILL_LIMIT,
+            "lane_counts": self.lane_counts(),
+        }
+
     def lane_counts(self) -> dict[str, int]:
         """Which lane carried each pass. The measurement that says whether the
         vector lane earned its place in M1b."""
@@ -240,7 +261,7 @@ async def build_recall(
     store = Store.open(data_dir / "daemon.sqlite3")
     reindex(data_dir, store)
     recall = MemoryRecall(store, embedder, now=parse_iso(spec.now))
-    return recall, await recall.backfill(limit=10_000)
+    return recall, await recall.backfill(limit=BACKFILL_LIMIT)
 
 
 async def evaluate(
@@ -372,12 +393,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--model", default="bge-m3")
     parser.add_argument("--questions", type=Path, default=QUESTIONS)
+    parser.add_argument(
+        "--json",
+        nargs="?",
+        const=RESULTS,
+        type=Path,
+        default=None,
+        help=f"also write the run as a record (default {RESULTS.name}).",
+    )
     args = parser.parse_args(argv)
 
     spec = load_spec(args.questions)
     embedder = _build_embedder(args.embedder, args.ollama_url, args.model)
     report = asyncio.run(run(spec, embedder=embedder))
     print(format_report(report))
+    if args.json is not None:
+        args.json.write_text(
+            json.dumps(report.as_record(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"\nwrote {args.json}")
     return 0 if report.pass_rate > 0 else 1
 
 

@@ -633,19 +633,30 @@ async def test_the_exchange_lands_in_the_markdown_log(
 ) -> None:
     """docs/PLAN.md 8.2, M1a gate: message it, it answers, and the exchange is in
     memory/log/YYYY-MM-DD.md. Everything but the channel is real here."""
+    from daemon.clock import now
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
 
     memory = FileMemoryWriter(data_dir, Store(db))
-    channel = FakeChannel([inbound("what did I say about the talk?")])
+    # Today, not the suite's pinned date: the loop stamps its own reply from the
+    # live clock, so a pinned inbound files the two halves of one exchange under
+    # two dates and this passes only on the day it was written.
+    asked = InboundMessage(
+        text="what did I say about the talk?",
+        sender_id="42",
+        received_at=now(),
+        channel="fake",
+    )
+    channel = FakeChannel([asked])
 
     await ConversationLoop(
         channel, gateway_for(fake_provider), memory, data_dir=data_dir
     ).run()
 
-    logs = sorted((data_dir / "memory" / "log").glob("*.md"))
-    assert len(logs) == 1
-    written = logs[0].read_text(encoding="utf-8")
+    today = f"{now():%Y-%m-%d}.md"
+    logs = sorted(p.name for p in (data_dir / "memory" / "log").glob("*.md"))
+    assert logs == [today]
+    written = (data_dir / "memory" / "log" / today).read_text(encoding="utf-8")
     assert "what did I say about the talk?" in written
     assert "ok" in written
     assert [m.text for m in channel.sent] == ["ok"]
