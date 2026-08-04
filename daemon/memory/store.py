@@ -25,7 +25,7 @@ import numpy as np
 
 from daemon.fs import secure_dir, secure_file
 from daemon.memory.base import LoggedMessage
-from daemon.memory.log import utc_iso
+from daemon.memory.log import from_iso, utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -682,6 +682,259 @@ class Store:
     def count_observations(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()
         return int(row["n"])
+
+    # --- M3: proactive candidates -------------------------------------------
+
+    def insert_candidate(
+        self,
+        *,
+        kind: str,
+        reason: str,
+        payload: str,
+        now: datetime,
+        due_at: datetime | None = None,
+        expires_at: datetime | None = None,
+        fire_budget: int = 1,
+        cooldown_secs: int = 86_400,
+    ) -> int:
+        """Mirror one candidate. Payload arrives already JSON-encoded so this layer
+        does not have to know what any generator puts in it."""
+        cursor = self.conn.execute(
+            "INSERT INTO proactive_candidates "
+            "(kind, reason, payload, created_at, due_at, expires_at, fire_budget, cooldown_secs) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                kind,
+                reason,
+                payload,
+                utc_iso(now),
+                None if due_at is None else utc_iso(due_at),
+                None if expires_at is None else utc_iso(expires_at),
+                fire_budget,
+                cooldown_secs,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    _LIVE = (
+        # `fired` is live too, as long as the candidate's own budget is not spent.
+        # Leaving it out meant a candidate allowed to fire twice was silently
+        # retired after the first - the state machine in schema.sql distinguishes
+        # `fired` from `done` precisely so that can be told apart, and a query that
+        # stops at 'armed' throws the distinction away.
+        "state IN ('pending', 'armed', 'fired') "
+        "AND fire_count < fire_budget "
+        "AND (expires_at IS NULL OR expires_at > :now)"
+    )
+
+    def live_candidates(self, *, now: datetime) -> list[sqlite3.Row]:
+        """Candidates still in play.
+
+        **Not the deduplication check**, which an earlier version of this docstring
+        claimed. It excludes `done`, `cancelled` and `expired`, and rows whose
+        budget is spent - so an open loop that already fired and was marked `done`
+        has no live row, is regenerated on the next tick, and the daemon asks about
+        the same presentation again. That is the stalker failure, arriving through
+        the one method that looked like it prevented it. Use
+        `existing_dedup_keys`, which reads *every* state.
+        """
+        return self.conn.execute(
+            f"SELECT * FROM proactive_candidates WHERE {self._LIVE} "
+            "ORDER BY due_at IS NULL, due_at ASC, id ASC",
+            {"now": utc_iso(now)},
+        ).fetchall()
+
+    def due_candidates(self, *, now: datetime) -> list[sqlite3.Row]:
+        """Live candidates whose moment has arrived - what the gate is offered.
+
+        Two separate cooldowns exist and this is the per-candidate one
+        (`cooldown_secs`): "do not raise *this* again for a day". The global gap
+        between any two utterances is the gate's, from settings. Conflating them
+        would let five different candidates fire in five minutes, each within its
+        own cooldown.
+        """
+        return self.conn.execute(
+            f"SELECT * FROM proactive_candidates WHERE {self._LIVE} "
+            "AND (due_at IS NULL OR due_at <= :now) "
+            "AND (last_fired_at IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', last_fired_at, "
+            "     '+' || cooldown_secs || ' seconds') <= :now) "
+            "ORDER BY due_at IS NULL, due_at ASC, id ASC",
+            {"now": utc_iso(now)},
+        ).fetchall()
+
+    def set_candidate_state(self, candidate_id: int, state: str) -> None:
+        self.conn.execute(
+            "UPDATE proactive_candidates SET state = ? WHERE id = ?", (state, candidate_id)
+        )
+        self.conn.commit()
+
+    def mark_candidate_fired(self, candidate_id: int, *, now: datetime) -> None:
+        """One more firing against this candidate's own budget.
+
+        `state` becomes `done` once the budget is spent, so a candidate that may
+        fire twice is not silently retired after the first.
+        """
+        stamp = utc_iso(now)
+        with self.conn:
+            self.conn.execute(
+                "UPDATE proactive_candidates "
+                "SET fire_count = fire_count + 1, last_fired_at = ?, "
+                "    state = CASE WHEN fire_count + 1 >= fire_budget THEN 'done' ELSE 'fired' END "
+                "WHERE id = ?",
+                (stamp, candidate_id),
+            )
+
+    def expire_candidates(self, *, now: datetime) -> int:
+        """Retire what ran out of time. Returns how many.
+
+        Separate from `live_candidates` filtering it out: a row left `pending`
+        forever is indistinguishable from one still waiting, and the state machine
+        in schema.sql is the thing a human reads to understand why nothing spoke.
+        """
+        cursor = self.conn.execute(
+            "UPDATE proactive_candidates SET state = 'expired' "
+            "WHERE state IN ('pending', 'armed') AND expires_at IS NOT NULL AND expires_at <= ?",
+            (utc_iso(now),),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def existing_dedup_keys(self, keys: Sequence[str]) -> set[str]:
+        """Which of these dedup keys the candidate table has *ever* held.
+
+        Every state, on purpose - see `live_candidates`. A key is spent the moment
+        a candidate carrying it exists, whatever became of that candidate: fired,
+        cancelled by hand, or expired unspoken. "It has been quiet too long" is one
+        observation, and a version that retries is an alarm clock.
+
+        The key lives in `payload` rather than a column only because
+        `daemon/memory/schema.sql` is frozen; a column with a unique index is the
+        better shape whenever v5 opens.
+        """
+        if not keys:
+            return set()
+        placeholders = ",".join("?" * len(keys))
+        rows = self.conn.execute(
+            "SELECT json_extract(payload, '$.dedup') AS dedup FROM proactive_candidates "
+            f"WHERE json_extract(payload, '$.dedup') IN ({placeholders})",
+            tuple(keys),
+        ).fetchall()
+        return {row["dedup"] for row in rows}
+
+    # --- M3: what the generators read ---------------------------------------
+    # `session_kind IN ('interactive', 'voice')` in all three is load-bearing, not
+    # hygiene: without it one proactive utterance resets the silence clock, and
+    # speaking becomes its own excuse to stop noticing the silence.
+    #
+    # Bounds are rendered with `utc_iso`, never `to_iso`. `messages.ts` is written
+    # at second precision, and as strings "...T12:00:00Z" > "...T12:00:00.000Z"
+    # because 'Z' > '.', so a millisecond bound silently drops a row sitting
+    # exactly on it.
+
+    def last_conversation_at(self) -> datetime | None:
+        """When the user and the daemon last actually talked."""
+        row = self.conn.execute(
+            "SELECT MAX(ts) AS ts FROM messages WHERE session_kind IN ('interactive', 'voice')"
+        ).fetchone()
+        return None if row["ts"] is None else from_iso(row["ts"])
+
+    def conversation_between(self, start: datetime, end: datetime) -> list[sqlite3.Row]:
+        """Conversation in a window, inclusive at both ends, in reading order."""
+        return self.conn.execute(
+            "SELECT * FROM messages WHERE session_kind IN ('interactive', 'voice') "
+            "AND ts >= ? AND ts <= ? ORDER BY ts ASC, id ASC",
+            (utc_iso(start), utc_iso(end)),
+        ).fetchall()
+
+    def conversation_times(self, since: datetime) -> list[datetime]:
+        """Just the timestamps. `pattern_time` reads two months of them to learn
+        which hours this person talks in, and wants none of the text."""
+        rows = self.conn.execute(
+            "SELECT ts FROM messages WHERE session_kind IN ('interactive', 'voice') "
+            "AND ts >= ? ORDER BY ts ASC",
+            (utc_iso(since),),
+        ).fetchall()
+        return [from_iso(row["ts"]) for row in rows]
+
+    # --- M3: what was actually said -----------------------------------------
+
+    def insert_utterance(
+        self,
+        *,
+        utterance_id: str,
+        candidate_id: int | None,
+        kind: str,
+        text: str,
+        route: str,
+        gate_snapshot: str,
+        now: datetime,
+    ) -> None:
+        """Record one proactive utterance. `utterance_id` is a uuid the label
+        button echoes back, so it is chosen by the caller rather than by sqlite."""
+        self.conn.execute(
+            "INSERT INTO proactive_utterances "
+            "(id, candidate_id, kind, text, spoken_at, route, gate_snapshot) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (utterance_id, candidate_id, kind, text, utc_iso(now), route, gate_snapshot),
+        )
+        self.conn.commit()
+
+    def last_utterance_at(self) -> datetime | None:
+        """When it last spoke first, of any kind - the cooldown's input."""
+        row = self.conn.execute(
+            "SELECT spoken_at FROM proactive_utterances ORDER BY spoken_at DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else from_iso(row["spoken_at"])
+
+    def utterances_since(self, *, since: datetime) -> list[sqlite3.Row]:
+        """Everything spoken since `since`, newest first.
+
+        The budget is per *local* day while `spoken_at` is UTC, so the caller
+        passes the local day's start converted to UTC rather than this method
+        trying to know which day it is - the same reason `messages_for_day`
+        filters on `log_file`.
+        """
+        return self.conn.execute(
+            "SELECT * FROM proactive_utterances WHERE spoken_at >= ? ORDER BY spoken_at DESC",
+            (utc_iso(since),),
+        ).fetchall()
+
+    def label_utterance(self, utterance_id: str, label: str, *, now: datetime) -> bool:
+        """Record the user's verdict. Returns whether the row existed.
+
+        This is the label clock (docs/PLAN.md 8.1): tuning proactivity needs weeks
+        of real "that was good" / "that was annoying", and no amount of thinking
+        substitutes for it.
+        """
+        cursor = self.conn.execute(
+            "UPDATE proactive_utterances SET label = ?, labeled_at = ? WHERE id = ?",
+            (label, utc_iso(now), utterance_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def mark_responded(self, utterance_id: str) -> None:
+        """The user replied to it, which is a label nobody had to press."""
+        self.conn.execute(
+            "UPDATE proactive_utterances SET responded = 1 WHERE id = ?", (utterance_id,)
+        )
+        self.conn.commit()
+
+    def label_counts(self) -> dict[str, int]:
+        """`good` / `bad` / `unlabeled` / `responded`. What `daemon doctor` prints,
+        because "is it a stalker or a dead bot" is the M3 gate and it is not
+        answerable from a log line."""
+        rows = self.conn.execute(
+            "SELECT COALESCE(label, 'unlabeled') AS verdict, COUNT(*) AS n "
+            "FROM proactive_utterances GROUP BY verdict"
+        ).fetchall()
+        counts = {row["verdict"]: int(row["n"]) for row in rows}
+        responded = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM proactive_utterances WHERE responded = 1"
+        ).fetchone()
+        counts["responded"] = int(responded["n"])
+        return counts
 
     # --- M2: what reflection reads ------------------------------------------
 

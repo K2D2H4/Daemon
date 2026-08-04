@@ -61,7 +61,7 @@ import math
 import re
 import sqlite3
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 
@@ -206,6 +206,28 @@ class MemoryRecall:
         if not keyword and not vector:
             return curated
 
+        top = self._score(keyword, vector, decay=True)[:limit]
+        # Messages only. A curated entry is reflection's own output, so marking it
+        # would mean nothing to the hygiene rule this serves (docs/PLAN.md 4.2 rule
+        # 2, which guards `messages_for_day` against re-extracting what was already
+        # injected) - and `memory_entries` has no such column.
+        self._store.mark_recalled([message_id for _, message_id, _ in top])
+        return [item for _, _, item in top] + curated
+
+    def _score(
+        self,
+        keyword: dict[int, float],
+        vector: dict[int, float],
+        *,
+        decay: bool,
+        older_than: datetime | None = None,
+    ) -> list[tuple[float, int, RecalledItem]]:
+        """Lane hits turned into scored items, best first.
+
+        `decay=False` and `older_than` exist for `associate`, which wants what
+        recency decay is there to bury. Shared with `search` so the two cannot
+        drift in how a hit becomes an item - only in how it is ranked.
+        """
         rows = self._store.messages_by_ids(list(keyword.keys() | vector.keys()))
         now = self._now or clock_now()
         scored: list[tuple[float, int, RecalledItem]] = []
@@ -213,7 +235,10 @@ class MemoryRecall:
             kw = keyword.get(message_id, 0.0)
             vec = vector.get(message_id, 0.0)
             ts = from_iso(row["ts"])
-            score = (kw + vec) * _decay(ts, now, self._half_life_days) * _importance(row)
+            if older_than is not None and ts >= older_than:
+                continue
+            recency = _decay(ts, now, self._half_life_days) if decay else 1.0
+            score = (kw + vec) * recency * _importance(row)
             if score <= 0:
                 continue
             scored.append(
@@ -232,17 +257,45 @@ class MemoryRecall:
                     ),
                 )
             )
-
         # id descending breaks score ties towards the newer message, which is the
         # same preference the decay expresses at coarser resolution.
         scored.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
-        top = scored[:limit]
-        # Messages only. A curated entry is reflection's own output, so marking it
-        # would mean nothing to the hygiene rule this serves (docs/PLAN.md 4.2 rule
-        # 2, which guards `messages_for_day` against re-extracting what was already
-        # injected) - and `memory_entries` has no such column.
-        self._store.mark_recalled([message_id for _, message_id, _ in top])
-        return [item for _, _, item in top] + curated
+        return scored
+
+    async def associate(
+        self, query: str, *, limit: int = 3, min_age_days: float = 30.0
+    ) -> list[RecalledItem]:
+        """Old memories strongly connected to `query` - PLAN 6.1's type E.
+
+        A separate entry point rather than a flag on `search`, because `search` is
+        wrong for this twice and both are load-bearing:
+
+        1. **It multiplies by recency decay.** At a 30-day half-life a
+           three-month-old memory arrives at 0.125x, so the items type E is
+           looking for are exactly the ones the scoring exists to bury. Here decay
+           is off and `min_age_days` is a *floor*: anything recent is excluded,
+           because a memory from this morning is not an association, it is the
+           conversation.
+        2. **It calls `mark_recalled`.** That is right for a turn - the hygiene rule
+           in PLAN 4.2 stops reflection re-extracting what the model was just
+           shown. It is wrong from a five-minute background tick, which shows
+           nobody anything: those rows would be flagged as already-seen and
+           `messages_for_day` would drop them from reflection **permanently**. A
+           generator that silently starves the reflection pass is worse than an
+           absent one, which is why type E shipped as silence until this existed.
+
+        Makes no model call beyond the embedder, same as Lane 1.
+        """
+        if not query.strip():
+            return []
+        pool = max(limit * 8, 40)
+        keyword = self._keyword_lane(query, pool)
+        vector = await self._vector_lane(query, pool)
+        if not keyword and not vector:
+            return []
+        cutoff = (self._now or clock_now()) - timedelta(days=min_age_days)
+        scored = self._score(keyword, vector, decay=False, older_than=cutoff)
+        return [item for _, _, item in scored[:limit]]
 
     # --- the curated tier (docs/PLAN.md 4.1 layer 2) -------------------------
 

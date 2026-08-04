@@ -68,6 +68,13 @@ WIRED_CLASSES = (
     "Reflection",
     "CuratedMemory",
     "EntityNotes",
+    # M3a, the deterministic half. Reachable because `daemon proactive` runs the
+    # same tick the 05-minute job will - a scheduled job nobody can run by hand is
+    # a job nobody can verify, and that is doubly true of one whose whole purpose
+    # is to decide *not* to do something.
+    "ProactiveTick",
+    "Gate",
+    "MachinePresence",
 )
 
 

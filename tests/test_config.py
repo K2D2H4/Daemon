@@ -349,3 +349,67 @@ def test_the_chosen_provider_answers_the_hosted_tasks(provider: str) -> None:
     # The five-minute proactive check stays local whatever was chosen: it runs
     # whether or not it ever speaks, so hosted cost would accumulate for nothing.
     assert settings.routing[Task.PROACTIVE_JUDGE] == "ollama"
+
+
+# --- proactivity brakes (M3) ------------------------------------------------
+# Every one of these settings makes it speak *less*, so a value that cannot be
+# understood has to fail here rather than at 03:00.
+
+
+def test_quiet_hours_that_are_not_a_range_fail_at_startup() -> None:
+    """The gate's honest answer to an unparseable window is to block everything,
+    which would turn the product off by typo and keep it off. Loud beats degraded.
+    """
+    with pytest.raises(ConfigError, match="DAEMON_PROACTIVE_QUIET_HOURS"):
+        make_settings(preset="offline", proactive_quiet_hours="11pm to 9am")
+
+
+def test_an_impossible_hour_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_PROACTIVE_QUIET_HOURS"):
+        make_settings(preset="offline", proactive_quiet_hours="25:00-09:00")
+
+
+def test_the_default_quiet_window_wraps_midnight() -> None:
+    """Wrapping is the ordinary case for this setting, not the edge case."""
+    settings = make_settings(preset="offline")
+    assert settings.proactive_quiet_hours == "23:00-09:00"
+
+
+def test_an_empty_quiet_window_is_allowed() -> None:
+    assert make_settings(preset="offline", proactive_quiet_hours="").proactive_quiet_hours == ""
+
+
+def test_an_open_loop_budget_above_the_daily_budget_fails_at_startup() -> None:
+    """The sub-cap exists to hold open loops *below* the overall budget; above it
+    the setting reads as a cap while capping nothing (docs/PLAN.md 6.2)."""
+    with pytest.raises(ConfigError, match="DAEMON_PROACTIVE_OPEN_LOOP_BUDGET"):
+        make_settings(preset="offline", proactive_daily_budget=3, proactive_open_loop_budget=5)
+
+
+def test_a_negative_budget_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_PROACTIVE_DAILY_BUDGET"):
+        make_settings(preset="offline", proactive_daily_budget=-1)
+
+
+def test_a_zero_silence_threshold_fails_at_startup() -> None:
+    """At zero every tick is a silence candidate, which is the stalker end of the
+    failure the M3 gate is judged on."""
+    with pytest.raises(ConfigError, match="DAEMON_PROACTIVE_SILENCE_HOURS"):
+        make_settings(preset="offline", proactive_silence_hours=0)
+
+
+def test_proactivity_and_the_speaker_are_off_by_default() -> None:
+    """Two separate switches, both off. An ignored notification costs nothing and a
+    voice in a meeting is an accident, so the speaker is not implied by turning
+    proactivity on (docs/PLAN.md 6.4)."""
+    settings = make_settings(preset="offline")
+    assert settings.proactive_enabled is False
+    assert settings.proactive_speaker_enabled is False
+
+
+def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:
+    """Zero is a legitimate answer - keep generating candidates, never speak - and
+    is how someone tunes it down without losing the label history."""
+    assert make_settings(
+        preset="offline", proactive_daily_budget=0, proactive_open_loop_budget=0
+    ).proactive_daily_budget == 0

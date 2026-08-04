@@ -65,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
     reflect.add_argument(
         "--force", action="store_true", help="redo a day that already has an artifact"
     )
+    sub.add_parser(
+        "proactive",
+        help="run one proactivity round now and print what it would say (it does not speak)",
+    )
 
     sub.add_parser("voice", help="hold one spoken conversation at this machine")
 
@@ -112,6 +116,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         inserted = _reindex(settings)
         print(f"reindexed {inserted} message(s) the mirror was missing")
         return OK
+    if command == "proactive":
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+        return asyncio.run(_proactive(settings))
     if command == "reflect":
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
         return asyncio.run(_reflect(settings, date=args.date, force=args.force))
@@ -232,6 +239,61 @@ def _reindex(settings: Settings) -> int:
         return inserted
     finally:
         store.close()
+
+
+async def _proactive(settings: Settings) -> int:
+    """One tick, printed. This is how the deterministic half gets checked.
+
+    It does not speak - M3a stops at the gate on purpose (docs/PLAN.md 6.4: do not
+    turn the voice on without the gate). What it prints is the reading the probes
+    took, every candidate that was due, and which rule allowed or blocked each one.
+    A gate whose verdicts nobody has read is not a gate anyone should trust with a
+    speaker.
+    """
+    from daemon.app import DB_FILENAME
+    from daemon.fs import harden_existing
+    from daemon.memory.store import Store
+    from daemon.proactivity.presence import MachinePresence
+    from daemon.proactivity.tick import ProactiveTick
+
+    harden_existing(settings.data_dir)
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    try:
+        result = await ProactiveTick(store, settings, MachinePresence()).run()
+    finally:
+        store.close()
+
+    reading = result.reading
+    idle = "unknown" if reading.idle_seconds is None else f"{reading.idle_seconds:.0f}s"
+    audio = {True: "busy", False: "free", None: "unknown"}[reading.audio_busy]
+    print(
+        f"presence: idle {idle} · app {reading.foreground_app or 'unknown'} · audio {audio}"
+    )
+    for reason in reading.unknown:
+        print(f"  ! {reason}")
+
+    if result.disabled:
+        print("\nproactivity is off (DAEMON_PROACTIVE_ENABLED=true to turn it on).")
+        print("Nothing was generated, so switching it on later starts from today.")
+        return OK
+
+    print(f"\ngenerated {result.generated} new candidate(s), expired {result.expired}")
+    if not result.considered:
+        print("nothing is due. That is the default and usually the right answer.")
+        return OK
+
+    for item in result.considered:
+        mark = "SPEAK" if item.verdict.allowed else "  -  "
+        where = f" -> {item.verdict.delivery}" if item.verdict.allowed else ""
+        print(f"\n[{mark}] {item.candidate.kind}{where}")
+        print(f"        why : {item.verdict.why}")
+        print(f"        said: {item.candidate.reason}")
+    blocked = result.blocked_by
+    if blocked:
+        print("\nblocked by: " + " · ".join(f"{rule} x{n}" for rule, n in sorted(blocked.items())))
+    if result.allowed:
+        print(f"\n{len(result.allowed)} would have been spoken. M3b decides what to say.")
+    return OK
 
 
 async def _reflect(settings: Settings, *, date: str | None, force: bool) -> int:
