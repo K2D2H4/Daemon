@@ -28,6 +28,7 @@ from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop, ResolveId
 from daemon.memory.base import MemoryWriter, Recall
+from daemon.proactivity.tick import ProactiveTick
 from daemon.reflection import Reflection
 from daemon.tasks import Task
 
@@ -40,6 +41,11 @@ PROBLEM = 1
 DB_FILENAME = "daemon.sqlite3"
 """Lives inside the data dir. Deleting it must never lose user data - the
 markdown log is the original (CONTRACTS.md non-negotiable 1)."""
+
+PROACTIVE_TICK_MINUTES = 5
+"""docs/PLAN.md 6.1's tick. Deterministic work only, unless a candidate is due and
+passes the gate - so the cost of the interval is a few sqlite reads and three
+subprocess probes, not a model call."""
 
 REFLECT_HOUR = 4
 """Local hour for the nightly pass. Late enough that the day is over, early enough
@@ -113,6 +119,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         coalesce=True,
         misfire_grace_time=None,
     )
+    if settings.proactive_enabled:
+        # Registered only when the user asked for it. A job that wakes every five
+        # minutes to decide against speaking is cheap but not free, and its absence
+        # is a clearer statement of "off" than a disabled job that still fires.
+        scheduler.add_job(
+            _proactive_tick,
+            "interval",
+            minutes=PROACTIVE_TICK_MINUTES,
+            args=[settings],
+            id="proactivity",
+            max_instances=1,
+            coalesce=True,
+            # A laptop that was asleep must not fire the ticks it missed: the
+            # candidates are still there and the gate would say the same thing, so
+            # the only effect would be several rounds of judging in one second.
+            misfire_grace_time=60,
+        )
     scheduler.start()
     app.state.scheduler = scheduler
 
@@ -246,14 +269,45 @@ class _IO:
     """Held only so the lifespan can close its HTTP client on shutdown."""
 
 
+def _build_channel(settings: Settings, store: Any) -> Channel:
+    """The one place the concrete channel is constructed.
+
+    Shared by the conversation loop and the proactivity tick so the two cannot end
+    up with different allowlists or different pairing policies - "who may talk to
+    Daemon" and "who Daemon speaks to unprompted" are the same person, and two
+    construction sites is how they would quietly stop being.
+    """
+    from daemon.channels.pairing import Pairing
+    from daemon.channels.telegram import TelegramChannel
+
+    # Pairing by default: on a first run the env allowlist is empty, and in
+    # `allowlist` mode that refuses to start - correct as a policy, useless as an
+    # onboarding step. The owner's id is captured from their first message instead
+    # of transcribed by hand.
+    pairing = (
+        Pairing(store, TelegramChannel.name)
+        if settings.telegram_dm_policy == "pairing"
+        else None
+    )
+    return TelegramChannel(
+        settings.telegram_bot_token,
+        settings.telegram_allowed_user_ids,
+        cursor=store,
+        dm_policy=settings.telegram_dm_policy,
+        pairing=pairing,
+        # Without this a 👍 press is received, authorised, and then dropped with an
+        # error - so the label clock (docs/PLAN.md 8.1) reads as "the owner never
+        # labels anything" and M3's own gate has nothing to measure.
+        labels=store,
+    )
+
+
 def _build_io(settings: Settings) -> _IO:
     """Wire the concrete channel, memory writer and recall, plus their teardown.
 
     TelegramChannel raises on an empty token or an empty allowlist, so those
     checks are deliberately not repeated here.
     """
-    from daemon.channels.pairing import Pairing
-    from daemon.channels.telegram import TelegramChannel
     from daemon.fs import harden_existing
     from daemon.memory.reindex import reindex
     from daemon.memory.store import Store
@@ -274,18 +328,7 @@ def _build_io(settings: Settings) -> _IO:
     # `allowlist` mode that refuses to start - correct as a policy, useless as an
     # onboarding step. The owner's id is captured from their first message
     # instead of transcribed by hand.
-    pairing = (
-        Pairing(store, TelegramChannel.name)
-        if settings.telegram_dm_policy == "pairing"
-        else None
-    )
-    channel = TelegramChannel(
-        settings.telegram_bot_token,
-        settings.telegram_allowed_user_ids,
-        cursor=store,
-        dm_policy=settings.telegram_dm_policy,
-        pairing=pairing,
-    )
+    channel = _build_channel(settings, store)
     recall, recall_status, embedder = _build_recall(settings, store)
     writer = FileMemoryWriter(settings.data_dir, store)
     return _IO(
@@ -376,6 +419,83 @@ def _build_recall(settings: Settings, store: Any) -> tuple[Recall | None, str, A
         return None, f"unavailable: {exc}", None
 
 
+async def build_proactive_tick(
+    settings: Settings, *, speak: bool = False
+) -> tuple[ProactiveTick, Callable[[], Awaitable[None]]]:
+    """A tick and the coroutine that releases what it holds.
+
+    `speak=False` assembles only the deterministic half: no gateway, no channel, no
+    speaker, and therefore no possibility of an utterance. That is not a debugging
+    convenience - PLAN 6.4 asks for the gate to be trustworthy *before* anything is
+    wired to a speaker, and a mode where speaking is structurally impossible is a
+    stronger statement of that than a flag checked at the end.
+
+    The speaker is built only when the user asked for it *and* the platform can do
+    it. Everything else degrades to Telegram, which is the safe direction.
+    """
+    from daemon.fs import harden_existing
+    from daemon.memory.store import Store
+    from daemon.proactivity.presence import MachinePresence
+
+    harden_existing(settings.data_dir)
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    closers: list[Callable[[], Awaitable[None]]] = []
+
+    judge = None
+    delivery = None
+    if speak:
+        from daemon.memory.writer import FileMemoryWriter
+        from daemon.proactivity.delivery import ProactiveDelivery
+        from daemon.proactivity.judge import Judge
+
+        providers = _build_providers(settings)
+        gateway = LLMGateway(
+            providers, settings.routing_table(), fallback=settings.fallback_route()
+        )
+        judge = Judge(gateway, data_dir=settings.data_dir)
+
+        channel = None
+        try:
+            channel = _build_channel(settings, store)
+        except Exception as exc:  # noqa: BLE001 - a missing token must not stop the tick
+            # Loud, and then Telegram simply is not a route. The gate still runs and
+            # the local speaker may still work, which is more than nothing.
+            logger.error("proactive: no channel, so nothing can be delivered there: %s", exc)
+
+        speaker = None
+        if settings.proactive_speaker_enabled:
+            from daemon.proactivity.speaker import LocalSpeaker
+
+            speaker = LocalSpeaker()
+            closers.append(speaker.aclose)
+
+        delivery = ProactiveDelivery(
+            store,
+            FileMemoryWriter(settings.data_dir, store),
+            channel=channel,
+            speaker=speaker,
+        )
+        if channel is not None:
+            closers.append(channel.close)
+        for provider in providers.values():
+            closer = getattr(provider, "aclose", None)
+            if closer is not None:
+                closers.append(closer)
+
+    async def close() -> None:
+        store.close()
+        for closer in closers:
+            with suppress(Exception):
+                await closer()
+
+    return (
+        ProactiveTick(
+            store, settings, MachinePresence(), judge=judge, delivery=delivery
+        ),
+        close,
+    )
+
+
 async def build_reflection(settings: Settings) -> tuple[Reflection, Callable[[], Awaitable[None]]]:
     """A `Reflection` and the coroutine that releases what it holds.
 
@@ -402,6 +522,47 @@ async def build_reflection(settings: Settings) -> tuple[Reflection, Callable[[],
                     await closer()
 
     return Reflection(settings.data_dir, store, gateway), close
+
+
+async def _proactive_tick(settings: Settings) -> None:
+    """The five-minute round. Catches everything, for the same reason the reflection
+    tick does: a job that raises inside APScheduler is logged once and then the
+    schedule carries on, which reads as a working loop that has silently decided
+    nothing for a month.
+
+    Logged at INFO even when nothing happened, because "it stayed silent" is the
+    output people need to be able to check.
+    """
+    try:
+        tick, close = await build_proactive_tick(settings, speak=True)
+    except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
+        logger.error("proactive tick could not start: %s", exc)
+        return
+    try:
+        result = await tick.run()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("proactive tick failed: %s", exc)
+        return
+    finally:
+        with suppress(Exception):
+            await close()
+
+    spoken = next((item for item in result.considered if item.delivered), None)
+    if spoken is not None and spoken.utterance is not None:
+        logger.info(
+            "proactive: spoke (%s via %s): %s",
+            spoken.candidate.kind,
+            spoken.delivered.route if spoken.delivered else "?",
+            spoken.utterance.text,
+        )
+        return
+    logger.info(
+        "proactive: silent - %d generated, %d considered, %d declined, blocked %s",
+        result.generated,
+        len(result.considered),
+        result.declined,
+        result.blocked_by or "nothing",
+    )
 
 
 async def _reflect_tick(settings: Settings) -> None:

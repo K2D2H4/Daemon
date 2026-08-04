@@ -393,14 +393,36 @@ def test_the_budget_rule_works_against_the_real_store(db: sqlite3.Connection) ->
 # --- audio, and the foreground app -------------------------------------------
 
 
-def test_audio_in_use_blocks_entirely() -> None:
-    """The clearest do-not-interrupt signal the machine has: the user is on a call.
-    Waiting costs nothing, since the candidate is still there next tick."""
+def test_audio_in_use_costs_the_speaker_not_the_utterance() -> None:
+    """Changed after running it. The original reading was that a busy audio device
+    means a call in progress and waiting is free, so it blocked outright.
+
+    The probe is `kAudioDevicePropertyDeviceIsRunningSomewhere`, which is equally
+    true for a notification chime, an autoplaying video, or a system-wide audio EQ
+    holding the device all day - one was installed on the development machine, and
+    the gate silenced everything. Someone who plays music would never be messaged,
+    which is the dead-bot end of the failure the M3 gate is judged on.
+
+    PLAN 6.4 already names the safe channel: the text notification is ignorable and
+    the voice is the accident. So this routes, exactly like the foreground app.
+    """
     busy = Reading(at=NOW, idle_seconds=12.0, foreground_app="Terminal", audio_busy=True)
+
     verdict = gate_for().judge(EMOTIONAL, busy, now=NOW)
 
-    assert not verdict.allowed
-    assert "audio busy" in verdict.why
+    assert verdict.allowed
+    assert verdict.delivery == "telegram"
+    assert "audio device in use" in verdict.why
+
+
+def test_an_unknown_audio_state_also_costs_only_the_speaker() -> None:
+    """Anything short of "provably free" keeps us off the device we would grab."""
+    unsure = Reading(at=NOW, idle_seconds=12.0, foreground_app="Terminal", audio_busy=None)
+
+    verdict = gate_for().judge(EMOTIONAL, unsure, now=NOW)
+
+    assert verdict.allowed
+    assert verdict.delivery == "telegram"
 
 
 def test_a_free_audio_device_does_not_block() -> None:

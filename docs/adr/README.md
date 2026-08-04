@@ -19,6 +19,7 @@ says "measured" was checked against the real thing, and the number is in the fil
 | [0005](0005-vectors-belong-in-m1b.md) | The vector index moved into M1b | accepted |
 | [0006](0006-reachability-and-acceptance-gates.md) | Reachability and acceptance are required gates | accepted |
 | [0007](0007-no-default-hosted-provider.md) | The hosted provider has no default | accepted |
+| [0008](0008-three-stages-one-model-call.md) | Proactivity is three stages, one model call | accepted |
 
 ## Format
 

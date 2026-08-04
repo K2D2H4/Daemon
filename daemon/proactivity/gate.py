@@ -173,11 +173,6 @@ class Gate:
         if budget is not None:
             return self._blocked(budget, reading)
 
-        # Only `True` blocks. `None` means the probe could not answer, which is not
-        # evidence of a call - it costs the speaker below, not the utterance.
-        if reading.audio_busy is True:
-            return self._blocked("audio busy: another process holds the audio device", reading)
-
         delivery, downgrade = self._route(reading)
         why = "ok" if downgrade is None else f"ok - telegram: {downgrade}"
         return Verdict(allowed=True, why=why, reading=reading, delivery=delivery)
@@ -252,9 +247,24 @@ class Gate:
             return "telegram", f"presence unknown ({', '.join(reading.unknown) or 'no reading'})"
         if not at_keyboard:
             return "telegram", f"user away, idle {reading.idle_seconds:.0f}s"
-        if reading.audio_busy is None:
-            # Unlike the foreground app, this is the very device we would grab.
-            return "telegram", "audio device state unknown"
+        if reading.audio_busy is not False:
+            # Both `True` and `None` cost the speaker and nothing else - this is
+            # the device we would grab, so anything short of "provably free" is a
+            # reason not to.
+            #
+            # `True` used to block the utterance outright, on the reading that a
+            # busy audio device means a call in progress and waiting is free.
+            # Running it disproved the premise: the probe is
+            # `kAudioDevicePropertyDeviceIsRunningSomewhere`, which is also true
+            # for a notification chime, an autoplaying video, or - observed on the
+            # development machine - a system-wide audio EQ holding the device all
+            # day. Blocking on that means someone who plays music is never
+            # messaged at all, which is the dead-bot end of the failure PLAN 6.1's
+            # gate is judged on. PLAN 6.4 already says which channel is safe: the
+            # text notification is ignorable, the voice is the accident. So this
+            # routes, exactly like the foreground app.
+            state = "in use" if reading.audio_busy else "state unknown"
+            return "telegram", f"audio device {state}"
         if focus_app(reading.foreground_app) is not None:
             return "telegram", f"{reading.foreground_app} is in the foreground"
         return "both", None

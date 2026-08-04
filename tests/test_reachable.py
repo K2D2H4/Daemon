@@ -41,12 +41,13 @@ PENDING_PROVIDERS: dict[str, str] = {
 
 PENDING_TASKS = {
     Task.RECALL_ESCALATION: "M1b+ - Lane 2 is specified, Lane 1 ships first",
-    Task.PROACTIVE_JUDGE: "M3 - the whole point of M3",
     Task.PERSONA_RULE: "M4",
 }
 
-PENDING_CLASSES = {
-    "LocalSpeaker": "M3 - proactive speech at the machine (PLAN 6.3)",
+PENDING_CLASSES: dict[str, str] = {
+    # Empty. `LocalSpeaker` was the last entry and closing it is what M3b is: the
+    # thing that speaks at the machine now exists and `app.build_proactive_tick`
+    # constructs it.
 }
 
 WIRED_CLASSES = (
@@ -75,6 +76,10 @@ WIRED_CLASSES = (
     "ProactiveTick",
     "Gate",
     "MachinePresence",
+    # M3b: the one model call, the voice at the machine, and what records both.
+    "Judge",
+    "LocalSpeaker",
+    "ProactiveDelivery",
 )
 
 

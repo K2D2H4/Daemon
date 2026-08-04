@@ -25,7 +25,7 @@ import asyncio
 import contextlib
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -54,12 +54,18 @@ class Provider:
 
     name = "fake"
 
-    def __init__(self) -> None:
+    def __init__(self, reply: str = "좋네. 몇 시에 만나?") -> None:
         self.prompts: list[list[Message]] = []
+        self.reply = reply
+
+    @property
+    def calls(self) -> list[list[Message]]:
+        """Alias so a test can say "no model call happened" in those words."""
+        return self.prompts
 
     async def complete(self, messages: list[Message], *, model: str, **kw: Any) -> Completion:
         self.prompts.append(list(messages))
-        return Completion(text="좋네. 몇 시에 만나?", model=model)
+        return Completion(text=self.reply, model=model)
 
     async def health(self) -> bool:
         return True
@@ -423,3 +429,250 @@ def test_the_schema_features_the_storage_layer_relies_on_are_present() -> None:
     conn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
     conn.execute("CREATE TABLE s(a TEXT NOT NULL) STRICT")
     conn.execute("CREATE TABLE j(a TEXT, CHECK (json_valid(a)))")
+
+
+# --- the M3 gate, as a person would check it ---------------------------------
+
+
+async def test_it_speaks_first_and_the_utterance_can_be_labelled(tmp_path: Path) -> None:
+    """The M3 gate end to end: something the user said becomes a reason, the reason
+    survives the gate, one model call turns it into a sentence, the sentence reaches
+    the channel with a label button, and pressing that button lands a verdict.
+
+    Fakes stop at the network edge - the store, the generators, the gate, the tick
+    and the delivery are all real, because every defect this milestone found lived
+    between them.
+    """
+    from daemon.channels.base import OutboundMessage
+    from daemon.config import Settings
+    from daemon.memory.base import LoggedMessage
+    from daemon.proactivity.base import Reading
+    from daemon.proactivity.delivery import ProactiveDelivery
+    from daemon.proactivity.judge import Judge
+    from daemon.proactivity.tick import ProactiveTick
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        (tmp_path / "persona").mkdir(exist_ok=True)
+        (tmp_path / "persona" / "seed.md").write_text("짧고 담백하게 말한다.\n", encoding="utf-8")
+        writer = FileMemoryWriter(tmp_path, store)
+
+        # Yesterday, the user mentioned something with a time attached.
+        await writer.record(
+            LoggedMessage(
+                ts=datetime.now(UTC) - timedelta(hours=40),
+                role="user",
+                content="나 내일 오후에 팀 발표 있어. 좀 걱정된다.",
+                origin="owner",
+                session_kind="interactive",
+                modality="text",
+                channel="telegram",
+                sender_id=str(OWNER),
+            )
+        )
+
+        outbound: list[OutboundMessage] = []
+
+        class Channel:
+            name = "telegram"
+
+            async def send(self, message: OutboundMessage) -> None:
+                outbound.append(message)
+
+            def listen(self) -> Any:  # pragma: no cover - driven directly
+                raise NotImplementedError
+
+            async def close(self) -> None: ...
+
+        class Present:
+            async def read(self) -> Reading:
+                return Reading(
+                    at=datetime.now(UTC),
+                    idle_seconds=5.0,
+                    foreground_app="Terminal",
+                    audio_busy=False,
+                )
+
+        provider = Provider(reply='{"say": "발표 어떻게 됐어?"}')
+        settings = Settings(
+            _env_file=None,
+            preset="offline",
+            data_dir=tmp_path,
+            proactive_enabled=True,
+            proactive_quiet_hours="",
+        )
+        tick = ProactiveTick(
+            store,
+            settings,
+            Present(),
+            judge=Judge(
+                LLMGateway({"fake": provider}, {Task.PROACTIVE_JUDGE: Route("fake", "m")}),
+                data_dir=tmp_path,
+            ),
+            delivery=ProactiveDelivery(store, writer, channel=Channel()),
+        )
+
+        result = await tick.run()
+
+        assert result.generated, "nothing became a candidate from a real conversation"
+        assert result.spoke == 1, f"it stayed silent: {result.blocked_by}"
+
+        said = outbound[0]
+        assert said.text == "발표 어떻게 됐어?"
+        assert said.labelable and said.utterance_id, "the label clock cannot start"
+        # Unsolicited: no request to answer, so the channel picks its own owner.
+        assert said.recipient_id is None
+
+        # The tap a person makes.
+        assert store.label_utterance(said.utterance_id, "good", now=datetime.now(UTC))
+        assert store.label_counts()["good"] == 1
+
+        # And the daemon's own voice is not evidence for the next round.
+        assert store.last_conversation_at() is not None
+        latest = store.recent(1)[0]
+        assert latest["session_kind"] == "proactive"
+    finally:
+        store.close()
+
+
+async def test_it_stays_silent_when_the_gate_says_so(tmp_path: Path) -> None:
+    """The other half of the same gate, and the one that matters more: quiet hours
+    must cost no model call at all (docs/CONTRACTS.md 7)."""
+    from daemon.config import Settings
+    from daemon.memory.base import LoggedMessage
+    from daemon.proactivity.base import Reading
+    from daemon.proactivity.delivery import ProactiveDelivery
+    from daemon.proactivity.judge import Judge
+    from daemon.proactivity.tick import ProactiveTick
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        (tmp_path / "persona").mkdir(exist_ok=True)
+        (tmp_path / "persona" / "seed.md").write_text("짧게.\n", encoding="utf-8")
+        writer = FileMemoryWriter(tmp_path, store)
+        await writer.record(
+            LoggedMessage(
+                ts=datetime.now(UTC) - timedelta(hours=40),
+                role="user",
+                content="요즘 진짜 힘들다.",
+                origin="owner",
+                session_kind="interactive",
+                modality="text",
+                channel="telegram",
+                sender_id=str(OWNER),
+            )
+        )
+
+        class Away:
+            async def read(self) -> Reading:
+                return Reading(at=datetime.now(UTC), idle_seconds=9000.0, audio_busy=False)
+
+        provider = Provider()
+        tick = ProactiveTick(
+            store,
+            Settings(
+                _env_file=None,
+                preset="offline",
+                data_dir=tmp_path,
+                proactive_enabled=True,
+                proactive_quiet_hours="00:00-23:59",
+            ),
+            Away(),
+            judge=Judge(
+                LLMGateway({"fake": provider}, {Task.PROACTIVE_JUDGE: Route("fake", "m")}),
+                data_dir=tmp_path,
+            ),
+            delivery=ProactiveDelivery(store, writer),
+        )
+
+        result = await tick.run()
+
+        assert result.spoke == 0
+        assert result.blocked_by, "it was allowed during quiet hours"
+        assert provider.calls == [], "a blocked candidate still cost a model call"
+        assert store.utterances_since(since=datetime.now(UTC) - timedelta(hours=1)) == []
+    finally:
+        store.close()
+
+
+async def test_a_label_press_lands_through_the_channel_the_app_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole label path, through `app._build_channel` rather than a channel this
+    test constructed.
+
+    Written because a mutation exposed a hole: deleting `labels=store` from
+    `_build_channel` broke nothing in 1,120 tests. Every piece was covered - the
+    button is attached, the press is authorised, the verdict is stored - and the
+    assembled app dropped the press with an error, so the label clock would have
+    read as "the owner never labels anything". That is this project's signature
+    defect (`docs/CONTRACTS.md`, Testing), and a constructor argument is exactly the
+    kind of wiring `tests/test_reachable.py` cannot see.
+    """
+    from daemon import app as daemon_app
+    from daemon.config import Settings
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        store.insert_utterance(
+            utterance_id="u-1",
+            candidate_id=None,
+            kind="open_loop",
+            text="발표 어떻게 됐어?",
+            route="telegram",
+            gate_snapshot="{}",
+            now=datetime.now(UTC),
+        )
+        api = FakeTelegram(
+            [
+                [
+                    {
+                        "update_id": 1,
+                        "callback_query": {
+                            "id": "q-1",
+                            "from": {"id": OWNER},
+                            "data": "label:up:u-1",
+                        },
+                    }
+                ]
+            ]
+        )
+        # The real class captured first: a lambda that calls `httpx.AsyncClient`
+        # after patching that same name recurses into itself.
+        real_client = httpx.AsyncClient
+        monkeypatch.setattr(
+            httpx,
+            "AsyncClient",
+            lambda *a, **k: real_client(transport=httpx.MockTransport(api.handler)),
+        )
+        settings = Settings(
+            _env_file=None,
+            preset="offline",
+            data_dir=tmp_path,
+            telegram_bot_token=TOKEN,
+            telegram_allowed_user_ids=(str(OWNER),),
+            telegram_dm_policy="allowlist",
+        )
+        channel = daemon_app._build_channel(settings, store)
+
+        async def drain() -> None:
+            async for _ in channel.listen():
+                pass
+
+        task = asyncio.create_task(drain())
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if store.label_counts().get("good"):
+                break
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await channel.close()
+
+        assert store.label_counts()["good"] == 1, (
+            "the press never reached storage - `labels=` is probably not wired"
+        )
+        answered = [c for c in api.sent if "callback_query_id" in c]
+        assert answered, "Telegram was left with a spinner on the button"
+    finally:
+        store.close()

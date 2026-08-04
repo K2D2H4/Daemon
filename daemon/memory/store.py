@@ -880,6 +880,32 @@ class Store:
         )
         self.conn.commit()
 
+    def set_utterance_route(self, utterance_id: str, route: str) -> None:
+        """Correct the route to what delivery actually achieved.
+
+        The row is written *before* sending so the id on the label button resolves
+        the moment it is pressed, which means the route stored at that point is the
+        intended one. A speaker that failed while Telegram succeeded turns `both`
+        into `telegram`, and the snapshot has to say what happened rather than what
+        was planned.
+        """
+        self.conn.execute(
+            "UPDATE proactive_utterances SET route = ? WHERE id = ?", (route, utterance_id)
+        )
+        self.conn.commit()
+
+    def delete_utterance(self, utterance_id: str) -> None:
+        """Remove a row for an utterance that was never delivered.
+
+        Deliberate, and the one place this table is written destructively -
+        non-negotiable 6 makes `observations` append-only and says nothing about
+        this one, because these rows are a record of *what was said*. An utterance
+        that reached nobody was not said, and leaving the row would spend the day's
+        budget on silence and put an unlabelable message in the precision numbers.
+        """
+        self.conn.execute("DELETE FROM proactive_utterances WHERE id = ?", (utterance_id,))
+        self.conn.commit()
+
     def last_utterance_at(self) -> datetime | None:
         """When it last spoke first, of any kind - the cooldown's input."""
         row = self.conn.execute(

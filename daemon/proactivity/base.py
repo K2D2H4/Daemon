@@ -136,3 +136,56 @@ class Verdict:
             "delivery": self.delivery,
             **self.reading.as_snapshot(),
         }
+
+
+# --- stage 3: the one model call, and what carries it ------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Utterance:
+    """What the judge decided. `text` empty means it chose not to speak.
+
+    Declining is a first-class answer, not a failure. The model is asked what to
+    say about a specific reason at a moment already judged safe - and "nothing
+    worth saying" is the correct answer most of the time, so it has to be
+    expressible without an exception.
+    """
+
+    text: str = ""
+    why_not: str = ""
+    """Why it declined, for the log. Empty when it spoke."""
+
+    def __bool__(self) -> bool:
+        return bool(self.text.strip())
+
+
+@runtime_checkable
+class Judgement(Protocol):
+    """Stage 3. One model call, for a candidate that already passed the gate.
+
+    A seam so the tick does not import the judge: `daemon/proactivity/tick.py`
+    orchestrates and must stay testable without a gateway. The narrow signature is
+    the point - everything about *when* was decided before this is called, so the
+    only question left is what to say.
+    """
+
+    async def decide(self, candidate: Candidate) -> Utterance: ...
+
+
+@runtime_checkable
+class Speaker(Protocol):
+    """Says a line out loud at this machine.
+
+    A separate seam from `VoiceSession` and not a special case of it: PLAN 6.5
+    records that Live API has **no verbatim TTS path** - `realtimeInput.text` is a
+    prompt, so the model answers the text instead of reading it. Speaking a
+    sentence we already chose is therefore a local job, which is also why this
+    path leaves no data on the machine at all (PLAN 6.3).
+    """
+
+    async def say(self, text: str) -> bool:
+        """True if it was spoken. False - never an exception - if it could not be:
+        a failed utterance must not lose the Telegram copy that went with it."""
+        ...
+
+    async def aclose(self) -> None: ...

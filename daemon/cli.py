@@ -65,9 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
     reflect.add_argument(
         "--force", action="store_true", help="redo a day that already has an artifact"
     )
-    sub.add_parser(
+    proactive = sub.add_parser(
         "proactive",
-        help="run one proactivity round now and print what it would say (it does not speak)",
+        help="run one proactivity round now and print its verdicts (dry by default)",
+    )
+    proactive.add_argument(
+        "--speak",
+        action="store_true",
+        help="actually decide what to say and deliver it. Without this the round "
+        "stops at the gate and costs no model call.",
     )
 
     sub.add_parser("voice", help="hold one spoken conversation at this machine")
@@ -118,7 +124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return OK
     if command == "proactive":
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-        return asyncio.run(_proactive(settings))
+        return asyncio.run(_proactive(settings, speak=args.speak))
     if command == "reflect":
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
         return asyncio.run(_reflect(settings, date=args.date, force=args.force))
@@ -241,27 +247,25 @@ def _reindex(settings: Settings) -> int:
         store.close()
 
 
-async def _proactive(settings: Settings) -> int:
+async def _proactive(settings: Settings, *, speak: bool = False) -> int:
     """One tick, printed. This is how the deterministic half gets checked.
 
-    It does not speak - M3a stops at the gate on purpose (docs/PLAN.md 6.4: do not
-    turn the voice on without the gate). What it prints is the reading the probes
-    took, every candidate that was due, and which rule allowed or blocked each one.
-    A gate whose verdicts nobody has read is not a gate anyone should trust with a
-    speaker.
-    """
-    from daemon.app import DB_FILENAME
-    from daemon.fs import harden_existing
-    from daemon.memory.store import Store
-    from daemon.proactivity.presence import MachinePresence
-    from daemon.proactivity.tick import ProactiveTick
+    Without `--speak` it cannot speak at all: the tick is assembled with no judge
+    and no delivery, so there is no gateway, no channel and no speaker to reach.
+    That is the order PLAN 6.4 asks for - a gate whose verdicts nobody has read is
+    not a gate anyone should trust with a speaker - and it is also the cheapest way
+    to see why the daemon has been quiet, since it costs no model call.
 
-    harden_existing(settings.data_dir)
-    store = Store.open(settings.data_dir / DB_FILENAME)
+    What it prints either way: the reading the probes took, every candidate that was
+    due, and which rule allowed or blocked each one.
+    """
+    from daemon.app import build_proactive_tick
+
+    tick, closing = await build_proactive_tick(settings, speak=speak)
     try:
-        result = await ProactiveTick(store, settings, MachinePresence()).run()
+        result = await tick.run()
     finally:
-        store.close()
+        await closing()
 
     reading = result.reading
     idle = "unknown" if reading.idle_seconds is None else f"{reading.idle_seconds:.0f}s"
@@ -291,8 +295,15 @@ async def _proactive(settings: Settings) -> int:
     blocked = result.blocked_by
     if blocked:
         print("\nblocked by: " + " · ".join(f"{rule} x{n}" for rule, n in sorted(blocked.items())))
-    if result.allowed:
-        print(f"\n{len(result.allowed)} would have been spoken. M3b decides what to say.")
+    if result.declined:
+        print(f"\n{result.declined} allowed, and there was nothing worth saying.")
+        print("That is the default answer and usually the right one.")
+    if result.spoke:
+        said = next(item for item in result.considered if item.delivered)
+        print(f"\nspoke via {said.delivered.route}: {said.utterance.text}")
+        print(f"  label it with the buttons on the message (id {said.delivered.utterance_id})")
+    elif result.allowed and not speak:
+        print(f"\n{len(result.allowed)} would have been spoken. Add --speak to let it.")
     return OK
 
 
@@ -371,6 +382,7 @@ def _doctor() -> int:
             _data_dir_check(settings),
             _schema_check(settings),
             _memory_check(settings),
+            _proactivity_check(settings),
             *_ollama_checks(settings),
         ]
 
@@ -384,6 +396,70 @@ def _doctor() -> int:
         sys.stdout.flush()
         print(f"\n{failed} check(s) failed.", file=sys.stderr)
     return PROBLEM if failed else OK
+
+
+def _proactivity_check(settings: Settings) -> Check:
+    """Whether it is on, and what the labels say.
+
+    The label counts are the M3 gate itself - *"오답률·방해도가 허용 범위. 스토커도
+    죽은봇도 아니다"* is not answerable from a log line, and docs/PLAN.md 8.1 says
+    the label clock cannot be compressed: precision needs dozens of real presses
+    over weeks. Printing the tally here is what makes the weeks visible.
+    """
+    from daemon.app import DB_FILENAME
+    from daemon.memory.store import Store
+
+    if not settings.proactive_enabled:
+        return Check("proactivity", True, "off (DAEMON_PROACTIVE_ENABLED=true to turn it on)")
+
+    # A missing seed is a *blocker*, not a cosmetic gap: the judge declines every
+    # candidate without one rather than speaking as a generic assistant, so
+    # proactivity would look switched on and never say a word. Reported by the
+    # agent that wrote the judge, which could not reach this file.
+    seed = settings.data_dir / "persona" / "seed.md"
+    if not seed.exists() or not seed.read_text(encoding="utf-8").strip():
+        return Check(
+            "proactivity",
+            False,
+            f"on, but {seed} is empty or missing. Every candidate will be declined "
+            "rather than spoken in a generic voice - run `daemon setup` to write a "
+            "persona seed.",
+        )
+
+    speaker = "speaker on" if settings.proactive_speaker_enabled else "telegram only"
+    quiet = settings.proactive_quiet_hours or "no quiet window"
+    detail = (
+        f"on, {speaker} · budget {settings.proactive_daily_budget}/day "
+        f"({settings.proactive_open_loop_budget} open_loop) · quiet {quiet}"
+    )
+
+    path = settings.data_dir / DB_FILENAME
+    if not path.exists():
+        return Check("proactivity", True, f"{detail}\n         nothing spoken yet")
+    try:
+        store = Store.open(path)
+    except Exception as exc:  # noqa: BLE001 - doctor reports state, it does not die
+        return Check("proactivity", True, f"{detail}\n         labels unreadable ({exc})")
+    try:
+        counts = store.label_counts()
+        total = sum(n for verdict, n in counts.items() if verdict != "responded")
+        if not total:
+            return Check("proactivity", True, f"{detail}\n         nothing spoken yet")
+        good, bad = counts.get("good", 0), counts.get("bad", 0)
+        judged = good + bad
+        line = (
+            f"{total} spoken · {good} good, {bad} bad, "
+            f"{counts.get('unlabeled', 0)} unlabeled · {counts.get('responded', 0)} replied to"
+        )
+        if judged:
+            line += f" · precision {good / judged:.0%}"
+        else:
+            # Said plainly: an unlabelled history is not a good result, it is no
+            # result, and the tuning PLAN 6.2 defers to labels cannot start.
+            line += " · no labels yet, so precision is unknown"
+        return Check("proactivity", True, f"{detail}\n         {line}")
+    finally:
+        store.close()
 
 
 def _memory_check(settings: Settings) -> Check:
