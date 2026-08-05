@@ -8,6 +8,7 @@ that holds four assertions.
 from __future__ import annotations
 
 import os
+import pathlib
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
@@ -142,6 +143,80 @@ def test_voice_is_refused_while_disabled_even_when_routed() -> None:
 
     with pytest.raises(ConfigError, match="voice is off"):
         settings.route_for(Task.CHAT_VOICE)
+
+
+def test_a_blank_endpointing_value_means_the_server_default(tmp_path: Any) -> None:
+    """`KEY=` in a .env file is an empty *string*, not an absent key.
+
+    Goes through a real .env file rather than keyword arguments, because that is the
+    gap: `make_settings` passes native Python values, so 1457 tests never exercised
+    the dotenv text path that turns `KEY=` into `""` - and pydantic does not coerce
+    that to None for an `int | None`. A .env copied from .env.example, where these
+    ship blank on purpose, took the whole daemon down with `int_parsing`, and did it
+    as `pydantic.ValidationError` rather than `ConfigError` - so `daemon doctor`,
+    whose whole job is explaining the breakage, printed a traceback instead.
+    """
+    env = tmp_path / ".env"
+    env.write_text(
+        "DAEMON_HOSTED_PROVIDER=anthropic\n"
+        "ANTHROPIC_API_KEY=k\n"
+        "DAEMON_VOICE_START_SENSITIVITY=\n"
+        "DAEMON_VOICE_END_SENSITIVITY=\n"
+        "DAEMON_VOICE_PREFIX_PADDING_MS=\n"
+        "DAEMON_VOICE_SILENCE_DURATION_MS=\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=str(env))
+
+    assert settings.voice_prefix_padding_ms is None
+    assert settings.voice_silence_duration_ms is None
+    assert settings.voice_start_sensitivity == ""
+
+
+def test_the_voice_lines_shipped_in_the_example_env_load(tmp_path: Any) -> None:
+    """The example file exists to be copied, so the lines it ships have to survive
+    being read back as a .env - verbatim, not paraphrased into this test.
+
+    Only the voice block. `DAEMON_ROUTE_OVERRIDES=` in the same file has had the
+    identical empty-string problem since f97595b ("Wire M1a end to end"), where it
+    raises `SettingsError` on a `dict[Task, str]` - a pre-existing defect this change
+    did not cause and does not touch.
+    """
+    example = pathlib.Path(__file__).resolve().parents[1] / ".env.example"
+    voice_lines = [
+        line
+        for line in example.read_text(encoding="utf-8").splitlines()
+        if line.startswith("DAEMON_VOICE_")
+    ]
+    assert voice_lines, "the example file stopped shipping the voice settings"
+    env = tmp_path / ".env"
+    env.write_text(
+        "\n".join([*voice_lines, "DAEMON_HOSTED_PROVIDER=anthropic", "ANTHROPIC_API_KEY=k"]),
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=str(env))
+
+    assert settings.voice_silence_duration_ms is None
+    assert settings.voice_prefix_padding_ms is None
+
+
+def test_a_real_endpointing_value_still_arrives_as_a_number(tmp_path: Any) -> None:
+    """The blank-is-unset rule must not swallow a value someone actually set."""
+    env = tmp_path / ".env"
+    env.write_text(
+        "DAEMON_HOSTED_PROVIDER=anthropic\nANTHROPIC_API_KEY=k\n"
+        "DAEMON_VOICE_SILENCE_DURATION_MS=400\n"
+        "DAEMON_VOICE_PREFIX_PADDING_MS=0\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=str(env))
+
+    assert settings.voice_silence_duration_ms == 400
+    # Zero is a choice, not an absence.
+    assert settings.voice_prefix_padding_ms == 0
 
 
 def test_a_misspelled_speech_sensitivity_fails_at_startup() -> None:

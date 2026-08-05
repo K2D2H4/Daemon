@@ -826,6 +826,11 @@ async def _voice_attempts(
     """
     from daemon.voice.conversation import VoiceConversation
 
+    # Carried across attempts until something actually answers it. Dropping it on
+    # every reconnect would reopen the exact failure the opening exists to fix: an
+    # attempt cut down during the handshake never gets the utterance in front of a
+    # model, and the owner is back to saying the wake phrase twice.
+    pending_opening = opening_audio
     for attempt in range(1, VOICE_RECONNECT_ATTEMPTS + 1):
         session = new_session()
         conversation = VoiceConversation(
@@ -834,10 +839,7 @@ async def _voice_attempts(
             memory,
             recall=recall,
             recall_limit=settings.recall_limit,
-            # Only the first attempt: on a reconnect the utterance has already been
-            # delivered and answered, and sending it again would have the daemon
-            # answer the same question twice.
-            opening_audio=opening_audio if attempt == 1 else b"",
+            opening_audio=pending_opening,
         )
         failure: Exception | None = None
         try:
@@ -858,6 +860,13 @@ async def _voice_attempts(
             )
         if conversation.ended:
             logger.info("voice session ended: %s", conversation.ended)
+        if conversation.stats.played_seconds > 0:
+            # Something was said back, so the opening utterance has been answered.
+            # Re-sending it on a later attempt would have the daemon answer the same
+            # question twice.
+            pending_opening = b""
+        elif pending_opening:
+            logger.info("voice: the opening utterance was not answered; carrying it over")
 
         if failure is None and not getattr(session, "going_away", False):
             return OK

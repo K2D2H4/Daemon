@@ -293,8 +293,9 @@ class Settings(BaseSettings):
     )
     """Silence before a turn is over. The one number that trades response latency
     against being cut off mid-sentence, and the one worth measuring: 800 ms is the
-    server's default and `VoiceStats.response_seconds` is what says whether a lower
-    value cost anything."""
+    server's default, and `VoiceStats.first_audio_seconds` read against
+    `interruptions` is what says whether a lower value cost anything - fewer seconds
+    to the first answer is only a win if the count of interruptions did not move."""
 
     # --- the wake gate (daemon/voice/wake.py) -----------------------------
     # A voice session bills per minute, so an always-open one costs about 48x what
@@ -436,6 +437,30 @@ class Settings(BaseSettings):
             return tuple(
                 part.strip() for part in text.replace(",", " ").split() if part.strip()
             )
+        return value
+
+    @field_validator(
+        "voice_prefix_padding_ms", "voice_silence_duration_ms", mode="before"
+    )
+    @classmethod
+    def _blank_is_the_servers_default(cls, value: object) -> object:
+        """`KEY=` in a .env file is an empty *string*, not an absent key.
+
+        pydantic does not coerce `""` to None for an `int | None`, and these two ship
+        blank in .env.example on purpose - so a .env copied from it failed every
+        `Settings()` with `int_parsing`, taking the whole daemon down rather than
+        voice. Worse, it raised `pydantic.ValidationError` rather than `ConfigError`,
+        which is the one exception `daemon doctor` catches: the command whose whole
+        job is explaining the breakage printed a traceback instead.
+
+        Not covered by the 1457 tests that passed, and the reason is worth keeping:
+        `make_settings` builds `Settings(_env_file=None, **kwargs)` with native
+        Python values, so nothing exercised the dotenv text path that turns `KEY=`
+        into `""`. These are also the first `int | None` settings here, so there was
+        no prior pattern to copy.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
         return value
 
     @field_validator("wake_aliases", mode="before")

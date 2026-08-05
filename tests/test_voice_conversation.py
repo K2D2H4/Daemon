@@ -1374,3 +1374,50 @@ async def test_the_cue_plays_and_a_speaker_that_refuses_it_is_not_fatal() -> Non
             raise RuntimeError("no speaker here")
 
     await play_ready_cue(Deaf())  # must not raise
+
+
+async def test_an_unanswered_opening_survives_a_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attempt cut down before it answers never got the utterance in front of a
+    model, so dropping it on the retry would reopen the failure the opening exists to
+    fix: the owner saying the wake phrase twice."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    opening = b"\x11\x22" * 200
+    failing = FakeSession(Cut("connection closed 1011: internal error"))
+    working = FakeSession(Says("user", "다시"), b"\x01", Turn())
+    app_mod, new_session, built, settings = _attempts(failing, working)
+
+    code = await app_mod._voice_attempts(
+        new_session, FakeAudio(), FakeMemory(), None, settings, Cut,
+        opening_audio=opening,
+    )
+
+    assert code == 0
+    assert built[1].sent and built[1].sent[0] == opening, (
+        "the utterance that opened the session was lost on the reconnect"
+    )
+
+
+async def test_an_answered_opening_is_not_asked_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half: once something has been said back, re-sending it would have
+    the daemon answer the same question twice."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    opening = b"\x11\x22" * 200
+    answered = FakeSession(Says("user", "안녕"), b"\x01" * 4800, Turn())
+    answered.going_away = True  # forces a reconnect after a turn that did answer
+    resumed = FakeSession(Says("user", "계속"), Turn())
+    app_mod, new_session, built, settings = _attempts(answered, resumed)
+
+    await app_mod._voice_attempts(
+        new_session, FakeAudio(), FakeMemory(), None, settings, Cut,
+        opening_audio=opening,
+    )
+
+    assert opening not in built[1].sent, "the answered question was asked again"
