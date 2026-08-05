@@ -36,7 +36,10 @@ def spec() -> Spec:
 
 
 def test_the_shipped_set_is_big_enough_to_mean_something(spec: Spec) -> None:
-    assert len(spec.cases) >= 20
+    """50 is the size docs/PLAN.md 8.3 asks of layer 1, and the reason is arithmetic:
+    at 30 cases one question is 3.3 percentage points, so a single case flipping
+    looks like a trend."""
+    assert len(spec.cases) >= 50
     assert len({case.id for case in spec.cases}) == len(spec.cases)
 
 

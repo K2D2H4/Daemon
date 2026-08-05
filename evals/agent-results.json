@@ -1,16 +1,16 @@
 {
-  "measured_at": "2026-08-04T02:28:56.098Z",
+  "measured_at": "2026-08-05T10:46:51.629Z",
   "embedder": "bge-m3",
   "top_n": 5,
-  "pass_rate": 0.9333,
-  "passed": 28,
-  "scored": 30,
+  "pass_rate": 0.94,
+  "passed": 47,
+  "scored": 50,
   "broken": 0,
   "vectors_indexed": 79,
   "backfill_limit": 10000,
   "lane_counts": {
     "keyword": 0,
-    "vector": 13,
-    "both": 15
+    "vector": 18,
+    "both": 29
   }
 }
