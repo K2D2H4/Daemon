@@ -216,15 +216,26 @@ class Settings(BaseSettings):
 
     preset: str = Field(default="balanced", alias="DAEMON_PRESET")
 
-    route_overrides: dict[Task, str] = Field(
+    route_overrides: Annotated[dict[Task, str], NoDecode] = Field(
         default_factory=dict, alias="DAEMON_ROUTE_OVERRIDES"
     )
     """Per-task override on top of the preset, as JSON:
-    `DAEMON_ROUTE_OVERRIDES={"reflection": "ollama"}`."""
+    `DAEMON_ROUTE_OVERRIDES={"reflection": "ollama"}`.
+
+    NoDecode for the same reason as TELEGRAM_ALLOWED_USER_IDS below, and it was
+    missed here: pydantic-settings JSON-decodes a complex field *before* field
+    validators run, so the empty value .env.example ships - the value most installs
+    hold, since that file says to copy it - made `json.loads("")` raise and took the
+    entire load down, `daemon run` and `daemon doctor` alike, with a SettingsError
+    naming neither the file nor the problem."""
 
     fallback_provider: str | None = Field(default=None, alias="DAEMON_FALLBACK_PROVIDER")
     """Opt-in. When unset, a ProviderError propagates instead of being retried
-    somewhere else - a silent switch to a weaker model is worse than an error."""
+    somewhere else - a silent switch to a weaker model is worse than an error.
+
+    `None` is what "unset" means to every reader of this field, and a dotenv can only
+    write that as an empty value - which `_blank_is_unset` below normalises, because
+    `""` reaching those readers reported a bogus unknown provider at startup."""
 
     hosted_provider: str = Field(default="", alias="DAEMON_HOSTED_PROVIDER")
     """Which commercial model answers wherever a preset says "hosted".
@@ -485,6 +496,43 @@ class Settings(BaseSettings):
     """Loopback by default. The HTTP surface is a local control plane, not a
     service to expose."""
     port: int = Field(default=8787, alias="DAEMON_PORT")
+
+    @field_validator("fallback_provider", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """`DAEMON_FALLBACK_PROVIDER=` means no fallback, which is what .env.example
+        documents it as. Normalised here rather than at each reader: `is None` is the
+        test at both the startup check and `fallback_route`, and a `""` slipping past
+        the second would give the gateway a fallback provider that cannot resolve.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("route_overrides", mode="before")
+    @classmethod
+    def _parse_overrides(cls, value: object) -> object:
+        """Empty means no overrides; anything else must be the documented JSON.
+
+        `NoDecode` on the field is what lets this run at all - see its docstring.
+        Unparseable text raises rather than quietly becoming `{}`: an override that
+        is dropped sends its task to the preset's provider instead of the chosen one
+        and says nothing, which is the degradation this module exists to prevent.
+        """
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            import json
+
+            try:
+                return json.loads(text)
+            except ValueError as exc:
+                raise ValueError(
+                    "DAEMON_ROUTE_OVERRIDES must be JSON per task, as in "
+                    f'{{"reflection": "ollama"}} - {exc}'
+                ) from exc
+        return value
 
     @field_validator("telegram_allowed_user_ids", mode="before")
     @classmethod
