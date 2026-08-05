@@ -8,6 +8,14 @@ open-weight native-audio models cannot generate audio on Apple Silicon today.
 Two seams, because they fail for different reasons and are mocked differently:
 `VoiceSession` is the network, `AudioIO` is the hardware.
 
+Two more for the wake gate, which exists because the session above bills per
+minute. Holding one open on the chance of being spoken to costs about 48x what
+30 minutes a day costs (docs/PLAN.md 6.5), so something free has to decide when
+to open it: `VoiceActivityDetector` says whether a frame is speech at all, and
+`SpeechRecognizer` says what a segment of speech was. Both are local and both are
+seams for the same reason as the two above - one is arithmetic on audio, the other
+is an OS service that can be absent, and they are mocked differently.
+
 Nothing here is imported unless voice is enabled: the audio dependencies live in
 the `voice` extra so a text-only install does not need PortAudio.
 """
@@ -161,3 +169,98 @@ class AudioIO(Protocol):
         ...
 
     async def close(self) -> None: ...
+
+
+# --- the wake gate ------------------------------------------------------------
+# Measured on this project's target machine (Apple Silicon, macOS 26, Python 3.13),
+# because both numbers decide whether the gate is allowed to exist:
+#   Silero VAD  0.155 ms per 32 ms frame - 0.49% of one core, 206x realtime
+#   Apple on-device ko-KR  partial at ~700 ms, final at 760 ms, no network
+# And one measurement that shapes the design rather than justifying it: the VAD
+# calls a 3-note chord with vibrato speech in 46.8% of frames. Music is speech to
+# a VAD, so the VAD cannot be the whole gate - a real `daemon voice` run against
+# ambient music recorded "nela o trecho da musica" as though the owner had said it.
+
+
+@runtime_checkable
+class VoiceActivityDetector(Protocol):
+    """Is this frame speech? Cheap enough to run forever.
+
+    Stateful: the reference implementation carries an LSTM state and the last 64
+    samples of context between frames, so frames must arrive in order and `reset`
+    must be called between unrelated streams. Getting that wrong is quiet - it
+    returns plausible-looking probabilities near zero for real speech.
+    """
+
+    frame_samples: int
+    """Exactly how many samples a call expects, and the implementation must check it.
+
+    An earlier version of this line claimed the model raises on anything else. It
+    does not, and the correction matters more than the original claim: measured on
+    the vendored model, widths 256, 300, 512, 576 and 600 all *run* and return
+    plausible-looking near-zero probabilities, while only 128, 1024 and 1600 raise.
+    So a wrong frame size is a silent wrong answer - exactly the failure this
+    project treats as the dangerous one - and the length check in `probability` is
+    the only thing that turns it into an error.
+    """
+
+    sample_rate: int
+
+    def probability(self, frame: bytes) -> float:
+        """Speech likelihood in [0, 1] for one frame of 16-bit little-endian PCM."""
+        ...
+
+    def reset(self) -> None:
+        """Forget the stream. Required between segments, or the tail of the last
+        one biases the head of the next."""
+        ...
+
+
+@runtime_checkable
+class SpeechRecognizer(Protocol):
+    """What did this segment of speech say?
+
+    Only ever asked about audio a `VoiceActivityDetector` already accepted, and
+    only to decide whether the owner said the wake phrase - never to hold a
+    conversation. That is `VoiceSession`'s job, and the reason is quality: a
+    cascade discards paralinguistics (docs/PLAN.md 6.5, and the module docstring
+    above). This seam exists to spend nothing while nobody is talking.
+
+    `available` is separate from the call because absence is normal and must be
+    reportable: an OS speech service can be missing, unauthorised, or lack the
+    locale, and each looks identical from a failed transcription.
+    """
+
+    @property
+    def available(self) -> bool:
+        """Whether this recognizer can answer at all, checked without asking."""
+        ...
+
+    async def transcribe(self, pcm: bytes) -> str:
+        """Best guess at the words in one segment, or `""` if it cannot say.
+
+        Must not raise for ordinary failure. It is called from a loop that has to
+        outlive an unavailable recognizer - a wake gate that dies takes the
+        always-listening promise with it, and does so silently.
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class WakeEvent:
+    """The owner called. Carries what was heard, not just that something was.
+
+    `heard` is the recognizer's actual output and `matched` is the alias it hit,
+    which are different strings on purpose: an on-device recognizer will not emit
+    a coined name, so "루시야" arrives as "루시" and "헤이 데몬" as "헤이 대문".
+    Both are stable per speaker, which is what makes matching on them work, and
+    keeping the raw text is what lets `daemon doctor` show why a phrase does or
+    does not fire instead of leaving the owner to guess.
+    """
+
+    heard: str
+    matched: str
+    confidence: float
+    """Mean VAD probability over the segment. Not the recognizer's confidence -
+    it does not report one on-device - so it says "this was speech", not "these
+    were the words"."""

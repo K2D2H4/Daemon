@@ -10,8 +10,9 @@ in `app.py`, which owns every concrete-implementation import here.
 | | |
 |---|---|
 | `app.py` | composition root and lifespan. **The only file allowed to import concrete providers, channels and writers** — its imports are function-local to keep that exception visible. Also `run_voice`, `build_reflection` and `build_proactive_tick` |
-| `cli.py` | `run` · `setup` · `install` · `uninstall` · `status` · `doctor` · `reindex` · `reflect` · `voice` · `proactive` · `pairing` |
+| `cli.py` | `run` · `setup` · `install` · `uninstall` · `status` · `doctor` · `reindex` · `reflect` · `voice` · `proactive` · `pairing` · `wake calibrate` · `wake test` |
 | `setup.py` | the onboarding wizard: preset, hosted provider, keys, persona seed, pairing |
+| `wake_cli.py` | `daemon wake`: measure what the recognizer returns for the owner's phrase, save it as `DAEMON_WAKE_ALIASES`, then run the gate and print what fires. Writes `.env` through `setup.py`'s writer |
 | `config.py` | settings and the three presets. `HOSTED` resolves to the chosen provider |
 | `loop.py` | the text conversation: record → recall → complete → record → send |
 | `reflection.py` | the 04:00 pass: one local day → curated facts, entity notes, observations |
@@ -36,6 +37,8 @@ daemon run                     # the loop, in this terminal
 daemon reflect                 # the 04:00 pass, now, by hand (`--date`, `--force`)
 daemon proactive               # one proactivity round, verdicts only (`--speak` to let it)
 daemon reindex                 # rebuild all three markdown tiers into the mirror
+daemon wake calibrate          # what does the recognizer actually hear you say? (`--takes`)
+daemon wake test               # run the wake gate here and print what fires (`--seconds`)
 python3 -m pytest tests/test_reachable.py   # is everything you built reachable?
 ```
 

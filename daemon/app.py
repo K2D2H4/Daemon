@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
@@ -32,7 +32,25 @@ from daemon.proactivity.tick import ProactiveTick
 from daemon.reflection import Reflection
 from daemon.tasks import Task
 
+if TYPE_CHECKING:  # the wake gate, used only in the signatures below
+    from daemon.voice.base import AudioIO, SpeechRecognizer
+    from daemon.voice.wake import WakeGate
+
+WakeRound = Callable[[], Awaitable[None]]
+"""One round of listen-until-called-then-converse.
+
+Defined at runtime rather than under TYPE_CHECKING because `create_app` takes one
+as a real argument, and a name that only exists for a type checker is a name that
+fails at import for anyone reading the signature literally."""
+
 logger = logging.getLogger(__name__)
+
+WAKE_RETRY_SECONDS = 5.0
+"""Floor between wake rounds after a failure.
+
+Same reason the Telegram poll has one (daemon/channels/telegram.py): a round
+that fails instantly - no microphone, a revoked permission - would otherwise
+retry as fast as the process can manage."""
 
 OK = 0
 PROBLEM = 1
@@ -58,9 +76,15 @@ def create_app(
     channel: Channel | None = None,
     memory: MemoryWriter | None = None,
     recall: Recall | None = None,
+    wake: WakeRound | None = None,
 ) -> FastAPI:
-    """Assemble the process. `channel`/`memory`/`recall` are injection points for
-    tests; normally all three are built from settings during startup."""
+    """Assemble the process. `channel`/`memory`/`recall`/`wake` are injection points
+    for tests; normally all four are built from settings during startup.
+
+    `wake` is one round of "listen until called, then hold a conversation" - see
+    `_wake_round`. Injected rather than assembled in tests because the real one
+    opens a microphone and then a billed session, and neither belongs in a test.
+    """
     resolved = settings or Settings()
     app = FastAPI(title="Daemon", version="0.0.1", lifespan=_lifespan)
     app.state.settings = resolved
@@ -69,6 +93,9 @@ def create_app(
     app.state.recall = recall
     app.state.recall_status = "injected" if recall is not None else "not started"
     app.state.loop_task = None
+    app.state.wake_round = wake
+    app.state.wake_task = None
+    app.state.wake_status = "off"
     app.state.tools = None
     app.state.tools_status = "not started"
     app.state.mcp = None
@@ -89,6 +116,10 @@ def create_app(
             # embedder is down, the module is mid-rewrite). Saying so here is the
             # difference between a degraded daemon and one that quietly forgets.
             "recall": _recall_health(app.state),
+            # Same reason, and the failure is even quieter: a wake gate that died
+            # leaves a daemon that answers Telegram normally and has simply stopped
+            # hearing the room, with nothing anywhere saying so.
+            "wake_gate": _wake_health(app.state),
             # Same reasoning: an MCP server that failed to start leaves the model
             # with fewer tools and nothing else different, which is exactly the kind
             # of quiet degradation this endpoint exists to name.
@@ -207,6 +238,36 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             _backfill(recall), name="recall-backfill"
         )
 
+    # The always-on gate. This is what makes "it hears me when I call it" a property
+    # of the resident process rather than of a command somebody remembered to run -
+    # `daemon wake test` proves the gate works, and this is what uses it.
+    wake_round: WakeRound | None = app.state.wake_round
+    if wake_round is not None:
+        # Injected: a test drives the resident behaviour without a microphone.
+        app.state.wake_task = asyncio.create_task(_rounds(wake_round), name="wake-gate")
+    elif settings.wake_enabled:
+        try:
+            # Built once here so an unavailable recognizer or a missing model is
+            # reported at startup instead of five seconds into a retry loop that
+            # looks like a quiet room.
+            recognizer = build_wake_recognizer()
+            if not recognizer.available:
+                raise RuntimeError(
+                    "no on-device speech recognizer, so nothing could hear a wake word; "
+                    "install the voice extra (pip install -e '.[voice]') or turn "
+                    "DAEMON_WAKE_ENABLED off"
+                )
+        except Exception as exc:
+            # Not fatal: Telegram still works and the daemon is still worth running.
+            # Loud, and /health says `unavailable` rather than `off`, because the two
+            # mean different things to whoever is wondering why it stopped answering.
+            logger.error("wake gate not started: %s", exc)
+            app.state.wake_status = "unavailable"
+        else:
+            app.state.wake_task = asyncio.create_task(
+                _wake_forever(settings), name="wake-gate"
+            )
+
     try:
         yield
     finally:
@@ -215,7 +276,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # that escaped the finally block - skipping the channel close, the sqlite
         # close, the scheduler shutdown and every provider aclose below it. A
         # revoked bot token was enough to leak the lot on every restart.
-        for name in ("backfill_task", "loop_task"):
+        for name in ("backfill_task", "loop_task", "wake_task"):
             pending = getattr(app.state, name, None)
             if pending is None:
                 continue
@@ -688,6 +749,179 @@ async def run_voice(settings: Settings) -> int:
         return OK
     finally:
         store.close()
+
+
+def _wake_health(state: Any) -> str:
+    """What the wake gate is actually doing, not whether it was switched on.
+
+    Four answers, because they need four different actions and `recall`'s history
+    is the argument for spelling them out: `"ready"` there was once set when the
+    object was built, and three unrelated failures then looked identical from
+    outside. Here: `off` is nobody asked for it, `running` is listening,
+    `unavailable` is asked-for-but-nothing-to-listen-with (no microphone, no
+    on-device recognizer, no model), and `stopped` is it was listening and is not
+    any more - the one that used to be invisible.
+    """
+    task = getattr(state, "wake_task", None)
+    if task is None:
+        return getattr(state, "wake_status", "off")
+    if not task.done():
+        return "running"
+    return "stopped"
+
+
+async def _wake_round(settings: Settings) -> None:
+    """Listen until called, hold one spoken conversation, release the microphone.
+
+    One round, because the caller loops: keeping this a single round is what makes
+    the gate stop listening while the conversation runs. Two recording streams do
+    coexist on a Mac - measured, both opened and both delivered audio - so this is
+    not about the device. It is that a gate listening through a conversation hears
+    the conversation: the owner's half is speech, it starts with whatever they say
+    next, and the alias is one ordinary Korean word (`데몬` arrives as `질문`), so
+    the gate would re-fire on the daemon's own conversation.
+
+    Cost shape, which is the reason the gate exists at all: the VAD and the
+    recognizer are local and free, and only the `run_voice` call below opens the
+    per-minute session (docs/PLAN.md 6.5).
+    """
+    gate, close_gate = await build_wake_gate(settings)
+    fired = None
+    try:
+        async for event in gate.listen():
+            fired = event
+            break
+    finally:
+        # Before the conversation, not after: this is what hands the microphone over
+        # and stops the gate hearing what happens next.
+        with suppress(Exception):
+            await close_gate()
+    if fired is None:
+        # The stream ended without a wake word - a closed device, or a test's
+        # scripted audio running out. Not an error, but not a reason to spin either;
+        # the caller's own guard handles the pacing.
+        return
+    logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
+    await run_voice(settings)
+
+
+async def _rounds(round_: WakeRound) -> None:
+    """Drive an injected round forever, with the same guards as the real loop.
+
+    Exists so `create_app(wake=...)` exercises the *resident* behaviour - repeats,
+    survives a failing round - rather than a single call a test could have made
+    itself. Sharing the guards with `_wake_forever` matters: a test that proves the
+    loop recovers has proved it about the loop the product runs.
+    """
+    while True:
+        try:
+            await round_()
+        except asyncio.CancelledError:
+            # Explicit, though `except Exception` below could not catch it anyway:
+            # CancelledError is a BaseException. Kept because the clause is what tells
+            # a reader that shutdown is not one of the failures this loop absorbs, and
+            # because daemon/voice/conversation.py states it the same way. A mutation
+            # removing it changes nothing, which is the honest description of it.
+            raise
+        except Exception:
+            logger.exception("wake: injected round failed; continuing")
+            await asyncio.sleep(WAKE_RETRY_SECONDS)
+        else:
+            await asyncio.sleep(0)
+
+
+async def _wake_forever(settings: Settings) -> None:
+    """Rounds, until cancelled.
+
+    Every failure is caught and the loop continues. A wake gate that dies is the
+    failure this repo has shipped three times in a different costume: the process
+    stays alive, `/health` says `ok`, Telegram still answers, and the machine has
+    simply gone deaf with nothing saying why. `/health`'s `wake_gate` is the other
+    half of that guarantee, and it reads `stopped` only if even this loop is gone.
+
+    The floor exists for the same reason the Telegram poll has one: a round that
+    fails immediately - no microphone, a revoked device permission - would otherwise
+    spin as fast as the process can retry it.
+    """
+    while True:
+        try:
+            await _wake_round(settings)
+        except asyncio.CancelledError:
+            raise  # BaseException, so the clause below would not have caught it
+        except Exception:
+            logger.exception("wake: round failed; listening again shortly")
+            await asyncio.sleep(WAKE_RETRY_SECONDS)
+        else:
+            await asyncio.sleep(0)  # yield, so a stream that ends instantly cannot pin the loop
+
+
+# --- the wake gate ------------------------------------------------------------
+# Three assembly points for the always-on gate, all here for the same reason as
+# everything else in this module: nothing outside it may import an implementation
+# (docs/CONTRACTS.md 4). The commands that use them are in `daemon/wake_cli.py`,
+# which talks only to the protocols in `daemon/voice/base.py`.
+
+
+def build_wake_recognizer() -> SpeechRecognizer:
+    """The on-device recognizer, for `daemon wake calibrate`.
+
+    Nothing about it is configurable: it is whatever this OS can do on-device, and
+    whether that is anything at all is `SpeechRecognizer.available` - which the
+    command asks before it records, because a missing locale and a failed
+    transcription are indistinguishable after the fact.
+    """
+    from daemon.voice.apple_speech import AppleSpeechRecognizer
+
+    return AppleSpeechRecognizer()
+
+
+def build_wake_audio() -> AudioIO:
+    """The microphone, for one calibration take."""
+    from daemon.voice.audio import SoundDeviceAudio
+
+    return SoundDeviceAudio()
+
+
+async def build_wake_gate(
+    settings: Settings,
+) -> tuple[WakeGate, Callable[[], Awaitable[None]]]:
+    """The always-on gate and the coroutine that releases the microphone.
+
+    A gate rather than a bare stream of events, because `WakeGate.counters` is the
+    other half of the answer: a gate whose recognizer is unavailable, or whose every
+    segment is too short, hears nothing forever and looks exactly like a quiet house
+    (daemon/voice/wake.py). `daemon wake test` prints those counters, which is what
+    makes "nothing fired" a diagnosis instead of a shrug.
+
+    Every knob comes from `.env` rather than from this function's opinion.
+    `DAEMON_WAKE_ALIASES` is the one that has to: the on-device recognizer never
+    returns a coined name, so the strings that work are the ones measured on the
+    owner's own voice by `daemon wake calibrate` (daemon/wake_cli.py).
+    """
+    from daemon.voice.apple_speech import AppleSpeechRecognizer
+    from daemon.voice.audio import SoundDeviceAudio
+    from daemon.voice.vad import SileroVad
+    from daemon.voice.wake import WakeGate
+
+    audio = SoundDeviceAudio()
+    gate = WakeGate(
+        audio,
+        SileroVad(),
+        AppleSpeechRecognizer(),
+        settings.wake_aliases,
+        threshold=settings.wake_vad_threshold,
+        hangover_ms=settings.wake_hangover_ms,
+        pre_roll_ms=settings.wake_pre_roll_ms,
+        min_speech_ms=settings.wake_min_speech_ms,
+        max_segment_ms=settings.wake_max_segment_ms,
+        cooldown_seconds=settings.wake_cooldown_seconds,
+    )
+
+    async def close() -> None:
+        with suppress(Exception):
+            await audio.close()
+
+    return gate, close
 
 
 def _read_seed(data_dir: Path) -> str:

@@ -17,6 +17,48 @@ from daemon.llm.base import Completion, Message, ProviderError, ToolCall, ToolSp
 
 SCHEMA = Path(__file__).resolve().parents[1] / "daemon" / "memory" / "schema.sql"
 
+CONFIG_PREFIXES = ("DAEMON_", "TELEGRAM_", "GEMINI_", "ANTHROPIC_", "OPENAI_")
+"""Every prefix `daemon/config.py` reads from the environment."""
+
+CANARY = "DAEMON_CONFTEST_CANARY"
+"""Planted in the environment at collection so the isolation below is falsifiable.
+
+Without it, `test_the_environment_is_isolated` only fails on a machine that happens
+to have `DAEMON_*` set - so CI, which is clean, would pass with the isolation
+deleted. Removing the fixture now fails everywhere instead of nowhere."""
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    os.environ[CANARY] = "1"
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    os.environ.pop(CANARY, None)
+
+
+@pytest.fixture(autouse=True)
+def no_real_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide the developer's own environment from every test.
+
+    `Settings(_env_file=None, ...)` stops pydantic-settings reading `.env` from
+    disk but *not* from the process environment, so a shell that had sourced
+    `.env` - which is how you run the product - leaked real values into tests that
+    had explicitly chosen their own.
+
+    Found by sourcing `.env` and running the suite: `DAEMON_VOICE_ENABLED=true`
+    made `test_the_allowlist_accepts_what_a_person_would_type` raise ConfigError,
+    because voice is on and the preset that test picks is `offline`. Three
+    allowlist cases failed for a reason that had nothing to do with allowlists.
+
+    Autouse and suite-wide rather than a fix to that one test: a green suite that
+    depends on a clean shell is not a gate, and the same leak was available to
+    every test that builds `Settings`. It also makes CONTRACTS' "a test that needs
+    an API key is a broken test" enforceable rather than aspirational - a test
+    cannot now accidentally *see* a real key either.
+    """
+    for name in [k for k in os.environ if k.startswith(CONFIG_PREFIXES)]:
+        monkeypatch.delenv(name, raising=False)
+
 
 @pytest.fixture(autouse=True)
 def _no_ambient_settings(monkeypatch: pytest.MonkeyPatch) -> None:

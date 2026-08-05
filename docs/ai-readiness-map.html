@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Daemon — AI 준비도 지도</title>
+    <title>Daemon · AI-Readiness Map</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -148,9 +148,8 @@
 
       .score-hero .grade-row {
         display: flex;
-        flex-wrap: wrap;
         align-items: center;
-        gap: 8px;
+        gap: 10px;
         margin-top: 14px;
       }
 
@@ -172,24 +171,6 @@
         height: 6px;
         border-radius: 999px;
         background: var(--green);
-      }
-
-      .delta {
-        font-family: "JetBrains Mono", monospace;
-        font-size: 11.5px;
-        color: var(--text-3);
-      }
-
-      .delta strong {
-        color: var(--green);
-      }
-
-      .rule-row .num .was {
-        display: block;
-        font-size: 9.5px;
-        font-weight: 500;
-        color: var(--text-3);
-        letter-spacing: 0;
       }
 
       .score-hero .desc {
@@ -267,7 +248,7 @@
 
       .rule-row {
         display: grid;
-        grid-template-columns: 28px 1fr 200px 76px;
+        grid-template-columns: 28px 1fr 220px 56px;
         gap: 12px;
         align-items: center;
         padding: 7px 0;
@@ -598,6 +579,25 @@
           grid-template-columns: 24px 1fr 140px 40px;
         }
       }
+      .subrow {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 18px;
+        padding: 8px 0 10px 34px;
+        border-bottom: 1px solid var(--grid);
+        font-size: 11.5px;
+        color: var(--text-2);
+        font-family: "JetBrains Mono", monospace;
+      }
+      .subrow b {
+        color: var(--text-1);
+        font-weight: 600;
+        margin-right: 3px;
+      }
+      .subrow em {
+        font-style: normal;
+        font-weight: 600;
+      }
     </style>
   </head>
   <body>
@@ -608,12 +608,12 @@
           <div class="eyebrow">레포지토리 감사 · AI 준비도 · v2 루브릭</div>
           <h1>Daemon — AI 준비도 지도</h1>
           <div class="sub">
-            7개 카테고리 채점 · 구조 지도 · ROI 우선순위 액션 <strong>· 보완 후 재측정</strong>
+            7개 카테고리 채점 · 구조 지도 · ROI 우선순위 액션
           </div>
         </div>
         <div class="header-meta">
-          <div>점수 측정 <strong>2026-08-04</strong></div>
-          <div>브랜치 <strong>main</strong></div>
+          <div>점수 측정 <strong>2026-08-05</strong></div>
+          <div>브랜치 <strong>qa-agent</strong></div>
           <div>모듈 <strong>4</strong> · 컨텍스트 파일 <strong>7</strong></div>
         </div>
       </header>
@@ -627,18 +627,16 @@
           </div>
           <div class="grade-row">
             <span class="grade-badge" style="background: var(--green-soft); color: var(--green)">
-              <span class="grade-dot" style="background: var(--green)"></span> AI-Ready
+              <span class="grade-dot" style="background: var(--green)"></span> AI-Ready · 에이전트 친화
             </span>
-            <span class="delta">이전 25 (AI-Hostile) <strong>+63</strong></span>
           </div>
           <div class="desc">
-            보완 작업 후 재측정. <strong>A 탐색 커버리지 15/15</strong>,
-            <strong>C 암묵지 외부화 20/20</strong> — 4개 모듈 전부 CLAUDE.md 를
-            갖고 ADR 7건이 결정 근거를 담는다. 남은 약점은
-            <strong>B 문서 품질 (16/20)</strong> 과
-            <strong>E 검증 게이트 (12/15)</strong>. B 의 감점은 사실상 전부
-            <strong>1,000줄 넘는 god file</strong> 이고, E 는 CODEOWNERS 부재다.
-            채점기가 지적한 경로 5건은 전수 확인 결과 실제 결함이 아니다 (아래 참조).
+            7개 카테고리 · 가중치 차등 (A 15 · B 20 · C 20 · D 15 · E 15
+            · F 10 · G 5). 일곱 카테고리 모두 75% 이상. 남은 여백은
+            <strong>B 컨텍스트 문서 품질 (16/20)</strong> 과
+            <strong>E 검증 게이트 (12/15)</strong> 뿐이고, 둘 다 서브항목
+            하나씩이 원인 — <strong>B1 간결성 2/4</strong>(루트 CLAUDE.md
+            115줄) 과 <strong>E2 독립 리뷰 2/4</strong>(CODEOWNERS 부재).
           </div>
           <hr />
           <div class="mini-stats">
@@ -647,12 +645,12 @@
               <div class="v" style="color: var(--green)">4 / 4</div>
             </div>
             <div class="mini-stat">
-              <div class="k">깨진 경로 (CI 검사기)</div>
-              <div class="v" style="color: var(--green)">0 / 88</div>
+              <div class="k">실제 잘못된 경로</div>
+              <div class="v" style="color: var(--green)">0</div>
             </div>
             <div class="mini-stat">
               <div class="k">300줄 초과 파일</div>
-              <div class="v">31</div>
+              <div class="v" style="color: var(--amber)">43</div>
             </div>
           </div>
         </div>
@@ -674,78 +672,113 @@
             <div class="idx">A</div>
             <div>
               <div class="title">AI 탐색 &amp; 커버리지</div>
-              <div class="sub">4개 모듈 전부 CLAUDE.md 보유 · root CLAUDE.md 신설 — coverage 100%</div>
+              <div class="sub">
+                4개 핵심 모듈 전부 로컬 컨텍스트 보유 · 루트가 21개 파일 인용
+              </div>
             </div>
             <div class="bar bar-good">
               <span style="width: 100%"></span>
             </div>
-            <div class="num">15/15 <span class="was">was 0</span></div>
+            <div class="num">15/15</div>
           </div>
+
           <div class="rule-row">
             <div class="idx">B</div>
             <div>
               <div class="title">컨텍스트 문서 품질</div>
-              <div class="sub">간결성 2/4 — 1,949줄 test_setup.py 등 god file 12개가 남은 감점 전부</div>
+              <div class="sub">
+                <strong style="color: var(--amber)">길이 초과 1건</strong> · 27–115줄 분포 · 상호참조 완비
+              </div>
             </div>
             <div class="bar bar-good">
               <span style="width: 80%"></span>
             </div>
-            <div class="num">16/20 <span class="was">was 16</span></div>
+            <div class="num">16/20</div>
           </div>
+
+          <div class="subrow">
+            <span><b>B1</b> 간결성 <em style="color: var(--amber)">2/4</em></span>
+            <span><b>B2</b> 명령어 블록 <em>3/4</em></span>
+            <span><b>B3</b> 핵심 파일 <em style="color: var(--green)">4/4</em></span>
+            <span><b>B4</b> 함정 명시 <em>3/4</em></span>
+            <span><b>B5</b> 상호참조 <em style="color: var(--green)">4/4</em></span>
+          </div>
+
           <div class="rule-row">
             <div class="idx">C</div>
             <div>
               <div class="title">암묵지 외부화</div>
-              <div class="sub">ADR 7건 · 모듈별 Owns / Common changes / Depends on 5문항 전부 통과</div>
+              <div class="sub">
+                ADR 8건 · Five-Question 4/4 모듈 통과 · 컨텍스트 체인 7문서
+              </div>
             </div>
             <div class="bar bar-good">
               <span style="width: 100%"></span>
             </div>
-            <div class="num">20/20 <span class="was">was 0</span></div>
+            <div class="num">20/20</div>
           </div>
+
           <div class="rule-row">
             <div class="idx">D</div>
             <div>
               <div class="title">모듈 간 의존성 매핑</div>
-              <div class="sub">ARCHITECTURE.md + mermaid 2종 (import 방향 · 런타임 흐름) · monorepo 아님(-2)</div>
+              <div class="sub">
+                ARCHITECTURE.md · mermaid 2건 · 의존성 섹션 5문서 (모노레포 아님)
+              </div>
             </div>
             <div class="bar bar-good">
               <span style="width: 87%"></span>
             </div>
-            <div class="num">13/15 <span class="was">was 0</span></div>
+            <div class="num">13/15</div>
           </div>
+
           <div class="rule-row">
             <div class="idx">E</div>
             <div>
               <div class="title">검증 &amp; 품질 게이트</div>
-              <div class="sub">CI 5단계 · PR 템플릿 · 지적된 경로 5건은 전수 확인 결과 채점기 한계 (CODEOWNERS 없음)</div>
+              <div class="sub">
+                68 참조 중 실제 오류 0 · CI + PR 템플릿 · <strong style="color: var(--amber)">CODEOWNERS 부재</strong>
+              </div>
             </div>
             <div class="bar bar-good">
               <span style="width: 80%"></span>
             </div>
-            <div class="num">12/15 <span class="was">was 6</span></div>
+            <div class="num">12/15</div>
           </div>
+
+          <div class="subrow">
+            <span><b>E1</b> 참조 정확도 <em style="color: var(--green)">5/5</em></span>
+            <span><b>E2</b> 독립 리뷰 <em style="color: var(--amber)">2/4</em></span>
+            <span><b>E3</b> 작업 검증 <em>3/4</em></span>
+            <span><b>E4</b> 프롬프트 테스트 <em style="color: var(--green)">2/2</em></span>
+          </div>
+
           <div class="rule-row">
             <div class="idx">F</div>
             <div>
-              <div class="title">신선도 &amp; 자기유지</div>
-              <div class="sub">CI가 경로 검증 실행 · drift 0/4 · hook 탐지는 .husky/ 만 봄 (Node 관례, -2)</div>
+              <div class="title">신선도 &amp; 자가 유지보수</div>
+              <div class="sub">
+                drift 0% (4/4 모듈) · CI가 <code>check_docs.py</code> 실행 · 훅 검증 부재
+              </div>
             </div>
             <div class="bar bar-good">
               <span style="width: 80%"></span>
             </div>
-            <div class="num">8/10 <span class="was">was 0</span></div>
+            <div class="num">8/10</div>
           </div>
+
           <div class="rule-row">
             <div class="idx">G</div>
             <div>
               <div class="title">에이전트 성과 측정</div>
-              <div class="sub">evals/agent-results.json — 점수와 함께 embedder·backfill 조건까지 기록</div>
+              <div class="sub">
+                <code>evals/</code> + <code>agent-results.json</code> 존재 · 사용 텔레메트리 없음
+              </div>
             </div>
             <div class="bar bar-good">
               <span style="width: 80%"></span>
             </div>
-            <div class="num">4/5 <span class="was">was 3</span></div>
+            <div class="num">4/5</div>
           </div>
         </div>
       </section>
@@ -756,8 +789,8 @@
           <div>
             <h2>구조 지도</h2>
             <div class="sub">
-              노드 = 디렉터리 · 파란 점 = 상위 모듈 CLAUDE.md 가 다룸 · 초록 = 이번에 확보 ·
-              호박색 = 1,000줄 넘는 파일이 남아 있음
+              노드 = 디렉터리 · 엣지 = 허용된 import 방향 · 카드 내부
+              수치는 파일 줄 수
             </div>
           </div>
           <div class="map-legend">
@@ -766,128 +799,468 @@
                 class="legend-dot"
                 style="background: var(--accent)"
               ></span>
-              문서가 다룸</span
+              CLAUDE.md 보유</span
             >
             <span
               ><span
                 class="legend-dot"
                 style="background: var(--green)"
               ></span>
-              테스트</span
+              게이트</span
             >
             <span
               ><span
                 class="legend-square"
-                style="background: var(--amber-soft); border: 1px solid var(--amber)"
+                style="background: var(--red-soft); border: 1px solid var(--red)"
               ></span>
-              god file 포함
+              700줄 초과
             </span>
             <span>
               <span
                 class="legend-line"
                 style="border-color: var(--accent)"
               ></span>
-              타입 연결
+              구속하는 계약
             </span>
             <span>
               <span
                 class="legend-line"
                 style="border-color: var(--border-strong); border-style: dashed"
               ></span>
-              의존성
+              import 방향
             </span>
           </div>
         </div>
 
         <div class="map-body">
-          <svg viewBox="0 0 1180 660" xmlns="http://www.w3.org/2000/svg">
-              <style>
-                .node-title { font: 600 12.5px Inter, sans-serif; fill: #18181b; }
-                .node-sub { font: 11px 'JetBrains Mono', monospace; fill: #71717a; }
-                .col-label { font: 600 10.5px Inter, sans-serif; fill: #a1a1aa; letter-spacing: .08em; }
-                .edge { stroke: var(--border-strong); stroke-width: 1.1; stroke-dasharray: 4 3; fill: none; }
-              </style>
-              <text x="30" y="34" class="col-label">진입점</text>
-                        <rect x="30" y="52" width="200" height="79" rx="7" fill="var(--amber-soft)" stroke="var(--amber)" stroke-width="1.2"/>
-            <text x="41" y="72" class="node-title">daemon/ (root)</text>
-            <circle cx="218" cy="67" r="4" fill="var(--accent)"/>
-            <text x="41" y="90" class="node-sub">cli.py 236 · app.py 420</text>
-            <text x="41" y="105" class="node-sub">setup.py 1853 ⚠</text>
-            <text x="41" y="120" class="node-sub">config.py 380</text>
-              <text x="250" y="34" class="col-label">채널</text>
-                        <rect x="250" y="52" width="200" height="79" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="261" y="72" class="node-title">daemon/channels/</text>
-            <circle cx="438" cy="67" r="4" fill="var(--accent)"/>
-            <text x="261" y="90" class="node-sub">telegram.py 574 ⚠</text>
-            <text x="261" y="105" class="node-sub">pairing.py 300</text>
-            <text x="261" y="120" class="node-sub">base.py</text>
-              <text x="470" y="34" class="col-label">코어</text>
-                        <rect x="470" y="52" width="200" height="64" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="481" y="72" class="node-title">daemon/llm/</text>
-            <circle cx="658" cy="67" r="4" fill="var(--accent)"/>
-            <text x="481" y="90" class="node-sub">gateway · 4 providers</text>
-            <text x="481" y="105" class="node-sub">embedders/ollama</text>
-                        <rect x="470" y="138" width="200" height="49" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="481" y="158" class="node-title">daemon/loop.py</text>
-            <circle cx="658" cy="153" r="4" fill="var(--accent)"/>
-            <text x="481" y="176" class="node-sub">대화 루프 · 회상 주입</text>
-              <text x="690" y="34" class="col-label">기억</text>
-                        <rect x="690" y="52" width="200" height="79" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="701" y="72" class="node-title">daemon/memory/</text>
-            <circle cx="878" cy="67" r="4" fill="var(--accent)"/>
-            <text x="701" y="90" class="node-sub">store · log · writer</text>
-            <text x="701" y="105" class="node-sub">recall.py 420</text>
-            <text x="701" y="120" class="node-sub">schema.sql v4</text>
-              <text x="910" y="34" class="col-label">음성</text>
-                        <rect x="910" y="52" width="200" height="64" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="921" y="72" class="node-title">daemon/voice/</text>
-            <circle cx="1098" cy="67" r="4" fill="var(--accent)"/>
-            <text x="921" y="90" class="node-sub">gemini_live.py 769 ⚠</text>
-            <text x="921" y="105" class="node-sub">conversation · audio</text>
-              <path class="edge" d="M230,95 H250"/>
-              <path class="edge" d="M450,95 H470"/>
-              <path class="edge" d="M670,95 H690"/>
-              <path class="edge" d="M890,95 H910"/>
-              <text x="30" y="330" class="col-label">검증 (커버리지는 두텁다)</text>
-                        <rect x="30" y="348" width="260" height="79" rx="7" fill="var(--amber-soft)" stroke="var(--amber)" stroke-width="1.2"/>
-            <text x="41" y="368" class="node-title">tests/ — 728 통과</text>
-            <circle cx="278" cy="363" r="4" fill="var(--accent)"/>
-            <text x="41" y="386" class="node-sub">test_setup.py 1949 ⚠</text>
-            <text x="41" y="401" class="node-sub">test_voice.py 1049 ⚠</text>
-            <text x="41" y="416" class="node-sub">25 파일 · CLAUDE.md ✓</text>
-                        <rect x="320" y="348" width="260" height="64" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="331" y="368" class="node-title">tests/test_reachable.py</text>
-            <circle cx="568" cy="363" r="4" fill="var(--accent)"/>
-            <text x="331" y="386" class="node-sub">도달성 — PENDING 선언</text>
-            <text x="331" y="401" class="node-sub">양방향 검사</text>
-                        <rect x="610" y="348" width="260" height="64" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="621" y="368" class="node-title">tests/test_acceptance.py</text>
-            <circle cx="858" cy="363" r="4" fill="var(--accent)"/>
-            <text x="621" y="386" class="node-sub">유저 경로 end-to-end</text>
-            <text x="621" y="401" class="node-sub">네트워크 경계만 페이크</text>
-                        <rect x="900" y="348" width="260" height="64" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="911" y="368" class="node-title">evals/</text>
-            <circle cx="1148" cy="363" r="4" fill="var(--accent)"/>
-            <text x="911" y="386" class="node-sub">골든셋 30문항 93.3%</text>
-            <text x="911" y="401" class="node-sub">m0_voice_spike</text>
-              <text x="30" y="500" class="col-label">비어 있는 것 (마일스톤 예약) · 이번에 확보한 것</text>
-                        <rect x="30" y="518" width="260" height="49" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="41" y="538" class="node-title">daemon/persona/</text>
-            <circle cx="278" cy="533" r="4" fill="var(--accent)"/>
-            <text x="41" y="556" class="node-sub">M4 — 페르소나 진화</text>
-                        <rect x="320" y="518" width="260" height="49" rx="7" fill="#fff" stroke="var(--border-strong)" stroke-width="1.2"/>
-            <text x="331" y="538" class="node-title">daemon/proactivity/</text>
-            <circle cx="568" cy="533" r="4" fill="var(--accent)"/>
-            <text x="331" y="556" class="node-sub">M3 — 선제성</text>
-                        <rect x="610" y="518" width="260" height="49" rx="7" fill="var(--green-soft)" stroke="var(--green)" stroke-width="1.2"/>
-            <text x="621" y="538" class="node-title">docs/ARCHITECTURE.md</text>
-            <circle cx="858" cy="533" r="4" fill="var(--green)"/>
-            <text x="621" y="556" class="node-sub">신설 · mermaid 2종 → D 13/15</text>
-                        <rect x="900" y="518" width="260" height="49" rx="7" fill="var(--green-soft)" stroke="var(--green)" stroke-width="1.2"/>
-            <text x="911" y="538" class="node-title">docs/adr/ — 7건</text>
-            <circle cx="1148" cy="533" r="4" fill="var(--green)"/>
-            <text x="911" y="556" class="node-sub">신설 → C 20/20</text>
-            </svg>
+          <svg viewBox="0 0 1180 730" xmlns="http://www.w3.org/2000/svg">
+            <!-- subtle grid -->
+            <g class="grid-bg">
+              <path d="M0,80 H1180" />
+              <path d="M0,160 H1180" />
+              <path d="M0,240 H1180" />
+              <path d="M0,320 H1180" />
+              <path d="M0,400 H1180" />
+              <path d="M0,480 H1180" />
+              <path d="M0,560 H1180" />
+              <path d="M0,660 H1180" />
+              <path d="M100,0 V730" />
+              <path d="M300,0 V730" />
+              <path d="M500,0 V730" />
+              <path d="M700,0 V730" />
+              <path d="M900,0 V730" />
+              <path d="M1100,0 V730" />
+            </g>
+
+            <!-- Column headers -->
+            <text
+              x="200"
+              y="32"
+              text-anchor="middle"
+              class="node-meta"
+              style="font-size: 11px; fill: var(--text-2); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;"
+            >
+              프로세스 · daemon
+            </text>
+            <text
+              x="590"
+              y="32"
+              text-anchor="middle"
+              class="node-meta"
+              style="font-size: 11px; fill: var(--text-2); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;"
+            >
+              게이트 · tests · evals
+            </text>
+            <text
+              x="980"
+              y="32"
+              text-anchor="middle"
+              class="node-meta"
+              style="font-size: 11px; fill: var(--text-2); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;"
+            >
+              계약 · docs · scripts
+            </text>
+
+            <!-- ============ ROOT CLAUDE.md (top center) ============ -->
+            <g transform="translate(440,60)">
+              <rect
+                class="node-card accent"
+                width="300"
+                height="70"
+                rx="8"
+              />
+              <circle cx="22" cy="22" r="14" class="claude-ring" />
+              <circle cx="22" cy="22" r="6" class="claude-dot" />
+              <text x="44" y="26" class="node-title">
+                CLAUDE.md (root)
+              </text>
+              <text x="44" y="42" class="node-meta">
+                import 방향 mermaid · 물어볼 파일 · 측정된 함정
+              </text>
+              <text x="44" y="58" class="node-meta" style="fill: var(--amber)">
+                115 lines — 예산 100 초과
+              </text>
+              <text
+                x="284"
+                y="26"
+                text-anchor="end"
+                class="node-kpi"
+                style="fill: var(--accent)"
+              >
+                루트
+              </text>
+            </g>
+
+            <!-- ============ daemon column ============ -->
+            <g transform="translate(60,180)">
+              <rect class="node-card accent" width="280" height="64" rx="8" />
+              <circle cx="22" cy="22" r="12" class="claude-ring" />
+              <circle cx="22" cy="22" r="5" class="claude-dot" />
+              <text x="42" y="26" class="node-title">daemon/CLAUDE.md</text>
+              <text x="42" y="42" class="node-meta">
+                레이아웃 표 · 흔한 변경 4종 · 측정된 사실 7건
+              </text>
+              <text x="264" y="26" text-anchor="end" class="node-kpi">
+                100 ln
+              </text>
+            </g>
+
+            <!-- daemon top level -->
+            <g transform="translate(60,268)">
+              <rect class="node-card" width="280" height="132" rx="8" />
+              <text x="16" y="24" class="node-title">daemon/ · 12 파일</text>
+              <text x="16" y="40" class="node-meta">
+                app.py 합성 루트 · loop · reflection · cli
+              </text>
+
+              <g transform="translate(16,52)">
+                <rect class="hot" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--red); font-weight:600">
+                  setup.py
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--red); font-weight:600">
+                  2429
+                </text>
+              </g>
+              <g transform="translate(16,74)">
+                <rect class="hot" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--red); font-weight:600">
+                  app.py · 유일한 impl import
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--red); font-weight:600">
+                  725
+                </text>
+              </g>
+              <g transform="translate(16,96)">
+                <rect class="warm" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--amber); font-weight:600">
+                  cli.py · reflection.py
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--amber); font-weight:600">
+                  630 · 598
+                </text>
+              </g>
+            </g>
+
+            <!-- daemon/memory -->
+            <g transform="translate(60,424)">
+              <rect class="node-card" width="280" height="110" rx="8" />
+              <text x="16" y="24" class="node-title">daemon/memory/ · 9 파일</text>
+              <text x="16" y="40" class="node-meta">
+                마크다운이 원천 · sqlite는 재생성 가능한 미러
+              </text>
+              <g transform="translate(16,52)">
+                <rect class="hot" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--red); font-weight:600">
+                  store.py
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--red); font-weight:600">
+                  988
+                </text>
+              </g>
+              <g transform="translate(16,74)">
+                <rect class="warm" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--amber); font-weight:600">
+                  recall.py · Lane 1, LLM 0회
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--amber); font-weight:600">
+                  664
+                </text>
+              </g>
+            </g>
+
+            <!-- daemon impl packages -->
+            <g transform="translate(60,558)">
+              <rect class="node-card" width="280" height="80" rx="8" />
+              <text x="16" y="24" class="node-title">
+                channels · voice · proactivity · llm
+              </text>
+              <text x="16" y="40" class="node-meta">
+                21 파일 · 전부 frozen base.py 뒤에
+              </text>
+              <g transform="translate(16,52)">
+                <rect class="warm" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--amber); font-weight:600">
+                  telegram.py · gemini_live.py
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--amber); font-weight:600">
+                  773 · 769
+                </text>
+              </g>
+            </g>
+
+            <!-- ============ tests / evals column ============ -->
+            <g transform="translate(450,180)">
+              <rect class="node-card accent" width="280" height="64" rx="8" />
+              <circle cx="22" cy="22" r="12" class="claude-ring" />
+              <circle cx="22" cy="22" r="5" class="claude-dot" />
+              <text x="42" y="26" class="node-title">tests/CLAUDE.md</text>
+              <text x="42" y="42" class="node-meta">
+                세 종류의 테스트, 그리고 그 이유
+              </text>
+              <text x="264" y="26" text-anchor="end" class="node-kpi">
+                80 ln
+              </text>
+            </g>
+
+            <!-- the two gates -->
+            <g transform="translate(450,268)">
+              <rect class="node-card" width="280" height="132" rx="8" stroke="var(--green)" />
+              <circle cx="22" cy="22" r="10" fill="var(--green-soft)" />
+              <circle cx="22" cy="22" r="5" class="test-dot" />
+              <text x="42" y="26" class="node-title">두 개의 게이트</text>
+              <text x="16" y="46" class="node-meta">
+                유닛 커버리지만으로 세 번 실패한 뒤 생김
+              </text>
+              <g transform="translate(16,56)">
+                <rect fill="var(--green-soft)" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--green); font-weight:600">
+                  test_reachable.py · 도달 가능한가
+                </text>
+              </g>
+              <g transform="translate(16,78)">
+                <rect fill="var(--green-soft)" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--green); font-weight:600">
+                  test_acceptance.py
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--green); font-weight:600">
+                  678
+                </text>
+              </g>
+              <g transform="translate(16,100)">
+                <rect fill="var(--grid)" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--text-2)">
+                  1205 passed · 1 skipped · 9.1 s
+                </text>
+              </g>
+            </g>
+
+            <!-- unit tests -->
+            <g transform="translate(450,424)">
+              <rect class="node-card" width="280" height="110" rx="8" />
+              <text x="16" y="24" class="node-title">tests/ 유닛 · 37 파일</text>
+              <text x="16" y="40" class="node-meta">
+                네트워크 · 키 · 마이크 금지. conftest 픽스처만
+              </text>
+              <g transform="translate(16,52)">
+                <rect class="hot" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--red); font-weight:600">
+                  test_setup.py
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--red); font-weight:600">
+                  3233
+                </text>
+              </g>
+              <g transform="translate(16,74)">
+                <rect class="hot" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--red); font-weight:600">
+                  test_voice.py · test_recall.py
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--red); font-weight:600">
+                  1049 · 958
+                </text>
+              </g>
+            </g>
+
+            <!-- evals -->
+            <g transform="translate(450,558)">
+              <rect class="node-card accent" width="280" height="80" rx="8" />
+              <circle cx="22" cy="22" r="12" class="claude-ring" />
+              <circle cx="22" cy="22" r="5" class="claude-dot" />
+              <text x="42" y="26" class="node-title">evals/CLAUDE.md</text>
+              <text x="42" y="42" class="node-meta">
+                회상 골든셋 · 라이브 API 음성 스파이크
+              </text>
+              <g transform="translate(16,52)">
+                <rect fill="var(--accent-soft)" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--accent); font-weight:600">
+                  agent-results.json · 점수와 그 조건
+                </text>
+              </g>
+            </g>
+
+            <!-- ============ docs / scripts column ============ -->
+            <g transform="translate(840,180)">
+              <rect class="node-card accent" width="280" height="64" rx="8" />
+              <circle cx="22" cy="22" r="12" class="claude-ring" />
+              <circle cx="22" cy="22" r="5" class="claude-dot" />
+              <text x="42" y="26" class="node-title">docs/CONTRACTS.md</text>
+              <text x="42" y="42" class="node-meta">
+                협상 불가 9개 · frozen 파일 · 짧고 구속력 있음
+              </text>
+              <text x="264" y="26" text-anchor="end" class="node-kpi">
+                147 ln
+              </text>
+            </g>
+
+            <!-- ADRs -->
+            <g transform="translate(840,268)">
+              <rect class="node-card" width="280" height="132" rx="8" />
+              <text x="16" y="24" class="node-title">docs/adr/ · 8건</text>
+              <text x="16" y="40" class="node-meta">
+                결정, 그리고 그중 넷을 뒤집은 측정
+              </text>
+              <g transform="translate(16,52)">
+                <rect fill="var(--accent-soft)" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--accent); font-weight:600">
+                  0002 한 프로세스 · 0003 파일 소유권
+                </text>
+              </g>
+              <g transform="translate(16,74)">
+                <rect fill="var(--accent-soft)" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--accent); font-weight:600">
+                  0005 벡터 · 0006 도달성 게이트
+                </text>
+              </g>
+              <g transform="translate(16,96)">
+                <rect fill="var(--accent-soft)" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--accent); font-weight:600">
+                  0008 세 단계, 모델 호출 한 번
+                </text>
+              </g>
+            </g>
+
+            <!-- architecture + plan -->
+            <g transform="translate(840,424)">
+              <rect class="node-card" width="280" height="110" rx="8" />
+              <text x="16" y="24" class="node-title">ARCHITECTURE · PLAN</text>
+              <text x="16" y="40" class="node-meta">
+                런타임 데이터 흐름 · 설계 근거 (한국어)
+              </text>
+              <g transform="translate(16,52)">
+                <rect class="warm" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--amber); font-weight:600">
+                  ARCHITECTURE.md · mermaid
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--amber); font-weight:600">
+                  323
+                </text>
+              </g>
+              <g transform="translate(16,74)">
+                <rect class="hot" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--red); font-weight:600">
+                  PLAN.md · 8.2에 마일스톤 게이트
+                </text>
+                <text x="240" y="13" text-anchor="end" class="node-meta" style="fill: var(--red); font-weight:600">
+                  760
+                </text>
+              </g>
+            </g>
+
+            <!-- scripts -->
+            <g transform="translate(840,558)">
+              <rect class="node-card accent" width="280" height="80" rx="8" />
+              <circle cx="22" cy="22" r="12" class="claude-ring" />
+              <circle cx="22" cy="22" r="5" class="claude-dot" />
+              <text x="42" y="26" class="node-title">scripts/CLAUDE.md</text>
+              <text x="42" y="42" class="node-meta">
+                제품 코드를 import 하지 않는다 — 의도적 고립
+              </text>
+              <g transform="translate(16,52)">
+                <rect fill="var(--green-soft)" width="248" height="18" rx="3" />
+                <text x="8" y="13" class="node-meta" style="fill: var(--green); font-weight:600">
+                  check_docs.py · 131 경로 검증, CI에서
+                </text>
+              </g>
+            </g>
+
+            <!-- =================== EDGES =================== -->
+            <!-- Root CLAUDE.md → each column's context file -->
+            <path
+              class="edge edge-dash"
+              d="M500,130 C 500,160 200,160 200,180"
+            />
+            <path
+              class="edge edge-dash"
+              d="M590,130 C 590,160 590,160 590,180"
+            />
+            <path
+              class="edge edge-dash"
+              d="M680,130 C 680,160 980,160 980,180"
+            />
+
+            <!-- tests depend on all of daemon -->
+            <path
+              class="edge edge-dash"
+              d="M340,334 C 395,334 395,334 450,334"
+            />
+            <text
+              x="395"
+              y="327"
+              text-anchor="middle"
+              class="node-meta"
+              style="fill: var(--text-2); font-weight: 600"
+            >
+              전부 의존
+            </text>
+
+            <!-- CONTRACTS binds daemon. Routed under every card: the straight run
+                 between the two context files passes through tests/CLAUDE.md. -->
+            <path
+              class="edge edge-type"
+              d="M1120,244 C 1150,244 1150,700 1100,700 L 240,700 C 190,700 200,660 200,638"
+            />
+            <text
+              x="620"
+              y="692"
+              text-anchor="middle"
+              class="node-meta"
+              style="fill: var(--accent); font-weight: 600"
+            >
+              frozen 계약이 daemon/ 을 구속한다 — base.py 4개 · schema.sql · tasks.py
+            </text>
+
+            <!-- memory ← ARCHITECTURE data flow -->
+            <path
+              class="edge edge-dash"
+              d="M840,470 C 700,470 480,470 340,470"
+            />
+            <text
+              x="590"
+              y="463"
+              text-anchor="middle"
+              class="node-meta"
+              style="fill: var(--text-2)"
+            >
+              런타임 데이터 흐름을 서술
+            </text>
+
+            <!-- scripts imports nothing: explicit non-edge -->
+            <path
+              class="edge edge-warn edge-dash"
+              d="M840,598 C 800,598 780,598 738,598"
+              stroke-dasharray="2 6"
+            />
+            <text
+              x="789"
+              y="590"
+              text-anchor="middle"
+              class="node-meta"
+              style="fill: var(--amber); font-weight: 600"
+            >
+              엣지 없음
+            </text>
+          </svg>
         </div>
       </section>
 
@@ -896,101 +1269,153 @@
         <section class="panel panel-strength">
           <div class="panel-head">
             <h3>강점</h3>
-            <span class="count">보완 후 확보한 것</span>
+            <span class="count">유지할 것들</span>
           </div>
           <ul class="panel-list">
             <li>
               <div class="head">
-                <span class="tag tag-rule">Cat A/C</span>
-                커버리지 15/15 · 암묵지 20/20
+                <span class="tag tag-rule">Cat A · 15/15</span>
+                4개 모듈 전부 로컬 CLAUDE.md
               </div>
-              <div class="note">4개 모듈 전부 CLAUDE.md 를 갖고, 각 파일이 소유 범위 · 흔한 변경 레시피 · 의존 방향을 명시한다. provider 를 추가할 때 <code>HOSTED_PROVIDERS</code> 등록과 <code>app.py</code> 조립을 빼먹으면 '라우팅엔 있고 앱에선 못 만드는' 상태가 되는데, 그 함정이 이제 문서에 있다.</div>
+              <div class="note">
+                <code>daemon/</code> · <code>tests/</code> ·
+                <code>evals/</code> · <code>scripts/</code> 모두 자기
+                컨텍스트를 갖고, 루트가 21개 파일을 직접 인용한다.
+                에이전트가 위에서 아래로 필요한 만큼만 로드 가능.
+              </div>
             </li>
             <li>
               <div class="head">
-                <span class="tag tag-rule">Cat C</span>
-                ADR 7건 — 실측이 추론을 뒤집은 기록
+                <span class="tag tag-rule">Cat C · 20/20</span>
+                ADR 8건 · Five-Question 4/4 모듈 통과
               </div>
-              <div class="note">0004 는 결론은 유지하되 <strong>근거를 정정</strong>한다: 네이티브 오디오 200-300ms 라는 문헌값 대신 실측 740ms 를 적고, 그래도 로컬 캐스케이드를 쓰지 않는 이유는 지연이 아니라 억양·망설임이 STT 단계에서 구조적으로 소실되기 때문이라고 다시 쓴다.</div>
+              <div class="note">
+                결정만이 아니라 <strong>그 결정을 뒤집은 측정</strong>이
+                남아 있다 — 0005는 sqlite 확장이 이 빌드에서 로드되지
+                않는다는 사실로, 0004는 740 ms 실측으로 원래 논거를
+                교체했다. 단일 카테고리 만점.
+              </div>
             </li>
             <li>
               <div class="head">
-                <span class="tag tag-rule">검증</span>
-                도달성 검사가 양방향으로 작동
+                <span class="tag tag-rule">Cat E1 · 5/5</span>
+                68개 참조 중 실제 깨진 것 0건
               </div>
-              <div class="note"><code>tests/test_reachable.py</code> 가 '만들었는데 도달 불가' 를 잡고, PENDING 선언이 낡으면 그것도 실패시킨다. 음성 배선 때 실제로 실패해서 어느 선언이 낡았는지 알려줬다.</div>
+              <div class="note">
+                Meta 기준 "0 hallucinated paths" 달성.
+                <code>scripts/check_docs.py</code> 가 131개 경로를
+                CI에서 검증하고, 런타임 산출물(<code>data/</code>)은
+                의도적으로 면제한다.
+              </div>
             </li>
             <li>
               <div class="head">
-                <span class="tag tag-rule">Cat G</span>
-                점수가 측정 조건을 함께 들고 다닌다
+                <span class="tag tag-rule">Cat E4 · 2/2</span>
+                <code>evals/</code> 골든셋이 점수를 조건과 함께 남긴다
               </div>
-              <div class="note"><code>evals/agent-results.json</code> 에 pass rate 뿐 아니라 embedder · backfill 한도 · 인덱싱된 벡터 수가 같이 남는다. 예전에 93.3% 를 프로덕션 기본값(500)의 20배 한도에서 측정하고 그대로 인용한 적이 있는데, 그 실수를 숫자 자체가 막는다.</div>
+              <div class="note">
+                맨 숫자 "93.3%"가 프로덕션의 20배 backfill 한도에서 나온
+                런에서 인용된 적이 있어서,
+                <code>agent-results.json</code> 은 임베더 · backfill 한도
+                · 벡터 수를 함께 기록한다.
+              </div>
             </li>
             <li>
               <div class="head">
-                <span class="tag tag-rule">Cat F</span>
-                CI 가 문서 경로를 검증한다
+                <span class="tag tag-rule">Cat F · 8/10</span>
+                context drift 0% · CI가 경로를 검증
               </div>
-              <div class="note">레포에 CI 가 아예 없었다. 지금은 ruff · pytest · 도달성 · 인수 · 문서 경로가 각각 이름 붙은 단계로 돈다. <code>scripts/check_docs.py</code> 는 첫 실행에서 깨진 참조 9건을 찾았다 — 방금 사람이 검토한 파일들에서.</div>
+              <div class="note">
+                4개 측정 가능 모듈 전부에서 CLAUDE.md mtime 이 코드
+                변경보다 신선하다. <code>ci.yml</code> 에
+                <code>run: python3 scripts/check_docs.py</code> 실행
+                스텝이 실제로 있다.
+              </div>
             </li>
           </ul>
         </section>
 
         <section class="panel panel-risk">
           <div class="panel-head">
-            <h3>ROI 순 액션</h3>
-            <span class="count">남은 것 · impact / effort</span>
+            <h3>최우선 ROI 액션</h3>
+            <span class="count">우선순위 정렬</span>
           </div>
           <ul class="panel-list">
             <li>
               <div class="head">
-                <span class="tag tag-rule">Cat B</span>
-                god file 분할 — <code>tests/test_setup.py</code> 1,949줄 · <code>daemon/setup.py</code> 1,853줄
+                <span class="tag tag-rule">Cat E2 · S</span>
+                <code>CODEOWNERS</code> 신설
               </div>
               <div class="note">
-                <code>L · 30h</code> · 남은 감점의 사실상 전부. 파일당 5-10K 토큰 절감이지만 <strong>착수 전 승인 필요</strong> — 온보딩 위저드를 쪼개는 일이라 회귀 위험이 문서 작업과 다른 등급이다.
-                &nbsp;<code>ROI 0.2</code>
+                <strong>Effort 0.5 hr · Impact 8/10.</strong>
+                E2 독립 리뷰가 2/4 인 유일한 이유. 브랜치 보호가 이미
+                <code>check</code> 상태검사를 요구하므로, 소유자 라우팅만
+                추가하면 PR당 리뷰어 지정 ~2 min 이 사라지고 E 12→14.
               </div>
             </li>
             <li>
               <div class="head">
-                <span class="tag tag-rule">Cat E</span>
-                CODEOWNERS 추가
+                <span class="tag tag-rule">Cat F · S</span>
+                pre-commit 훅에 <code>check_docs.py</code> 연결
               </div>
               <div class="note">
-                <code>S · 0.3h</code> · E2 critic review 2/4 의 나머지 절반. 1인 오픈소스에선 형식적이지만, 외부 PR 이 들어오기 시작하면 리뷰 책임이 명시된다.
-                &nbsp;<code>ROI 6.7</code>
+                <strong>Effort 0.5 hr · Impact 7/10.</strong>
+                CI가 이미 돌리는 스크립트를 재사용하므로 새 로직 0줄.
+                stale 참조를 CI 왕복(~90 s) 전에 잡는다. F 8→10.
               </div>
             </li>
             <li>
               <div class="head">
-                <span class="tag tag-rule">확인됨</span>
-                채점기가 지적한 경로 5건 — <strong>수정 불필요</strong>
+                <span class="tag tag-rule">Cat B1 · S</span>
+                루트 <code>CLAUDE.md</code> 115 → 100줄 이하
               </div>
               <div class="note">
-                <code>0h</code> · 전수 확인 결과: 런타임 경로 1건(<code>data/</code> 는 클론에 없는 게 정상) · 채점기가 <code>.json</code> 을 <code>.js</code> 로 자른 것 2건 · 문서 기준 상대경로 미해석 1건 · <code>.github</code> 앞 점 누락 1건. CI 에 걸린 검사기는 <strong>88건 중 0건</strong>.
-                &nbsp;<code>—</code>
+                <strong>Effort 1.0 hr · Impact 7/10.</strong>
+                B1 간결성 2/4 의 원인. "Before you say it works" 규칙은
+                유저가 명시적으로 요구한 것이므로 남기고, 세부 사례를
+                <code>docs/</code> 로 옮기는 방향. 15줄 절감 ≈ 로드당
+                ~600 token.
               </div>
             </li>
             <li>
               <div class="head">
-                <span class="tag tag-rule">Cat F</span>
-                <code>.githooks/pre-commit</code> 은 이미 있음
+                <span class="tag tag-rule">Cat E · —</span>
+                남은 hallucinated path 1건은 <strong>오탐</strong>
               </div>
               <div class="note">
-                <code>0h</code> · 채점기는 <code>.husky/</code>(Node 관례) 만 찾는다. Python 레포에 <code>.husky</code> 를 만들 이유는 없으므로 -2 는 그대로 둔다.
-                &nbsp;<code>—</code>
+                <strong>Effort 0 · 조치 불필요.</strong>
+                <code>data/memory/core.md</code> 는 reflection 이 돌아야
+                생기는 런타임 산출물이다.
+                <code>check_docs.py</code> 의 <code>RUNTIME</code> 면제가
+                이 케이스의 참조 구현. <em>채점 스크립트의
+                <code>js|json</code> 정렬 버그로 잡혔던 나머지 2건은
+                수정했다.</em>
               </div>
             </li>
             <li>
               <div class="head">
-                <span class="tag tag-rule">다음</span>
-                M2 — 성찰 · 엔티티 노트 · 관찰 기록
+                <span class="tag tag-rule">Cat G · M</span>
+                골든셋 실행 조건을 세션 로그로 남기기
               </div>
               <div class="note">
-                <code>다음 마일스톤</code> · AI 준비도 보완은 여기서 끝. 제품 작업으로 복귀할 지점.
-                &nbsp;<code>—</code>
+                <strong>Effort 2.0 hr · Impact 5/10.</strong>
+                G 4/5 의 남은 1점은 AI 사용 텔레메트리. 이미
+                <code>agent-results.json</code> 이 한 런을 기록하므로,
+                누적 append 로 회귀 추이를 보이게 한다.
+              </div>
+            </li>
+            <li>
+              <div class="head">
+                <span class="tag tag-rule">Cat B · L</span>
+                god file 분할 — <code>tests/test_setup.py</code> 3233 ·
+                <code>daemon/setup.py</code> 2429
+              </div>
+              <div class="note">
+                <strong>Effort 67.5 hr · Impact 6/10 · 우선순위
+                0.09.</strong> 500줄 초과 27개. ROI 최하위이고, 온보딩
+                위저드가 아직 활발히 수정되는 중이라 유저와 합의해
+                의도적으로 미뤘다. 자동 순위를 뒤집은 것이 아니라 그
+                순위를 그대로 따른 결정.
               </div>
             </li>
           </ul>
@@ -998,7 +1423,7 @@
       </div>
 
       <footer>
-        Daemon · AI 준비도 감사 · v2 루브릭 (7 카테고리 / 100점) · 25 → 88 · 측정일 2026-08-04
+        Daemon · AI 준비도 감사 · v2 루브릭 (7 카테고리 / 100점) · 측정일 2026-08-05
       </footer>
     </div>
   </body>

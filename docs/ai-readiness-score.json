@@ -2,12 +2,14 @@
   "meta": {
     "repo": "Daemon",
     "path": "/Users/gimdaehyeon/Daemon",
-    "scored_at": "2026-08-04",
-    "git_branch": "main",
+    "scored_at": "2026-08-05",
+    "git_branch": "qa-agent",
     "rubric_version": "v2-100pt",
     "modules_total": 4,
     "context_files_total": 7,
-    "large_files_300plus": 31
+    "hub_context_files": 7,
+    "imported_knowledge_docs": 0,
+    "large_files_300plus": 43
   },
   "total": 88,
   "grade": "AI-Ready",
@@ -20,6 +22,8 @@
       "evidence": {
         "core_modules": 4,
         "covered_modules": 4,
+        "covered_local": 4,
+        "covered_by_root_chain": 0,
         "coverage_ratio": 1.0,
         "root_claude": "CLAUDE.md"
       },
@@ -32,8 +36,9 @@
       "max": 20,
       "evidence": {
         "context_files": 7,
-        "max_lines": 100,
-        "min_lines": 26
+        "knowledge_files": 0,
+        "max_lines": 115,
+        "min_lines": 27
       },
       "sub_scores": {
         "B1_Conciseness": 2,
@@ -42,7 +47,9 @@
         "B4_NonObvious": 3,
         "B5_CrossRefs": 4
       },
-      "findings": []
+      "findings": [
+        "conciseness 초과(>100 lines) context 1건: CLAUDE.md (115)"
+      ]
     },
     "C": {
       "name": "Tribal Knowledge Externalization",
@@ -51,6 +58,11 @@
       "evidence": {
         "memory_md": false,
         "adr": true,
+        "adr_paths": [
+          "docs/adr"
+        ],
+        "context_chain_docs": 7,
+        "chain_resolved_refs": 67,
         "modules_total": 4,
         "q1_owns": 4,
         "q2_patterns": 4,
@@ -72,6 +84,10 @@
       "max": 15,
       "evidence": {
         "architecture_doc": true,
+        "architecture_docs": [
+          "docs/ARCHITECTURE.md",
+          "docs/architecture.md"
+        ],
         "mermaid_diagrams": true,
         "context_with_deps_section": 5,
         "monorepo_workspace": false
@@ -84,13 +100,22 @@
       "score": 12,
       "max": 15,
       "evidence": {
-        "ref_total": 64,
-        "ref_broken": 5,
+        "ref_total": 68,
+        "ref_broken": 1,
+        "ref_external": 0,
+        "ref_url_skipped": 0,
+        "ref_broken_samples": [
+          "daemon/CLAUDE.md: data/memory/core.md"
+        ],
+        "ref_external_samples": [],
         "codeowners": false,
         "pr_template": true,
         "ci_workflows": true,
         "husky": false,
-        "evals_dir": true
+        "evals_dir": true,
+        "eval_paths": [
+          "evals"
+        ]
       },
       "sub_scores": {
         "E1_RefAccuracy": 5,
@@ -99,7 +124,7 @@
         "E4_PromptTests": 2
       },
       "findings": [
-        "hallucinated path 5건 (총 64 참조 중) — 예: CLAUDE.md: data/persona/seed.md, CLAUDE.md: evals/agent-results.js, evals/CLAUDE.md: evals/agent-results.js, docs/adr/README.md: ./PLAN.md"
+        "hallucinated path 1건 (총 68 참조 중) — 예: daemon/CLAUDE.md: data/memory/core.md"
       ]
     },
     "F": {
@@ -111,6 +136,9 @@
         "measurable_modules": 4,
         "drift_ratio": 0.0,
         "ctx_validation_workflow": true,
+        "ctx_validation_evidence": [
+          "ci.yml: run: python3 scripts/check_docs.py"
+        ],
         "hook_validates_paths": false
       },
       "sub_scores": {},
@@ -141,11 +169,11 @@
     "총점 88/100 · 등급 AI-Ready",
     "가장 낮은 카테고리: B Context Document Quality 16/20",
     "가장 낮은 카테고리: E Verification & Quality Gates 12/15",
-    "⚠️  context에 hallucinated path 5건 — Meta 기준으로는 0이어야 함"
+    "⚠️  context에 hallucinated path 1건 — Meta 기준으로는 0이어야 함"
   ],
   "actions": [
     {
-      "title": "context의 hallucinated path 5건 수정 (referential trust)",
+      "title": "context의 hallucinated path 1건 수정 (referential trust)",
       "category": "E",
       "effort": "S",
       "effort_hours": 0.5,
@@ -154,24 +182,52 @@
       "priority": 20.0
     },
     {
-      "title": "god file 12개 분할 (>500 lines): tests/test_setup.py (1949), daemon/setup.py (1853), tests/test_voice.py (1049)",
+      "title": "과도한 CLAUDE.md를 25-35 lines로 압축 (compass-not-encyclopedia)",
+      "category": "B",
+      "effort": "M",
+      "effort_hours": 2.0,
+      "impact": "agent context 로드 시간 단축 + 핵심 정보 가시성 ↑",
+      "impact_score": 7,
+      "priority": 3.5
+    },
+    {
+      "title": "god file 27개 분할 (>500 lines): tests/test_setup.py (3233), daemon/setup.py (2429), tests/test_voice.py (1049)",
       "category": "B",
       "effort": "L",
-      "effort_hours": 30.0,
+      "effort_hours": 67.5,
       "impact": "파일당 ~5K-10K token 절감 + 편집 정확도 ↑",
       "impact_score": 6,
-      "priority": 0.2
+      "priority": 0.08888888888888889
     }
   ],
   "extras": {
+    "context_chain": [
+      "README.md",
+      "CLAUDE.md",
+      "evals/CLAUDE.md",
+      "tests/CLAUDE.md",
+      "docs/adr/README.md",
+      "daemon/CLAUDE.md",
+      "scripts/CLAUDE.md"
+    ],
     "modules": [
       {
         "path": "/Users/gimdaehyeon/Daemon/daemon",
         "rel": "daemon",
-        "code_files": 40,
+        "code_files": 51,
         "has_context": true,
         "context_file": "/Users/gimdaehyeon/Daemon/daemon/CLAUDE.md",
-        "context_kind": "CLAUDE.md"
+        "context_kind": "CLAUDE.md",
+        "local_context": true,
+        "root_ref_files": 21,
+        "root_ref_threshold": 3,
+        "guiding_docs": [
+          "CLAUDE.md",
+          "daemon/CLAUDE.md",
+          "evals/CLAUDE.md",
+          "scripts/CLAUDE.md",
+          "tests/CLAUDE.md"
+        ]
       },
       {
         "path": "/Users/gimdaehyeon/Daemon/evals",
@@ -179,7 +235,14 @@
         "code_files": 3,
         "has_context": true,
         "context_file": "/Users/gimdaehyeon/Daemon/evals/CLAUDE.md",
-        "context_kind": "CLAUDE.md"
+        "context_kind": "CLAUDE.md",
+        "local_context": true,
+        "root_ref_files": 2,
+        "root_ref_threshold": 3,
+        "guiding_docs": [
+          "CLAUDE.md",
+          "evals/CLAUDE.md"
+        ]
       },
       {
         "path": "/Users/gimdaehyeon/Daemon/scripts",
@@ -187,29 +250,58 @@
         "code_files": 1,
         "has_context": true,
         "context_file": "/Users/gimdaehyeon/Daemon/scripts/CLAUDE.md",
-        "context_kind": "CLAUDE.md"
+        "context_kind": "CLAUDE.md",
+        "local_context": true,
+        "root_ref_files": 2,
+        "root_ref_threshold": 3,
+        "guiding_docs": [
+          "CLAUDE.md",
+          "README.md",
+          "daemon/CLAUDE.md",
+          "scripts/CLAUDE.md"
+        ]
       },
       {
         "path": "/Users/gimdaehyeon/Daemon/tests",
         "rel": "tests",
-        "code_files": 25,
+        "code_files": 37,
         "has_context": true,
         "context_file": "/Users/gimdaehyeon/Daemon/tests/CLAUDE.md",
-        "context_kind": "CLAUDE.md"
+        "context_kind": "CLAUDE.md",
+        "local_context": true,
+        "root_ref_files": 4,
+        "root_ref_threshold": 3,
+        "guiding_docs": [
+          "CLAUDE.md",
+          "daemon/CLAUDE.md",
+          "tests/CLAUDE.md"
+        ]
       }
     ],
     "large_files": [
       {
         "path": "tests/test_setup.py",
-        "lines": 1949
+        "lines": 3233
       },
       {
         "path": "daemon/setup.py",
-        "lines": 1853
+        "lines": 2429
       },
       {
         "path": "tests/test_voice.py",
         "lines": 1049
+      },
+      {
+        "path": "daemon/memory/store.py",
+        "lines": 988
+      },
+      {
+        "path": "tests/test_recall.py",
+        "lines": 958
+      },
+      {
+        "path": "tests/test_telegram.py",
+        "lines": 953
       },
       {
         "path": "tests/test_providers.py",
@@ -220,104 +312,92 @@
         "lines": 876
       },
       {
-        "path": "tests/test_audio.py",
-        "lines": 782
+        "path": "tests/test_loop.py",
+        "lines": 845
+      },
+      {
+        "path": "daemon/channels/telegram.py",
+        "lines": 773
       },
       {
         "path": "daemon/voice/gemini_live.py",
         "lines": 769
       },
       {
-        "path": "tests/test_loop.py",
-        "lines": 748
+        "path": "daemon/app.py",
+        "lines": 725
       },
       {
-        "path": "tests/test_telegram.py",
-        "lines": 574
+        "path": "tests/test_presence.py",
+        "lines": 685
       },
       {
-        "path": "tests/test_recall.py",
+        "path": "tests/test_acceptance.py",
+        "lines": 678
+      },
+      {
+        "path": "daemon/memory/recall.py",
+        "lines": 664
+      },
+      {
+        "path": "tests/test_candidates.py",
+        "lines": 640
+      },
+      {
+        "path": "daemon/cli.py",
+        "lines": 630
+      },
+      {
+        "path": "daemon/proactivity/candidates.py",
+        "lines": 602
+      },
+      {
+        "path": "daemon/reflection.py",
+        "lines": 598
+      },
+      {
+        "path": "tests/test_speaker.py",
+        "lines": 583
+      },
+      {
+        "path": "tests/test_reflection.py",
+        "lines": 578
+      },
+      {
+        "path": "tests/test_cli.py",
+        "lines": 570
+      },
+      {
+        "path": "tests/test_audio.py",
+        "lines": 549
+      },
+      {
+        "path": "daemon/proactivity/presence.py",
+        "lines": 541
+      },
+      {
+        "path": "daemon/config.py",
+        "lines": 540
+      },
+      {
+        "path": "tests/test_gate.py",
         "lines": 538
-      },
-      {
-        "path": "daemon/channels/telegram.py",
-        "lines": 511
       },
       {
         "path": "daemon/tui.py",
         "lines": 508
       },
       {
-        "path": "daemon/app.py",
-        "lines": 485
-      },
-      {
-        "path": "daemon/voice/conversation.py",
-        "lines": 479
-      },
-      {
         "path": "tests/test_tui.py",
         "lines": 478
       },
       {
-        "path": "daemon/memory/store.py",
-        "lines": 472
-      },
-      {
-        "path": "daemon/config.py",
-        "lines": 464
+        "path": "daemon/voice/conversation.py",
+        "lines": 463
       },
       {
         "path": "daemon/service.py",
         "lines": 452
-      },
-      {
-        "path": "tests/test_acceptance.py",
-        "lines": 425
-      },
-      {
-        "path": "evals/golden_set.py",
-        "lines": 420
-      },
-      {
-        "path": "tests/test_reliability.py",
-        "lines": 412
-      },
-      {
-        "path": "tests/test_m1b_audit.py",
-        "lines": 407
-      },
-      {
-        "path": "daemon/voice/audio.py",
-        "lines": 387
-      },
-      {
-        "path": "daemon/cli.py",
-        "lines": 378
-      },
-      {
-        "path": "daemon/memory/recall.py",
-        "lines": 366
-      },
-      {
-        "path": "tests/test_config.py",
-        "lines": 351
-      },
-      {
-        "path": "tests/test_hardening.py",
-        "lines": 336
-      },
-      {
-        "path": "tests/test_pairing.py",
-        "lines": 332
-      },
-      {
-        "path": "daemon/memory/schema.sql",
-        "lines": 332
-      },
-      {
-        "path": "tests/test_service.py",
-        "lines": 331
       }
     ]
   }

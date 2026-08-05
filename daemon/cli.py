@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sqlite3
 import sys
 from collections.abc import Sequence
@@ -78,6 +79,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("voice", help="hold one spoken conversation at this machine")
 
+    wake = sub.add_parser(
+        "wake", help="the always-on wake phrase: measure it on your voice, then hear it work"
+    )
+    wake_sub = wake.add_subparsers(dest="wake_command", required=True)
+    calibrate = wake_sub.add_parser(
+        "calibrate",
+        help="say the phrase a few times and save what the recognizer actually heard",
+    )
+    calibrate.add_argument(
+        "--takes",
+        type=int,
+        # Not a literal default, so the number and the reasoning behind it stay in
+        # one place - `wake_cli.TAKES`, which is 3. Naming it here would need
+        # wake_cli imported to build the parser, and the parser is built for every
+        # command.
+        help="how many times to say it (3 if omitted; fewer than 2 cannot show "
+        "whether the transcription is stable)",
+    )
+    wake_test = wake_sub.add_parser(
+        "test", help="run the gate here and print every wake event it fires"
+    )
+    wake_test.add_argument(
+        "--seconds",
+        type=int,
+        help="how long to listen (60 if omitted). 0 waits for Ctrl-C, which is what "
+        "leaving a television on and watching for a false wake needs.",
+    )
+
     pairing = sub.add_parser("pairing", help="see and approve who may talk to Daemon")
     pairing_sub = pairing.add_subparsers(dest="pairing_command", required=True)
     pairing_sub.add_parser("list", help="pending pairing requests and their codes")
@@ -112,6 +141,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Same reason, more so: setup exists for the machine that has no usable
         # configuration yet, so it must not require one to start.
         return _setup(check_only=args.check)
+    if command == "wake" and args.wake_command == "calibrate":
+        # Also before Settings, and for setup's reason: calibration reads nothing
+        # out of the configuration and writes one key into `.env`, so it has to work
+        # on an install whose configuration does not load yet. `wake test` does need
+        # settings - it builds the gate - so it stays below.
+        from daemon.wake_cli import calibrate
+
+        return calibrate(takes=args.takes)
 
     try:
         settings = Settings()
@@ -125,6 +162,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
+        # Before the loop starts, because this is the command that suffers for it and
+        # `daemon doctor` is the command nobody runs first. An install lost hours to a
+        # repeating Telegram 409 whose cause was `~/.zshrc` exporting
+        # TELEGRAM_BOT_TOKEN for a different tool: the environment outranks the file,
+        # so `.env` named the right bot and was never consulted. Doctor reports it,
+        # but only if you already suspect something.
+        override = _env_override_check(settings)
+        if not override.ok:
+            logging.getLogger(__name__).warning("%s", override.detail)
         return _serve(settings)
     if command == "reindex":
         inserted = _reindex(settings)
@@ -144,6 +190,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         from daemon.app import run_voice
 
         return asyncio.run(run_voice(settings))
+    if command == "wake":
+        # Only `test` reaches here; `calibrate` returned above.
+        #
+        # Logging on, at WARNING: the gate steps over a raising VAD or recognizer
+        # rather than dying, and logs it - so without a handler the one command whose
+        # job is to explain why nothing fired would be hiding the explanation. Not
+        # INFO: the gate logs every fire there too, and this command prints those
+        # itself.
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s %(message)s")
+        from daemon.wake_cli import listen
+
+        return listen(settings, seconds=args.seconds)
     if command == "pairing":
         return _pairing(settings, args)
     if command == "tools":
@@ -480,6 +538,7 @@ def _doctor() -> int:
                 True,
                 f"preset={settings.preset} voice={settings.voice_enabled} [{table}]",
             ),
+            _env_override_check(settings),
             _data_dir_check(settings),
             _schema_check(settings),
             _memory_check(settings),
@@ -498,6 +557,55 @@ def _doctor() -> int:
         sys.stdout.flush()
         print(f"\n{failed} check(s) failed.", file=sys.stderr)
     return PROBLEM if failed else OK
+
+
+def _env_override_check(settings: Settings) -> Check:
+    """Does the shell's environment silently outrank `.env`?
+
+    pydantic-settings reads the process environment *before* the file, by design, and
+    that is normally what you want. It stops being what you want when a credential is
+    involved and nobody said so: an install spent hours on a repeating Telegram 409
+    because `~/.zshrc` exported `TELEGRAM_BOT_TOKEN` for a different tool, so every
+    terminal quietly pointed `daemon run` at that tool's bot - which the tool was
+    already polling. `.env` was correct the whole time and never used.
+
+    Nothing is changed here. The environment winning is a legitimate thing to want,
+    and the fix depends on which of the two the owner meant. Values are compared but
+    never printed: only the fact that they differ, and for a bot token the numeric id,
+    which is not a secret.
+    """
+    from daemon.setup import parse_env
+
+    path = Path(".env")
+    if not path.exists():
+        return Check("environment", True, "no .env, so nothing to be overridden")
+    try:
+        on_disk = parse_env(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return Check("environment", False, f"could not read {path}: {exc}")
+
+    clashes: list[str] = []
+    for key, filed in on_disk.items():
+        live = os.environ.get(key)
+        if live is None or live == filed:
+            continue
+        if key == "TELEGRAM_BOT_TOKEN":
+            # The id half identifies the bot and is not a secret - it is what the
+            # 409 message prints, and naming it here is the whole point.
+            clashes.append(
+                f"{key} (env names bot {live.split(':')[0]}, .env names {filed.split(':')[0]})"
+            )
+        else:
+            clashes.append(f"{key} (env value differs)")
+    if not clashes:
+        return Check("environment", True, "nothing in the environment overrides .env")
+    return Check(
+        "environment",
+        False,
+        f"the shell environment overrides .env for {', '.join(clashes)}"
+        " - the environment wins, so .env is being ignored for these."
+        " `unset` them, or remove them from .env, whichever you meant",
+    )
 
 
 def _tools_check(settings: Settings) -> Check:

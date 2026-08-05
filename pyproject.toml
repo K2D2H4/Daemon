@@ -36,6 +36,19 @@ voice = [
     # every such install failed TLS on the first voice turn with an error that
     # looked like the user's network.
     "certifi>=2024.0",
+    # The wake gate's VAD (daemon/voice/vad.py) runs the vendored Silero graph on
+    # this and numpy alone - deliberately not the `silero-vad` package, whose
+    # torchaudio import fails outright against the installed torch here. Listed
+    # because `SileroVad` raises an AudioUnavailable that tells the reader to run
+    # `pip install -e '.[voice]'`, and until this line existed that command did not
+    # install the thing the message was about.
+    "onnxruntime>=1.20",
+    # The wake gate's recognizer (daemon/voice/apple_speech.py). macOS only, and
+    # marked as such so `pip install '.[voice]'` still resolves on Linux - there
+    # the Apple recognizer is simply unavailable and `available` returns False.
+    # Speech is the recognizer; AVFoundation is the PCM buffer it is fed.
+    "pyobjc-framework-Speech>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-AVFoundation>=10.0; sys_platform == 'darwin'",
 ]
 mcp = [
     # Only needed when DAEMON_MCP_ENABLED is on. The built-in tools need nothing

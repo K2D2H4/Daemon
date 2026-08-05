@@ -248,6 +248,39 @@ async def test_persona_seed_becomes_the_system_turn(
     )
 
 
+async def test_an_edit_to_the_seed_lands_on_the_very_next_turn(
+    data_dir: Path, fake_provider: FakeProvider
+) -> None:
+    """`seed.md` is human-owned and documented as re-read per turn, so an edit takes
+    effect with no restart (docs/PLAN.md 5.1).
+
+    That promise is the whole answer to "it will not stop being so talkative": the
+    fix is one line in a file the user owns, and it has to land immediately. Nothing
+    pinned it - caching the seed after the first read, which is the obvious
+    optimisation, passed the entire suite.
+    """
+    seed = data_dir / "persona" / "seed.md"
+    seed.write_text("I say more than the minimum.\n")
+
+    class EditsBetweenTurns(FakeChannel):
+        """Stands in for the user opening the file mid-conversation."""
+
+        def listen(self) -> AsyncIterator[InboundMessage]:
+            async def stream() -> AsyncIterator[InboundMessage]:
+                yield inbound("hello")
+                seed.write_text("I keep it short.\n")
+                yield inbound("shorter please")
+
+            return stream()
+
+    await ConversationLoop(
+        EditsBetweenTurns([]), gateway_for(fake_provider), FakeMemory(), data_dir=data_dir
+    ).run()
+
+    systems = [call[0].content for call in fake_provider.calls]
+    assert systems == ["I say more than the minimum.", "I keep it short."]
+
+
 async def test_missing_seed_means_no_system_turn(
     data_dir: Path, fake_provider: FakeProvider
 ) -> None:

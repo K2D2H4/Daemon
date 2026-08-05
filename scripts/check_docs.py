@@ -38,6 +38,19 @@ to say where things live was the one document nobody verified.
 
 EXTRA_GLOBS = ("**/CLAUDE.md", "**/AGENTS.md", "docs/adr/*.md")
 
+SKIP_DIRS = {".venv", "venv", ".git", "node_modules", ".claude"}
+"""Directories the recursive globs must not descend into.
+
+`.claude` is the one that bit. Agent sessions create git worktrees under
+`.claude/worktrees/`, each a full copy of the repo, so `**/CLAUDE.md` started
+matching a second and third set of module docs: the count went from 131 paths to
+209 with nothing in the working tree changed. Two ways that is wrong - the number
+stops meaning anything, and a stale doc in an abandoned worktree can fail this
+check for the main tree, where the reference it names is fine.
+
+A checker whose result depends on whether someone happens to have a worktree open
+is the thing this script exists to prevent, one level up."""
+
 BACKTICKED = re.compile(r"`([^`\n]+)`")
 
 # A backticked span is only a path claim if it looks like one. Commands, flags,
@@ -106,18 +119,28 @@ def _candidates(token: str, doc: Path) -> list[Path] | None:
     return [doc.parent / token, ROOT / token]
 
 
-def main() -> int:
-    targets: list[Path] = []
+def targets() -> list[Path]:
+    """Every document this check reads, deduplicated and ordered.
+
+    Its own function so the scope can be asserted on directly. Inlined in `main` it
+    could only be tested by a copy of the same loop, and a test that reimplements
+    the filter it is checking passes whatever the filter does - which is how the
+    `.venv`-only version survived a mutation check.
+    """
+    found: list[Path] = []
     for name in DOCS:
         path = ROOT / name
         if path.exists():
-            targets.append(path)
+            found.append(path)
     for pattern in EXTRA_GLOBS:
-        targets.extend(p for p in ROOT.glob(pattern) if ".venv" not in p.parts)
+        found.extend(p for p in ROOT.glob(pattern) if not SKIP_DIRS.intersection(p.parts))
+    return sorted(set(found))
 
+
+def main() -> int:
     broken: list[tuple[str, str]] = []
     checked = 0
-    for doc in sorted(set(targets)):
+    for doc in targets():
         text = doc.read_text(encoding="utf-8")
         for token in sorted(_claims(text)):
             candidates = _candidates(token, doc)

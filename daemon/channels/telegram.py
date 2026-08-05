@@ -49,6 +49,12 @@ MAX_TEXT_LEN = 4096
 
 _ASCII_DIGITS = re.compile(r"[0-9]+")
 
+DESCRIPTION_LIMIT = 200
+"""Cap on Telegram's `description` when it reaches a log line.
+
+The same bound and the same reason as `BODY_LIMIT` in `daemon/setup.py`: a log line
+whose length the far end chooses is the far end writing our logs."""
+
 POLL_TIMEOUT_SECONDS = 30
 """Server-side long-poll window; getUpdates returns early when updates exist."""
 
@@ -375,6 +381,8 @@ class TelegramChannel:
         # yet had confirmed - which would append the same turn to the log again.
         self._offset = cursor.load_cursor(self.name) if cursor is not None else None
         self._closed = False
+        # Resolved lazily by `identify`, and only to describe a failure.
+        self._handle: str | None = None
         self._log_filter = _TokenFilter(token)
         # The token lives in the URL path (Bot API has no other way), and httpx
         # logs the full request URL at INFO. A filter on the "httpx" logger only
@@ -474,9 +482,31 @@ class TelegramChannel:
                 if exc.retry_after:
                     delay = max(delay, float(exc.retry_after))
                 if exc.status == 409:
-                    # Two instances are polling the same bot. Backing off quietly
-                    # would hide a misconfiguration that never resolves itself.
-                    logger.error("telegram: conflict, another instance is polling: %s", exc)
+                    # Two pollers, one bot. Backing off quietly would hide a
+                    # misconfiguration that never resolves itself - and naming the
+                    # bot is the whole diagnosis, because the other poller is not
+                    # necessarily another daemon. Any tool on this machine holding
+                    # the same token polls the same bot: an install lost hours to a
+                    # 409 whose cause was that TELEGRAM_BOT_TOKEN named the bot a
+                    # Claude Code channel plugin was already polling.
+                    #
+                    # The id goes out first, on its own, before anything that can
+                    # block. `bot_id` needs no call; resolving the handle does, and
+                    # awaiting it *inside* the logging call meant nothing was printed
+                    # until getMe returned - so an operator who saw silence and hit
+                    # Ctrl-C got no 409 line at all, which is worse than the bare
+                    # `HTTP 409` this replaced.
+                    logger.error(
+                        "telegram: 409 conflict on bot id %s - something else is polling "
+                        "this same bot. Not necessarily another daemon: any tool "
+                        "holding this token polls it too. Check that "
+                        "TELEGRAM_BOT_TOKEN names the bot you meant. %s",
+                        self.bot_id,
+                        exc,
+                    )
+                    handle = await self.identify()
+                    if handle:
+                        logger.error("telegram: bot id %s is %s", self.bot_id, handle)
                 else:
                     logger.warning("telegram: %s; retrying in %.1fs", exc, delay)
                 await _sleep(delay)
@@ -752,22 +782,113 @@ class TelegramChannel:
             raise TelegramError(f"{method} failed: {detail}")
         if response.status_code != 200:
             retry_after = None
+            description = None
             try:
-                retry_after = (response.json().get("parameters") or {}).get("retry_after")
+                body = response.json()
+                if isinstance(body, dict):
+                    retry_after = (body.get("parameters") or {}).get("retry_after")
+                    description = body.get("description")
             except ValueError:
                 pass  # not every error response is JSON
+            # Keep the description. On a 409 it *is* the diagnosis - "terminated by
+            # other getUpdates request" and "can't use getUpdates method while
+            # webhook is active" need opposite actions and share the status code.
+            # `daemon setup` already learned this the expensive way; this path had
+            # not, so `daemon run` logged a bare `HTTP 409` for hours.
+            detail = f"{method} returned HTTP {response.status_code}"
+            said = self._said(description)
+            if said:
+                detail = f"{detail}: {said}"
             raise TelegramError(
-                f"{method} returned HTTP {response.status_code}",
+                detail,
                 status=response.status_code,
                 retry_after=retry_after if isinstance(retry_after, int) else None,
             )
-        body = response.json()
+        # Both guards exist because this method is now called from inside the poll
+        # loop's own `except` clause. An exception raised in one `except` is not
+        # offered to the siblings of the same `try`, so a raw ValueError here
+        # escaped the async generator and killed the inbound path - the failure this
+        # file has already paid for twice.
+        try:
+            body = response.json()
+        except ValueError:
+            # A 200 that is not JSON: a captive portal, or an intercepting proxy.
+            raise TelegramError(f"{method} answered 200 with a non-JSON body") from None
+        if not isinstance(body, dict):
+            raise TelegramError(
+                f"{method} answered 200 with {type(body).__name__}, not an object"
+            )
         if not body.get("ok"):
             raise TelegramError(
-                f"{method} rejected: {self._redact(str(body.get('description')))}",
+                f"{method} rejected: {self._said(body.get('description'))}",
                 status=body.get("error_code") if isinstance(body.get("error_code"), int) else None,
             )
         return body.get("result")
 
     def _redact(self, text: str) -> str:
         return text.replace(self._token, "<token>")
+
+    def _said(self, description: Any) -> str:
+        """Telegram's own `description`, made safe to log. Empty when there is none.
+
+        Untrusted text on its way to a log, so three things happen to it, and
+        `daemon/setup.py`'s `_telegram_said` does the same three for the same field.
+        The token is redacted, because an error body may echo request context and
+        for the Bot API the token is in the path. Control characters go, because an
+        escape sequence in a log line lets the far end repaint the line after it -
+        and a newline lets it forge a whole record. And it is bounded, because a log
+        line whose length someone else chooses is someone else writing our logs.
+        """
+        if not isinstance(description, str) or not description:
+            return ""
+        collapsed = " ".join(self._redact(description).split())
+        printable = "".join(char for char in collapsed if char.isprintable())
+        return printable[:DESCRIPTION_LIMIT]
+
+    @property
+    def bot_id(self) -> str:
+        """The numeric half of the token.
+
+        Not a secret - it is the bot's user id, visible to anyone the bot has ever
+        replied to - and it is the one thing that tells two tokens apart. Free:
+        no API call, so it can go in a message that fires on a failure path.
+
+        The `":" in` guard is what keeps that promise true. `split(":", 1)[0]` on a
+        token with no separator returns the whole token, so a malformed value in
+        `.env` would have put the secret in a log line under a docstring promising
+        it was safe.
+        """
+        return self._token.split(":", 1)[0] if ":" in self._token else "<unparseable token>"
+
+    async def identify(self) -> str:
+        """`@handle` for this token, or `""` if `getMe` cannot say.
+
+        Costs one call, cached including the failure, and only ever used to describe
+        a failure. Worth it: a 409 means some *other* process holds this bot, and
+        the only useful question is which bot the token actually names. A real
+        install spent hours on a 409 whose whole answer was that
+        `TELEGRAM_BOT_TOKEN` pointed at a bot another tool on the same machine was
+        already polling.
+
+        **Cannot raise.** It is called from inside the poll loop's own `except`
+        clause, where an exception is not offered to the siblings of the same `try`
+        and so escapes the async generator - which is how a process stays alive,
+        `/health`-green and permanently deaf. `except Exception` rather than
+        `TelegramError` because `_call` reaches this through a JSON body of the
+        wrong shape and through httpx's bare `RuntimeError` on a closed client;
+        `CancelledError` is a `BaseException` and still propagates, as it must.
+
+        The failure is cached too, so a 409 storm costs one `getMe` and not one per
+        poll - and the reason is logged rather than swallowed, because a missing
+        handle with no explanation is the original defect wearing a different hat.
+        """
+        if self._handle is None:
+            self._handle = ""  # set first: an early return must not retry per-409
+            try:
+                me = await self._call("getMe", {})
+                username = me.get("username") if isinstance(me, dict) else None
+                if isinstance(username, str) and username:
+                    self._handle = f"@{username}"
+            except Exception as exc:  # noqa: BLE001 - see the docstring
+                logger.warning("telegram: getMe could not name this bot: %s", exc)
+        return self._handle

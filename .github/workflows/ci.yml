@@ -42,3 +42,9 @@ jobs:
 
       - name: documented paths exist
         run: python3 scripts/check_docs.py
+
+      # The landing page quotes the proactivity defaults as fact and invites the
+      # reader to reproduce them. It shipped with cooldown arithmetic that did
+      # not hold and a foreground app rendered as a block rather than a route.
+      - name: landing page claims match the code
+        run: python3 scripts/check_landing_claims.py
