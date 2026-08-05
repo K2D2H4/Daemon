@@ -594,6 +594,13 @@ def _report(prompt: Prompt, reading: Reading, phrase: str, takes: int) -> bool:
         )
         for line in ALTERNATIVES:
             say(line)
+        say()
+        # Nothing to offer. This used to fall through to `_save`, which defaulted the
+        # answer to No but still printed a Review block naming the three unusable
+        # strings - directly under a line saying to pick a different phrase and run
+        # again. A real run ended in Ctrl-C at exactly that prompt, which is the only
+        # sensible reading of a question the tool had just argued against.
+        return False
     else:
         say(
             status(
@@ -745,6 +752,23 @@ def listen(
         f"alias from {ALIASES_KEY} is what turns it into a wake event.",
     )
     say()
+    if not settings.wake_aliases:
+        # Before the microphone, not after the window. With an empty alias list every
+        # comparison fails, so the run can only ever end in "nothing fired" - and a
+        # real one spent a minute talking to a microphone to be told that. The tally
+        # afterwards said "uncalibrated", which is true of a wrong alias and not of no
+        # alias at all: those are two different states with the same symptom.
+        say(status(theme, "fail", f"{ALIASES_KEY} is empty, so nothing can match."))
+        _prose(
+            prompt,
+            "The gate compares what the recognizer heard against that list, and an "
+            "empty list has nothing to compare against - listening now could only "
+            "end in 'nothing fired', whatever you said. Run `daemon wake calibrate` "
+            "first: it says what this recognizer hears when you speak, and those "
+            "strings are the list.",
+        )
+        say()
+        return PROBLEM
     say(status(theme, "warn", LIVE_MIC))
     say()
     say(

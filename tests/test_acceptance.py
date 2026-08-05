@@ -378,6 +378,65 @@ def test_doctor_reports_a_fresh_install_without_crashing(
     assert main(["doctor"]) != 0, "doctor passed a configuration that cannot load"
 
 
+def test_doctor_says_when_the_shell_is_overriding_the_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The failure this exists for cost hours twice, and both times invisibly.
+
+    pydantic-settings reads the process environment before the file, by design. An
+    install had `TELEGRAM_BOT_TOKEN` exported from `~/.zshrc` for a *different* tool,
+    so every terminal silently pointed `daemon run` at that tool's bot - which the
+    tool was already polling, so every poll was a 409. `.env` named the right bot the
+    whole time and was never used. The 409 message names the bot, which is what found
+    it; this names the reason, which is what would have found it in one command.
+
+    Two ids, no secrets: the numeric half of a bot token is the bot's user id, and it
+    is already printed by the conflict message.
+    """
+    from daemon.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "DAEMON_PRESET=offline\n"
+        "DAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        "TELEGRAM_BOT_TOKEN=8989515019:AAH-the-one-in-the-file\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "8747818363:AAH-the-one-in-the-shell")
+
+    main(["doctor"])
+    printed = capsys.readouterr().out
+
+    assert "environment" in printed
+    assert "8747818363" in printed and "8989515019" in printed, (
+        "it must name both bots - which one is wrong is the owner's call, and they "
+        "cannot make it without seeing both"
+    )
+    assert ".env is being ignored" in printed
+    # The id half is public; the secret half is not, and neither is any other value.
+    assert "AAH-the-one-in-the-shell" not in printed
+    assert "AAH-the-one-in-the-file" not in printed
+
+
+def test_doctor_is_quiet_when_the_environment_agrees_with_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exporting the same value is not a problem, and reporting it as one would train
+    the owner to ignore the check that matters."""
+    from daemon.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+
+    main(["doctor"])
+    printed = capsys.readouterr().out
+
+    assert "nothing in the environment overrides" in printed
+
+
 def test_uninstall_does_not_claim_to_have_installed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

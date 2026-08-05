@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sqlite3
 import sys
 from collections.abc import Sequence
@@ -427,6 +428,7 @@ def _doctor() -> int:
                 True,
                 f"preset={settings.preset} voice={settings.voice_enabled} [{table}]",
             ),
+            _env_override_check(settings),
             _data_dir_check(settings),
             _schema_check(settings),
             _memory_check(settings),
@@ -444,6 +446,55 @@ def _doctor() -> int:
         sys.stdout.flush()
         print(f"\n{failed} check(s) failed.", file=sys.stderr)
     return PROBLEM if failed else OK
+
+
+def _env_override_check(settings: Settings) -> Check:
+    """Does the shell's environment silently outrank `.env`?
+
+    pydantic-settings reads the process environment *before* the file, by design, and
+    that is normally what you want. It stops being what you want when a credential is
+    involved and nobody said so: an install spent hours on a repeating Telegram 409
+    because `~/.zshrc` exported `TELEGRAM_BOT_TOKEN` for a different tool, so every
+    terminal quietly pointed `daemon run` at that tool's bot - which the tool was
+    already polling. `.env` was correct the whole time and never used.
+
+    Nothing is changed here. The environment winning is a legitimate thing to want,
+    and the fix depends on which of the two the owner meant. Values are compared but
+    never printed: only the fact that they differ, and for a bot token the numeric id,
+    which is not a secret.
+    """
+    from daemon.setup import parse_env
+
+    path = Path(".env")
+    if not path.exists():
+        return Check("environment", True, "no .env, so nothing to be overridden")
+    try:
+        on_disk = parse_env(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return Check("environment", False, f"could not read {path}: {exc}")
+
+    clashes: list[str] = []
+    for key, filed in on_disk.items():
+        live = os.environ.get(key)
+        if live is None or live == filed:
+            continue
+        if key == "TELEGRAM_BOT_TOKEN":
+            # The id half identifies the bot and is not a secret - it is what the
+            # 409 message prints, and naming it here is the whole point.
+            clashes.append(
+                f"{key} (env names bot {live.split(':')[0]}, .env names {filed.split(':')[0]})"
+            )
+        else:
+            clashes.append(f"{key} (env value differs)")
+    if not clashes:
+        return Check("environment", True, "nothing in the environment overrides .env")
+    return Check(
+        "environment",
+        False,
+        f"the shell environment overrides .env for {', '.join(clashes)}"
+        " - the environment wins, so .env is being ignored for these."
+        " `unset` them, or remove them from .env, whichever you meant",
+    )
 
 
 def _proactivity_check(settings: Settings) -> Check:

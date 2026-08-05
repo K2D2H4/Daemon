@@ -239,13 +239,20 @@ def value_of(written: str, key: str) -> str:
     return parse_env(written).get(key, "")
 
 
-def settings_for(tmp_path: Path) -> Settings:
-    """A configuration that loads without a key, for the one command that needs one."""
+def settings_for(tmp_path: Path, *, aliases: str = "헤이 대문,루시") -> Settings:
+    """A configuration that loads without a key, for the one command that needs one.
+
+    Aliases by default, because `daemon wake test` with an empty list can only ever
+    end in "nothing fired" - so a suite that left them out was testing the one state
+    the command now refuses to enter, and would have gone on passing if the gate had
+    stopped comparing against the list at all.
+    """
     return Settings(
         _env_file=None,
         DAEMON_PRESET="offline",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path / "data"),
+        DAEMON_WAKE_ALIASES=aliases,
     )
 
 
@@ -331,15 +338,18 @@ def test_two_normal_forms_of_the_same_korean_word_are_one_alias(tmp_path: Path) 
 def test_an_unstable_phrase_is_reported_and_not_written_by_pressing_enter(
     tmp_path: Path,
 ) -> None:
-    """Warned, not silently saved.
+    """Warned, and not offered at all.
 
     Three takes, three different transcriptions: there is no string the gate could
-    match twice, so the write prompt has to default to No. Pressing Enter through
-    the command must not leave a gate that looks configured and never fires.
+    match twice. This asserted a write prompt defaulting to No until a real run
+    showed why that is not enough - the tool printed "This phrase is a bad wake
+    phrase / pick a phrase from the first kind and run this again" and then, four
+    lines later, a Review block naming those three strings and "Write it (y/N)".
+    The run ended in Ctrl-C there, which is the only sensible answer to a question
+    the tool has just argued against. So there is no question now.
 
     Driven with voice already on, which is the state where the switch *would* be
-    offered - so this also pins that it is not offered for a phrase just called a
-    bad one. Turning a gate on for it would contradict the paragraph above it.
+    offered, so this pins that it is not offered either.
     """
     ears = FakeRecognizer(heard=["질문", "헤이씨", "루씨"])
     result = drive(
@@ -350,10 +360,19 @@ def test_an_unstable_phrase_is_reported_and_not_written_by_pressing_enter(
     assert "unstable" in out
     assert "bad wake phrase" in out
     assert "ordinary Korean words transcribe reliably" in out, "it suggests what to try"
-    assert "Write it (y/N)" in out, "the default must be No, so Enter declines"
+    assert "Write it" not in out, (
+        "it offered to save strings it had just called unusable - the contradiction "
+        "a real run stopped at"
+    )
+    assert "Review" not in out, "and it showed them in a Review block as if they were a plan"
     assert "Turn DAEMON_WAKE_ENABLED on" not in out
     assert "DAEMON_WAKE_ALIASES" not in result.written
-    assert result.code == 0, "declining an unstable reading is the right answer"
+    # Non-zero now, and the change is deliberate. It used to exit 0 because
+    # *declining* an offer is a legitimate answer - but there is no offer any more, and
+    # what happened is that the owner ran a command and got no usable phrase out of it.
+    # `daemon wake test` refusing an empty alias list exits 1 for the same reason, so a
+    # script that chains the two stops at the first one that achieved nothing.
+    assert result.code == 1, "nothing usable came out of the run, so it is not a success"
 
 
 def test_a_partly_stable_phrase_is_a_warning_and_still_saves_every_spelling(
@@ -804,6 +823,41 @@ def test_a_gate_that_cannot_be_built_is_a_sentence_and_not_a_traceback(
     assert "the gate could not run" in flattened
     assert "onnxruntime" in flattened
     assert "daemon/voice/wake.py" in flattened, "it names where the gate comes from"
+    assert code == 1
+
+
+def test_wake_test_refuses_before_recording_when_there_are_no_aliases(
+    tmp_path: Path,
+) -> None:
+    """An empty list cannot match anything, so listening is a minute wasted.
+
+    A real run spent 60 seconds talking to the microphone and was then told the
+    aliases looked uncalibrated - which is what a *wrong* alias looks like, not a
+    missing one. Same symptom, different state, and only one of them is worth
+    opening a microphone for.
+    """
+    built: list[bool] = []
+
+    async def never(settings: Settings) -> tuple[FakeGate, Any]:  # pragma: no cover
+        built.append(True)
+        gate = FakeGate(ends=True)
+        return gate, gate.close
+
+    out = io.StringIO()
+    code = wake_cli.listen(
+        settings_for(tmp_path, aliases=""),
+        seconds=WINDOW,
+        stdout=out,
+        devices=devices_for(gate=never),
+    )
+
+    flattened = flat(out.getvalue())
+    assert "is empty, so nothing can match" in flattened
+    assert "daemon wake calibrate" in flattened, "it names the command that fixes it"
+    assert "this room is being listened to" not in flattened, (
+        "it warned about a microphone it had already decided not to open"
+    )
+    assert built == [], "the gate was built, so the microphone was opened anyway"
     assert code == 1
 
 
