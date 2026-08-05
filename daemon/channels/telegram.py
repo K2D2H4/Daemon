@@ -375,6 +375,8 @@ class TelegramChannel:
         # yet had confirmed - which would append the same turn to the log again.
         self._offset = cursor.load_cursor(self.name) if cursor is not None else None
         self._closed = False
+        # Resolved lazily by `identify`, and only to describe a failure.
+        self._handle: str | None = None
         self._log_filter = _TokenFilter(token)
         # The token lives in the URL path (Bot API has no other way), and httpx
         # logs the full request URL at INFO. A filter on the "httpx" logger only
@@ -474,9 +476,21 @@ class TelegramChannel:
                 if exc.retry_after:
                     delay = max(delay, float(exc.retry_after))
                 if exc.status == 409:
-                    # Two instances are polling the same bot. Backing off quietly
-                    # would hide a misconfiguration that never resolves itself.
-                    logger.error("telegram: conflict, another instance is polling: %s", exc)
+                    # Two pollers, one bot. Backing off quietly would hide a
+                    # misconfiguration that never resolves itself - and naming the
+                    # bot is the whole diagnosis, because the other poller is not
+                    # necessarily another daemon. Any tool on this machine holding
+                    # the same token polls the same bot: an install lost hours to a
+                    # 409 whose cause was that TELEGRAM_BOT_TOKEN named the bot a
+                    # Claude Code channel plugin was already polling.
+                    logger.error(
+                        "telegram: 409 conflict on bot %s - something else is polling "
+                        "this same bot. Not necessarily another daemon: any tool "
+                        "holding this token polls it too. Check that "
+                        "TELEGRAM_BOT_TOKEN names the bot you meant. %s",
+                        await self.identify(),
+                        exc,
+                    )
                 else:
                     logger.warning("telegram: %s; retrying in %.1fs", exc, delay)
                 await _sleep(delay)
@@ -752,12 +766,23 @@ class TelegramChannel:
             raise TelegramError(f"{method} failed: {detail}")
         if response.status_code != 200:
             retry_after = None
+            description = None
             try:
-                retry_after = (response.json().get("parameters") or {}).get("retry_after")
+                body = response.json()
+                retry_after = (body.get("parameters") or {}).get("retry_after")
+                description = body.get("description")
             except ValueError:
                 pass  # not every error response is JSON
+            # Keep the description. On a 409 it *is* the diagnosis - "terminated by
+            # other getUpdates request" and "can't use getUpdates method while
+            # webhook is active" need opposite actions and share the status code.
+            # `daemon setup` already learned this the expensive way; this path had
+            # not, so `daemon run` logged a bare `HTTP 409` for hours.
+            detail = f"{method} returned HTTP {response.status_code}"
+            if isinstance(description, str) and description:
+                detail = f"{detail}: {self._redact(description)}"
             raise TelegramError(
-                f"{method} returned HTTP {response.status_code}",
+                detail,
                 status=response.status_code,
                 retry_after=retry_after if isinstance(retry_after, int) else None,
             )
@@ -771,3 +796,32 @@ class TelegramChannel:
 
     def _redact(self, text: str) -> str:
         return text.replace(self._token, "<token>")
+
+    @property
+    def bot_id(self) -> str:
+        """The numeric half of the token.
+
+        Not a secret - it is the bot's user id, visible to anyone the bot has ever
+        replied to - and it is the one thing that tells two tokens apart. Free:
+        no API call, so it can go in a message that fires on a failure path.
+        """
+        return self._token.split(":", 1)[0]
+
+    async def identify(self) -> str:
+        """`@handle (id N)` for this token, or `id N` if `getMe` cannot be reached.
+
+        Costs one call, cached, and only ever used to describe a failure. Worth it:
+        a 409 means some *other* process holds this bot, and the only useful
+        question is which bot the token actually names. A real install spent hours
+        on a 409 whose whole answer was that `TELEGRAM_BOT_TOKEN` pointed at a bot
+        another tool on the same machine was already polling.
+        """
+        if self._handle is None:
+            try:
+                me = await self._call("getMe", {})
+                username = (me or {}).get("username")
+                self._handle = f"@{username}" if username else ""
+            except TelegramError:
+                # Never mask the failure we are trying to explain.
+                self._handle = ""
+        return f"{self._handle} (id {self.bot_id})" if self._handle else f"id {self.bot_id}"

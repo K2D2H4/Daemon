@@ -298,8 +298,15 @@ TELEGRAM_CONFLICT_HINT = (
     "    curl https://api.telegram.org/bot<token>/getWebhookInfo",
     "    curl -X POST https://api.telegram.org/bot<token>/deleteWebhook",
     "",
-    "  Another process is polling this token. Transient: stop the other `daemon run`,",
-    "  or the installed service (`daemon uninstall` removes it), and try again.",
+    "  Something else is polling this bot. Not necessarily another daemon - any tool",
+    "  holding this token polls the same bot, and the bot named above is the thing to",
+    "  check first. Stop the other poller, or point TELEGRAM_BOT_TOKEN at a bot of",
+    "  its own (@BotFather -> /newbot). Candidates, in the order they have bitten:",
+    "    another tool configured with this same bot - a chat-channel plugin, a",
+    "      bridge, an old experiment. Its process outlives the terminal you started",
+    "      it in, so a reboot is not evidence that it is gone.",
+    "    another `daemon setup` or `daemon run` in a second terminal.",
+    "    the installed service - `daemon status` to see it, `daemon uninstall` to stop it.",
     "",
     "  <token> is TELEGRAM_BOT_TOKEN from .env - nothing here exports it to a shell.",
 )
@@ -310,6 +317,14 @@ nothing else, then fell through to `PAIRING_NOTE` - which tells you to run the
 daemon, and the daemon polls the same endpoint and fails the same way. The status
 code alone cannot tell the two causes apart; the description can, and one of them
 is a persistent setting while the other clears itself when a process exits.
+
+The second cause used to say "stop the other `daemon run`", which quietly asserts
+the competitor is ours. It was not. A real install spent hours on a 409 because
+`TELEGRAM_BOT_TOKEN` named a bot that a Claude Code channel plugin was already
+polling from a process nobody remembered starting - so the fix was a second bot,
+not stopping a daemon. The handle printed above that block was the entire
+diagnosis for those hours, and naming only our own processes is what stopped
+anyone reading it.
 
 A block rather than a sentence because it is two diagnoses, two actions and two
 commands to copy. Deliberately no `deleteWebhook` call from here."""
@@ -2163,8 +2178,17 @@ class Wizard:
                 if not batch.ok:
                     # One failure ends it rather than retrying for three minutes:
                     # the token worked seconds ago, so this is the network, and the
-                    # user should hear that instead of watching a spinner.
-                    say(status(theme, "fail", batch.detail))
+                    # user should hear that instead of watching a spinner. A 409 is
+                    # not the network, and retrying is still wrong - a webhook never
+                    # clears, and a competing poller would just make the two of us
+                    # take turns, which reads as flaky rather than as the
+                    # misconfiguration it is.
+                    #
+                    # Name the bot. `handle` is the whole diagnosis when something
+                    # else holds this token, and it is already resolved above for
+                    # the "message this bot" line - an install spent hours on a 409
+                    # whose answer was that this handle belonged to another tool.
+                    say(status(theme, "fail", f"{batch.detail} - on bot {handle}"))
                     for line in batch.hint:
                         # Plain lines rather than `status`: a hint carrying a command
                         # to copy has to keep the indentation it was written with,

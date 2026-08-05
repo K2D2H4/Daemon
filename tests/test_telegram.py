@@ -40,9 +40,11 @@ class StopPolling(Exception):
 class FakeAPI:
     """Scriptable Bot API. Each getUpdates poll consumes one scripted step."""
 
-    def __init__(self, *steps: Any) -> None:
+    def __init__(self, *steps: Any, me_status: int = 200) -> None:
         self.steps = list(steps)
         self.requests: list[tuple[str, dict[str, Any]]] = []
+        self.me_status = me_status
+        """`getMe`'s status. Not 200 when a test needs the bot to be unnameable."""
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -56,6 +58,15 @@ class FakeAPI:
     def _handle(self, request: httpx.Request) -> httpx.Response:
         method = request.url.path.rsplit("/", 1)[-1]
         self.requests.append((method, json.loads(request.content)))
+        if method == "getMe":
+            # Answered without consuming a step, like sendMessage: the 409 path
+            # calls it to name the bot, and a poll script must not be shifted by
+            # whether the channel happened to identify itself.
+            if self.me_status != 200:
+                return httpx.Response(self.me_status, text="nope")
+            return httpx.Response(
+                200, json={"ok": True, "result": {"id": 123456, "username": "someone_bot"}}
+            )
         if method == "sendMessage":
             return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
         if method == "answerCallbackQuery":
@@ -65,6 +76,8 @@ class FakeAPI:
         step = self.steps.pop(0)
         if isinstance(step, Exception):
             raise step
+        if isinstance(step, httpx.Response):  # a status code *and* a body
+            return step
         if isinstance(step, int):  # bare status code
             return httpx.Response(step, text="upstream is unhappy")
         if isinstance(step, dict):  # raw Bot API envelope, e.g. ok=false
@@ -951,3 +964,115 @@ async def test_token_never_appears_in_api_rejection() -> None:
         await ch.send(OutboundMessage(text="hi"))
 
     assert TOKEN not in str(caught.value)
+
+
+# --- a 409 has to name the bot ------------------------------------------------
+# An install spent hours on a repeating 409 from `daemon run`. The log said
+# "another instance is polling" and nothing else, so the search went looking for a
+# second daemon. There was none: TELEGRAM_BOT_TOKEN named a bot that a different
+# tool on the same machine was already polling, and the fix was a second bot. The
+# handle was the whole diagnosis and the log never printed it.
+
+
+def conflict(description: str = "") -> httpx.Response:
+    body: dict[str, Any] = {"ok": False, "error_code": 409}
+    if description:
+        body["description"] = description
+    return httpx.Response(409, json=body)
+
+
+TERMINATED = "Conflict: terminated by other getUpdates request"
+
+
+async def test_a_409_names_the_bot_it_is_about(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    api = FakeAPI(conflict(TERMINATED), [message_update(1, sender_id=OWNER, text="ok")])
+
+    with caplog.at_level(logging.ERROR):
+        await drain(channel(api))
+
+    # The handle and the id: one is readable, the other survives a bot with no
+    # username, and together they answer "which bot is this token?".
+    assert "@someone_bot" in caplog.text
+    assert "123456" in caplog.text
+
+
+async def test_a_409_does_not_claim_the_other_poller_is_ours(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The old message said "another instance is polling", which sent the search
+    after a second daemon that did not exist."""
+    api = FakeAPI(conflict(TERMINATED), [message_update(1, sender_id=OWNER, text="ok")])
+
+    with caplog.at_level(logging.ERROR):
+        await drain(channel(api))
+
+    assert "Not necessarily another daemon" in caplog.text
+    assert "TELEGRAM_BOT_TOKEN" in caplog.text
+
+
+async def test_a_409_keeps_telegrams_own_description(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """409 has two causes needing opposite actions, and only the body says which.
+
+    `daemon setup` already learned this; this path had not, and dropped the
+    description for every non-200 - so `daemon run` logged a bare `HTTP 409`.
+    """
+    api = FakeAPI(conflict(TERMINATED), [message_update(1, sender_id=OWNER, text="ok")])
+
+    with caplog.at_level(logging.ERROR):
+        await drain(channel(api))
+
+    assert "terminated by other getUpdates request" in caplog.text
+
+
+async def test_a_webhook_409_is_distinguishable_from_the_other_one(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    webhook = "Conflict: can't use getUpdates method while webhook is active"
+    api = FakeAPI(conflict(webhook), [message_update(1, sender_id=OWNER, text="ok")])
+
+    with caplog.at_level(logging.ERROR):
+        await drain(channel(api))
+
+    assert "webhook is active" in caplog.text
+    # Same status code, different sentence - which is the entire point.
+    assert "terminated by other" not in caplog.text
+
+
+async def test_a_409_still_reports_when_getMe_cannot_answer(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Naming the bot must never mask the failure being named.
+
+    `identify` falls back to the token's own numeric half, which needs no call at
+    all - it is the bot's user id, not a secret.
+    """
+
+    api = FakeAPI(
+        conflict(TERMINATED),
+        [message_update(1, sender_id=OWNER, text="ok")],
+        me_status=500,
+    )
+    with caplog.at_level(logging.ERROR):
+        await drain(channel(api))
+
+    assert "409" in caplog.text
+    assert "id 123456" in caplog.text  # the token's own prefix, no call needed
+    assert "@" not in caplog.text.split("409 conflict on bot")[1].split(" - ")[0]
+
+
+async def test_the_token_never_reaches_the_conflict_log(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The 409 path builds a new message and calls getMe, so it is a new chance to
+    leak the secret half of the token."""
+    api = FakeAPI(conflict(TERMINATED), [message_update(1, sender_id=OWNER, text="ok")])
+
+    with caplog.at_level(logging.ERROR):
+        await drain(channel(api))
+
+    assert TOKEN not in caplog.text
+    assert "AAHfake-token-value" not in caplog.text
