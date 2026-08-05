@@ -399,16 +399,16 @@ def test_doctor_says_when_the_shell_is_overriding_the_env_file(
     (tmp_path / ".env").write_text(
         "DAEMON_PRESET=offline\n"
         "DAEMON_OLLAMA_MODEL=gemma3:4b\n"
-        "TELEGRAM_BOT_TOKEN=8989515019:AAH-the-one-in-the-file\n",
+        "TELEGRAM_BOT_TOKEN=1111111111:AAH-the-one-in-the-file\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "8747818363:AAH-the-one-in-the-shell")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "2222222222:AAH-the-one-in-the-shell")
 
     main(["doctor"])
     printed = capsys.readouterr().out
 
     assert "environment" in printed
-    assert "8747818363" in printed and "8989515019" in printed, (
+    assert "2222222222" in printed and "1111111111" in printed, (
         "it must name both bots - which one is wrong is the owner's call, and they "
         "cannot make it without seeing both"
     )

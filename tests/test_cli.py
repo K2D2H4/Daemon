@@ -226,17 +226,17 @@ def test_run_warns_when_the_shell_overrides_the_env_file(
     (tmp_path / ".env").write_text(
         "DAEMON_PRESET=offline\n"
         "DAEMON_OLLAMA_MODEL=gemma3:4b\n"
-        "TELEGRAM_BOT_TOKEN=8989515019:AAH-in-the-file\n",
+        "TELEGRAM_BOT_TOKEN=1111111111:AAH-in-the-file\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "8747818363:AAH-in-the-shell")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "2222222222:AAH-in-the-shell")
     monkeypatch.setattr(cli, "_serve", lambda settings: 0)
 
     with caplog.at_level(logging.WARNING):
         assert cli.main(["run"]) == 0
 
     assert "overrides .env" in caplog.text
-    assert "8747818363" in caplog.text and "8989515019" in caplog.text
+    assert "2222222222" in caplog.text and "1111111111" in caplog.text
     # The id half is the bot's user id and public; the secret half is neither.
     assert "AAH-in-the-shell" not in caplog.text
 
