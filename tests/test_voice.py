@@ -24,6 +24,8 @@ import pytest
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK, InvalidStatus
 from websockets.frames import Close
 
+from daemon.llm.base import ToolCall, ToolSpec, call_name
+from daemon.tools.base import ToolResult
 from daemon.voice import gemini_live
 from daemon.voice.base import Interrupted, Transcript, VoiceSession
 from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
@@ -1141,3 +1143,341 @@ async def test_a_session_that_never_opens_still_removes_its_log_filter() -> None
             pass  # pragma: no cover
 
     assert [len(h.filters) for h in root.handlers] == before
+
+
+# --- tool calling -----------------------------------------------------------
+# The frame only. Nothing in `daemon/` offers a tool to a voice session yet, so
+# nothing here drives a whole tool round trip through `VoiceConversation` - that
+# is PR-2b's, and `tests/test_reachable.py` says so out loud.
+#
+# https://ai.google.dev/gemini-api/docs/live-tools
+
+READ_FILE = ToolSpec(
+    name="read_file",
+    description="Read a text file the owner has allowed.",
+    parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+)
+
+
+def tool_call(*calls: dict[str, Any]) -> dict[str, Any]:
+    """A server `toolCall`. Note it is a **sibling** of `serverContent`, not a
+    field inside it - which is why `_decode` cannot read it after the early return
+    that gives up on a message with no `serverContent`."""
+    return {"toolCall": {"functionCalls": list(calls)}}
+
+
+async def opened(connection: FakeConnection, **kwargs: Any) -> GeminiLiveSession:
+    live = session(connection, **kwargs)
+    await live.__aenter__()
+    return live
+
+
+async def test_no_tools_means_no_tool_frame_at_all() -> None:
+    """An install with tools off must send exactly what it sent before this
+    existed. An empty `tools: []` is not that - it is a new field on the wire, and
+    a wrong field closes the socket 1007, which this file classifies permanent."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection):
+        pass
+
+    assert "tools" not in connection.messages("setup")[0]
+
+
+async def test_a_tool_reaches_setup_as_a_function_declaration() -> None:
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection, tools=[READ_FILE]):
+        pass
+
+    (setup,) = connection.messages("setup")
+    (group,) = setup["tools"]
+    (declared,) = group["functionDeclarations"]
+    assert declared["name"] == "read_file"
+    assert declared["description"] == READ_FILE.description
+    assert declared["parameters"] == READ_FILE.parameters
+
+
+async def test_every_tool_goes_in_one_group_not_one_group_each() -> None:
+    """The API takes a list of tool *objects* and a function is a declaration
+    inside one of them - the same shape `llm/providers/gemini.py` sends."""
+    other = ToolSpec(name="notify", description="Say something.", parameters={})
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection, tools=[READ_FILE, other]):
+        pass
+
+    (group,) = connection.messages("setup")[0]["tools"]
+    assert [d["name"] for d in group["functionDeclarations"]] == ["read_file", "notify"]
+
+
+async def test_a_declaration_carries_no_behavior_unless_asked() -> None:
+    """`behavior: NON_BLOCKING` is what turns on asynchronous function calling, and
+    the docs say it is not supported on the model this repo runs. Sending it by
+    default would be betting the socket on a doc being out of date."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection, tools=[READ_FILE]):
+        pass
+
+    (declared,) = connection.messages("setup")[0]["tools"][0]["functionDeclarations"]
+    assert "behavior" not in declared
+
+
+async def test_non_blocking_is_expressible_for_the_spike_that_measures_it() -> None:
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection, tools=[READ_FILE], tool_behavior="NON_BLOCKING"):
+        pass
+
+    (declared,) = connection.messages("setup")[0]["tools"][0]["functionDeclarations"]
+    assert declared["behavior"] == "NON_BLOCKING"
+
+
+@pytest.mark.parametrize("behavior", ["non_blocking", "BLOCKING", "nonsense"])
+def test_an_unknown_behavior_is_refused_at_construction(behavior: str) -> None:
+    """Checked here rather than left to the server, for the reason the
+    sensitivities are: the server's answer is a 1007 close, classified permanent,
+    so a typo would not fail the setting - it would end voice mode."""
+    with pytest.raises(ValueError, match="behavior"):
+        GeminiLiveSession(KEY, MODEL, tool_behavior=behavior)
+
+
+@pytest.mark.parametrize("scheduling", ["interrupt", "NOW", "none"])
+def test_an_unknown_scheduling_is_refused_at_construction(scheduling: str) -> None:
+    """Empty is not in the list: empty means "omit the field", which is the
+    default and the only thing sent today."""
+    with pytest.raises(ValueError, match="scheduling"):
+        GeminiLiveSession(KEY, MODEL, tool_scheduling=scheduling)
+
+
+# --- receiving a call -------------------------------------------------------
+
+
+async def test_a_tool_call_is_yielded_from_receive() -> None:
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        tool_call({"id": "fc_1", "name": "read_file", "args": {"path": "메모.md"}}),
+        {"serverContent": {"turnComplete": True}},
+    )
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        items = await drain(live)
+    finally:
+        await live.close()
+
+    assert items == [ToolCall(id="fc_1", name="read_file", arguments={"path": "메모.md"})]
+
+
+async def test_a_call_with_no_id_gets_a_synthesised_one() -> None:
+    """Documented as optional, and `llm/providers/gemini.py` already had to invent
+    one because the REST API issues none at all. A result cannot be paired with a
+    request without something in that field."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        tool_call({"name": "read_file", "args": {}}),
+        {"serverContent": {"turnComplete": True}},
+    )
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        (call,) = await drain(live)
+    finally:
+        await live.close()
+
+    assert isinstance(call, ToolCall)
+    assert call.id and call_name(call.id) == "read_file"
+
+
+async def test_a_call_with_no_name_is_dropped_rather_than_yielded_nameless() -> None:
+    """Nothing could be run and nothing could be answered, so handing it up would
+    only move the crash."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        tool_call({"id": "fc_1", "args": {}}),
+        {"serverContent": {"turnComplete": True}},
+    )
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        assert await drain(live) == []
+    finally:
+        await live.close()
+
+
+async def test_a_tool_call_nobody_offered_a_tool_for_is_not_yielded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cross-PR guard. `VoiceConversation` today routes anything that is not
+    audio and not `Interrupted` to `_on_transcript`, so a `ToolCall` reaching it
+    would be recorded as something the owner said. A session that declared no
+    tools cannot legitimately receive one, and staying quiet about it is what this
+    project treats as the dangerous failure - hence the log."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        tool_call({"id": "fc_1", "name": "read_file", "args": {}}),
+        {"serverContent": {"turnComplete": True}},
+    )
+    live = await opened(connection)
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert await drain(live) == []
+    finally:
+        await live.close()
+
+    assert "no tool was offered" in caplog.text
+
+
+async def test_a_cancellation_is_reported_and_not_answered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`toolCallCancellation` carries ids the server no longer wants answers for.
+    Nothing above this can act on it yet, so it is logged rather than swallowed -
+    a documented server message that vanishes silently is how a wrong answer gets
+    sent back to a call nobody is waiting for."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        {"toolCallCancellation": {"ids": ["fc_1"]}},
+        {"serverContent": {"turnComplete": True}},
+    )
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        with caplog.at_level(logging.INFO):
+            assert await drain(live) == []
+    finally:
+        await live.close()
+
+    assert "fc_1" in caplog.text
+
+
+async def test_a_call_arriving_with_audio_comes_after_it() -> None:
+    """One server event can carry several fields, and `toolCall` is a sibling of
+    `serverContent` rather than a field in it, so in principle both can land at
+    once. Audio first: PR-2b's consumer will `await` the tool inside this loop, and
+    a chunk yielded after that would be a chunk the speaker got late.
+
+    The combination is not documented and was not observed - `toolCall` arrives as
+    its own server message. What is asserted here is only that the order is the one
+    chosen on purpose rather than whichever the dict happened to give.
+    """
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        {**audio_frame(b"pcm"), **tool_call({"id": "fc_1", "name": "read_file", "args": {}})},
+        {"serverContent": {"turnComplete": True}},
+    )
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        items = await drain(live)
+    finally:
+        await live.close()
+
+    assert items == [b"pcm", ToolCall(id="fc_1", name="read_file", arguments={})]
+
+
+# --- answering a call -------------------------------------------------------
+
+
+async def test_a_result_goes_back_as_a_function_response() -> None:
+    connection = FakeConnection(SETUP_COMPLETE)
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        await live.send_tool_response(
+            [ToolResult(call_id="fc_1", name="read_file", content="안녕")]
+        )
+    finally:
+        await live.close()
+
+    (response,) = connection.messages("toolResponse")
+    (answered,) = response["functionResponses"]
+    assert answered["id"] == "fc_1"
+    assert answered["name"] == "read_file"
+    assert answered["response"] == {"result": "안녕"}
+
+
+async def test_a_failed_tool_says_so_rather_than_returning_its_error_as_a_result() -> None:
+    """The model has to be able to tell "the file said this" from "the read
+    failed", or it reports a refusal as content."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        await live.send_tool_response(
+            [ToolResult(call_id="fc_1", name="read_file", content="refused: nope", ok=False)]
+        )
+    finally:
+        await live.close()
+
+    (answered,) = connection.messages("toolResponse")[0]["functionResponses"]
+    assert answered["response"] == {"error": "refused: nope"}
+
+
+async def test_several_results_go_back_in_one_message() -> None:
+    """One `toolResponse` per round, not per call: the server pairs by id, and a
+    message per result is a message per chance to interrupt generation."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        await live.send_tool_response(
+            [
+                ToolResult(call_id="fc_1", name="read_file", content="a"),
+                ToolResult(call_id="fc_2", name="read_file", content="b"),
+            ]
+        )
+    finally:
+        await live.close()
+
+    (response,) = connection.messages("toolResponse")
+    assert [r["id"] for r in response["functionResponses"]] == ["fc_1", "fc_2"]
+
+
+async def test_nothing_to_answer_sends_nothing() -> None:
+    """An empty frame on a per-minute-billed socket buys nothing, and `clientContent`
+    has already taught this file that a needless client message can cost a turn."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        await live.send_tool_response([])
+    finally:
+        await live.close()
+
+    assert connection.messages("toolResponse") == []
+
+
+async def test_a_response_carries_no_scheduling_unless_asked() -> None:
+    """The default is not INTERRUPT, and not WHEN_IDLE or SILENT either: the field
+    is absent, because it only means anything for a NON_BLOCKING declaration and
+    this session does not send one. See `TOOL_SCHEDULING` for what is measured and
+    what is not."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    live = await opened(connection, tools=[READ_FILE])
+    try:
+        await live.send_tool_response([ToolResult(call_id="fc_1", name="read_file", content="a")])
+    finally:
+        await live.close()
+
+    (answered,) = connection.messages("toolResponse")[0]["functionResponses"]
+    assert "scheduling" not in answered
+
+
+@pytest.mark.parametrize("scheduling", ["INTERRUPT", "WHEN_IDLE", "SILENT"])
+async def test_scheduling_is_expressible_for_the_spike_that_measures_it(
+    scheduling: str,
+) -> None:
+    connection = FakeConnection(SETUP_COMPLETE)
+    live = await opened(
+        connection, tools=[READ_FILE], tool_behavior="NON_BLOCKING", tool_scheduling=scheduling
+    )
+    try:
+        await live.send_tool_response([ToolResult(call_id="fc_1", name="read_file", content="a")])
+    finally:
+        await live.close()
+
+    (answered,) = connection.messages("toolResponse")[0]["functionResponses"]
+    assert answered["scheduling"] == scheduling
+
+
+async def test_answering_a_closed_session_raises_the_normalised_error() -> None:
+    """Same path every other send takes: a websockets exception must not escape,
+    because its message can quote the URI."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    live = await opened(connection, tools=[READ_FILE])
+    await connection.close()
+    try:
+        with pytest.raises(GeminiLiveError):
+            await live.send_tool_response(
+                [ToolResult(call_id="fc_1", name="read_file", content="a")]
+            )
+    finally:
+        await live.close()

@@ -129,3 +129,12 @@ package. Rules: [CONTRACTS.md](../docs/CONTRACTS.md). Data flow:
 - **Two Telegram traps.** The inbound poll needs a floor — left to the long poll alone, a
   transport that returns immediately spins at ~16,000 requests/second. And `allowed_updates`
   is **server-side**: at `["message"]` a 👍 press is never delivered at all.
+- **Which tools `mode=allowlist` could never run was guessed wrong in both
+  directions.** The guess was `write_file`, `open_path` and `notify`. Enumerated
+  instead: `notify` is `risk="safe"` and never reaches the mode check at all, and
+  `open_path` *does* implement `argv`, so of the ten built-in and browser tools
+  exactly **one** — `write_file` — was stuck. The group it actually cost is MCP:
+  `McpTool` has no argv by construction and is `guarded` unless `data/mcp.json` names it
+  safe, so `allowlist` refused every remote tool an owner added. `tool_grants` is
+  that second axis, and it is read only for tools that are *not* `Executable` —
+  a tool-level grant on `run_command` would be `mode=full` wearing one table row.

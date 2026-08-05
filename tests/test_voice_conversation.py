@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import pathlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from websockets.exceptions import ConnectionClosedOK
 from websockets.frames import Close
 
 from daemon.memory.base import LoggedMessage, RecalledItem
+from daemon.tools.base import ToolResult
 from daemon.voice import conversation as conversation_module
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 from daemon.voice.conversation import VoiceConversation
@@ -88,10 +90,11 @@ class Hang:
 class FakeSession:
     """A scripted `VoiceSession`, protocol-complete.
 
-    All six methods are the protocol's now, including the three the audit added, so
-    the conversation calls them rather than hunting for them - and a fake that
-    lacked one would fail `test_the_fakes_satisfy_the_protocols` instead of quietly
-    exercising a fallback the product does not have.
+    All seven methods are the protocol's now, including the three the audit added
+    and `send_tool_response`, so the conversation calls them rather than hunting for
+    them - and a fake that lacked one would fail
+    `test_the_fakes_satisfy_the_protocols` instead of quietly exercising a fallback
+    the product does not have.
 
     One `receive()` is one turn: the script is consumed across calls and a `Turn`
     step ends the iterator, which is what the real session does at
@@ -107,6 +110,7 @@ class FakeSession:
         self.texts: list[str] = []
         self.contexts: list[str] = []
         self.sent_while_generating: list[str] = []
+        self.tool_responses: list[list[ToolResult]] = []
         self.generating = False
         self.interrupts = 0
         self.entered = False
@@ -141,6 +145,15 @@ class FakeSession:
         # tell the fixed behaviour from the bug.
         if self.generating:
             self.sent_while_generating.append(text)
+
+    async def send_tool_response(self, results: Sequence[ToolResult]) -> None:
+        # Recorded and unused. Nothing in `VoiceConversation` offers a tool to a
+        # session yet - PR-2b owns that, and `tests/test_reachable.py` says so - but
+        # the method is the protocol's, so a fake without it would fail
+        # `test_the_fakes_satisfy_the_protocols` rather than quietly let the
+        # conversation find some fallback the product does not have.
+        self.tool_responses.append(list(results))
+        self.events.append("tool_response")
 
     async def interrupt(self) -> None:
         self.interrupts += 1

@@ -22,9 +22,22 @@ the `voice` extra so a text-only install does not need PortAudio.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+
+from daemon.llm.base import ToolCall
+from daemon.tools.base import ToolResult
+
+# `ToolCall` and `ToolResult` rather than voice-shaped copies of them. A spoken
+# tool call is the same event as a typed one - the model asking for a named thing
+# with decoded arguments - and it goes to the same `ToolRunner`, through the same
+# `ToolPolicy`, leaving the same `tool_calls` row. A second pair of dataclasses
+# would be a second place for the origin gate to be got wrong, and the whole
+# reason that gate is trustworthy is that there is one of it.
+# Both modules imported here are protocol files themselves, so this is a sideways
+# import and not a layering break: `tools/base.py` already imports `llm/base.py`
+# for `ToolSpec`.
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,9 +132,36 @@ class VoiceSession(Protocol):
         the machine (docs/PLAN.md 6.3) - and which never leaves the device."""
         ...
 
-    def receive(self) -> AsyncIterator[bytes | Transcript | Interrupted]:
+    async def send_tool_response(self, results: Sequence[ToolResult]) -> None:
+        """Answer the tool calls this turn asked for, in one message.
+
+        One message per round rather than one per call: the server pairs a result
+        to its request by `ToolResult.call_id`, and every extra client message is
+        another chance to interrupt generation - which is not a theoretical cost
+        here. `send_context` is `clientContent`, the Live API says a message there
+        "will interrupt any current model generation", and one recall seed
+        mid-answer cut a 46.7 s turn down to 2.2 s of audio (`Interrupted`).
+
+        A `toolResponse` is a different top-level message from `clientContent` and
+        the docs claim nothing about it interrupting. That is inference, not
+        measurement: `evals/m1c_voice_tools_spike.py` is what settles it, and
+        `daemon/voice/gemini_live.py` records what it found.
+
+        Whether a caller may answer at all is not this seam's question. The
+        origin gate (`daemon/tools/policy.py`) decides that, and it decides it for
+        a spoken turn exactly as for a typed one.
+        """
+        ...
+
+    def receive(self) -> AsyncIterator[bytes | Transcript | Interrupted | ToolCall]:
         """Interleaved output for one turn: audio to play, transcripts to record,
-        and the provider saying the user cut in.
+        the provider saying the user cut in, and tools the model wants run.
+
+        A `ToolCall` is only ever yielded by a session that was given tool specs
+        to declare. A caller that offered none cannot receive one, which is what
+        makes it safe for `VoiceConversation` to have routed everything that is
+        neither audio nor `Interrupted` to the transcript path for as long as it
+        has.
 
         **Ends at the turn boundary.** Measured: a turn that answered in 2.6 s
         and delivered its final transcript then blocked forever, and the server

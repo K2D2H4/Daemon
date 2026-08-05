@@ -32,7 +32,7 @@ import json
 import logging
 import os
 import ssl
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from typing import Any
 
 import certifi
@@ -44,6 +44,8 @@ from websockets.exceptions import (
     InvalidStatus,
 )
 
+from daemon.llm.base import ToolCall, ToolSpec, decode_tool_arguments, synthesise_call_id
+from daemon.tools.base import ToolResult
 from daemon.voice.base import Interrupted, Transcript
 
 logger = logging.getLogger(__name__)
@@ -100,6 +102,50 @@ already what omitting the field does."""
 
 _START_SENSITIVITY = {name: f"START_SENSITIVITY_{name.upper()}" for name in SENSITIVITIES}
 _END_SENSITIVITY = {name: f"END_SENSITIVITY_{name.upper()}" for name in SENSITIVITIES}
+
+# --- tool calling -------------------------------------------------------------
+# https://ai.google.dev/gemini-api/docs/live-tools
+#
+# Two knobs, both **off by default**, and the default is the load-bearing part.
+#
+# A declaration with no `behavior` is a *blocking* function call: the model asks,
+# stops, and waits for the answer. Then `scheduling` on the response means nothing
+# - it is documented only for `NON_BLOCKING`, where the model kept talking and has
+# to be told what to do with an answer that arrived late. So sending neither field
+# is not a timid default, it is the only coherent one for a blocking call, and it
+# is why `INTERRUPT` is not the default: there is nothing here for it to schedule.
+#
+# **What is measured and what is not.** The reason to care is
+# `daemon/voice/base.py`'s `Interrupted`: `clientContent` mid-answer killed the
+# reply on every turn - 2.2 s of audio with recall on, 46.7 s with it off, 38.8 s
+# deferred to the turn boundary. A `toolResponse` is a *different* top-level client
+# message and the docs claim nothing about it interrupting, but "different message
+# type, therefore safe" is inference and this file's own history says inference
+# loses to the socket. `evals/m1c_voice_tools_spike.py` asks the socket. It has not
+# been run: the key lives in the owner's `.env` and this work was asked not to read
+# it, so there are no numbers to put here yet and none are invented.
+#
+# One thing the docs already answer, and it is not the answer the shape of the
+# names suggests: **asynchronous function calling is documented as unsupported on
+# Gemini 3.1 Flash Live**, which is the model this repo runs
+# (`evals/m0_voice_spike.py`, `RECOMMENDED_MODEL`). So `NON_BLOCKING` and therefore
+# `scheduling` may be rejected outright here, and the spike's first question is
+# whether they are accepted at all rather than which value is best.
+
+TOOL_BEHAVIORS = ("NON_BLOCKING",)
+"""What a caller may ask for, beyond the default of not sending the field.
+
+Only one value, because the other one *is* the absent field: the API's default
+behaviour is blocking, and `"BLOCKING"` is not a spelling it documents."""
+
+TOOL_SCHEDULING = ("INTERRUPT", "WHEN_IDLE", "SILENT")
+"""What to do with a `NON_BLOCKING` answer: cut the model off, wait for it to
+finish, or keep the answer without saying anything.
+
+Accepted here without requiring `NON_BLOCKING` alongside it, on purpose - "does
+this field do anything on a blocking call?" is one of the questions the spike
+exists to ask, and a constructor that refused the combination would answer it by
+assumption. A warning is logged instead."""
 
 _PERMANENT_STATUS = frozenset({400, 401, 403, 404})
 """Handshake statuses that retrying cannot fix: a bad, revoked or unauthorised
@@ -256,6 +302,9 @@ class GeminiLiveSession:
         end_sensitivity: str = "",
         prefix_padding_ms: int | None = None,
         silence_duration_ms: int | None = None,
+        tools: Sequence[ToolSpec] = (),
+        tool_behavior: str = "",
+        tool_scheduling: str = "",
         connect: Any = None,
         url: str = WS_URL,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
@@ -285,6 +334,32 @@ class GeminiLiveSession:
         self._end_sensitivity = end_sensitivity
         self._prefix_padding_ms = prefix_padding_ms
         self._silence_duration_ms = silence_duration_ms
+        # Same reasoning as the sensitivities above, and the same consequence for
+        # getting it wrong: an unknown enum value comes back as a 1007 close, which
+        # `_permanent_close` classifies permanent, so a typo would not fail the
+        # setting - it would end voice mode with a message about invalid arguments.
+        if tool_behavior and tool_behavior not in TOOL_BEHAVIORS:
+            raise ValueError(
+                f"tool behavior must be one of {TOOL_BEHAVIORS} or empty, not {tool_behavior!r}"
+            )
+        if tool_scheduling and tool_scheduling not in TOOL_SCHEDULING:
+            raise ValueError(
+                f"tool scheduling must be one of {TOOL_SCHEDULING} or empty, "
+                f"not {tool_scheduling!r}"
+            )
+        if tool_scheduling and not tool_behavior:
+            # Not refused - see `TOOL_SCHEDULING`. Said out loud, because a null
+            # result from the spike would otherwise be indistinguishable from the
+            # server ignoring a field that needs a companion it did not get.
+            logger.warning(
+                "gemini-live: tool_scheduling=%s without tool_behavior=NON_BLOCKING; "
+                "scheduling is documented only for non-blocking calls, so the server "
+                "may ignore it",
+                tool_scheduling,
+            )
+        self._tools = tuple(tools)
+        self._tool_behavior = tool_behavior
+        self._tool_scheduling = tool_scheduling
         self._connect = connect if connect is not None else websockets.connect
         self._url = url
         self._max_attempts = max(1, max_attempts)
@@ -436,7 +511,38 @@ class GeminiLiveSession:
             return
         await self._send({"realtimeInput": {"text": text}})
 
-    async def receive(self) -> AsyncIterator[bytes | Transcript | Interrupted]:
+    async def send_tool_response(self, results: Sequence[ToolResult]) -> None:
+        """Answer this turn's tool calls, all of them in one message.
+
+        `ok` decides the key, not just the text: `{"result": ...}` and
+        `{"error": ...}` are what let the model tell "the file said this" from "the
+        read was refused". Handing a refusal back under `result` is how a policy
+        denial gets reported to the owner as content.
+
+        Sends nothing when there is nothing to answer. An empty frame on a
+        per-minute-billed socket buys nothing, and `send_context` has already taught
+        this file that a needless client message can cost a turn.
+        """
+        if not results:
+            logger.debug("gemini-live: no tool results to send")
+            return
+        answers: list[dict[str, Any]] = []
+        for result in results:
+            answer: dict[str, Any] = {
+                "id": result.call_id,
+                # Both, though the id alone should pair them: the REST half of this
+                # API issues no ids at all and pairs by name (llm/providers/gemini.py),
+                # so a server that ignores one of the two still has the other.
+                "name": result.name,
+                # Must be an object, never a bare string.
+                "response": {"result" if result.ok else "error": result.content},
+            }
+            if self._tool_scheduling:
+                answer["scheduling"] = self._tool_scheduling
+            answers.append(answer)
+        await self._send({"toolResponse": {"functionResponses": answers}})
+
+    async def receive(self) -> AsyncIterator[bytes | Transcript | Interrupted | ToolCall]:
         """One turn: audio chunks to play, interleaved with completed transcripts.
 
         Only `final=True` transcripts are ever yielded. Gemini streams
@@ -674,10 +780,40 @@ class GeminiLiveSession:
         }
         if self._system_instruction:
             setup["systemInstruction"] = {"parts": [{"text": self._system_instruction}]}
+        if self._tools:
+            # Only when there is something to declare. An empty `tools: []` is a
+            # new field on the wire for no gain, and this file has already been
+            # closed with 1007 "Unknown name" for putting a field in the wrong
+            # place - the cost of a wrong field here is the whole session.
+            #
+            # One tool *object* holding every declaration, not one object each:
+            # `llm/providers/gemini.py` says the same thing about the REST API,
+            # which is the same proto.
+            setup["tools"] = [{"functionDeclarations": self._function_declarations()}]
         detection = self._activity_detection()
         if detection:
             setup["realtimeInputConfig"] = {"automaticActivityDetection": detection}
         return {"setup": setup}
+
+    def _function_declarations(self) -> list[dict[str, Any]]:
+        """`ToolSpec` as the wire wants it.
+
+        `parameters` goes through untouched, which is the property that lets an MCP
+        server's own schema be forwarded without this layer understanding it - the
+        same passthrough `ToolSpec` documents and `llm/providers/gemini.py` relies
+        on.
+        """
+        declarations: list[dict[str, Any]] = []
+        for spec in self._tools:
+            declared: dict[str, Any] = {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            }
+            if self._tool_behavior:
+                declared["behavior"] = self._tool_behavior
+            declarations.append(declared)
+        return declarations
 
     def _activity_detection(self) -> dict[str, Any]:
         """How the server decides the user started and stopped talking.
@@ -713,7 +849,7 @@ class GeminiLiveSession:
             return None
         return message if isinstance(message, dict) else None
 
-    def _decode(self, raw: str | bytes) -> Iterator[bytes | Transcript | Interrupted]:
+    def _decode(self, raw: str | bytes) -> Iterator[bytes | Transcript | Interrupted | ToolCall]:
         message = self._parse(raw)
         if message is None:
             return
@@ -724,7 +860,61 @@ class GeminiLiveSession:
             left = (message.get("goAway") or {}).get("timeLeft")
             self.going_away = True
             logger.info("gemini-live: server will disconnect, timeLeft=%s", left)
-        content = message.get("serverContent")
+        if "toolCallCancellation" in message:
+            # Ids the server no longer wants answers for. Nothing above this can act
+            # on it yet - `VoiceConversation` has no tool loop until PR-2b - so it is
+            # reported rather than dropped: a documented server message that vanishes
+            # quietly is how an answer gets sent back to a call nobody is waiting for.
+            ids = (message.get("toolCallCancellation") or {}).get("ids") or []
+            logger.info("gemini-live: the server cancelled tool calls %s", list(ids))
+        # `serverContent` first, then `toolCall`. They are siblings on the wire, and
+        # audio is the one with somewhere to be: PR-2b's consumer will `await` the
+        # tool inside `receive()`'s loop, so a chunk handed over after that is a
+        # chunk the speaker got late.
+        yield from self._decode_content(message.get("serverContent"))
+        yield from self._decode_tool_calls(message.get("toolCall"))
+
+    def _decode_tool_calls(self, block: Any) -> Iterator[ToolCall]:
+        """`toolCall.functionCalls` as the neutral `ToolCall` the tool layer runs.
+
+        Not a voice-specific shape: the same dataclass the text path uses, so the
+        same runner, the same policy and the same audit row serve both.
+        """
+        calls = block.get("functionCalls") if isinstance(block, dict) else None
+        if not isinstance(calls, list):
+            return
+        for index, raw in enumerate(calls):
+            if not isinstance(raw, dict):
+                continue
+            name = raw.get("name")
+            if not isinstance(name, str) or not name:
+                # Nothing could be run and nothing could be answered, so handing it
+                # up would only move the failure somewhere with less context.
+                logger.warning("gemini-live: dropping a tool call with no name")
+                continue
+            if not self._tools:
+                # A session that declared nothing cannot legitimately be asked for
+                # anything. Dropped rather than yielded because a consumer written
+                # before tool calls existed routes every non-audio, non-Interrupted
+                # item to the transcript path - so this would be recorded as
+                # something the owner said.
+                logger.warning(
+                    "gemini-live: dropping a call to %r - no tool was offered in setup", name
+                )
+                continue
+            call_id = raw.get("id")
+            yield ToolCall(
+                # Documented as optional. `llm/providers/gemini.py` already had to
+                # invent one because the REST half of this API issues none at all,
+                # and a result with nothing in `id` cannot be paired with its call.
+                id=call_id
+                if isinstance(call_id, str) and call_id
+                else synthesise_call_id(name, index),
+                name=name,
+                arguments=decode_tool_arguments(raw.get("args")),
+            )
+
+    def _decode_content(self, content: Any) -> Iterator[bytes | Transcript | Interrupted]:
         if not isinstance(content, dict):
             return
 

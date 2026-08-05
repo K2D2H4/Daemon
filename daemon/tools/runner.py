@@ -131,7 +131,15 @@ class ToolRunner:
     async def _one(
         self, tool: Tool, call: ToolCall, context: TurnContext, outcome: Outcome
     ) -> ToolResult:
-        decision = self._policy.decide(tool, call.arguments, origin=context.origin)
+        decision = self._policy.decide(
+            tool,
+            call.arguments,
+            origin=context.origin,
+            # The same channel that goes in the audit column, so a grant scoped to
+            # one channel is matched on the value the row will later say it was
+            # matched on.
+            channel=context.channel,
+        )
         preview = _preview(tool, call.arguments)
 
         if decision.verdict == "deny":

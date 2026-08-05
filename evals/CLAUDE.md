@@ -10,6 +10,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `golden_set.py` | recall quality as a pass rate, repeatable |
 | `fixtures/` | four days of Korean fixture conversation, 79 messages, 50 questions |
 | `m0_voice_spike.py` | the six things about Gemini Live only a live key could settle |
+| `m1c_voice_tools_spike.py` | whether answering a voice tool call costs the answer. **Not yet run** |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py
@@ -59,6 +60,35 @@ while `true` produces a full answer.
 
 That is what this file is for. When a doc and a socket disagree, the socket wins,
 and the way to find out is to ask it.
+
+## m1c_voice_tools_spike.py
+
+```bash
+python3 -m evals.m1c_voice_tools_spike
+```
+
+Needs `GEMINI_API_KEY`. Sends text and reads the reply, so no microphone; the tool
+it declares is a fake clock that touches nothing. Four sessions — one blocking call,
+then `NON_BLOCKING` once per `scheduling` value.
+
+**It has not been run, and no number from it is quoted anywhere.** The work that
+built it was asked not to read the owner's `.env`, so the harness was verified
+against a scripted socket (its before/after audio accounting and its report are
+right) and the measurement itself is owed. Until it runs, three things stay
+inference:
+
+- whether a native-audio session accepts `tools` at all;
+- whether `behavior: NON_BLOCKING` is accepted on `gemini-3.1-flash-live-preview` —
+  the docs say asynchronous function calling is **not** supported there, which
+  would make `scheduling` unreachable;
+- **whether `toolResponse` interrupts generation.** This is the one that matters.
+  `clientContent` does — 2.2s of audio against 46.7s — and `toolResponse` is a
+  different top-level message that nothing documents as interrupting. Different
+  message, therefore safe, is inference of exactly the kind this directory exists
+  to replace.
+
+`daemon/voice/gemini_live.py` sends neither field by default, so nothing is riding
+on the guess in the meantime.
 
 ## Common changes
 

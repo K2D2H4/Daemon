@@ -30,7 +30,7 @@ from daemon.memory.log import from_iso, utc_iso
 logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _INSERT_MESSAGE = """
 INSERT INTO messages
@@ -128,7 +128,7 @@ class Store:
                     self.conn.execute(ddl)
             # The index over external_id is left to schema.sql, which runs next
             # now that the column exists.
-        # v3, v4 and v5 add only new tables, which schema.sql creates on its own.
+        # v3 to v6 add only new tables, which schema.sql creates on its own.
         self.conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),
@@ -460,6 +460,53 @@ class Store:
         cursor = self.conn.execute(
             "DELETE FROM tool_allowlist WHERE pattern = ?", (" ".join(pattern.split()),)
         )
+        self.conn.commit()
+        return cursor.rowcount
+
+    # Per-tool grants, the other standing axis. `'*'` rather than an import of
+    # `daemon.tools.policy.ANY_CHANNEL`: memory is foundation and the tool layer
+    # sits above it, so importing upwards to share one character would invert the
+    # layering - the same trade `config.py` takes with the voice sensitivities.
+
+    def add_tool_grant(self, tool: str, *, channel: str = "*", now: datetime) -> None:
+        """Grant a whole tool. Idempotent, for the reason
+        `add_tool_allowlist_entry` is."""
+        self.conn.execute(
+            "INSERT INTO tool_grants (tool, channel, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (tool, channel) DO NOTHING",
+            (tool, channel, utc_iso(now)),
+        )
+        self.conn.commit()
+
+    def tool_grants(self, tool: str) -> list[str]:
+        """Channels this tool is granted on, `'*'` meaning all of them.
+
+        Read on every decision rather than cached: the row may be written by
+        something else - a web admin, another process - into a database this one
+        already has open, and a grant that needed a restart would be a setting
+        that lies.
+        """
+        return [
+            str(row["channel"])
+            for row in self.conn.execute(
+                "SELECT channel FROM tool_grants WHERE tool = ? ORDER BY channel", (tool,)
+            )
+        ]
+
+    def all_tool_grants(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM tool_grants ORDER BY tool, channel"
+        ).fetchall()
+
+    def remove_tool_grant(self, tool: str) -> int:
+        """Revoke a tool everywhere, returning how many rows went.
+
+        By tool and not by (tool, channel), for the reason
+        `remove_tool_allowlist_entry` takes the whole pattern: someone revoking a
+        grant wants the tool to stop, and leaving one channel's row behind would
+        be a revocation that did not revoke.
+        """
+        cursor = self.conn.execute("DELETE FROM tool_grants WHERE tool = ?", (tool,))
         self.conn.commit()
         return cursor.rowcount
 

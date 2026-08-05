@@ -48,7 +48,42 @@ PENDING_CLASSES: dict[str, str] = {
     # Empty. `LocalSpeaker` was the last entry and closing it is what M3b is: the
     # thing that speaks at the machine now exists and `app.build_proactive_tick`
     # constructs it.
+    #
+    # And it stays empty through the tool-grant / voice-tool-frame work, which is
+    # worth writing down because that work *is* unreachable and this dict cannot
+    # say so: neither half is a class. A grant is rows plus methods on `Store`, and
+    # the voice tool frame is arguments to `GeminiLiveSession`, which `app.py`
+    # already constructs - so `_constructed` finds it and reports the whole thing
+    # wired. `test_the_voice_tool_frame_is_still_unwired` and
+    # `test_nothing_writes_a_tool_grant_yet` below are the both-directions
+    # declarations instead. Same blind spot `WakeGate`'s comment describes: this
+    # file asks whether something *calls* a name, never with what.
 }
+
+PENDING_WIRING = {
+    "send_tool_response": (
+        "M1c+ / PR-2b - VoiceConversation routes a spoken tool call to ToolRunner",
+        ("base.py", "gemini_live.py"),
+    ),
+    "add_tool_grant": (
+        "M1c+ / PR-2b - the surface an owner grants a whole tool through. Whatever "
+        "closes this must also make the grant visible: CONTRACTS rule 12 says a "
+        "capability reported nowhere is the silent state this project keeps being "
+        "bitten by, and `_tools_check` in cli.py reads config only, so a granted "
+        "tool would run without asking while `daemon doctor` said "
+        "runs-without-asking=nothing. There is nothing to under-report while "
+        "nothing writes a row, and that stops being true the moment this closes. "
+        "M1c",
+        ("store.py",),
+    ),
+}
+"""Built, tested, and called by nothing - declared the way PENDING_CLASSES declares
+an unbuilt class, because these are functions and that dict only holds types.
+
+The value is (owning milestone, the files allowed to mention it): the module that
+declares it and the module that implements it. Any *other* file under `daemon/`
+mentioning the name means it has been wired, and the test below then fails - which
+is the reminder to delete the entry rather than leave a closed gap declared open."""
 
 WIRED_CLASSES = (
     "TelegramChannel",
@@ -246,6 +281,40 @@ def test_the_pending_lists_do_not_overlap_the_wired_list() -> None:
     assert not set(PENDING_CLASSES) & set(WIRED_CLASSES)
 
 
+@pytest.mark.parametrize("name", sorted(PENDING_WIRING))
+def test_declared_wiring_gaps_are_still_gaps(name: str) -> None:
+    """The other direction for a *function* nothing calls yet.
+
+    `PENDING_CLASSES` cannot hold these - they are not classes - and the class
+    checks above cannot see them either, because the classes that own them
+    (`GeminiLiveSession`, `Store`) are constructed already. So a seam can be built,
+    unit-tested and never called while every assertion in this file passes, which is
+    the one failure mode the whole file exists to prevent.
+
+    When PR-2b calls one of these, this fails and the entry goes. That is the file
+    working.
+    """
+    reason, allowed = PENDING_WIRING[name]
+    callers = sorted(
+        path.name for path, text in _sources() if name in text and path.name not in allowed
+    )
+    assert not callers, (
+        f"{name} is now used in {callers} - remove it from PENDING_WIRING. {reason}"
+    )
+
+
+def test_every_declared_wiring_gap_names_a_real_seam() -> None:
+    """A gap declared against a name nothing defines is a gap that cannot close,
+    and it would sit here reading as work someone still owes."""
+    for name, (_reason, allowed) in PENDING_WIRING.items():
+        defining = {path.name for path, text in _sources() if f"def {name}" in text}
+        assert defining, f"nothing under daemon/ defines {name}"
+        assert defining <= set(allowed), (
+            f"{name} is defined in {sorted(defining - set(allowed))}, which "
+            "PENDING_WIRING does not list as allowed to mention it"
+        )
+
+
 # --- tools -------------------------------------------------------------------
 
 
@@ -309,7 +378,8 @@ def test_the_tool_layer_is_reachable_from_settings() -> None:
 
 def test_every_pending_entry_names_its_milestone() -> None:
     """A gap without an owner is just a gap."""
-    for label, reason in (*PENDING_TASKS.items(), *PENDING_CLASSES.items()):
+    wiring = {name: reason for name, (reason, _allowed) in PENDING_WIRING.items()}
+    for label, reason in (*PENDING_TASKS.items(), *PENDING_CLASSES.items(), *wiring.items()):
         assert re.search(r"M\d", reason), f"{label} is pending with no milestone: {reason!r}"
 
 

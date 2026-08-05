@@ -31,6 +31,13 @@ It checks **both directions**: a stale PENDING fails too. When voice was wired
 this file failed, saying so, and closing those entries was the fix. That is the
 file working, not the file being annoying.
 
+**It has a blind spot, and `PENDING_WIRING` is the patch.** The class checks only
+ask whether something *calls* a name, never with what — so a new argument to a
+class the app already builds (`GeminiLiveSession(tools=...)`) or a new method on
+`Store` is built, tested and unreachable while every assertion here passes. Names
+in that state are declared by name, with the milestone that owns them and the files
+allowed to mention them; anything else touching the name fails the check.
+
 ## test_acceptance.py
 
 Assembles the app the way the entrypoint does and drives a real conversation:

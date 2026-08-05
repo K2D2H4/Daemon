@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from daemon import clock
 from daemon.llm.base import ToolCall, ToolSpec
 from daemon.memory.store import Store
 from daemon.tools.base import Registry, ToolError, canonical_arguments
@@ -31,7 +32,7 @@ from daemon.tools.builtin import (
     WriteFile,
     builtin_tools,
 )
-from daemon.tools.policy import Command, ToolPolicy
+from daemon.tools.policy import ANY_CHANNEL, Command, ToolPolicy
 from daemon.tools.runner import ToolRunner, TurnContext
 
 OWNER = "5502877373"
@@ -1078,3 +1079,125 @@ async def test_resuming_a_tool_that_no_longer_exists_is_refused(
     )
     assert not result.ok
     assert "no longer available" in result.content
+
+
+# --- per-tool grants ---------------------------------------------------------
+# `tool_allowlist` is an argv pattern; `tool_grants` is a whole tool. The second
+# exists because the first cannot describe a tool with no argv, and `mode=allowlist`
+# therefore refused `write_file` and every MCP tool in every configuration.
+
+
+async def test_a_grant_round_trips_through_the_real_store(store: Store) -> None:
+    store.add_tool_grant("write_file", now=clock.now())
+    assert store.tool_grants("write_file") == [ANY_CHANNEL]
+    assert store.tool_grants("run_command") == []
+
+
+async def test_granting_the_same_tool_twice_is_one_row(store: Store) -> None:
+    """Re-granting is what a person does when they have forgotten they already
+    did, same as `add_tool_allowlist_entry`."""
+    store.add_tool_grant("write_file", now=clock.now())
+    store.add_tool_grant("write_file", now=clock.now())
+    assert store.tool_grants("write_file") == [ANY_CHANNEL]
+
+
+async def test_a_channel_scoped_grant_is_a_separate_row(store: Store) -> None:
+    store.add_tool_grant("write_file", channel="telegram", now=clock.now())
+    store.add_tool_grant("write_file", now=clock.now())
+    assert store.tool_grants("write_file") == [ANY_CHANNEL, "telegram"]
+
+
+async def test_forgetting_a_grant_leaves_the_others_alone(store: Store) -> None:
+    store.add_tool_grant("write_file", channel="telegram", now=clock.now())
+    store.add_tool_grant("open_path", now=clock.now())
+    assert store.remove_tool_grant("write_file") == 1
+    assert store.tool_grants("write_file") == []
+    assert store.tool_grants("open_path") == [ANY_CHANNEL]
+
+
+async def test_forgetting_a_grant_nobody_made_says_nothing_went(store: Store) -> None:
+    assert store.remove_tool_grant("write_file") == 0
+
+
+async def test_all_grants_are_listable_for_an_operator(store: Store) -> None:
+    """`daemon tools forget` prints what is standing when it cannot match, and a
+    grant nobody can see is a grant nobody can revoke."""
+    store.add_tool_grant("write_file", now=clock.now())
+    rows = store.all_tool_grants()
+    assert [(r["tool"], r["channel"]) for r in rows] == [("write_file", ANY_CHANNEL)]
+
+
+async def test_a_granted_write_runs_without_asking_and_is_audited(
+    store: Store, tmp_path: Path
+) -> None:
+    """End to end through the runner, in the mode that refused it before: the file
+    is written, nothing is parked for approval, and the audit row says so.
+
+    A Korean filename because the preview and the audit excerpt both carry it, and
+    CJK is where this repo's text handling has broken before.
+    """
+    target = tmp_path / "메모.md"
+    store.add_tool_grant("write_file", now=clock.now())
+    tools = runner(store, tmp_path, mode="allowlist")
+    outcome = await tools.execute(
+        [
+            ToolCall(
+                id="1",
+                name="write_file",
+                arguments={"path": str(target), "content": "안녕"},
+            )
+        ],
+        CONTEXT,
+    )
+    assert outcome.results[0].ok, outcome.results[0].content
+    assert target.read_text(encoding="utf-8") == "안녕"
+    assert not outcome.approvals
+    (row,) = store.recent_tool_calls()
+    assert row["verdict"] == "allow" and row["ran"] == 1
+    assert "grant" in row["reason"]
+    assert row["channel"] == "telegram"
+    assert "메모.md" in row["preview"]
+
+
+async def test_an_ungranted_write_is_still_refused_in_allowlist_mode(
+    store: Store, tmp_path: Path
+) -> None:
+    """The other direction, so the grant above cannot be passing for a reason that
+    would let everything through."""
+    target = tmp_path / "메모.md"
+    outcome = await runner(store, tmp_path, mode="allowlist").execute(
+        [ToolCall(id="1", name="write_file", arguments={"path": str(target), "content": "안녕"})],
+        CONTEXT,
+    )
+    assert not outcome.results[0].ok
+    assert not target.exists()
+
+
+async def test_a_grant_is_read_per_call_not_cached_at_construction(
+    store: Store, tmp_path: Path
+) -> None:
+    """The web admin writes a row into a database the running daemon already has
+    open. A policy that read the grants once at startup would need a restart to
+    honour one, which is the shape of a setting that lies."""
+    tools = runner(store, tmp_path, mode="allowlist")
+    call = ToolCall(
+        id="1", name="write_file", arguments={"path": str(tmp_path / "a.md"), "content": "x"}
+    )
+    assert not (await tools.execute([call], CONTEXT)).results[0].ok
+    store.add_tool_grant("write_file", now=clock.now())
+    assert (await tools.execute([call], CONTEXT)).results[0].ok
+
+
+async def test_the_channel_the_runner_reports_is_the_one_the_grant_is_matched_on(
+    store: Store, tmp_path: Path
+) -> None:
+    """The audit column and the decision have to agree, or a grant scoped to one
+    channel would be honoured on another and the row would say the wrong thing."""
+    store.add_tool_grant("write_file", channel="telegram", now=clock.now())
+    tools = runner(store, tmp_path, mode="allowlist")
+    call = ToolCall(
+        id="1", name="write_file", arguments={"path": str(tmp_path / "a.md"), "content": "x"}
+    )
+    assert (await tools.execute([call], CONTEXT)).results[0].ok
+    elsewhere = TurnContext(origin="owner", channel="voice", sender_id=OWNER)
+    assert not (await tools.execute([call], elsewhere)).results[0].ok
