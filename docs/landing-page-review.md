@@ -74,21 +74,30 @@ a mystery to the next reader:
 | `.motes` | 9 squares rising on 19–31s loops | "floating particles" is on the forbidden list |
 | `.chip a–d` | 4 squares drifting on 5.5–8s `ease-in-out` loops | eased decorative motion |
 | `.hero-plinth` | grounding bar at `opacity:.5` | invented element, fractional opacity |
-| Sprite size | `clamp(180px, 24vw, 336px)`, `160px` mobile | fluid sizing lands between multiples of 28 at mid widths; 160 is not a multiple of 28 |
-| Entrance | headline typed line by line, then `.fadeup` at 2.3/2.45/2.6s | **the primary CTA does not exist for the first 2.45 seconds** |
 | `h1` size | `clamp(30px, 3.6vw, 46px)` | display size is specified as 40px |
 | Height | `min-height: calc(100svh - 64px)` | ~300px of dead space above and below the copy at 900px tall |
+| Typewriter | headline typed line by line over 2.15s | none any more — see below |
 
-Two of these are worth separating from taste, because they are not aesthetic
-tradeoffs:
+### Two things in that list were defects, not taste, and are fixed
 
-- **The 2.45s CTA delay.** Every visitor waits that long before "GET STARTED"
-  exists. Removing the three `.fadeup` classes in the hero markup keeps the
-  typewriter and fixes this.
-- **Fluid sprite sizing.** At 1400px+ it happens to land on 336 (28×12), so it
-  looks correct; at ~1100px it renders at 264, which is not a multiple of 28 and
-  puts the sprite off its own pixel grid. This is the one item here that
-  degrades the sprite itself rather than the composition.
+Both were fixed without touching the grid, vignette, motes, chips or the
+typewriter:
+
+- **The CTA no longer waits 2.45 seconds.** The three `.fadeup` classes on the
+  sub-line, the buttons and the badge are gone, so all three render on first
+  paint while the headline still types above them. `.fadeup` and its keyframes
+  were removed as dead code. Verified by capturing the page at ~0.8s of its life:
+  lines 3 and 4 of the headline are still being typed and "GET STARTED" is
+  already present and clickable.
+- **The sprite is stepped, never fluid.** `clamp(180px, 24vw, 336px)` rendered
+  288px at a 1200px viewport and 240px at 1000px — neither a multiple of 28, so
+  the mascot's own pixels stopped lining up. Now `336 / 280 / 224 / 168` at
+  `∞ / 1320 / 1080 / 820`, and mobile's `160px` became `168px`. Measured at 1200,
+  1000 and 360: every rendered sprite on the page is a multiple of 28.
+
+The nearest step is within 8px of what the clamp produced at the widths that
+matter (1200 → 280 vs 288; 1000 → 224 vs 240), so the sprite looks the size it
+did before.
 
 An intermediate version was tried and rejected: the grid rebuilt as an inline
 SVG rect pattern (hard edges, no gradient, flat `#1A1624` — the exact colour

@@ -102,7 +102,12 @@ opacity:.3}
 .hero-in{position:relative;z-index:1;width:100%;padding-top:64px;padding-bottom:64px}
 .hero-copy{display:grid;grid-template-columns:1fr auto;gap:56px;align-items:center}
 .hero-h1{font-size:clamp(30px,3.6vw,46px);line-height:1.18;letter-spacing:-.01em;max-width:24ch}
-.hero-sprite{width:clamp(180px,24vw,336px);pointer-events:none;position:relative}
+/* Stepped, never fluid: a sprite drawn on a 28px grid has to be rendered at a
+   whole multiple of 28 or its own pixels stop lining up. The old
+   clamp(180px,24vw,336px) only happened to be right at 1400px+. */
+.hero-sprite{width:336px;pointer-events:none;position:relative}
+@media (max-width:1320px){.hero-sprite{width:280px}}
+@media (max-width:1080px){.hero-sprite{width:224px}}
 .hero-stage{position:relative;display:flex;justify-content:center;align-items:flex-end}
 .hero-plinth{position:absolute;left:50%;bottom:-18px;transform:translateX(-50%);width:78%;height:10px;background:var(--accent-deep);opacity:.5}
 .hero-plinth::after{content:"";position:absolute;left:8%;top:10px;width:84%;height:6px;background:var(--outline)}
@@ -125,13 +130,11 @@ opacity:.3}
 @keyframes type{to{width:100%}}
 .hero-h1 .cur{display:inline-block;width:.62em;height:.86em;background:var(--accent);vertical-align:-.08em;margin-left:.08em;opacity:0;animation:curOn 0s 2.15s forwards,caret 1s step-end 2.15s infinite}
 @keyframes curOn{to{opacity:1}}
-.fadeup{opacity:0;transform:translateY(8px);animation:fadeup .32s ease-out forwards}
-@keyframes fadeup{to{opacity:1;transform:none}}
-@media (prefers-reduced-motion:reduce){.hero-h1 .ln{width:auto;animation:none}.hero-h1 .cur{opacity:1;animation:none}.fadeup{opacity:1;transform:none;animation:none}}
+@media (prefers-reduced-motion:reduce){.hero-h1 .ln{width:auto;animation:none}.hero-h1 .cur{opacity:1;animation:none}}
 @media (max-width:820px){
 .hero{min-height:0}
 .hero-copy{grid-template-columns:1fr;gap:32px}
-.hero-sprite{width:160px}
+.hero-sprite{width:168px}
 }
 /* header */
 header{position:sticky;top:0;z-index:9;background:var(--canvas);border-bottom:2px solid var(--line)}
@@ -925,12 +928,12 @@ section{padding:48px 0}
     <div class="hero-copy">
       <div>
         <h1 class="hero-h1"><span class="ln">An AI companion</span><span class="ln">you shape.</span><span class="ln" style="color:var(--accent)">And that reshapes</span><span class="ln" style="color:var(--accent)">itself around you.<i class="cur" aria-hidden="true"></i></span></h1>
-        <p class="muted fadeup" style="margin-top:28px;max-width:46ch;animation-delay:2.3s">Open source, self-hosted. A process that lives on your machine; its memory and personality are plain markdown files you own.</p>
-        <div class="fadeup" style="display:flex;gap:14px;margin-top:28px;flex-wrap:wrap;animation-delay:2.45s">
+        <p class="muted" style="margin-top:28px;max-width:46ch">Open source, self-hosted. A process that lives on your machine; its memory and personality are plain markdown files you own.</p>
+        <div style="display:flex;gap:14px;margin-top:28px;flex-wrap:wrap">
           <a class="btn pri" href="https://github.com/K2D2H4/Daemon">GET STARTED</a>
           <a class="btn" href="https://github.com/K2D2H4/Daemon/blob/main/docs/PLAN.md">DESIGN NOTES</a>
         </div>
-        <div class="fadeup" style="display:flex;gap:14px;margin-top:24px;align-items:center;flex-wrap:wrap;animation-delay:2.6s">
+        <div style="display:flex;gap:14px;margin-top:24px;align-items:center;flex-wrap:wrap">
           <span class="badge b-warn">EARLY</span>
           <span class="cap" style="max-width:340px">Public because the design decisions are worth arguing with, not because it is finished.</span>
         </div>
