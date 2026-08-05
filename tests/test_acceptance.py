@@ -805,8 +805,28 @@ async def test_it_stays_silent_when_the_gate_says_so(tmp_path: Path) -> None:
         store.close()
 
 
-def test_the_tool_layer_is_off_unless_asked_for(tmp_path: Path) -> None:
-    """An existing install must not gain a shell by upgrading."""
+def test_the_tool_layer_can_be_switched_off_entirely(tmp_path: Path) -> None:
+    """Tools are on by default now, so what has to be asserted is the way back: off
+    means nothing is assembled at all, and `/health` says so rather than leaving it
+    to be inferred."""
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PRESET="offline",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN=TOKEN,
+        DAEMON_TOOLS_ENABLED=False,
+    )
+    from daemon.app import _build_tools
+
+    runner, bridge, status = asyncio.run(_build_tools(settings, None))
+    assert runner is None and bridge is None
+    assert "DAEMON_TOOLS_ENABLED" in status
+
+
+def test_the_default_install_has_tools_and_asks_before_acting(tmp_path: Path) -> None:
+    """The default a person actually gets: tools assembled, `ask` in force, and the
+    browser and MCP still off."""
     settings = Settings(
         _env_file=None,
         DAEMON_PRESET="offline",
@@ -814,14 +834,18 @@ def test_the_tool_layer_is_off_unless_asked_for(tmp_path: Path) -> None:
         DAEMON_DATA_DIR=str(tmp_path),
         TELEGRAM_BOT_TOKEN=TOKEN,
     )
-    assert settings.tools_enabled is False
-    assert settings.mcp_enabled is False
+    assert settings.tools_enabled is True
 
-    from daemon.app import _build_tools
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        from daemon.app import _build_tools
 
-    runner, bridge, status = asyncio.run(_build_tools(settings, None))
-    assert runner is None and bridge is None
-    assert "DAEMON_TOOLS_ENABLED" in status
+        runner, bridge, status = asyncio.run(_build_tools(settings, store))
+        assert runner is not None and len(runner) == 7, "the built-ins, and not the browser"
+        assert bridge is None, "mcp is off by default"
+        assert "mode=ask" in status and "browser" not in status
+    finally:
+        store.close()
 
 
 def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:

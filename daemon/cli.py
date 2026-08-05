@@ -484,6 +484,7 @@ def _doctor() -> int:
             _schema_check(settings),
             _memory_check(settings),
             _proactivity_check(settings),
+            _tools_check(settings),
             *_ollama_checks(settings),
         ]
 
@@ -497,6 +498,36 @@ def _doctor() -> int:
         sys.stdout.flush()
         print(f"\n{failed} check(s) failed.", file=sys.stderr)
     return PROBLEM if failed else OK
+
+
+def _tools_check(settings: Settings) -> Check:
+    """What Daemon may do to this machine, said out loud.
+
+    Here because tools are on by default: a capability nobody was asked about and
+    which is reported nowhere is the silent state this project keeps being bitten by
+    (CLAUDE.md, "report state, do not assume it"). `daemon setup` does not ask about
+    tools, so this line and the startup log are the only places the answer appears.
+    """
+    if not settings.tools_enabled:
+        return Check("tools", True, "off (DAEMON_TOOLS_ENABLED=true to turn it on)")
+
+    extras = []
+    if settings.browser_enabled:
+        extras.append(f"browser={settings.browser_app}")
+    if settings.mcp_enabled:
+        extras.append("mcp=on")
+    allowed = ", ".join(settings.tools_allowlist) or "nothing"
+    detail = (
+        f"on mode={settings.tools_mode} roots={', '.join(settings.tools_roots)} "
+        f"runs-without-asking={allowed}"
+    )
+    if extras:
+        detail += " " + " ".join(extras)
+    # `full` is the one setting where nothing but the origin gate is left, so it is
+    # reported as a failed check rather than as a detail someone might skim past.
+    if settings.tools_mode == "full":
+        return Check("tools", False, detail + " - `full` asks about nothing")
+    return Check("tools", True, detail)
 
 
 def _proactivity_check(settings: Settings) -> Check:

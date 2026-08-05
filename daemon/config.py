@@ -322,10 +322,21 @@ class Settings(BaseSettings):
     hand, `dm_policy=allowlist` could not be configured at all, and `_split_ids`
     below was dead code that looked like it worked."""
 
-    tools_enabled: bool = Field(default=False, alias="DAEMON_TOOLS_ENABLED")
-    """Off by default, and that is a product decision rather than caution about
-    the code: upgrading a companion should not silently hand it a shell. The user
-    turns this on once they want it to reach the machine (docs/PLAN.md tool use)."""
+    tools_enabled: bool = Field(default=True, alias="DAEMON_TOOLS_ENABLED")
+    """On by default, because the alternative is a product that does not do what it
+    says. docs/PLAN.md 1 defines Daemon as a companion that lives on your machine,
+    and one that cannot open a file on it is a chat window with extra steps - so a
+    default of `false` would ship the definition unmet and call it caution.
+
+    What makes that safe is not this switch, it is the gate: `tools_mode` is `ask`,
+    so nothing that changes the machine runs without a one-shot code, and no tool at
+    all runs on a turn that is not the owner's own words (tools/policy.py). The two
+    capabilities that read more than that - the browser group and MCP - stay off and
+    have their own switches.
+
+    Turning it off is one line, and `daemon doctor` says which way it is set: a
+    capability the owner cannot see is the silent state this project keeps being
+    bitten by."""
 
     tools_mode: str = Field(default="ask", alias="DAEMON_TOOLS_MODE")
     """`off` | `allowlist` | `ask` | `full` - see daemon/tools/policy.py.

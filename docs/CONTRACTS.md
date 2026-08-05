@@ -93,10 +93,14 @@ FROZEN means: do not edit without flagging it first.
     gate. OpenClaw's `auto` mode (an LLM reviewer for edge cases) was deliberately
     not ported.
 
-12. **Tools are off unless configured on**, and every executed call leaves a
-    `tool_calls` row and a line in the reply the owner reads. A tool that ran
-    without either is a defect, which is why `ToolRunner` owns decide, execute and
-    audit together instead of exposing them separately.
+12. **Every executed tool call leaves a `tool_calls` row and a line in the reply
+    the owner reads.** A tool that ran without either is a defect, which is why
+    `ToolRunner` owns decide, execute and audit together instead of exposing them
+    separately. Tools are **on** by default - the safety is rule 10 and mode `ask`,
+    not the switch - so `daemon doctor` has to say which way it is set: a capability
+    nobody was asked about and which is reported nowhere is the silent state this
+    project keeps being bitten by. The two groups that read more than the owner's own
+    files, the browser and MCP, stay off and keep their own switches.
 
 13. **Code is never built from data.** Three places would be natural to get this
     wrong and all three are done the same way — the script is a constant and the

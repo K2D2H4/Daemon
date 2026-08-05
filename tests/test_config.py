@@ -418,15 +418,29 @@ def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:
 # --- tool use ---------------------------------------------------------------
 
 
-def test_tools_are_off_and_asking_by_default() -> None:
-    """Off, so an upgrade does not hand an existing install a shell; `ask` once on,
-    because `allowlist` answers anything unlisted with a flat refusal."""
+def test_tools_are_on_and_asking_by_default() -> None:
+    """On, because a companion that cannot open a file on the machine it lives on is
+    the definition unmet (docs/PLAN.md 1). What makes that safe is the rest of this
+    assertion, not a switch: `ask` means nothing that changes the machine runs
+    without a one-shot code, the allowlist is empty so nothing at all runs
+    unprompted, and the two groups that read more than the owner's own files - the
+    browser and MCP - are still off."""
     settings = make_settings(preset="offline", ollama_model="gemma3:4b")
-    assert settings.tools_enabled is False
+    assert settings.tools_enabled is True
     assert settings.tools_mode == "ask"
+    assert settings.tools_allowlist == (), "nothing runs without being asked about"
     assert settings.tools_roots == ("~",)
-    assert settings.tools_allowlist == ()
+    assert settings.browser_enabled is False
     assert settings.mcp_enabled is False
+
+
+def test_tools_can_be_switched_off_entirely() -> None:
+    """The other direction has to keep working, or "on by default" becomes
+    "on, and no way back"."""
+    settings = make_settings(
+        preset="offline", ollama_model="gemma3:4b", DAEMON_TOOLS_ENABLED=False
+    )
+    assert settings.tools_enabled is False
 
 
 def test_an_unknown_tool_mode_fails_at_startup() -> None:
@@ -492,10 +506,17 @@ def test_an_incoherent_tool_setup_fails_at_startup(kwargs: dict, expected: str) 
         {"DAEMON_TOOLS_MAX_ROUNDS": 0},
     ],
 )
-def test_a_text_only_install_is_not_held_to_a_tool_setup(kwargs: dict) -> None:
-    """The same rule voice follows: a configuration that is never reached must not
-    be a reason to refuse to start."""
-    make_settings(preset="offline", ollama_model="gemma3:4b", **kwargs)  # must not raise
+def test_an_install_with_tools_off_is_not_held_to_a_tool_setup(kwargs: dict) -> None:
+    """The same rule voice follows: a configuration that is never reached must not be
+    a reason to refuse to start. Now that tools are on by default this needs the
+    switch stated - which is the point, since with them *on* the setting is reached
+    and an incoherent one should fail at startup rather than mid-conversation."""
+    make_settings(
+        preset="offline",
+        ollama_model="gemma3:4b",
+        DAEMON_TOOLS_ENABLED=False,
+        **kwargs,
+    )  # must not raise
 
 
 def test_no_new_task_was_added_for_tool_use() -> None:
@@ -521,6 +542,7 @@ def test_the_browser_cannot_be_on_while_tools_are_off() -> None:
         make_settings(
             preset="offline",
             ollama_model="gemma3:4b",
+            DAEMON_TOOLS_ENABLED=False,
             DAEMON_BROWSER_ENABLED=True,
         )
 
