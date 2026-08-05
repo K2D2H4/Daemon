@@ -11,7 +11,6 @@ not know that the channel is Telegram or that memory is markdown.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import secrets
@@ -23,6 +22,7 @@ from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.llm.base import Message
 from daemon.llm.gateway import LLMGateway
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
+from daemon.persona.loader import load_persona
 from daemon.tasks import Task
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ class ConversationLoop:
         self._channel = channel
         self._gateway = gateway
         self._memory = memory
-        self._seed_path = Path(data_dir) / "persona" / "seed.md"
+        self._data_dir = Path(data_dir)
         self._context_turns = context_turns
         self._recall = recall
         self._recall_limit = recall_limit
@@ -207,15 +207,17 @@ class ConversationLoop:
         await self._index(pending_index)
 
     async def _assemble(self, inbound: InboundMessage) -> list[Message]:
-        """Persona seed, then recalled memory, then the recent window.
+        """Persona (seed + learned), then recalled memory, then the recent window.
 
         Recall and the recent window are both here and do different jobs: the
         window is the thread being spoken right now, recall is everything older
-        that turned out to matter. M4 replaces the seed read with
-        persona/loader.py assembling seed.md + learned.md.
+        that turned out to matter. The persona system turn comes from
+        `persona/loader.py`'s `load_persona`, which assembles seed.md (human-owned,
+        read fresh every turn) and learned.md (M4's accumulated rules) into one
+        block - the same freshness guarantee `_read_seed` used to provide alone.
         """
         messages: list[Message] = []
-        seed = await self._read_seed()
+        seed = await load_persona(self._data_dir)
         if seed:
             messages.append(Message(role="system", content=seed))
 
@@ -287,17 +289,6 @@ class ConversationLoop:
                 # truth; the vector is an index and can be rebuilt. Losing it must
                 # not cost the user their answer.
                 logger.exception("indexing failed message_id=%d", message_id)
-
-    async def _read_seed(self) -> str:
-        """Read every turn, not once at startup: seed.md is human-owned and an
-        edit should take effect without a restart (docs/PLAN.md 5.1)."""
-        try:
-            return (await asyncio.to_thread(self._seed_path.read_text, encoding="utf-8")).strip()
-        except FileNotFoundError:
-            return ""
-        except OSError:
-            logger.exception("could not read %s", self._seed_path)
-            return ""
 
 
 def render_recall(

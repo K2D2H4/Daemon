@@ -23,7 +23,8 @@ in `app.py`, which owns every concrete-implementation import here.
 | `llm/` | `llm/base.py` (frozen) · `llm/gateway.py` · `llm/providers/` (4) · `llm/embedders/` |
 | `memory/` | `memory/schema.sql` (frozen) · `store` · `log` · `writer` · `recall` · `curated` · `entities` · `reindex` |
 | `voice/` | `voice/base.py` (frozen) · `voice/gemini_live.py` · `voice/audio.py` · `voice/conversation.py` |
-| `proactivity/` | `proactivity/base.py` (frozen) · `candidates` · `gate` · `presence` · `judge` · `delivery` · `speaker` · `tick`. `persona/` is still empty — M4 |
+| `proactivity/` | `proactivity/base.py` (frozen) · `candidates` · `gate` · `presence` · `judge` · `delivery` · `speaker` · `tick` |
+| `persona/` | `persona/loader.py` (assembles `seed.md` + `learned.md` into one system message, read every turn) · `persona/rules.py` (the only write path for `data/persona/learned.md` and its `persona_rules` mirror) · `persona/evolve.py` (the weekly pass: observations → rule proposals, at most one model call) |
 
 ## Layering
 
@@ -36,7 +37,10 @@ daemon doctor                  # config, reachability, and what reflection has b
 daemon run                     # the loop, in this terminal
 daemon reflect                 # the 04:00 pass, now, by hand (`--date`, `--force`)
 daemon proactive               # one proactivity round, verdicts only (`--speak` to let it)
-daemon reindex                 # rebuild all three markdown tiers into the mirror
+daemon persona                 # active learned rules, last evolution, last diary
+daemon persona evolve          # the Monday 05:00 pass, now, by hand (`--force`)
+daemon persona forget <id>     # retire a learned rule - a human's deletion request (`--why`)
+daemon reindex                 # rebuild the mirror from markdown - log, curated, entities, persona rules
 daemon wake calibrate          # what does the recognizer actually hear you say? (`--takes`)
 daemon wake test               # run the wake gate here and print what fires (`--seconds`)
 python3 -m pytest tests/test_reachable.py   # is everything you built reachable?
@@ -101,3 +105,28 @@ package. Rules: [CONTRACTS.md](../docs/CONTRACTS.md). Data flow:
 - **Two Telegram traps.** The inbound poll needs a floor — left to the long poll alone, a
   transport that returns immediately spins at ~16,000 requests/second. And `allowed_updates`
   is **server-side**: at `["message"]` a 👍 press is never delivered at all.
+- **M4's gate had no input to measure.** The live database held 0 observations, 0
+  `persona_rules`, no LaunchAgent installed — reflection had never run on real data. The
+  cause: `Store.messages_for_day` excludes `recalled = 1` rows permanently (PLAN.md 4.2),
+  which dropped 29 of 38 real messages in one day, and the excluded lines were exactly the
+  persona-relevant ones.
+- **`daemon doctor` and `daemon reflect` disagreed about the same day.** Doctor's backlog
+  count includes today; `Reflection.catch_up` deliberately excludes it. Running the command
+  doctor recommended answered "nothing to reflect on."
+- **A real weekly evolution pass, run against Gemini with 30 seeded observations:** 30 read
+  -> 7 proposed -> 3 added, 10.8 s, with the 4 the per-cycle cap dropped reported rather than
+  discarded. A same-week rerun skipped in 0.64 s and made no model call.
+- **Printing a real turn's assembled prompt found a defect.** `load_persona` was injecting
+  all of `learned.md`, including its human-facing header (`daemon persona forget <id>`, a
+  repeat of the sentence the loader already prefixes). Only the rule bullets go in now;
+  `seed.md` still goes in verbatim.
+- **`learned.md` was being rewritten from the mirror, so deleting the rebuildable sqlite file
+  cost 5 rules out of 5 on the next ordinary write** — non-negotiable 1, measured, not argued.
+  `add`/`retire` now refuse on divergence (`LearnedFileDiverged`), `daemon reindex` restores
+  rows from the file additively, and `doctor` reports the divergence as a blocker. A crash
+  between the two writes has the same shape: the instant after is allowed, the *next* write
+  was what destroyed.
+- **`write_private_replace` used one fixed temp filename**, so two writers on the same path
+  (the Monday job and a hand-run `evolve`) raced: one `O_TRUNC`ed the other's bytes, then the
+  loser's `os.replace` raised. Random suffix now. Two concurrent writers still do not merge —
+  the later `replace` wins outright, and that is not fixed.

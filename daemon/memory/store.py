@@ -683,6 +683,85 @@ class Store:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()
         return int(row["n"])
 
+    # --- M4: persona rules ---------------------------------------------------
+    # Body lives in persona/learned.md (docs/CONTRACTS.md non-negotiable 5);
+    # these columns are the metadata a model must not be able to forge in prose
+    # (non-negotiable 3). Unlike memory_entries there is no unique index on
+    # supersession_key - persona.rules.LearnedRules is what keeps one active row
+    # per key, by resolving a batch before it ever reaches these methods.
+
+    def insert_persona_rule(
+        self,
+        *,
+        body: str,
+        created_at: datetime,
+        evidence: Sequence[int],
+        supersession_key: str | None = None,
+    ) -> int:
+        """Append one persona rule to the mirror. Self-commits: the caller
+        (`persona.rules.LearnedRules.add`) writes and fsyncs `learned.md`
+        *before* calling this, so nothing here needs to defer a commit the way
+        `insert_entry` does for the curated tier."""
+        cursor = self.conn.execute(
+            "INSERT INTO persona_rules (body, created_at, evidence, supersession_key) "
+            "VALUES (?, ?, ?, ?)",
+            (body, utc_iso(created_at), json.dumps(list(evidence)), supersession_key),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def active_persona_rules(self) -> list[sqlite3.Row]:
+        """Active rules, oldest first - reads as an accumulated history."""
+        return self.conn.execute(
+            "SELECT * FROM persona_rules WHERE status = 'active' ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+
+    def retire_persona_rule(self, rule_id: int, *, when: datetime, why: str) -> bool:
+        """Retire one rule - a human's `daemon persona forget`, or one batch
+        auto-superseding an older rule that shares its key. Returns whether a
+        matching active row existed; never raises."""
+        cursor = self.conn.execute(
+            "UPDATE persona_rules SET status = 'retired', retired_at = ?, retired_why = ? "
+            "WHERE id = ? AND status = 'active'",
+            (utc_iso(when), why, rule_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def count_active_persona_rules(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM persona_rules WHERE status = 'active'"
+        ).fetchone()
+        return int(row["n"])
+
+    def persona_rules_created_since(self, ts: str) -> int:
+        """How many rules (any status) were created at or after `ts` - the
+        weekly cap's raw input for `daemon doctor` / `daemon persona`."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM persona_rules WHERE created_at >= ?", (ts,)
+        ).fetchone()
+        return int(row["n"])
+
+    def consume_observations(self, ids: Sequence[int], rule_id: int) -> None:
+        """Mark observations consumed by this rule. Only `consumed_by IS NULL`
+        rows are touched, so an observation is consumed exactly once - the one
+        field on an append-only table (docs/CONTRACTS.md non-negotiable 6) that
+        may be set later, and only the once."""
+        if not ids:
+            return
+        self.conn.executemany(
+            "UPDATE observations SET consumed_by = ? WHERE id = ? AND consumed_by IS NULL",
+            [(rule_id, int(i)) for i in ids],
+        )
+        self.conn.commit()
+
+    def last_persona_rule_created_at(self) -> str | None:
+        """When the most recent persona rule (any status) was created, for
+        `daemon doctor` / `daemon persona` - not evolve.py's own idempotency
+        check, which is the diary file's existence."""
+        row = self.conn.execute("SELECT MAX(created_at) AS ts FROM persona_rules").fetchone()
+        return row["ts"]
+
     # --- M3: proactive candidates -------------------------------------------
 
     def insert_candidate(

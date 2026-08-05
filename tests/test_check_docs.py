@@ -49,11 +49,18 @@ def scanned(module: object) -> list[Path]:
 
 def test_a_worktree_copy_of_the_repo_is_not_scanned_twice(check_docs: object) -> None:
     """Agent sessions create these under `.claude/worktrees/`, so this is the live
-    case rather than a hypothetical - it was already true when it was found."""
+    case rather than a hypothetical - it was already true when it was found.
+
+    Relative to ROOT, not absolute. Run from *inside* a worktree the repo's own
+    root legitimately sits under `.claude/worktrees/`, so an absolute check called
+    every ordinary doc a duplicate - and the filter it guards had the same bug, in
+    the same direction: it skipped everything and reported ok over five docs.
+    """
+    root = check_docs.ROOT  # type: ignore[attr-defined]
     files = scanned(check_docs)
 
     assert files, "the checker found nothing to scan, so this proves nothing"
-    duplicated = [p for p in files if "worktrees" in p.parts]
+    duplicated = [p for p in files if "worktrees" in p.relative_to(root).parts]
     assert duplicated == [], f"scanning worktree copies: {duplicated}"
 
 

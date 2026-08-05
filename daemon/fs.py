@@ -13,6 +13,7 @@ remove bits and a permissive umask would leave these files exposed.
 from __future__ import annotations
 
 import os
+import uuid
 from pathlib import Path
 
 DIR_MODE = 0o700
@@ -87,9 +88,20 @@ def write_private_replace(path: Path, content: str) -> None:
         because the previous content is gone too. This is the same reasoning as
         `log.append`: the markdown is the source of truth, so it must be at least
         as durable as the sqlite mirror that indexes it.
+
+    The temp name carries a random suffix so two concurrent callers on the same
+    `path` (e.g. a scheduled pass and a hand-run CLI command overlapping) never
+    open, write and truncate the *same* inode - that collision previously let
+    the second writer's `O_TRUNC` erase the first writer's already-written
+    bytes before it could rename them into place, and then made the first
+    writer's own `os.replace` raise `FileNotFoundError` because its temp path
+    had already been renamed away by the second. A unique name does not make
+    two concurrent writers to the same `path` produce a merged result (the
+    later `os.replace` still wins outright), but it stops that crash and the
+    byte-level corruption of the loser's content before it could even finish.
     """
     secure_dir(path.parent)
-    temporary = path.with_name(f".{path.name}.tmp")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

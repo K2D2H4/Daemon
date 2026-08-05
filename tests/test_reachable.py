@@ -41,7 +41,6 @@ PENDING_PROVIDERS: dict[str, str] = {
 
 PENDING_TASKS = {
     Task.RECALL_ESCALATION: "M1b+ - Lane 2 is specified, Lane 1 ships first",
-    Task.PERSONA_RULE: "M4",
 }
 
 PENDING_CLASSES: dict[str, str] = {
@@ -80,6 +79,12 @@ WIRED_CLASSES = (
     "Judge",
     "LocalSpeaker",
     "ProactiveDelivery",
+    # M4: the weekly pass, and its one write path for persona/learned.md.
+    # `app.build_persona_evolution` constructs the pass for both the Monday job
+    # and `daemon persona evolve` - a scheduled pass nobody can run by hand is a
+    # pass nobody can verify, the same reason `Reflection` is wired the same way.
+    "PersonaEvolution",
+    "LearnedRules",
     # The wake gate, built by `app.wake_events` - which is also what
     # `daemon wake test` drives. Being *named* here is not enough on its own: this
     # file only asks whether something calls `WakeGate(...)`, and it was called with

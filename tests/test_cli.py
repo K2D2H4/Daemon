@@ -13,6 +13,7 @@ import logging
 import os
 import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from daemon.memory.curated import CuratedMemory
 from daemon.memory.entities import EntityNotes
 from daemon.memory.store import Store
 from daemon.memory.writer import FileMemoryWriter
+from daemon.persona.evolve import PersonaEvolution
 from daemon.reflection import Reflection, artifact_path
 from daemon.service import ServiceAction, ServiceStatus
 from daemon.tasks import Task
@@ -187,6 +189,46 @@ def reflection_seam(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeProvid
             return _reflection_for(settings.data_dir, store, provider), close
 
         monkeypatch.setattr(daemon_app, "build_reflection", build)
+        return provider
+
+    return install
+
+
+def _add_observations(data_dir: Path, n: int, *, day: str = "2026-08-01") -> None:
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        for i in range(n):
+            store.insert_observation(body=f"관찰 {i}", observed_from=day, now=NOW)
+    finally:
+        store.close()
+
+
+@pytest.fixture
+def persona_seam(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeProvider]:
+    """Replace the one thing in `daemon persona evolve` that would reach a
+    provider - same seam shape as `reflection_seam`, for the same reason:
+    `daemon.app.build_persona_evolution` is what the Monday job and the CLI
+    share, so patching it leaves the pass, the store and the exit code real.
+    """
+
+    def install(reply: str = '{"rules": []}', *, fail: bool = False, **kwargs: Any) -> FakeProvider:
+        provider = FakeProvider(reply, fail=fail)
+
+        async def build(settings: Settings) -> tuple[PersonaEvolution, Any]:
+            store = Store.open(settings.data_dir / daemon_app.DB_FILENAME)
+
+            async def close() -> None:
+                store.close()
+
+            gateway = LLMGateway(
+                {provider.name: provider}, {Task.PERSONA_RULE: Route(provider.name, "m")}
+            )
+            evolution = PersonaEvolution(
+                settings.data_dir, store, gateway, min_observations=1, **kwargs
+            )
+            return evolution, close
+
+        monkeypatch.setattr(daemon_app, "build_persona_evolution", build)
         return provider
 
     return install
@@ -458,6 +500,97 @@ def test_doctor_survives_a_database_it_cannot_open(
     assert "[FAIL] schema" in out
 
 
+# --- doctor: what persona evolution built (M4) --------------------------------
+
+
+def test_doctor_says_nothing_recorded_yet_for_persona_on_a_fresh_install(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["doctor"]) == 0
+    assert "[ok] persona: nothing recorded yet" in capsys.readouterr().out
+
+
+def test_doctor_reports_why_the_next_persona_run_would_skip(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty rule set and a working weekly pass look the same from outside,
+    so doctor has to say *why* the next run would do nothing - not just that
+    nothing has happened yet."""
+    Store.open(data_dir / daemon_app.DB_FILENAME).close()  # create the mirror, no rows
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert "[ok] persona: 0 active rule(s), 0 unconsumed observation(s)" in out
+    assert "next run would skip: not enough observations (0<5)" in out
+
+
+def test_doctor_reports_active_persona_rules_and_unconsumed_observations(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _add_observations(data_dir, 6)
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        store.insert_persona_rule(body="아침엔 인사만 짧게 한다", created_at=NOW, evidence=[])
+    finally:
+        store.close()
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert "[ok] persona: 1 active rule(s), 6 unconsumed observation(s)" in out
+    assert "next run would skip" not in out, "there is room and evidence; it should not skip"
+
+
+def test_doctor_reports_a_learned_file_diverged_from_an_empty_mirror(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A crash between `add()`'s markdown write and its mirror commit: the
+    database exists, but the row for this bullet was never committed.
+    `LearnedRules.add` now refuses to write in that state rather than
+    silently dropping the rule, so this has to be visible somewhere an
+    operator will actually look."""
+    from daemon.persona.rules import render as render_learned
+
+    Store.open(data_dir / daemon_app.DB_FILENAME).close()  # create the mirror, no rows
+    (data_dir / "persona").mkdir(exist_ok=True)
+    (data_dir / "persona" / "learned.md").write_text(
+        render_learned(["손으로 있던 규칙"]), encoding="utf-8"
+    )
+
+    assert cli.main(["doctor"]) == 1
+
+    out = capsys.readouterr().out
+    assert "[FAIL] persona" in out
+    assert "learned.md has 1 rule(s) the mirror does not know about" in out
+    assert "daemon reindex" in out
+
+
+def test_doctor_reports_a_learned_file_diverged_with_no_database_at_all(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The literal reproduction: `rm daemon.sqlite3` (non-negotiable 1 calls
+    that legitimate) leaves no database file at all, not just an empty one.
+    `_persona_check` used to shortcut straight to "nothing recorded yet"
+    whenever the file was simply absent, which hid this exact state - the one
+    the bug report actually describes."""
+    from daemon.persona.rules import render as render_learned
+
+    (data_dir / "persona").mkdir(exist_ok=True)
+    (data_dir / "persona" / "learned.md").write_text(
+        render_learned(["규칙 0", "규칙 1"]), encoding="utf-8"
+    )
+    assert not (data_dir / daemon_app.DB_FILENAME).exists()
+
+    assert cli.main(["doctor"]) == 1
+
+    out = capsys.readouterr().out
+    assert "[FAIL] persona" in out
+    assert "learned.md has 2 rule(s)" in out
+    assert "no database yet" in out
+    assert "daemon reindex" in out
+
+
 # --- reflect -----------------------------------------------------------------
 
 
@@ -572,6 +705,127 @@ def test_reflect_passes_date_and_force_through(
     assert seen == {"date": DAY, "force": True}
 
 
+# --- persona (M4) --------------------------------------------------------------
+
+
+def test_persona_with_no_rules_says_so(
+    data_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["persona"]) == 0
+    out = capsys.readouterr().out
+    assert "no active persona rules yet." in out
+    assert "last rule created: never" in out
+    assert "last diary: none yet" in out
+
+
+def test_persona_reports_the_most_recent_diary(
+    data_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    diary_dir = data_dir / "persona" / "diary"
+    diary_dir.mkdir(parents=True)
+    (diary_dir / "2026-07-27.md").write_text("older week", encoding="utf-8")
+    (diary_dir / "2026-08-03.md").write_text("latest week", encoding="utf-8")
+
+    assert cli.main(["persona"]) == 0
+    assert "last diary: 2026-08-03" in capsys.readouterr().out
+
+
+def test_persona_lists_active_rules(
+    data_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        store.insert_persona_rule(
+            body="아침엔 인사만 짧게 한다", created_at=NOW, evidence=[1, 2]
+        )
+    finally:
+        store.close()
+
+    assert cli.main(["persona"]) == 0
+    out = capsys.readouterr().out
+    assert "아침엔 인사만 짧게 한다" in out
+    assert "2 observation(s)" in out
+    assert "last rule created: never" not in out
+
+
+def test_persona_forget_retires_a_rule(
+    data_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        rule_id = store.insert_persona_rule(body="규칙", created_at=NOW, evidence=[])
+    finally:
+        store.close()
+
+    assert cli.main(["persona", "forget", str(rule_id), "--why", "싫다"]) == 0
+    assert f"retired rule {rule_id}: 싫다" in capsys.readouterr().out
+
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        assert store.active_persona_rules() == []
+    finally:
+        store.close()
+
+
+def test_persona_forget_an_unknown_id_is_a_usage_error(data_dir: Path) -> None:
+    assert cli.main(["persona", "forget", "999", "--why", "no such rule"]) == 2
+
+
+def test_persona_evolve_runs_the_real_pass_and_reports_it(
+    data_dir: Path,
+    persona_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _add_observations(data_dir, 3)
+    reply = json.dumps(
+        {"rules": [{"body": "아침엔 인사만 짧게 한다", "evidence": [1, 2], "key": None}]}
+    )
+    persona_seam(reply)
+
+    assert cli.main(["persona", "evolve"]) == 0
+
+    out = capsys.readouterr().out
+    assert "1 added" in out
+
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        assert [r["body"] for r in store.active_persona_rules()] == ["아침엔 인사만 짧게 한다"]
+    finally:
+        store.close()
+
+
+def test_persona_evolve_passes_force_through(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    class FakeEvolution:
+        async def run(self, *, force: bool = False) -> Any:
+            seen["force"] = force
+
+            @dataclass
+            class Result:
+                date: str = "2026-08-03"
+                observations_read: int = 0
+                proposed: int = 0
+                added: int = 0
+                retired: int = 0
+                skipped: str = ""
+                problems: tuple[str, ...] = ()
+
+            return Result()
+
+    async def build(settings: Settings) -> tuple[Any, Any]:
+        async def close() -> None: ...
+
+        return FakeEvolution(), close
+
+    monkeypatch.setattr(daemon_app, "build_persona_evolution", build)
+
+    assert cli.main(["persona", "evolve", "--force"]) == 0
+    assert seen == {"force": True}
+
+
 # --- reindex -----------------------------------------------------------------
 
 
@@ -613,5 +867,37 @@ async def test_reindex_rebuilds_all_three_markdown_tiers(
         assert [row["body"] for row in store.active_entries()] == ["연희동에 산다"]
         graph = {name: linked for name, _mentions, linked in EntityNotes(data_dir, store).graph()}
         assert graph["지현"] == ["연희동"]
+    finally:
+        store.close()
+
+
+def test_reindex_restores_persona_rules_from_learned_md(
+    data_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fourth tier `_reindex` rebuilds, additively: a mirror wiped clean
+    (`rm daemon.sqlite3`, a legitimate state per non-negotiable 1) comes back
+    with every rule `learned.md` still names, and a second run adds nothing
+    more."""
+    from daemon.persona.rules import render as render_learned
+
+    Store.open(data_dir / daemon_app.DB_FILENAME).close()
+    persona_dir = data_dir / "persona"
+    persona_dir.mkdir(exist_ok=True)
+    bodies = [f"규칙 {i}" for i in range(5)]
+    (persona_dir / "learned.md").write_text(render_learned(bodies), encoding="utf-8")
+
+    assert cli.main(["reindex"]) == 0
+    capsys.readouterr()
+
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        assert sorted(row["body"] for row in store.active_persona_rules()) == sorted(bodies)
+    finally:
+        store.close()
+
+    assert cli.main(["reindex"]) == 0
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        assert len(store.active_persona_rules()) == 5, "a second reindex must not duplicate rows"
     finally:
         store.close()
