@@ -700,9 +700,21 @@ M2는 ✅다**: `search()`가 검색 히트 뒤에 항상 주입되는 큐레이
       동일하므로 판단은 유지하되 두 숫자를 다 남긴다. 개선 후 턴당 p50 0.005ms,
       버퍼 확장이 걸리는 최악의 턴만 3.2ms(약 2500턴마다).
 - [ ] 감사 후속 (M2 전에): 마이크/스피커 큐 무제한 ·
-      음성 취소 경로의 전사 유실과 필터 잔존 · plist 원자적 쓰기 ·
-      `launchctl bootstrap` 문구 오판 · 종료 시 진행 중 턴이 버려지고 dedup이 재시도를
-      막는 문제
+      음성 취소 경로의 전사 유실과 필터 잔존 · 종료 시 진행 중 턴이 버려지고 dedup이
+      재시도를 막는 문제
+- [x] 감사 후속: plist 원자적 쓰기 · `launchctl bootstrap` 문구 오판 —
+      **둘 다 해소(2026-08-05), 실측으로.** 문구 쪽은 추측이 아니라 결함이었다:
+      이미 로드된 잡을 bootstrap하면 launchd는 **exit 5 `Input/output error`**를
+      주고(이 맥에서 throwaway 잡으로 확인), 없는 경로에 대해서도 **같은 문자열**을
+      준다. 코드가 봐주려던 `service already loaded`는 launchd가 출력하지 않는
+      문구이므로 `daemon install`을 두 번째로 돌리면 죽었다 — 그리고 그 문구를
+      단정하던 테스트가 초록불이라 안 보였다. 문자열로 구분할 수 없으므로 이제
+      실패 시 `launchctl print`로 **잡이 있는지** 묻는다. plist는
+      `fs.write_private_replace`로 옮겼다(temp+fsync+rename). O_TRUNC 쓰기가 중간에
+      죽으면 launchd가 파싱 못 하는 plist가 남고 이전 것은 이미 지워져 있어서,
+      다음 로그인에 데몬이 조용히 안 돌아온다. `secure_parent=False`가 필요했다 —
+      `secure_dir`은 이미 있는 부모를 0700으로 바꾸고, `~/Library/LaunchAgents`는
+      우리 것이 아니다(0755 → 0700, 실측).
 - [ ] `memory_entries`에 `(status, importance, updated_at)` 커버링 인덱스 —
       큐레이션 계층은 매 턴 주입되므로 그 ORDER BY가 매 턴 돈다. 활성 항목 50개에서
       0.07ms, 500개에서 0.75ms라 지금은 문제가 아니지만 5만 개에서는 10ms다.
