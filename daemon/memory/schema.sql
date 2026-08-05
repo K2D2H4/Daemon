@@ -45,8 +45,11 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_id     TEXT,
     log_file      TEXT    NOT NULL,   -- relative path of the markdown original
     recalled      INTEGER NOT NULL DEFAULT 0,
-                  -- 1 = this row was surfaced by recall. Marked so reflection
-                  -- cannot re-extract it and create a self-amplifying loop.
+                  -- 1 = this row was surfaced by recall. Still written, no longer
+                  -- read (2026-08-05): it used to exclude the row from reflection
+                  -- permanently, which removed 29 of 38 messages on a real day and
+                  -- prevented no loop - recall's hits are injected as a system
+                  -- block and are never rows. See Store.messages_for_day.
 
     -- The channel's own id for this message (a Telegram update_id). Telegram
     -- only confirms an update on the *next* getUpdates, so a restart in that

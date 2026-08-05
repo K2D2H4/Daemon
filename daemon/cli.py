@@ -676,7 +676,9 @@ def _memory_check(settings: Settings) -> Check:
     The backlog is in here for the same reason: a reflection loop that has run
     zero times leaves no trace anywhere else.
     """
+    from daemon import clock
     from daemon.app import DB_FILENAME
+    from daemon.memory import log
     from daemon.memory.entities import EntityNotes
     from daemon.memory.store import Store
     from daemon.reflection import pending_days
@@ -685,7 +687,15 @@ def _memory_check(settings: Settings) -> Check:
     # not. That ordering is the fix for a real hole: with the sqlite file deleted -
     # which non-negotiable 1 calls a legitimate state - this reported "nothing
     # recorded yet" and hid a month of unreflected log behind it.
-    backlog = pending_days(settings.data_dir)
+    #
+    # Today is dropped, because `Reflection.catch_up` drops it: the day is still
+    # being written to. Counting it made doctor report "1 day(s) not reflected on
+    # yet - run `daemon reflect`" every single day, and the command it named
+    # answered "nothing to reflect on: no day has a log without a reflection
+    # already". Two commands disagreeing about one day is worse than either being
+    # wrong, because it teaches you to stop reading both.
+    today = log.local_date(clock.now())
+    backlog = [day for day in pending_days(settings.data_dir) if day != today]
     behind = (
         f"{len(backlog)} day(s) not reflected on yet (oldest {backlog[0]})"
         " - run `daemon reflect`"

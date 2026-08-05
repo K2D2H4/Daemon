@@ -358,10 +358,18 @@ class Store:
     def mark_recalled(self, ids: Sequence[int]) -> None:
         """Flag rows that recall put in front of the model.
 
-        docs/PLAN.md 4.2 hygiene rule 2: reflection must not re-extract what was
-        recalled, or its own injected context becomes new evidence and the loop
-        amplifies itself. Note that this UPDATE fires `messages_au`, which rewrites
-        the row's FTS entry with identical content - correct, just not free.
+        **Nothing reads this flag any more** (2026-08-05). It existed for
+        docs/PLAN.md 4.2 hygiene rule 2, which excluded flagged rows from
+        `messages_for_day` permanently; that exclusion cost 29 of 38 messages on a
+        real day and blocked no loop, so it is gone and the reasoning is written
+        out in `messages_for_day`. The write stays because "recall has surfaced
+        this row" is a true and cheap thing to record, and because deleting a
+        column from a frozen schema is a bigger decision than this was.
+
+        **Do not reinstate a reflection filter on it** without reading that
+        docstring first: the input it removes is exactly what persona evolution
+        runs on. Note also that this UPDATE fires `messages_au`, which rewrites the
+        row's FTS entry with identical content - correct, just not free.
         """
         if not ids:
             return
@@ -1044,24 +1052,39 @@ class Store:
     # --- M2: what reflection reads ------------------------------------------
 
     def messages_for_day(self, date: str) -> list[sqlite3.Row]:
-        """One local day's conversation, in reading order, filtered by the two
-        hygiene rules in docs/PLAN.md 4.2.
+        """One local day's conversation, in reading order.
 
         `log_file` is the filter rather than a range over `ts`, because the log is
         split on the *local* day while timestamps are UTC - a KST day legitimately
         holds records whose UTC date is the day before, so a BETWEEN on `ts` would
         silently reflect on a nine-hour-shifted window.
 
-          * rule 1: proactive and reflection sessions are excluded. Their content
-            is the daemon's own speech, and letting that become evidence is the
-            self-amplifying loop the rule exists to block.
-          * rule 2: rows recall already put in front of the model are excluded.
-            They informed a reply once; counting them again turns injected context
-            into new evidence.
+        Rule 1 of docs/PLAN.md 4.2 is here: proactive and reflection sessions are
+        excluded, because their content is the daemon's own speech and letting
+        that become evidence is the self-amplifying loop the rule blocks.
+
+        **Rule 2 used to be here too and is not any more** (2026-08-05). It
+        excluded `recalled = 1` - rows recall had put in front of the model - and
+        the exclusion was permanent. Two things measured on one real day of use:
+
+          * It removed 29 of 38 messages, and the 29 were the persona-relevant
+            ones ("너무 말이 길이 조금 짧게 대답해줄래", "답장이 왜케 오래걸려")
+            while the 9 survivors were wake-word noise ("루시아", "에이데몬").
+            Reflection produced 0 facts, 0 entities, 0 observations - it was not
+            judging badly, it was handed nothing to judge.
+          * It never blocked the loop it named. Recall injects its hits as a
+            *system block*; `loop.py` records only the user turn and the reply, so
+            injected context is never a row in the first place. The path that does
+            exist - the reply restating what was recalled - produces a fresh row
+            carrying no flag, which this filter never saw.
+
+        So the cost was the whole of M4's input and the benefit was nothing. The
+        column and `mark_recalled` are left alone: the flag still records what
+        recall has surfaced, and nothing now reads it (see its docstring).
         """
         return self.conn.execute(
             "SELECT * FROM messages WHERE log_file = ? "
-            "AND session_kind IN ('interactive', 'voice') AND recalled = 0 "
+            "AND session_kind IN ('interactive', 'voice') "
             "ORDER BY ts ASC, id ASC",
             (f"memory/log/{date}.md",),
         ).fetchall()

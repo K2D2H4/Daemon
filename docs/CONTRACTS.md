@@ -146,6 +146,10 @@ Still out of scope: the type-E associative candidate generator (PLAN.md
 §6.1), the `osascript`-under-LaunchAgent question (PLAN.md §6.3.1), and
 pointing `daemon/proactivity/judge.py` at learned rules — it deliberately
 stays seed-only, a separate decision from this milestone
-(docs/design/2026-08-05-m4-persona-design.md). The `recalled = 1` hygiene
-rule starving the observation table (PLAN.md §9) is a related but separate
-open item, not fixed here.
+(docs/design/2026-08-05-m4-persona-design.md).
+
+The `recalled = 1` hygiene rule that was starving the observation table **was**
+fixed, after being scoped out first: PLAN.md §4.2's rule 2 is retired, because it
+cost 29 of 38 messages on a real day and blocked no loop — recall's hits are
+injected as a system block and never become rows. Read
+`Store.messages_for_day`'s docstring before reinstating any filter on that flag.

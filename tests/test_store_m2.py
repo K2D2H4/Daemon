@@ -241,14 +241,22 @@ def test_reflection_never_reads_the_daemons_own_speech(store: Store) -> None:
     assert [row["content"] for row in store.messages_for_day("2026-08-03")] == ["유저가 한 말"]
 
 
-def test_reflection_skips_what_recall_already_showed_the_model(store: Store) -> None:
-    """Hygiene rule 2: counting injected context again turns it into new evidence."""
+def test_reflection_reads_a_row_recall_has_surfaced(store: Store) -> None:
+    """Hygiene rule 2 is retired, and this is the assertion that used to say the
+    opposite.
+
+    It excluded `recalled = 1` permanently, which on one real day removed 29 of 38
+    messages - the persona-relevant ones, leaving wake-word noise - and it blocked
+    nothing: recall's hits go into the prompt as a system block, and the only rows
+    written are the user's turn and the reply, so injected text is never a row to
+    re-extract. See `Store.messages_for_day`.
+    """
     fresh = _record(store, message("새 증거"))
-    reused = _record(store, message("이미 주입된 것"))
-    store.mark_recalled([reused])
+    surfaced = _record(store, message("회상이 한 번 보여준 것"))
+    store.mark_recalled([surfaced])
 
     rows = store.messages_for_day("2026-08-03")
-    assert [row["id"] for row in rows] == [fresh]
+    assert [row["id"] for row in rows] == [fresh, surfaced]
 
 
 def test_the_day_filter_is_the_log_file_not_a_timestamp_range(store: Store) -> None:

@@ -478,6 +478,25 @@ def test_doctor_reports_a_reflection_backlog_and_what_to_run(
     assert "2 day(s) not reflected on yet (oldest 2026-08-01) - run `daemon reflect`" in out
 
 
+def test_doctor_does_not_call_today_a_backlog(
+    data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Today's log has no reflection artifact and never will until tomorrow -
+    `Reflection.catch_up` drops the day still being written to. Counting it made
+    doctor say "1 day(s) not reflected on yet - run `daemon reflect`" every day of
+    the product's life, and the command it named answered "nothing to reflect on".
+    """
+    from daemon import clock
+    from daemon.memory import log
+
+    _logged_day(data_dir, log.local_date(clock.now()))
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert "not reflected on yet" not in out
+
+
 def test_doctor_says_nothing_recorded_yet_on_a_fresh_install(
     data_dir: Path, reachable_ollama: None, capsys: pytest.CaptureFixture[str]
 ) -> None:

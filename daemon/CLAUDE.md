@@ -105,14 +105,16 @@ package. Rules: [CONTRACTS.md](../docs/CONTRACTS.md). Data flow:
 - **Two Telegram traps.** The inbound poll needs a floor — left to the long poll alone, a
   transport that returns immediately spins at ~16,000 requests/second. And `allowed_updates`
   is **server-side**: at `["message"]` a 👍 press is never delivered at all.
-- **M4's gate had no input to measure.** The live database held 0 observations, 0
-  `persona_rules`, no LaunchAgent installed — reflection had never run on real data. The
-  cause: `Store.messages_for_day` excludes `recalled = 1` rows permanently (PLAN.md 4.2),
-  which dropped 29 of 38 real messages in one day, and the excluded lines were exactly the
-  persona-relevant ones.
+- **The hygiene rule that fed nothing to reflection cost 29 of 38 real messages**, and the
+  29 were the persona-relevant lines while the 9 survivors were wake-word noise: 0 facts, 0
+  entities, 0 observations out. It also never blocked the loop it named — recall injects its
+  hits as a system block, and only the user turn and the reply become rows. Rule 2 is
+  retired; the same real day then gave **110 read → 3 facts, 1 entity, 3 observations**. The
+  flag is still written and nothing reads it; see `Store.mark_recalled`.
 - **`daemon doctor` and `daemon reflect` disagreed about the same day.** Doctor's backlog
-  count includes today; `Reflection.catch_up` deliberately excludes it. Running the command
-  doctor recommended answered "nothing to reflect on."
+  counted today; `Reflection.catch_up` deliberately excludes it. So doctor said "run `daemon
+  reflect`" every day and that command answered "nothing to reflect on." Today is dropped
+  from the backlog now — two commands contradicting each other teaches you to read neither.
 - **A real weekly evolution pass, run against Gemini with 30 seeded observations:** 30 read
   -> 7 proposed -> 3 added, 10.8 s, with the 4 the per-cycle cap dropped reported rather than
   discarded. A same-week rerun skipped in 0.64 s and made no model call.
