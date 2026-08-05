@@ -317,3 +317,27 @@ def test_no_name_this_file_reasons_about_is_defined_twice() -> None:
         "these names are checked above and defined in more than one module under "
         f"daemon/, so the checks cannot tell which one they found: {duplicates}"
     )
+
+
+# --- the suite's own greenness must not depend on the shell -------------------
+
+
+def test_the_environment_is_isolated_from_the_developers_own() -> None:
+    """`Settings(_env_file=None, ...)` does not stop pydantic-settings reading the
+    *process* environment, only the file. So a shell that had sourced `.env` - which
+    is how you run the product - leaked real values into tests that had explicitly
+    chosen their own, and `DAEMON_VOICE_ENABLED=true` made three allowlist cases
+    above fail with a ConfigError about voice.
+
+    Same defect class as the rest of this file, one level up: a gate whose result
+    depends on something nobody declared. `conftest.CANARY` is what makes this
+    falsifiable in CI, where the environment is clean and the assertion would
+    otherwise be vacuous.
+    """
+    import os
+
+    from tests.conftest import CANARY, CONFIG_PREFIXES
+
+    leaked = sorted(k for k in os.environ if k.startswith(CONFIG_PREFIXES))
+    assert leaked == [], f"real configuration is visible to tests: {leaked}"
+    assert CANARY not in os.environ
