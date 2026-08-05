@@ -7,11 +7,12 @@ stays visible next to the provider contract.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
 
-from daemon.llm.base import Completion, Message, ProviderError
+from daemon.llm.base import Completion, Message, ProviderError, ToolCall, ToolSpec
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
@@ -48,12 +49,11 @@ class AnthropicProvider:
         model: str,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> Completion:
         # System turns are a top-level field here, not a role in the list.
         system = "\n\n".join(m.content for m in messages if m.role == "system")
-        turns = [
-            {"role": m.role, "content": m.content} for m in messages if m.role != "system"
-        ]
+        turns = _turns(messages)
         if not turns:
             raise ProviderError("anthropic needs at least one user or assistant message")
 
@@ -66,14 +66,39 @@ class AnthropicProvider:
             payload["system"] = system
         if temperature is not None:
             payload["temperature"] = temperature
+        if tools:
+            # `input_schema`, not `parameters`: the one field name this API spells
+            # differently from the other three.
+            payload["tools"] = [
+                {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "input_schema": spec.parameters,
+                }
+                for spec in tools
+            ]
 
         data = await self._post(payload)
+        blocks = data.get("content")
+        blocks = blocks if isinstance(blocks, list) else []
         text = "".join(
             block.get("text", "")
-            for block in data.get("content", [])
+            for block in blocks
             if isinstance(block, dict) and block.get("type") == "text"
         )
-        if not text:
+        calls = tuple(
+            ToolCall(
+                id=str(block.get("id", "")),
+                name=str(block.get("name", "")),
+                # Already a decoded object on this API.
+                arguments=block.get("input") if isinstance(block.get("input"), dict) else {},
+            )
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        )
+        if not text and not calls:
+            # `stop_reason: "tool_use"` produces no text at all, which is a
+            # complete response rather than a failed one.
             raise ProviderError(f"anthropic returned no text content: {data!r}")
 
         usage = data.get("usage") or {}
@@ -83,6 +108,7 @@ class AnthropicProvider:
             input_tokens=int(usage.get("input_tokens", 0)),
             output_tokens=int(usage.get("output_tokens", 0)),
             meta={"stop_reason": str(data.get("stop_reason", ""))},
+            tool_calls=calls,
         )
 
     async def health(self) -> bool:
@@ -129,3 +155,54 @@ class AnthropicProvider:
             return data
 
         raise ProviderError("anthropic call failed")  # unreachable
+
+
+def _turns(messages: list[Message]) -> list[dict[str, Any]]:
+    """Neutral messages as Anthropic turns.
+
+    This API has no `tool` role. A tool result is a `tool_result` block inside a
+    **user** turn, and consecutive results have to share one turn: the API rejects
+    two user turns in a row, so a reply that asked for three tools at once would
+    otherwise be answered with three separate turns and a 400.
+    """
+    turns: list[dict[str, Any]] = []
+    for message in messages:
+        if message.role == "system":
+            continue
+        if message.role == "tool":
+            block = {
+                "type": "tool_result",
+                "tool_use_id": message.tool_call_id or "",
+                "content": message.content,
+            }
+            previous = turns[-1] if turns else None
+            if previous is not None and previous.get("role") == "user" and _is_results(previous):
+                previous["content"].append(block)
+            else:
+                turns.append({"role": "user", "content": [block]})
+            continue
+        if message.role == "assistant" and message.tool_calls:
+            content: list[dict[str, Any]] = []
+            if message.content:
+                content.append({"type": "text", "text": message.content})
+            content.extend(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }
+                for call in message.tool_calls
+            )
+            turns.append({"role": "assistant", "content": content})
+            continue
+        turns.append({"role": message.role, "content": message.content})
+    return turns
+
+
+def _is_results(turn: dict[str, Any]) -> bool:
+    """A user turn whose content is a list of tool results, so another can join it."""
+    content = turn.get("content")
+    return isinstance(content, list) and all(
+        isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+    )

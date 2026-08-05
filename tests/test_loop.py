@@ -145,6 +145,7 @@ class FlakyProvider:
         messages: list[Message],
         *,
         model: str,
+        tools: object = None,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
     ) -> Completion:
@@ -629,15 +630,26 @@ async def test_a_broken_channel_does_not_end_the_loop(data_dir: Path) -> None:
 
 
 async def test_the_exchange_lands_in_the_markdown_log(
-    data_dir: Path, db: Any, fake_provider: FakeProvider
+    data_dir: Path, db: Any, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """docs/PLAN.md 8.2, M1a gate: message it, it answers, and the exchange is in
-    memory/log/YYYY-MM-DD.md. Everything but the channel is real here."""
+    memory/log/YYYY-MM-DD.md. Everything but the channel is real here.
+
+    The clock is pinned to the inbound message's own day. Without that this asserted
+    "one log file" while the user turn was dated 2026-08-03 and the reply took
+    `clock.now()`, so the test passed only while the machine's date happened to be
+    2026-08-03 and started failing on its own once the date moved - a real property
+    of the log writer (a turn can straddle midnight) tested by accident.
+    """
+    from daemon import clock
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
 
+    arrival = inbound("what did I say about the talk?")
+    monkeypatch.setattr(clock, "now", lambda: arrival.received_at)
+
     memory = FileMemoryWriter(data_dir, Store(db))
-    channel = FakeChannel([inbound("what did I say about the talk?")])
+    channel = FakeChannel([arrival])
 
     await ConversationLoop(
         channel, gateway_for(fake_provider), memory, data_dir=data_dir

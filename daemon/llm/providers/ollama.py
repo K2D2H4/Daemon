@@ -9,11 +9,19 @@ tokens, and it complicates the token accounting the gateway logs.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
 
-from daemon.llm.base import Completion, Message, ProviderError
+from daemon.llm.base import (
+    Completion,
+    Message,
+    ProviderError,
+    ToolCall,
+    ToolSpec,
+    decode_tool_arguments,
+)
 
 DEFAULT_TIMEOUT = 120.0
 """Generous: a 14B model on a cold load is slow. Bounded all the same - an
@@ -41,6 +49,7 @@ class OllamaProvider:
         model: str,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> Completion:
         options: dict[str, Any] = {}
         if max_output_tokens is not None:
@@ -50,7 +59,7 @@ class OllamaProvider:
 
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [_turn(m) for m in messages],
             "stream": False,
             # No `think` parameter on purpose. Measured on qwen3:4b: `think:
             # false` does not stop a reasoning model from reasoning, it stops
@@ -65,18 +74,36 @@ class OllamaProvider:
         }
         if options:
             payload["options"] = options
+        if tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": spec.name,
+                        "description": spec.description,
+                        "parameters": spec.parameters,
+                    },
+                }
+                for spec in tools
+            ]
 
         data = await self._post(f"{self._base_url}/api/chat", payload)
-        try:
-            text = data["message"]["content"]
-        except (KeyError, TypeError) as exc:
-            raise ProviderError(f"ollama returned no message content: {data!r}") from exc
+        message = data.get("message")
+        if not isinstance(message, dict):
+            raise ProviderError(f"ollama returned no message content: {data!r}")
+        text = message.get("content")
+        calls = _tool_calls(message)
+        if not isinstance(text, str) or (not text and not calls):
+            # A tool-calling turn legitimately has an empty `content`, so absent
+            # text is only a failure when the model asked for nothing either.
+            raise ProviderError(f"ollama returned no message content: {data!r}")
 
         return Completion(
             text=text,
             model=str(data.get("model", model)),
             input_tokens=int(data.get("prompt_eval_count", 0)),
             output_tokens=int(data.get("eval_count", 0)),
+            tool_calls=calls,
         )
 
     async def health(self) -> bool:
@@ -120,3 +147,51 @@ class OllamaProvider:
             return data
 
         raise ProviderError(f"ollama call to {url} failed")  # unreachable
+
+
+def _turn(message: Message) -> dict[str, Any]:
+    """One neutral Message as Ollama's chat format.
+
+    Ollama follows OpenAI's older chat shape, so the `tool` role survives as
+    itself here - unlike Anthropic, where it has to become a user turn.
+    """
+    turn: dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.tool_calls:
+        turn["tool_calls"] = [
+            {"function": {"name": call.name, "arguments": call.arguments}}
+            for call in message.tool_calls
+        ]
+    if message.role == "tool":
+        # Ollama matches results to requests by position and by name, not by id:
+        # there is no `tool_call_id` in its schema, and sending one is ignored at
+        # best. `tool_name` is what recent versions read.
+        turn["tool_name"] = message.tool_call_id or ""
+    return turn
+
+
+def _tool_calls(message: dict[str, Any]) -> tuple[ToolCall, ...]:
+    """Ollama's tool calls carry no ids, so they are numbered by position.
+
+    That is enough because the ids never leave this process: the loop uses them to
+    pair a result with its request within one turn, and `_turn` above sends the
+    name back rather than the id.
+    """
+    raw = message.get("tool_calls")
+    if not isinstance(raw, list):
+        return ()
+    calls: list[ToolCall] = []
+    for index, item in enumerate(raw):
+        function = item.get("function") if isinstance(item, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        calls.append(
+            ToolCall(
+                id=str(item.get("id") or f"{name}-{index}"),
+                name=name,
+                arguments=decode_tool_arguments(function.get("arguments")),
+            )
+        )
+    return tuple(calls)
