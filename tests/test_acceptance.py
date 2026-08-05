@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import json
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,35 @@ def _settings(tmp_path: Path, **extra: Any) -> Settings:
     )
 
 
+class _Idle:
+    """Yields nothing and stays open, like a quiet channel.
+
+    Module level because three tests need it. It was local to the first one until
+    the wake tests arrived, and a second copy would have been the parallel fixture
+    `tests/conftest.py` tells you not to write.
+    """
+
+    name = "telegram"
+
+    async def send(self, message: Any) -> None: ...
+
+    async def listen(self) -> Any:
+        await asyncio.Event().wait()  # never fires; cancelled at shutdown
+        yield  # pragma: no cover
+
+    async def close(self) -> None: ...
+
+
+class _Mem:
+    async def record(self, message: Any) -> None: ...
+
+    async def seen(self, channel: str, external_id: str) -> bool:
+        return False
+
+    async def recent(self, limit: int = 20) -> list[Any]:
+        return []
+
+
 # --- the defect that reached the user ---------------------------------------
 
 
@@ -133,33 +163,8 @@ def test_the_lifespan_actually_starts_the_conversation_loop(tmp_path: Path) -> N
     from starlette.testclient import TestClient
 
     from daemon.app import create_app
-    from daemon.memory.base import LoggedMessage
 
-    class Idle:
-        """Yields nothing and stays open, like a quiet channel."""
-
-        name = "telegram"
-
-        async def send(self, message: Any) -> None: ...
-
-        async def listen(self) -> Any:
-            import asyncio
-
-            await asyncio.Event().wait()  # never fires; cancelled at shutdown
-            yield  # pragma: no cover
-
-        async def close(self) -> None: ...
-
-    class Mem:
-        async def record(self, message: LoggedMessage) -> None: ...
-
-        async def seen(self, channel: str, external_id: str) -> bool:
-            return False
-
-        async def recent(self, limit: int = 20) -> list[LoggedMessage]:
-            return []
-
-    app = create_app(_settings(tmp_path), channel=Idle(), memory=Mem())
+    app = create_app(_settings(tmp_path), channel=_Idle(), memory=_Mem())
     with TestClient(app) as client:
         body = client.get("/health").json()
 
@@ -371,6 +376,65 @@ def test_doctor_reports_a_fresh_install_without_crashing(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
     assert main(["doctor"]) != 0, "doctor passed a configuration that cannot load"
+
+
+def test_doctor_says_when_the_shell_is_overriding_the_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The failure this exists for cost hours twice, and both times invisibly.
+
+    pydantic-settings reads the process environment before the file, by design. An
+    install had `TELEGRAM_BOT_TOKEN` exported from `~/.zshrc` for a *different* tool,
+    so every terminal silently pointed `daemon run` at that tool's bot - which the
+    tool was already polling, so every poll was a 409. `.env` named the right bot the
+    whole time and was never used. The 409 message names the bot, which is what found
+    it; this names the reason, which is what would have found it in one command.
+
+    Two ids, no secrets: the numeric half of a bot token is the bot's user id, and it
+    is already printed by the conflict message.
+    """
+    from daemon.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "DAEMON_PRESET=offline\n"
+        "DAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        "TELEGRAM_BOT_TOKEN=1111111111:AAH-the-one-in-the-file\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "2222222222:AAH-the-one-in-the-shell")
+
+    main(["doctor"])
+    printed = capsys.readouterr().out
+
+    assert "environment" in printed
+    assert "2222222222" in printed and "1111111111" in printed, (
+        "it must name both bots - which one is wrong is the owner's call, and they "
+        "cannot make it without seeing both"
+    )
+    assert ".env is being ignored" in printed
+    # The id half is public; the secret half is not, and neither is any other value.
+    assert "AAH-the-one-in-the-shell" not in printed
+    assert "AAH-the-one-in-the-file" not in printed
+
+
+def test_doctor_is_quiet_when_the_environment_agrees_with_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exporting the same value is not a problem, and reporting it as one would train
+    the owner to ignore the check that matters."""
+    from daemon.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+
+    main(["doctor"])
+    printed = capsys.readouterr().out
+
+    assert "nothing in the environment overrides" in printed
 
 
 def test_uninstall_does_not_claim_to_have_installed(
@@ -676,3 +740,241 @@ async def test_a_label_press_lands_through_the_channel_the_app_builds(
         assert answered, "Telegram was left with a spinner on the button"
     finally:
         store.close()
+
+
+# --- the wake gate, as a person would check it -------------------------------
+# "When Daemon is awake on the PC, it should hear me call it and answer." The unit
+# tests prove the gate classifies audio; these prove the *resident process* uses
+# it. That gap is this file's whole reason for existing: the gate shipped with 68
+# passing tests while `daemon run` never started it, so a person would have had to
+# run a command by hand - which is the thing the gate was built to remove.
+
+
+def test_the_resident_process_listens_and_keeps_listening(tmp_path: Path) -> None:
+    """The gate has to survive a round, and a failing round, without a restart.
+
+    A wake gate that stops is this repo's recurring defect wearing a new costume:
+    the process stays alive, /health says ok, Telegram still answers, and the
+    machine has quietly gone deaf. So the assertion is not "a round ran" but
+    "rounds keep running after one of them raised".
+    """
+    from starlette.testclient import TestClient
+
+    from daemon.app import create_app
+
+    rounds = 0
+
+    async def flaky_round() -> None:
+        nonlocal rounds
+        rounds += 1
+        if rounds == 1:
+            raise RuntimeError("no microphone this time")
+        await asyncio.sleep(0.01)
+
+    app = create_app(
+        _settings(tmp_path), channel=_Idle(), memory=_Mem(), wake=flaky_round
+    )
+    with TestClient(app) as client:
+        body = client.get("/health").json()
+        deadline = asyncio.new_event_loop()
+        try:
+            # The first round raises and the loop waits out its floor, so give it
+            # room to come back rather than asserting on a race.
+            deadline.run_until_complete(asyncio.sleep(0.05))
+        finally:
+            deadline.close()
+        after = client.get("/health").json()
+
+    assert body["wake_gate"] == "running", (
+        "the daemon booted without a wake gate - a person would have to start one "
+        "by hand, which is the problem the gate exists to remove"
+    )
+    assert after["wake_gate"] == "running", "the gate stopped and nothing said so"
+    assert rounds >= 1
+
+
+def test_the_gate_goes_back_to_listening_after_every_conversation(tmp_path: Path) -> None:
+    """One round is listen-then-converse, so "keeps listening" means "rounds repeat".
+
+    Tested separately from the failure case above, and this is why: a round that
+    raises waits out `WAKE_RETRY_SECONDS` before the next one, so within any short
+    test the task is still alive and /health still says `running`. That made the
+    recovery test pass against a loop that had been cut down to a single round -
+    found by mutation, not by reading.
+    """
+    from starlette.testclient import TestClient
+
+    from daemon.app import create_app
+
+    rounds = 0
+    third = threading.Event()
+
+    async def quick_round() -> None:
+        nonlocal rounds
+        rounds += 1
+        if rounds >= 3:
+            third.set()
+            await asyncio.sleep(0.5)  # stop racing ahead once the point is made
+
+    app = create_app(
+        _settings(tmp_path), channel=_Idle(), memory=_Mem(), wake=quick_round
+    )
+    with TestClient(app):
+        assert third.wait(timeout=5.0), f"the gate ran {rounds} round(s) and stopped"
+
+    assert rounds >= 3
+
+
+def test_the_microphone_is_released_when_the_daemon_stops(tmp_path: Path) -> None:
+    """A wake task that outlives the process's shutdown holds the microphone.
+
+    The next `daemon run` then starts against a device someone else is recording
+    from, and on a LaunchAgent that "someone else" is the previous instance of
+    itself. The lifespan cancels three tasks; this asserts the third is one of them.
+    """
+    from starlette.testclient import TestClient
+
+    from daemon.app import create_app
+
+    started = threading.Event()
+    released = threading.Event()
+
+    async def round_that_notices_cancellation() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            released.set()
+            raise
+
+    app = create_app(
+        _settings(tmp_path),
+        channel=_Idle(),
+        memory=_Mem(),
+        wake=round_that_notices_cancellation,
+    )
+    with TestClient(app):
+        assert started.wait(timeout=5.0), "the gate never started"
+
+    assert released.is_set(), (
+        "shutdown left the wake task running - it still holds the microphone, and "
+        "the next start will find the device busy"
+    )
+    assert app.state.wake_task.done()
+
+
+def test_the_microphone_is_released_before_storage_closes(tmp_path: Path) -> None:
+    """Cancelled *by the lifespan*, not by the event loop tearing down after it.
+
+    "Is it cancelled at the end" cannot tell those apart - asyncio cancels whatever
+    is left when the loop closes, so removing `wake_task` from the lifespan's cancel
+    list still ends the task and still passes the test above. Found by mutation.
+
+    What actually differs is order. Cancelled by the lifespan, the gate stops
+    recording before the channel and the sqlite connection go; left to the loop, it
+    is still holding the microphone and still able to reach a `Store` that is being
+    closed underneath it. So the assertion is the sequence.
+    """
+    from starlette.testclient import TestClient
+
+    from daemon.app import create_app
+
+    order: list[str] = []
+    started = threading.Event()
+
+    class Closing(_Idle):
+        async def close(self) -> None:
+            order.append("channel-closed")
+
+    async def round_that_records_its_cancellation() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            order.append("wake-cancelled")
+            raise
+
+    app = create_app(
+        _settings(tmp_path),
+        channel=Closing(),
+        memory=_Mem(),
+        wake=round_that_records_its_cancellation,
+    )
+    with TestClient(app):
+        assert started.wait(timeout=5.0), "the gate never started"
+
+    assert order == ["wake-cancelled", "channel-closed"], (
+        f"expected the microphone released before the channel closed, got {order}"
+    )
+
+
+def test_a_daemon_nobody_asked_to_listen_says_off_not_running(tmp_path: Path) -> None:
+    """`off` and `unavailable` and `stopped` are three different problems.
+
+    Reporting them as one number is what made recall's health useless before it was
+    split (see `_recall_health`), so the wake gate got the same treatment on the way
+    in rather than after a session was lost to it.
+    """
+    from starlette.testclient import TestClient
+
+    from daemon.app import create_app
+
+    app = create_app(_settings(tmp_path), channel=_Idle(), memory=_Mem())
+    with TestClient(app) as client:
+        assert client.get("/health").json()["wake_gate"] == "off"
+
+
+def test_asking_for_a_gate_with_nothing_to_hear_with_is_reported(tmp_path: Path) -> None:
+    """`DAEMON_WAKE_ENABLED=true` on a machine with no on-device recognizer.
+
+    The daemon must still run - Telegram is unaffected and the install is still
+    worth having - but it must not claim to be listening. This is the Linux case,
+    and the case of a macOS install that never got the voice extra.
+    """
+    from starlette.testclient import TestClient
+
+    from daemon.app import create_app
+
+    class Deaf:
+        available = False
+
+        async def transcribe(self, pcm: bytes) -> str:  # pragma: no cover - never asked
+            return ""
+
+    # Not via `_settings`: this needs a preset that routes voice, and `_settings`
+    # pins `offline`, which by design routes none (docs/PLAN.md 3.2).
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PRESET="balanced",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN=TOKEN,
+        DAEMON_HOSTED_PROVIDER="gemini",
+        GEMINI_API_KEY="k",
+        DAEMON_VOICE_ENABLED="true",
+        DAEMON_GEMINI_LIVE_MODEL="gemini-3.1-flash-live-preview",
+        DAEMON_GEMINI_MODEL="gemini-3.5-flash",
+        DAEMON_WAKE_ENABLED="true",
+        DAEMON_WAKE_ALIASES="루시",
+    )
+    app = create_app(settings, channel=_Idle(), memory=_Mem())
+    # Patched before the client starts, not inside it: `TestClient.__enter__` runs
+    # the lifespan, so a patch applied in the body arrives after the decision it was
+    # meant to change. The first version of this test asserted `unavailable` and got
+    # `running` for exactly that reason - and on a machine without the voice extra
+    # it would have passed anyway, which is the worse half of the mistake.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("daemon.app.build_wake_recognizer", lambda: Deaf())
+        with TestClient(app) as client:
+            body = client.get("/health").json()
+
+    assert body["status"] == "ok", "a deaf machine must still run the rest of the daemon"
+    # Exactly `unavailable`, not "one of unavailable or off". The looser version was
+    # what this assertion said first, and a mutation that ignored DAEMON_WAKE_ENABLED
+    # altogether survived it by reporting `off` - which is the one answer this state
+    # must not give, because `off` means nobody asked and the owner did ask.
+    assert body["wake_gate"] == "unavailable", (
+        "asked to listen with nothing to listen with, and it reported "
+        f"{body['wake_gate']!r} - `off` would send the owner looking at their config "
+        "instead of at the missing voice extra"
+    )

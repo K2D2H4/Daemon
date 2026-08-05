@@ -51,6 +51,8 @@ Pick `offline` and you need no API key at all, just [Ollama](https://ollama.com)
 daemon run       # here, in this terminal
 daemon install   # or keep it running after you close it, and after a reboot
 daemon voice     # one spoken conversation
+daemon wake calibrate  # what your on-device recognizer actually hears you say
+daemon wake test       # run the always-on wake gate here, and see what fires
 daemon reflect   # consolidate a day into memory now, instead of waiting for 04:00
 daemon proactive # one round of "is there a reason to speak?", and what it decided
 daemon doctor    # what is configured, reachable, indexed and remembered

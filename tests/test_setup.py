@@ -1505,6 +1505,32 @@ def test_the_token_never_appears_while_pairing(tmp_path: Path) -> None:
     assert f"...{GOOD_TOKEN[-4:]}" in result.out
 
 
+def test_a_pairing_failure_names_the_bot_it_was_polling(tmp_path: Path) -> None:
+    """The handle is the diagnosis when something else holds the token.
+
+    A real install read `fail: api.telegram.org returned HTTP 409` several times
+    and went looking for a second daemon. There was none - the token named a bot
+    another tool on the machine was already polling, and the handle printed two
+    lines earlier (in "send any message to @x") was the answer. Printing it *on the
+    failure* is what makes the two facts land in the same glance.
+    """
+    def updates(token: str, offset: int | None, timeout: int) -> Updates:
+        return Updates(
+            False,
+            detail="api.telegram.org returned HTTP 409: Conflict: terminated by other"
+            " getUpdates request",
+            hint=setup.TELEGRAM_CONFLICT_HINT,
+        )
+
+    result = drive(tmp_path, answers_for(pairing=["y", "y"]), checks=checks_with(updates))
+    out = flat(result.out)
+
+    assert "HTTP 409" in out
+    assert "on bot @test_bot" in out  # the failure itself says which bot
+    # And the hint keeps pointing away from the assumption that it is one of ours.
+    assert "Not necessarily another daemon" in out
+
+
 def test_the_pairing_poll_carries_the_token_it_was_given(tmp_path: Path) -> None:
     seen: list[str] = []
 
@@ -1701,11 +1727,35 @@ def test_a_409_names_both_causes_and_what_to_do_about_each(
 
     assert "webhook" in hint
     assert "deleteWebhook" in hint  # the command, for the persistent cause
-    assert "polling this token" in hint  # and the transient one
+    assert "polling this bot" in hint  # and the transient one
     assert "daemon uninstall" in hint  # where the other poller usually is
     # Named, not run. Deleting a webhook changes something the user may have set on
     # purpose, and this wizard writes nothing but `.env`.
     assert "curl -X POST" in hint
+
+
+@pytest.mark.parametrize("body", [WEBHOOK_409, OTHER_POLLER_409, {}])
+def test_the_other_poller_is_not_assumed_to_be_one_of_ours(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, object]
+) -> None:
+    """The transient cause used to read "stop the other `daemon run`".
+
+    That sentence quietly asserts the competitor is ours, and a real install lost
+    hours to a 409 where it was not: `TELEGRAM_BOT_TOKEN` named a bot that another
+    tool on the same machine was already polling, so no daemon existed to stop and
+    the fix was a second bot. Someone who trusts the hint stops looking exactly
+    where the answer is.
+    """
+    monkeypatch.setattr(setup.httpx, "get", canned(409, body))
+
+    hint = flat("\n".join(setup.fetch_updates(GOOD_TOKEN, None, 1).hint))
+
+    assert "Not necessarily another daemon" in hint
+    # The two ways out, and the second one is what actually resolved it.
+    assert "another tool configured with this same bot" in hint
+    assert "/newbot" in hint
+    # And the reason a reboot is not evidence: the process outlives its terminal.
+    assert "outlives the terminal" in hint
 
 
 def test_a_409_with_no_parseable_body_still_reports_the_code_and_the_causes(
