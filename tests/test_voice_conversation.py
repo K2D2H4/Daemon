@@ -1255,3 +1255,122 @@ async def test_the_same_turn_is_not_seeded_twice() -> None:
 
     assert len(session.contexts) <= 1, "the same turn was seeded more than once"
     assert session.sent_while_generating == []
+
+
+# --- the utterance that opened the session, and the cue that invites the next ---
+# The gate used to consume "루시 뭐 해", match on the alias, and throw the sound away,
+# so the session opened deaf to the question it was opened for. Measured on a real
+# run: 14.79s from the wake word to the first audio out, most of it a person saying
+# the same thing twice.
+
+
+async def test_the_opening_utterance_is_the_first_thing_the_session_hears() -> None:
+    """First, not merely eventually: live microphone audio arriving ahead of it would
+    put the question behind the noise of a person settling down.
+
+    Asserted as "the first chunk", not "before `record()` is called", because the
+    latter is not a real guarantee - `record()` only builds the generator and nothing
+    flows until the pump task runs. A mutation swapping those two lines changes
+    nothing, and a test that failed on it would be pinning noise."""
+    opening = b"\x11\x22" * 400
+    audio = FakeAudio(b"live-block")
+    session = FakeSession(Says("user", "뭐 해"), b"\x01", Turn())
+    conv = conversation(session, audio, opening_audio=opening)
+    await run(conv)
+
+    assert session.sent, "the opening utterance never reached the session"
+    assert session.sent[0] == opening, (
+        "something else was fed to the session before the utterance that opened it"
+    )
+
+
+async def test_no_opening_audio_is_the_ordinary_case() -> None:
+    """`daemon voice` run by hand has no wake segment, and neither does a session
+    opened by a provider with nothing to offer."""
+    audio = FakeAudio(b"live-block")
+    session = FakeSession(Says("user", "안녕"), Turn())
+    conv = conversation(session, audio)
+    await run(conv)
+
+    assert b"" not in session.sent, "an empty opening was sent as a chunk"
+
+
+async def test_a_session_that_refuses_the_opening_still_holds_the_conversation() -> None:
+    """One repeated sentence is the cost of losing it. Raising here would cost the
+    whole turn, which is worse."""
+
+    class Refuses(FakeSession):
+        async def send_audio(self, chunk: bytes) -> None:
+            if not self.sent:
+                self.sent.append(chunk)
+                raise RuntimeError("the socket hiccuped on the first chunk")
+            await super().send_audio(chunk)
+
+    session = Refuses(Says("user", "안녕"), b"\x01", Turn())
+    conv = conversation(session, opening_audio=b"\x11\x22")
+    await run(conv)
+
+    assert conv.stats.played_seconds > 0, "a refused opening took the answer with it"
+
+
+# --- the ready cue -------------------------------------------------------------
+
+
+def test_the_ready_cue_is_short_quiet_and_starts_at_silence() -> None:
+    """A bare sine starts on a discontinuity, which is an audible click and exactly
+    the kind of noise a VAD notices."""
+    import numpy as np
+
+    from daemon.app import READY_CUE_MS, ready_cue
+
+    pcm = ready_cue(24_000)
+    samples = np.frombuffer(pcm, dtype="<i2")
+
+    assert len(samples) == pytest.approx(24_000 * READY_CUE_MS / 1000, rel=0.02)
+    assert samples[0] == 0 and samples[-1] == 0, "the cue clicks"
+    assert 0 < int(np.abs(samples).max()) < 8000, "the cue is loud enough to startle"
+
+
+def test_the_ready_cue_follows_the_devices_rate() -> None:
+    """Synthesised rather than shipped as a wav precisely so this holds: a cue at the
+    wrong rate is the chipmunk bug in miniature."""
+    from daemon.app import ready_cue
+
+    assert len(ready_cue(48_000)) == 2 * len(ready_cue(24_000))
+
+
+def test_the_ready_cue_rises() -> None:
+    """Rising reads as "go ahead"; falling reads as "finished"."""
+    import numpy as np
+
+    from daemon.app import ready_cue
+
+    samples = np.frombuffer(ready_cue(24_000), dtype="<i2")
+    half = len(samples) // 2
+
+    def hz(part: np.ndarray) -> float:
+        crossings = int(((part[:-1] >= 0) != (part[1:] >= 0)).sum())
+        return crossings / 2 / (len(part) / 24_000)
+
+    assert hz(samples[half:]) > hz(samples[:half])
+
+
+async def test_the_cue_plays_and_a_speaker_that_refuses_it_is_not_fatal() -> None:
+    """The cue is a courtesy. A conversation that failed because it could not be
+    played would be a worse trade than no cue at all."""
+    from daemon.app import play_ready_cue, ready_cue
+
+    audio = FakeAudio()
+    await play_ready_cue(audio)
+    assert audio.played, "the cue never reached the speaker"
+    # At the playback rate, not the capture rate. FakeAudio deliberately has two
+    # different ones (16k in, 24k out), so a cue built at the wrong one arrives the
+    # wrong length - the chipmunk bug in miniature (daemon/voice/base.py).
+    assert audio.played[0] == ready_cue(audio.playback_sample_rate)
+    assert audio.played[0] != ready_cue(audio.sample_rate)
+
+    class Deaf(FakeAudio):
+        async def play(self, chunk: bytes) -> None:
+            raise RuntimeError("no speaker here")
+
+    await play_ready_cue(Deaf())  # must not raise

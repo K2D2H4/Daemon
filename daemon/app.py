@@ -657,7 +657,7 @@ async def _reflect_tick(settings: Settings) -> None:
         )
 
 
-async def run_voice(settings: Settings) -> int:
+async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
     """One spoken conversation at this machine, then exit.
 
     Assembled here rather than inside the daemon's own loop because voice is a
@@ -690,6 +690,10 @@ async def run_voice(settings: Settings) -> int:
         recall, _status, embedder = _build_recall(settings, store)
         seed = _read_seed(settings.data_dir)
         audio = build_voice_audio()
+        # Before the handshake, so the acknowledgement is as close to the wake word
+        # as it can be. Nothing is feeding the session yet, so the cue cannot be
+        # heard as the owner interrupting.
+        await play_ready_cue(audio)
 
         def new_session() -> Any:
             """A fresh session per attempt. Reconnecting means starting clean: the
@@ -713,7 +717,13 @@ async def run_voice(settings: Settings) -> int:
 
         try:
             return await _voice_attempts(
-                new_session, audio, memory, recall, settings, GeminiLiveError
+                new_session,
+                audio,
+                memory,
+                recall,
+                settings,
+                GeminiLiveError,
+                opening_audio=opening_audio,
             )
         finally:
             with suppress(Exception):
@@ -725,6 +735,55 @@ async def run_voice(settings: Settings) -> int:
                         await closer()
     finally:
         store.close()
+
+
+READY_CUE_HZ = (784.0, 1046.5)
+"""Two short notes, G5 then C6, rising. A rising pair reads as "go ahead" where a
+falling one reads as "finished", and neither is a word - so it cannot be mistaken for
+the daemon speaking or transcribed as one."""
+
+READY_CUE_MS = 90
+READY_CUE_GAIN = 0.18
+"""Short and quiet on purpose. The cue answers "may I speak now?", and the honest
+answer is that until it existed there was none: the wake gate released the microphone
+and about a second passed with nothing to say the session was live, so the owner
+guessed - and guessing early is how an utterance lands in the handover and is lost."""
+
+
+def ready_cue(sample_rate: int) -> bytes:
+    """A short rising two-note cue as 16-bit mono PCM at `sample_rate`.
+
+    Synthesised rather than shipped as a file: it is 90 ms of arithmetic, a wav in
+    the package would need finding at runtime from a LaunchAgent whose working
+    directory is not the repo, and this way it is correct at whatever rate the
+    device wants.
+    """
+    import numpy as np
+
+    per_note = int(sample_rate * (READY_CUE_MS / 1000.0) / len(READY_CUE_HZ))
+    notes = []
+    for hz in READY_CUE_HZ:
+        t = np.arange(per_note) / float(sample_rate)
+        tone = np.sin(2.0 * np.pi * hz * t)
+        # Raised-cosine envelope. A bare sine starts and stops on a discontinuity,
+        # which is an audible click and exactly the kind of noise a VAD notices.
+        envelope = np.sin(np.pi * np.arange(per_note) / max(per_note - 1, 1))
+        notes.append(tone * envelope * READY_CUE_GAIN)
+    wave = np.concatenate(notes) if notes else np.zeros(0)
+    return np.clip(wave * 32768.0, -32768, 32767).astype("<i2").tobytes()
+
+
+async def play_ready_cue(audio: AudioIO) -> None:
+    """Tell the owner the microphone is theirs.
+
+    Played before the session is even opened, which is the whole point: the sooner it
+    lands the less of the handover a person talks into. Never raises - a missing cue
+    is a worse conversation, and an exception here would be no conversation.
+    """
+    try:
+        await audio.play(ready_cue(audio.playback_sample_rate))
+    except Exception:
+        logger.debug("voice: could not play the ready cue", exc_info=True)
 
 
 VOICE_RECONNECT_ATTEMPTS = 3
@@ -750,6 +809,7 @@ async def _voice_attempts(
     recall: Recall | None,
     settings: Settings,
     session_error: type[Exception],
+    opening_audio: bytes = b"",
 ) -> int:
     """Hold a conversation, and pick it back up if the session is cut.
 
@@ -769,7 +829,15 @@ async def _voice_attempts(
     for attempt in range(1, VOICE_RECONNECT_ATTEMPTS + 1):
         session = new_session()
         conversation = VoiceConversation(
-            session, audio, memory, recall=recall, recall_limit=settings.recall_limit
+            session,
+            audio,
+            memory,
+            recall=recall,
+            recall_limit=settings.recall_limit,
+            # Only the first attempt: on a reconnect the utterance has already been
+            # delivered and answered, and sending it again would have the daemon
+            # answer the same question twice.
+            opening_audio=opening_audio if attempt == 1 else b"",
         )
         failure: Exception | None = None
         try:
@@ -868,7 +936,11 @@ async def _wake_round(settings: Settings) -> None:
         # the caller's own guard handles the pacing.
         return
     logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
-    await run_voice(settings)
+    # The segment that fired the gate goes with it. Without this the session opens
+    # deaf to the question it was opened for: the gate consumed "루시 뭐 해", matched
+    # on the alias, and the owner had to say "뭐 해" again into a microphone that had
+    # just changed hands.
+    await run_voice(settings, opening_audio=fired.pcm)
 
 
 async def _rounds(round_: WakeRound) -> None:

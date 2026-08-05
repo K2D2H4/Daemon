@@ -175,6 +175,7 @@ class VoiceConversation:
         recall_limit: int = 6,
         channel: str = VOICE_CHANNEL,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
+        opening_audio: bytes = b"",
     ) -> None:
         self._session = session
         self._audio = audio
@@ -183,6 +184,13 @@ class VoiceConversation:
         self._recall_limit = recall_limit
         self._channel = channel
         self._idle_timeout = idle_timeout
+        self._opening_audio = opening_audio
+        """Audio to hand the session before the microphone is even open.
+
+        The wake gate's own segment, normally: it heard the owner say "루시 뭐 해",
+        matched the alias, and used to throw the sound away - so the session began
+        deaf to the question it was opened for and the owner said it again. At
+        `AudioIO.sample_rate`, because that is what a session must be fed."""
 
         self.recalled: list[RecalledItem] = []
         """What recall had ready for the last completed utterance.
@@ -255,6 +263,10 @@ class VoiceConversation:
         # that started the clock afterwards would hide exactly that.
         self._started_at = asyncio.get_running_loop().time()
         async with self._session as session:
+            # Before the microphone, so the utterance that opened the session is the
+            # first thing the model hears rather than racing live audio for its place
+            # in the turn.
+            await self._send_opening(session)
             microphone = self._audio.record()
             # The microphone keeps feeding the session while the model talks. It
             # has to: server-side activity detection is what notices a barge-in,
@@ -279,6 +291,19 @@ class VoiceConversation:
                 # either.
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.shield(self._record_pending(session))
+
+    async def _send_opening(self, session: VoiceSession) -> None:
+        """Hand over what was already said, if anything was.
+
+        Never fails the conversation: an opening that cannot be delivered costs the
+        user one repeated sentence, and raising here would cost them the whole turn.
+        """
+        if not self._opening_audio:
+            return
+        try:
+            await session.send_audio(self._opening_audio)
+        except Exception:
+            logger.exception("voice: could not hand over the utterance that opened the session")
 
     # --- the two streams ----------------------------------------------------
 

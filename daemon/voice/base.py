@@ -287,3 +287,24 @@ class WakeEvent:
     """Mean VAD probability over the segment. Not the recognizer's confidence -
     it does not report one on-device - so it says "this was speech", not "these
     were the words"."""
+
+    pcm: bytes = b""
+    """The audio that fired the gate, at `AudioIO.sample_rate`, so the conversation
+    can begin with what was actually said.
+
+    Carried because throwing it away cost the owner a whole utterance. The gate
+    consumed "루시 뭐 해", matched on `루시`, and then discarded the sound - so the
+    session opened having never heard "뭐 해" and the owner had to say it again.
+    Measured on a real run: 14.79 s from the wake word to the first audio out, most
+    of it a person repeating themselves into a microphone that had just changed
+    hands.
+
+    A whole segment, wake phrase included, not the tail after the phrase: there is no
+    reliable boundary between them - the recognizer returns text, not alignment - and
+    a model hearing "루시 뭐 해" is being addressed by name, which is what happened.
+
+    Empty by default, so a gate that has no audio to offer and a caller that does not
+    want any both keep working. **It only helps a phrase spoken in one breath.** A
+    pause after the wake word ends the segment (`hangover_ms`), and whatever is said
+    during the handover belongs to nobody - which is what `AudioIO`'s ready cue is
+    for."""
