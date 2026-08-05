@@ -8,6 +8,7 @@ broken product does not stop the checks from telling you what is broken.
 | | |
 |---|---|
 | `scripts/check_docs.py` | every path written in backticks in a `.md` must exist |
+| `scripts/check_landing_claims.py` | the defaults `site/index.html` quotes must be the defaults in `daemon/config.py` |
 
 ## Common changes
 
@@ -23,13 +24,16 @@ only for paths in *another* project that this repo quotes on purpose.
 
 ```bash
 python3 scripts/check_docs.py            # every documented path exists
+python3 scripts/check_landing_claims.py  # the landing page still tells the truth
 git config core.hooksPath .githooks      # run that check before each commit
 ```
 
 ## Depends on
 
-Nothing in [daemon/](../daemon/CLAUDE.md). Used by `.github/workflows/ci.yml` and
-the optional `.githooks/pre-commit`.
+Nothing in [daemon/](../daemon/CLAUDE.md) — `check_landing_claims.py` reads
+`daemon/config.py` as *text* for the same reason: a broken product should still be
+able to tell you the landing page is wrong. Used by `.github/workflows/ci.yml`,
+`.github/workflows/pages.yml`, and the optional `.githooks/pre-commit`.
 
 ## Why this exists at all
 
