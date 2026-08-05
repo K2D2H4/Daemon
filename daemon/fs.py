@@ -69,7 +69,7 @@ def open_private_append(path: Path):
     return os.fdopen(fd, "a", encoding="utf-8")
 
 
-def write_private_replace(path: Path, content: str) -> None:
+def write_private_replace(path: Path, content: str, *, secure_parent: bool = True) -> None:
     """Replace `path` wholesale: owner-only, atomic, and durable.
 
     For the files that are rewritten rather than appended to - the curated memory
@@ -87,8 +87,15 @@ def write_private_replace(path: Path, content: str) -> None:
         because the previous content is gone too. This is the same reasoning as
         `log.append`: the markdown is the source of truth, so it must be at least
         as durable as the sqlite mirror that indexes it.
+
+    `secure_parent=False` for the one file we write outside the data dir: the
+    LaunchAgent plist. `~/Library/LaunchAgents` is shared with every other agent
+    the user has installed and normally stands at 0755, so taking it to 0700 is
+    the overreach `secure_dir` above already records happening once. The file is
+    ours; the directory is not.
     """
-    secure_dir(path.parent)
+    if secure_parent:
+        secure_dir(path.parent)
     temporary = path.with_name(f".{path.name}.tmp")
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)

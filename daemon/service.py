@@ -36,7 +36,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from daemon.config import SERVICE_LABEL_RE
-from daemon.fs import DIR_MODE, FILE_MODE, secure_dir, secure_file
+from daemon.fs import DIR_MODE, FILE_MODE, secure_dir, secure_file, write_private_replace
 
 DARWIN = "darwin"
 LINUX = "linux"
@@ -279,7 +279,13 @@ WantedBy=default.target
                 label=self.label,
                 unit_path=path,
                 applied=False,
-                notes=("already installed and unchanged; reloaded it", *self._platform_notes()),
+                # Not "reloaded it": on macOS the bootstrap below is refused when
+                # launchd already has the job, and what `_load` then confirms is
+                # that it is loaded - not that anything was restarted.
+                notes=(
+                    "already installed and unchanged; the job is loaded",
+                    *self._platform_notes(),
+                ),
                 commands=self._load(),
             )
 
@@ -304,7 +310,12 @@ WantedBy=default.target
 
         path.parent.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
         self._prepare_logs()
-        _write_private(path, desired)
+        # Atomic and fsynced, like the markdown tiers: a plist that was caught
+        # half-written is a plist launchd will not parse, and the next login has
+        # nothing to fall back to because the previous one was truncated in place.
+        # `secure_parent=False` - see `fs.write_private_replace`; the directory
+        # this lands in belongs to every agent the user has, not to us.
+        write_private_replace(path, desired, secure_parent=False)
         commands += self._load()
 
         return ServiceAction(
@@ -343,7 +354,7 @@ WantedBy=default.target
         path = self.unit_path
         installed = path.exists()
         if self._platform == DARWIN:
-            result = self._run(("launchctl", "print", f"gui/{self._uid}/{self.label}"))
+            result = self._run(self._print_command())
             loaded = result.returncode == 0
             running = "state = running" in result.stdout
             detail = _first_line(result.stdout if loaded else result.stderr)
@@ -367,7 +378,14 @@ WantedBy=default.target
     def _load(self) -> tuple[tuple[str, ...], ...]:
         if self._platform == DARWIN:
             command = ("launchctl", "bootstrap", f"gui/{self._uid}", str(self.unit_path))
-            self._check(command, allow="service already loaded")
+            result = self._run(command)
+            # launchd will not say why. Bootstrapping a job it already has exits
+            # **5 with `Input/output error`** - measured, and byte for byte the same
+            # answer it gives for a plist path that does not exist. So there is no
+            # string to allow here; the only reliable question is whether the job is
+            # in the domain, which is the same query `status` already makes.
+            if result.returncode != 0 and not self._is_loaded():
+                raise self._failed(command, result)
             return (command,)
         reload_ = ("systemctl", "--user", "daemon-reload")
         enable = ("systemctl", "--user", "enable", "--now", self.unit_path.name)
@@ -385,6 +403,15 @@ WantedBy=default.target
         self._check(disable, allow="not loaded")
         return (disable,)
 
+    def _print_command(self) -> tuple[str, ...]:
+        """Asked by both `status` and `_load`, so the domain string is written once."""
+        return ("launchctl", "print", f"gui/{self._uid}/{self.label}")
+
+    def _is_loaded(self) -> bool:
+        """Does launchd have this job? Exit 0 from `print` is the whole answer; the
+        alternative is 113 and `Could not find service ...`."""
+        return self._run(self._print_command()).returncode == 0
+
     def _check(self, command: Sequence[str], *, allow: str | None = None) -> RunResult:
         result = self._run(command)
         if result.returncode == 0:
@@ -392,7 +419,10 @@ WantedBy=default.target
         output = f"{result.stdout}\n{result.stderr}"
         if allow is not None and allow.lower() in output.lower():
             return result
-        raise ServiceError(
+        raise self._failed(command, result)
+
+    def _failed(self, command: Sequence[str], result: RunResult) -> ServiceError:
+        return ServiceError(
             f"`{' '.join(command)}` failed with exit {result.returncode}: "
             f"{_first_line(result.stderr or result.stdout)}"
         )
@@ -425,15 +455,6 @@ WantedBy=default.target
             "process alive the way residency needs (docs/PLAN.md 3.1). Run "
             "`daemon run` yourself, or use WSL2 where the systemd path applies."
         )
-
-
-def _write_private(path: Path, content: str) -> None:
-    """Truncating write that is owner-only from the moment the file appears."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(content)
-    # O_CREAT does not touch the mode of a file that already existed.
-    secure_file(path)
 
 
 def _diff(before: str, after: str, path: Path) -> tuple[str, ...]:

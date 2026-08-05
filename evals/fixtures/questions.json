@@ -1,5 +1,5 @@
 {
-  "note": "Golden set for Lane 1 recall. Format is documented in evals/golden_set.py.",
+  "note": "Golden set for Lane 1 recall. Format is documented in evals/golden_set.py. q01-q30 ask what a single stated fact was. q31-q50 ask the questions those could not: a fact the later day replaced (q31, q33, q34), a question sharing no token with the message that answers it (q34, q40, q42), an answer the daemon itself said rather than the user (q37), an inflected form FTS5 tokenises apart (q38), and a number that has to pick out its own topic among three (q50).",
   "top_n": 5,
   "now": "2026-08-01T09:00:00Z",
   "logs": "logs",
@@ -183,6 +183,126 @@
       "question": "빨간색 문제 왜 못 깨고 있어?",
       "expect": ["손가락 힘"],
       "log": "2026-07-29.md"
+    },
+    {
+      "id": "q31",
+      "question": "모의 면접 언제로 옮겼다고 했지?",
+      "expect": ["오늘 저녁으로 옮겼"],
+      "log": "2026-07-31.md"
+    },
+    {
+      "id": "q32",
+      "question": "지훈이 어디서 계속 막혔어?",
+      "expect": ["이직 이유"],
+      "log": "2026-07-31.md"
+    },
+    {
+      "id": "q33",
+      "question": "고양이 사료 왜 바꿨어?",
+      "expect": ["단종돼서"],
+      "log": "2026-07-31.md"
+    },
+    {
+      "id": "q34",
+      "question": "그 책 결국 끝냈어?",
+      "expect": ["다 읽었어"],
+      "log": "2026-07-31.md"
+    },
+    {
+      "id": "q35",
+      "question": "롤백 문서 반응이 어땠어?",
+      "expect": ["칭찬해줬어"],
+      "log": "2026-07-28.md"
+    },
+    {
+      "id": "q36",
+      "question": "회고 전에 뭐가 부담이었어?",
+      "expect": ["배포 실패"],
+      "log": "2026-07-28.md"
+    },
+    {
+      "id": "q37",
+      "question": "요리 얘기할 때 빼기로 한 게 뭐였지?",
+      "expect": ["갑각류"],
+      "log": "2026-07-28.md"
+    },
+    {
+      "id": "q38",
+      "question": "커피 바꾼 이유가 뭐였지?",
+      "expect": ["위가 좀 안 좋아서"],
+      "log": "2026-07-28.md"
+    },
+    {
+      "id": "q39",
+      "question": "자전거 펑크 원인이 뭐였어?",
+      "expect": ["유리 밟은"],
+      "log": "2026-07-30.md"
+    },
+    {
+      "id": "q40",
+      "question": "여행 날짜 왜 아직 못 정했어?",
+      "expect": ["추석 앞뒤"],
+      "log": "2026-07-30.md"
+    },
+    {
+      "id": "q41",
+      "question": "비밀번호 옮긴 이유가 뭐였지?",
+      "expect": ["찜찜했거든"],
+      "log": "2026-07-30.md"
+    },
+    {
+      "id": "q42",
+      "question": "몸 안 좋은 거 처음 신호가 뭐였어?",
+      "expect": ["칼칼해"],
+      "log": "2026-07-30.md"
+    },
+    {
+      "id": "q43",
+      "question": "편의점에서 때운 날 몸이 어땠어?",
+      "expect": ["입맛이 없다"],
+      "log": "2026-07-30.md"
+    },
+    {
+      "id": "q44",
+      "question": "열도 났었어?",
+      "expect": ["열은 없어"],
+      "log": "2026-07-30.md"
+    },
+    {
+      "id": "q45",
+      "question": "클라이밍 다녀와서 손가락은 어땠어?",
+      "expect": ["덜 아팠어"],
+      "log": "2026-07-29.md"
+    },
+    {
+      "id": "q46",
+      "question": "서연이 글솜씨 어떻다고 했지?",
+      "expect": ["나보다 잘 써"],
+      "log": "2026-07-29.md"
+    },
+    {
+      "id": "q47",
+      "question": "맥북 고칠 때까지 어떻게 버티기로 했어?",
+      "expect": ["외장 마우스"],
+      "log": "2026-07-29.md"
+    },
+    {
+      "id": "q48",
+      "question": "루미에서 계속 걸렸던 게 뭐였지?",
+      "expect": ["마음에 안 들어"],
+      "log": "2026-07-29.md"
+    },
+    {
+      "id": "q49",
+      "question": "작년 부모님 기념일엔 뭐 했어?",
+      "expect": ["케이크만 사갔"],
+      "log": "2026-07-31.md"
+    },
+    {
+      "id": "q50",
+      "question": "5천만 원 얘기가 뭐였지?",
+      "expect": ["대출을 더 받아야"],
+      "log": "2026-07-30.md"
     }
   ]
 }
