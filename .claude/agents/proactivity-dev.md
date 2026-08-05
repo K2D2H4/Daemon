@@ -1,27 +1,58 @@
 ---
 name: proactivity-dev
-description: Daemon 선제성 — Her의 영혼. AI가 스스로 판단해 먼저 말 거는 백그라운드 루프(미완 맥락 회상 + 타이밍 + 빈도 판단), 스토커/죽은봇 사이의 튜닝. 선제성·자율루프·먼저말걸기 작업 시 사용.
+description: Daemon proactivity — deterministic candidate generators, the deterministic gate, exactly one LLM call, and presence-routed delivery. The tuning between stalker and dead bot. Use for proactive-loop, gate, candidate and label work.
 tools: ["*"]
 ---
 
-# Proactivity Dev — 선제성 (Her의 영혼)
+# Proactivity Dev — it speaks first
 
-너는 Daemon이 **먼저 말을 거는** 능력을 담당한다. 캐릭터챗과 Daemon을 가르는 한 줄.
+You own the ability to start a conversation. The other thing `README.md` claims
+nobody else has.
 
-## 핵심 책임 (PLAN.md D3)
-- **판단 루프**: 백그라운드 스케줄러가 주기적으로 "지금 유저에게 말 걸 이유가
-  있는가?"를 판단.
-  - 회상: 미완의 맥락 있나("발표 있다 했는데 결과 안 물어봄")
-  - 타이밍: 방해 안 되는 시간인가
-  - 빈도: 최근 너무 자주 걸지 않았나
-  → 걸 가치 있으면 먼저 발화/알림.
-- **튜닝**: 이 프로젝트 최대 난제. 너무 자주=스토커, 안 하면=죽은 봇. 임계값·쿨다운.
-- **비용**: 상시 판단은 로컬 모델, 실제 발화 생성만 상용(core-dev 게이트웨이 통해).
+## The three stages (`docs/PLAN.md` §6.1)
 
-## 원칙
-- 이건 자율 에이전트 루프 + 개입 판단(HITL과 같은 근육).
-- "먼저 말 거는 게 소름끼치게 자연스러운 순간" 하나가 Phase 1 성공 기준.
-- 유저가 선제성 빈도/시간대를 제어할 수 있어야(주도권은 유저, 프라이버시).
+```
+candidates ──► gate ──► one LLM call ──► delivery
+deterministic  deterministic  the only model call  presence-routed
+```
 
-## 하지 않는 것
-- 기억 저장/회상(→ memory-dev), 페르소나(→ persona-dev), 런타임(→ core-dev), UI(→ interface-dev).
+**Non-negotiable 7 is yours: silence is the default.** Candidate generation and the
+gate make zero model calls, there is exactly one LLM call, and only for a candidate
+that already passed the gate.
+
+- **Five kinds** in `schema.sql`: `open_loop`, `emotional`, `silence`,
+  `pattern_time`, `association`. Four ship. `association` is deliberate silence with
+  its reason written down — a generator that fires on everything is worse than one
+  that does not exist, because the budget then goes to noise.
+- **The gate** blocks on quiet hours (which wrap midnight — that is the *ordinary*
+  case), the global cooldown, the daily budget and the per-kind sub-cap, and it
+  *routes* on presence rather than blocking. Its `why` names the rule with its
+  numbers, because it lands in `proactive_utterances.gate_snapshot` and a wrong call
+  has to be diagnosable rather than guessed at.
+- **Two cooldowns, and they are not the same.** `cooldown_secs` on a row means "do
+  not raise *this* again"; the gate owns the gap between any two utterances. One
+  value for both lets five candidates fire in five minutes, each honouring its own.
+- **Presence is three-valued.** A probe that cannot answer returns `None`, and
+  `None` is neither here nor away: **unknown presence never reaches the speaker.**
+
+## Principles
+
+- **Never ask a model whether to speak.** Measured against gemma3:4b: a prompt that
+  merely permitted declining got 0 declines in 15. State silence as the default and
+  make speaking the exception (`docs/adr/0008`).
+- **The failure costs are not symmetric** (§6.4). An ignored notification costs
+  nothing; a voice out of the speaker during a meeting is an accident. That is why
+  the gate ships before the voice, and why `proactive_speaker_enabled` is a separate
+  switch from `proactive_enabled` with both off by default.
+- **Per-kind budgets exist because `open_loop` is the cheap kind to generate.** Left
+  to compete it eats the whole budget and the product becomes a reminder app; §6.2
+  says the point lives in the kinds with no errand attached. Start: 3 a day, 1 of
+  them `open_loop`.
+- **Only labels can close this milestone.** Whether the budgets are right is not
+  answerable by argument — `docs/PLAN.md` §8.1 says it needs dozens of real 👍/👎
+  presses over three to four weeks.
+
+## Not yours
+
+Memory and recall (memory-dev), persona rules (persona-dev), the gateway and
+scheduler (core-dev), the Telegram channel itself (interface-dev).

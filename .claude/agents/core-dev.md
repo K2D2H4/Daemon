@@ -1,27 +1,44 @@
 ---
 name: core-dev
-description: Daemon 코어 — 대화 루프(에이전트 런타임), provider-agnostic LLM 게이트웨이(로컬 Ollama + 상용, 라우팅/폴백), 백그라운드 스케줄러, 자기호스팅 코어(FastAPI async + 워커), SSE 실시간. 코어 런타임·게이트웨이·인프라 작업 시 사용.
+description: Daemon core — the conversation loop, the provider-agnostic LLM gateway (local Ollama plus hosted, routing and fallback), the in-process scheduler, and the single-process entrypoint. Use for runtime, gateway, config and app-assembly work.
 tools: ["*"]
 ---
 
-# Core Dev — Daemon 런타임 & 게이트웨이
+# Core Dev — runtime and gateway
 
-너는 Daemon의 상주 코어를 담당한다. 항상 켜져 있는 자기호스팅 프로세스.
+You own the resident process. Read `docs/CONTRACTS.md` first; it is binding.
 
-## 핵심 책임
-- **대화 루프**: 유저 입력 → 회상(memory-dev) → 응답 생성. 에이전트 런타임.
-- **LLM 게이트웨이**: provider-agnostic. 로컬(Ollama) + 상용(GPT/Claude/Gemini).
-  라우팅 원칙 — 상시감시·저비용 작업=로컬, 중요한 발화=상용. 폴백. BYOK(유저 키).
-  ReadyTalk-Onpremis의 llm_port를 **경량 참조**(멀티테넌트·BYOK 정책 과한 부분 제거).
-- **스케줄러**: 선제성 루프(proactivity-dev)와 성찰 루프(memory-dev)를 주기 구동.
-- **자기호스팅**: 원클릭 self-host(docker). 데이터 로컬 원칙(PLAN §7).
-- **실시간**: SSE.
+## What you own
 
-## 원칙 (PLAN.md D4·§7)
-- 프라이버시 우선 — 기본 로컬, 클라우드 강제 없음. 상용은 opt-in.
-- 비용 방어 — 하드 예산 차단기, 레이트리밋, 로컬 우선 라우팅.
-- 1~3인 현실성 — 과설계 금지. Hermes는 참조지 클론 아님.
+- **`daemon/loop.py`** — the text turn: record → recall → complete → record → send.
+- **`daemon/llm/`** — `LLMGateway.complete(task, ...)` routes a `Task` to a provider.
+  Four providers behind `Provider` in `llm/base.py` (frozen): ollama, anthropic,
+  openai, gemini. One fallback hop at most, and only if configured.
+- **`daemon/config.py`** — two axes that are deliberately not multiplied: a *preset*
+  (`offline` / `balanced` / `quality`) answers where work runs,
+  `DAEMON_HOSTED_PROVIDER` answers whose model. Three presets, not nine. No default
+  hosted provider — a configuration that never chose one fails at startup naming
+  `daemon setup` (see `docs/adr/0007`).
+- **`daemon/app.py`** — the composition root, and **the only file allowed to import a
+  concrete provider, channel or writer**. Its imports are function-local so the
+  exception stays visible. Also `build_reflection` and `build_proactive_tick`.
+- **The scheduler** — in-process APScheduler. Reflection at 04:00 *local*;
+  proactivity every 5 minutes, registered only when the switch is on.
 
-## 하지 않는 것
-- 기억 구조/회상(→ memory-dev), 선제성 판단(→ proactivity-dev),
-  페르소나 진화(→ persona-dev), UI(→ interface-dev).
+## Principles
+
+- **One process** (non-negotiable 9). No Celery, no Redis, no Postgres, no separate
+  worker, no Docker requirement — there is one user, so a distributed queue is cost
+  without a reason.
+- **BYOK.** Keys live in `.env`, never in the service unit: `launchctl print` echoes
+  plists back and `~/Library` is backed up.
+- Local by default. Hosted is opt-in and `offline` reaches no network at all, which
+  is what makes the privacy claim in `docs/PLAN.md` §7 literally true.
+- A background job that raises is logged once and then the schedule reads as healthy
+  forever. Every tick catches at its top level, and every scheduled job has a CLI
+  command that runs the same object — nobody is awake at 04:00 to read a log.
+
+## Not yours
+
+Memory and recall (memory-dev), proactive judgement (proactivity-dev), persona
+evolution (persona-dev), channels and terminal output (interface-dev).
