@@ -59,8 +59,14 @@ daemon wake calibrate  # what your on-device recognizer actually hears you say
 daemon wake test       # run the always-on wake gate here, and see what fires
 daemon reflect   # consolidate a day into memory now, instead of waiting for 04:00
 daemon proactive # one round of "is there a reason to speak?", and what it decided
+daemon tools list  # what it may do to this machine, and what needs your say-so
+daemon tools log   # every tool call it has made, refusals included
 daemon doctor    # what is configured, reachable, indexed and remembered
 ```
+
+`daemon setup` asks whether it may act on this machine (`DAEMON_TOOLS_ENABLED=true`
+by default); set it to false in `.env` to answer no later, and `daemon doctor` always
+says which way it is set.
 
 ## Five faces
 
@@ -149,6 +155,7 @@ is finished.
 |---|---|
 | **M1a** ✅ | Text conversation over Telegram, logged to markdown |
 | **M1b** ✅ | Recall, voice, OS residency |
+| **M1c** ✅ | PC control — ten tools it can reach your machine with, and a gate in front of them |
 | **M2** ✅ | Reflection pass, entity graph, observations, and recall reads the curated tier |
 | **M3** ◐ | Proactivity — it speaks first, on a five-minute loop that mostly decides not to. Off until you switch it on; the speaker is a second switch. Tuning waits on labels |
 | M4 | Persona evolution |
@@ -162,7 +169,8 @@ holds the last run as data, and `python3 -m evals.golden_set --json` reproduces 
 
 Read **[docs/CONTRACTS.md](docs/CONTRACTS.md)** first — short, and binding. Its
 non-negotiables are not style preferences; each exists because breaking one loses
-user data, leaks a secret, or launders untrusted text into the personality.
+user data, leaks a secret, launders untrusted text into the personality, or lets a
+forwarded message run a command.
 
 ```bash
 python3 -m pytest                        # the whole suite

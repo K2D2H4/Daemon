@@ -96,6 +96,9 @@ def create_app(
     app.state.wake_round = wake
     app.state.wake_task = None
     app.state.wake_status = "off"
+    app.state.tools = None
+    app.state.tools_status = "not started"
+    app.state.mcp = None
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -117,6 +120,10 @@ def create_app(
             # leaves a daemon that answers Telegram normally and has simply stopped
             # hearing the room, with nothing anywhere saying so.
             "wake_gate": _wake_health(app.state),
+            # Same reasoning: an MCP server that failed to start leaves the model
+            # with fewer tools and nothing else different, which is exactly the kind
+            # of quiet degradation this endpoint exists to name.
+            "tools": _tools_health(app.state),
         }
 
     return app
@@ -176,6 +183,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     resolve_id: ResolveId | None = None
     close_io: Callable[[], None] | None = None
     embedder: Any = None
+    tools: Any = None
     if channel is None or memory is None:
         try:
             io = _build_io(settings)
@@ -190,6 +198,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             embedder = io.embedder
             app.state.recall = recall
             app.state.recall_status = io.recall_status
+            tools, app.state.mcp, app.state.tools_status = await _build_tools(
+                settings, io.store
+            )
+            app.state.tools = tools
 
     if channel is not None and memory is not None:
         app.state.channel = channel
@@ -202,6 +214,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             recall=recall,
             recall_limit=settings.recall_limit,
             resolve_id=resolve_id,
+            tools=tools,
+            max_tool_rounds=settings.tools_max_rounds,
         )
         task = asyncio.create_task(loop.run(), name="conversation-loop")
         # run() only guards individual turns; anything raised by the channel's own
@@ -272,11 +286,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if channel is not None:
             with suppress(Exception):
                 await channel.close()
+        mcp = getattr(app.state, "mcp", None)
+        if mcp is not None:
+            # Before the sqlite close and the scheduler shutdown, because these are
+            # child processes: a stdio MCP server left running is one more orphan
+            # per restart.
+            with suppress(Exception):
+                await mcp.aclose()
         if close_io is not None:
             with suppress(Exception):
                 close_io()
         scheduler.shutdown(wait=False)
         closeables: list[Any] = [*providers.values()]
+        if tools is not None:
+            # `fetch_page` owns an HTTP client; the runner walks the registry for it.
+            closeables.append(tools)
         if embedder is not None:
             # The embedder holds its own HTTP client, and it is not in `providers`
             # because embeddings are routed separately (llm/base.py).
@@ -328,6 +352,10 @@ class _IO:
     close: Callable[[], None]
     embedder: Any = None
     """Held only so the lifespan can close its HTTP client on shutdown."""
+    store: Any = None
+    """The open sqlite handle. Carried out because the tool layer needs it for the
+    approval and audit tables, and building those inside `_build_io` would mean
+    starting MCP subprocesses from a synchronous function."""
 
 
 def _build_channel(settings: Settings, store: Any) -> Channel:
@@ -400,6 +428,7 @@ def _build_io(settings: Settings) -> _IO:
         resolve_id=_id_resolver(writer),
         close=store.close,
         embedder=embedder,
+        store=store,
     )
 
 
@@ -902,6 +931,108 @@ def _read_seed(data_dir: Path) -> str:
         return path.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+
+
+async def _build_tools(settings: Settings, store: Any) -> tuple[Any, Any, str]:
+    """Assemble the tool layer. Returns (runner, mcp bridge, status).
+
+    Nothing here is fatal, on the same principle as `_build_recall`: a broken tool
+    configuration should cost the user their tools, not their conversation. The
+    difference from recall is that this one is off unless asked for, so "not
+    configured" is the ordinary answer rather than a degradation.
+    """
+    if not settings.tools_enabled:
+        return None, None, "off (DAEMON_TOOLS_ENABLED)"
+
+    try:
+        from daemon.tools.base import Registry
+        from daemon.tools.builtin import builtin_tools
+        from daemon.tools.policy import ToolPolicy
+        from daemon.tools.runner import ToolRunner
+    except ImportError as exc:
+        logger.error("tool layer unavailable, continuing without it: %s", exc)
+        return None, None, f"unavailable: {exc}"
+
+    # The same presence the proactivity tick reads, so `system_state` cannot drift
+    # from the gate's own view of whether the owner is here (docs/PLAN.md 6.1).
+    from daemon.proactivity.presence import MachinePresence
+
+    registry = Registry()
+    try:
+        for tool in builtin_tools(
+            roots=settings.tools_roots,
+            timeout_secs=settings.tools_timeout_secs,
+            max_output=settings.tools_max_output,
+            presence=MachinePresence(),
+        ):
+            registry.register(tool)
+    except Exception as exc:
+        # An unusable DAEMON_TOOLS_ROOTS lands here, and the honest response is no
+        # tools at all rather than tools with no idea where they may look.
+        logger.error("built-in tools could not be built, continuing without them: %s", exc)
+        return None, None, f"unavailable: {exc}"
+
+    if settings.browser_enabled:
+        # Guarded like the built-ins above: a name collision or an import failure
+        # here would otherwise raise out of startup and take the whole daemon with
+        # it, when losing three tools is the proportionate outcome.
+        try:
+            from daemon.tools.browser import browser_tools
+
+            for tool in browser_tools(
+                app=settings.browser_app,
+                timeout_secs=settings.tools_timeout_secs,
+                max_output=settings.tools_max_output,
+            ):
+                registry.register(tool)
+            logger.info("browser tools on, reading %s", settings.browser_app)
+        except Exception as exc:
+            logger.error("browser tools could not be built, continuing without: %s", exc)
+
+    bridge: Any = None
+    if settings.mcp_enabled:
+        from daemon.tools.mcp import McpBridge, load_config
+
+        bridge = McpBridge(load_config(settings.data_dir))
+        try:
+            landed = await bridge.start(registry)
+        except Exception:
+            logger.exception("MCP startup failed; continuing with the built-in tools only")
+            landed = 0
+        logger.info("MCP contributed %d tool(s)", landed)
+
+    policy = ToolPolicy(
+        store,
+        mode=settings.tools_mode,  # type: ignore[arg-type]
+        allowlist=settings.tools_allowlist,
+        enabled=True,
+    )
+    runner = ToolRunner(registry, policy, store)
+    logger.info(
+        "tool layer ready: %d tool(s), mode=%s", len(registry), settings.tools_mode
+    )
+    browser = f", browser={settings.browser_app}" if settings.browser_enabled else ""
+    return (
+        runner,
+        bridge,
+        f"ready, {len(registry)} tools, mode={settings.tools_mode}{browser}",
+    )
+
+
+def _tools_health(state: Any) -> str:
+    """What the tool layer is actually offering, and what failed to load.
+
+    The failure list is the point. An MCP server that did not start leaves a model
+    with fewer tools and no error anywhere the user will see, which reads as "the
+    daemon decided not to use it" rather than as the misconfiguration it is.
+    """
+    status = str(getattr(state, "tools_status", "not started"))
+    bridge = getattr(state, "mcp", None)
+    failures = getattr(bridge, "failures", None) if bridge is not None else None
+    if failures:
+        broken = "; ".join(f"{name}: {why}" for name, why in sorted(failures.items()))
+        return f"{status}; mcp failed: {broken}"
+    return status
 
 
 def _recall_health(state: Any) -> str:

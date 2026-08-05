@@ -12,17 +12,30 @@ raises, so `?key=` leaks the key into logs and stack traces. daemon/setup.py's
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
 
-from daemon.llm.base import Completion, Message, ProviderError
+from daemon.llm.base import (
+    Completion,
+    Message,
+    ProviderError,
+    ToolCall,
+    ToolSpec,
+    call_name,
+    decode_tool_arguments,
+    synthesise_call_id,
+)
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_TIMEOUT = 60.0
 
 ROLES = {"user": "user", "assistant": "model"}
-"""`contents` only knows these two. A system turn is a separate field entirely."""
+"""`contents` only knows these two. A system turn is a separate field entirely.
+
+A `tool` turn is neither: it becomes a `user` turn carrying a `functionResponse`
+part, which is why `_contents` below does not go through this table."""
 
 STANDARD_KEY_HINT = (
     " - if that key is an old Google 'Standard' key, the Gemini API already "
@@ -63,20 +76,33 @@ class GeminiProvider:
         model: str,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> Completion:
         # System turns are their own top-level field here, not a role in the list.
         system = "\n\n".join(m.content for m in messages if m.role == "system")
-        contents = [
-            {"role": ROLES[m.role], "parts": [{"text": m.content}]}
-            for m in messages
-            if m.role != "system"
-        ]
+        contents = _contents(messages)
         if not contents:
             raise ProviderError("gemini needs at least one user or assistant message")
 
         payload: dict[str, Any] = {"contents": contents}
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
+        if tools:
+            # One `tools` entry holding every declaration, not one entry each: the
+            # API takes a list of tool *objects*, and a function is a declaration
+            # inside one of them.
+            payload["tools"] = [
+                {
+                    "function_declarations": [
+                        {
+                            "name": spec.name,
+                            "description": spec.description,
+                            "parameters": spec.parameters,
+                        }
+                        for spec in tools
+                    ]
+                }
+            ]
         config: dict[str, Any] = {}
         if max_output_tokens is not None:
             config["maxOutputTokens"] = max_output_tokens
@@ -94,6 +120,7 @@ class GeminiProvider:
             candidate = (data.get("candidates") or [{}])[0]
             parts = (candidate.get("content") or {}).get("parts") or []
             text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+            calls = _tool_calls(parts)
             usage = data.get("usageMetadata") or {}
             input_tokens = int(usage.get("promptTokenCount", 0))
             # On this API `candidatesTokenCount` already contains the thinking
@@ -109,9 +136,10 @@ class GeminiProvider:
                 f"gemini returned an unreadable response: {self._redact(repr(data))}"
             ) from exc
 
-        if not text:
+        if not text and not calls:
             # A blocked prompt lands here: `promptFeedback.blockReason` is set and
-            # there is no candidate at all, which is not a reply.
+            # there is no candidate at all, which is not a reply. A turn that only
+            # asked for tools has no text either, and that one is a reply.
             raise ProviderError(
                 f"gemini returned no text content: {self._redact(repr(data))}"
             )
@@ -125,6 +153,7 @@ class GeminiProvider:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             meta={"stop_reason": finish_reason},
+            tool_calls=calls,
         )
 
     async def health(self) -> bool:
@@ -188,3 +217,67 @@ class GeminiProvider:
             return data
 
         raise ProviderError(f"gemini call to {url} failed")  # unreachable
+
+
+def _contents(messages: list[Message]) -> list[dict[str, Any]]:
+    """Neutral messages as `contents`.
+
+    A tool result is a `functionResponse` part in a **user** turn, and the name -
+    not an id - is what pairs it with its request, because this API issues no call
+    ids at all. `_tool_calls` below synthesises ids for our own use; they are not
+    sent back.
+    """
+    contents: list[dict[str, Any]] = []
+    for message in messages:
+        if message.role == "system":
+            continue
+        if message.role == "tool":
+            contents.append(
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": call_name(message.tool_call_id),
+                                # Must be an object, not a bare string.
+                                "response": {"result": message.content},
+                            }
+                        }
+                    ],
+                }
+            )
+            continue
+        parts: list[dict[str, Any]] = []
+        if message.content:
+            parts.append({"text": message.content})
+        parts.extend(
+            {"functionCall": {"name": call.name, "args": call.arguments}}
+            for call in message.tool_calls
+        )
+        if not parts:
+            # An empty `parts` is rejected, and an assistant turn with neither text
+            # nor calls carries nothing worth sending anyway.
+            continue
+        contents.append({"role": ROLES[message.role], "parts": parts})
+    return contents
+
+
+def _tool_calls(parts: list[Any]) -> tuple[ToolCall, ...]:
+    calls: list[ToolCall] = []
+    for index, part in enumerate(parts):
+        call = part.get("functionCall") if isinstance(part, dict) else None
+        if not isinstance(call, dict):
+            continue
+        name = call.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        calls.append(
+            ToolCall(
+                # Synthesised: this API issues none, and the loop needs something
+                # to pair a result with its request within the turn.
+                id=synthesise_call_id(name, index),
+                name=name,
+                arguments=decode_tool_arguments(call.get("args")),
+            )
+        )
+    return tuple(calls)

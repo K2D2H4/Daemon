@@ -30,7 +30,7 @@ from daemon.memory.log import from_iso, utc_iso
 logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _INSERT_MESSAGE = """
 INSERT INTO messages
@@ -128,7 +128,7 @@ class Store:
                     self.conn.execute(ddl)
             # The index over external_id is left to schema.sql, which runs next
             # now that the column exists.
-        # v3 and v4 add only new tables, which schema.sql creates on its own.
+        # v3, v4 and v5 add only new tables, which schema.sql creates on its own.
         self.conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),
@@ -272,6 +272,196 @@ class Store:
             (channel, external_id),
         ).fetchone()
         return row is not None
+
+    # --- tool use -----------------------------------------------------------
+    # Not rebuildable from the markdown either (schema.sql): an audit trail of what
+    # the machine did, and the standing approvals that let it. Same timestamp
+    # discipline as pairing above - every value written with `utc_iso`, so the
+    # expiry comparison stays a lexicographic one.
+
+    def record_tool_call(
+        self,
+        *,
+        tool: str,
+        arguments: str,
+        preview: str,
+        verdict: str,
+        mode: str,
+        reason: str,
+        origin: str,
+        channel: str,
+        sender_id: str | None,
+        ran: bool = False,
+        ok: bool | None = None,
+        output_excerpt: str | None = None,
+        elapsed_ms: int | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Append one audit row, returning its id.
+
+        Written for refused calls as well as executed ones. A denial that leaves no
+        trace is the same as no policy at all when someone later asks what happened.
+        """
+        cursor = self.conn.execute(
+            "INSERT INTO tool_calls (ts, tool, arguments, preview, verdict, mode, reason, "
+            "origin, channel, sender_id, ran, ok, output_excerpt, elapsed_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                utc_iso(now or datetime.now(UTC)),
+                tool,
+                arguments,
+                preview,
+                verdict,
+                mode,
+                reason,
+                origin,
+                channel,
+                sender_id,
+                1 if ran else 0,
+                None if ok is None else (1 if ok else 0),
+                output_excerpt,
+                elapsed_ms,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def recent_tool_calls(self, limit: int = 20) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM tool_calls ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+    def create_tool_approval(
+        self,
+        *,
+        code: str,
+        channel: str,
+        sender_id: str,
+        tool: str,
+        arguments: str,
+        fingerprint: str,
+        preview: str,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> bool:
+        """Record a pending approval. False when the code collided with a live one,
+        so the caller retries with a fresh code rather than letting an
+        IntegrityError escape into the conversation loop (as `create_pairing` does).
+        """
+        try:
+            self.conn.execute(
+                "INSERT INTO tool_approvals (code, channel, sender_id, tool, arguments, "
+                "fingerprint, preview, state, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    code,
+                    channel,
+                    sender_id,
+                    tool,
+                    arguments,
+                    fingerprint,
+                    preview,
+                    utc_iso(created_at),
+                    utc_iso(expires_at),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            return False
+        self.conn.commit()
+        return True
+
+    def count_pending_tool_approvals(self, *, now: datetime) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM tool_approvals WHERE state = 'pending' "
+            "AND expires_at > ?",
+            (utc_iso(now),),
+        ).fetchone()
+        return int(row["n"])
+
+    def tool_approval(self, code: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM tool_approvals WHERE code = ?", (code,)
+        ).fetchone()
+
+    def pending_tool_approvals(self, *, now: datetime) -> list[sqlite3.Row]:
+        """Live pending approvals, oldest first."""
+        return self.conn.execute(
+            "SELECT * FROM tool_approvals WHERE state = 'pending' AND expires_at > ? "
+            "ORDER BY created_at, code",
+            (utc_iso(now),),
+        ).fetchall()
+
+    def spend_tool_approval(
+        self, code: str, *, sender_id: str, denied: bool, now: datetime
+    ) -> sqlite3.Row | None:
+        """Claim a pending, unexpired approval, returning the row that was claimed.
+
+        Two statements in one transaction, and the `state = 'pending'` in the SELECT
+        is what makes it single-use: once the UPDATE has landed, a second attempt
+        selects nothing. (An earlier version of this docstring claimed "one statement",
+        which was simply wrong about its own mechanism.) `sender_id` is part of the
+        WHERE clause because a guest who was allowlisted for conversation must not be
+        able to spend an approval addressed to the owner.
+        """
+        with self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM tool_approvals WHERE code = ? AND sender_id = ? "
+                "AND state = 'pending' AND expires_at > ?",
+                (code, sender_id, utc_iso(now)),
+            ).fetchone()
+            if row is None:
+                return None
+            self.conn.execute(
+                "UPDATE tool_approvals SET state = ?, decided_at = ? WHERE code = ?",
+                ("denied" if denied else "spent", utc_iso(now), code),
+            )
+        return row
+
+    def expire_tool_approvals(self, *, now: datetime) -> int:
+        """Delete pending approvals past their deadline, returning how many."""
+        cursor = self.conn.execute(
+            "DELETE FROM tool_approvals WHERE state = 'pending' AND expires_at <= ?",
+            (utc_iso(now),),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def add_tool_allowlist_entry(self, tool: str, pattern: str, *, now: datetime) -> None:
+        """Grant a standing approval. Idempotent - re-granting the same pattern is
+        what a user does when they have forgotten they already did."""
+        self.conn.execute(
+            "INSERT INTO tool_allowlist (tool, pattern, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (tool, pattern) DO NOTHING",
+            (tool, pattern, utc_iso(now)),
+        )
+        self.conn.commit()
+
+    def tool_allowlist(self, tool: str) -> list[str]:
+        return [
+            str(row["pattern"])
+            for row in self.conn.execute(
+                "SELECT pattern FROM tool_allowlist WHERE tool = ? ORDER BY pattern", (tool,)
+            )
+        ]
+
+    def all_tool_allowlist(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM tool_allowlist ORDER BY tool, pattern"
+        ).fetchall()
+
+    def remove_tool_allowlist_entry(self, pattern: str) -> int:
+        """Revoke a standing approval, returning how many rows went.
+
+        By pattern across every tool rather than by (tool, pattern): the user typing
+        this has seen `git status` in a list and should not also have to know which
+        tool it belongs to.
+        """
+        cursor = self.conn.execute(
+            "DELETE FROM tool_allowlist WHERE pattern = ?", (" ".join(pattern.split()),)
+        )
+        self.conn.commit()
+        return cursor.rowcount
 
     def schema_version(self) -> int | None:
         """None for a database that has no version recorded yet - including a

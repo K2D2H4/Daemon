@@ -10,11 +10,11 @@ the evidence base for the hard budget breaker, so it is not decoration.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from time import perf_counter
 
 from daemon.config import ConfigError, Route
-from daemon.llm.base import Completion, Message, Provider, ProviderError
+from daemon.llm.base import Completion, Message, Provider, ProviderError, ToolSpec
 from daemon.tasks import Task
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class LLMGateway:
         *,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> Completion:
         """Route one call. Falls back at most once, and only if configured."""
         route = self._routing.get(task)
@@ -46,7 +47,7 @@ class LLMGateway:
             raise ConfigError(f"no provider routed for task {task.value!r}")
 
         try:
-            return await self._call(task, route, messages, max_output_tokens, temperature)
+            return await self._call(task, route, messages, max_output_tokens, temperature, tools)
         except ProviderError as exc:
             fallback = self._fallback
             if fallback is None or fallback.provider == route.provider:
@@ -68,7 +69,7 @@ class LLMGateway:
             # One attempt only. A chain of fallbacks hides a broken setup and
             # spends money doing it.
             return await self._call(
-                task, fallback, messages, max_output_tokens, temperature, fallback=True
+                task, fallback, messages, max_output_tokens, temperature, tools, fallback=True
             )
 
     async def _call(
@@ -78,6 +79,7 @@ class LLMGateway:
         messages: list[Message],
         max_output_tokens: int | None,
         temperature: float | None,
+        tools: Sequence[ToolSpec] | None = None,
         *,
         fallback: bool = False,
     ) -> Completion:
@@ -95,15 +97,19 @@ class LLMGateway:
             model=route.model,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            tools=tools,
         )
         logger.info(
-            "llm.call task=%s provider=%s model=%s in_tokens=%d out_tokens=%d ms=%d fallback=%s",
+            "llm.call task=%s provider=%s model=%s in_tokens=%d out_tokens=%d ms=%d "
+            "tools_offered=%d tools_asked=%d fallback=%s",
             task.value,
             route.provider,
             completion.model,
             completion.input_tokens,
             completion.output_tokens,
             (perf_counter() - started) * 1000,
+            len(tools or ()),
+            len(completion.tool_calls),
             fallback,
         )
         return completion
