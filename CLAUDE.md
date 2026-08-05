@@ -18,6 +18,7 @@ untrusted text into the personality. Rationale: [docs/PLAN.md](docs/PLAN.md)
 | [evals/](evals/CLAUDE.md) | recall golden set, and the live-API voice spike |
 | `docs/` | PLAN (design), CONTRACTS (rules), ARCHITECTURE (layout), adr/ (decisions) |
 | [scripts/](scripts/CLAUDE.md) | repo checks that run in CI and import no product code |
+| `site/` | the landing page — one self-contained file, deployed to GitHub Pages. Everything in here is published; put working files in `docs/design/` instead |
 
 ## Which way imports are allowed to point
 

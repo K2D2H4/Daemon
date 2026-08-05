@@ -1,0 +1,56 @@
+name: pages
+
+# `site/` is a single self-contained HTML file with no build step, so this
+# workflow only uploads it. It deliberately does NOT publish `docs/` - those
+# markdown files are written to be read on GitHub, and pointing Pages at that
+# directory would serve PLAN.md and the ADRs as raw files.
+#
+# Requires one manual step that cannot live in the repo: Settings -> Pages ->
+# Source -> "GitHub Actions". Until that is set, this workflow fails at deploy
+# with "Pages site not found".
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A superseded deploy is wasted, but never cancel one mid-flight: an interrupted
+# Pages deploy can leave the site serving a half-published state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # The page makes factual claims about the product's defaults. ci.yml runs
+      # this on every PR; running it here too means a deploy cannot publish a
+      # page that contradicts the code, even via workflow_dispatch.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: landing page claims match the code
+        run: python3 scripts/check_landing_claims.py
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
