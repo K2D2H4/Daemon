@@ -105,10 +105,10 @@ package. Rules: [CONTRACTS.md](../docs/CONTRACTS.md). Data flow:
   does not know about - so the echo goes and the user does not
   (`daemon/voice/apple_audio.py`). (2) Gemini delivers `inputTranscription` **at the
   turn boundary, in the same server event as the answer's first audio chunk**, and
-  `conversation.py` inferred a barge-in from the transcript growing while audio
+  `daemon/voice/conversation.py` inferred a barge-in from the transcript growing while audio
   played. So the question's own transcript condemned its own answer: a complete,
   fluent reply generated and **0.0s of it played**. The barge-in is now the server's
-  `interrupted`, which is what `base.py` always said the authority was. Same
+  `interrupted`, which is what `daemon/voice/base.py` always said the authority was. Same
   measurement retires a documented claim: the recall prefetch cannot be free against
   this provider, because the partial it fires on arrives with the answer.
 - **Recall was killing the answer it was fetched for, and this was the biggest of the
