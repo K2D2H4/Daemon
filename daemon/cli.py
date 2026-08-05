@@ -60,6 +60,14 @@ def build_parser() -> argparse.ArgumentParser:
     pairing_sub.add_parser("list", help="pending pairing requests and their codes")
     approve = pairing_sub.add_parser("approve", help="approve a pairing code")
     approve.add_argument("code", help="the 8-character code the bot replied with")
+
+    tools = sub.add_parser("tools", help="what Daemon may do to this machine, and what it did")
+    tools_sub = tools.add_subparsers(dest="tools_command", required=True)
+    tools_sub.add_parser("list", help="the tools that are loaded, and the policy in force")
+    tools_sub.add_parser("log", help="recent tool calls, including the refused ones")
+    tools_sub.add_parser("pending", help="approvals waiting on an answer")
+    forget = tools_sub.add_parser("forget", help="drop a standing approval granted with 'always'")
+    forget.add_argument("pattern", help="the command pattern to stop trusting, e.g. 'git status'")
     return parser
 
 
@@ -101,6 +109,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return OK
     if command == "pairing":
         return _pairing(settings, args)
+    if command == "tools":
+        return _tools(settings, args)
 
     try:
         if command == "install":
@@ -184,6 +194,97 @@ def _pairing(settings: Settings, args: Any) -> int:
             return USAGE
         who = "owner" if approval.is_owner else "guest"
         print(f"approved id={approval.sender_id} as {who}. They can talk to Daemon now.")
+        return OK
+    finally:
+        store.close()
+
+
+def _tools(settings: Settings, args: Any) -> int:
+    """What Daemon may do to this machine, and what it has done.
+
+    The `log` subcommand is the one that earns this command's existence. Tool calls
+    are audited into sqlite rather than into the markdown log (schema.sql), so
+    without a way to read them back the audit trail is real but unreachable, which
+    is the same as not having one.
+    """
+    from daemon.app import DB_FILENAME
+    from daemon.memory.store import Store
+    from daemon.tools.builtin import builtin_tools
+
+    if args.tools_command == "list":
+        print(f"tools:      {'on' if settings.tools_enabled else 'off (DAEMON_TOOLS_ENABLED)'}")
+        print(f"mode:       {settings.tools_mode}")
+        print(f"roots:      {', '.join(settings.tools_roots) or '(none)'}")
+        print(f"allowlist:  {', '.join(settings.tools_allowlist) or '(none)'}")
+        browser = f"on ({settings.browser_app})" if settings.browser_enabled else "off"
+        print(f"browser:    {browser}")
+        print(f"mcp:        {'on' if settings.mcp_enabled else 'off'}")
+        print()
+        try:
+            available = builtin_tools(
+                roots=settings.tools_roots,
+                timeout_secs=settings.tools_timeout_secs,
+                max_output=settings.tools_max_output,
+            )
+            if settings.browser_enabled:
+                # Listed here too, or this command answers "what may it do" with
+                # three of the answers missing.
+                from daemon.tools.browser import browser_tools
+
+                available += browser_tools(
+                    app=settings.browser_app,
+                    timeout_secs=settings.tools_timeout_secs,
+                    max_output=settings.tools_max_output,
+                )
+        except Exception as exc:
+            print(f"daemon: the built-in tools cannot be built: {exc}", file=sys.stderr)
+            return PROBLEM
+        for tool in available:
+            gate = "asks first" if tool.risk == "guarded" else "runs freely"
+            print(f"  {tool.spec.name:<14} {gate}")
+        # MCP tools are not listed: finding out what a server offers means starting
+        # it, and an operator command should not spawn subprocesses to print a list.
+        if settings.mcp_enabled:
+            print("\n  plus whatever mcp.json's servers offer, once the daemon is running")
+        return OK
+
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    try:
+        if args.tools_command == "log":
+            rows = store.recent_tool_calls(30)
+            if not rows:
+                print("nothing yet. No tool has been asked for on this install.")
+                return OK
+            for row in rows:
+                ran = "ran" if row["ran"] else row["verdict"]
+                mark = "" if row["ok"] in (1, None) else " FAILED"
+                print(f"  {row['ts']}  {ran:<6}{mark}  {row['preview']}")
+                if not row["ran"]:
+                    print(f"                                    {row['reason']}")
+            return OK
+
+        if args.tools_command == "pending":
+            from daemon import clock
+
+            rows = store.pending_tool_approvals(now=clock.now())
+            if not rows:
+                print("no approvals are waiting.")
+                return OK
+            for row in rows:
+                print(f"  {row['code']}  {row['preview']}  (lapses {row['expires_at']})")
+            print("\nApprovals are answered in the conversation, not here: reply /approve <code>.")
+            return OK
+
+        removed = store.remove_tool_allowlist_entry(args.pattern)
+        if not removed:
+            standing = store.all_tool_allowlist()
+            print(f"daemon: nothing standing matches {args.pattern!r}", file=sys.stderr)
+            if standing:
+                print("granted:", file=sys.stderr)
+                for row in standing:
+                    print(f"  {row['pattern']}  ({row['tool']})", file=sys.stderr)
+            return USAGE
+        print(f"forgotten. {args.pattern!r} will be asked about again.")
         return OK
     finally:
         store.close()

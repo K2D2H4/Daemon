@@ -330,3 +330,76 @@ CREATE TABLE IF NOT EXISTS proactive_utterances (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_utterances_label ON proactive_utterances (spoken_at, label);
+
+-- ---------------------------------------------------------------------------
+-- M1c: tool use (PC control)
+-- ---------------------------------------------------------------------------
+-- Like channel_pairing and channel_cursor above, these three are NOT rebuildable
+-- from the markdown, and for the same reason: they are not what the user said,
+-- they are what the machine did and what it was allowed to do. Losing them costs
+-- an audit trail and a set of standing approvals, not conversation.
+--
+-- The decision recorded here is always made *before* the tool runs and without a
+-- model call (docs/PLAN.md tool policy). `verdict` is therefore the deterministic
+-- answer, and `ran` says whether execution followed - the two differ for every
+-- approval that was requested and never granted.
+
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id             INTEGER PRIMARY KEY,
+    ts             TEXT    NOT NULL,
+    tool           TEXT    NOT NULL,
+    arguments      TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(arguments)),
+    preview        TEXT    NOT NULL,   -- one line, as shown to the user
+
+    verdict        TEXT    NOT NULL CHECK (verdict IN ('allow', 'ask', 'deny')),
+    mode           TEXT    NOT NULL,   -- policy mode in force at the time
+    reason         TEXT    NOT NULL DEFAULT '',
+
+    -- provenance (docs/PLAN.md 4.2). `origin` is the load-bearing one: a turn
+    -- that is not the owner's own words never reaches a tool, and this column is
+    -- the evidence of which turns did.
+    origin         TEXT    NOT NULL CHECK (origin IN ('owner', 'agent', 'untrusted', 'system')),
+    channel        TEXT    NOT NULL,
+    sender_id      TEXT,
+
+    ran            INTEGER NOT NULL DEFAULT 0,
+    ok             INTEGER,
+    output_excerpt TEXT,
+    elapsed_ms     INTEGER
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_tool_calls_ts ON tool_calls (ts);
+
+-- Pending approval codes. Shaped after channel_pairing, which had the security
+-- details worked out already, with one addition: `fingerprint` binds the approval
+-- to the exact call. OpenClaw's exec approvals bind cwd, argv and the resolved
+-- executable for the same reason - an approval for `ls /tmp` must not authorise
+-- `rm -rf /`, and the model is the one that would supply the difference.
+CREATE TABLE IF NOT EXISTS tool_approvals (
+    code        TEXT    PRIMARY KEY,
+    channel     TEXT    NOT NULL,
+    sender_id   TEXT    NOT NULL,
+    tool        TEXT    NOT NULL,
+    arguments   TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(arguments)),
+    fingerprint TEXT    NOT NULL,
+    preview     TEXT    NOT NULL,
+    state       TEXT    NOT NULL CHECK (state IN ('pending', 'spent', 'denied')),
+    created_at  TEXT    NOT NULL,
+    expires_at  TEXT    NOT NULL,
+    decided_at  TEXT
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_tool_approvals_pending ON tool_approvals (state, expires_at);
+
+-- Standing approvals ("/approve CODE always"). Config carries the allowlist a
+-- user wrote by hand; this carries the ones they granted in conversation, so the
+-- two can be told apart and this one can be emptied without editing .env.
+CREATE TABLE IF NOT EXISTS tool_allowlist (
+    id         INTEGER PRIMARY KEY,
+    tool       TEXT    NOT NULL,
+    pattern    TEXT    NOT NULL,   -- argv prefix, e.g. 'git status'
+    created_at TEXT    NOT NULL
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_allowlist_entry
+    ON tool_allowlist (tool, pattern);

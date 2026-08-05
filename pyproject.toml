@@ -30,6 +30,13 @@ voice = [
     "websockets>=14.0",
     "sounddevice>=0.5",
 ]
+mcp = [
+    # Only needed when DAEMON_MCP_ENABLED is on. The built-in tools need nothing
+    # beyond the standard library, so an install that only wants Daemon to reach
+    # its own machine does not take this on. Imported from daemon/tools/mcp.py
+    # alone, which is also where a v2 API change would land.
+    "mcp>=1.9",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",

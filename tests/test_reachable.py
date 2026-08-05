@@ -59,6 +59,13 @@ WIRED_CLASSES = (
     "MemoryRecall",
     "OllamaEmbedder",
     "Pairing",
+    # The tool layer. Written, tested and unreachable is exactly the defect this
+    # file exists for, and a policy nothing constructs is the worst version of it:
+    # the tests would pass, the tools would still work, and nothing would be gated.
+    "ToolPolicy",
+    "ToolRunner",
+    "McpBridge",
+    "Registry",
 )
 
 
@@ -197,6 +204,67 @@ def test_pending_implementations_are_still_pending(name: str) -> None:
 
 def test_the_pending_lists_do_not_overlap_the_wired_list() -> None:
     assert not set(PENDING_CLASSES) & set(WIRED_CLASSES)
+
+
+# --- tools -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("module", ["builtin", "browser"])
+def test_every_tool_class_is_in_its_factory(module: str, tmp_path: pathlib.Path) -> None:
+    """A tool class its factory does not return is invisible to the model, and its
+    own unit tests pass regardless.
+
+    This is the same defect as the provider list, one layer down: writing the thing
+    and wiring the thing are separate acts, and only the second one ships.
+    """
+    import importlib
+
+    from daemon.tools.base import Tool
+
+    loaded = importlib.import_module(f"daemon.tools.{module}")
+    factory, kwargs = (
+        (loaded.builtin_tools, {"roots": [tmp_path]})
+        if module == "builtin"
+        else (loaded.browser_tools, {})
+    )
+
+    defined = {
+        name
+        for name, value in vars(loaded).items()
+        # Concrete tools only: `PathScope` is not a tool, and `Tool` itself is the
+        # protocol. `isinstance` against a runtime_checkable protocol only checks
+        # methods, so the risk attribute is what separates them.
+        if isinstance(value, type) and hasattr(value, "spec") and hasattr(value, "risk")
+    }
+    wired = {type(tool).__name__ for tool in factory(**kwargs)}
+    assert defined == wired, (
+        f"{', '.join(sorted(defined - wired))} is defined in {module}.py but not "
+        f"returned by its factory, so nothing registers it and no model can call it."
+    )
+    assert all(isinstance(tool, Tool) for tool in factory(**kwargs))
+
+
+def test_no_two_tools_answer_to_the_same_name(tmp_path: pathlib.Path) -> None:
+    """`Registry.register` refuses a collision, so a clash between the built-ins and
+    the browser group would surface as a crash at startup rather than here."""
+    from daemon.tools.browser import browser_tools
+    from daemon.tools.builtin import builtin_tools
+
+    names = [t.spec.name for t in builtin_tools(roots=[tmp_path])] + [
+        t.spec.name for t in browser_tools()
+    ]
+    assert len(names) == len(set(names)), f"duplicate tool name in {names}"
+
+
+def test_the_tool_layer_is_reachable_from_settings() -> None:
+    """The config surface and the assembly have to agree, which is the failure
+    `openai`/`gemini` shipped with once already: nameable and unbuildable."""
+    app = (DAEMON / "app.py").read_text(encoding="utf-8")
+    assert "tools_enabled" in app
+    assert "tools_max_rounds" in app, "the round cap is configurable and must be passed on"
+    assert "mcp_enabled" in app
+    assert "browser_enabled" in app, "a setting nothing reads is a setting that lies"
+    assert "browser_app" in app
 
 
 def test_every_pending_entry_names_its_milestone() -> None:

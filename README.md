@@ -36,6 +36,7 @@ it is finished.
 |---|---|
 | **M1a** ✅ | Text conversation over Telegram, logged to markdown |
 | **M1b** 🔨 | Recall, voice, OS residency, recall evaluation |
+| **M1c** 🔨 | PC control — it can act on the machine it lives on |
 | M2 | Reflection, entity notes, observation capture |
 | M3 | Proactivity — it speaks first |
 | M4 | Persona evolution |
@@ -61,6 +62,23 @@ it is finished.
 - **Vector search is brute-force numpy over float32 blobs**, not a SQLite
   extension: 0.18 ms per query over 10k messages, and it works on Python builds
   that cannot load extensions at all — which is many of them.
+- **It can act on your machine, and the gate on that is not configurable.** Seven
+  built-in tools (read, list, write, run, open, notify, and "are you at your
+  desk"), plus any MCP server you point it at, all under one policy: reading is
+  free, anything that changes the machine is either on a list you wrote or asks
+  you first with a one-shot code. There is no shell — commands are exec'd as an
+  argv vector, so there is nothing to inject into. And **nothing reaches a tool on
+  a turn that is not your own words**: a forwarded message, an inline-bot result,
+  or anything recall dug up cannot run a command in any mode. Off by default;
+  `daemon tools log` shows every call, including the refused ones.
+- **It can read the page you are looking at**, so you can ask what something says
+  instead of pasting it — three more tools behind their own switch, because
+  letting it act on the machine and letting it read a logged-in session are two
+  different decisions. The JavaScript it runs in your browser is **one fixed string
+  that reads visible text**; there is deliberately no tool that runs code you or
+  the model supplies, and none of them click, type or navigate. Fetching a URL
+  cannot reach the private network — every redirect hop is resolved and checked,
+  because otherwise a link is a way to read this daemon's own control plane.
 
 ## Your data, and where it goes
 
@@ -80,6 +98,17 @@ Plainly, because the honest version is more useful than a slogan:
   channel because it is the only one that actually reaches your phone for free.
 - When Daemon speaks first while you are at your desk, it comes out of your
   **local speaker** — that path touches no network at all.
+- **Tools read your machine, and whatever they read goes to whichever model is
+  answering.** With the `offline` preset that is Ollama on localhost and nothing
+  leaves. With a hosted model, the contents of a file it read are in the request.
+  Files that hold credentials — `.ssh`, `.env`, `*.pem`, keychains — are refused
+  outright, and `DAEMON_TOOLS_ROOTS` is how you narrow the rest. An MCP server you
+  configure with a `url` rather than a `command` is a network hop by definition.
+- **The same is true of the page you ask it to read**, and more sharply: that page
+  may be behind your login, and its text goes to the model that answers. Reading
+  page contents also needs a toggle in Chrome itself, which grants *any* app that
+  can send Apple events the ability to run JavaScript in your tabs — not just this
+  one. `DAEMON_BROWSER_ENABLED=false` is the default for both reasons.
 
 Hosted models are bring-your-own-key throughout, with a hard spend limit.
 
@@ -110,12 +139,16 @@ python3 -c "from daemon.app import main; main()"
 
 Message your bot. The exchange lands in `data/memory/log/`.
 
+To let it touch the machine as well, set `DAEMON_TOOLS_ENABLED=true`. Start with
+`daemon tools list` to see what that grants and `daemon tools log` afterwards to
+see what it used. `.env.example` documents the policy modes.
+
 ## Contributing
 
 Read [docs/CONTRACTS.md](docs/CONTRACTS.md) first — it is short, and it is
-binding. The nine non-negotiables in it are not style preferences; each one
-exists because breaking it loses user data, leaks a secret, or launders
-untrusted text into the personality.
+binding. The twelve non-negotiables in it are not style preferences; each one
+exists because breaking it loses user data, leaks a secret, launders untrusted
+text into the personality, or lets a forwarded message run a command.
 
 Tests never touch the network and never need an API key. `python3 -m pytest`
 and `python3 -m ruff check .` both pass, or the change is not done.

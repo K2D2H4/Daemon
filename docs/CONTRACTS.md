@@ -20,6 +20,13 @@ daemon/
   channels/
     base.py           Channel protocol, InboundMessage, OutboundMessage. FROZEN.
     telegram.py
+  tools/
+    base.py           Tool + Executable protocols, Registry, ToolResult
+    policy.py         ToolPolicy: the origin gate, modes, approvals. Read this first.
+    builtin.py        the seven built-in tools
+    browser.py        fetch_page, list_tabs, read_page. Read the module docstring.
+    mcp.py            MCP client; the only file that imports the `mcp` package
+    runner.py         ToolRunner: decide -> execute -> audit, in that order
   tui.py              terminal presentation: colours, boxes, CJK-aware widths
   memory/
     schema.sql        storage contract. FROZEN.
@@ -70,6 +77,36 @@ FROZEN means: do not edit without flagging it first.
 9. **Single process.** No Celery, no Redis, no Postgres, no separate worker.
    Background work runs on the in-process APScheduler.
 
+10. **No tool runs on a turn whose origin is not `owner`.** Not in any mode, not
+    with any setting, `full` included. `InboundMessage.authored_by_sender` is False
+    for a forward or an inline-bot result, and recall replays arbitrary old text
+    into every prompt - so without this gate, "look at this message" is a way to
+    hand a stranger a shell. Decided in `tools/policy.py:decide`, before the model
+    is called, and it is the first check in the function for a reason. If you find
+    yourself needing an exception, stop and flag it.
+
+11. **The tool policy makes no model calls.** Same rule as recall Lane 1 and for a
+    different reason: a gate that asks a model whether to open the gate is not a
+    gate. OpenClaw's `auto` mode (an LLM reviewer for edge cases) was deliberately
+    not ported.
+
+12. **Tools are off unless configured on**, and every executed call leaves a
+    `tool_calls` row and a line in the reply the owner reads. A tool that ran
+    without either is a defect, which is why `ToolRunner` owns decide, execute and
+    audit together instead of exposing them separately.
+
+13. **Code is never built from data.** Three places would be natural to get this
+    wrong and all three are done the same way — the script is a constant and the
+    values travel as `argv`:
+    - `notify`'s AppleScript (a title with a quote in it would be AppleScript),
+    - `read_page`'s JavaScript (it runs in a logged-in session),
+    - `run_command` (there is no shell, so an argv vector, never a string).
+
+    **There must be no tool that runs model-supplied code in the browser.** Not
+    `execute_javascript`, not an `eval` parameter, not a `script` argument. The
+    owner's browser holds their sessions; a page's author must never reach it
+    through us. `tests/test_browser.py` asserts this and is meant to.
+
 ## Testing (required, not optional)
 
 **Unit tests are not enough, and we learned that the expensive way.** A milestone
@@ -90,6 +127,14 @@ kinds of test are required, and a change is not done without them:
   chain the product promises: the reply, the markdown, the mirror, the vector, and
   the recall on the next turn. Fakes stop at the network edge, because the defects
   live between.
+- **`tests/test_e2e.py` — does the *assembled daemon* work?** One layer further out:
+  boot the real `create_app` and its lifespan, so the real `_build_io`, the real
+  `_build_tools`, the real loop task and the real Telegram channel all run. Messages
+  go in through `getUpdates` and replies are read off `sendMessage`, so every
+  assertion is about what a person would see on their phone. Exactly three things
+  are faked and all three are network edges: the model, the embedder, Telegram's
+  HTTP. It also covers what the other two structurally cannot - a **restart** with
+  the same data dir, and shutdown leaving nothing running.
 
 And when you have run the suite, **run the product**. `pytest` passing is not the
 same as it working, and the difference is where every defect above lived.
@@ -142,6 +187,22 @@ Four pieces, one owner each:
    process to run in after the terminal closes and the machine reboots.
 4. **Golden set** — `evals/`. Recall gets a pass rate that moves when recall
    changes, so M1b's gate is a number rather than an impression.
+
+And **M1c — PC control**, pulled forward from post-M4 (docs/PLAN.md 8.2, §10):
+
+> It can read a file, run a command it has been allowed to run, and ask before
+> anything else - and a forwarded message can do none of it.
+
+One piece: `daemon/tools/`, plus tool calling in the provider contract and three
+tables in `schema.sql`. Both frozen files were extended additively; nothing that
+compiled before stopped compiling. No new `Task` - tool-using chat is still
+`chat_text`, so the preset tables are untouched.
+
+Then **the browser group** (`daemon/tools/browser.py`), behind its own
+`DAEMON_BROWSER_ENABLED`:
+
+> It can read the page the owner is looking at, so they can say "what does this
+> say?" instead of pasting it - and a forwarded message still cannot.
 
 Still out of scope: reflection, entity notes, observations, proactivity,
 persona rules. Their tables exist so those milestones need no migration.

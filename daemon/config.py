@@ -19,6 +19,7 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from daemon.tasks import Task
+from daemon.tools.policy import MODES as TOOL_MODES
 
 OLLAMA = "ollama"
 ANTHROPIC = "anthropic"
@@ -250,6 +251,60 @@ class Settings(BaseSettings):
     hand, `dm_policy=allowlist` could not be configured at all, and `_split_ids`
     below was dead code that looked like it worked."""
 
+    tools_enabled: bool = Field(default=False, alias="DAEMON_TOOLS_ENABLED")
+    """Off by default, and that is a product decision rather than caution about
+    the code: upgrading a companion should not silently hand it a shell. The user
+    turns this on once they want it to reach the machine (docs/PLAN.md tool use)."""
+
+    tools_mode: str = Field(default="ask", alias="DAEMON_TOOLS_MODE")
+    """`off` | `allowlist` | `ask` | `full` - see daemon/tools/policy.py.
+
+    `ask` rather than `allowlist` as the default for a switched-on install: the
+    first sessions are when you find out what it wants to run, and `allowlist`
+    answers anything unlisted with a flat refusal that teaches nobody anything."""
+
+    tools_allowlist: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=(), alias="DAEMON_TOOLS_ALLOWLIST"
+    )
+    """Commands that run without asking, as argv prefixes: `ls,git status,date`.
+    Comma-separated only - an entry legitimately contains a space, so the
+    whitespace-splitting that TELEGRAM_ALLOWED_USER_IDS accepts would break
+    `git status` into two useless entries."""
+
+    tools_roots: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("~",), alias="DAEMON_TOOLS_ROOTS"
+    )
+    """Where the file tools may look. Comma-separated. Defaults to the home
+    directory: narrower is better, and anyone who wants that should say so, but a
+    default of "nothing" would make the file tools look broken rather than safe."""
+
+    tools_timeout_secs: float = Field(default=20.0, alias="DAEMON_TOOLS_TIMEOUT_SECS")
+    tools_max_output: int = Field(default=4000, alias="DAEMON_TOOLS_MAX_OUTPUT")
+    """Characters of tool output given to the model. Paid for on every subsequent
+    round of the same turn, since the result stays in the context."""
+
+    tools_max_rounds: int = Field(default=6, alias="DAEMON_TOOLS_MAX_ROUNDS")
+    """Tool round-trips allowed in one turn before it must answer."""
+
+    browser_enabled: bool = Field(default=False, alias="DAEMON_BROWSER_ENABLED")
+    """Whether Daemon may fetch web pages and read the owner's open browser tabs.
+
+    Its own switch rather than part of DAEMON_TOOLS_ENABLED, because this is the one
+    group that reads an authenticated session: the page in front of the owner may be
+    their bank. Letting it act on the machine and letting it read over their shoulder
+    are two decisions, so they are two settings (the same reasoning as
+    DAEMON_VOICE_ENABLED)."""
+
+    browser_app: str = Field(default="Google Chrome", alias="DAEMON_BROWSER_APP")
+    """Which browser to read. Brave, Arc and Edge share Chrome's AppleScript
+    dictionary, so naming one of those works. Safari's is a different shape and is
+    not supported."""
+
+    mcp_enabled: bool = Field(default=False, alias="DAEMON_MCP_ENABLED")
+    """Whether `<data_dir>/mcp.json` is read at all. Separate from
+    DAEMON_TOOLS_ENABLED so an MCP server can be configured and left switched off,
+    and because starting one means starting somebody else's subprocess."""
+
     data_dir: Path = Field(default=Path("./data"), alias="DAEMON_DATA_DIR")
 
     host: str = Field(default="127.0.0.1", alias="DAEMON_HOST")
@@ -274,6 +329,24 @@ class Settings(BaseSettings):
             return tuple(
                 part.strip() for part in text.replace(",", " ").split() if part.strip()
             )
+        return value
+
+    @field_validator("tools_allowlist", "tools_roots", mode="before")
+    @classmethod
+    def _split_csv(cls, value: object) -> object:
+        """Commas only, so an entry may contain spaces (`git status`, or a path with
+        one in it). `NoDecode` for the same reason as the ids above: pydantic-settings
+        JSON-decodes a complex field before validators run."""
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                import json
+
+                try:
+                    return tuple(str(item).strip() for item in json.loads(text))
+                except (ValueError, TypeError):
+                    return ()
+            return tuple(part.strip() for part in text.split(",") if part.strip())
         return value
 
     @model_validator(mode="after")
@@ -321,6 +394,41 @@ class Settings(BaseSettings):
                 f"DAEMON_RECALL_HALF_LIFE_DAYS is {self.recall_half_life_days}; "
                 "it must be greater than 0 or recency decay is undefined"
             )
+        if self.tools_mode not in TOOL_MODES:
+            problems.append(
+                f"unknown DAEMON_TOOLS_MODE {self.tools_mode!r}; expected one of "
+                f"{', '.join(TOOL_MODES)}"
+            )
+        if self.tools_enabled:
+            # Only checked when tools are on: a text-only install should not have to
+            # hold a coherent tool configuration it never reaches.
+            if not self.tools_roots:
+                problems.append(
+                    "DAEMON_TOOLS_ENABLED is on but DAEMON_TOOLS_ROOTS is empty; "
+                    "the file tools would have nowhere they are allowed to look"
+                )
+            if self.tools_timeout_secs <= 0:
+                problems.append(
+                    f"DAEMON_TOOLS_TIMEOUT_SECS is {self.tools_timeout_secs}; it must be "
+                    "greater than 0 or every command is killed before it starts"
+                )
+            if self.tools_max_output < 200:
+                problems.append(
+                    f"DAEMON_TOOLS_MAX_OUTPUT is {self.tools_max_output}; below ~200 "
+                    "characters a tool result is truncated past the point of being useful"
+                )
+            if self.tools_max_rounds < 1:
+                problems.append(
+                    f"DAEMON_TOOLS_MAX_ROUNDS is {self.tools_max_rounds}; it must be at "
+                    "least 1 (to switch tools off, use DAEMON_TOOLS_ENABLED=false)"
+                )
+        if self.browser_enabled and not self.tools_enabled:
+            problems.append(
+                "DAEMON_BROWSER_ENABLED is on but DAEMON_TOOLS_ENABLED is off; the "
+                "browser tools are tools, so nothing would register them"
+            )
+        if self.browser_enabled and not self.browser_app.strip():
+            problems.append("DAEMON_BROWSER_APP is empty; name the browser to read")
         if not SERVICE_LABEL_RE.match(self.service_label):
             problems.append(
                 f"DAEMON_SERVICE_LABEL {self.service_label!r} is not a usable label; "
