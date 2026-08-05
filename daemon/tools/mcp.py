@@ -192,26 +192,17 @@ class McpBridge:
         """
         if not self._configs:
             return 0
-        try:
-            from mcp import ClientSession, StdioServerParameters
-            from mcp.client.stdio import stdio_client
-        except ImportError as exc:
-            for config in self._configs:
-                self.failures[config.name] = "the 'mcp' extra is not installed"
-            logger.error(
-                "%d MCP server(s) configured but the mcp package is missing "
-                "(pip install 'daemon-ai[mcp]'): %s",
-                len(self._configs),
-                exc,
-            )
-            return 0
 
         registered = 0
         for config in self._configs:
             try:
-                session = await self._connect(
-                    config, ClientSession, StdioServerParameters, stdio_client
-                )
+                # The SDK import lives in `_connect`, not here. Hoisting it made
+                # `start()` unrunnable without the optional extra, so the two tests
+                # that patch `_connect` passed only on a machine that happened to
+                # have `mcp` installed - which is to say they passed here and failed
+                # in CI. Per-server also reports better: one server's problem is
+                # recorded against that server.
+                session = await self._connect(config)
                 self._sessions[config.name] = session
                 # Inside the same guard as the connect, deliberately. It used to sit
                 # after it, so a server that connected and then hung on `list_tools`
@@ -227,14 +218,18 @@ class McpBridge:
                 continue
         return registered
 
-    async def _connect(
-        self,
-        config: ServerConfig,
-        client_session: Any,
-        stdio_params: Any,
-        stdio_client: Any,
-    ) -> Any:
+    async def _connect(self, config: ServerConfig) -> Any:
+        """Open one session. Raises, and `start` records it against this server."""
         import asyncio
+
+        try:
+            from mcp import ClientSession as client_session
+            from mcp import StdioServerParameters as stdio_params
+            from mcp.client.stdio import stdio_client
+        except ImportError as exc:
+            raise ImportError(
+                f"the 'mcp' extra is not installed (pip install 'daemon-ai[mcp]'): {exc}"
+            ) from exc
 
         if config.is_remote:
             from mcp.client.streamable_http import streamablehttp_client

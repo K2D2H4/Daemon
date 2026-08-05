@@ -968,6 +968,9 @@ async def test_it_can_talk_about_the_page_the_owner_is_looking_at(
     monkeypatch.setattr("daemon.tools.browser.asyncio.create_subprocess_exec", spawn)
     monkeypatch.setattr("daemon.tools.browser.platform.system", lambda: "Darwin")
     monkeypatch.setattr("daemon.tools.browser.shutil.which", lambda _n: "/usr/bin/osascript")
+    # The is-it-installed check too, or this passes only on a machine that happens to
+    # have Chrome - which is how it passed here and failed in CI.
+    monkeypatch.setattr("daemon.tools.browser._require_app", lambda _n: None)
 
     store = Store.open(tmp_path / "daemon.sqlite3")
     try:

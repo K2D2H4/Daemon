@@ -368,7 +368,7 @@ async def test_start_connects_and_registers(monkeypatch: pytest.MonkeyPatch) -> 
     bridge = McpBridge([config])
     session = Session([RemoteTool("search"), RemoteTool("write")])
 
-    async def connect(cfg: Any, *_a: Any) -> Any:
+    async def connect(cfg: Any) -> Any:
         return session
 
     monkeypatch.setattr(bridge, "_connect", connect)
@@ -385,7 +385,7 @@ async def test_one_server_failing_does_not_stop_the_next(
     bad = ServerConfig(name="bad", command="y")
     bridge = McpBridge([bad, good])
 
-    async def connect(cfg: Any, *_a: Any) -> Any:
+    async def connect(cfg: Any) -> Any:
         if cfg.name == "bad":
             raise RuntimeError("it exited immediately")
         return Session([RemoteTool("search")])
@@ -411,7 +411,7 @@ async def test_a_server_that_never_lists_its_tools_is_recorded(
     config = ServerConfig(name="slow", command="x")
     bridge = McpBridge([config])
 
-    async def connect(cfg: Any, *_a: Any) -> Any:
+    async def connect(cfg: Any) -> Any:
         return Slow([])
 
     monkeypatch.setattr(bridge, "_connect", connect)
