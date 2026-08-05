@@ -258,6 +258,23 @@ async def test_a_matched_alias_fires_exactly_one_event() -> None:
     assert rig.gate.counters.transcribed == 1
 
 
+async def test_the_event_carries_the_audio_that_fired_it() -> None:
+    """Discarding it cost the owner a whole utterance: the gate consumed
+    "루시 뭐 해", matched on the alias, and the session then opened having never heard
+    "뭐 해" - so it was said again, into a microphone that had just changed hands.
+    Measured on a real run at 14.79s from wake word to first audio out."""
+    blocks, probabilities = script(*ONE_PHRASE)
+    recognizer = FakeRecognizer("헤이 대문")
+    rig = build(blocks, probabilities, recognizer)
+
+    events = await rig.collect()
+
+    assert events[0].pcm, "the audio that fired the gate was thrown away"
+    # Exactly what the recognizer was asked about, so the session hears what the
+    # match was made on rather than a re-slice of it.
+    assert events[0].pcm == recognizer.calls[-1]
+
+
 async def test_the_wake_phrase_followed_by_a_question_still_fires() -> None:
     """`헤이 데몬, 지금 뭐 하고 있어` is one breath, so the alias arrives with the
     question attached. Requiring the whole transcript to equal an alias would make

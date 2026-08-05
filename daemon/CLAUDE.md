@@ -22,7 +22,7 @@ in `app.py`, which owns every concrete-implementation import here.
 | `channels/` | `channels/base.py` (frozen) · `channels/telegram.py` · `channels/pairing.py` |
 | `llm/` | `llm/base.py` (frozen) · `llm/gateway.py` · `llm/providers/` (4) · `llm/embedders/` |
 | `memory/` | `memory/schema.sql` (frozen) · `store` · `log` · `writer` · `recall` · `curated` · `entities` · `reindex` |
-| `voice/` | `voice/base.py` (frozen) · `voice/gemini_live.py` · `voice/audio.py` · `voice/conversation.py` |
+| `voice/` | `voice/base.py` (frozen) · `voice/gemini_live.py` · `voice/audio.py` (PortAudio) · `voice/apple_audio.py` (macOS echo cancellation) · `voice/conversation.py` · `voice/vad.py` · `voice/apple_speech.py` · `voice/wake.py` |
 | `proactivity/` | `proactivity/base.py` (frozen) · `candidates` · `gate` · `presence` · `judge` · `delivery` · `speaker` · `tick`. `persona/` is still empty — M4 |
 
 ## Layering
@@ -98,6 +98,34 @@ package. Rules: [CONTRACTS.md](../docs/CONTRACTS.md). Data flow:
   10k). What dominates is the embedder round trip, ~117 ms, mostly fixed overhead.
 - **FTS5 with `unicode61` cannot carry Korean recall alone** — whole-token matching,
   so an inflected word is a different token: 50% keyword-only vs 93% hybrid.
+- **Voice mode interrupted itself on every single turn, and echo was only half of
+  it.** Two independent causes, both measured. (1) The speaker leaks into the open
+  microphone: 80.1% of mic frames read as speech through PortAudio while the speaker
+  played, 0.0% through macOS voice processing, and 81.6% for speech the canceller
+  does not know about - so the echo goes and the user does not
+  (`daemon/voice/apple_audio.py`). (2) Gemini delivers `inputTranscription` **at the
+  turn boundary, in the same server event as the answer's first audio chunk**, and
+  `daemon/voice/conversation.py` inferred a barge-in from the transcript growing while audio
+  played. So the question's own transcript condemned its own answer: a complete,
+  fluent reply generated and **0.0s of it played**. The barge-in is now the server's
+  `interrupted`, which is what `daemon/voice/base.py` always said the authority was. Same
+  measurement retires a documented claim: the recall prefetch cannot be free against
+  this provider, because the partial it fires on arrives with the answer.
+- **Recall was killing the answer it was fetched for, and this was the biggest of the
+  three.** `send_context` is `clientContent`, and the Live API says plainly that "a
+  message here will interrupt any current model generation". The prefetch landed
+  mid-answer, so seeding a memory cut the reply off at "아..." - the owner's log paired
+  every barge-in with the embed call immediately before it, 1:1. Measured, one
+  conversation, same room and microphone: **2.2s of audio with recall on, 46.7s with
+  it off, 38.8s with it deferred to the turn boundary.** Deferring costs nothing that
+  was not already lost, because the prefetch fires on a partial that arrives with the
+  answer anyway. And note what `serverContent.interrupted` actually means - "a client
+  message has interrupted current model generation", *not* "the user spoke" - so it is
+  two failures wearing one flag, and reading it as pure user-VAD is what let the daemon
+  mistake its own memory for the owner talking over it.
+- **An interruption arriving after `generationComplete` is not an interruption.**
+  Measured four times: it lands ~0.25 s later on a turn nobody touched, and acted on
+  it empties the speaker of an answer that was fully delivered.
 - **Two Telegram traps.** The inbound poll needs a floor — left to the long poll alone, a
   transport that returns immediately spins at ~16,000 requests/second. And `allowed_updates`
   is **server-side**: at `["message"]` a 👍 press is never delivered at all.

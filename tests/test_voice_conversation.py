@@ -18,6 +18,7 @@ import json
 import pathlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,7 +27,7 @@ from websockets.frames import Close
 
 from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.voice import conversation as conversation_module
-from daemon.voice.base import AudioIO, Transcript, VoiceSession
+from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 from daemon.voice.conversation import VoiceConversation
 from daemon.voice.gemini_live import GeminiLiveSession
 
@@ -51,6 +52,29 @@ class Says:
 @dataclass(frozen=True)
 class Turn:
     """A turn boundary: the accumulated transcript is released, final."""
+
+
+@dataclass(frozen=True)
+class Cuts:
+    """The provider's activity detection says the user talked over the answer.
+
+    A script step rather than something the fake infers, because inferring it is
+    the bug: `serverContent.interrupted` is the only thing that knows, and the
+    conversation used to guess from transcript growth instead - which fired on
+    every turn, since this provider delivers the user's transcript in the same
+    event as the answer's first audio (daemon/voice/base.py)."""
+
+
+@dataclass(frozen=True)
+class Does:
+    """Run something at this exact point in the script, then let the loop breathe.
+
+    Exists because the thing under test is *timing*: recall has to land while the
+    model is mid-answer, and a search that resolves on its own does so before the
+    first audio chunk - which is how three tests here passed against the very bug
+    they were written for."""
+
+    action: Any
 
 
 @dataclass(frozen=True)
@@ -82,6 +106,8 @@ class FakeSession:
         self.sent: list[bytes] = []
         self.texts: list[str] = []
         self.contexts: list[str] = []
+        self.sent_while_generating: list[str] = []
+        self.generating = False
         self.interrupts = 0
         self.entered = False
         self.closed = False
@@ -109,6 +135,12 @@ class FakeSession:
     async def send_context(self, text: str) -> None:
         self.contexts.append(text)
         self.events.append("context")
+        # Recorded, because "did this interrupt the answer" is a question about
+        # *when* it was sent. `clientContent` mid-generation is what the Live API
+        # documents as interrupting, so a fake that only kept the text could not
+        # tell the fixed behaviour from the bug.
+        if self.generating:
+            self.sent_while_generating.append(text)
 
     async def interrupt(self) -> None:
         self.interrupts += 1
@@ -119,6 +151,7 @@ class FakeSession:
         while self.script:
             step = self.script.pop(0)
             if isinstance(step, bytes):
+                self.generating = True
                 yield step
             elif isinstance(step, Transcript):
                 yield step
@@ -134,7 +167,16 @@ class FakeSession:
                     # is nothing to wait for. One turn of the loop, so the
                     # microphone pump gets to run.
                     await asyncio.sleep(0)
+            elif isinstance(step, Does):
+                step.action()
+                # Several turns, not one: the prefetch task has a search to finish
+                # and a `send_context` to make after being released.
+                for _ in range(20):
+                    await asyncio.sleep(0)
+            elif isinstance(step, Cuts):
+                yield Interrupted()
             elif isinstance(step, Turn):
+                self.generating = False
                 for transcript in self._drain(final=True):
                     yield transcript
                 return  # the turn ended; the session did not
@@ -293,6 +335,29 @@ class FakeRecall:
             await asyncio.sleep(self.delay)
         if self.fail:
             raise RuntimeError("the embedder is down")
+        return list(self.items)
+
+    async def index(self, message_id: int, text: str) -> None: ...
+
+    async def backfill(self, limit: int = 500) -> int:
+        return 0
+
+
+class BlockingRecall:
+    """A `Recall` that hangs until released, so a test decides when the search lands.
+
+    The whole point of the deferral is what happens when it lands *during* an answer,
+    and no amount of scripting the session can arrange that if the search resolves
+    by itself on the next loop turn."""
+
+    def __init__(self, *items: RecalledItem) -> None:
+        self.items = list(items)
+        self.gate = asyncio.Event()
+        self.queries: list[str] = []
+
+    async def search(self, query: str, *, limit: int = 6) -> list[RecalledItem]:
+        self.queries.append(query)
+        await self.gate.wait()
         return list(self.items)
 
     async def index(self, message_id: int, text: str) -> None: ...
@@ -524,7 +589,8 @@ async def test_a_barge_in_stops_the_stream_and_the_speaker_both() -> None:
     events: list[str] = []
     session = FakeSession(
         b"\x01",  # the daemon is talking
-        Says("user", "아니 잠깐만"),  # and the user starts talking over it
+        Says("user", "아니 잠깐만"),  # the user starts talking over it
+        Cuts(),  # and the provider's own activity detection says so
         Turn(),
         events=events,
     )
@@ -874,3 +940,484 @@ async def test_a_provider_with_nothing_pending_is_not_a_problem() -> None:
     await asyncio.gather(task, return_exceptions=True)
 
     assert memory.records == []
+
+
+# --- what the session reports about itself -----------------------------------
+# Every number here used to exist and never leave the object. The one that
+# mattered - `interruptions` - is how the daemon cutting itself off would have
+# been visible, and it was counted for three milestones and printed nowhere.
+
+
+async def test_a_conversation_reports_what_it_did() -> None:
+    session = FakeSession(
+        Says("user", "오늘 일정 뭐야"),
+        b"\x01\x02",
+        Says("assistant", "회의가 두 개 있어요"),
+        Turn(),
+    )
+    audio = FakeAudio()
+    conv = conversation(session, audio)
+    await run(conv)
+
+    stats = conv.stats
+    assert stats.turns == 1
+    assert stats.interruptions == 0
+    assert stats.first_audio_seconds is not None
+    assert stats.played_seconds == pytest.approx(2 / (24_000 * 2))
+
+
+async def test_a_barge_in_is_visible_in_the_report() -> None:
+    """The whole reason the report exists. An interruption on every turn with
+    almost no audio played is the signature of the daemon cutting itself off, and
+    nothing used to say so - it went unnoticed for three milestones."""
+    session = FakeSession(b"\x01", Says("user", "아니 잠깐만"), Cuts(), Turn())
+    conv = conversation(session)
+    await run(conv)
+
+    assert conv.stats.interruptions == 1
+    assert "1 interruption(s)" in conv.stats.describe()
+
+
+async def test_a_session_that_never_spoke_says_so_rather_than_zero() -> None:
+    """A silent session and an instant one are different failures. Reported as
+    0.00s they would read the same, and the silent one is the one worth finding."""
+    session = FakeSession(Says("user", "여보세요"), Turn())
+    conv = conversation(session)
+    await run(conv)
+
+    assert conv.stats.first_audio_seconds is None
+    assert conv.stats.played_seconds == 0.0
+    assert "never spoke" in conv.stats.describe()
+
+
+async def test_played_seconds_is_seconds_at_the_playback_rate() -> None:
+    """Not the capture rate. 24 kHz out against 16 kHz in is the chipmunk bug's
+    other half (daemon/voice/base.py), and getting it wrong here would report
+    every session as 50% longer than it was."""
+    audio = FakeAudio()
+    session = FakeSession(b"\x00" * 48_000, Turn())
+    conv = conversation(session, audio)
+    await run(conv)
+
+    assert conv.stats.played_seconds == pytest.approx(1.0)
+
+
+async def test_the_answer_survives_the_transcript_of_the_question() -> None:
+    """The regression this file exists for now.
+
+    Gemini delivers `inputTranscription` at the turn boundary - measured, in the
+    same server event as the answer's first audio chunk. The conversation used to
+    read that as the user talking over the answer, so *every* turn was ruled a
+    barge-in: against the live API a complete reply ("안녕하세요! 반갑습니다. 오늘
+    어떤 대화를 나누고 싶으세요?") was generated and 0.0s of it was played.
+
+    So: audio, then the user's own transcript, and no `Cuts`. Nothing may be
+    interrupted."""
+    session = FakeSession(
+        b"\x01\x02",
+        Says("user", "안녕"),
+        Says("assistant", "안녕하세요! 반갑습니다"),
+        Turn(),
+    )
+    audio = FakeAudio()
+    conv = conversation(session, audio)
+    await run(conv)
+
+    assert conv.interruptions == 0, (
+        "the question's own transcript was read as a barge-in against its answer"
+    )
+    assert session.interrupts == 0
+    assert audio.stops == 0
+    assert audio.played == [b"\x01\x02"], "the answer was thrown away unheard"
+    assert conv.stats.played_seconds > 0
+
+
+async def test_the_report_survives_a_conversation_that_was_cancelled() -> None:
+    """`run_voice` reports from a `finally`, so this is read on the failure path
+    more often than the happy one."""
+    session = FakeSession(Says("user", "잠깐"), Hang())
+    conv = conversation(session)
+
+    task = asyncio.create_task(conv.run())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert conv.stats.turns == 0
+    assert "never spoke" in conv.stats.describe()
+
+
+# --- reconnecting a conversation the server cut -------------------------------
+# Until `app._voice_attempts` existed, a dropped socket simply ended `daemon voice`:
+# mid-sentence, with a shell exit code, and nothing said about whether it was the
+# network or the key.
+
+
+class Cut(Exception):
+    """Stands in for `GeminiLiveError`, with the flag that decides a retry."""
+
+    def __init__(self, message: str, *, permanent: bool = False) -> None:
+        super().__init__(message)
+        self.permanent = permanent
+
+
+def _attempts(*sessions: FakeSession, **kwargs: Any) -> Any:
+    """Drive `app._voice_attempts` over a queue of scripted sessions."""
+    from daemon import app as app_module
+
+    queue = list(sessions)
+    built: list[FakeSession] = []
+
+    def new_session() -> FakeSession:
+        session = queue.pop(0) if len(queue) > 1 else queue[0]
+        built.append(session)
+        return session
+
+    settings = SimpleNamespace(recall_limit=6)
+    return app_module, new_session, built, settings
+
+
+async def _drive(*sessions: FakeSession, audio: FakeAudio | None = None) -> tuple[int, list[Any]]:
+    app_module, new_session, built, settings = _attempts(*sessions)
+    code = await app_module._voice_attempts(
+        new_session, audio or FakeAudio(), FakeMemory(), None, settings, Cut
+    )
+    return code, built
+
+
+async def test_a_conversation_that_simply_ends_is_not_reconnected() -> None:
+    """An idle timeout is the conversation being over. Reconnecting into one bills
+    per minute for nothing."""
+    code, built = await _drive(FakeSession(Says("user", "안녕"), Turn()))
+
+    assert code == 0
+    assert len(built) == 1
+
+
+async def test_a_transient_close_is_picked_back_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """1011, or the 1008 that is really an idle timeout. The user is standing in the
+    middle of a conversation, so it is resumed rather than reported."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    failing = FakeSession(Cut("connection closed 1011: internal error"))
+    working = FakeSession(Says("user", "다시 들려?"), Turn())
+
+    code, built = await _drive(failing, working)
+
+    assert code == 0
+    assert len(built) == 2, "the dropped conversation was not picked back up"
+
+
+async def test_a_permanent_failure_is_not_retried() -> None:
+    """A bad key or a wrong model id. Retrying leaves the process alive,
+    healthy-looking and mute."""
+    code, built = await _drive(FakeSession(Cut("api key not valid", permanent=True)))
+
+    assert code == 1
+    assert len(built) == 1, "a permanent failure was retried"
+
+
+async def test_retries_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sessions bill per minute, so this is deliberately not a reconnect-forever
+    loop."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    # One fresh failure per attempt, plus a spare: a reused session would hand the
+    # second attempt an exhausted script, which ends cleanly and would make this
+    # test pass for the wrong reason.
+    code, built = await _drive(
+        *(
+            FakeSession(Cut("connection closed 1011: internal error"))
+            for _ in range(app_module.VOICE_RECONNECT_ATTEMPTS + 1)
+        )
+    )
+
+    assert code == 1
+    assert len(built) == app_module.VOICE_RECONNECT_ATTEMPTS
+
+
+async def test_a_go_away_is_reconnected_even_though_nothing_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The measured trap this closes: `goAway` means the server is ending the
+    *session*, not the turn, and it arrives looking exactly like a conversation that
+    finished normally - so the daemon used to stop mid-conversation with a clean exit
+    code."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    leaving = FakeSession(Says("user", "잠깐"), Turn())
+    leaving.going_away = True
+    resumed = FakeSession(Says("user", "계속하자"), Turn())
+
+    code, built = await _drive(leaving, resumed)
+
+    assert code == 0
+    assert len(built) == 2
+
+
+async def test_each_attempt_gets_a_fresh_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reconnecting means starting clean. The old session carries a half-flushed
+    transcript and a partial queue nobody will read again."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    first = FakeSession(Cut("connection closed 1011: internal error"))
+    second = FakeSession(Says("user", "다시"), Turn())
+
+    _code, built = await _drive(first, second)
+
+    assert built[0] is not built[1]
+
+
+async def test_what_each_attempt_did_is_reported(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One report per attempt, numbered. A single line covering three attempts would
+    hide which of them actually held a conversation."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    with caplog.at_level("INFO"):
+        await _drive(
+            FakeSession(Cut("connection closed 1011: internal error")),
+            FakeSession(Says("user", "다시"), b"\x01", Turn()),
+        )
+
+    assert "voice session:" in caplog.text
+    assert "voice session (attempt 2):" in caplog.text
+
+
+# --- recall must not interrupt the answer it was fetched for -------------------
+# The Live API: "a message here will interrupt any current model generation."
+# Measured against it - `interrupted` arrived 90 ms after the recall block went out,
+# and one conversation delivered 2.2s of audio with recall on against 46.7s with it
+# off. The daemon was killing its own answers with its own memory.
+
+
+async def test_recall_is_not_sent_while_the_model_is_answering() -> None:
+    """The measured bug. `clientContent` mid-generation is documented as interrupting
+    the answer, and against the live API `interrupted` came back 90 ms later."""
+    recall = BlockingRecall(_item())
+    session = FakeSession(
+        Says("user", "치과 언제였지"),  # the prefetch starts, and blocks
+        b"\x01\x02",  # the answer starts arriving: generating
+        Does(recall.gate.set),  # the search lands *now*, mid-answer
+        Turn(),
+    )
+    conv = conversation(session, recall=recall)
+    await run(conv)
+
+    assert recall.queries, "the prefetch never ran, so this proves nothing"
+    assert session.sent_while_generating == [], (
+        "recall was sent while the model was generating - the Live API documents "
+        "that as interrupting the answer, and it cost 2.2s of audio against 46.7s"
+    )
+    assert session.contexts, "recall was held back and then never sent at all"
+
+
+async def test_held_recall_is_sent_at_the_turn_boundary() -> None:
+    """Held, not dropped - and this is the case where only the flush can deliver it.
+
+    The prefetch covers the finished utterance, so `_settle_recall` reuses it instead
+    of searching again; with nothing redoing the offer, a missing flush means a memory
+    that was searched for and silently discarded."""
+    recall = BlockingRecall(_item())
+    session = FakeSession(
+        Says("user", "치과 언제였지"),
+        b"\x01",
+        Does(recall.gate.set),
+        Turn(),
+    )
+    conv = conversation(session, recall=recall)
+    await run(conv)
+
+    assert len(session.contexts) == 1, "the held recall never reached the model"
+    assert "치과" in session.contexts[0]
+    assert session.sent_while_generating == []
+
+
+async def test_the_same_turn_is_not_seeded_twice() -> None:
+    """Two blocks for one turn would hand the model the same facts again, and each
+    send is another chance to interrupt."""
+    recall = BlockingRecall(_item())
+    session = FakeSession(
+        Says("user", "치과"),
+        b"\x01",
+        Does(recall.gate.set),
+        Says("user", " 언제였지 그리고 약은"),
+        Turn(),
+    )
+    conv = conversation(session, recall=recall)
+    await run(conv)
+
+    assert len(session.contexts) <= 1, "the same turn was seeded more than once"
+    assert session.sent_while_generating == []
+
+
+# --- the utterance that opened the session, and the cue that invites the next ---
+# The gate used to consume "루시 뭐 해", match on the alias, and throw the sound away,
+# so the session opened deaf to the question it was opened for. Measured on a real
+# run: 14.79s from the wake word to the first audio out, most of it a person saying
+# the same thing twice.
+
+
+async def test_the_opening_utterance_is_the_first_thing_the_session_hears() -> None:
+    """First, not merely eventually: live microphone audio arriving ahead of it would
+    put the question behind the noise of a person settling down.
+
+    Asserted as "the first chunk", not "before `record()` is called", because the
+    latter is not a real guarantee - `record()` only builds the generator and nothing
+    flows until the pump task runs. A mutation swapping those two lines changes
+    nothing, and a test that failed on it would be pinning noise."""
+    opening = b"\x11\x22" * 400
+    audio = FakeAudio(b"live-block")
+    session = FakeSession(Says("user", "뭐 해"), b"\x01", Turn())
+    conv = conversation(session, audio, opening_audio=opening)
+    await run(conv)
+
+    assert session.sent, "the opening utterance never reached the session"
+    assert session.sent[0] == opening, (
+        "something else was fed to the session before the utterance that opened it"
+    )
+
+
+async def test_no_opening_audio_is_the_ordinary_case() -> None:
+    """`daemon voice` run by hand has no wake segment, and neither does a session
+    opened by a provider with nothing to offer."""
+    audio = FakeAudio(b"live-block")
+    session = FakeSession(Says("user", "안녕"), Turn())
+    conv = conversation(session, audio)
+    await run(conv)
+
+    assert b"" not in session.sent, "an empty opening was sent as a chunk"
+
+
+async def test_a_session_that_refuses_the_opening_still_holds_the_conversation() -> None:
+    """One repeated sentence is the cost of losing it. Raising here would cost the
+    whole turn, which is worse."""
+
+    class Refuses(FakeSession):
+        async def send_audio(self, chunk: bytes) -> None:
+            if not self.sent:
+                self.sent.append(chunk)
+                raise RuntimeError("the socket hiccuped on the first chunk")
+            await super().send_audio(chunk)
+
+    session = Refuses(Says("user", "안녕"), b"\x01", Turn())
+    conv = conversation(session, opening_audio=b"\x11\x22")
+    await run(conv)
+
+    assert conv.stats.played_seconds > 0, "a refused opening took the answer with it"
+
+
+# --- the ready cue -------------------------------------------------------------
+
+
+def test_the_ready_cue_is_short_quiet_and_starts_at_silence() -> None:
+    """A bare sine starts on a discontinuity, which is an audible click and exactly
+    the kind of noise a VAD notices."""
+    import numpy as np
+
+    from daemon.app import READY_CUE_MS, ready_cue
+
+    pcm = ready_cue(24_000)
+    samples = np.frombuffer(pcm, dtype="<i2")
+
+    assert len(samples) == pytest.approx(24_000 * READY_CUE_MS / 1000, rel=0.02)
+    assert samples[0] == 0 and samples[-1] == 0, "the cue clicks"
+    assert 0 < int(np.abs(samples).max()) < 8000, "the cue is loud enough to startle"
+
+
+def test_the_ready_cue_follows_the_devices_rate() -> None:
+    """Synthesised rather than shipped as a wav precisely so this holds: a cue at the
+    wrong rate is the chipmunk bug in miniature."""
+    from daemon.app import ready_cue
+
+    assert len(ready_cue(48_000)) == 2 * len(ready_cue(24_000))
+
+
+def test_the_ready_cue_rises() -> None:
+    """Rising reads as "go ahead"; falling reads as "finished"."""
+    import numpy as np
+
+    from daemon.app import ready_cue
+
+    samples = np.frombuffer(ready_cue(24_000), dtype="<i2")
+    half = len(samples) // 2
+
+    def hz(part: np.ndarray) -> float:
+        crossings = int(((part[:-1] >= 0) != (part[1:] >= 0)).sum())
+        return crossings / 2 / (len(part) / 24_000)
+
+    assert hz(samples[half:]) > hz(samples[:half])
+
+
+async def test_the_cue_plays_and_a_speaker_that_refuses_it_is_not_fatal() -> None:
+    """The cue is a courtesy. A conversation that failed because it could not be
+    played would be a worse trade than no cue at all."""
+    from daemon.app import play_ready_cue, ready_cue
+
+    audio = FakeAudio()
+    await play_ready_cue(audio)
+    assert audio.played, "the cue never reached the speaker"
+    # At the playback rate, not the capture rate. FakeAudio deliberately has two
+    # different ones (16k in, 24k out), so a cue built at the wrong one arrives the
+    # wrong length - the chipmunk bug in miniature (daemon/voice/base.py).
+    assert audio.played[0] == ready_cue(audio.playback_sample_rate)
+    assert audio.played[0] != ready_cue(audio.sample_rate)
+
+    class Deaf(FakeAudio):
+        async def play(self, chunk: bytes) -> None:
+            raise RuntimeError("no speaker here")
+
+    await play_ready_cue(Deaf())  # must not raise
+
+
+async def test_an_unanswered_opening_survives_a_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attempt cut down before it answers never got the utterance in front of a
+    model, so dropping it on the retry would reopen the failure the opening exists to
+    fix: the owner saying the wake phrase twice."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    opening = b"\x11\x22" * 200
+    failing = FakeSession(Cut("connection closed 1011: internal error"))
+    working = FakeSession(Says("user", "다시"), b"\x01", Turn())
+    app_mod, new_session, built, settings = _attempts(failing, working)
+
+    code = await app_mod._voice_attempts(
+        new_session, FakeAudio(), FakeMemory(), None, settings, Cut,
+        opening_audio=opening,
+    )
+
+    assert code == 0
+    assert built[1].sent and built[1].sent[0] == opening, (
+        "the utterance that opened the session was lost on the reconnect"
+    )
+
+
+async def test_an_answered_opening_is_not_asked_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half: once something has been said back, re-sending it would have
+    the daemon answer the same question twice."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    opening = b"\x11\x22" * 200
+    answered = FakeSession(Says("user", "안녕"), b"\x01" * 4800, Turn())
+    answered.going_away = True  # forces a reconnect after a turn that did answer
+    resumed = FakeSession(Says("user", "계속"), Turn())
+    app_mod, new_session, built, settings = _attempts(answered, resumed)
+
+    await app_mod._voice_attempts(
+        new_session, FakeAudio(), FakeMemory(), None, settings, Cut,
+        opening_audio=opening,
+    )
+
+    assert opening not in built[1].sent, "the answered question was asked again"

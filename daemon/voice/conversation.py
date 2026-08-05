@@ -12,16 +12,25 @@ Four things here are load-bearing rather than incidental:
    as deltas, so recording anything else would leave single syllables in the log
    as though they were utterances (daemon/voice/base.py).
 2. **Recall is prefetched from partial transcripts, and delivered from the same
-   place.** An embedder round trip is 117 ms at p50, ~105 ms of it fixed overhead
-   (docs/PLAN.md 4.3.1) - a cost that is unaffordable after the user stops talking
-   and free while they are still talking. So the search starts on the partial text,
-   the final transcript reuses that result when it covers enough of what was
-   actually said, and what came back goes to `send_context` while the user is still
-   mid-sentence: the final transcript only lands after the model has answered, so
-   anything sent then is context for the next turn rather than this one.
-3. **A barge-in does two things or it does nothing.** `session.interrupt()` stops
-   the abandoned turn's audio from arriving, `audio.stop_playback()` drops what is
-   already queued. Either one alone leaves the daemon talking over the user.
+   place** - but against Gemini it does not arrive in time, and saying so is more
+   use than the design it was written for. An embedder round trip is 117 ms at p50,
+   ~105 ms of it fixed overhead (docs/PLAN.md 4.3.1), which is free while the user
+   is still talking and silence afterwards. That only works if the provider
+   transcribes mid-utterance, and this one does not: `inputTranscription` arrives
+   at the turn boundary, in the same server event as the first audio chunk of the
+   answer. Measured, twice. So the prefetch fires when the answer has already
+   started and what it finds is context for the *next* turn. The machinery stays -
+   it is right for a provider that streams partials, which OpenAI Realtime does -
+   and the claim that it makes recall free is retracted.
+3. **A barge-in is the provider's call, not ours, and it does two things or it does
+   nothing.** `session.interrupt()` stops the abandoned turn's audio from arriving,
+   `audio.stop_playback()` drops what is already queued; either alone leaves the
+   daemon talking over the user. What decides it is `Interrupted` from `receive()`,
+   never a guess made here: inferring it from a transcript growing while audio played
+   ruled *every* turn a barge-in for the reason in point 2, and threw away complete
+   answers unheard. But `Interrupted` is not only the user, either - it is also raised
+   by anything *we* send mid-generation, which is why recall waits for the turn
+   boundary (`_offer`). Both readings of one flag, and both cost an answer.
 4. **One `receive()` is one turn, so a conversation is a loop.** `receive()` ends at
    the turn boundary (daemon/voice/base.py). The single call this replaced delivered
    the first answer and then blocked until the server cut the idle session with
@@ -43,6 +52,7 @@ import contextlib
 import logging
 import secrets
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 from daemon import clock
 
@@ -55,7 +65,7 @@ from daemon import clock
 # means "reference material", so the block arrives as a *user* turn.
 from daemon.loop import render_recall
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
-from daemon.voice.base import AudioIO, Transcript, VoiceSession
+from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +102,60 @@ the first third of an utterance is a different query and gets thrown away;
 covering most of it embeds to nearly the same vector and is worth the whole 117 ms
 it saves."""
 
+PLAYBACK_BYTES_PER_FRAME = 2
+"""16-bit mono, which is what every `AudioIO` here plays (daemon/voice/audio.py).
+Only used to turn a byte count into seconds for the session report."""
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceStats:
+    """What one conversation actually did, as numbers.
+
+    Exists because `interruptions` was counted and never reported, so the one
+    failure this module has in the field - the daemon cutting itself off when its
+    own speaker leaks into the microphone - was invisible from the outside. A
+    change to echo cancellation or to the server's endpointing can only be argued
+    for against these.
+    """
+
+    turns: int
+    """Turns that produced anything. An empty `receive()` is not a turn (see
+    `EMPTY_TURNS_ALLOWED`)."""
+
+    interruptions: int
+    """Barge-ins acted on. With no echo cancellation this counts the daemon
+    interrupting itself, which is the point of reporting it."""
+
+    first_audio_seconds: float | None
+    """From the conversation starting to the first audio chunk handed to the
+    speaker: handshake, setup, the first utterance and the first response, all in
+    one number. None if it never spoke at all."""
+
+    played_seconds: float
+    """Audio handed to the speaker. Not audio heard - a barge-in drops part of
+    what is already queued - so this is what was generated and paid for.
+
+    The one to read against `interruptions`: a turn count with seconds of audio and
+    no interruptions is a conversation, and turns with almost no audio are the
+    daemon throwing its own answers away."""
+
+    # Deliberately no per-turn response latency. It was tried, from the last
+    # in-progress transcript to that turn's first audio, and the measurement that
+    # justified this whole change killed it: the provider delivers that transcript
+    # in the *same server event* as the first audio, so the interval is always about
+    # zero and says nothing about endpointing. `first_audio_seconds` is the honest
+    # end-to-end number until something local decides turn boundaries.
+
+    def describe(self) -> str:
+        """One line, for the end of a session. An absent measurement says so rather
+        than reading as a zero."""
+        spoke = self.first_audio_seconds
+        first = "never spoke" if spoke is None else f"{spoke:.2f}s"
+        return (
+            f"{self.turns} turn(s), {self.interruptions} interruption(s), "
+            f"first audio {first}, {self.played_seconds:.1f}s of audio played"
+        )
+
 
 class VoiceConversation:
     """One live voice exchange, driven by injected protocols.
@@ -111,6 +175,7 @@ class VoiceConversation:
         recall_limit: int = 6,
         channel: str = VOICE_CHANNEL,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
+        opening_audio: bytes = b"",
     ) -> None:
         self._session = session
         self._audio = audio
@@ -119,6 +184,13 @@ class VoiceConversation:
         self._recall_limit = recall_limit
         self._channel = channel
         self._idle_timeout = idle_timeout
+        self._opening_audio = opening_audio
+        """Audio to hand the session before the microphone is even open.
+
+        The wake gate's own segment, normally: it heard the owner say "루시 뭐 해",
+        matched the alias, and used to throw the sound away - so the session began
+        deaf to the question it was opened for and the owner said it again. At
+        `AudioIO.sample_rate`, because that is what a session must be fed."""
 
         self.recalled: list[RecalledItem] = []
         """What recall had ready for the last completed utterance.
@@ -136,11 +208,47 @@ class VoiceConversation:
         is the latter)."""
 
         self.interruptions = 0
-        self._playing = False
+        self.turns = 0
+        """Turns that produced something. Reported, along with the rest of
+        `stats`, because none of these numbers used to leave this object."""
+
+        # Monotonic, from the event loop's own clock: these are durations, and
+        # `clock.now()` is the wall clock the records are stamped with.
+        self._started_at: float | None = None
+        self._first_audio_at: float | None = None
+        self._played_bytes = 0
+
+        self._generating = False
+        """Whether the model is mid-turn.
+
+        Named for what it gates: `clientContent` interrupts generation, so this is
+        what keeps recall off the wire until the answer is finished. It used to be
+        called `_playing` and used to decide barge-ins, and neither survived contact
+        with the provider - see `_offer` and `_watch_partials`."""
+
+        self._deferred: list[RecalledItem] | None = None
+        """Recall that arrived mid-answer and is waiting for the turn to end."""
+
         self._speculative: tuple[str, asyncio.Task[list[RecalledItem]]] | None = None
         self._offered: str | None = None
         """The last block put in front of the model, so a prefetch that is reused
         rather than redone does not seed the same memories twice."""
+
+    @property
+    def stats(self) -> VoiceStats:
+        """What this conversation did. Safe to read before, during and after
+        `run`; a caller reports it in a `finally`, so it must not depend on the
+        conversation having finished cleanly."""
+        seconds_per_byte = 1.0 / (self._audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME)
+        first = None
+        if self._first_audio_at is not None and self._started_at is not None:
+            first = self._first_audio_at - self._started_at
+        return VoiceStats(
+            turns=self.turns,
+            interruptions=self.interruptions,
+            first_audio_seconds=first,
+            played_seconds=self._played_bytes * seconds_per_byte,
+        )
 
     async def run(self) -> None:
         """Hold one conversation, then close the session.
@@ -150,7 +258,15 @@ class VoiceConversation:
         raises - a voice turn that cannot run should surface so the caller can
         fall back to text.
         """
+        # Before the session opens, so `first_audio_seconds` includes the handshake.
+        # A provider is allowed 20s of setup budget before it gives up, and a report
+        # that started the clock afterwards would hide exactly that.
+        self._started_at = asyncio.get_running_loop().time()
         async with self._session as session:
+            # Before the microphone, so the utterance that opened the session is the
+            # first thing the model hears rather than racing live audio for its place
+            # in the turn.
+            await self._send_opening(session)
             microphone = self._audio.record()
             # The microphone keeps feeding the session while the model talks. It
             # has to: server-side activity detection is what notices a barge-in,
@@ -175,6 +291,19 @@ class VoiceConversation:
                 # either.
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.shield(self._record_pending(session))
+
+    async def _send_opening(self, session: VoiceSession) -> None:
+        """Hand over what was already said, if anything was.
+
+        Never fails the conversation: an opening that cannot be delivered costs the
+        user one repeated sentence, and raising here would cost them the whole turn.
+        """
+        if not self._opening_audio:
+            return
+        try:
+            await session.send_audio(self._opening_audio)
+        except Exception:
+            logger.exception("voice: could not hand over the utterance that opened the session")
 
     # --- the two streams ----------------------------------------------------
 
@@ -225,13 +354,24 @@ class VoiceConversation:
                 produced = True
                 budget.reschedule(loop.time() + self._idle_timeout)
                 if isinstance(item, bytes):
-                    self._playing = True
+                    self._generating = True
+                    self._on_audio(loop.time(), len(item))
                     await self._audio.play(item)
+                elif isinstance(item, Interrupted):
+                    await self._barge_in(session)
                 else:
                     await self._on_transcript(session, item)
         finally:
             await _aclose(stream)
+        # The turn is over, whatever ended it, so nothing is generating and anything
+        # held back is now safe to send. Both matter: leaving the flag set would hold
+        # recall forever after a turn that ended without a final transcript, and
+        # never flushing would mean a memory searched for and then silently dropped.
+        self._generating = False
+        await self._flush_deferred(session)
         self.ended = getattr(session, "ended", None)
+        if produced:
+            self.turns += 1
         return produced
 
     async def _forward_microphone(
@@ -248,6 +388,12 @@ class VoiceConversation:
             # dying does not replace the error the caller needs to see.
             logger.exception("voice: stopped feeding the session")
 
+    def _on_audio(self, at: float, size: int) -> None:
+        """Note one chunk on its way to the speaker."""
+        self._played_bytes += size
+        if self._first_audio_at is None:
+            self._first_audio_at = at
+
     # --- transcripts --------------------------------------------------------
 
     async def _on_transcript(self, session: VoiceSession, transcript: Transcript) -> None:
@@ -258,7 +404,7 @@ class VoiceConversation:
             return
         # Both roles are flushed at the turn boundary, so a final transcript is
         # also the signal that this turn's audio is done.
-        self._playing = False
+        self._generating = False
         if transcript.role == "user":
             await self._settle_recall(session, transcript.text)
         await self._record(transcript)
@@ -304,16 +450,21 @@ class VoiceConversation:
     # --- recall -------------------------------------------------------------
 
     async def _watch_partials(self, session: VoiceSession) -> None:
-        """Prefetch recall, and notice a barge-in, from the in-progress transcript.
+        """Prefetch recall from the in-progress transcript.
 
-        Both come from the same signal because both are about the user speaking,
-        and the provider's own activity detection is the only thing that knows -
-        docs/PLAN.md's reference list is explicit that VAD and endpointing are not
-        ours to build.
+        **A barge-in is not decided here, and used to be.** The test was "audio is
+        playing and the user's transcript grew", which reads as sound reasoning and
+        is wrong for this provider: Gemini delivers `inputTranscription` at the turn
+        boundary, in the same server event as the first audio chunk of the answer
+        (measured - daemon/voice/base.py, `Interrupted`). So the question's own
+        transcript always arrived while its answer was playing, every turn was
+        ruled a barge-in, and a complete reply was generated and then thrown away
+        unheard. The signal now comes from the provider's own activity detection,
+        through `receive()`.
 
-        Pushed, not polled: each item arrives when the provider transcribes another
-        few syllables, so the search starts then rather than up to an interval
-        later, and a barge-in is noticed on the delta that proves it.
+        The same measurement costs this method its other justification, honestly
+        stated: a partial that arrives with the answer cannot make recall free. See
+        `_prefetch`.
         """
         seen = ""
         partials = session.partial_transcripts()
@@ -322,8 +473,6 @@ class VoiceConversation:
                 said = partial.text.strip()
                 if said == seen:
                     continue
-                if self._playing and len(said) > len(seen):
-                    await self._barge_in(session)
                 seen = said
                 self._prefetch(session, said)
         finally:
@@ -350,12 +499,13 @@ class VoiceConversation:
     async def _prepare(self, session: VoiceSession, query: str) -> list[RecalledItem]:
         """Search, and put what comes back in front of the model.
 
-        Delivered here - inside the prefetch, while the user is still speaking -
-        because that is the only window where it can reach the answer to *this*
-        question. The final transcript arrives at the turn boundary, and by then the
-        model has already spoken; context that lands then is context for the next
-        turn. The prefetch, at ~117 ms into an utterance, lands before the model
-        starts generating.
+        Delivered from inside the prefetch because that is the earliest moment there
+        is - not because it is early enough. Against a provider that transcribes
+        mid-utterance this lands before generation starts; against Gemini the first
+        partial and the first audio arrive in the same server event, so this reaches
+        the model one turn late (see point 2 of the module docstring). Still worth
+        sending: one turn late is what the memory is for the *next* question, and the
+        alternative is not sending it at all.
         """
         items = await self._search(query)
         await self._offer(session, items)
@@ -363,6 +513,22 @@ class VoiceConversation:
 
     async def _offer(self, session: VoiceSession, items: list[RecalledItem]) -> None:
         """Put recalled memory in the model's history without asking for an answer.
+
+        **Never while the model is generating.** `send_context` is `clientContent`,
+        and the Live API is explicit that "a message here will interrupt any current
+        model generation" - so seeding a memory mid-answer kills the answer. Measured
+        against the live API: `interrupted` arrived **90 ms** after the recall block
+        went out, and over one conversation the same room and microphone delivered
+        2.2s of audio with recall on and 46.7s with it off. Held to the turn boundary
+        instead, which costs nothing that was not already lost: the prefetch fires on
+        a partial that arrives with the answer, so its memories were only ever going
+        to reach the *next* turn anyway.
+
+        This is also what `serverContent.interrupted` really means. It is documented
+        as "a client message has interrupted current model generation" - not "the user
+        spoke - so it was never the pure user-VAD signal an earlier version of this
+        module took it for, and the daemon was reading its own interruption as the
+        owner talking over it.
 
         Never fails the turn, for the same reason recall itself does not: in voice
         mode an exception is silence, and answering with less memory beats not
@@ -375,11 +541,30 @@ class VoiceConversation:
         identity = render_recall(items, _IDENTITY_NONCE)
         if not identity or identity == self._offered:
             return
+        if self._generating:
+            # Held, not dropped, and `_offered` is deliberately left alone so the
+            # flush does not mistake this for something already sent. A later
+            # prefetch landing in the same turn simply replaces it - the newest
+            # search is the better one.
+            self._deferred = items
+            logger.debug("voice: holding recall until the turn ends, so it cannot cut it short")
+            return
+        self._deferred = None
         self._offered = identity
         try:
             await session.send_context(render_recall(items, secrets.token_hex(4)))
         except Exception:
             logger.exception("voice: recall could not be put in front of the model")
+
+    async def _flush_deferred(self, session: VoiceSession) -> None:
+        """Send what was held back while the model was talking.
+
+        Called at the turn boundary, which is where `clientContent` is safe: there is
+        no generation for it to interrupt.
+        """
+        held, self._deferred = self._deferred, None
+        if held is not None:
+            await self._offer(session, held)
 
     async def _settle_recall(self, session: VoiceSession, said: str) -> None:
         """Reuse the prefetched search if it was for close enough to this, else
@@ -428,14 +613,23 @@ class VoiceConversation:
     # --- barge-in -----------------------------------------------------------
 
     async def _barge_in(self, session: VoiceSession) -> None:
-        """The user started talking over us.
+        """The provider says the user talked over us.
 
         Both calls, always. Refusing to hand over more audio does not empty the
         speaker's buffer, and emptying the buffer does not stop the stream; one
         without the other keeps the daemon talking (daemon/voice/base.py).
         """
+        # Logged, not just counted. A session report saying "3 interruptions" does
+        # not say whether a person cut in three times or the daemon cut itself off
+        # three times, and those need opposite fixes - which is exactly the
+        # confusion that let a self-interruption on every single turn go unnoticed.
+        logger.info(
+            "voice: barge-in %d, reported by the provider (the user cut in, or "
+            "something we sent did)",
+            self.interruptions + 1,
+        )
         self.interruptions += 1
-        self._playing = False
+        self._generating = False
         await session.interrupt()
         await self._audio.stop_playback()
 
