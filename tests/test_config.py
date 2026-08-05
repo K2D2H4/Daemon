@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from daemon import clock
 from daemon.config import PRESETS, ConfigError, Route, Settings
@@ -274,6 +275,23 @@ def test_no_fallback_by_default() -> None:
     assert make_settings(preset="offline").fallback_route() is None
 
 
+def test_an_empty_fallback_provider_means_no_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The only way a dotenv can say "unset" is an empty value, and .env.example
+    ships exactly that documented as "the error propagates". `None` is the sentinel
+    the rest of the code tests against, so a blank has to become one here: it used to
+    stay `""`, which failed startup as an unknown provider and - had that check ever
+    been passed - would have handed the gateway a fallback route to nowhere."""
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_FALLBACK_PROVIDER", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.fallback_provider is None
+    assert settings.fallback_route() is None
+
+
 def test_configured_fallback_resolves_to_a_route() -> None:
     settings = make_settings(
         preset="balanced", anthropic_api_key="k", fallback_provider="ollama"
@@ -363,6 +381,46 @@ def test_allowlist_is_parsed_from_a_comma_separated_string() -> None:
     settings = make_settings(preset="offline", telegram_allowed_user_ids="123, 456 ,")
 
     assert settings.telegram_allowed_user_ids == ("123", "456")
+
+
+def test_an_empty_route_overrides_means_no_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.env.example ships `DAEMON_ROUTE_OVERRIDES=` and tells the reader to copy the
+    file, so this is the value most installs actually hold. It used to kill the whole
+    load - `daemon run`, `daemon doctor`, everything - with a SettingsError naming
+    neither the file nor the problem, because a complex field is JSON-decoded before
+    any validator runs and `json.loads("")` raises."""
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_ROUTE_OVERRIDES", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.route_overrides == {}
+    assert settings.routing[Task.REFLECTION] == "ollama"
+
+
+def test_route_overrides_reads_the_json_documented_in_env_example(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_ROUTE_OVERRIDES", '{"reflection": "ollama"}')
+
+    settings = Settings(_env_file=None)
+
+    assert settings.route_overrides == {Task.REFLECTION: "ollama"}
+
+
+def test_unparseable_route_overrides_names_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loud beats degraded: treating a typo as "no overrides" would route a task to
+    the preset's provider instead of the chosen one and say nothing about it."""
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_ROUTE_OVERRIDES", "reflection: ollama")
+
+    with pytest.raises(ValidationError, match="DAEMON_ROUTE_OVERRIDES"):
+        Settings(_env_file=None)
 
 
 def test_env_vars_are_read_with_their_documented_names(
