@@ -62,14 +62,17 @@ daemon proactive # one round of "is there a reason to speak?", and what it decid
 daemon doctor    # what is configured, reachable, indexed and remembered
 ```
 
-## What it is doing, at a glance
+## Five faces
 
 <div align="center">
-<img src="docs/assets/states.png" alt="The five states: running, responding, working, suspended, error" width="900">
+<img src="docs/assets/states.png" alt="The five sprite states: running, responding, working, suspended, error" width="900">
 </div>
 
-The expression is picked from the state rather than the other way round. Two of
-them animate; the other three sit still, which is itself the information.
+One 28×28 sprite per state. Which face shows is decided by what the process is
+doing rather than by which one looks best — a mascot free to pick its own mood is
+a mascot that will eventually lie about the state of your machine. They drive the
+**[landing page](https://k2d2h4.github.io/Daemon/)**; there is no graphical status
+surface in the terminal, where `daemon doctor` reports plain text instead.
 
 ## Deciding whether to speak
 
