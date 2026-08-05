@@ -154,6 +154,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
+        # Before the loop starts, because this is the command that suffers for it and
+        # `daemon doctor` is the command nobody runs first. An install lost hours to a
+        # repeating Telegram 409 whose cause was `~/.zshrc` exporting
+        # TELEGRAM_BOT_TOKEN for a different tool: the environment outranks the file,
+        # so `.env` named the right bot and was never consulted. Doctor reports it,
+        # but only if you already suspect something.
+        override = _env_override_check(settings)
+        if not override.ok:
+            logging.getLogger(__name__).warning("%s", override.detail)
         return _serve(settings)
     if command == "reindex":
         inserted = _reindex(settings)

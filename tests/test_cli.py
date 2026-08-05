@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 from collections.abc import Callable
@@ -208,6 +209,52 @@ def test_run_serves(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "_serve", lambda settings: 0)
 
     assert cli.main(["run"]) == 0
+
+
+def test_run_warns_when_the_shell_overrides_the_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`daemon run` is the command that suffers for it, and doctor is the command
+    nobody runs first.
+
+    An install lost hours to a repeating Telegram 409 because `~/.zshrc` exported
+    TELEGRAM_BOT_TOKEN for a different tool. The environment outranks `.env`, so the
+    file named the right bot and was never consulted, and the only place that said so
+    was a check you had to already suspect something to run.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "DAEMON_PRESET=offline\n"
+        "DAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        "TELEGRAM_BOT_TOKEN=8989515019:AAH-in-the-file\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "8747818363:AAH-in-the-shell")
+    monkeypatch.setattr(cli, "_serve", lambda settings: 0)
+
+    with caplog.at_level(logging.WARNING):
+        assert cli.main(["run"]) == 0
+
+    assert "overrides .env" in caplog.text
+    assert "8747818363" in caplog.text and "8989515019" in caplog.text
+    # The id half is the bot's user id and public; the secret half is neither.
+    assert "AAH-in-the-shell" not in caplog.text
+
+
+def test_run_is_quiet_when_the_environment_agrees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A warning on every start would be a warning nobody reads."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "_serve", lambda settings: 0)
+
+    with caplog.at_level(logging.WARNING):
+        assert cli.main(["run"]) == 0
+
+    assert "overrides" not in caplog.text
 
 
 def test_install_calls_install(service: FakeService) -> None:
