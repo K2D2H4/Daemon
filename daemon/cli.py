@@ -78,6 +78,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("voice", help="hold one spoken conversation at this machine")
 
+    wake = sub.add_parser(
+        "wake", help="the always-on wake phrase: measure it on your voice, then hear it work"
+    )
+    wake_sub = wake.add_subparsers(dest="wake_command", required=True)
+    calibrate = wake_sub.add_parser(
+        "calibrate",
+        help="say the phrase a few times and save what the recognizer actually heard",
+    )
+    calibrate.add_argument(
+        "--takes",
+        type=int,
+        # Not a literal default, so the number and the reasoning behind it stay in
+        # one place - `wake_cli.TAKES`, which is 3. Naming it here would need
+        # wake_cli imported to build the parser, and the parser is built for every
+        # command.
+        help="how many times to say it (3 if omitted; fewer than 2 cannot show "
+        "whether the transcription is stable)",
+    )
+    wake_test = wake_sub.add_parser(
+        "test", help="run the gate here and print every wake event it fires"
+    )
+    wake_test.add_argument(
+        "--seconds",
+        type=int,
+        help="how long to listen (60 if omitted). 0 waits for Ctrl-C, which is what "
+        "leaving a television on and watching for a false wake needs.",
+    )
+
     pairing = sub.add_parser("pairing", help="see and approve who may talk to Daemon")
     pairing_sub = pairing.add_subparsers(dest="pairing_command", required=True)
     pairing_sub.add_parser("list", help="pending pairing requests and their codes")
@@ -104,6 +132,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Same reason, more so: setup exists for the machine that has no usable
         # configuration yet, so it must not require one to start.
         return _setup(check_only=args.check)
+    if command == "wake" and args.wake_command == "calibrate":
+        # Also before Settings, and for setup's reason: calibration reads nothing
+        # out of the configuration and writes one key into `.env`, so it has to work
+        # on an install whose configuration does not load yet. `wake test` does need
+        # settings - it builds the gate - so it stays below.
+        from daemon.wake_cli import calibrate
+
+        return calibrate(takes=args.takes)
 
     try:
         settings = Settings()
@@ -136,6 +172,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         from daemon.app import run_voice
 
         return asyncio.run(run_voice(settings))
+    if command == "wake":
+        # Only `test` reaches here; `calibrate` returned above.
+        #
+        # Logging on, at WARNING: the gate steps over a raising VAD or recognizer
+        # rather than dying, and logs it - so without a handler the one command whose
+        # job is to explain why nothing fired would be hiding the explanation. Not
+        # INFO: the gate logs every fire there too, and this command prints those
+        # itself.
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s %(message)s")
+        from daemon.wake_cli import listen
+
+        return listen(settings, seconds=args.seconds)
     if command == "pairing":
         return _pairing(settings, args)
 

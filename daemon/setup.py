@@ -1104,7 +1104,17 @@ def parse_env(text: str) -> dict[str, str]:
     return values
 
 
-def merge_env(existing: str, updates: Mapping[str, str]) -> str:
+WROTE_BY = "written by `daemon setup`"
+"""The comment that marks a block of keys this file appended.
+
+A parameter rather than a constant in `merge_env` because this is no longer the
+only command that writes `.env`: `daemon wake calibrate` saves the aliases it
+measured through the same writer, and a block it appended labelled as setup's
+would send the next reader to the wrong command. One writer, one quoting rule,
+and the line says which command actually ran (`daemon/wake_cli.py`)."""
+
+
+def merge_env(existing: str, updates: Mapping[str, str], *, note: str = WROTE_BY) -> str:
     """Existing file with `updates` applied in place, everything else untouched.
 
     Comments, ordering and keys this wizard knows nothing about all survive: the
@@ -1121,7 +1131,7 @@ def merge_env(existing: str, updates: Mapping[str, str]) -> str:
     if pending:
         if lines and lines[-1].strip():
             lines.append("")
-        lines.append("# written by `daemon setup`")
+        lines.append(f"# {note}")
         lines.extend(f"{key}={value}" for key, value in pending.items())
     return "\n".join(lines) + "\n"
 

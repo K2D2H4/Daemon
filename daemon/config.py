@@ -255,6 +255,56 @@ class Settings(BaseSettings):
     default - a guessed model id fails at the first voice turn, which is exactly
     the kind of late failure this module exists to prevent."""
 
+    # --- the wake gate (daemon/voice/wake.py) -----------------------------
+    # A voice session bills per minute, so an always-open one costs about 48x what
+    # 30 minutes a day costs (docs/PLAN.md 6.5). These knobs describe the free
+    # local listener that decides when to open a paid one. The defaults are the
+    # measured ones; daemon/voice/wake.py repeats them, because this module is
+    # foundation and importing the voice layer here would invert the layering.
+
+    wake_enabled: bool = Field(default=False, alias="DAEMON_WAKE_ENABLED")
+    """Off until asked for. The product is complete without it, and a microphone
+    the owner did not switch on is not a default anyone should be opted into."""
+
+    wake_aliases: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=(), alias="DAEMON_WAKE_ALIASES"
+    )
+    """What the recognizer actually returns for the wake phrase, comma-separated.
+
+    Not the name the owner chose: an on-device recognizer never emits a coined one.
+    Measured, 3 runs each, 100% stable - `헤이 데몬` came back as `헤이 대문`,
+    `데몬` as `질문`, `루시야` as `루시`. So this is a per-speaker calibration, written
+    by `daemon wake calibrate`, and it lives in .env rather than in the code.
+
+    NoDecode for the same reason as TELEGRAM_ALLOWED_USER_IDS below:
+    pydantic-settings JSON-decodes a complex field before field validators run, so
+    without it the comma-separated form a person would type raises instead of
+    loading."""
+
+    wake_vad_threshold: float = Field(default=0.5, alias="DAEMON_WAKE_VAD_THRESHOLD")
+    """Speech probability at or above which a frame counts as speech. Lowering it
+    buys nothing on its own: the VAD calls a 3-note chord speech in 46.8% of frames
+    already, and the recognizer stage is what makes that harmless."""
+
+    wake_hangover_ms: int = Field(default=600, alias="DAEMON_WAKE_HANGOVER_MS")
+    """Non-speech that ends a segment. Longer than the pause inside a two-word
+    wake phrase, shorter than the gap between two sentences."""
+
+    wake_pre_roll_ms: int = Field(default=300, alias="DAEMON_WAKE_PRE_ROLL_MS")
+    """Audio kept from before the VAD said speech. A VAD notices speech a frame or
+    two late and a wake word is one or two syllables, so the head is the match."""
+
+    wake_min_speech_ms: int = Field(default=200, alias="DAEMON_WAKE_MIN_SPEECH_MS")
+    """Below this a segment is dropped unheard - a 32 ms blip is not a wake word and
+    must not cost a transcription."""
+
+    wake_max_segment_ms: int = Field(default=3000, alias="DAEMON_WAKE_MAX_SEGMENT_MS")
+    """Hard cap on one segment, so a minute of talking is neither held in memory nor
+    sent to the recognizer as one blob (measured: a 2.2 s clip finalised in 760 ms)."""
+
+    wake_cooldown_seconds: float = Field(default=5.0, alias="DAEMON_WAKE_COOLDOWN_SECONDS")
+    """Quiet window after a fire, so one wake phrase cannot open two sessions."""
+
     # --- proactivity (M3, docs/PLAN.md 6) ---------------------------------
     # Every one of these is a way to make it speak *less*. That asymmetry is the
     # design: non-negotiable 7 makes silence the default, so the knobs are brakes.
@@ -347,6 +397,27 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("wake_aliases", mode="before")
+    @classmethod
+    def _split_aliases(cls, value: object) -> object:
+        """Accept what a person would type: `헤이 대문,루씨` or `헤이 대문, 루씨`.
+
+        Commas only, never whitespace - unlike the numeric allowlist above, an
+        alias is a *phrase*, and splitting `헤이 대문` on the space would configure
+        two wake words neither of which was ever said.
+        """
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                import json
+
+                try:
+                    return tuple(str(item).strip() for item in json.loads(text))
+                except (ValueError, TypeError):
+                    return ()
+            return tuple(part.strip() for part in text.split(",") if part.strip())
+        return value
+
     @model_validator(mode="after")
     def _check(self) -> Settings:
         if self.preset not in PRESETS:
@@ -388,6 +459,49 @@ class Settings(BaseSettings):
             problems.append(
                 "DAEMON_VOICE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
                 "the native-audio endpoint needs its own model id"
+            )
+
+        if self.wake_enabled and not self.wake_aliases:
+            problems.append(
+                "DAEMON_WAKE_ENABLED is on but DAEMON_WAKE_ALIASES is empty, so nothing "
+                "can ever match; the gate matches what the recognizer returns for your "
+                "voice rather than the name you chose, so run `daemon wake calibrate` to "
+                "measure it"
+            )
+        if self.wake_enabled and not self.voice_enabled:
+            problems.append(
+                "DAEMON_WAKE_ENABLED is on but DAEMON_VOICE_ENABLED is off; the gate exists "
+                "only to open a voice session, so set DAEMON_VOICE_ENABLED=true or switch "
+                "the gate off"
+            )
+        if not 0.0 < self.wake_vad_threshold <= 1.0:
+            problems.append(
+                f"DAEMON_WAKE_VAD_THRESHOLD is {self.wake_vad_threshold}; it must be within "
+                "(0, 1] - at 0 every frame of silence is speech"
+            )
+        for name, value in (
+            ("DAEMON_WAKE_HANGOVER_MS", self.wake_hangover_ms),
+            ("DAEMON_WAKE_MIN_SPEECH_MS", self.wake_min_speech_ms),
+            ("DAEMON_WAKE_MAX_SEGMENT_MS", self.wake_max_segment_ms),
+        ):
+            if value <= 0:
+                problems.append(f"{name} is {value}; it must be greater than 0")
+        if self.wake_pre_roll_ms < 0:
+            problems.append(
+                f"DAEMON_WAKE_PRE_ROLL_MS is {self.wake_pre_roll_ms}; it cannot be negative "
+                "(0 keeps no audio from before speech started, which clips the wake word)"
+            )
+        if self.wake_cooldown_seconds < 0:
+            problems.append(
+                f"DAEMON_WAKE_COOLDOWN_SECONDS is {self.wake_cooldown_seconds}; it cannot be "
+                "negative (0 allows one phrase to open two sessions)"
+            )
+        if self.wake_max_segment_ms <= self.wake_pre_roll_ms + self.wake_min_speech_ms:
+            problems.append(
+                f"DAEMON_WAKE_MAX_SEGMENT_MS ({self.wake_max_segment_ms}) leaves no room for "
+                f"DAEMON_WAKE_PRE_ROLL_MS ({self.wake_pre_roll_ms}) plus "
+                f"DAEMON_WAKE_MIN_SPEECH_MS ({self.wake_min_speech_ms}); every segment would "
+                "be cut short of the length that makes it worth transcribing"
             )
 
         if not self.embed_model:

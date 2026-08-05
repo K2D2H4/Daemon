@@ -80,6 +80,13 @@ WIRED_CLASSES = (
     "Judge",
     "LocalSpeaker",
     "ProactiveDelivery",
+    # The wake gate, built by `app.wake_events` - which is also what
+    # `daemon wake test` drives. Being *named* here is not enough on its own: this
+    # file only asks whether something calls `WakeGate(...)`, and it was called with
+    # arguments the class did not have for as long as it took two agents to agree,
+    # which no assertion here can see. `test_wake.py` drives `app.wake_events`
+    # itself for that reason.
+    "WakeGate",
 )
 
 
