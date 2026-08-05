@@ -871,11 +871,15 @@ AppleScript가 실행된다.
 즉 기본 설치에서 **묻지 않고 되는 것은 읽기뿐**이다(`read_file`·`list_dir`·`system_state`
 ·`notify`). 쓰기·실행·열기는 매번 코드를 요구한다.
 
-**대신 조용하면 안 된다.** `daemon setup`은 도구를 묻지 않으므로(그 마법사를 건드리지
-않았다) 기본값이 조용히 적용된다. 그래서 `daemon doctor`가 상태를 한 줄로 보고한다 —
-`tools: on mode=ask roots=~ runs-without-asking=nothing`. CLAUDE.md의 "상태를 보고하라,
-가정하지 말라"가 이 프로젝트에서 반복해서 깨진 규칙이고, 아무도 묻지 않은 능력이 어디에도
-안 적히는 것이 정확히 그 실패다. `mode=full`은 detail이 아니라 **실패한 체크**로 보고한다.
+**대신 조용하면 안 된다.** 처음에는 기본값에 맡기고 `daemon doctor` 한 줄로만 보고하려
+했는데 — 아무도 묻지 않은 능력이 어디에도 안 적히는 것이 CLAUDE.md가 경고하는 바로 그
+조용한 상태다. 그래서 `daemon setup`이 **1/5단계로 가장 먼저** 묻고, 답을 기본값에 기대지
+않고 `DAEMON_TOOLS_ENABLED`로 명시해 파일에 쓴다. 이 마법사에서 "어떻게 동작하는가"가
+아니라 "무엇을 해도 되는가"를 묻는 유일한 질문이므로 별도 단계다.
+
+`daemon doctor`도 같은 상태를 한 줄로 보고한다 —
+`tools: on mode=ask roots=~ runs-without-asking=nothing`. `mode=full`은 detail이 아니라
+**실패한 체크**로 보고한다.
 
 **비용은 프롬프트뿐이다.** 켜져 있으면 TOOL_CONTRACT 684자(≈170토큰) + 도구 스키마
 (내장 7개 ≈620토큰)가 매 턴 들어간다. 실측: 도구를 켜고 모델이 도구를 쓰지 않은 턴은
