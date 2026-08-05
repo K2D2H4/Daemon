@@ -133,7 +133,14 @@ def targets() -> list[Path]:
         if path.exists():
             found.append(path)
     for pattern in EXTRA_GLOBS:
-        found.extend(p for p in ROOT.glob(pattern) if not SKIP_DIRS.intersection(p.parts))
+        # Relative to ROOT, not absolute: when ROOT is itself a worktree the
+        # absolute parts contain `.claude` for *every* match, so the skip matched
+        # everything and these globs contributed nothing at all. See SKIP_DIRS.
+        found.extend(
+            p
+            for p in ROOT.glob(pattern)
+            if not SKIP_DIRS.intersection(p.relative_to(ROOT).parts)
+        )
     return sorted(set(found))
 
 
