@@ -13,11 +13,20 @@ so all three hosted providers hoist system turns the same way.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
 
-from daemon.llm.base import Completion, Message, ProviderError
+from daemon.llm.base import (
+    Completion,
+    Message,
+    ProviderError,
+    ToolCall,
+    ToolSpec,
+    decode_tool_arguments,
+)
 
 API_URL = "https://api.openai.com/v1/responses"
 MODELS_URL = "https://api.openai.com/v1/models"
@@ -54,12 +63,11 @@ class OpenAIProvider:
         model: str,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> Completion:
         # System turns are a top-level field here, not a role in the list.
         instructions = "\n\n".join(m.content for m in messages if m.role == "system")
-        turns = [
-            {"role": m.role, "content": m.content} for m in messages if m.role != "system"
-        ]
+        turns = _input_items(messages)
         if not turns:
             raise ProviderError("openai needs at least one user or assistant message")
 
@@ -78,6 +86,18 @@ class OpenAIProvider:
             payload["max_output_tokens"] = max_output_tokens
         if temperature is not None:
             payload["temperature"] = temperature
+        if tools:
+            # Flat on Responses - `name`/`parameters` sit beside `type`, where Chat
+            # Completions nested them under a `function` object.
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.parameters,
+                }
+                for spec in tools
+            ]
 
         data = await self._post(payload)
         try:
@@ -90,6 +110,17 @@ class OpenAIProvider:
                 if isinstance(item, dict) and item.get("type") == "message"
                 for part in item.get("content", [])
                 if isinstance(part, dict) and part.get("type") == "output_text"
+            )
+            calls = tuple(
+                ToolCall(
+                    # `call_id` is the one to echo back in function_call_output;
+                    # `id` is the item's own id and pairing on it gets a 400.
+                    id=str(item.get("call_id") or item.get("id", "")),
+                    name=str(item.get("name", "")),
+                    arguments=decode_tool_arguments(item.get("arguments")),
+                )
+                for item in data.get("output", [])
+                if isinstance(item, dict) and item.get("type") == "function_call"
             )
             usage = data.get("usage") or {}
             input_tokens = int(usage.get("input_tokens", 0))
@@ -106,9 +137,10 @@ class OpenAIProvider:
                 f"openai returned an unreadable response: {self._redact(repr(data))}"
             ) from exc
 
-        if not text:
+        if not text and not calls:
             # A refusal lands here too: it comes back as a `refusal` part rather
-            # than `output_text`, which leaves no reply to hand back.
+            # than `output_text`, which leaves no reply to hand back. A turn that
+            # only asked for tools has no text either, and that one is fine.
             raise ProviderError(
                 f"openai returned no text content: {self._redact(repr(data))}"
             )
@@ -119,6 +151,7 @@ class OpenAIProvider:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             meta={"stop_reason": reason or status},
+            tool_calls=calls,
         )
 
     async def health(self) -> bool:
@@ -179,3 +212,45 @@ class OpenAIProvider:
             return data
 
         raise ProviderError("openai call failed")  # unreachable
+
+
+def _input_items(messages: list[Message]) -> list[dict[str, Any]]:
+    """Neutral messages as Responses `input` items.
+
+    Tool traffic is not a role here: a request is a `function_call` item and a
+    result is a `function_call_output` item, both siblings of the message items.
+
+    The assistant's own `function_call` items have to be echoed back rather than
+    referenced, because this provider sends `store: False` (see the payload above,
+    and docs/PLAN.md 7): with nothing kept server-side there is no previous
+    response for the API to read the pending call out of.
+    """
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        if message.role == "system":
+            continue
+        if message.role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id or "",
+                    "output": message.content,
+                }
+            )
+            continue
+        if message.role == "assistant" and message.tool_calls:
+            if message.content:
+                items.append({"role": "assistant", "content": message.content})
+            items.extend(
+                {
+                    "type": "function_call",
+                    "call_id": call.id,
+                    "name": call.name,
+                    # Back to a string: this API sends and expects JSON text here.
+                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                }
+                for call in message.tool_calls
+            )
+            continue
+        items.append({"role": message.role, "content": message.content})
+    return items

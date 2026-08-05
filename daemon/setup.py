@@ -1548,7 +1548,10 @@ class Wizard:
         say(f"{self.env_path}.")
         say()
 
-        self._step(1, "How should Daemon think?")
+        self._step(1, "What may Daemon do to this computer?")
+        tools = self._choose_tools(env, updates)
+
+        self._step(2, "How should Daemon think?")
         preset = self._choose_preset(env, updates)
         hosted = self._choose_hosted(preset, env, updates)
         voice = self._choose_voice(preset, hosted, env, updates)
@@ -1559,8 +1562,9 @@ class Wizard:
             "DAEMON_PRESET": preset,
             "DAEMON_HOSTED_PROVIDER": hosted,
             "DAEMON_VOICE_ENABLED": str(voice).lower(),
+            "DAEMON_TOOLS_ENABLED": str(tools).lower(),
         }
-        self._step(2, "Keys and tokens")
+        self._step(3, "Keys and tokens")
         for need in needs_for(merged):
             value = self._fill(need, merged)
             if value:
@@ -1589,8 +1593,8 @@ class Wizard:
 
     # --- presentation --------------------------------------------------------
 
-    STEPS = 4
-    """Preset, credentials, persona, pairing. Printed as `2/4` so the question a
+    STEPS = 5
+    """PC control, preset, credentials, persona, pairing. Printed as `2/5` so the question a
     person has partway through - how much of this is left - has an answer without
     them having to ask it."""
 
@@ -1760,6 +1764,43 @@ class Wizard:
             return answer
 
     # --- steps ---------------------------------------------------------------
+
+    def _choose_tools(self, env: Mapping[str, str], updates: dict[str, str]) -> bool:
+        """Whether Daemon may act on this machine.
+
+        Asked first, and as its own step, because it is the only question in this
+        wizard about what Daemon is *allowed* to do rather than how it works - and the
+        answer is written explicitly, so the file says what it is instead of the
+        behaviour resting on a default nobody was shown. It was very nearly left to
+        that default with only `daemon doctor` reporting it, which is the wrong shape:
+        a capability nobody chose is exactly the silent state CLAUDE.md warns about.
+        """
+        raw = env.get("DAEMON_TOOLS_ENABLED", "")
+        was = _truthy(raw) if raw else True
+        self.prompt.say("Daemon can read your files, run programs, open things and show")
+        self.prompt.say("notifications on this computer.")
+        self.prompt.say()
+        self._prose(
+            "Reading happens straight away. Anything that *changes* the machine - "
+            "writing a file, running a command - asks you first with a one-shot code "
+            "that lapses in five minutes. Nothing runs at all on a message you "
+            "forwarded from someone else, in any setting. `daemon tools log` shows "
+            "every call it has made, refusals included."
+        )
+        if raw:
+            self.prompt.say(f"  Currently {'on' if was else 'off'}. {KEEP_HINT}")
+        enabled = self.prompt.ask_yes_no("Let it act on this computer", default=was)
+        _record(updates, "DAEMON_TOOLS_ENABLED", str(enabled).lower(), raw)
+        if enabled:
+            self.prompt.say()
+            self._prose(
+                "Reading is limited to your home directory and files holding "
+                "credentials (.ssh, .env, *.pem, keychains) are refused; narrow it "
+                "further with DAEMON_TOOLS_ROOTS. Reading the page open in your "
+                "browser is a separate switch and stays off."
+            )
+        self.prompt.say()
+        return enabled
 
     def _choose_preset(self, env: Mapping[str, str], updates: dict[str, str]) -> str:
         current = env.get("DAEMON_PRESET", "")
@@ -2018,7 +2059,7 @@ class Wizard:
         try:
             self._seed_persona(settings)
             if settings.telegram_bot_token or unpaired:
-                self._step(4, "Connect your phone")
+                self._step(5, "Connect your phone")
             if unpaired and self._pair_here(settings):
                 unpaired = False
             elif not unpaired and settings.telegram_bot_token:
@@ -2058,7 +2099,7 @@ class Wizard:
         say = self.prompt.say
         theme = self.prompt.theme
         path = settings.data_dir / "persona" / "seed.md"
-        self._step(3, "Who should this be?")
+        self._step(4, "Who should this be?")
         if path.exists():
             # Human-owned (docs/PLAN.md 5.1), and re-running setup is not consent
             # to overwrite a personality someone has been editing for a month.

@@ -509,3 +509,159 @@ def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:
     assert make_settings(
         preset="offline", proactive_daily_budget=0, proactive_open_loop_budget=0
     ).proactive_daily_budget == 0
+
+
+# --- tool use ---------------------------------------------------------------
+
+
+def test_tools_are_on_and_asking_by_default() -> None:
+    """On, because a companion that cannot open a file on the machine it lives on is
+    the definition unmet (docs/PLAN.md 1). What makes that safe is the rest of this
+    assertion, not a switch: `ask` means nothing that changes the machine runs
+    without a one-shot code, the allowlist is empty so nothing at all runs
+    unprompted, and the two groups that read more than the owner's own files - the
+    browser and MCP - are still off."""
+    settings = make_settings(preset="offline", ollama_model="gemma3:4b")
+    assert settings.tools_enabled is True
+    assert settings.tools_mode == "ask"
+    assert settings.tools_allowlist == (), "nothing runs without being asked about"
+    assert settings.tools_roots == ("~",)
+    assert settings.browser_enabled is False
+    assert settings.mcp_enabled is False
+
+
+def test_tools_can_be_switched_off_entirely() -> None:
+    """The other direction has to keep working, or "on by default" becomes
+    "on, and no way back"."""
+    settings = make_settings(
+        preset="offline", ollama_model="gemma3:4b", DAEMON_TOOLS_ENABLED=False
+    )
+    assert settings.tools_enabled is False
+
+
+def test_an_unknown_tool_mode_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_TOOLS_MODE"):
+        make_settings(preset="offline", ollama_model="gemma3:4b", DAEMON_TOOLS_MODE="yolo")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("ls", ("ls",)),
+        ("ls,git status", ("ls", "git status")),
+        ("ls, git status , date", ("ls", "git status", "date")),
+        ('["ls","git status"]', ("ls", "git status")),
+        ("", ()),
+    ],
+)
+def test_the_allowlist_splits_on_commas_only(raw: str, expected: tuple[str, ...]) -> None:
+    """Commas only, because an entry legitimately contains a space. Splitting on
+    whitespace as well would turn `git status` into two useless entries - and the
+    prefix `git` alone would cover `git push`."""
+    settings = make_settings(
+        preset="offline", ollama_model="gemma3:4b", DAEMON_TOOLS_ALLOWLIST=raw
+    )
+    assert settings.tools_allowlist == expected
+
+
+def test_roots_split_the_same_way() -> None:
+    """A path can contain a space too."""
+    settings = make_settings(
+        preset="offline",
+        ollama_model="gemma3:4b",
+        DAEMON_TOOLS_ROOTS="~/Documents,~/My Projects",
+    )
+    assert settings.tools_roots == ("~/Documents", "~/My Projects")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"DAEMON_TOOLS_ROOTS": ""}, "DAEMON_TOOLS_ROOTS is empty"),
+        ({"DAEMON_TOOLS_TIMEOUT_SECS": 0}, "DAEMON_TOOLS_TIMEOUT_SECS"),
+        ({"DAEMON_TOOLS_TIMEOUT_SECS": -1}, "DAEMON_TOOLS_TIMEOUT_SECS"),
+        ({"DAEMON_TOOLS_MAX_OUTPUT": 10}, "DAEMON_TOOLS_MAX_OUTPUT"),
+        ({"DAEMON_TOOLS_MAX_ROUNDS": 0}, "DAEMON_TOOLS_MAX_ROUNDS"),
+    ],
+)
+def test_an_incoherent_tool_setup_fails_at_startup(kwargs: dict, expected: str) -> None:
+    with pytest.raises(ConfigError, match=expected):
+        make_settings(
+            preset="offline",
+            ollama_model="gemma3:4b",
+            DAEMON_TOOLS_ENABLED=True,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"DAEMON_TOOLS_ROOTS": ""},
+        {"DAEMON_TOOLS_TIMEOUT_SECS": 0},
+        {"DAEMON_TOOLS_MAX_ROUNDS": 0},
+    ],
+)
+def test_an_install_with_tools_off_is_not_held_to_a_tool_setup(kwargs: dict) -> None:
+    """The same rule voice follows: a configuration that is never reached must not be
+    a reason to refuse to start. Now that tools are on by default this needs the
+    switch stated - which is the point, since with them *on* the setting is reached
+    and an incoherent one should fail at startup rather than mid-conversation."""
+    make_settings(
+        preset="offline",
+        ollama_model="gemma3:4b",
+        DAEMON_TOOLS_ENABLED=False,
+        **kwargs,
+    )  # must not raise
+
+
+def test_no_new_task_was_added_for_tool_use() -> None:
+    """Tool-using chat is still `chat_text`, which is why tasks.py and the preset
+    tables stayed frozen. A new Task here would need a row in all three presets."""
+    for table in PRESETS.values():
+        assert set(table) <= set(Task)
+    assert Task.CHAT_TEXT in PRESETS["offline"]
+
+
+def test_the_browser_has_its_own_switch() -> None:
+    """Letting Daemon act on the machine and letting it read the owner's logged-in
+    browser are two decisions, so they are two settings."""
+    settings = make_settings(preset="offline", ollama_model="gemma3:4b")
+    assert settings.browser_enabled is False
+    assert settings.browser_app == "Google Chrome"
+
+
+def test_the_browser_cannot_be_on_while_tools_are_off() -> None:
+    """The browser tools are tools; with the layer off nothing would register them,
+    so the setting would silently do nothing."""
+    with pytest.raises(ConfigError, match="DAEMON_TOOLS_ENABLED is off"):
+        make_settings(
+            preset="offline",
+            ollama_model="gemma3:4b",
+            DAEMON_TOOLS_ENABLED=False,
+            DAEMON_BROWSER_ENABLED=True,
+        )
+
+
+def test_an_empty_browser_app_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_BROWSER_APP"):
+        make_settings(
+            preset="offline",
+            ollama_model="gemma3:4b",
+            DAEMON_TOOLS_ENABLED=True,
+            DAEMON_BROWSER_ENABLED=True,
+            DAEMON_BROWSER_APP="  ",
+        )
+
+
+def test_a_chromium_relative_can_be_named() -> None:
+    """Brave, Arc and Edge share Chrome's AppleScript dictionary, so one setting
+    covers the family."""
+    settings = make_settings(
+        preset="offline",
+        ollama_model="gemma3:4b",
+        DAEMON_TOOLS_ENABLED=True,
+        DAEMON_BROWSER_ENABLED=True,
+        DAEMON_BROWSER_APP="Arc",
+    )
+    assert settings.browser_app == "Arc"
