@@ -66,6 +66,18 @@ class Cuts:
 
 
 @dataclass(frozen=True)
+class Does:
+    """Run something at this exact point in the script, then let the loop breathe.
+
+    Exists because the thing under test is *timing*: recall has to land while the
+    model is mid-answer, and a search that resolves on its own does so before the
+    first audio chunk - which is how three tests here passed against the very bug
+    they were written for."""
+
+    action: Any
+
+
+@dataclass(frozen=True)
 class Hang:
     """The user has stopped and the turn has not ended."""
 
@@ -94,6 +106,8 @@ class FakeSession:
         self.sent: list[bytes] = []
         self.texts: list[str] = []
         self.contexts: list[str] = []
+        self.sent_while_generating: list[str] = []
+        self.generating = False
         self.interrupts = 0
         self.entered = False
         self.closed = False
@@ -121,6 +135,12 @@ class FakeSession:
     async def send_context(self, text: str) -> None:
         self.contexts.append(text)
         self.events.append("context")
+        # Recorded, because "did this interrupt the answer" is a question about
+        # *when* it was sent. `clientContent` mid-generation is what the Live API
+        # documents as interrupting, so a fake that only kept the text could not
+        # tell the fixed behaviour from the bug.
+        if self.generating:
+            self.sent_while_generating.append(text)
 
     async def interrupt(self) -> None:
         self.interrupts += 1
@@ -131,6 +151,7 @@ class FakeSession:
         while self.script:
             step = self.script.pop(0)
             if isinstance(step, bytes):
+                self.generating = True
                 yield step
             elif isinstance(step, Transcript):
                 yield step
@@ -146,9 +167,16 @@ class FakeSession:
                     # is nothing to wait for. One turn of the loop, so the
                     # microphone pump gets to run.
                     await asyncio.sleep(0)
+            elif isinstance(step, Does):
+                step.action()
+                # Several turns, not one: the prefetch task has a search to finish
+                # and a `send_context` to make after being released.
+                for _ in range(20):
+                    await asyncio.sleep(0)
             elif isinstance(step, Cuts):
                 yield Interrupted()
             elif isinstance(step, Turn):
+                self.generating = False
                 for transcript in self._drain(final=True):
                     yield transcript
                 return  # the turn ended; the session did not
@@ -307,6 +335,29 @@ class FakeRecall:
             await asyncio.sleep(self.delay)
         if self.fail:
             raise RuntimeError("the embedder is down")
+        return list(self.items)
+
+    async def index(self, message_id: int, text: str) -> None: ...
+
+    async def backfill(self, limit: int = 500) -> int:
+        return 0
+
+
+class BlockingRecall:
+    """A `Recall` that hangs until released, so a test decides when the search lands.
+
+    The whole point of the deferral is what happens when it lands *during* an answer,
+    and no amount of scripting the session can arrange that if the search resolves
+    by itself on the next loop turn."""
+
+    def __init__(self, *items: RecalledItem) -> None:
+        self.items = list(items)
+        self.gate = asyncio.Event()
+        self.queries: list[str] = []
+
+    async def search(self, query: str, *, limit: int = 6) -> list[RecalledItem]:
+        self.queries.append(query)
+        await self.gate.wait()
         return list(self.items)
 
     async def index(self, message_id: int, text: str) -> None: ...
@@ -1137,3 +1188,70 @@ async def test_what_each_attempt_did_is_reported(
 
     assert "voice session:" in caplog.text
     assert "voice session (attempt 2):" in caplog.text
+
+
+# --- recall must not interrupt the answer it was fetched for -------------------
+# The Live API: "a message here will interrupt any current model generation."
+# Measured against it - `interrupted` arrived 90 ms after the recall block went out,
+# and one conversation delivered 2.2s of audio with recall on against 46.7s with it
+# off. The daemon was killing its own answers with its own memory.
+
+
+async def test_recall_is_not_sent_while_the_model_is_answering() -> None:
+    """The measured bug. `clientContent` mid-generation is documented as interrupting
+    the answer, and against the live API `interrupted` came back 90 ms later."""
+    recall = BlockingRecall(_item())
+    session = FakeSession(
+        Says("user", "치과 언제였지"),  # the prefetch starts, and blocks
+        b"\x01\x02",  # the answer starts arriving: generating
+        Does(recall.gate.set),  # the search lands *now*, mid-answer
+        Turn(),
+    )
+    conv = conversation(session, recall=recall)
+    await run(conv)
+
+    assert recall.queries, "the prefetch never ran, so this proves nothing"
+    assert session.sent_while_generating == [], (
+        "recall was sent while the model was generating - the Live API documents "
+        "that as interrupting the answer, and it cost 2.2s of audio against 46.7s"
+    )
+    assert session.contexts, "recall was held back and then never sent at all"
+
+
+async def test_held_recall_is_sent_at_the_turn_boundary() -> None:
+    """Held, not dropped - and this is the case where only the flush can deliver it.
+
+    The prefetch covers the finished utterance, so `_settle_recall` reuses it instead
+    of searching again; with nothing redoing the offer, a missing flush means a memory
+    that was searched for and silently discarded."""
+    recall = BlockingRecall(_item())
+    session = FakeSession(
+        Says("user", "치과 언제였지"),
+        b"\x01",
+        Does(recall.gate.set),
+        Turn(),
+    )
+    conv = conversation(session, recall=recall)
+    await run(conv)
+
+    assert len(session.contexts) == 1, "the held recall never reached the model"
+    assert "치과" in session.contexts[0]
+    assert session.sent_while_generating == []
+
+
+async def test_the_same_turn_is_not_seeded_twice() -> None:
+    """Two blocks for one turn would hand the model the same facts again, and each
+    send is another chance to interrupt."""
+    recall = BlockingRecall(_item())
+    session = FakeSession(
+        Says("user", "치과"),
+        b"\x01",
+        Does(recall.gate.set),
+        Says("user", " 언제였지 그리고 약은"),
+        Turn(),
+    )
+    conv = conversation(session, recall=recall)
+    await run(conv)
+
+    assert len(session.contexts) <= 1, "the same turn was seeded more than once"
+    assert session.sent_while_generating == []

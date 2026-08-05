@@ -25,10 +25,12 @@ Four things here are load-bearing rather than incidental:
 3. **A barge-in is the provider's call, not ours, and it does two things or it does
    nothing.** `session.interrupt()` stops the abandoned turn's audio from arriving,
    `audio.stop_playback()` drops what is already queued; either alone leaves the
-   daemon talking over the user. What decides it is `Interrupted` from `receive()` -
-   the server's own activity detection. Deciding it here instead, from a transcript
-   growing while audio played, ruled *every* turn a barge-in for the reason in
-   point 2, and threw away complete answers unheard.
+   daemon talking over the user. What decides it is `Interrupted` from `receive()`,
+   never a guess made here: inferring it from a transcript growing while audio played
+   ruled *every* turn a barge-in for the reason in point 2, and threw away complete
+   answers unheard. But `Interrupted` is not only the user, either - it is also raised
+   by anything *we* send mid-generation, which is why recall waits for the turn
+   boundary (`_offer`). Both readings of one flag, and both cost an answer.
 4. **One `receive()` is one turn, so a conversation is a loop.** `receive()` ends at
    the turn boundary (daemon/voice/base.py). The single call this replaced delivered
    the first answer and then blocked until the server cut the idle session with
@@ -208,7 +210,17 @@ class VoiceConversation:
         self._first_audio_at: float | None = None
         self._played_bytes = 0
 
-        self._playing = False
+        self._generating = False
+        """Whether the model is mid-turn.
+
+        Named for what it gates: `clientContent` interrupts generation, so this is
+        what keeps recall off the wire until the answer is finished. It used to be
+        called `_playing` and used to decide barge-ins, and neither survived contact
+        with the provider - see `_offer` and `_watch_partials`."""
+
+        self._deferred: list[RecalledItem] | None = None
+        """Recall that arrived mid-answer and is waiting for the turn to end."""
+
         self._speculative: tuple[str, asyncio.Task[list[RecalledItem]]] | None = None
         self._offered: str | None = None
         """The last block put in front of the model, so a prefetch that is reused
@@ -317,7 +329,7 @@ class VoiceConversation:
                 produced = True
                 budget.reschedule(loop.time() + self._idle_timeout)
                 if isinstance(item, bytes):
-                    self._playing = True
+                    self._generating = True
                     self._on_audio(loop.time(), len(item))
                     await self._audio.play(item)
                 elif isinstance(item, Interrupted):
@@ -326,6 +338,12 @@ class VoiceConversation:
                     await self._on_transcript(session, item)
         finally:
             await _aclose(stream)
+        # The turn is over, whatever ended it, so nothing is generating and anything
+        # held back is now safe to send. Both matter: leaving the flag set would hold
+        # recall forever after a turn that ended without a final transcript, and
+        # never flushing would mean a memory searched for and then silently dropped.
+        self._generating = False
+        await self._flush_deferred(session)
         self.ended = getattr(session, "ended", None)
         if produced:
             self.turns += 1
@@ -361,7 +379,7 @@ class VoiceConversation:
             return
         # Both roles are flushed at the turn boundary, so a final transcript is
         # also the signal that this turn's audio is done.
-        self._playing = False
+        self._generating = False
         if transcript.role == "user":
             await self._settle_recall(session, transcript.text)
         await self._record(transcript)
@@ -471,6 +489,22 @@ class VoiceConversation:
     async def _offer(self, session: VoiceSession, items: list[RecalledItem]) -> None:
         """Put recalled memory in the model's history without asking for an answer.
 
+        **Never while the model is generating.** `send_context` is `clientContent`,
+        and the Live API is explicit that "a message here will interrupt any current
+        model generation" - so seeding a memory mid-answer kills the answer. Measured
+        against the live API: `interrupted` arrived **90 ms** after the recall block
+        went out, and over one conversation the same room and microphone delivered
+        2.2s of audio with recall on and 46.7s with it off. Held to the turn boundary
+        instead, which costs nothing that was not already lost: the prefetch fires on
+        a partial that arrives with the answer, so its memories were only ever going
+        to reach the *next* turn anyway.
+
+        This is also what `serverContent.interrupted` really means. It is documented
+        as "a client message has interrupted current model generation" - not "the user
+        spoke - so it was never the pure user-VAD signal an earlier version of this
+        module took it for, and the daemon was reading its own interruption as the
+        owner talking over it.
+
         Never fails the turn, for the same reason recall itself does not: in voice
         mode an exception is silence, and answering with less memory beats not
         answering.
@@ -482,11 +516,30 @@ class VoiceConversation:
         identity = render_recall(items, _IDENTITY_NONCE)
         if not identity or identity == self._offered:
             return
+        if self._generating:
+            # Held, not dropped, and `_offered` is deliberately left alone so the
+            # flush does not mistake this for something already sent. A later
+            # prefetch landing in the same turn simply replaces it - the newest
+            # search is the better one.
+            self._deferred = items
+            logger.debug("voice: holding recall until the turn ends, so it cannot cut it short")
+            return
+        self._deferred = None
         self._offered = identity
         try:
             await session.send_context(render_recall(items, secrets.token_hex(4)))
         except Exception:
             logger.exception("voice: recall could not be put in front of the model")
+
+    async def _flush_deferred(self, session: VoiceSession) -> None:
+        """Send what was held back while the model was talking.
+
+        Called at the turn boundary, which is where `clientContent` is safe: there is
+        no generation for it to interrupt.
+        """
+        held, self._deferred = self._deferred, None
+        if held is not None:
+            await self._offer(session, held)
 
     async def _settle_recall(self, session: VoiceSession, said: str) -> None:
         """Reuse the prefetched search if it was for close enough to this, else
@@ -546,11 +599,12 @@ class VoiceConversation:
         # three times, and those need opposite fixes - which is exactly the
         # confusion that let a self-interruption on every single turn go unnoticed.
         logger.info(
-            "voice: barge-in %d, reported by the provider's activity detection",
+            "voice: barge-in %d, reported by the provider (the user cut in, or "
+            "something we sent did)",
             self.interruptions + 1,
         )
         self.interruptions += 1
-        self._playing = False
+        self._generating = False
         await session.interrupt()
         await self._audio.stop_playback()
 

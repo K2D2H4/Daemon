@@ -111,6 +111,18 @@ package. Rules: [CONTRACTS.md](../docs/CONTRACTS.md). Data flow:
   `interrupted`, which is what `base.py` always said the authority was. Same
   measurement retires a documented claim: the recall prefetch cannot be free against
   this provider, because the partial it fires on arrives with the answer.
+- **Recall was killing the answer it was fetched for, and this was the biggest of the
+  three.** `send_context` is `clientContent`, and the Live API says plainly that "a
+  message here will interrupt any current model generation". The prefetch landed
+  mid-answer, so seeding a memory cut the reply off at "아..." - the owner's log paired
+  every barge-in with the embed call immediately before it, 1:1. Measured, one
+  conversation, same room and microphone: **2.2s of audio with recall on, 46.7s with
+  it off, 38.8s with it deferred to the turn boundary.** Deferring costs nothing that
+  was not already lost, because the prefetch fires on a partial that arrives with the
+  answer anyway. And note what `serverContent.interrupted` actually means - "a client
+  message has interrupted current model generation", *not* "the user spoke" - so it is
+  two failures wearing one flag, and reading it as pure user-VAD is what let the daemon
+  mistake its own memory for the owner talking over it.
 - **An interruption arriving after `generationComplete` is not an interruption.**
   Measured four times: it lands ~0.25 s later on a turn nobody touched, and acted on
   it empties the speaker of an answer that was fully delivered.

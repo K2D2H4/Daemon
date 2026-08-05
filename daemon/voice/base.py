@@ -66,10 +66,12 @@ class Interrupted:
     it, and every turn was killed: a full, fluent reply generated and 0.0s of it
     played, twice reproduced against the live API.
 
-    The authority was always meant to be the server. `interrupt()` below has said so
-    since it was written - "under server-side VAD the user's own audio is what stops
-    generation, reported back as `serverContent.interrupted`" - and this is that
-    sentence given a wire.
+    What it does **not** mean is "the user spoke". The Live API documents the flag as
+    "a client message has interrupted current model generation", and a client message
+    is something *we* sent: seeding recall through `send_context` mid-answer raised
+    this flag 90 ms later and killed the answer. So a caller must both act on it -
+    the speaker has to be emptied - and avoid causing it, which is
+    `VoiceConversation._offer`'s job. Two different failures wearing one flag.
     """
 
 
