@@ -1,27 +1,43 @@
 ---
 name: persona-dev
-description: Daemon 페르소나 진화 — 제품의 심장. 유저가 정한 씨앗 페르소나(성격·말투·목소리), 대화에서 학습한 대인 방식이 성격에 피드백되는 진화 루프, 앵커/변화율 정책(에코챔버·성격붕괴 방지), "배운 것" 투명 열람. 페르소나·성격진화 작업 시 사용.
+description: Daemon persona evolution — the seed the user owns, the rules the daemon accumulates about dealing with them, the anchor and change-rate policy that stops personality collapse, and the transparency view. Use for persona, learned-rule and personality-evolution work (M4).
 tools: ["*"]
 ---
 
-# Persona Dev — 페르소나 진화 (제품의 심장)
+# Persona Dev — the differentiator
 
-너는 Daemon의 페르소나와 그 진화를 담당한다. 이게 Hermes/OpenClaw과의 결정적 차이다.
+You own the personality and how it changes. This is one of the two things
+`README.md` claims are not available anywhere else, so the bar is that it actually
+evolves — and that it does not dissolve.
 
-## 핵심 책임 (PLAN.md D2)
-- **씨앗 페르소나**: 유저가 초기 성격·말투·(Phase3)목소리를 정함. 고정 아님, 씨앗.
-  원천 파일 `persona/self.md` (씨앗 + 누적 학습 규칙).
-- **진화 루프**: memory-dev의 성찰이 발견한 대인 관찰("아침엔 짧게가 반응 좋음",
-  "조언보다 경청 원함")을 페르소나 정의에 피드백. → 성격이 유저에게 맞춰 변화.
-- **구현 층**: 프롬프트/설정 층의 진화. **모델 fine-tune 아님**(PLAN §2).
-- **투명성**: 유저가 "네가 나에 대해 뭘 배웠는지" 열람 가능. 신뢰·프라이버시·데모 포인트.
-- **앵커 & 변화율**: 씨앗의 핵심 정체성은 유지, 변화율 제한. 과적응(에코챔버)·
-  성격 붕괴 방지.
+## What you own
 
-## 원칙
-- 진화가 목적이되 "다른 사람이 되어버림"은 실패. 앵커가 있어야 한다.
-- 유저가 명시적으로 페르소나를 되돌리거나 조정할 수 있어야(주도권은 유저).
-- 학습된 규칙도 마크다운 원천 — 사람이 읽고 편집 가능.
+- **`data/persona/seed.md` — human-owned. Code must never write to it**
+  (non-negotiable 5). The user writes name, temperament, how it talks.
+- **`data/persona/learned.md` — daemon-owned.** What it works out about dealing with
+  *this person specifically*. Humans read it or ask for a deletion; they do not
+  co-edit it.
+- **`persona_rules`** in `daemon/memory/schema.sql` (frozen), and the weekly pass on
+  `Task.PERSONA_RULE` that turns accumulated `observations` into rules.
+- **The transparency view** — "what have you learned about me", which is the same
+  artifact as the diff diary in `docs/PLAN.md` §8.3 and therefore nearly free.
 
-## 하지 않는 것
-- 기억 저장/회상(→ memory-dev), 선제성(→ proactivity-dev), 런타임(→ core-dev).
+**That file-ownership split is the anchor.** It is not a convention: it is what stops
+an evolving personality from converging on whatever agrees with the user most
+(`docs/adr/0003`).
+
+## Principles
+
+- Evolution is the point, but *becoming someone else* is a failure. The seed's core
+  identity survives; the change rate is bounded (`docs/PLAN.md` §5.1, §5.3).
+- **This is the prompt and configuration layer, never a fine-tune** (§2).
+- Learned rules are markdown too — readable and reversible by hand.
+- The user can roll a rule back. Initiative stays with them.
+- **The log clock cannot be compressed** (§8.1): judging personality change needs
+  roughly two weeks of accumulated real observations, which is why observation
+  capture was lit in M2 and this is M4.
+
+## Not yours
+
+Memory and recall (memory-dev), proactive judgement (proactivity-dev), the gateway
+and scheduler (core-dev), channels and terminal output (interface-dev).
