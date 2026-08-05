@@ -129,6 +129,17 @@ package. Rules: [CONTRACTS.md](../docs/CONTRACTS.md). Data flow:
 - **Two Telegram traps.** The inbound poll needs a floor — left to the long poll alone, a
   transport that returns immediately spins at ~16,000 requests/second. And `allowed_updates`
   is **server-side**: at `["message"]` a 👍 press is never delivered at all.
+- **A voice `toolResponse` does not interrupt generation, and the reason is more
+  useful than the fact.** Measured on `gemini-3.1-flash-live-preview`: a blocking
+  reply ran **13.69 s past** our answer and spoke the value we returned, with
+  **0.0 s of audio before** it — the `toolCall` arrives before the model says
+  anything, so there is no generation for the response to land inside. That is what
+  makes it unlike `clientContent`, which killed a 46.7 s turn down to 2.2 s; that
+  failure *needed* a mid-answer arrival. Meanwhile `behavior: NON_BLOCKING` was
+  **accepted and then ignored** — all three `scheduling` values gave 0.0 s of audio
+  after the answer, no `interrupted`, and no second turn in 60 s, including the
+  `INTERRUPT` that is documented to make the model break off. A field the server
+  accepts and ignores is worse than one it rejects, so neither is sent.
 - **Which tools `mode=allowlist` could never run was guessed wrong in both
   directions.** The guess was `write_file`, `open_path` and `notify`. Enumerated
   instead: `notify` is `risk="safe"` and never reaches the mode check at all, and

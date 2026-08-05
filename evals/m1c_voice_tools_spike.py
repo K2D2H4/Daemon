@@ -38,6 +38,12 @@ It sends text and reads the reply, so it needs no microphone. The tool it declar
 is a fake clock that touches nothing. Nothing is written to the repo, and the key
 is only ever read from the environment.
 
+**What it found** lives where the code that acts on it is - the
+`--- tool calling ---` comment in `daemon/voice/gemini_live.py` - and in
+`evals/CLAUDE.md`. Short version, 2026-08-05: 3 is answered and is the good answer,
+1 holds, and 2/4 came back worse than a rejection would have been. The questions
+above are left as questions because they are what to re-ask when the model changes.
+
 **Nothing here runs in CI and nothing here is a test.** A test may not touch the
 network or a key (tests/CLAUDE.md); that is why this lives in `evals/`.
 """

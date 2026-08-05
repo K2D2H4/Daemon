@@ -115,28 +115,56 @@ _END_SENSITIVITY = {name: f"END_SENSITIVITY_{name.upper()}" for name in SENSITIV
 # is not a timid default, it is the only coherent one for a blocking call, and it
 # is why `INTERRUPT` is not the default: there is nothing here for it to schedule.
 #
-# **What is measured and what is not.** The reason to care is
-# `daemon/voice/base.py`'s `Interrupted`: `clientContent` mid-answer killed the
+# **Measured**, `evals/m1c_voice_tools_spike.py`, 2026-08-05,
+# gemini-3.1-flash-live-preview, one session per configuration. The reason to care
+# is `daemon/voice/base.py`'s `Interrupted`: `clientContent` mid-answer killed the
 # reply on every turn - 2.2 s of audio with recall on, 46.7 s with it off, 38.8 s
 # deferred to the turn boundary. A `toolResponse` is a *different* top-level client
-# message and the docs claim nothing about it interrupting, but "different message
-# type, therefore safe" is inference and this file's own history says inference
-# loses to the socket. `evals/m1c_voice_tools_spike.py` asks the socket. It has not
-# been run: the key lives in the owner's `.env` and this work was asked not to read
-# it, so there are no numbers to put here yet and none are invented.
+# message, and the question was whether the trap extends to it.
 #
-# One thing the docs already answer, and it is not the answer the shape of the
-# names suggests: **asynchronous function calling is documented as unsupported on
-# Gemini 3.1 Flash Live**, which is the model this repo runs
-# (`evals/m0_voice_spike.py`, `RECOMMENDED_MODEL`). So `NON_BLOCKING` and therefore
-# `scheduling` may be rejected outright here, and the spike's first question is
-# whether they are accepted at all rather than which value is best.
+# It does not, and blocking is better than "not worse":
+#
+#   blocking (no behavior, no scheduling)   0.0 s of audio before the answer,
+#                                           13.69 s after it, 0 interruptions
+#
+# Two things in that line. `toolResponse` did not interrupt anything - the reply ran
+# for 13.69 s after we answered and spoke the value we returned back to us. And the
+# 0.0 s says the `toolCall` arrives *before* any audio: a blocking call generates
+# nothing while it waits, so there is no generation for a response to land in the
+# middle of. The `clientContent` failure needed a mid-answer arrival to happen at
+# all, and this shape does not have one.
+#
+# `NON_BLOCKING` is where the surprise is, and it is the bad kind. Setup **accepted
+# it** on a model whose docs say asynchronous function calling is not supported -
+# and then nothing came of it, for every scheduling value:
+#
+#   NON_BLOCKING + INTERRUPT    10.16 s before the answer, 0.0 s after
+#   NON_BLOCKING + WHEN_IDLE     8.89 s before,            0.0 s after
+#   NON_BLOCKING + SILENT       13.84 s before,            0.0 s after
+#
+# All three: 0 interruptions, and no second turn within 60 s. The model did keep
+# talking while it waited, which is what non-blocking is for - and then the answer
+# bought nothing. `INTERRUPT` in particular is documented as making the model break
+# off and report, and it did not.
+#
+# What this run cannot separate: the `toolCall` arrived 9-14 s in, at or near the
+# end of the model's own turn, so "asynchronous function calling is inert here" and
+# "the answer landed after the turn boundary, leaving scheduling nothing to
+# schedule" fit the same numbers. Both point one way, which is why the default is
+# not a compromise between them: **a field the server accepts and then ignores is
+# worse than one it rejects**, because a rejection fails loudly and this fails while
+# looking configured. So neither field is sent, `_warn_about_tool_behavior` says so
+# to anyone who sets one, and re-measuring is one spike run.
 
 TOOL_BEHAVIORS = ("NON_BLOCKING",)
 """What a caller may ask for, beyond the default of not sending the field.
 
 Only one value, because the other one *is* the absent field: the API's default
-behaviour is blocking, and `"BLOCKING"` is not a spelling it documents."""
+behaviour is blocking, and `"BLOCKING"` is not a spelling it documents.
+
+Still accepted although it was measured inert (above), because the way to find out
+that it has started working is to set it and run the spike again. It is not
+reachable from configuration - only from code - and setting it logs a warning."""
 
 TOOL_SCHEDULING = ("INTERRUPT", "WHEN_IDLE", "SILENT")
 """What to do with a `NON_BLOCKING` answer: cut the model off, wait for it to
@@ -274,6 +302,33 @@ class _KeyFilter(logging.Filter):
         return True
 
 
+def _warn_about_tool_behavior(behavior: str, scheduling: str) -> None:
+    """Say what was measured about the two fields, to whoever just set one.
+
+    Silent for the default, because `daemon voice` constructs a session per
+    reconnect attempt and a warning on every ordinary one is a warning nobody
+    reads.
+    """
+    if behavior:
+        logger.warning(
+            "gemini-live: tool_behavior=%s was measured accepted-and-inert on "
+            "gemini-3.1-flash-live-preview - the tool answer produced no further "
+            "audio under any scheduling value. Re-check with "
+            "evals/m1c_voice_tools_spike.py before relying on it",
+            behavior,
+        )
+    if scheduling and not behavior:
+        # Not refused - see `TOOL_SCHEDULING`. Said out loud, because a null result
+        # from the spike would otherwise be indistinguishable from the server
+        # ignoring a field that needs a companion it did not get.
+        logger.warning(
+            "gemini-live: tool_scheduling=%s without tool_behavior=NON_BLOCKING; "
+            "scheduling is documented only for non-blocking calls, so the server "
+            "may ignore it",
+            scheduling,
+        )
+
+
 async def _sleep(seconds: float) -> None:
     # Indirection so tests can drive the backoff clock without real waiting.
     await asyncio.sleep(seconds)
@@ -347,16 +402,7 @@ class GeminiLiveSession:
                 f"tool scheduling must be one of {TOOL_SCHEDULING} or empty, "
                 f"not {tool_scheduling!r}"
             )
-        if tool_scheduling and not tool_behavior:
-            # Not refused - see `TOOL_SCHEDULING`. Said out loud, because a null
-            # result from the spike would otherwise be indistinguishable from the
-            # server ignoring a field that needs a companion it did not get.
-            logger.warning(
-                "gemini-live: tool_scheduling=%s without tool_behavior=NON_BLOCKING; "
-                "scheduling is documented only for non-blocking calls, so the server "
-                "may ignore it",
-                tool_scheduling,
-            )
+        _warn_about_tool_behavior(tool_behavior, tool_scheduling)
         self._tools = tuple(tools)
         self._tool_behavior = tool_behavior
         self._tool_scheduling = tool_scheduling

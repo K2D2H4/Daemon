@@ -10,7 +10,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `golden_set.py` | recall quality as a pass rate, repeatable |
 | `fixtures/` | four days of Korean fixture conversation, 79 messages, 50 questions |
 | `m0_voice_spike.py` | the six things about Gemini Live only a live key could settle |
-| `m1c_voice_tools_spike.py` | whether answering a voice tool call costs the answer. **Not yet run** |
+| `m1c_voice_tools_spike.py` | whether answering a voice tool call costs the answer — it does not |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py
@@ -71,24 +71,40 @@ Needs `GEMINI_API_KEY`. Sends text and reads the reply, so no microphone; the to
 it declares is a fake clock that touches nothing. Four sessions — one blocking call,
 then `NON_BLOCKING` once per `scheduling` value.
 
-**It has not been run, and no number from it is quoted anywhere.** The work that
-built it was asked not to read the owner's `.env`, so the harness was verified
-against a scripted socket (its before/after audio accounting and its report are
-right) and the measurement itself is owed. Until it runs, three things stay
-inference:
+Measured 2026-08-05 on `gemini-3.1-flash-live-preview`, one session each:
 
-- whether a native-audio session accepts `tools` at all;
-- whether `behavior: NON_BLOCKING` is accepted on `gemini-3.1-flash-live-preview` —
-  the docs say asynchronous function calling is **not** supported there, which
-  would make `scheduling` unreachable;
-- **whether `toolResponse` interrupts generation.** This is the one that matters.
-  `clientContent` does — 2.2s of audio against 46.7s — and `toolResponse` is a
-  different top-level message that nothing documents as interrupting. Different
-  message, therefore safe, is inference of exactly the kind this directory exists
-  to replace.
+| | audio before the answer | after | interrupts |
+|---|---|---|---|
+| blocking (what ships) | 0.0s | **13.69s** | 0 |
+| `NON_BLOCKING` + `INTERRUPT` | 10.16s | 0.0s | 0 |
+| `NON_BLOCKING` + `WHEN_IDLE` | 8.89s | 0.0s | 0 |
+| `NON_BLOCKING` + `SILENT` | 13.84s | 0.0s | 0 |
 
-`daemon/voice/gemini_live.py` sends neither field by default, so nothing is riding
-on the guess in the meantime.
+**A `toolResponse` does not interrupt generation.** That was the question worth
+asking, because `clientContent` does — 2.2s of audio against 46.7s — and "different
+message type, therefore safe" is exactly the inference this directory replaces. The
+blocking reply ran 13.69s past our answer and spoke the value we returned. The
+`0.0s before` is the second half of it: a blocking `toolCall` arrives *before any
+audio*, so there is no generation for the response to land in the middle of. The
+`clientContent` failure needed a mid-answer arrival to exist at all.
+
+**`NON_BLOCKING` was accepted and then ignored,** on a model whose docs say
+asynchronous function calling is unsupported. All three scheduling values: the model
+talked for 9–14s while it waited, we answered, and nothing followed — no audio, no
+`interrupted`, no second turn inside 60s. `INTERRUPT` is documented as making the
+model break off and report; it did not. This run cannot separate "inert here" from
+"the answer landed after the turn boundary, so scheduling had nothing to schedule" —
+the call arrived at the end of the model's own turn. Both readings say the same
+thing, and **a field the server accepts and ignores is worse than one it rejects**,
+because a rejection fails loudly and this fails while looking configured.
+
+Two smaller corrections. Native audio and function calling do compose — the answer
+shaped a spoken Korean reply. And **Live issues its own call ids** (`fc_<19
+digits>`), unlike the REST half of the same API, so `synthesise_call_id` is a
+fallback that never fires here.
+
+`daemon/voice/gemini_live.py` sends neither field, which is now measured rather than
+cautious, and warns anyone who sets one.
 
 ## Common changes
 

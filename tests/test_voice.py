@@ -1229,6 +1229,32 @@ async def test_non_blocking_is_expressible_for_the_spike_that_measures_it() -> N
     assert declared["behavior"] == "NON_BLOCKING"
 
 
+def test_asking_for_non_blocking_says_it_was_measured_inert(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The server *accepted* this field and then did nothing with it - measured, all
+    three scheduling values, 0.0s of audio after the answer every time. An accepted
+    field that is ignored is the failure this project calls the dangerous one,
+    because it looks configured. Rejecting it outright would make re-measuring
+    impossible, so it is allowed and it is announced."""
+    with caplog.at_level(logging.WARNING):
+        GeminiLiveSession(KEY, MODEL, tools=[READ_FILE], tool_behavior="NON_BLOCKING")
+
+    assert "NON_BLOCKING" in caplog.text
+    assert "m1c_voice_tools_spike" in caplog.text
+
+
+def test_the_default_configuration_warns_about_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The other direction. A warning on every ordinary session is a warning nobody
+    reads, and `daemon voice` builds one of these per reconnect attempt."""
+    with caplog.at_level(logging.WARNING):
+        GeminiLiveSession(KEY, MODEL, tools=[READ_FILE])
+
+    assert caplog.text == ""
+
+
 @pytest.mark.parametrize("behavior", ["non_blocking", "BLOCKING", "nonsense"])
 def test_an_unknown_behavior_is_refused_at_construction(behavior: str) -> None:
     """Checked here rather than left to the server, for the reason the
@@ -1267,7 +1293,13 @@ async def test_a_tool_call_is_yielded_from_receive() -> None:
 async def test_a_call_with_no_id_gets_a_synthesised_one() -> None:
     """Documented as optional, and `llm/providers/gemini.py` already had to invent
     one because the REST API issues none at all. A result cannot be paired with a
-    request without something in that field."""
+    request without something in that field.
+
+    Measured since: **Live does issue ids**, unlike the REST half of the same API -
+    they arrive as `fc_<19 digits>`. So this is a fallback that never fired against
+    the live server, which is worth knowing the next time someone reads the two
+    halves as one API and assumes the id has to be invented here too.
+    """
     connection = FakeConnection(
         SETUP_COMPLETE,
         tool_call({"name": "read_file", "args": {}}),
