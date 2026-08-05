@@ -40,11 +40,16 @@ class StopPolling(Exception):
 class FakeAPI:
     """Scriptable Bot API. Each getUpdates poll consumes one scripted step."""
 
-    def __init__(self, *steps: Any, me_status: int = 200) -> None:
+    def __init__(
+        self, *steps: Any, me_status: int = 200, me_response: httpx.Response | None = None
+    ) -> None:
         self.steps = list(steps)
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.me_status = me_status
         """`getMe`'s status. Not 200 when a test needs the bot to be unnameable."""
+        self.me_response = me_response
+        """A whole `getMe` response, for the malformed shapes that once killed the
+        poll loop from inside its own error handler."""
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self._handle)
@@ -62,6 +67,8 @@ class FakeAPI:
             # Answered without consuming a step, like sendMessage: the 409 path
             # calls it to name the bot, and a poll script must not be shifted by
             # whether the channel happened to identify itself.
+            if self.me_response is not None:
+                return self.me_response
             if self.me_status != 200:
                 return httpx.Response(self.me_status, text="nope")
             return httpx.Response(
@@ -1076,3 +1083,270 @@ async def test_the_token_never_reaches_the_conflict_log(
 
     assert TOKEN not in caplog.text
     assert "AAHfake-token-value" not in caplog.text
+
+
+# --- the 409 handler must not become the thing that kills the loop ------------
+# Naming the bot put an `await` inside the poll loop's own `except` clause, and an
+# exception raised in one `except` is not offered to the siblings of the same
+# `try` - so the neighbouring `except RuntimeError`, which exists precisely to
+# absorb "close() pulled the client out from under us", could not catch it. Every
+# case below ended `listen()` and left a process that was alive, /health-green and
+# permanently deaf: the exact failure this file has already paid for twice.
+
+FAILING_ME = {
+    "a 200 that is not JSON at all": httpx.Response(200, text="<html>captive portal</html>"),
+    "a top-level array": httpx.Response(200, json=[1, 2]),
+    "ok=false with no description": httpx.Response(200, json={"ok": False}),
+    "a 500": httpx.Response(500, text="nope"),
+}
+"""Shapes where `getMe` genuinely fails. Each of these ended `listen()` before."""
+
+USELESS_ME = {
+    "a result that is a string": httpx.Response(200, json={"ok": True, "result": "x_bot"}),
+    "a result with no username": httpx.Response(200, json={"ok": True, "result": {"id": 1}}),
+}
+"""Shapes that answer without failing. No warning is owed: nothing went wrong, there
+is simply no handle to print. Kept separate rather than folded into `FAILING_ME`
+because asserting a warning here would have been asserting the wrong behaviour - the
+string case is what caught that, by failing."""
+
+MALFORMED_ME = {**FAILING_ME, **USELESS_ME}
+
+
+@pytest.mark.parametrize("shape", list(MALFORMED_ME))
+async def test_a_malformed_getMe_does_not_kill_the_poll_loop(
+    shape: str, no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    api = FakeAPI(
+        conflict(TERMINATED),
+        [message_update(1, sender_id=OWNER, text="still here")],
+        me_response=MALFORMED_ME[shape],
+    )
+    with caplog.at_level(logging.WARNING):
+        received = await drain(channel(api))
+
+    # The loop survived the 409 *and* the failed attempt to describe it.
+    assert [m.text for m in received] == ["still here"]
+    # The 409 was still reported, with the half that needs no call.
+    assert "409 conflict on bot id 123456" in caplog.text
+
+
+@pytest.mark.parametrize("shape", list(FAILING_ME))
+async def test_a_failed_getMe_is_logged_not_swallowed(
+    shape: str, no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A missing handle with no explanation is the original defect in a new hat."""
+    api = FakeAPI(
+        conflict(TERMINATED),
+        [message_update(1, sender_id=OWNER, text="ok")],
+        me_response=FAILING_ME[shape],
+    )
+    with caplog.at_level(logging.WARNING):
+        await drain(channel(api))
+
+    assert "getMe could not name this bot" in caplog.text
+
+
+@pytest.mark.parametrize("shape", list(USELESS_ME))
+async def test_a_getMe_that_answers_without_a_handle_is_not_an_error(
+    shape: str, no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing failed, so nothing is warned about - but nothing is claimed either."""
+    api = FakeAPI(
+        conflict(TERMINATED),
+        [message_update(1, sender_id=OWNER, text="ok")],
+        me_response=USELESS_ME[shape],
+    )
+    with caplog.at_level(logging.WARNING):
+        await drain(channel(api))
+
+    assert "could not name this bot" not in caplog.text
+    # And no half-built handle: the enrichment line is simply not emitted.
+    assert "is @" not in caplog.text
+
+
+async def test_the_conflict_is_reported_before_getMe_is_even_asked(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """`await` inside the logging call meant nothing printed until getMe returned.
+
+    The client's read timeout is `poll_timeout + 10`, so that was up to 40 seconds
+    of silence on the first 409 - and an operator who saw nothing and hit Ctrl-C got
+    no 409 line at all, which is worse than the bare `HTTP 409` this replaced.
+    """
+    order: list[str] = []
+
+    class Watcher(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            order.append(f"log:{record.getMessage()[:24]}")
+
+    api = FakeAPI(conflict(TERMINATED), [message_update(1, sender_id=OWNER, text="ok")])
+    ch = channel(api)
+    handler = Watcher()
+    logging.getLogger("daemon.channels.telegram").addHandler(handler)
+    try:
+        with caplog.at_level(logging.ERROR):
+            await drain(ch)
+    finally:
+        logging.getLogger("daemon.channels.telegram").removeHandler(handler)
+
+    getme_at = [i for i, (name, _) in enumerate(api.requests) if name == "getMe"]
+    assert getme_at, "getMe was never called, so this test proves nothing"
+    # The conflict line exists, and it is the first thing logged - not the enrichment.
+    assert order[0].startswith("log:telegram: 409 conflict")
+
+
+async def test_one_failed_getMe_costs_one_call_not_one_per_conflict(
+    no_real_sleep: list[float],
+) -> None:
+    """A 409 storm is exactly when the API path is flaky, so the failure is cached.
+
+    Without caching the failure this would be a getMe per poll, against an endpoint
+    already refusing us.
+    """
+    api = FakeAPI(
+        conflict(TERMINATED),
+        conflict(TERMINATED),
+        conflict(TERMINATED),
+        [message_update(1, sender_id=OWNER, text="ok")],
+        me_status=502,
+    )
+    await drain(channel(api))
+
+    assert len([name for name, _ in api.requests if name == "getMe"]) == 1
+
+
+async def test_a_token_with_no_colon_never_reaches_the_log(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """`split(":", 1)[0]` returns the whole string when there is no separator.
+
+    `bot_id` is documented as safe to print, so a malformed value in `.env` would
+    have put the secret into a log line under a docstring promising it was not one.
+    """
+    weird = "AAHfake-token-with-no-colon"
+    api = FakeAPI(conflict(TERMINATED), [message_update(1, sender_id=OWNER, text="ok")])
+    ch = TelegramChannel(weird, (OWNER,), client=api.client(), poll_timeout=0)
+
+    assert ch.bot_id == "<unparseable token>"
+    with caplog.at_level(logging.ERROR):
+        await drain(ch)
+
+    assert weird not in caplog.text
+
+
+# --- Telegram's description is untrusted text on its way to a log --------------
+
+
+async def test_a_hostile_description_cannot_forge_a_log_record(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A newline lets the far end forge a whole record; an escape repaints the line.
+
+    `daemon/setup.py` does three things to this same field - redact, strip
+    non-printables, bound the length - and this path had copied only the first.
+    """
+    nasty = "Conflict: x\nERROR daemon.channels.telegram telegram: all clear\x1b[2K"
+    api = FakeAPI(
+        httpx.Response(409, json={"ok": False, "error_code": 409, "description": nasty}),
+        [message_update(1, sender_id=OWNER, text="ok")],
+    )
+    with caplog.at_level(logging.ERROR):
+        await drain(channel(api))
+
+    assert "\n" not in caplog.text.split("409 conflict")[1].split("\n")[0]
+    assert "\x1b" not in caplog.text
+    assert "all clear" in caplog.text  # collapsed onto one line, not a second record
+    assert len([r for r in caplog.records if "all clear" in r.getMessage()]) == 1
+
+
+async def test_a_very_long_description_is_bounded(
+    no_real_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    api = FakeAPI(
+        httpx.Response(
+            409, json={"ok": False, "error_code": 409, "description": "x" * 5000}
+        ),
+        [message_update(1, sender_id=OWNER, text="ok")],
+    )
+    with caplog.at_level(logging.ERROR):
+        await drain(channel(api))
+
+    assert "x" * telegram.DESCRIPTION_LIMIT in caplog.text
+    assert "x" * (telegram.DESCRIPTION_LIMIT + 1) not in caplog.text
+
+
+# --- each guard pinned on its own ---------------------------------------------
+# The `_call` hardening and `identify`'s broad `except` are deliberately redundant,
+# which means a mutation to either one is masked by the other. Tested directly so
+# both stay honest: a mutation check on the 409 path alone said "not caught" for two
+# real guards.
+
+
+async def test_call_turns_a_non_json_200_into_a_telegram_error() -> None:
+    """Not a bare ValueError. Raised from inside an `except` clause, a ValueError is
+    not offered to the siblings of that `try`, so it escaped the poll loop."""
+    api = FakeAPI(me_response=httpx.Response(200, text="<html>portal</html>"))
+    ch = channel(api)
+    try:
+        with pytest.raises(TelegramError, match="non-JSON body"):
+            await ch._call("getMe", {})
+    finally:
+        await ch.close()
+
+
+async def test_call_turns_a_non_object_200_into_a_telegram_error() -> None:
+    """`body.get("ok")` on a list is an AttributeError, with the same consequence."""
+    api = FakeAPI(me_response=httpx.Response(200, json=[1, 2]))
+    ch = channel(api)
+    try:
+        with pytest.raises(TelegramError, match="not an object"):
+            await ch._call("getMe", {})
+    finally:
+        await ch.close()
+
+
+async def test_identify_survives_an_error_that_is_not_a_telegram_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """httpx raises a bare RuntimeError from a closed client, and `_call` does not
+    convert it. `identify` is called from inside the poll loop's own `except`, so
+    anything it lets out kills the inbound path."""
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+    ch = TelegramChannel(
+        TOKEN,
+        (OWNER,),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(boom)),
+        poll_timeout=0,
+    )
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert await ch.identify() == ""  # returned, not raised
+        assert "getMe could not name this bot" in caplog.text
+    finally:
+        await ch.close()
+
+
+async def test_identify_asks_once_even_when_it_raises_oddly() -> None:
+    """The failure is cached whatever kind it was, so a 409 storm costs one call."""
+    calls = [0]
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        calls[0] += 1
+        raise RuntimeError("closed")
+
+    ch = TelegramChannel(
+        TOKEN,
+        (OWNER,),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(boom)),
+        poll_timeout=0,
+    )
+    try:
+        for _ in range(4):
+            assert await ch.identify() == ""
+        assert calls[0] == 1
+    finally:
+        await ch.close()
