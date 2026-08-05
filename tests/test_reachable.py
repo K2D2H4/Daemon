@@ -51,6 +51,12 @@ PENDING_CLASSES: dict[str, str] = {
 }
 
 WIRED_CLASSES = (
+    # What both endpoints do their work through. Named here because a capability
+    # layer nothing constructs is the same defect as an unreachable provider, one
+    # level up: `daemon/loop.py` and `daemon/voice/conversation.py` would take one
+    # as an argument, their tests would pass against a hand-made instance, and the
+    # assembled daemon would carry none.
+    "Companion",
     "TelegramChannel",
     "FileMemoryWriter",
     "MemoryRecall",

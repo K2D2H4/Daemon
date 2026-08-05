@@ -14,7 +14,8 @@ in `app.py`, which owns every concrete-implementation import here.
 | `setup.py` | the onboarding wizard: PC control, preset, hosted provider, keys, persona seed, pairing |
 | `wake_cli.py` | `daemon wake`: measure what the recognizer returns for the owner's phrase, save it as `DAEMON_WAKE_ALIASES`, then run the gate and print what fires. Writes `.env` through `setup.py`'s writer |
 | `config.py` | settings and the three presets. `HOSTED` resolves to the chosen provider |
-| `loop.py` | the text conversation: record → recall → complete → record → send |
+| `companion.py` | **what both endpoints can do, in one place**: `context` (persona + tool rules + the recall block), `record` + `index_recorded`, `specs` / `run_tools`. Add a capability here, not twice |
+| `loop.py` | the text transport: record → context → complete → record → send. Owns the tool loop's shape, `/approve`, and the wire |
 | `reflection.py` | the 04:00 pass: one local day → curated facts, entity notes, observations |
 | `tasks.py` | the `Task` enum. **Frozen** — it is the LLM routing key |
 | `tui.py` · `service.py` | terminal presentation, CJK-aware widths, plain text when not a tty · the LaunchAgent / systemd user unit, which holds no secrets |
@@ -23,7 +24,8 @@ in `app.py`, which owns every concrete-implementation import here.
 | `llm/` | `llm/base.py` (frozen) · `llm/gateway.py` · `llm/providers/` (4) · `llm/embedders/` |
 | `memory/` | `memory/schema.sql` (frozen) · `store` · `log` · `writer` · `recall` · `curated` · `entities` · `reindex` |
 | `voice/` | `voice/base.py` (frozen) · `voice/gemini_live.py` · `voice/audio.py` (PortAudio) · `voice/apple_audio.py` (macOS echo cancellation) · `voice/conversation.py` · `voice/vad.py` · `voice/apple_speech.py` · `voice/wake.py` |
-| `proactivity/` | `proactivity/base.py` (frozen) · `candidates` · `gate` · `presence` · `judge` · `delivery` · `speaker` · `tick`. `persona/` is still empty — M4 |
+| `proactivity/` | `proactivity/base.py` (frozen) · `candidates` · `gate` · `presence` · `judge` · `delivery` · `speaker` · `tick` |
+| `persona/` | `persona/loader.py` — the only place the persona is assembled. `seed.md` today; M4 adds `learned.md` to this one file |
 
 ## Layering
 
@@ -67,9 +69,19 @@ resolved path — a blocklist is not exhaustive. Date records by the day they ar
 `daemon/config.py` *and* give it a caller, or `tests/test_reachable.py` fails unless it is declared
 PENDING with the milestone that owns it.
 
+**Anything the daemon can *do*** — something new in front of the model, something new
+written down. It goes in `daemon/companion.py`, once, and both endpoints get it.
+Adding it to `daemon/loop.py` is how voice ended up recording every spoken turn and
+embedding none of them: two implementations of one thing, and only one of them
+complete. What genuinely belongs to an endpoint is *transport* — the wire, and when
+it is safe to write to it. That includes voice's injection timing, which is measured
+and must stay in `daemon/voice/conversation.py`: `clientContent` sent mid-generation
+kills the answer.
+
 ## Depends on
 
-Downwards only: `daemon/loop.py`, `daemon/voice/conversation.py`, `daemon/reflection.py`
+Downwards only: `daemon/loop.py`, `daemon/voice/conversation.py`, `daemon/companion.py`,
+`daemon/reflection.py`
 and `daemon/proactivity/` depend on the protocols in `daemon/llm/base.py`,
 `daemon/channels/base.py`, `daemon/memory/base.py` and `daemon/proactivity/base.py`,
 never on what implements them; `daemon/memory/` depends on `daemon/fs.py` and

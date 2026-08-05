@@ -172,6 +172,7 @@ async def test_ordinary_text_is_still_attributed_to_the_sender() -> None:
 async def test_relayed_text_is_recorded_as_untrusted(tmp_path: Path) -> None:
     """The end of the chain: schema.sql's origin column exists to be
     unforgeable, so laundering must be stopped before the row is written."""
+    from daemon.companion import Companion
     from daemon.loop import ConversationLoop
     from daemon.tasks import Task
 
@@ -196,9 +197,7 @@ async def test_relayed_text_is_recorded_as_untrusted(tmp_path: Path) -> None:
 
         async def close(self) -> None: ...
 
-    loop = ConversationLoop(
-        channel=Channel(), gateway=Gateway(), memory=writer, data_dir=tmp_path
-    )
+    loop = ConversationLoop(Channel(), Gateway(), Companion(writer, data_dir=tmp_path))
     try:
         await loop.handle(
             InboundMessage(

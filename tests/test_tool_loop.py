@@ -20,8 +20,9 @@ from conftest import FakeProvider
 from test_loop import FakeChannel, FakeMemory, gateway_for
 
 from daemon.channels.base import InboundMessage
+from daemon.companion import TOOL_CONTRACT, Companion
 from daemon.llm.base import ToolCall
-from daemon.loop import TOOL_CONTRACT, ConversationLoop
+from daemon.loop import ConversationLoop
 from daemon.memory.store import Store
 from daemon.tools.base import Registry
 from daemon.tools.builtin import builtin_tools
@@ -67,7 +68,10 @@ def loop_for(
     **kw: Any,
 ) -> ConversationLoop:
     return ConversationLoop(
-        channel, gateway_for(provider), memory, data_dir=data_dir, tools=tools, **kw
+        channel,
+        gateway_for(provider),
+        Companion(memory, data_dir=data_dir, tools=tools),
+        **kw,
     )
 
 

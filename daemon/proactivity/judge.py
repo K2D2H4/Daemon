@@ -68,12 +68,12 @@ silent degradation is this project's signature defect.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 
 from daemon.llm.base import Message, ProviderError
 from daemon.llm.gateway import LLMGateway
+from daemon.persona import loader as persona
 from daemon.proactivity.base import Candidate, Utterance
 from daemon.reflection import extract_json
 from daemon.tasks import Task
@@ -139,9 +139,12 @@ class Judge:
 
     def __init__(self, gateway: LLMGateway, data_dir: Path) -> None:
         self._gateway = gateway
-        # The same file `daemon/loop.py` reads, read the same way: seed.md is
-        # human-owned and an edit takes effect without a restart (PLAN 5.1).
-        self._seed_path = Path(data_dir) / "persona" / "seed.md"
+        self._data_dir = Path(data_dir)
+        # Named for the warning below, which has to say *which* file is missing. The
+        # read itself goes through `daemon/persona/loader.py`, the one place the
+        # persona is assembled - so a judge speaking first uses the same persona the
+        # conversation does, and M4's learned rules reach it without a change here.
+        self._seed_path = self._data_dir / "persona" / persona.SEED
 
     async def decide(self, candidate: Candidate) -> Utterance:
         """What to say about `candidate`, or a falsy `Utterance` and why not.
@@ -150,7 +153,7 @@ class Judge:
         answer to "could not reach the model" is the same as the answer to "nothing
         worth saying", and the tick records nothing either way.
         """
-        seed = await self._read_seed()
+        seed = await persona.load(self._data_dir)
         if not seed:
             # Reported rather than swallowed: proactivity going permanently quiet
             # because a file is missing must not look like a quiet week.
@@ -179,16 +182,6 @@ class Judge:
         if not utterance:
             logger.info("judge: declined %s (%s)", candidate.kind, utterance.why_not)
         return utterance
-
-    async def _read_seed(self) -> str:
-        try:
-            return (await asyncio.to_thread(self._seed_path.read_text, encoding="utf-8")).strip()
-        except FileNotFoundError:
-            return ""
-        except OSError:
-            logger.exception("could not read %s", self._seed_path)
-            return ""
-
 
 def _reason_block(candidate: Candidate) -> str:
     reason = " ".join(candidate.reason.split())[:MAX_REASON_CHARS]

@@ -223,6 +223,7 @@ async def test_a_redelivered_message_is_not_recorded_twice(tmp_path: Path) -> No
     """Belt and braces for the one-message window the cursor cannot close: the
     crash between handling and confirming."""
     from daemon.channels.base import InboundMessage
+    from daemon.companion import Companion
     from daemon.llm.base import Completion
     from daemon.loop import ConversationLoop
 
@@ -247,7 +248,7 @@ async def test_a_redelivered_message_is_not_recorded_twice(tmp_path: Path) -> No
 
         async def close(self) -> None: ...
 
-    loop = ConversationLoop(Channel(), Gateway(), writer, data_dir=tmp_path)
+    loop = ConversationLoop(Channel(), Gateway(), Companion(writer, data_dir=tmp_path))
     inbound = InboundMessage(
         text="같은 메시지",
         sender_id=str(OWNER),

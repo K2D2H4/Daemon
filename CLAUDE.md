@@ -27,20 +27,28 @@ flowchart TD
   APP["daemon/app.py<br/><i>the only place implementations are imported</i>"]
   PROTO["protocols<br/>llm · channels · memory · voice base.py"]
   IMPL["implementations<br/>providers · telegram · writer · gemini_live"]
-  CORE["daemon/loop.py<br/>daemon/voice/conversation.py"]
-  FOUND["memory · fs.py · clock.py · config.py"]
+  CAP["daemon/companion.py<br/><i>what it can do — one copy</i>"]
+  CORE["endpoints<br/>daemon/loop.py · daemon/voice/conversation.py"]
+  FOUND["memory · persona/loader.py · fs.py · clock.py · config.py"]
 
   APP --> IMPL
   APP --> CORE
+  APP --> CAP
+  CORE --> CAP
+  CAP --> PROTO
   CORE --> PROTO
   IMPL -.implements.-> PROTO
+  CAP --> FOUND
   CORE --> FOUND
   IMPL --> FOUND
 ```
 
-No arrow from `CORE` to `IMPL`, and that absence is the rule. `tests/` depends on
-all of it, `scripts/` on none. Runtime data flow is a different question, answered
-in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+No arrow from `CORE` to `IMPL`, and that absence is the rule. Nor one from `CAP`
+back to `CORE`: a capability that knows which endpoint is asking is a capability
+about to be written twice — which is how voice came to record every spoken turn and
+embed none of them. `tests/` depends on all of it, `scripts/` on none. Runtime data
+flow is a different question, answered in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Commands
 
