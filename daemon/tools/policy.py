@@ -19,7 +19,10 @@ way to hand a stranger a shell, so:
     no tool runs on a turn whose origin is not 'owner' - in every mode, `full`
     included, with no way to configure it off.
 
-That is why `decide` takes an origin and why it is checked before anything else.
+That is why `decide` takes an origin, and why nothing below it - not a mode, not
+an allowlist, not a standing grant - can reach past it. (The `_enabled` check runs
+first, because tools being switched off refuses everything anyway; origin is the first
+check that can distinguish one turn from another.)
 """
 
 from __future__ import annotations

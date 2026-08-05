@@ -1333,3 +1333,64 @@ async def test_gemini_drops_an_assistant_turn_with_nothing_in_it() -> None:
 )
 async def test_tool_arguments_are_normalised_to_a_dict(raw: object, expected: dict) -> None:
     assert decode_tool_arguments(raw) == expected
+
+
+async def test_ollama_pairs_a_result_by_name_not_by_synthesised_id() -> None:
+    """The round trip with the id Ollama actually produces, which is none.
+
+    The test above hand-built `call_1`, so it only proved that whatever id went in
+    came back out - and what came back out was `read_file-0` in the field Ollama
+    reads as a *name*. Driving the real synthesised id is what catches it.
+    """
+    payloads: list[dict] = []
+    async with mock_client(lambda r: httpx.Response(200, json=OLLAMA_TOOL_CALL)) as client:
+        asked = await OllamaProvider(client=client).complete(PROMPT, model="m", tools=TOOLS)
+    (call,) = asked.tool_calls
+    assert call.id == "run_command-0", "the id is synthesised from name and position"
+
+    turns = [
+        *PROMPT,
+        Message(role="assistant", content="", tool_calls=asked.tool_calls),
+        Message(role="tool", content="Mon 3 Aug 2026", tool_call_id=call.id),
+    ]
+    async with mock_client(capture(payloads, OLLAMA_OK)) as client:
+        await OllamaProvider(client=client).complete(turns, model="m", tools=TOOLS)
+
+    assert payloads[0]["messages"][-1]["tool_name"] == "run_command"
+
+
+async def test_a_provider_issued_id_is_not_mangled() -> None:
+    """`call_name` only strips a `-<digits>` suffix, so a real id with a dash in it
+    survives - Ollama does hand one over sometimes."""
+    payloads: list[dict] = []
+    turns = [
+        *PROMPT,
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=(ToolCall(id="abc-def", name="run_command", arguments={}),),
+        ),
+        Message(role="tool", content="out", tool_call_id="abc-def"),
+    ]
+    async with mock_client(capture(payloads, OLLAMA_OK)) as client:
+        await OllamaProvider(client=client).complete(turns, model="m", tools=TOOLS)
+    assert payloads[0]["messages"][-1]["tool_name"] == "abc-def"
+
+
+@pytest.mark.parametrize(
+    ("call_id", "expected"),
+    [
+        ("read_file-0", "read_file"),
+        ("run_command-12", "run_command"),
+        ("notes__search-0", "notes__search"),
+        ("call_abc123", "call_abc123"),
+        ("abc-def", "abc-def"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+async def test_call_name_inverts_the_synthesised_id(call_id: object, expected: str) -> None:
+    from daemon.llm.base import call_name, synthesise_call_id
+
+    assert call_name(call_id) == expected  # type: ignore[arg-type]
+    assert call_name(synthesise_call_id("read_file", 3)) == "read_file"

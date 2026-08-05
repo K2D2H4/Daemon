@@ -332,12 +332,13 @@ async def test_a_forwarded_message_cannot_reach_the_machine(
 
         assert not target.exists()
         assert len(api.sent) == 1, "no approval should have been offered either"
+        assert model.offered == [()], "an untrusted turn was offered tools"
 
     store = Store.open(tmp_path / DB_FILENAME)
     try:
-        (row,) = store.recent_tool_calls()
-        assert row["ran"] == 0 and row["verdict"] == "deny"
-        assert row["origin"] == "untrusted"
+        # No audit row, because nothing reached the runner to audit - the turn was
+        # offered no tools at all. The runner-level refusal has its own test.
+        assert not store.recent_tool_calls()
         # And the words were still recorded, as somebody else's.
         assert [r["origin"] for r in store.recent(5) if r["role"] == "user"] == ["untrusted"]
     finally:

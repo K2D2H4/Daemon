@@ -537,7 +537,7 @@ Daemon은 자기가 사는 기계를 열어볼 수도 없었다. 이건 기능 �
 | | Hermes Agent | OpenClaw | Daemon |
 |---|---|---|---|
 | 도구 수 | ~81개, 25 toolset, `tools/registry.py` 자기등록 | ~26개 (`exec`/`process`/`read`/`write`/`browser`/`screen`) | **내장 7개 + MCP.** 유저 1명, 기계 1대 — 81개는 우리가 채울 플랫폼 표면이 아니다 |
-| 필터 | toolset 플래그 + 크레덴셜 + 플랫폼 | `tools.allow`/`tools.deny`, **"정책은 모델 호출 전에 적용"** | 같음. 레지스트리를 걸러서 스키마 자체를 안 보낸다 |
+| 필터 | toolset 플래그 + 크레덴셜 + 플랫폼 | `tools.allow`/`tools.deny`, **"정책은 모델 호출 전에 적용"** | 비슷함. owner 턴이 아니면 스키마를 아예 안 보내고, 개별 호출은 실행 직전에 다시 판정 |
 | exec 안전장치 | **문서상 없음** — `terminal`이 임의 셸 실행 | `tools.exec.mode` = `deny`/`allowlist`/`ask`/`auto`/`full`, 승인 시 **cwd+argv+실행파일 경로 바인딩**, 승인 후 파일 변경되면 거부, allowlist 모드에서 체이닝·리다이렉션 거부, SQLite 영속화 | **거의 그대로 이식** (§10.2). `auto`만 버렸다 — 리뷰어 모델을 쓰는데, 게이트를 열지 물어보는 모델은 게이트가 아니다 |
 | 승인 UX | — | 게이트웨이가 `exec.approval.requested` 브로드캐스트, UI 없으면 `askFallback: deny` | 채널로 짧은 코드 — 이미 있는 페어링 플로우와 같은 모양 |
 | MCP | — | `mcp` CLI, 서버를 config로 | MCP 클라이언트. 툴은 네임스페이스 + **같은 정책 아래** |

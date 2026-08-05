@@ -73,6 +73,30 @@ class Completion:
     `text` is often empty - a provider must not treat that as a failed call."""
 
 
+def synthesise_call_id(name: str, index: int) -> str:
+    """A call id for a provider that issues none, and `call_name` recovers the name.
+
+    Two providers need this - Gemini issues no ids at all, and Ollama issues them
+    only sometimes - and both then have to pair a *result* back to its request by
+    name rather than by id. Keeping the format and its inverse together is the point:
+    they were written separately, and Ollama's half sent the whole `read_file-0` back
+    where its own comment said the name should go.
+    """
+    return f"{name}-{index}"
+
+
+def call_name(call_id: str | None) -> str:
+    """The function name out of a `synthesise_call_id` id, or the id unchanged.
+
+    Left alone when it does not have the synthesised shape, so a real provider-issued
+    id is not mangled by a stray dash in it.
+    """
+    if not call_id:
+        return ""
+    head, _, tail = call_id.rpartition("-")
+    return head if head and tail.isdigit() else call_id
+
+
 def decode_tool_arguments(raw: object) -> dict[str, Any]:
     """Normalise whatever a provider calls tool arguments into a dict.
 
@@ -140,9 +164,11 @@ class Provider(Protocol):
     ) -> Completion:
         """`tools` offers the model a set of tools it may ask for.
 
-        Offering is not permission: what the model is allowed to *reach* is
-        decided deterministically before this call, by filtering the specs
-        (daemon/tools/policy.py). A provider only translates.
+        Offering is not permission. A caller that must not reach tools at all is
+        handed none - `loop.py` passes nothing on a turn that is not the owner's own
+        words - and every individual call is decided again by
+        `daemon/tools/policy.py` before it runs. A provider only translates; it never
+        decides.
         """
         ...
 

@@ -20,7 +20,9 @@ from daemon.llm.base import (
     ProviderError,
     ToolCall,
     ToolSpec,
+    call_name,
     decode_tool_arguments,
+    synthesise_call_id,
 )
 
 DEFAULT_TIMEOUT = 120.0
@@ -164,8 +166,11 @@ def _turn(message: Message) -> dict[str, Any]:
     if message.role == "tool":
         # Ollama matches results to requests by position and by name, not by id:
         # there is no `tool_call_id` in its schema, and sending one is ignored at
-        # best. `tool_name` is what recent versions read.
-        turn["tool_name"] = message.tool_call_id or ""
+        # best. `tool_name` is what recent versions read - so the *name* goes here,
+        # recovered from the synthesised id. Sending the id itself put `read_file-0`
+        # where `read_file` belonged, which is the pairing this line exists to get
+        # right.
+        turn["tool_name"] = call_name(message.tool_call_id)
     return turn
 
 
@@ -189,7 +194,7 @@ def _tool_calls(message: dict[str, Any]) -> tuple[ToolCall, ...]:
             continue
         calls.append(
             ToolCall(
-                id=str(item.get("id") or f"{name}-{index}"),
+                id=str(item.get("id") or synthesise_call_id(name, index)),
                 name=name,
                 arguments=decode_tool_arguments(function.get("arguments")),
             )

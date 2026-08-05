@@ -81,9 +81,10 @@ FROZEN means: do not edit without flagging it first.
     with any setting, `full` included. `InboundMessage.authored_by_sender` is False
     for a forward or an inline-bot result, and recall replays arbitrary old text
     into every prompt - so without this gate, "look at this message" is a way to
-    hand a stranger a shell. Decided in `tools/policy.py:decide`, before the model
-    is called, and it is the first check in the function for a reason. If you find
-    yourself needing an exception, stop and flag it.
+    hand a stranger a shell. Enforced twice on purpose: `loop.py` offers such a turn
+    no tools at all, and `tools/policy.py:decide` refuses every call regardless of
+    mode, allowlist or standing grant. The offering side is a convenience; `decide`
+    is the guarantee. If you find yourself needing an exception, stop and flag it.
 
 11. **The tool policy makes no model calls.** Same rule as recall Lane 1 and for a
     different reason: a gate that asks a model whether to open the gate is not a

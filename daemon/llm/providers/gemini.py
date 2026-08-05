@@ -23,7 +23,9 @@ from daemon.llm.base import (
     ProviderError,
     ToolCall,
     ToolSpec,
+    call_name,
     decode_tool_arguments,
+    synthesise_call_id,
 )
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -236,9 +238,7 @@ def _contents(messages: list[Message]) -> list[dict[str, Any]]:
                     "parts": [
                         {
                             "functionResponse": {
-                                # The synthesised id is `name-index`, so the name is
-                                # recovered by dropping the suffix.
-                                "name": _call_name(message.tool_call_id),
+                                "name": call_name(message.tool_call_id),
                                 # Must be an object, not a bare string.
                                 "response": {"result": message.content},
                             }
@@ -262,14 +262,6 @@ def _contents(messages: list[Message]) -> list[dict[str, Any]]:
     return contents
 
 
-def _call_name(call_id: str | None) -> str:
-    """The function name out of a synthesised `name-index` id."""
-    if not call_id:
-        return ""
-    head, _, tail = call_id.rpartition("-")
-    return head if head and tail.isdigit() else call_id
-
-
 def _tool_calls(parts: list[Any]) -> tuple[ToolCall, ...]:
     calls: list[ToolCall] = []
     for index, part in enumerate(parts):
@@ -283,7 +275,7 @@ def _tool_calls(parts: list[Any]) -> tuple[ToolCall, ...]:
             ToolCall(
                 # Synthesised: this API issues none, and the loop needs something
                 # to pair a result with its request within the turn.
-                id=f"{name}-{index}",
+                id=synthesise_call_id(name, index),
                 name=name,
                 arguments=decode_tool_arguments(call.get("args")),
             )

@@ -186,7 +186,7 @@ class ConversationLoop:
                 # markdown write, so `/approve A3F2K9QT` does not become a memory
                 # that recall surfaces next week. What it authorised is recorded in
                 # `tool_calls` instead, where it belongs. A replay after a restart
-                # is harmless because a code is spent in a single UPDATE.
+                # is harmless because spending a code is single-use (memory/store.py).
                 await self._approve(inbound, command, origin=origin)
                 return
 
@@ -250,9 +250,15 @@ class ConversationLoop:
         """The model's reply, running whatever tools it asks for on the way.
 
         With no tool runner this is one call and nothing else, which is exactly the
-        behaviour before tools existed.
+        behaviour before tools existed. A turn that is not the owner's own words is
+        the same case: nothing is offered, so the model is not put in the position of
+        asking for something that will be refused - and `llm/base.py`'s claim that
+        what the model may reach is decided *before* the call becomes true rather
+        than aspirational. `ToolPolicy.decide` still refuses it at execution; two
+        layers, because the offering side is a convenience and the gate is the
+        guarantee.
         """
-        if self._tools is None or not len(self._tools):
+        if self._tools is None or not len(self._tools) or context.origin != "owner":
             completion = await self._gateway.complete(Task.CHAT_TEXT, messages)
             return completion.text, Outcome()
 
@@ -354,6 +360,7 @@ class ConversationLoop:
         completion = await self._gateway.complete(Task.CHAT_TEXT, messages)
         text = _with_notices(completion.text, [f"🔧 {claimed.preview}"])
 
+        pending_index: list[tuple[int, str]] = []
         await self._memory.record(
             LoggedMessage(
                 ts=clock.now(),
@@ -365,7 +372,13 @@ class ConversationLoop:
                 channel=inbound.channel,
             )
         )
+        self._note_for_index(pending_index, text)
         await say(text)
+        # Indexed like any other reply. Recording without indexing left this one turn
+        # with no vector until the next restart's backfill, and it is the turn most
+        # likely to be asked about later ("what did you change in my todo?") - the
+        # same "looks like it works" gap `handle` argues against above.
+        await self._index(pending_index)
 
     async def _assemble_after_tool(
         self, preview: str, output: str, *, said: str
@@ -417,9 +430,13 @@ class ConversationLoop:
         seed = await self._read_seed()
         if seed:
             messages.append(Message(role="system", content=seed))
-        if self._tools is not None and len(self._tools):
+        if self._tools is not None and len(self._tools) and inbound.authored_by_sender:
             # After the seed, before recall: the seed is who it is, this is what it
             # may touch, and recall is material it is reasoning over.
+            #
+            # Skipped on a relayed turn for the same reason the tools themselves are:
+            # this describes tools that will not be offered, so it is two hundred
+            # tokens of rules about a capability the model does not have on this turn.
             messages.append(Message(role="system", content=TOOL_CONTRACT))
 
         history = await self._memory.recent(limit=self._context_turns)

@@ -396,10 +396,12 @@ class Store:
     ) -> sqlite3.Row | None:
         """Claim a pending, unexpired approval, returning the row that was claimed.
 
-        One statement, so two messages carrying the same code cannot both win and
-        run the command twice. `sender_id` is part of the WHERE clause because a
-        guest who was allowlisted for conversation must not be able to spend an
-        approval addressed to the owner.
+        Two statements in one transaction, and the `state = 'pending'` in the SELECT
+        is what makes it single-use: once the UPDATE has landed, a second attempt
+        selects nothing. (An earlier version of this docstring claimed "one statement",
+        which was simply wrong about its own mechanism.) `sender_id` is part of the
+        WHERE clause because a guest who was allowlisted for conversation must not be
+        able to spend an approval addressed to the owner.
         """
         with self.conn:
             row = self.conn.execute(
