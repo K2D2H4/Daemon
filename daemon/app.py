@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -671,8 +672,6 @@ async def run_voice(settings: Settings) -> int:
     from daemon.memory.reindex import reindex
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
-    from daemon.voice.audio import SoundDeviceAudio
-    from daemon.voice.conversation import VoiceConversation
     from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
 
     if not settings.voice_enabled:
@@ -690,23 +689,32 @@ async def run_voice(settings: Settings) -> int:
         memory = FileMemoryWriter(settings.data_dir, store)
         recall, _status, embedder = _build_recall(settings, store)
         seed = _read_seed(settings.data_dir)
-        audio = SoundDeviceAudio()
-        session = GeminiLiveSession(
-            api_key=settings.gemini_api_key,
-            model=route.model,
-            # The persona is the seed, same as the text path. Without it the model
-            # answers as a generic assistant, which is the one voice PLAN 5 says
-            # this product must not have.
-            system_instruction=seed or None,
-        )
-        conversation = VoiceConversation(
-            session, audio, memory, recall=recall, recall_limit=settings.recall_limit
-        )
+        audio = build_voice_audio()
+
+        def new_session() -> Any:
+            """A fresh session per attempt. Reconnecting means starting clean: the
+            old one carries a half-flushed transcript, a partial-transcript queue
+            nobody will read again, and a log filter holding the API key."""
+            return GeminiLiveSession(
+                api_key=settings.gemini_api_key,
+                model=route.model,
+                # The persona is the seed, same as the text path. Without it the
+                # model answers as a generic assistant, which is the one voice
+                # PLAN 5 says this product must not have.
+                system_instruction=seed or None,
+                # Empty and None pass straight through as "leave it to the server",
+                # so an unconfigured install sends no `realtimeInputConfig` at all -
+                # the behaviour every session had before these settings existed.
+                start_sensitivity=settings.voice_start_sensitivity,
+                end_sensitivity=settings.voice_end_sensitivity,
+                prefix_padding_ms=settings.voice_prefix_padding_ms,
+                silence_duration_ms=settings.voice_silence_duration_ms,
+            )
+
         try:
-            await conversation.run()
-        except GeminiLiveError as exc:
-            logger.error("voice session failed: %s", exc)
-            return PROBLEM
+            return await _voice_attempts(
+                new_session, audio, memory, recall, settings, GeminiLiveError
+            )
         finally:
             with suppress(Exception):
                 await audio.close()
@@ -715,11 +723,98 @@ async def run_voice(settings: Settings) -> int:
                 if closer is not None:
                     with suppress(Exception):
                         await closer()
-        if conversation.ended:
-            logger.info("voice session ended: %s", conversation.ended)
-        return OK
     finally:
         store.close()
+
+
+VOICE_RECONNECT_ATTEMPTS = 3
+"""How many times a dropped conversation is picked back up.
+
+Bounded, and bounded here rather than inside the session, because the two failures
+need different answers: a socket that will not *open* should fail fast and let the
+caller fall back to text, while a socket that opened, worked, and was then cut has a
+conversation in progress that the user is standing in the middle of. Three, because
+the thing being ridden out is a transport hiccup or a server-side session limit, and
+anything that survives three attempts and 6s is not weather. Sessions bill per
+minute, so this is deliberately not a reconnect-forever loop."""
+
+VOICE_RECONNECT_BACKOFF_SECONDS = 2.0
+"""Flat, not exponential. The gap the user is standing in is silence, and doubling
+it turns a recoverable hiccup into an abandoned conversation."""
+
+
+async def _voice_attempts(
+    new_session: Callable[[], Any],
+    audio: AudioIO,
+    memory: MemoryWriter,
+    recall: Recall | None,
+    settings: Settings,
+    session_error: type[Exception],
+) -> int:
+    """Hold a conversation, and pick it back up if the session is cut.
+
+    Until this existed a dropped socket simply ended `daemon voice`: mid-sentence,
+    with a shell exit code, and nothing said about whether it was the network or the
+    key. The two cases that are worth resuming are a transient close - 1011, or the
+    1008 that is really an idle timeout - and a `goAway`, which is the server saying
+    it is about to end the session rather than the turn and which used to read
+    exactly like a conversation that had finished.
+
+    What is *not* resumed: a permanent failure (a bad key, a wrong model id, a
+    malformed setup), because retrying leaves the process alive, healthy-looking and
+    mute; and an ordinary idle timeout, because that is the conversation being over.
+    """
+    from daemon.voice.conversation import VoiceConversation
+
+    for attempt in range(1, VOICE_RECONNECT_ATTEMPTS + 1):
+        session = new_session()
+        conversation = VoiceConversation(
+            session, audio, memory, recall=recall, recall_limit=settings.recall_limit
+        )
+        failure: Exception | None = None
+        try:
+            await conversation.run()
+        except session_error as exc:
+            failure = exc
+        finally:
+            # Reported on every exit path including the failing ones, because a
+            # session that cut itself off mid-answer is a session that *ran*. This
+            # is the only place these numbers surface: `interruptions` was counted
+            # for three milestones and printed nowhere, so a self-interruption on
+            # every single turn - a full answer generated and 0.0s of it played -
+            # looked like nothing at all from outside.
+            logger.info(
+                "voice session%s: %s",
+                f" (attempt {attempt})" if attempt > 1 else "",
+                conversation.stats.describe(),
+            )
+        if conversation.ended:
+            logger.info("voice session ended: %s", conversation.ended)
+
+        if failure is None and not getattr(session, "going_away", False):
+            return OK
+        if failure is not None and getattr(failure, "permanent", False):
+            logger.error("voice session failed and retrying cannot help: %s", failure)
+            return PROBLEM
+        if attempt == VOICE_RECONNECT_ATTEMPTS:
+            if failure is not None:
+                logger.error(
+                    "voice session failed %d times, giving up: %s", attempt, failure
+                )
+                return PROBLEM
+            # A `goAway` on the last attempt is the server ending things, not a
+            # fault. The conversation is over; saying so is not an error.
+            logger.info("voice: the server ended the session and the retries are spent")
+            return OK
+        logger.warning(
+            "voice: %s; reconnecting in %.0fs (attempt %d of %d)",
+            failure or "the server announced it was ending the session",
+            VOICE_RECONNECT_BACKOFF_SECONDS,
+            attempt + 1,
+            VOICE_RECONNECT_ATTEMPTS,
+        )
+        await asyncio.sleep(VOICE_RECONNECT_BACKOFF_SECONDS)
+    return PROBLEM  # pragma: no cover - the loop returns on every path
 
 
 def _wake_health(state: Any) -> str:
@@ -847,10 +942,45 @@ def build_wake_recognizer() -> SpeechRecognizer:
 
 
 def build_wake_audio() -> AudioIO:
-    """The microphone, for one calibration take."""
+    """The microphone, for one calibration take.
+
+    Deliberately *not* the echo-cancelling path, even on macOS. Voice processing
+    applies its own gain control, and `DAEMON_WAKE_ALIASES` is a measurement of
+    what the recognizer returns for this speaker through this capture path - so
+    calibrating through one path and listening through another would quietly
+    invalidate the strings the gate matches on.
+    """
     from daemon.voice.audio import SoundDeviceAudio
 
     return SoundDeviceAudio()
+
+
+def build_voice_audio() -> AudioIO:
+    """Microphone and speaker for one conversation, echo-cancelled where possible.
+
+    The conversation is the only place that needs cancellation, and it needs it
+    badly: it keeps the microphone open while the model talks, because that is the
+    only way a barge-in can be noticed (daemon/voice/conversation.py). Measured on
+    this project's target machine, Silero at 0.5 over 10 s of Korean TTS out of the
+    speaker - 80.1% of microphone frames read as speech through PortAudio and 0.0%
+    through macOS voice processing, while speech from a source the canceller does
+    not know about still reads 81.6%. So the echo goes and the user does not.
+
+    The wake gate keeps PortAudio (see `build_wake_audio`), and so does every
+    platform without an Apple canceller: PortAudio has no path to enable one, so on
+    Linux this is the honest best available rather than a fallback.
+    """
+    if sys.platform != "darwin":
+        from daemon.voice.audio import SoundDeviceAudio
+
+        return SoundDeviceAudio()
+    from daemon.voice.apple_audio import VoiceProcessingAudio
+
+    # No automatic fall back to PortAudio if this cannot start. Falling back would
+    # mean the daemon interrupting itself while looking healthy, which is the
+    # failure class this repo treats as the dangerous one; a readable error naming
+    # the engine is worth more than a working-looking session that cuts itself off.
+    return VoiceProcessingAudio()
 
 
 async def build_wake_gate(

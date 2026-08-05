@@ -44,7 +44,7 @@ from websockets.exceptions import (
     InvalidStatus,
 )
 
-from daemon.voice.base import Transcript
+from daemon.voice.base import Interrupted, Transcript
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,17 @@ a session, speaks and closes without ever asking what the user is saying - and a
 unbounded queue nobody drains grows for the length of the session. Dropping the
 oldest costs nothing: each partial is the whole utterance so far, so the newest
 one contains every older one."""
+
+SENSITIVITIES = ("low", "high")
+"""What a caller may ask for, in the words a person would write in `.env`.
+
+The wire wants `START_SENSITIVITY_LOW`; nobody should have to type that, and the
+short form is what makes the pair below the only place the enum spelling exists.
+`UNSPECIFIED` is deliberately absent - it means "the server decides", which is
+already what omitting the field does."""
+
+_START_SENSITIVITY = {name: f"START_SENSITIVITY_{name.upper()}" for name in SENSITIVITIES}
+_END_SENSITIVITY = {name: f"END_SENSITIVITY_{name.upper()}" for name in SENSITIVITIES}
 
 _PERMANENT_STATUS = frozenset({400, 401, 403, 404})
 """Handshake statuses that retrying cannot fix: a bad, revoked or unauthorised
@@ -241,6 +252,10 @@ class GeminiLiveSession:
         *,
         system_instruction: str | None = None,
         voice_name: str | None = None,
+        start_sensitivity: str = "",
+        end_sensitivity: str = "",
+        prefix_padding_ms: int | None = None,
+        silence_duration_ms: int | None = None,
         connect: Any = None,
         url: str = WS_URL,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
@@ -258,6 +273,18 @@ class GeminiLiveSession:
         # No language code: the native-audio models pick the language themselves
         # and reject being told, which matters for a Korean-first user.
         self._voice_name = voice_name
+        # Checked here rather than left to the server, because the server's answer
+        # is a 1007 close - classified permanent above, so a typo in one of these
+        # would not fail the setting, it would end voice mode outright.
+        for name in (start_sensitivity, end_sensitivity):
+            if name and name not in SENSITIVITIES:
+                raise ValueError(
+                    f"sensitivity must be one of {SENSITIVITIES} or empty, not {name!r}"
+                )
+        self._start_sensitivity = start_sensitivity
+        self._end_sensitivity = end_sensitivity
+        self._prefix_padding_ms = prefix_padding_ms
+        self._silence_duration_ms = silence_duration_ms
         self._connect = connect if connect is not None else websockets.connect
         self._url = url
         self._max_attempts = max(1, max_attempts)
@@ -409,7 +436,7 @@ class GeminiLiveSession:
             return
         await self._send({"realtimeInput": {"text": text}})
 
-    async def receive(self) -> AsyncIterator[bytes | Transcript]:
+    async def receive(self) -> AsyncIterator[bytes | Transcript | Interrupted]:
         """One turn: audio chunks to play, interleaved with completed transcripts.
 
         Only `final=True` transcripts are ever yielded. Gemini streams
@@ -647,7 +674,36 @@ class GeminiLiveSession:
         }
         if self._system_instruction:
             setup["systemInstruction"] = {"parts": [{"text": self._system_instruction}]}
+        detection = self._activity_detection()
+        if detection:
+            setup["realtimeInputConfig"] = {"automaticActivityDetection": detection}
         return {"setup": setup}
+
+    def _activity_detection(self) -> dict[str, Any]:
+        """How the server decides the user started and stopped talking.
+
+        Sent only for the fields a caller actually set, and the distinction is the
+        point: omitting a field leaves the server's own default, and the default
+        `silenceDurationMs` is ~800 ms
+        (https://ai.google.dev/gemini-api/docs/live-guide). Sending a value for
+        everything would mean picking three numbers to get one, and each of the
+        other two would then be a guess presented as a decision.
+
+        Nothing here disables detection. `disabled: true` hands turn boundaries to
+        the client, which means this session would have to send
+        `activityStart`/`activityEnd` itself and something local would have to
+        decide when - a different design, not a setting.
+        """
+        detection: dict[str, Any] = {}
+        if self._start_sensitivity:
+            detection["startOfSpeechSensitivity"] = _START_SENSITIVITY[self._start_sensitivity]
+        if self._end_sensitivity:
+            detection["endOfSpeechSensitivity"] = _END_SENSITIVITY[self._end_sensitivity]
+        if self._prefix_padding_ms is not None:
+            detection["prefixPaddingMs"] = self._prefix_padding_ms
+        if self._silence_duration_ms is not None:
+            detection["silenceDurationMs"] = self._silence_duration_ms
+        return detection
 
     def _parse(self, raw: str | bytes) -> dict[str, Any] | None:
         try:
@@ -657,7 +713,7 @@ class GeminiLiveSession:
             return None
         return message if isinstance(message, dict) else None
 
-    def _decode(self, raw: str | bytes) -> Iterator[bytes | Transcript]:
+    def _decode(self, raw: str | bytes) -> Iterator[bytes | Transcript | Interrupted]:
         message = self._parse(raw)
         if message is None:
             return
@@ -676,7 +732,25 @@ class GeminiLiveSession:
         # carry several fields at once, and audio from an interrupted turn must
         # not slip out ahead of the flag that condemns it.
         if content.get("interrupted"):
-            self._dropping = True
+            # Only while there is a turn to abandon, and the guard is not tidiness.
+            # Measured against the live API, four runs: `interrupted` arrives about
+            # 0.25s *after* `generationComplete` on a turn nobody interrupted -
+            # every time. Acted on then it drops a complete answer out of the
+            # speaker mid-playback, which is the same shape as the bug `interrupt()`
+            # below already guards against, one layer earlier.
+            if self._generating:
+                self._dropping = True
+                # Handed to the caller as well as acted on here, because dropping
+                # the rest of the stream is only half of a barge-in - the speaker's
+                # own buffer has to go too, and only the caller has the speaker.
+                # This is the *authoritative* signal: it is the server's own
+                # activity detection, and inferring it from transcripts instead
+                # killed every turn (daemon/voice/base.py, `Interrupted`).
+                yield Interrupted()
+            else:
+                logger.debug(
+                    "gemini-live: ignoring an interruption with nothing being generated"
+                )
 
         for part in (content.get("modelTurn") or {}).get("parts") or []:
             data = (part.get("inlineData") or {}).get("data")

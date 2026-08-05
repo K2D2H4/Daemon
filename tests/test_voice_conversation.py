@@ -18,6 +18,7 @@ import json
 import pathlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,7 +27,7 @@ from websockets.frames import Close
 
 from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.voice import conversation as conversation_module
-from daemon.voice.base import AudioIO, Transcript, VoiceSession
+from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 from daemon.voice.conversation import VoiceConversation
 from daemon.voice.gemini_live import GeminiLiveSession
 
@@ -51,6 +52,17 @@ class Says:
 @dataclass(frozen=True)
 class Turn:
     """A turn boundary: the accumulated transcript is released, final."""
+
+
+@dataclass(frozen=True)
+class Cuts:
+    """The provider's activity detection says the user talked over the answer.
+
+    A script step rather than something the fake infers, because inferring it is
+    the bug: `serverContent.interrupted` is the only thing that knows, and the
+    conversation used to guess from transcript growth instead - which fired on
+    every turn, since this provider delivers the user's transcript in the same
+    event as the answer's first audio (daemon/voice/base.py)."""
 
 
 @dataclass(frozen=True)
@@ -134,6 +146,8 @@ class FakeSession:
                     # is nothing to wait for. One turn of the loop, so the
                     # microphone pump gets to run.
                     await asyncio.sleep(0)
+            elif isinstance(step, Cuts):
+                yield Interrupted()
             elif isinstance(step, Turn):
                 for transcript in self._drain(final=True):
                     yield transcript
@@ -524,7 +538,8 @@ async def test_a_barge_in_stops_the_stream_and_the_speaker_both() -> None:
     events: list[str] = []
     session = FakeSession(
         b"\x01",  # the daemon is talking
-        Says("user", "아니 잠깐만"),  # and the user starts talking over it
+        Says("user", "아니 잠깐만"),  # the user starts talking over it
+        Cuts(),  # and the provider's own activity detection says so
         Turn(),
         events=events,
     )
@@ -874,3 +889,251 @@ async def test_a_provider_with_nothing_pending_is_not_a_problem() -> None:
     await asyncio.gather(task, return_exceptions=True)
 
     assert memory.records == []
+
+
+# --- what the session reports about itself -----------------------------------
+# Every number here used to exist and never leave the object. The one that
+# mattered - `interruptions` - is how the daemon cutting itself off would have
+# been visible, and it was counted for three milestones and printed nowhere.
+
+
+async def test_a_conversation_reports_what_it_did() -> None:
+    session = FakeSession(
+        Says("user", "오늘 일정 뭐야"),
+        b"\x01\x02",
+        Says("assistant", "회의가 두 개 있어요"),
+        Turn(),
+    )
+    audio = FakeAudio()
+    conv = conversation(session, audio)
+    await run(conv)
+
+    stats = conv.stats
+    assert stats.turns == 1
+    assert stats.interruptions == 0
+    assert stats.first_audio_seconds is not None
+    assert stats.played_seconds == pytest.approx(2 / (24_000 * 2))
+
+
+async def test_a_barge_in_is_visible_in_the_report() -> None:
+    """The whole reason the report exists. An interruption on every turn with
+    almost no audio played is the signature of the daemon cutting itself off, and
+    nothing used to say so - it went unnoticed for three milestones."""
+    session = FakeSession(b"\x01", Says("user", "아니 잠깐만"), Cuts(), Turn())
+    conv = conversation(session)
+    await run(conv)
+
+    assert conv.stats.interruptions == 1
+    assert "1 interruption(s)" in conv.stats.describe()
+
+
+async def test_a_session_that_never_spoke_says_so_rather_than_zero() -> None:
+    """A silent session and an instant one are different failures. Reported as
+    0.00s they would read the same, and the silent one is the one worth finding."""
+    session = FakeSession(Says("user", "여보세요"), Turn())
+    conv = conversation(session)
+    await run(conv)
+
+    assert conv.stats.first_audio_seconds is None
+    assert conv.stats.played_seconds == 0.0
+    assert "never spoke" in conv.stats.describe()
+
+
+async def test_played_seconds_is_seconds_at_the_playback_rate() -> None:
+    """Not the capture rate. 24 kHz out against 16 kHz in is the chipmunk bug's
+    other half (daemon/voice/base.py), and getting it wrong here would report
+    every session as 50% longer than it was."""
+    audio = FakeAudio()
+    session = FakeSession(b"\x00" * 48_000, Turn())
+    conv = conversation(session, audio)
+    await run(conv)
+
+    assert conv.stats.played_seconds == pytest.approx(1.0)
+
+
+async def test_the_answer_survives_the_transcript_of_the_question() -> None:
+    """The regression this file exists for now.
+
+    Gemini delivers `inputTranscription` at the turn boundary - measured, in the
+    same server event as the answer's first audio chunk. The conversation used to
+    read that as the user talking over the answer, so *every* turn was ruled a
+    barge-in: against the live API a complete reply ("안녕하세요! 반갑습니다. 오늘
+    어떤 대화를 나누고 싶으세요?") was generated and 0.0s of it was played.
+
+    So: audio, then the user's own transcript, and no `Cuts`. Nothing may be
+    interrupted."""
+    session = FakeSession(
+        b"\x01\x02",
+        Says("user", "안녕"),
+        Says("assistant", "안녕하세요! 반갑습니다"),
+        Turn(),
+    )
+    audio = FakeAudio()
+    conv = conversation(session, audio)
+    await run(conv)
+
+    assert conv.interruptions == 0, (
+        "the question's own transcript was read as a barge-in against its answer"
+    )
+    assert session.interrupts == 0
+    assert audio.stops == 0
+    assert audio.played == [b"\x01\x02"], "the answer was thrown away unheard"
+    assert conv.stats.played_seconds > 0
+
+
+async def test_the_report_survives_a_conversation_that_was_cancelled() -> None:
+    """`run_voice` reports from a `finally`, so this is read on the failure path
+    more often than the happy one."""
+    session = FakeSession(Says("user", "잠깐"), Hang())
+    conv = conversation(session)
+
+    task = asyncio.create_task(conv.run())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert conv.stats.turns == 0
+    assert "never spoke" in conv.stats.describe()
+
+
+# --- reconnecting a conversation the server cut -------------------------------
+# Until `app._voice_attempts` existed, a dropped socket simply ended `daemon voice`:
+# mid-sentence, with a shell exit code, and nothing said about whether it was the
+# network or the key.
+
+
+class Cut(Exception):
+    """Stands in for `GeminiLiveError`, with the flag that decides a retry."""
+
+    def __init__(self, message: str, *, permanent: bool = False) -> None:
+        super().__init__(message)
+        self.permanent = permanent
+
+
+def _attempts(*sessions: FakeSession, **kwargs: Any) -> Any:
+    """Drive `app._voice_attempts` over a queue of scripted sessions."""
+    from daemon import app as app_module
+
+    queue = list(sessions)
+    built: list[FakeSession] = []
+
+    def new_session() -> FakeSession:
+        session = queue.pop(0) if len(queue) > 1 else queue[0]
+        built.append(session)
+        return session
+
+    settings = SimpleNamespace(recall_limit=6)
+    return app_module, new_session, built, settings
+
+
+async def _drive(*sessions: FakeSession, audio: FakeAudio | None = None) -> tuple[int, list[Any]]:
+    app_module, new_session, built, settings = _attempts(*sessions)
+    code = await app_module._voice_attempts(
+        new_session, audio or FakeAudio(), FakeMemory(), None, settings, Cut
+    )
+    return code, built
+
+
+async def test_a_conversation_that_simply_ends_is_not_reconnected() -> None:
+    """An idle timeout is the conversation being over. Reconnecting into one bills
+    per minute for nothing."""
+    code, built = await _drive(FakeSession(Says("user", "안녕"), Turn()))
+
+    assert code == 0
+    assert len(built) == 1
+
+
+async def test_a_transient_close_is_picked_back_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """1011, or the 1008 that is really an idle timeout. The user is standing in the
+    middle of a conversation, so it is resumed rather than reported."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    failing = FakeSession(Cut("connection closed 1011: internal error"))
+    working = FakeSession(Says("user", "다시 들려?"), Turn())
+
+    code, built = await _drive(failing, working)
+
+    assert code == 0
+    assert len(built) == 2, "the dropped conversation was not picked back up"
+
+
+async def test_a_permanent_failure_is_not_retried() -> None:
+    """A bad key or a wrong model id. Retrying leaves the process alive,
+    healthy-looking and mute."""
+    code, built = await _drive(FakeSession(Cut("api key not valid", permanent=True)))
+
+    assert code == 1
+    assert len(built) == 1, "a permanent failure was retried"
+
+
+async def test_retries_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sessions bill per minute, so this is deliberately not a reconnect-forever
+    loop."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    # One fresh failure per attempt, plus a spare: a reused session would hand the
+    # second attempt an exhausted script, which ends cleanly and would make this
+    # test pass for the wrong reason.
+    code, built = await _drive(
+        *(
+            FakeSession(Cut("connection closed 1011: internal error"))
+            for _ in range(app_module.VOICE_RECONNECT_ATTEMPTS + 1)
+        )
+    )
+
+    assert code == 1
+    assert len(built) == app_module.VOICE_RECONNECT_ATTEMPTS
+
+
+async def test_a_go_away_is_reconnected_even_though_nothing_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The measured trap this closes: `goAway` means the server is ending the
+    *session*, not the turn, and it arrives looking exactly like a conversation that
+    finished normally - so the daemon used to stop mid-conversation with a clean exit
+    code."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    leaving = FakeSession(Says("user", "잠깐"), Turn())
+    leaving.going_away = True
+    resumed = FakeSession(Says("user", "계속하자"), Turn())
+
+    code, built = await _drive(leaving, resumed)
+
+    assert code == 0
+    assert len(built) == 2
+
+
+async def test_each_attempt_gets_a_fresh_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reconnecting means starting clean. The old session carries a half-flushed
+    transcript and a partial queue nobody will read again."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    first = FakeSession(Cut("connection closed 1011: internal error"))
+    second = FakeSession(Says("user", "다시"), Turn())
+
+    _code, built = await _drive(first, second)
+
+    assert built[0] is not built[1]
+
+
+async def test_what_each_attempt_did_is_reported(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One report per attempt, numbered. A single line covering three attempts would
+    hide which of them actually held a conversation."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    with caplog.at_level("INFO"):
+        await _drive(
+            FakeSession(Cut("connection closed 1011: internal error")),
+            FakeSession(Says("user", "다시"), b"\x01", Turn()),
+        )
+
+    assert "voice session:" in caplog.text
+    assert "voice session (attempt 2):" in caplog.text

@@ -55,6 +55,16 @@ opposite of local, and the offline preset never resolves HOSTED at all."""
 VOICE_TASKS = frozenset({Task.CHAT_VOICE})
 """Tasks that need a hosted native-audio model. The offline preset has none."""
 
+SENSITIVITIES = ("low", "high")
+"""What the two speech-sensitivity settings accept, plus empty for "the server
+decides".
+
+Repeated here rather than imported from `daemon/voice/gemini_live.py`, for the same
+reason the wake defaults below are repeated: this module is foundation, and
+importing the voice layer into it would invert the layering. The cost of the copy
+is one line; the cost of the import is that config cannot be read without
+PortAudio."""
+
 # docs/PLAN.md 3.2. Notes on the non-obvious cells:
 #   - RECALL_ESCALATION follows chat, because Lane 2 is a conversation turn.
 #   - PROACTIVE_JUDGE stays local except under `quality`: it runs on a 5-minute
@@ -254,6 +264,37 @@ class Settings(BaseSettings):
     the text and realtime endpoints do not take the same ids. Deliberately has no
     default - a guessed model id fails at the first voice turn, which is exactly
     the kind of late failure this module exists to prevent."""
+
+    # --- how the server decides a turn ended (daemon/voice/gemini_live.py) ---
+    # All four are empty or None by default, and that is not laziness: an omitted
+    # field leaves the server's own default, which is ~800 ms of silence before a
+    # turn is considered over (https://ai.google.dev/gemini-api/docs/live-guide).
+    # Until these existed the daemon sent no `realtimeInputConfig` at all, so there
+    # was no knob - and the thing worth tuning is what happens *after* echo
+    # cancellation, because without it lowering the sensitivity is how you buy back
+    # the daemon interrupting itself, at the price of not being interruptible.
+
+    voice_start_sensitivity: str = Field(default="", alias="DAEMON_VOICE_START_SENSITIVITY")
+    """How eagerly the server decides the user has started talking: `low`, `high`,
+    or empty for the server's default. `low` is the setting that stops leaked
+    speaker audio from registering as a barge-in, and it is a workaround for a
+    missing echo canceller rather than a preference."""
+
+    voice_end_sensitivity: str = Field(default="", alias="DAEMON_VOICE_END_SENSITIVITY")
+    """How eagerly the server decides the user has stopped: `low`, `high`, or empty."""
+
+    voice_prefix_padding_ms: int | None = Field(
+        default=None, alias="DAEMON_VOICE_PREFIX_PADDING_MS"
+    )
+    """How much speech must accumulate before the server commits to a start."""
+
+    voice_silence_duration_ms: int | None = Field(
+        default=None, alias="DAEMON_VOICE_SILENCE_DURATION_MS"
+    )
+    """Silence before a turn is over. The one number that trades response latency
+    against being cut off mid-sentence, and the one worth measuring: 800 ms is the
+    server's default and `VoiceStats.response_seconds` is what says whether a lower
+    value cost anything."""
 
     # --- the wake gate (daemon/voice/wake.py) -----------------------------
     # A voice session bills per minute, so an always-open one costs about 48x what
@@ -460,6 +501,20 @@ class Settings(BaseSettings):
                 "DAEMON_VOICE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
                 "the native-audio endpoint needs its own model id"
             )
+
+        # Caught here rather than on the wire. The server answers a bad enum by
+        # closing with 1007, which the session classifies as permanent - so a typo
+        # in one of these would not be a bad setting, it would be voice mode gone
+        # with a message about an unknown name.
+        for env, chosen in (
+            ("DAEMON_VOICE_START_SENSITIVITY", self.voice_start_sensitivity),
+            ("DAEMON_VOICE_END_SENSITIVITY", self.voice_end_sensitivity),
+        ):
+            if chosen and chosen not in SENSITIVITIES:
+                problems.append(
+                    f"{env} is {chosen!r}; expected one of {', '.join(SENSITIVITIES)}, "
+                    "or empty to leave it to the server"
+                )
 
         if self.wake_enabled and not self.wake_aliases:
             problems.append(

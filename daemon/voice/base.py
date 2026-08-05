@@ -53,6 +53,26 @@ class Transcript:
     than a loosening of this one."""
 
 
+@dataclass(frozen=True, slots=True)
+class Interrupted:
+    """The provider's activity detection says the user talked over us.
+
+    A separate item in `receive()` rather than something a caller works out for
+    itself, because working it out is what broke. `VoiceConversation` used to infer
+    a barge-in from the user's transcript growing while audio played, and Gemini
+    delivers `inputTranscription` *at the turn boundary* - measured, in the same
+    server event as the first audio chunk of the answer. So the arrival of the
+    question's own transcript looked exactly like someone interrupting the answer to
+    it, and every turn was killed: a full, fluent reply generated and 0.0s of it
+    played, twice reproduced against the live API.
+
+    The authority was always meant to be the server. `interrupt()` below has said so
+    since it was written - "under server-side VAD the user's own audio is what stops
+    generation, reported back as `serverContent.interrupted`" - and this is that
+    sentence given a wire.
+    """
+
+
 @runtime_checkable
 class VoiceSession(Protocol):
     """One live conversation with a hosted native-audio model.
@@ -97,8 +117,9 @@ class VoiceSession(Protocol):
         the machine (docs/PLAN.md 6.3) - and which never leaves the device."""
         ...
 
-    def receive(self) -> AsyncIterator[bytes | Transcript]:
-        """Interleaved output for one turn: audio to play, transcripts to record.
+    def receive(self) -> AsyncIterator[bytes | Transcript | Interrupted]:
+        """Interleaved output for one turn: audio to play, transcripts to record,
+        and the provider saying the user cut in.
 
         **Ends at the turn boundary.** Measured: a turn that answered in 2.6 s
         and delivered its final transcript then blocked forever, and the server

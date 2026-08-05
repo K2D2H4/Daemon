@@ -144,6 +144,27 @@ def test_voice_is_refused_while_disabled_even_when_routed() -> None:
         settings.route_for(Task.CHAT_VOICE)
 
 
+def test_a_misspelled_speech_sensitivity_fails_at_startup() -> None:
+    """Left to the wire, the server closes with 1007 and the session classifies
+    that as permanent - so a typo would take voice mode out entirely rather than
+    fail the setting that caused it."""
+    with pytest.raises(ConfigError, match="DAEMON_VOICE_START_SENSITIVITY"):
+        make_settings(voice_start_sensitivity="LOW")
+    with pytest.raises(ConfigError, match="DAEMON_VOICE_END_SENSITIVITY"):
+        make_settings(voice_end_sensitivity="medium")
+
+
+def test_endpointing_is_unset_by_default_so_the_server_decides() -> None:
+    """~800 ms of silence is the server's own default. A default of our own here
+    would be a number nobody measured, presented as a decision."""
+    settings = make_settings(anthropic_api_key="k")
+
+    assert settings.voice_start_sensitivity == ""
+    assert settings.voice_end_sensitivity == ""
+    assert settings.voice_prefix_padding_ms is None
+    assert settings.voice_silence_duration_ms is None
+
+
 def test_disabled_voice_needs_no_voice_key_but_enabled_voice_does() -> None:
     # The M1a default install is text-only, so it must not be asked for a key
     # it will never use.
