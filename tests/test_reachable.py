@@ -62,6 +62,10 @@ WIRED_CLASSES = (
     "GeminiLiveSession",
     "SoundDeviceAudio",
     "VoiceConversation",
+    # The echo-cancelling AudioIO, built by `app.build_voice_audio` on macOS.
+    # `SoundDeviceAudio` stays above it rather than being replaced: it is still what
+    # the wake gate and every non-Apple platform record through.
+    "VoiceProcessingAudio",
     # M2. `Reflection` is the one that matters: the pass is only reachable because
     # `app.build_reflection` constructs it for both the 04:00 job and
     # `daemon reflect`, and a scheduled job nobody can run by hand is a job nobody

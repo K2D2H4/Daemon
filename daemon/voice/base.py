@@ -53,6 +53,28 @@ class Transcript:
     than a loosening of this one."""
 
 
+@dataclass(frozen=True, slots=True)
+class Interrupted:
+    """The provider's activity detection says the user talked over us.
+
+    A separate item in `receive()` rather than something a caller works out for
+    itself, because working it out is what broke. `VoiceConversation` used to infer
+    a barge-in from the user's transcript growing while audio played, and Gemini
+    delivers `inputTranscription` *at the turn boundary* - measured, in the same
+    server event as the first audio chunk of the answer. So the arrival of the
+    question's own transcript looked exactly like someone interrupting the answer to
+    it, and every turn was killed: a full, fluent reply generated and 0.0s of it
+    played, twice reproduced against the live API.
+
+    What it does **not** mean is "the user spoke". The Live API documents the flag as
+    "a client message has interrupted current model generation", and a client message
+    is something *we* sent: seeding recall through `send_context` mid-answer raised
+    this flag 90 ms later and killed the answer. So a caller must both act on it -
+    the speaker has to be emptied - and avoid causing it, which is
+    `VoiceConversation._offer`'s job. Two different failures wearing one flag.
+    """
+
+
 @runtime_checkable
 class VoiceSession(Protocol):
     """One live conversation with a hosted native-audio model.
@@ -97,8 +119,9 @@ class VoiceSession(Protocol):
         the machine (docs/PLAN.md 6.3) - and which never leaves the device."""
         ...
 
-    def receive(self) -> AsyncIterator[bytes | Transcript]:
-        """Interleaved output for one turn: audio to play, transcripts to record.
+    def receive(self) -> AsyncIterator[bytes | Transcript | Interrupted]:
+        """Interleaved output for one turn: audio to play, transcripts to record,
+        and the provider saying the user cut in.
 
         **Ends at the turn boundary.** Measured: a turn that answered in 2.6 s
         and delivered its final transcript then blocked forever, and the server
@@ -264,3 +287,24 @@ class WakeEvent:
     """Mean VAD probability over the segment. Not the recognizer's confidence -
     it does not report one on-device - so it says "this was speech", not "these
     were the words"."""
+
+    pcm: bytes = b""
+    """The audio that fired the gate, at `AudioIO.sample_rate`, so the conversation
+    can begin with what was actually said.
+
+    Carried because throwing it away cost the owner a whole utterance. The gate
+    consumed "루시 뭐 해", matched on `루시`, and then discarded the sound - so the
+    session opened having never heard "뭐 해" and the owner had to say it again.
+    Measured on a real run: 14.79 s from the wake word to the first audio out, most
+    of it a person repeating themselves into a microphone that had just changed
+    hands.
+
+    A whole segment, wake phrase included, not the tail after the phrase: there is no
+    reliable boundary between them - the recognizer returns text, not alignment - and
+    a model hearing "루시 뭐 해" is being addressed by name, which is what happened.
+
+    Empty by default, so a gate that has no audio to offer and a caller that does not
+    want any both keep working. **It only helps a phrase spoken in one breath.** A
+    pause after the wake word ends the segment (`hangover_ms`), and whatever is said
+    during the handover belongs to nobody - which is what `AudioIO`'s ready cue is
+    for."""
