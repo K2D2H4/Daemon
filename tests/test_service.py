@@ -13,10 +13,22 @@ from pathlib import Path
 
 import pytest
 
+from daemon import service as service_module
 from daemon.fs import DIR_MODE, FILE_MODE
 from daemon.service import RunResult, Service, ServiceError
 
 PROGRAM = ("/opt/venv/bin/daemon", "run")
+
+BOOTSTRAP_EIO = (
+    "Bootstrap failed: 5: Input/output error\n"
+    "Try re-running the command as root for richer errors."
+)
+"""What real launchd says when it will not bootstrap - measured, not invented. It
+is the same text for a job that is already loaded and for a path that does not
+exist, so no substring of it can tell the two apart."""
+
+NO_SUCH_SERVICE = 'Could not find service "ai.daemon.default" in domain for user gui: 501'
+"""And what it says (exit 113) when the job really is not loaded."""
 
 
 class FakeRunner:
@@ -153,6 +165,72 @@ def test_install_tightens_a_plist_that_was_already_world_readable(tmp_path: Path
     assert mode_of(service.unit_path) == FILE_MODE
 
 
+def test_install_does_not_re_permission_the_directory_it_writes_into(tmp_path: Path) -> None:
+    """`~/Library/LaunchAgents` is not ours. It is shared with every other agent the
+    user has installed, it normally stands at 0755, and `fs.secure_dir` would take
+    it to 0700 - the same overreach its own docstring records `daemon install`
+    committing once already, when it walked out to $HOME.
+
+    The plist inside is ours and stays 0600; the directory holding it is not.
+    """
+    service = make_service(tmp_path)
+    service.unit_path.parent.mkdir(parents=True)
+    service.unit_path.parent.chmod(0o755)
+
+    service.install()
+
+    assert mode_of(service.unit_path.parent) == 0o755
+    assert mode_of(service.unit_path) == FILE_MODE
+
+
+# --- the unit file is replaced, never truncated ------------------------------
+#
+# A plist launchd cannot parse is not loaded, and a job that is not loaded is a
+# daemon that quietly never comes back after the next login. So the window where
+# this file is empty or half-written has to not exist, which is `fs.py`'s atomic
+# replace rather than an O_TRUNC write.
+
+
+def test_replacing_the_unit_file_swaps_it_instead_of_truncating_it(tmp_path: Path) -> None:
+    """Rename, not rewrite: the inode under the path changes, so no reader - and no
+    login-time launchd scan - can observe the file mid-write."""
+    service = make_service(tmp_path)
+    service.install()
+    service.unit_path.write_text("<plist>hand edited</plist>")
+    before = service.unit_path.stat().st_ino
+
+    service.install(force=True)
+
+    assert service.unit_path.read_text() == service.render()
+    assert service.unit_path.stat().st_ino != before
+    # And nothing left beside it. A stray dotfile in ~/Library/LaunchAgents is
+    # somebody else's confusing morning.
+    assert [path.name for path in service.unit_path.parent.iterdir()] == [
+        service.unit_path.name
+    ]
+
+
+def test_a_write_that_fails_leaves_the_installed_unit_file_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure this ordering exists for. A truncating write that dies partway
+    leaves a plist launchd refuses, and the previous working one is already gone -
+    strictly worse than not having written at all."""
+    service = make_service(tmp_path)
+    service.install()
+    service.unit_path.write_text("<plist>hand edited</plist>")
+
+    def boom(*_: object, **__: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service_module, "write_private_replace", boom, raising=False)
+
+    with pytest.raises(OSError):
+        service.install(force=True)
+
+    assert service.unit_path.read_text() == "<plist>hand edited</plist>"
+
+
 # --- launchctl / systemctl ---------------------------------------------------
 
 
@@ -183,19 +261,34 @@ def test_install_on_linux_reloads_and_enables_the_unit(tmp_path: Path) -> None:
 
 
 def test_a_failing_launchctl_becomes_a_ServiceError(tmp_path: Path) -> None:
-    runner = FakeRunner({"bootstrap": RunResult(5, stderr="Load failed: 5: Input/output error")})
+    runner = FakeRunner(
+        {
+            "bootstrap": RunResult(5, stderr=BOOTSTRAP_EIO),
+            "print": RunResult(113, stderr=NO_SUCH_SERVICE),
+        }
+    )
     service = make_service(tmp_path, runner=runner)
 
-    with pytest.raises(ServiceError, match="Load failed"):
+    with pytest.raises(ServiceError, match="Input/output error"):
         service.install()
 
 
 def test_an_already_loaded_job_is_not_a_failure(tmp_path: Path) -> None:
-    runner = FakeRunner(
-        {"bootstrap": RunResult(17, stderr="Bootstrap failed: service already loaded")}
-    )
+    """Measured against real launchd (Darwin 25.5, uid 501): bootstrapping a job
+    launchd already has exits **5 with `Input/output error`** - byte for byte the
+    same generic EIO it gives for a plist path that does not exist. This test used
+    to assert `17: service already loaded`, a string launchctl never produces, so
+    it stayed green while `daemon install` raised on its own second run.
 
-    make_service(tmp_path, runner=runner).install()  # must not raise
+    There is no message to match, which is the whole point: ask launchd whether the
+    job is there instead of reading its prose.
+    """
+    runner = FakeRunner({"bootstrap": RunResult(5, stderr=BOOTSTRAP_EIO)})
+    service = make_service(tmp_path, runner=runner)
+
+    service.install()  # must not raise
+
+    assert ("launchctl", "print", "gui/501/ai.daemon.default") in runner.commands
 
 
 # --- an existing install -----------------------------------------------------

@@ -133,11 +133,9 @@ def targets() -> list[Path]:
         if path.exists():
             found.append(path)
     for pattern in EXTRA_GLOBS:
-        # Relative to ROOT, not absolute: run from inside one of the worktrees this
-        # filter exists to skip, every absolute path contains `.claude` and the
-        # whole scan came back empty. The checker then reported "ok" over five
-        # top-level docs while silently skipping every module doc - which is the
-        # failure this file was written to prevent, one level up again.
+        # Relative to ROOT, not absolute: when ROOT is itself a worktree the
+        # absolute parts contain `.claude` for *every* match, so the skip matched
+        # everything and these globs contributed nothing at all. See SKIP_DIRS.
         found.extend(
             p
             for p in ROOT.glob(pattern)

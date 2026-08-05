@@ -126,11 +126,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run even if this week's diary already exists",
     )
-    forget = persona_sub.add_parser(
+    # `persona_forget`, not `forget`: `daemon tools forget` below binds that name
+    # too, and two parsers sharing one variable is a trap for whoever adds an
+    # argument to the first of them.
+    persona_forget = persona_sub.add_parser(
         "forget", help="retire a learned rule - a human's deletion request"
     )
-    forget.add_argument("id", type=int, help="the rule id, from `daemon persona`")
-    forget.add_argument("--why", required=True, help="why this rule should be retired")
+    persona_forget.add_argument("id", type=int, help="the rule id, from `daemon persona`")
+    persona_forget.add_argument("--why", required=True, help="why this rule should be retired")
+    tools = sub.add_parser("tools", help="what Daemon may do to this machine, and what it did")
+    tools_sub = tools.add_subparsers(dest="tools_command", required=True)
+    tools_sub.add_parser("list", help="the tools that are loaded, and the policy in force")
+    tools_sub.add_parser("log", help="recent tool calls, including the refused ones")
+    tools_sub.add_parser("pending", help="approvals waiting on an answer")
+    forget = tools_sub.add_parser("forget", help="drop a standing approval granted with 'always'")
+    forget.add_argument("pattern", help="the command pattern to stop trusting, e.g. 'git status'")
     return parser
 
 
@@ -218,6 +228,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "persona":
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
         return asyncio.run(_persona(settings, args))
+    if command == "tools":
+        return _tools(settings, args)
 
     try:
         if command == "install":
@@ -301,6 +313,97 @@ def _pairing(settings: Settings, args: Any) -> int:
             return USAGE
         who = "owner" if approval.is_owner else "guest"
         print(f"approved id={approval.sender_id} as {who}. They can talk to Daemon now.")
+        return OK
+    finally:
+        store.close()
+
+
+def _tools(settings: Settings, args: Any) -> int:
+    """What Daemon may do to this machine, and what it has done.
+
+    The `log` subcommand is the one that earns this command's existence. Tool calls
+    are audited into sqlite rather than into the markdown log (schema.sql), so
+    without a way to read them back the audit trail is real but unreachable, which
+    is the same as not having one.
+    """
+    from daemon.app import DB_FILENAME
+    from daemon.memory.store import Store
+    from daemon.tools.builtin import builtin_tools
+
+    if args.tools_command == "list":
+        print(f"tools:      {'on' if settings.tools_enabled else 'off (DAEMON_TOOLS_ENABLED)'}")
+        print(f"mode:       {settings.tools_mode}")
+        print(f"roots:      {', '.join(settings.tools_roots) or '(none)'}")
+        print(f"allowlist:  {', '.join(settings.tools_allowlist) or '(none)'}")
+        browser = f"on ({settings.browser_app})" if settings.browser_enabled else "off"
+        print(f"browser:    {browser}")
+        print(f"mcp:        {'on' if settings.mcp_enabled else 'off'}")
+        print()
+        try:
+            available = builtin_tools(
+                roots=settings.tools_roots,
+                timeout_secs=settings.tools_timeout_secs,
+                max_output=settings.tools_max_output,
+            )
+            if settings.browser_enabled:
+                # Listed here too, or this command answers "what may it do" with
+                # three of the answers missing.
+                from daemon.tools.browser import browser_tools
+
+                available += browser_tools(
+                    app=settings.browser_app,
+                    timeout_secs=settings.tools_timeout_secs,
+                    max_output=settings.tools_max_output,
+                )
+        except Exception as exc:
+            print(f"daemon: the built-in tools cannot be built: {exc}", file=sys.stderr)
+            return PROBLEM
+        for tool in available:
+            gate = "asks first" if tool.risk == "guarded" else "runs freely"
+            print(f"  {tool.spec.name:<14} {gate}")
+        # MCP tools are not listed: finding out what a server offers means starting
+        # it, and an operator command should not spawn subprocesses to print a list.
+        if settings.mcp_enabled:
+            print("\n  plus whatever mcp.json's servers offer, once the daemon is running")
+        return OK
+
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    try:
+        if args.tools_command == "log":
+            rows = store.recent_tool_calls(30)
+            if not rows:
+                print("nothing yet. No tool has been asked for on this install.")
+                return OK
+            for row in rows:
+                ran = "ran" if row["ran"] else row["verdict"]
+                mark = "" if row["ok"] in (1, None) else " FAILED"
+                print(f"  {row['ts']}  {ran:<6}{mark}  {row['preview']}")
+                if not row["ran"]:
+                    print(f"                                    {row['reason']}")
+            return OK
+
+        if args.tools_command == "pending":
+            from daemon import clock
+
+            rows = store.pending_tool_approvals(now=clock.now())
+            if not rows:
+                print("no approvals are waiting.")
+                return OK
+            for row in rows:
+                print(f"  {row['code']}  {row['preview']}  (lapses {row['expires_at']})")
+            print("\nApprovals are answered in the conversation, not here: reply /approve <code>.")
+            return OK
+
+        removed = store.remove_tool_allowlist_entry(args.pattern)
+        if not removed:
+            standing = store.all_tool_allowlist()
+            print(f"daemon: nothing standing matches {args.pattern!r}", file=sys.stderr)
+            if standing:
+                print("granted:", file=sys.stderr)
+                for row in standing:
+                    print(f"  {row['pattern']}  ({row['tool']})", file=sys.stderr)
+            return USAGE
+        print(f"forgotten. {args.pattern!r} will be asked about again.")
         return OK
     finally:
         store.close()
@@ -539,6 +642,7 @@ def _doctor() -> int:
             _memory_check(settings),
             _persona_check(settings),
             _proactivity_check(settings),
+            _tools_check(settings),
             *_ollama_checks(settings),
         ]
 
@@ -601,6 +705,36 @@ def _env_override_check(settings: Settings) -> Check:
         " - the environment wins, so .env is being ignored for these."
         " `unset` them, or remove them from .env, whichever you meant",
     )
+
+
+def _tools_check(settings: Settings) -> Check:
+    """What Daemon may do to this machine, said out loud.
+
+    Here because tools are on by default: a capability nobody was asked about and
+    which is reported nowhere is the silent state this project keeps being bitten by
+    (CLAUDE.md, "report state, do not assume it"). `daemon setup` does not ask about
+    tools, so this line and the startup log are the only places the answer appears.
+    """
+    if not settings.tools_enabled:
+        return Check("tools", True, "off (DAEMON_TOOLS_ENABLED=true to turn it on)")
+
+    extras = []
+    if settings.browser_enabled:
+        extras.append(f"browser={settings.browser_app}")
+    if settings.mcp_enabled:
+        extras.append("mcp=on")
+    allowed = ", ".join(settings.tools_allowlist) or "nothing"
+    detail = (
+        f"on mode={settings.tools_mode} roots={', '.join(settings.tools_roots)} "
+        f"runs-without-asking={allowed}"
+    )
+    if extras:
+        detail += " " + " ".join(extras)
+    # `full` is the one setting where nothing but the origin gate is left, so it is
+    # reported as a failed check rather than as a detail someone might skim past.
+    if settings.tools_mode == "full":
+        return Check("tools", False, detail + " - `full` asks about nothing")
+    return Check("tools", True, detail)
 
 
 def _proactivity_check(settings: Settings) -> Check:

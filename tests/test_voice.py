@@ -25,7 +25,7 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK, Inv
 from websockets.frames import Close
 
 from daemon.voice import gemini_live
-from daemon.voice.base import Transcript, VoiceSession
+from daemon.voice.base import Interrupted, Transcript, VoiceSession
 from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
 
 KEY = "AIzaSy-fake-key-value"  # fake shape; no test may need a real one
@@ -216,6 +216,77 @@ async def test_persona_voice_and_system_instruction_reach_setup() -> None:
     voice = setup["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
     assert voice["voiceName"] == "Kore"
     assert setup["systemInstruction"]["parts"][0]["text"] == "너는 조용한 편이다"
+
+
+async def test_an_unconfigured_session_lets_the_server_decide_turn_boundaries() -> None:
+    """No `realtimeInputConfig` at all, which is what every session sent before
+    these settings existed. Sending a partly-filled one would replace the server's
+    ~800 ms default with three numbers nobody chose."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection):
+        pass
+
+    assert "realtimeInputConfig" not in connection.messages("setup")[0]
+
+
+async def test_endpointing_settings_reach_setup_in_the_wire_spelling() -> None:
+    """`low` is what a person writes in .env; `START_SENSITIVITY_LOW` is what the
+    server accepts, and anything else closes the socket with 1007."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    live = session(
+        connection,
+        start_sensitivity="low",
+        end_sensitivity="high",
+        prefix_padding_ms=100,
+        silence_duration_ms=400,
+    )
+    async with live:
+        pass
+
+    detection = connection.messages("setup")[0]["realtimeInputConfig"][
+        "automaticActivityDetection"
+    ]
+    assert detection == {
+        "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+        "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
+        "prefixPaddingMs": 100,
+        "silenceDurationMs": 400,
+    }
+
+
+async def test_only_the_settings_that_were_set_are_sent() -> None:
+    """An omitted field is the server's default; a field sent as 0 is not."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection, silence_duration_ms=400):
+        pass
+
+    detection = connection.messages("setup")[0]["realtimeInputConfig"][
+        "automaticActivityDetection"
+    ]
+    assert detection == {"silenceDurationMs": 400}
+
+
+async def test_a_zero_is_a_choice_and_is_sent() -> None:
+    """None means "leave it alone" and 0 means "no padding at all". Collapsing the
+    two would make the more aggressive setting unreachable."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection, prefix_padding_ms=0):
+        pass
+
+    detection = connection.messages("setup")[0]["realtimeInputConfig"][
+        "automaticActivityDetection"
+    ]
+    assert detection == {"prefixPaddingMs": 0}
+
+
+async def test_a_misspelled_sensitivity_fails_here_rather_than_on_the_wire() -> None:
+    """The server's answer is a 1007 close, which `_permanent_close` classifies as
+    permanent - so left to the wire a typo does not fail the setting, it ends voice
+    mode with a message about an unknown name."""
+    with pytest.raises(ValueError, match="sensitivity"):
+        GeminiLiveSession(KEY, MODEL, start_sensitivity="LOW")
+    with pytest.raises(ValueError, match="sensitivity"):
+        GeminiLiveSession(KEY, MODEL, end_sensitivity="medium")
 
 
 async def test_api_key_travels_as_a_header_not_in_the_url() -> None:
@@ -741,7 +812,30 @@ async def test_server_side_interruption_drops_the_rest_of_the_turn() -> None:
         {"serverContent": {"turnComplete": True}},
     )
     async with session(connection) as live:
-        assert await drain(live) == [b"early"]
+        # The marker is handed over as well as acted on: dropping the rest of the
+        # stream is only half a barge-in, and the caller owns the speaker whose
+        # buffer is the other half.
+        assert await drain(live) == [b"early", Interrupted()]
+
+
+async def test_an_interruption_after_generation_finished_is_ignored() -> None:
+    """Measured against the live API, four runs: `interrupted` arrives about 0.25s
+    after `generationComplete` on a turn nobody interrupted - every time. Handed on,
+    it makes the caller drop a complete answer out of the speaker mid-playback."""
+    connection = FakeConnection(
+        SETUP_COMPLETE,
+        audio_frame(b"the whole answer"),
+        {"serverContent": {"generationComplete": True}},
+        {"serverContent": {"interrupted": True}},
+        {"serverContent": {"turnComplete": True}},
+    )
+    async with session(connection) as live:
+        first = await drain(live)
+        assert Interrupted() not in first, (
+            "an interruption with nothing being generated reached the caller, and "
+            "the caller's answer to it is to empty the speaker"
+        )
+        assert b"the whole answer" in first
 
 
 # --- failure and backoff ----------------------------------------------------

@@ -365,7 +365,9 @@ class WakeGate:
             matched,
             confidence,
         )
-        return WakeEvent(heard=heard, matched=matched, confidence=confidence)
+        # The segment travels with the event. Discarding it is what made the owner
+        # say everything twice - see `WakeEvent.pcm`.
+        return WakeEvent(heard=heard, matched=matched, confidence=confidence, pcm=pcm)
 
     def _available(self) -> bool:
         try:

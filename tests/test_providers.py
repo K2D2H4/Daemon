@@ -14,7 +14,13 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from daemon.llm.base import Message, ProviderError
+from daemon.llm.base import (
+    Message,
+    ProviderError,
+    ToolCall,
+    ToolSpec,
+    decode_tool_arguments,
+)
 from daemon.llm.providers.anthropic import AnthropicProvider
 from daemon.llm.providers.gemini import GeminiProvider
 from daemon.llm.providers.ollama import OllamaProvider
@@ -908,3 +914,483 @@ async def test_openai_health_never_raises() -> None:
 
     async with mock_client(handler) as client:
         assert await OpenAIProvider(SECRET, client=client).health() is False
+
+
+# --- tool use: schema out, tool call back ------------------------------------
+# Four providers, four different spellings for the same two things. Each one is
+# asserted in both directions here, because a mistranslation shows up as a 400 from
+# the vendor on the first turn that uses a tool - not at startup, and not in any
+# unit test of the tool layer itself.
+
+TOOLS = [
+    ToolSpec(
+        name="run_command",
+        description="Run one program.",
+        parameters={
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    )
+]
+
+TOOL_TURNS = [
+    Message(role="system", content="seed"),
+    Message(role="user", content="what is the date?"),
+    Message(
+        role="assistant",
+        content="",
+        tool_calls=(ToolCall(id="call_1", name="run_command", arguments={"command": "date"}),),
+    ),
+    Message(role="tool", content="Mon 3 Aug 2026", tool_call_id="call_1"),
+]
+
+
+def capture(payloads: list[dict], response: dict) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json=response)
+
+    return handler
+
+
+# ollama
+
+OLLAMA_TOOL_CALL = {
+    "model": "qwen3:14b",
+    "message": {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"function": {"name": "run_command", "arguments": {"command": "date"}}}],
+    },
+}
+
+
+async def test_ollama_sends_openai_shaped_tools() -> None:
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, OLLAMA_OK)) as client:
+        await OllamaProvider(client=client).complete(PROMPT, model="m", tools=TOOLS)
+
+    (tool,) = payloads[0]["tools"]
+    assert tool["type"] == "function"
+    assert tool["function"]["name"] == "run_command"
+    assert tool["function"]["parameters"]["required"] == ["command"]
+
+
+async def test_ollama_omits_tools_when_there_are_none() -> None:
+    """An empty list is not the same as absent: some backends reject one."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, OLLAMA_OK)) as client:
+        await OllamaProvider(client=client).complete(PROMPT, model="m")
+    assert "tools" not in payloads[0]
+
+
+async def test_ollama_reads_back_a_tool_call() -> None:
+    async with mock_client(lambda r: httpx.Response(200, json=OLLAMA_TOOL_CALL)) as client:
+        completion = await OllamaProvider(client=client).complete(PROMPT, model="m", tools=TOOLS)
+
+    (call,) = completion.tool_calls
+    assert call.name == "run_command"
+    # Ollama sends a dict where OpenAI sends a JSON string; both arrive decoded.
+    assert call.arguments == {"command": "date"}
+    assert completion.text == ""
+
+
+async def test_ollama_does_not_treat_a_tool_only_reply_as_a_failure() -> None:
+    """`content` is empty on a tool-calling turn, which used to raise here."""
+    async with mock_client(lambda r: httpx.Response(200, json=OLLAMA_TOOL_CALL)) as client:
+        completion = await OllamaProvider(client=client).complete(PROMPT, model="m", tools=TOOLS)
+    assert completion.tool_calls
+
+
+async def test_ollama_still_fails_on_no_text_and_no_tools() -> None:
+    body = {"model": "m", "message": {"role": "assistant", "content": ""}}
+    async with mock_client(lambda r: httpx.Response(200, json=body)) as client:
+        with pytest.raises(ProviderError):
+            await OllamaProvider(client=client).complete(PROMPT, model="m")
+
+
+async def test_ollama_sends_a_tool_result_as_a_tool_role() -> None:
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, OLLAMA_OK)) as client:
+        await OllamaProvider(client=client).complete(TOOL_TURNS, model="m", tools=TOOLS)
+
+    turns = payloads[0]["messages"]
+    assert turns[-1]["role"] == "tool"
+    assert turns[-1]["content"] == "Mon 3 Aug 2026"
+    # Ollama pairs by name, not by id - it has no tool_call_id field.
+    assert turns[-1]["tool_name"] == "call_1"
+    assert turns[-2]["tool_calls"][0]["function"]["arguments"] == {"command": "date"}
+
+
+async def test_ollama_skips_a_malformed_tool_call() -> None:
+    body = {
+        "model": "m",
+        "message": {
+            "role": "assistant",
+            "content": "here",
+            "tool_calls": [{"nonsense": True}, {"function": {"arguments": {}}}],
+        },
+    }
+    async with mock_client(lambda r: httpx.Response(200, json=body)) as client:
+        completion = await OllamaProvider(client=client).complete(PROMPT, model="m", tools=TOOLS)
+    assert completion.tool_calls == ()
+    assert completion.text == "here"
+
+
+# anthropic
+
+ANTHROPIC_TOOL_CALL = {
+    "model": "claude-sonnet-5",
+    "stop_reason": "tool_use",
+    "content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "run_command", "input": {"command": "date"}}
+    ],
+    "usage": {"input_tokens": 9, "output_tokens": 4},
+}
+
+
+async def test_anthropic_calls_the_schema_input_schema() -> None:
+    """The one field name this API spells differently from the other three."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, ANTHROPIC_OK)) as client:
+        await AnthropicProvider(SECRET, client=client).complete(PROMPT, model="m", tools=TOOLS)
+
+    (tool,) = payloads[0]["tools"]
+    assert tool["input_schema"]["required"] == ["command"]
+    assert "parameters" not in tool
+
+
+async def test_anthropic_reads_back_a_tool_use_block() -> None:
+    handler = lambda r: httpx.Response(200, json=ANTHROPIC_TOOL_CALL)  # noqa: E731
+    async with mock_client(handler) as client:
+        completion = await AnthropicProvider(SECRET, client=client).complete(
+            PROMPT, model="m", tools=TOOLS
+        )
+    (call,) = completion.tool_calls
+    assert (call.id, call.name, call.arguments) == ("toolu_1", "run_command", {"command": "date"})
+    assert completion.meta["stop_reason"] == "tool_use"
+
+
+async def test_anthropic_sends_a_result_as_a_user_turn_of_blocks() -> None:
+    """This API has no tool role. A result is a `tool_result` block inside a user
+    turn, and getting it wrong is a 400."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, ANTHROPIC_OK)) as client:
+        await AnthropicProvider(SECRET, client=client).complete(
+            TOOL_TURNS, model="m", tools=TOOLS
+        )
+
+    turns = payloads[0]["messages"]
+    assert turns[-1]["role"] == "user"
+    (block,) = turns[-1]["content"]
+    assert block["type"] == "tool_result"
+    assert block["tool_use_id"] == "call_1"
+    assert turns[-2]["content"][0] == {
+        "type": "tool_use",
+        "id": "call_1",
+        "name": "run_command",
+        "input": {"command": "date"},
+    }
+
+
+async def test_anthropic_coalesces_several_results_into_one_turn() -> None:
+    """The API rejects two user turns in a row, so a reply that asked for three
+    tools at once would otherwise produce three turns and a 400."""
+    messages = [
+        Message(role="user", content="do three things"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=tuple(
+                ToolCall(id=f"c{i}", name="run_command", arguments={"command": "date"})
+                for i in range(3)
+            ),
+        ),
+        *[Message(role="tool", content=f"out{i}", tool_call_id=f"c{i}") for i in range(3)],
+    ]
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, ANTHROPIC_OK)) as client:
+        await AnthropicProvider(SECRET, client=client).complete(messages, model="m", tools=TOOLS)
+
+    turns = payloads[0]["messages"]
+    assert [turn["role"] for turn in turns] == ["user", "assistant", "user"]
+    assert len(turns[-1]["content"]) == 3
+
+
+async def test_anthropic_keeps_text_alongside_tool_use() -> None:
+    """A model that says "let me check" and then calls a tool must not lose the
+    sentence: dropping it changes the transcript the next turn is built on."""
+    messages = [
+        Message(role="user", content="check"),
+        Message(
+            role="assistant",
+            content="let me look",
+            tool_calls=(ToolCall(id="c1", name="run_command", arguments={"command": "date"}),),
+        ),
+        Message(role="tool", content="Mon", tool_call_id="c1"),
+    ]
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, ANTHROPIC_OK)) as client:
+        await AnthropicProvider(SECRET, client=client).complete(messages, model="m", tools=TOOLS)
+
+    blocks = payloads[0]["messages"][1]["content"]
+    assert blocks[0] == {"type": "text", "text": "let me look"}
+    assert blocks[1]["type"] == "tool_use"
+
+
+async def test_anthropic_still_fails_on_no_text_and_no_tools() -> None:
+    body = {"model": "m", "content": [], "usage": {}}
+    async with mock_client(lambda r: httpx.Response(200, json=body)) as client:
+        with pytest.raises(ProviderError):
+            await AnthropicProvider(SECRET, client=client).complete(PROMPT, model="m")
+
+
+# openai (Responses)
+
+OPENAI_TOOL_CALL = {
+    "model": "gpt-5",
+    "status": "completed",
+    "output": [
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "run_command",
+            "arguments": '{"command": "date"}',
+        }
+    ],
+    "usage": {"input_tokens": 7, "output_tokens": 3},
+}
+
+
+async def test_openai_sends_flat_function_tools() -> None:
+    """Flat on Responses: `name`/`parameters` sit beside `type`, where Chat
+    Completions nested them under a `function` object."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, OPENAI_OK)) as client:
+        await OpenAIProvider(SECRET, client=client).complete(PROMPT, model="m", tools=TOOLS)
+
+    (tool,) = payloads[0]["tools"]
+    assert tool["type"] == "function"
+    assert tool["name"] == "run_command"
+    assert "function" not in tool
+
+
+async def test_openai_reads_back_a_function_call_by_call_id() -> None:
+    """`call_id`, not `id`: pairing a result on the item's own id gets a 400."""
+    async with mock_client(lambda r: httpx.Response(200, json=OPENAI_TOOL_CALL)) as client:
+        completion = await OpenAIProvider(SECRET, client=client).complete(
+            PROMPT, model="m", tools=TOOLS
+        )
+    (call,) = completion.tool_calls
+    assert call.id == "call_1"
+    # Sent as a JSON string; arrives decoded.
+    assert call.arguments == {"command": "date"}
+
+
+async def test_openai_sends_the_call_and_its_output_as_items() -> None:
+    """With `store: False` there is no server-side state, so the pending call has to
+    be echoed back rather than referenced."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, OPENAI_OK)) as client:
+        await OpenAIProvider(SECRET, client=client).complete(TOOL_TURNS, model="m", tools=TOOLS)
+
+    items = payloads[0]["input"]
+    assert payloads[0]["store"] is False
+    call_item = next(i for i in items if i.get("type") == "function_call")
+    assert call_item["call_id"] == "call_1"
+    assert json.loads(call_item["arguments"]) == {"command": "date"}
+    output_item = next(i for i in items if i.get("type") == "function_call_output")
+    assert output_item["call_id"] == "call_1"
+    assert output_item["output"] == "Mon 3 Aug 2026"
+
+
+async def test_openai_survives_arguments_that_are_not_json() -> None:
+    """A small model occasionally emits a broken string. That is a bad tool call, not
+    a broken provider, so it fails later against the tool's own schema."""
+    body = {
+        **OPENAI_TOOL_CALL,
+        "output": [
+            {"type": "function_call", "call_id": "c", "name": "run_command", "arguments": "{oops"}
+        ],
+    }
+    async with mock_client(lambda r: httpx.Response(200, json=body)) as client:
+        completion = await OpenAIProvider(SECRET, client=client).complete(
+            PROMPT, model="m", tools=TOOLS
+        )
+    assert completion.tool_calls[0].arguments == {}
+
+
+async def test_openai_still_fails_on_no_text_and_no_tools() -> None:
+    body = {"model": "m", "status": "completed", "output": [], "usage": {}}
+    async with mock_client(lambda r: httpx.Response(200, json=body)) as client:
+        with pytest.raises(ProviderError):
+            await OpenAIProvider(SECRET, client=client).complete(PROMPT, model="m")
+
+
+# gemini
+
+GEMINI_TOOL_CALL = {
+    "modelVersion": "gemini-2.5-flash",
+    "candidates": [
+        {
+            "content": {
+                "parts": [{"functionCall": {"name": "run_command", "args": {"command": "date"}}}]
+            },
+            "finishReason": "STOP",
+        }
+    ],
+    "usageMetadata": {"promptTokenCount": 8, "candidatesTokenCount": 5},
+}
+
+
+async def test_gemini_wraps_declarations_in_one_tools_entry() -> None:
+    """The API takes a list of tool *objects*; a function is a declaration inside
+    one of them, so one entry holds every declaration."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, GEMINI_OK)) as client:
+        await GeminiProvider(SECRET, client=client).complete(PROMPT, model="m", tools=TOOLS)
+
+    (entry,) = payloads[0]["tools"]
+    (declaration,) = entry["function_declarations"]
+    assert declaration["name"] == "run_command"
+
+
+async def test_gemini_synthesises_a_call_id() -> None:
+    """This API issues none, and the loop needs something to pair a result with its
+    request inside one turn."""
+    async with mock_client(lambda r: httpx.Response(200, json=GEMINI_TOOL_CALL)) as client:
+        completion = await GeminiProvider(SECRET, client=client).complete(
+            PROMPT, model="m", tools=TOOLS
+        )
+    (call,) = completion.tool_calls
+    assert call.name == "run_command"
+    assert call.id == "run_command-0"
+    assert call.arguments == {"command": "date"}
+
+
+async def test_gemini_sends_a_result_as_a_function_response_part() -> None:
+    payloads: list[dict] = []
+    turns = [
+        Message(role="user", content="what is the date?"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=(
+                ToolCall(id="run_command-0", name="run_command", arguments={"command": "date"}),
+            ),
+        ),
+        Message(role="tool", content="Mon 3 Aug 2026", tool_call_id="run_command-0"),
+    ]
+    async with mock_client(capture(payloads, GEMINI_OK)) as client:
+        await GeminiProvider(SECRET, client=client).complete(turns, model="m", tools=TOOLS)
+
+    contents = payloads[0]["contents"]
+    assert [c["role"] for c in contents] == ["user", "model", "user"]
+    assert contents[1]["parts"][0]["functionCall"] == {
+        "name": "run_command",
+        "args": {"command": "date"},
+    }
+    response = contents[2]["parts"][0]["functionResponse"]
+    # Paired by name, recovered from the synthesised id, and the response must be an
+    # object rather than a bare string.
+    assert response["name"] == "run_command"
+    assert response["response"] == {"result": "Mon 3 Aug 2026"}
+
+
+async def test_gemini_still_fails_on_no_text_and_no_tools() -> None:
+    body = {"candidates": [{"content": {"parts": []}}], "usageMetadata": {}}
+    async with mock_client(lambda r: httpx.Response(200, json=body)) as client:
+        with pytest.raises(ProviderError):
+            await GeminiProvider(SECRET, client=client).complete(PROMPT, model="m")
+
+
+async def test_gemini_drops_an_assistant_turn_with_nothing_in_it() -> None:
+    """An empty `parts` is rejected by the API, and such a turn carries nothing."""
+    payloads: list[dict] = []
+    turns = [
+        Message(role="user", content="hi"),
+        Message(role="assistant", content=""),
+        Message(role="user", content="still there?"),
+    ]
+    async with mock_client(capture(payloads, GEMINI_OK)) as client:
+        await GeminiProvider(SECRET, client=client).complete(turns, model="m")
+    assert [c["role"] for c in payloads[0]["contents"]] == ["user", "user"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"a": 1}, {"a": 1}),
+        ('{"a": 1}', {"a": 1}),
+        ("{not json", {}),
+        ("", {}),
+        (None, {}),
+        (42, {}),
+        ('["a"]', {}),
+    ],
+)
+async def test_tool_arguments_are_normalised_to_a_dict(raw: object, expected: dict) -> None:
+    assert decode_tool_arguments(raw) == expected
+
+
+async def test_ollama_pairs_a_result_by_name_not_by_synthesised_id() -> None:
+    """The round trip with the id Ollama actually produces, which is none.
+
+    The test above hand-built `call_1`, so it only proved that whatever id went in
+    came back out - and what came back out was `read_file-0` in the field Ollama
+    reads as a *name*. Driving the real synthesised id is what catches it.
+    """
+    payloads: list[dict] = []
+    async with mock_client(lambda r: httpx.Response(200, json=OLLAMA_TOOL_CALL)) as client:
+        asked = await OllamaProvider(client=client).complete(PROMPT, model="m", tools=TOOLS)
+    (call,) = asked.tool_calls
+    assert call.id == "run_command-0", "the id is synthesised from name and position"
+
+    turns = [
+        *PROMPT,
+        Message(role="assistant", content="", tool_calls=asked.tool_calls),
+        Message(role="tool", content="Mon 3 Aug 2026", tool_call_id=call.id),
+    ]
+    async with mock_client(capture(payloads, OLLAMA_OK)) as client:
+        await OllamaProvider(client=client).complete(turns, model="m", tools=TOOLS)
+
+    assert payloads[0]["messages"][-1]["tool_name"] == "run_command"
+
+
+async def test_a_provider_issued_id_is_not_mangled() -> None:
+    """`call_name` only strips a `-<digits>` suffix, so a real id with a dash in it
+    survives - Ollama does hand one over sometimes."""
+    payloads: list[dict] = []
+    turns = [
+        *PROMPT,
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=(ToolCall(id="abc-def", name="run_command", arguments={}),),
+        ),
+        Message(role="tool", content="out", tool_call_id="abc-def"),
+    ]
+    async with mock_client(capture(payloads, OLLAMA_OK)) as client:
+        await OllamaProvider(client=client).complete(turns, model="m", tools=TOOLS)
+    assert payloads[0]["messages"][-1]["tool_name"] == "abc-def"
+
+
+@pytest.mark.parametrize(
+    ("call_id", "expected"),
+    [
+        ("read_file-0", "read_file"),
+        ("run_command-12", "run_command"),
+        ("notes__search-0", "notes__search"),
+        ("call_abc123", "call_abc123"),
+        ("abc-def", "abc-def"),
+        ("", ""),
+        (None, ""),
+    ],
+)
+async def test_call_name_inverts_the_synthesised_id(call_id: object, expected: str) -> None:
+    from daemon.llm.base import call_name, synthesise_call_id
+
+    assert call_name(call_id) == expected  # type: ignore[arg-type]
+    assert call_name(synthesise_call_id("read_file", 3)) == "read_file"

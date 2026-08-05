@@ -51,15 +51,15 @@ def test_a_worktree_copy_of_the_repo_is_not_scanned_twice(check_docs: object) ->
     """Agent sessions create these under `.claude/worktrees/`, so this is the live
     case rather than a hypothetical - it was already true when it was found.
 
-    Relative to ROOT, not absolute. Run from *inside* a worktree the repo's own
-    root legitimately sits under `.claude/worktrees/`, so an absolute check called
-    every ordinary doc a duplicate - and the filter it guards had the same bug, in
-    the same direction: it skipped everything and reported ok over five docs.
+    Relative to the checker's own root, because a copy is only a copy if it is
+    *below* the root. Asserting on the absolute parts made this fail whenever the
+    suite ran from a worktree, whatever the checker did - and it read as worktree
+    noise rather than as the finding it was sitting next to.
     """
-    root = check_docs.ROOT  # type: ignore[attr-defined]
     files = scanned(check_docs)
 
     assert files, "the checker found nothing to scan, so this proves nothing"
+    root = check_docs.ROOT  # type: ignore[attr-defined]
     duplicated = [p for p in files if "worktrees" in p.relative_to(root).parts]
     assert duplicated == [], f"scanning worktree copies: {duplicated}"
 
@@ -86,6 +86,40 @@ def test_the_module_docs_are_still_scanned(check_docs: object) -> None:
         "docs/CONTRACTS.md",
         "docs/ARCHITECTURE.md",
     } <= relative
+
+
+def test_the_module_docs_are_scanned_when_the_repo_lives_in_a_worktree(
+    check_docs: object, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The skip must be judged relative to the root, not against the absolute path.
+
+    `.claude` is in every glob result's absolute parts once the root is *itself*
+    under `.claude/worktrees/`, so the filter matched everything and `EXTRA_GLOBS`
+    returned nothing: `check_docs.py` printed `ok` having read five files and no
+    module doc, no ADR. That is the normal case for an agent session in this repo,
+    so the half of the check nobody ran was the half that covers the docs an agent
+    actually navigates by.
+
+    Built on a fake root rather than asserting on the real one, because the real
+    one's location is the variable under test - a test that only fails when the
+    suite happens to run from a worktree is the same defect one level up.
+    """
+    root = tmp_path / ".claude" / "worktrees" / "some-branch"
+    for doc in (
+        "CLAUDE.md",
+        "daemon/CLAUDE.md",
+        "docs/adr/0001-a-decision.md",
+        ".claude/worktrees/a-copy/daemon/CLAUDE.md",  # a nested copy: still skipped
+    ):
+        path = root / doc
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fake\n", encoding="utf-8")
+    monkeypatch.setattr(check_docs, "ROOT", root)
+
+    relative = {p.relative_to(root).as_posix() for p in scanned(check_docs)}
+
+    assert {"CLAUDE.md", "daemon/CLAUDE.md", "docs/adr/0001-a-decision.md"} <= relative
+    assert ".claude/worktrees/a-copy/daemon/CLAUDE.md" not in relative
 
 
 def test_the_checker_passes_on_this_repo(check_docs: object) -> None:

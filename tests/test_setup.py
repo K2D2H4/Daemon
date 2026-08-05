@@ -140,6 +140,13 @@ def drive(
     """
     env_path = tmp_path / ".env"
     if existing is not None:
+        if "DAEMON_TOOLS_ENABLED" not in existing:
+            # Step 1 asks about PC control, so a file that never mentions it is an
+            # *upgrade* rather than a configured install - and "keep every answer"
+            # would necessarily write the new key, which is not what the tests below
+            # are about. They get a file that has already answered it; the upgrade
+            # path has its own test (`test_a_file_from_before_pc_control_is_asked`).
+            existing = "DAEMON_TOOLS_ENABLED=true\n" + existing
         env_path.write_text(existing, encoding="utf-8")
     out = stdout if stdout is not None else io.StringIO()
     code = setup.run(
@@ -151,6 +158,12 @@ def drive(
     )
     return Run(code, out.getvalue(), env_path)
 
+
+TOOLS_YES = "y"
+"""Step 1: yes, Daemon may act on this computer.
+
+Named rather than inlined because it is now the first answer every scripted run
+gives, and a bare "y" at the head of a list reads like part of what follows it."""
 
 KEEP = ""
 """Enter at a step whose answer is already in `.env`.
@@ -165,10 +178,11 @@ that drives a re-run answers one more question than it used to.
 def answers_for(*, persona: Sequence[str] = ("", "", ""), pairing: Sequence[str] = ()) -> list[str]:
     """Every answer a fresh `offline` install is asked for, in order.
 
-    One place, because the order is the product: preset, credentials, write, then
-    the two steps that used to be homework - the persona seed and pairing.
+    One place, because the order is the product: what it may do to this computer,
+    preset, credentials, write, then the two steps that used to be homework - the
+    persona seed and pairing.
     """
-    return ["1", "gemma3:4b", GOOD_TOKEN, "y", *persona, *pairing]
+    return [TOOLS_YES, "1", "gemma3:4b", GOOD_TOKEN, "y", *persona, *pairing]
 
 
 def message(update_id: int, sender_id: int, text: str, **user: object) -> dict[str, Any]:
@@ -262,7 +276,7 @@ def test_the_folded_preset_menu_still_says_voice_is_the_trade(tmp_path: Path) ->
     # docs/PLAN.md 7 rests on the offline preset being real, so the *trade* has to
     # be legible without expanding anything - a person choosing offline must not
     # discover afterwards that they gave voice up.
-    result = drive(tmp_path, ["1", "gemma3:4b", GOOD_TOKEN, "y"])
+    result = drive(tmp_path, [TOOLS_YES, "1", "gemma3:4b", GOOD_TOKEN, "y"])
 
     assert "Voice unavailable" in flat(result.out)
     # And the argument is not printed unasked: folding is what made the menu
@@ -274,7 +288,7 @@ def test_the_reasoning_is_one_keypress_away_and_loses_nothing(tmp_path: Path) ->
     # Folding is not omission (daemon/tui.py). The sentence that carries
     # docs/PLAN.md 7 is the single most load-bearing line in this menu, and `?` has
     # to be a route to it rather than a shorter paraphrase of it.
-    result = drive(tmp_path, [EXPAND, "1", "gemma3:4b", GOOD_TOKEN, "y"])
+    result = drive(tmp_path, [TOOLS_YES, EXPAND, "1", "gemma3:4b", GOOD_TOKEN, "y"])
 
     assert result.code == 0
     flattened = " ".join(result.out.split())
@@ -286,7 +300,7 @@ def test_the_reasoning_is_one_keypress_away_and_loses_nothing(tmp_path: Path) ->
 
 
 def test_an_unusable_answer_at_a_choice_says_what_is_usable(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["cheap", "1", "gemma3:4b", GOOD_TOKEN, "y"])
+    result = drive(tmp_path, [TOOLS_YES, "cheap", "1", "gemma3:4b", GOOD_TOKEN, "y"])
 
     assert result.code == 0
     assert "Pick one of: offline, balanced, quality." in result.out
@@ -297,7 +311,7 @@ def test_offline_asks_for_no_hosted_key_at_all(tmp_path: Path) -> None:
     recorder = Recorder()
     result = drive(
         tmp_path,
-        ["1", "gemma3:4b", GOOD_TOKEN, "y"],
+        [TOOLS_YES, "1", "gemma3:4b", GOOD_TOKEN, "y"],
         checks=recorder.checks(),
         opener=recorder.opened.append,
     )
@@ -318,7 +332,7 @@ def test_balanced_asks_for_anthropic_but_not_for_voice(tmp_path: Path) -> None:
         tmp_path,
         # The "" after the key is Enter at the Anthropic model id, which now has a
         # question of its own.
-        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "", GOOD_TOKEN, "y"],
+        [TOOLS_YES, "2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "", GOOD_TOKEN, "y"],
         checks=recorder.checks(),
     )
 
@@ -333,7 +347,10 @@ def test_voice_asks_for_gemini_and_writes_both_model_ids(tmp_path: Path) -> None
     recorder = Recorder()
     result = drive(
         tmp_path,
-        ["2", "anthropic", "y", "gemma3:4b", GOOD_KEY, "", "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
+        [
+            TOOLS_YES, "2", "anthropic", "y", "gemma3:4b", GOOD_KEY, "", "AIzaGEMINIKEY", "",
+            GOOD_TOKEN, "y",
+        ],
         checks=recorder.checks(),
     )
 
@@ -351,7 +368,9 @@ def test_quality_does_not_make_ollama_a_condition_of_finishing(tmp_path: Path) -
     # only affects recall quality.
     recorder = Recorder()
     result = drive(
-        tmp_path, ["3", "anthropic", "n", GOOD_KEY, "", GOOD_TOKEN, "y"], checks=recorder.checks()
+        tmp_path, [
+            TOOLS_YES, "3", "anthropic", "n", GOOD_KEY, "", GOOD_TOKEN, "y",
+        ], checks=recorder.checks()
     )
 
     assert result.code == 0
@@ -369,7 +388,7 @@ def test_missing_ollama_models_are_printed_as_commands_not_run(tmp_path: Path) -
         # Ollama is up but empty: the interesting case, and the common one.
         ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ()),
     )
-    result = drive(tmp_path, ["1", "gemma3:4b", GOOD_TOKEN, "y"], checks=checks)
+    result = drive(tmp_path, [TOOLS_YES, "1", "gemma3:4b", GOOD_TOKEN, "y"], checks=checks)
 
     assert result.code == 0
     assert "ollama pull gemma3:4b" in result.out
@@ -384,7 +403,7 @@ def test_unreachable_ollama_is_a_warning_not_a_dead_end(tmp_path: Path) -> None:
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
         ollama=lambda url: OllamaState(False, f"not reachable at {url}"),
     )
-    result = drive(tmp_path, ["1", "gemma3:4b", GOOD_TOKEN, "y"], checks=checks)
+    result = drive(tmp_path, [TOOLS_YES, "1", "gemma3:4b", GOOD_TOKEN, "y"], checks=checks)
 
     assert result.code == 0
     assert "not reachable" in result.out
@@ -416,7 +435,10 @@ def test_a_rejected_key_is_re_asked_and_the_bad_one_is_never_written(
     )
     result = drive(
         tmp_path,
-        ["2", "anthropic", "n", "gemma3:4b", "sk-ant-TYPO", GOOD_KEY, "", GOOD_TOKEN, "y"],
+        [
+            TOOLS_YES, "2", "anthropic", "n", "gemma3:4b", "sk-ant-TYPO", GOOD_KEY, "", GOOD_TOKEN,
+            "y",
+        ],
         checks=checks,
     )
 
@@ -446,7 +468,7 @@ def test_the_key_is_checked_against_the_configured_model(tmp_path: Path) -> None
     existing = "DAEMON_PRESET=balanced\nDAEMON_ANTHROPIC_MODEL=claude-opus-4-1\n"
     drive(
         tmp_path,
-        [KEEP, "anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
         existing=existing,
         checks=checks,
     )
@@ -461,7 +483,10 @@ def test_giving_up_on_a_key_writes_nothing(tmp_path: Path) -> None:
         telegram=lambda token: Verdict(True, "ok"),
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
     )
-    answers = ["2", "anthropic", "n", "gemma3:4b", "bad1", "bad2", "bad3", GOOD_TOKEN, "y"]
+    answers = [
+        TOOLS_YES, "2", "anthropic", "n", "gemma3:4b", "bad1", "bad2", "bad3",
+        GOOD_TOKEN, "y",
+    ]
     result = drive(tmp_path, answers, checks=checks)
 
     assert result.code == 1
@@ -476,7 +501,10 @@ def test_a_verdict_hint_is_shown_so_the_user_can_act_on_it(tmp_path: Path) -> No
     result = drive(
         tmp_path,
         # quality + voice on: the hosted chat key, then the voice key three times.
-        ["3", "anthropic", "y", GOOD_KEY, "AIza-STANDARD-KEY", "AIza-AUTH-KEY", "", GOOD_TOKEN],
+        [
+            TOOLS_YES, "3", "anthropic", "y", GOOD_KEY, "AIza-STANDARD-KEY", "AIza-AUTH-KEY", "",
+            GOOD_TOKEN,
+        ],
         checks=Recorder().checks(gemini_verdict=verdict),
         opener=recorder.opened.append,
     )
@@ -618,6 +646,7 @@ def test_ollama_probe_reports_the_installed_models(monkeypatch: pytest.MonkeyPat
 
 EXISTING = """# my own notes
 DAEMON_PRESET=offline
+DAEMON_TOOLS_ENABLED=true
 DAEMON_DATA_DIR=/somewhere/private
 DAEMON_PORT=9999
 
@@ -626,8 +655,70 @@ DAEMON_RECALL_LIMIT=12
 """
 
 
+def test_a_file_from_before_pc_control_is_asked(tmp_path: Path) -> None:
+    """An `.env` written before this question existed does not silently inherit the
+    default: the wizard asks, and the answer is written so the file says what it is.
+
+    `drive` normally supplies the key for a "configured" install, so this test writes
+    the file itself - it is the one case that has to see the question arrive.
+    """
+    env_path = tmp_path / ".env"
+    env_path.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    result = drive(tmp_path, ["n", KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=None)
+
+    assert result.code == 0
+    assert "Let it act on this computer" in flat(result.out)
+    assert "DAEMON_TOOLS_ENABLED=false" in result.written, result.written
+
+
+def test_saying_yes_is_written_rather_than_left_to_the_default(tmp_path: Path) -> None:
+    """The default is already `true`, so the wizard could have written nothing here.
+
+    It writes it anyway: a capability nobody was shown, resting on a default that is
+    only visible in `daemon/config.py`, is the silent state this repo keeps shipping.
+    """
+    result = drive(tmp_path, answers_for())
+
+    assert result.code == 0
+    assert "DAEMON_TOOLS_ENABLED=true" in result.written, result.written
+
+
+def test_the_permission_question_comes_before_how_it_thinks(tmp_path: Path) -> None:
+    # Order is the product: what it may do to your machine is not a footnote to
+    # which model answers, and burying it under "keys and tokens" is how it ends up
+    # never being asked at all.
+    result = drive(tmp_path, answers_for())
+
+    assert result.code == 0
+    out = flat(result.out)
+    assert out.index("What may Daemon do to this computer") < out.index("How should Daemon think")
+
+
+def test_an_install_that_said_no_is_not_flipped_back_on_by_enter(tmp_path: Path) -> None:
+    # Enter means "keep", and keeping `false` has to keep `false` - the default the
+    # prompt offers is the current value, not the shipped one.
+    existing = "DAEMON_TOOLS_ENABLED=false\nDAEMON_PRESET=offline\n"
+    result = drive(tmp_path, [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=existing)
+
+    assert result.code == 0
+    assert "Currently off." in flat(result.out)
+    assert "DAEMON_TOOLS_ENABLED=false" in result.written, result.written
+    assert "DAEMON_TOOLS_ENABLED=true" not in result.written
+
+
+def test_the_narrowing_advice_is_only_shown_to_someone_who_said_yes(tmp_path: Path) -> None:
+    # Telling someone who declined how to narrow DAEMON_TOOLS_ROOTS is noise, and
+    # noise in an onboarding wizard is how people stop reading it.
+    said_no = drive(tmp_path / "no", ["n", "1", "gemma3:4b", GOOD_TOKEN, "y"])
+    said_yes = drive(tmp_path / "yes", answers_for())
+
+    assert (said_no.code, said_yes.code) == (0, 0)
+    assert "DAEMON_TOOLS_ROOTS" in flat(said_yes.out)
+    assert "DAEMON_TOOLS_ROOTS" not in flat(said_no.out)
+
+
 def test_an_existing_env_is_merged_not_replaced(tmp_path: Path) -> None:
-    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=EXISTING)
+    result = drive(tmp_path, [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=EXISTING)
 
     assert result.code == 0
     written = result.written
@@ -645,7 +736,7 @@ def test_a_value_already_in_the_file_is_not_asked_for_again(tmp_path: Path) -> N
     existing = f"DAEMON_PRESET=balanced\nANTHROPIC_API_KEY={GOOD_KEY}\n"
     result = drive(
         tmp_path,
-        [KEEP, "anthropic", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "anthropic", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(),
     )
@@ -681,7 +772,7 @@ def test_an_in_place_update_does_not_duplicate_the_key(tmp_path: Path) -> None:
 
 
 def test_the_written_file_is_owner_only(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["1", "gemma3:4b", GOOD_TOKEN, "y"])
+    result = drive(tmp_path, [TOOLS_YES, "1", "gemma3:4b", GOOD_TOKEN, "y"])
 
     assert result.env_path.stat().st_mode & 0o777 == 0o600
 
@@ -692,7 +783,7 @@ def test_a_world_readable_env_is_tightened_when_it_is_touched(tmp_path: Path) ->
     env_path.chmod(0o644)
 
     result = drive(
-        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
+        tmp_path, [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
     )
 
     assert result.code == 0
@@ -701,10 +792,10 @@ def test_a_world_readable_env_is_tightened_when_it_is_touched(tmp_path: Path) ->
 
 def test_nothing_left_to_do_is_not_a_rewrite(tmp_path: Path) -> None:
     existing = (
-        f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
-        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
+        f"DAEMON_TOOLS_ENABLED=true\nDAEMON_PRESET=offline\n"
+        f"DAEMON_OLLAMA_MODEL=gemma3:4b\nTELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
     )
-    result = drive(tmp_path, [KEEP], existing=existing)
+    result = drive(tmp_path, [KEEP, KEEP], existing=existing)
 
     assert result.code == 0
     assert "already configured" in result.out
@@ -714,7 +805,7 @@ def test_nothing_left_to_do_is_not_a_rewrite(tmp_path: Path) -> None:
 
 
 def test_declining_the_write_leaves_the_file_alone(tmp_path: Path) -> None:
-    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "n"], existing=EXISTING)
+    result = drive(tmp_path, [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "n"], existing=EXISTING)
 
     assert result.code == 1
     assert "Nothing was written." in result.out
@@ -725,7 +816,7 @@ def test_declining_the_write_leaves_the_file_alone(tmp_path: Path) -> None:
 
 
 def test_end_of_input_leaves_an_existing_file_untouched(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["gemma3:4b"], existing=EXISTING)  # runs out at the token
+    result = drive(tmp_path, [KEEP, "gemma3:4b"], existing=EXISTING)  # runs out at the token
 
     assert result.code == 1
     assert "was not touched" in result.out
@@ -733,7 +824,7 @@ def test_end_of_input_leaves_an_existing_file_untouched(tmp_path: Path) -> None:
 
 
 def test_end_of_input_creates_no_file(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["2"])
+    result = drive(tmp_path, [TOOLS_YES, "2"])
 
     assert result.code == 1
     assert not result.env_path.exists()
@@ -744,7 +835,7 @@ def test_ctrl_c_leaves_an_existing_file_untouched(tmp_path: Path) -> None:
         def readline(self, *args: object, **kwargs: object) -> str:
             raise KeyboardInterrupt
 
-    result = drive(tmp_path, [], existing=EXISTING, stdin=Interrupting())
+    result = drive(tmp_path, [KEEP, ], existing=EXISTING, stdin=Interrupting())
 
     assert result.code == 1
     assert result.written == EXISTING
@@ -754,7 +845,7 @@ def test_a_file_that_still_fails_validation_is_explained_not_traced(tmp_path: Pa
     # A hand-edited `.env` can be invalid in ways the wizard never asks about.
     # Startup would reject it; setup has to say so in words.
     existing = "DAEMON_PRESET=offline\nDAEMON_RECALL_LIMIT=0\n"
-    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=existing)
+    result = drive(tmp_path, [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=existing)
 
     assert result.code == 1
     assert "not usable yet" in result.out
@@ -767,7 +858,7 @@ def test_a_file_that_still_fails_validation_is_explained_not_traced(tmp_path: Pa
 def test_no_secret_is_ever_echoed_back(tmp_path: Path) -> None:
     result = drive(
         tmp_path,
-        ["2", "anthropic", "y", GOOD_KEY, "", "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
+        [KEEP, "2", "anthropic", "y", GOOD_KEY, "", "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
         existing="DAEMON_OLLAMA_MODEL=gemma3:4b\n",
     )
 
@@ -784,7 +875,7 @@ def test_no_secret_is_ever_echoed_back(tmp_path: Path) -> None:
 def test_a_replaced_secret_is_masked_in_the_change_list(tmp_path: Path) -> None:
     existing = "DAEMON_PRESET=offline\nTELEGRAM_BOT_TOKEN=1111:OLDTOKENZZZZ\n"
     result = drive(
-        tmp_path, [KEEP, "gemma3:4b", "y"], existing=existing
+        tmp_path, [KEEP, KEEP, "gemma3:4b", "y"], existing=existing
     )  # token already set, so only the model is asked
 
     assert result.code == 0
@@ -801,7 +892,7 @@ def test_mask_never_shows_a_short_value(tmp_path: Path) -> None:
 
 
 def test_no_numeric_telegram_id_is_ever_requested(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["1", "gemma3:4b", GOOD_TOKEN, "y"])
+    result = drive(tmp_path, [TOOLS_YES, "1", "gemma3:4b", GOOD_TOKEN, "y"])
 
     assert result.code == 0
     # No prompt for an id, and no trace of the @userinfobot procedure this command
@@ -823,7 +914,7 @@ def test_an_existing_allowlist_suppresses_the_pairing_note(tmp_path: Path) -> No
     # belongs to daemon/config.py.
     existing = 'DAEMON_PRESET=offline\nTELEGRAM_ALLOWED_USER_IDS=["4242"]\n'
     result = drive(
-        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""], existing=existing
+        tmp_path, [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""], existing=existing
     )
 
     assert result.code == 0
@@ -832,7 +923,7 @@ def test_an_existing_allowlist_suppresses_the_pairing_note(tmp_path: Path) -> No
 
 
 def test_the_telegram_token_can_be_skipped(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["1", "gemma3:4b", "", "y"])
+    result = drive(tmp_path, [TOOLS_YES, "1", "gemma3:4b", "", "y"])
 
     assert result.code == 0
     assert "Skipped" in result.out
@@ -1150,10 +1241,10 @@ def test_a_very_long_answer_is_cut_rather_than_prepended_to_every_turn(
 
 
 def test_ctrl_c_during_the_persona_questions_leaves_no_half_file(tmp_path: Path) -> None:
-    # Four prompts get answers (preset, model, token, write), then Ctrl-C at the
-    # name. The `.env` is already on disk and has to stay; the seed is written in
+    # Five prompts get answers (tools, preset, model, token, write), then Ctrl-C at
+    # the name. The `.env` is already on disk and has to stay; the seed is written in
     # one atomic replace at the end, so there is nothing half-written to find.
-    stdin = InterruptingAfter(answers_for(persona=()), count=4)
+    stdin = InterruptingAfter(answers_for(persona=()), count=5)
 
     result = drive(tmp_path, [], stdin=stdin)
 
@@ -1170,10 +1261,10 @@ def test_a_second_setup_can_still_write_the_seed_it_skipped(tmp_path: Path) -> N
     # there was nothing left to change, so the wizard returned before ever
     # reaching the persona questions.
     existing = (
-        f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
-        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
+        f"DAEMON_TOOLS_ENABLED=true\nDAEMON_PRESET=offline\n"
+        f"DAEMON_OLLAMA_MODEL=gemma3:4b\nTELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
     )
-    result = drive(tmp_path, [KEEP, "루미", "1", ""], existing=existing)
+    result = drive(tmp_path, [KEEP, KEEP, "루미", "1", ""], existing=existing)
 
     assert result.code == 0
     assert "already configured" in result.out
@@ -1191,7 +1282,7 @@ def test_a_data_dir_that_cannot_be_created_is_a_sentence_not_a_traceback(
     existing = f"DAEMON_PRESET=offline\nDAEMON_DATA_DIR={blocked / 'data'}\n"
 
     result = drive(
-        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
+        tmp_path, [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
     )
 
     assert result.code == 0
@@ -1207,7 +1298,7 @@ def test_a_pairing_database_that_cannot_be_opened_is_reported(tmp_path: Path) ->
 
     result = drive(
         tmp_path,
-        [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "y"],
+        [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "y"],
         existing=existing,
         checks=checks_with(inbox),
     )
@@ -1248,7 +1339,7 @@ def test_pairing_is_not_offered_when_the_ids_come_from_the_file(tmp_path: Path) 
     inbox = Inbox()
     result = drive(
         tmp_path,
-        [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""],
+        [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""],
         existing=existing,
         checks=checks_with(inbox),
     )
@@ -1596,7 +1687,7 @@ def test_a_token_already_in_the_file_is_re_verified_before_the_wait(tmp_path: Pa
     )
 
     result = drive(
-        tmp_path, [KEEP, "gemma3:4b", "y", "", "", "", "y"], existing=existing, checks=checks
+        tmp_path, [KEEP, KEEP, "gemma3:4b", "y", "", "", "", "y"], existing=existing, checks=checks
     )
 
     assert result.code == 0
@@ -1919,7 +2010,7 @@ def test_the_chosen_provider_is_the_one_whose_key_is_asked_for(
     recorder = Recorder()
     # balanced, the chosen provider, voice off, then the model id where one is
     # asked for (anthropic has a Settings default, so it is not).
-    answers = ["2", provider, "n", "gemma3:4b", key_value]
+    answers = [TOOLS_YES, "2", provider, "n", "gemma3:4b", key_value]
     if provider != "anthropic":
         answers.append("")  # the offered model id
     answers += [GOOD_TOKEN, "y", "", "", "", "n"]
@@ -1951,7 +2042,7 @@ def test_the_env_the_wizard_writes_loads_and_routes_to_that_provider(
     from daemon.tasks import Task
 
     _, key_value = HOSTED_KEY[provider]
-    answers = ["2", provider, "n", "gemma3:4b", key_value]
+    answers = [TOOLS_YES, "2", provider, "n", "gemma3:4b", key_value]
     if provider != "anthropic":
         answers.append("")
     answers += [GOOD_TOKEN, "y", "", "", "", "n"]
@@ -1987,7 +2078,10 @@ def test_gemini_as_the_chat_provider_still_warns_about_standard_keys(
     )
     result = drive(
         tmp_path,
-        ["2", "gemini", "n", "gemma3:4b", "AIza-STANDARD", "AIza-STANDARD", "AIza-STANDARD"],
+        [
+            TOOLS_YES, "2", "gemini", "n", "gemma3:4b", "AIza-STANDARD", "AIza-STANDARD",
+            "AIza-STANDARD",
+        ],
         checks=Recorder().checks(gemini_verdict=verdict),
     )
 
@@ -2003,7 +2097,7 @@ def test_an_openai_key_is_masked_in_the_change_list(tmp_path: Path) -> None:
     secret = "sk-proj-REALOPENAI7777"
     result = drive(
         tmp_path,
-        ["2", "openai", "n", "gemma3:4b", secret, "", GOOD_TOKEN, "y", "", "", "", "n"],
+        [TOOLS_YES, "2", "openai", "n", "gemma3:4b", secret, "", GOOD_TOKEN, "y", "", "", "", "n"],
     )
 
     assert result.code == 0
@@ -2022,7 +2116,10 @@ def test_a_provider_already_chosen_is_offered_again_and_enter_keeps_it(
     existing = "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai\n"
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "", "n"],
+        [
+            KEEP, KEEP, KEEP, "n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "",
+            "n",
+        ],
         existing=existing,
     )
 
@@ -2154,7 +2251,7 @@ def gemini_listing(
     )
 
 
-VOICE_ANSWERS = ["2", "gemini", "y", "gemma3:4b", GOOD_GEMINI]
+VOICE_ANSWERS = [TOOLS_YES, "2", "gemini", "y", "gemma3:4b", GOOD_GEMINI]
 """balanced, Gemini for the hosted work, voice on, the local model, the key.
 
 The next two questions are the Live id and the text id, in that order, and the key
@@ -2546,7 +2643,7 @@ def test_choosing_which_claude_is_a_question_with_a_menu_behind_it(
     # menu. `1` is the Settings default, because Enter and `1` have to agree.
     result = drive(
         tmp_path,
-        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "2", GOOD_TOKEN, "y"],
+        [TOOLS_YES, "2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "2", GOOD_TOKEN, "y"],
         checks=checks,
     )
 
@@ -2572,7 +2669,10 @@ def test_an_id_the_account_never_listed_is_still_accepted_for_claude(
     )
     result = drive(
         tmp_path,
-        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "claude-opus-6-20260901", GOOD_TOKEN, "y"],
+        [
+            TOOLS_YES, "2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "claude-opus-6-20260901",
+            GOOD_TOKEN, "y",
+        ],
         checks=checks,
     )
 
@@ -2600,7 +2700,7 @@ def test_a_saved_anthropic_key_still_produces_a_menu_on_a_re_install(
     )
     result = drive(
         tmp_path,
-        [KEEP, "anthropic", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "anthropic", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
         existing=f"DAEMON_PRESET=balanced\nANTHROPIC_API_KEY={GOOD_KEY}\n",
         checks=checks,
     )
@@ -2622,7 +2722,7 @@ def test_the_expand_key_still_prints_every_id_the_account_has(tmp_path: Path) ->
     # The Live id takes Enter, then the text question gets `?` and then Enter.
     result = drive(
         tmp_path,
-        [*VOICE_ANSWERS, "", EXPAND, "", "", "y"],
+        [TOOLS_YES, *VOICE_ANSWERS, "", EXPAND, "", "", "y"],
         checks=gemini_listing(
             live=(setup.DEFAULT_GEMINI_LIVE_MODEL,), text=REAL_TEXT_MODELS
         ),
@@ -2647,7 +2747,7 @@ def test_the_live_id_comes_from_the_account_rather_than_from_a_guess(
     live = ("gemini-3.1-flash-live-preview", "gemini-live-3-pro")
     result = drive(
         tmp_path,
-        [*VOICE_ANSWERS, "2", "", "", "y"],
+        [TOOLS_YES, *VOICE_ANSWERS, "2", "", "", "y"],
         checks=gemini_listing(live=live, text=("gemini-2.5-flash",)),
     )
 
@@ -2664,7 +2764,7 @@ def test_the_two_gemini_questions_are_offered_two_different_lists(tmp_path: Path
         tmp_path,
         # "1" for each, because neither hard-coded default is in these lists and a
         # dropped default makes Enter re-ask.
-        [*VOICE_ANSWERS, "1", "1", "", "", "y"],
+        [TOOLS_YES, *VOICE_ANSWERS, "1", "1", "", "", "y"],
         checks=gemini_listing(live=("live-a", "live-b"), text=("text-a", "text-b")),
     )
 
@@ -2679,7 +2779,7 @@ def test_the_openai_list_reaches_the_openai_question(tmp_path: Path) -> None:
     verdict = Verdict(True, "key works", models={"DAEMON_OPENAI_MODEL": ("gpt-4.1", "o3-mini")})
     result = drive(
         tmp_path,
-        ["2", "openai", "n", "gemma3:4b", "sk-proj-REALOPENAI7777", "1", "", "y"],
+        [TOOLS_YES, "2", "openai", "n", "gemma3:4b", "sk-proj-REALOPENAI7777", "1", "", "y"],
         checks=Recorder().checks(openai_verdict=verdict),
     )
 
@@ -2698,7 +2798,7 @@ def test_an_id_of_your_own_is_taken_even_when_the_list_never_heard_of_it(
     mine = "gemini-4.0-flash-live-preview-11-2026"
     result = drive(
         tmp_path,
-        [*VOICE_ANSWERS, mine, "", "", "y"],
+        [TOOLS_YES, *VOICE_ANSWERS, mine, "", "", "y"],
         checks=gemini_listing(live=("gemini-3.1-flash-live-preview",), text=("gemini-2.5-flash",)),
     )
 
@@ -2715,7 +2815,7 @@ def test_the_folded_tail_is_one_keypress_away_and_the_numbers_do_not_move(
     live = tuple(f"live-{index:02d}" for index in range(1, 21))
     result = drive(
         tmp_path,
-        [*VOICE_ANSWERS, EXPAND, "9", "", "", "y"],
+        [TOOLS_YES, *VOICE_ANSWERS, EXPAND, "9", "", "", "y"],
         checks=gemini_listing(live=live, text=("gemini-2.5-flash",)),
     )
 
@@ -2742,7 +2842,7 @@ def test_a_default_the_account_did_not_list_is_said_out_loud(tmp_path: Path) -> 
     empty_then_choose = ["", "1"]
     result = drive(
         tmp_path,
-        [*VOICE_ANSWERS, *empty_then_choose, "", "", "y"],
+        [TOOLS_YES, *VOICE_ANSWERS, *empty_then_choose, "", "", "y"],
         checks=gemini_listing(live=("gemini-live-3-pro",), text=("gemini-2.5-flash",)),
     )
 
@@ -2759,7 +2859,9 @@ def test_no_list_falls_back_to_the_question_it_always_asked(tmp_path: Path) -> N
     # A listing that fails must cost the menu and not the wizard. `Recorder`'s
     # default Gemini verdict carries no lists at all, which is also what a key
     # already sitting in `.env` produces: nothing probed it this run.
-    result = drive(tmp_path, [*VOICE_ANSWERS, "", "", "", "y"], checks=Recorder().checks())
+    result = drive(
+        tmp_path, [TOOLS_YES, *VOICE_ANSWERS, "", "", "", "y"], checks=Recorder().checks()
+    )
 
     assert result.code == 0
     assert setup.NO_LIST_NOTE in flat(result.out)
@@ -2770,7 +2872,7 @@ def test_no_list_falls_back_to_the_question_it_always_asked(tmp_path: Path) -> N
 def test_an_account_with_nothing_that_fits_says_that_instead(tmp_path: Path) -> None:
     # A different sentence from the one above, because it is a different fact:
     # the account answered, and had nothing.
-    result = drive(tmp_path, [*VOICE_ANSWERS, "", "", "", "y"], checks=gemini_listing())
+    result = drive(tmp_path, [TOOLS_YES, *VOICE_ANSWERS, "", "", "", "y"], checks=gemini_listing())
 
     assert result.code == 0
     assert setup.EMPTY_LIST_NOTE in flat(result.out)
@@ -2786,7 +2888,7 @@ def test_a_rejected_key_offers_no_list_and_fails_the_way_it_did_before(
     )
     result = drive(
         tmp_path,
-        [*VOICE_ANSWERS, "AIza-2", "AIza-3"],
+        [TOOLS_YES, *VOICE_ANSWERS, "AIza-2", "AIza-3"],
         checks=Recorder().checks(gemini_verdict=verdict),
     )
 
@@ -2804,7 +2906,7 @@ def test_a_long_model_list_still_fits_the_terminal(tmp_path: Path) -> None:
     live = tuple(f"gemini-{index}-flash-native-audio-preview-12-2026" for index in range(20))
     result = drive(
         tmp_path,
-        [*VOICE_ANSWERS, EXPAND, "1", "", "", "y"],
+        [TOOLS_YES, *VOICE_ANSWERS, EXPAND, "1", "", "", "y"],
         checks=gemini_listing(live=live, text=("gemini-2.5-flash",)),
     )
 
@@ -2875,7 +2977,7 @@ def test_the_wordmark_is_drawn_once(tmp_path: Path) -> None:
         assert part in result.out
 
 
-def test_every_step_is_numbered_out_of_four(tmp_path: Path) -> None:
+def test_every_step_is_numbered_out_of_five(tmp_path: Path) -> None:
     # A wizard that does not say how much is left is a wizard people abandon.
     inbox = Inbox([(message(3, 4242, "hi", first_name="Owner"),)])
 
@@ -2884,8 +2986,10 @@ def test_every_step_is_numbered_out_of_four(tmp_path: Path) -> None:
     )
 
     assert result.code == 0
-    for step in range(1, 5):
-        assert f"── {step}/4 ─" in result.out
+    # Hardcoded rather than read off `Wizard.STEPS`: the count is the thing being
+    # asserted, and a test that borrows it would agree with any number.
+    for step in range(1, 6):
+        assert f"── {step}/5 ─" in result.out
 
 
 def test_nothing_the_wizard_prints_overflows_the_width(tmp_path: Path) -> None:
@@ -2942,7 +3046,7 @@ def test_the_change_list_is_a_table_and_still_masks_secrets(tmp_path: Path) -> N
 
     existing = "DAEMON_PRESET=offline\nDAEMON_DATA_DIR=./데이터\n"
     result = drive(
-        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
+        tmp_path, [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
     )
 
     assert result.code == 0
@@ -3027,7 +3131,7 @@ def test_needs_come_from_the_preset_table(tmp_path: Path) -> None:
 
 def test_a_decided_preset_is_offered_again(tmp_path: Path) -> None:
     result = drive(
-        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
+        tmp_path, [KEEP, KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
     )
 
     assert result.code == 0
@@ -3042,7 +3146,7 @@ def test_a_preset_can_actually_be_changed_by_re_running(tmp_path: Path) -> None:
         tmp_path,
         # Order matters and is the product: preset, provider, voice, then the
         # credentials the chosen preset actually needs.
-        ["balanced", "gemini", "n", "gemma3:4b", GOOD_GEMINI, "", GOOD_TOKEN, "y"],
+        [KEEP, "balanced", "gemini", "n", "gemma3:4b", GOOD_GEMINI, "", GOOD_TOKEN, "y"],
         existing="DAEMON_PRESET=offline\n",
     )
 
@@ -3055,10 +3159,10 @@ def test_keeping_every_answer_writes_nothing(tmp_path: Path) -> None:
     """A re-run that changes nothing must stay harmless. `_record` compares against
     the current value precisely so "already configured" keeps being true."""
     existing = (
-        f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
-        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
+        f"DAEMON_TOOLS_ENABLED=true\nDAEMON_PRESET=offline\n"
+        f"DAEMON_OLLAMA_MODEL=gemma3:4b\nTELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
     )
-    result = drive(tmp_path, [KEEP], existing=existing)
+    result = drive(tmp_path, [KEEP, KEEP], existing=existing)
 
     assert result.code == 0
     assert result.written == existing
@@ -3075,7 +3179,7 @@ def test_voice_can_be_turned_off_again(tmp_path: Path) -> None:
     )
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "n", "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, KEEP, "n", "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
         existing=existing,
     )
 
@@ -3099,7 +3203,7 @@ def test_enter_at_the_voice_question_keeps_it_on(tmp_path: Path) -> None:
     )
     result = drive(
         tmp_path,
-        [KEEP, KEEP, KEEP, "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, KEEP, KEEP, "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
         existing=existing,
     )
 
@@ -3129,7 +3233,7 @@ def test_a_saved_key_still_gets_the_account_a_list(tmp_path: Path) -> None:
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "n", "1", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, KEEP, "n", "1", GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(
             gemini_verdict=Verdict(
@@ -3155,7 +3259,7 @@ def test_one_probe_answers_both_gemini_questions(tmp_path: Path) -> None:
 
     drive(
         tmp_path,
-        [KEEP, KEEP, KEEP, "1", "1", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, KEEP, KEEP, "1", "1", GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(
             gemini_verdict=Verdict(
@@ -3186,7 +3290,7 @@ def test_a_model_id_already_in_the_file_is_still_offered(tmp_path: Path) -> None
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, KEEP, "1", "1", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, KEEP, KEEP, "1", "1", GOOD_TOKEN, "y"],
         existing=existing,
         checks=gemini_listing(
             live=("gemini-2.5-flash-native-audio",), text=("gemini-2.5-flash",)
@@ -3210,7 +3314,7 @@ def test_a_saved_model_id_is_the_default_not_the_built_in_one(tmp_path: Path) ->
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "n", KEEP, GOOD_TOKEN, "y"],
+        [KEEP, KEEP, KEEP, "n", KEEP, GOOD_TOKEN, "y"],
         existing=existing,
         checks=gemini_listing(text=("gemini-2.5-flash", "gemini-2.5-pro")),
     )
@@ -3230,7 +3334,7 @@ def test_a_saved_key_that_stopped_working_is_said_out_loud(tmp_path: Path) -> No
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "n", "gemini-2.5-flash", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, KEEP, "n", "gemini-2.5-flash", GOOD_TOKEN, "y"],
         existing=existing,
         checks=Recorder().checks(
             gemini_verdict=Verdict(False, "Google refused the key (HTTP 403).")
@@ -3265,7 +3369,7 @@ def test_one_probe_even_when_only_one_of_the_two_lists_came_back(
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, KEEP, "1", "gemini-2.5-pro", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, KEEP, KEEP, "1", "gemini-2.5-pro", GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(
             gemini_verdict=Verdict(

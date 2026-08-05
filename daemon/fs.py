@@ -70,7 +70,7 @@ def open_private_append(path: Path):
     return os.fdopen(fd, "a", encoding="utf-8")
 
 
-def write_private_replace(path: Path, content: str) -> None:
+def write_private_replace(path: Path, content: str, *, secure_parent: bool = True) -> None:
     """Replace `path` wholesale: owner-only, atomic, and durable.
 
     For the files that are rewritten rather than appended to - the curated memory
@@ -89,18 +89,25 @@ def write_private_replace(path: Path, content: str) -> None:
         `log.append`: the markdown is the source of truth, so it must be at least
         as durable as the sqlite mirror that indexes it.
 
+    `secure_parent=False` for the one file we write outside the data dir: the
+    LaunchAgent plist. `~/Library/LaunchAgents` is shared with every other agent
+    the user has installed and normally stands at 0755, so taking it to 0700 is
+    the overreach `secure_dir` above already records happening once. The file is
+    ours; the directory is not.
+
     The temp name carries a random suffix so two concurrent callers on the same
     `path` (e.g. a scheduled pass and a hand-run CLI command overlapping) never
-    open, write and truncate the *same* inode - that collision previously let
-    the second writer's `O_TRUNC` erase the first writer's already-written
-    bytes before it could rename them into place, and then made the first
-    writer's own `os.replace` raise `FileNotFoundError` because its temp path
-    had already been renamed away by the second. A unique name does not make
-    two concurrent writers to the same `path` produce a merged result (the
-    later `os.replace` still wins outright), but it stops that crash and the
-    byte-level corruption of the loser's content before it could even finish.
+    open, write and truncate the *same* inode - that collision previously let the
+    second writer's `O_TRUNC` erase the first writer's already-written bytes
+    before it could rename them into place, and then made the first writer's own
+    `os.replace` raise `FileNotFoundError` because its temp path had already been
+    renamed away by the second. A unique name does not make two concurrent writers
+    to the same `path` produce a merged result (the later `os.replace` still wins
+    outright), but it stops that crash and the byte-level corruption of the
+    loser's content before it could even finish.
     """
-    secure_dir(path.parent)
+    if secure_parent:
+        secure_dir(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)

@@ -8,7 +8,7 @@ automated. This is that one, plus the spike that needed a real key.
 | | |
 |---|---|
 | `golden_set.py` | recall quality as a pass rate, repeatable |
-| `fixtures/` | four days of Korean fixture conversation, 79 messages, 30 questions |
+| `fixtures/` | four days of Korean fixture conversation, 79 messages, 50 questions |
 | `m0_voice_spike.py` | the six things about Gemini Live only a live key could settle |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
@@ -21,12 +21,18 @@ python3 -m evals.golden_set --embedder none    # keyword lane only
 python3 -m evals.golden_set --embedder ollama --json   # ...and record the run
 ```
 
-Measured, top-5: **keyword only 50.0% · stub embedder 56.7% · bge-m3 93.3%.**
+Measured 2026-08-05 on 50 questions, top-5: **keyword only 56.0% · stub embedder
+60.0% · bge-m3 94.0%.** The 30-question set this grew out of read 50.0 · 56.7 ·
+93.3 on 2026-08-03; nearly doubling the set moved every column by less than four
+points, which is the first evidence that the shape was not an artefact of 30
+questions.
 
 The number that mattered was the middle one, not the last. Keyword-only does not
-improve from top-5 to top-8 — 15 of 30 cases are invisible to FTS5 at any limit,
-because `unicode61` matches whole tokens and Korean inflects. That is what moved
-the vector index from M2 into M1b.
+improve from top-5 to top-8 — re-measured at 50 questions both are **56.0%, to the
+case**, so 22 of 50 are invisible to FTS5 at any limit, because `unicode61` matches
+whole tokens and Korean inflects. That is what moved the vector index from M2 into
+M1b, and the lane split still says it: of 47 hybrid passes, **0 were carried by the
+keyword lane alone** (18 vector, 29 both).
 
 Two things to know before quoting a pass rate:
 
@@ -59,6 +65,13 @@ and the way to find out is to ask it.
 **Adding a golden case.** A question, the file whose messages answer it, and the
 phrases that prove it. Put your own failed questions here — the fixtures are a
 floor, not the target.
+
+q01–q30 all ask what a single stated fact was. q31–q50 are the shapes that could
+not ask: a fact a later day replaced, a question sharing no token with the message
+that answers it, an answer the daemon said rather than the user. **Gotcha when
+writing one:** `_find` checks whether the phrase is in a recalled item, not which
+day the item came from — so a phrase that also appears on another date gives you a
+case that can pass off the wrong message. Pick a phrase that exists once.
 
 **Changing the recall algorithm.** Run all three embedder modes above and quote
 all three numbers. **Why:** the keyword-only column is the one that carries an

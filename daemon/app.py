@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -103,6 +104,9 @@ def create_app(
     app.state.wake_round = wake
     app.state.wake_task = None
     app.state.wake_status = "off"
+    app.state.tools = None
+    app.state.tools_status = "not started"
+    app.state.mcp = None
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -124,6 +128,10 @@ def create_app(
             # leaves a daemon that answers Telegram normally and has simply stopped
             # hearing the room, with nothing anywhere saying so.
             "wake_gate": _wake_health(app.state),
+            # Same reasoning: an MCP server that failed to start leaves the model
+            # with fewer tools and nothing else different, which is exactly the kind
+            # of quiet degradation this endpoint exists to name.
+            "tools": _tools_health(app.state),
         }
 
     return app
@@ -200,6 +208,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     resolve_id: ResolveId | None = None
     close_io: Callable[[], None] | None = None
     embedder: Any = None
+    tools: Any = None
     if channel is None or memory is None:
         try:
             io = _build_io(settings)
@@ -214,6 +223,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             embedder = io.embedder
             app.state.recall = recall
             app.state.recall_status = io.recall_status
+            tools, app.state.mcp, app.state.tools_status = await _build_tools(
+                settings, io.store
+            )
+            app.state.tools = tools
 
     if channel is not None and memory is not None:
         app.state.channel = channel
@@ -226,6 +239,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             recall=recall,
             recall_limit=settings.recall_limit,
             resolve_id=resolve_id,
+            tools=tools,
+            max_tool_rounds=settings.tools_max_rounds,
         )
         task = asyncio.create_task(loop.run(), name="conversation-loop")
         # run() only guards individual turns; anything raised by the channel's own
@@ -296,11 +311,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if channel is not None:
             with suppress(Exception):
                 await channel.close()
+        mcp = getattr(app.state, "mcp", None)
+        if mcp is not None:
+            # Before the sqlite close and the scheduler shutdown, because these are
+            # child processes: a stdio MCP server left running is one more orphan
+            # per restart.
+            with suppress(Exception):
+                await mcp.aclose()
         if close_io is not None:
             with suppress(Exception):
                 close_io()
         scheduler.shutdown(wait=False)
         closeables: list[Any] = [*providers.values()]
+        if tools is not None:
+            # `fetch_page` owns an HTTP client; the runner walks the registry for it.
+            closeables.append(tools)
         if embedder is not None:
             # The embedder holds its own HTTP client, and it is not in `providers`
             # because embeddings are routed separately (llm/base.py).
@@ -352,6 +377,10 @@ class _IO:
     close: Callable[[], None]
     embedder: Any = None
     """Held only so the lifespan can close its HTTP client on shutdown."""
+    store: Any = None
+    """The open sqlite handle. Carried out because the tool layer needs it for the
+    approval and audit tables, and building those inside `_build_io` would mean
+    starting MCP subprocesses from a synchronous function."""
 
 
 def _build_channel(settings: Settings, store: Any) -> Channel:
@@ -424,6 +453,7 @@ def _build_io(settings: Settings) -> _IO:
         resolve_id=_id_resolver(writer),
         close=store.close,
         embedder=embedder,
+        store=store,
     )
 
 
@@ -757,7 +787,7 @@ async def _persona_tick(settings: Settings) -> None:
     )
 
 
-async def run_voice(settings: Settings) -> int:
+async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
     """One spoken conversation at this machine, then exit.
 
     Assembled here rather than inside the daemon's own loop because voice is a
@@ -772,8 +802,6 @@ async def run_voice(settings: Settings) -> int:
     from daemon.memory.reindex import reindex
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
-    from daemon.voice.audio import SoundDeviceAudio
-    from daemon.voice.conversation import VoiceConversation
     from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
 
     if not settings.voice_enabled:
@@ -790,27 +818,47 @@ async def run_voice(settings: Settings) -> int:
         reindex(settings.data_dir, store)
         memory = FileMemoryWriter(settings.data_dir, store)
         recall, _status, embedder = _build_recall(settings, store)
-        # Seed and learned rules both, same as the text path (daemon/loop.py):
-        # a conversation surface is a conversation surface, and M4's learned
-        # half is meant to reach every one of them except the proactive judge,
-        # which stays seed-only on purpose (daemon/proactivity/judge.py).
+        # Seed and learned rules both, same as the text path (daemon/loop.py): a
+        # conversation surface is a conversation surface, and M4's learned half is
+        # meant to reach every one of them except the proactive judge, which stays
+        # seed-only on purpose (daemon/proactivity/judge.py).
         seed = await load_persona(settings.data_dir)
-        audio = SoundDeviceAudio()
-        session = GeminiLiveSession(
-            api_key=settings.gemini_api_key,
-            model=route.model,
-            # Without a persona the model answers as a generic assistant, which
-            # is the one voice PLAN 5 says this product must not have.
-            system_instruction=seed or None,
-        )
-        conversation = VoiceConversation(
-            session, audio, memory, recall=recall, recall_limit=settings.recall_limit
-        )
+        audio = build_voice_audio()
+        # Before the handshake, so the acknowledgement is as close to the wake word
+        # as it can be. Nothing is feeding the session yet, so the cue cannot be
+        # heard as the owner interrupting.
+        await play_ready_cue(audio)
+
+        def new_session() -> Any:
+            """A fresh session per attempt. Reconnecting means starting clean: the
+            old one carries a half-flushed transcript, a partial-transcript queue
+            nobody will read again, and a log filter holding the API key."""
+            return GeminiLiveSession(
+                api_key=settings.gemini_api_key,
+                model=route.model,
+                # The persona is the seed, same as the text path. Without it the
+                # model answers as a generic assistant, which is the one voice
+                # PLAN 5 says this product must not have.
+                system_instruction=seed or None,
+                # Empty and None pass straight through as "leave it to the server",
+                # so an unconfigured install sends no `realtimeInputConfig` at all -
+                # the behaviour every session had before these settings existed.
+                start_sensitivity=settings.voice_start_sensitivity,
+                end_sensitivity=settings.voice_end_sensitivity,
+                prefix_padding_ms=settings.voice_prefix_padding_ms,
+                silence_duration_ms=settings.voice_silence_duration_ms,
+            )
+
         try:
-            await conversation.run()
-        except GeminiLiveError as exc:
-            logger.error("voice session failed: %s", exc)
-            return PROBLEM
+            return await _voice_attempts(
+                new_session,
+                audio,
+                memory,
+                recall,
+                settings,
+                GeminiLiveError,
+                opening_audio=opening_audio,
+            )
         finally:
             with suppress(Exception):
                 await audio.close()
@@ -819,11 +867,165 @@ async def run_voice(settings: Settings) -> int:
                 if closer is not None:
                     with suppress(Exception):
                         await closer()
-        if conversation.ended:
-            logger.info("voice session ended: %s", conversation.ended)
-        return OK
     finally:
         store.close()
+
+
+READY_CUE_HZ = (784.0, 1046.5)
+"""Two short notes, G5 then C6, rising. A rising pair reads as "go ahead" where a
+falling one reads as "finished", and neither is a word - so it cannot be mistaken for
+the daemon speaking or transcribed as one."""
+
+READY_CUE_MS = 90
+READY_CUE_GAIN = 0.18
+"""Short and quiet on purpose. The cue answers "may I speak now?", and the honest
+answer is that until it existed there was none: the wake gate released the microphone
+and about a second passed with nothing to say the session was live, so the owner
+guessed - and guessing early is how an utterance lands in the handover and is lost."""
+
+
+def ready_cue(sample_rate: int) -> bytes:
+    """A short rising two-note cue as 16-bit mono PCM at `sample_rate`.
+
+    Synthesised rather than shipped as a file: it is 90 ms of arithmetic, a wav in
+    the package would need finding at runtime from a LaunchAgent whose working
+    directory is not the repo, and this way it is correct at whatever rate the
+    device wants.
+    """
+    import numpy as np
+
+    per_note = int(sample_rate * (READY_CUE_MS / 1000.0) / len(READY_CUE_HZ))
+    notes = []
+    for hz in READY_CUE_HZ:
+        t = np.arange(per_note) / float(sample_rate)
+        tone = np.sin(2.0 * np.pi * hz * t)
+        # Raised-cosine envelope. A bare sine starts and stops on a discontinuity,
+        # which is an audible click and exactly the kind of noise a VAD notices.
+        envelope = np.sin(np.pi * np.arange(per_note) / max(per_note - 1, 1))
+        notes.append(tone * envelope * READY_CUE_GAIN)
+    wave = np.concatenate(notes) if notes else np.zeros(0)
+    return np.clip(wave * 32768.0, -32768, 32767).astype("<i2").tobytes()
+
+
+async def play_ready_cue(audio: AudioIO) -> None:
+    """Tell the owner the microphone is theirs.
+
+    Played before the session is even opened, which is the whole point: the sooner it
+    lands the less of the handover a person talks into. Never raises - a missing cue
+    is a worse conversation, and an exception here would be no conversation.
+    """
+    try:
+        await audio.play(ready_cue(audio.playback_sample_rate))
+    except Exception:
+        logger.debug("voice: could not play the ready cue", exc_info=True)
+
+
+VOICE_RECONNECT_ATTEMPTS = 3
+"""How many times a dropped conversation is picked back up.
+
+Bounded, and bounded here rather than inside the session, because the two failures
+need different answers: a socket that will not *open* should fail fast and let the
+caller fall back to text, while a socket that opened, worked, and was then cut has a
+conversation in progress that the user is standing in the middle of. Three, because
+the thing being ridden out is a transport hiccup or a server-side session limit, and
+anything that survives three attempts and 6s is not weather. Sessions bill per
+minute, so this is deliberately not a reconnect-forever loop."""
+
+VOICE_RECONNECT_BACKOFF_SECONDS = 2.0
+"""Flat, not exponential. The gap the user is standing in is silence, and doubling
+it turns a recoverable hiccup into an abandoned conversation."""
+
+
+async def _voice_attempts(
+    new_session: Callable[[], Any],
+    audio: AudioIO,
+    memory: MemoryWriter,
+    recall: Recall | None,
+    settings: Settings,
+    session_error: type[Exception],
+    opening_audio: bytes = b"",
+) -> int:
+    """Hold a conversation, and pick it back up if the session is cut.
+
+    Until this existed a dropped socket simply ended `daemon voice`: mid-sentence,
+    with a shell exit code, and nothing said about whether it was the network or the
+    key. The two cases that are worth resuming are a transient close - 1011, or the
+    1008 that is really an idle timeout - and a `goAway`, which is the server saying
+    it is about to end the session rather than the turn and which used to read
+    exactly like a conversation that had finished.
+
+    What is *not* resumed: a permanent failure (a bad key, a wrong model id, a
+    malformed setup), because retrying leaves the process alive, healthy-looking and
+    mute; and an ordinary idle timeout, because that is the conversation being over.
+    """
+    from daemon.voice.conversation import VoiceConversation
+
+    # Carried across attempts until something actually answers it. Dropping it on
+    # every reconnect would reopen the exact failure the opening exists to fix: an
+    # attempt cut down during the handshake never gets the utterance in front of a
+    # model, and the owner is back to saying the wake phrase twice.
+    pending_opening = opening_audio
+    for attempt in range(1, VOICE_RECONNECT_ATTEMPTS + 1):
+        session = new_session()
+        conversation = VoiceConversation(
+            session,
+            audio,
+            memory,
+            recall=recall,
+            recall_limit=settings.recall_limit,
+            opening_audio=pending_opening,
+        )
+        failure: Exception | None = None
+        try:
+            await conversation.run()
+        except session_error as exc:
+            failure = exc
+        finally:
+            # Reported on every exit path including the failing ones, because a
+            # session that cut itself off mid-answer is a session that *ran*. This
+            # is the only place these numbers surface: `interruptions` was counted
+            # for three milestones and printed nowhere, so a self-interruption on
+            # every single turn - a full answer generated and 0.0s of it played -
+            # looked like nothing at all from outside.
+            logger.info(
+                "voice session%s: %s",
+                f" (attempt {attempt})" if attempt > 1 else "",
+                conversation.stats.describe(),
+            )
+        if conversation.ended:
+            logger.info("voice session ended: %s", conversation.ended)
+        if conversation.stats.played_seconds > 0:
+            # Something was said back, so the opening utterance has been answered.
+            # Re-sending it on a later attempt would have the daemon answer the same
+            # question twice.
+            pending_opening = b""
+        elif pending_opening:
+            logger.info("voice: the opening utterance was not answered; carrying it over")
+
+        if failure is None and not getattr(session, "going_away", False):
+            return OK
+        if failure is not None and getattr(failure, "permanent", False):
+            logger.error("voice session failed and retrying cannot help: %s", failure)
+            return PROBLEM
+        if attempt == VOICE_RECONNECT_ATTEMPTS:
+            if failure is not None:
+                logger.error(
+                    "voice session failed %d times, giving up: %s", attempt, failure
+                )
+                return PROBLEM
+            # A `goAway` on the last attempt is the server ending things, not a
+            # fault. The conversation is over; saying so is not an error.
+            logger.info("voice: the server ended the session and the retries are spent")
+            return OK
+        logger.warning(
+            "voice: %s; reconnecting in %.0fs (attempt %d of %d)",
+            failure or "the server announced it was ending the session",
+            VOICE_RECONNECT_BACKOFF_SECONDS,
+            attempt + 1,
+            VOICE_RECONNECT_ATTEMPTS,
+        )
+        await asyncio.sleep(VOICE_RECONNECT_BACKOFF_SECONDS)
+    return PROBLEM  # pragma: no cover - the loop returns on every path
 
 
 def _wake_health(state: Any) -> str:
@@ -877,7 +1079,11 @@ async def _wake_round(settings: Settings) -> None:
         # the caller's own guard handles the pacing.
         return
     logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
-    await run_voice(settings)
+    # The segment that fired the gate goes with it. Without this the session opens
+    # deaf to the question it was opened for: the gate consumed "루시 뭐 해", matched
+    # on the alias, and the owner had to say "뭐 해" again into a microphone that had
+    # just changed hands.
+    await run_voice(settings, opening_audio=fired.pcm)
 
 
 async def _rounds(round_: WakeRound) -> None:
@@ -951,10 +1157,45 @@ def build_wake_recognizer() -> SpeechRecognizer:
 
 
 def build_wake_audio() -> AudioIO:
-    """The microphone, for one calibration take."""
+    """The microphone, for one calibration take.
+
+    Deliberately *not* the echo-cancelling path, even on macOS. Voice processing
+    applies its own gain control, and `DAEMON_WAKE_ALIASES` is a measurement of
+    what the recognizer returns for this speaker through this capture path - so
+    calibrating through one path and listening through another would quietly
+    invalidate the strings the gate matches on.
+    """
     from daemon.voice.audio import SoundDeviceAudio
 
     return SoundDeviceAudio()
+
+
+def build_voice_audio() -> AudioIO:
+    """Microphone and speaker for one conversation, echo-cancelled where possible.
+
+    The conversation is the only place that needs cancellation, and it needs it
+    badly: it keeps the microphone open while the model talks, because that is the
+    only way a barge-in can be noticed (daemon/voice/conversation.py). Measured on
+    this project's target machine, Silero at 0.5 over 10 s of Korean TTS out of the
+    speaker - 80.1% of microphone frames read as speech through PortAudio and 0.0%
+    through macOS voice processing, while speech from a source the canceller does
+    not know about still reads 81.6%. So the echo goes and the user does not.
+
+    The wake gate keeps PortAudio (see `build_wake_audio`), and so does every
+    platform without an Apple canceller: PortAudio has no path to enable one, so on
+    Linux this is the honest best available rather than a fallback.
+    """
+    if sys.platform != "darwin":
+        from daemon.voice.audio import SoundDeviceAudio
+
+        return SoundDeviceAudio()
+    from daemon.voice.apple_audio import VoiceProcessingAudio
+
+    # No automatic fall back to PortAudio if this cannot start. Falling back would
+    # mean the daemon interrupting itself while looking healthy, which is the
+    # failure class this repo treats as the dangerous one; a readable error naming
+    # the engine is worth more than a working-looking session that cuts itself off.
+    return VoiceProcessingAudio()
 
 
 async def build_wake_gate(
@@ -997,6 +1238,108 @@ async def build_wake_gate(
             await audio.close()
 
     return gate, close
+
+
+async def _build_tools(settings: Settings, store: Any) -> tuple[Any, Any, str]:
+    """Assemble the tool layer. Returns (runner, mcp bridge, status).
+
+    Nothing here is fatal, on the same principle as `_build_recall`: a broken tool
+    configuration should cost the user their tools, not their conversation. The
+    difference from recall is that this one is off unless asked for, so "not
+    configured" is the ordinary answer rather than a degradation.
+    """
+    if not settings.tools_enabled:
+        return None, None, "off (DAEMON_TOOLS_ENABLED)"
+
+    try:
+        from daemon.tools.base import Registry
+        from daemon.tools.builtin import builtin_tools
+        from daemon.tools.policy import ToolPolicy
+        from daemon.tools.runner import ToolRunner
+    except ImportError as exc:
+        logger.error("tool layer unavailable, continuing without it: %s", exc)
+        return None, None, f"unavailable: {exc}"
+
+    # The same presence the proactivity tick reads, so `system_state` cannot drift
+    # from the gate's own view of whether the owner is here (docs/PLAN.md 6.1).
+    from daemon.proactivity.presence import MachinePresence
+
+    registry = Registry()
+    try:
+        for tool in builtin_tools(
+            roots=settings.tools_roots,
+            timeout_secs=settings.tools_timeout_secs,
+            max_output=settings.tools_max_output,
+            presence=MachinePresence(),
+        ):
+            registry.register(tool)
+    except Exception as exc:
+        # An unusable DAEMON_TOOLS_ROOTS lands here, and the honest response is no
+        # tools at all rather than tools with no idea where they may look.
+        logger.error("built-in tools could not be built, continuing without them: %s", exc)
+        return None, None, f"unavailable: {exc}"
+
+    if settings.browser_enabled:
+        # Guarded like the built-ins above: a name collision or an import failure
+        # here would otherwise raise out of startup and take the whole daemon with
+        # it, when losing three tools is the proportionate outcome.
+        try:
+            from daemon.tools.browser import browser_tools
+
+            for tool in browser_tools(
+                app=settings.browser_app,
+                timeout_secs=settings.tools_timeout_secs,
+                max_output=settings.tools_max_output,
+            ):
+                registry.register(tool)
+            logger.info("browser tools on, reading %s", settings.browser_app)
+        except Exception as exc:
+            logger.error("browser tools could not be built, continuing without: %s", exc)
+
+    bridge: Any = None
+    if settings.mcp_enabled:
+        from daemon.tools.mcp import McpBridge, load_config
+
+        bridge = McpBridge(load_config(settings.data_dir))
+        try:
+            landed = await bridge.start(registry)
+        except Exception:
+            logger.exception("MCP startup failed; continuing with the built-in tools only")
+            landed = 0
+        logger.info("MCP contributed %d tool(s)", landed)
+
+    policy = ToolPolicy(
+        store,
+        mode=settings.tools_mode,  # type: ignore[arg-type]
+        allowlist=settings.tools_allowlist,
+        enabled=True,
+    )
+    runner = ToolRunner(registry, policy, store)
+    logger.info(
+        "tool layer ready: %d tool(s), mode=%s", len(registry), settings.tools_mode
+    )
+    browser = f", browser={settings.browser_app}" if settings.browser_enabled else ""
+    return (
+        runner,
+        bridge,
+        f"ready, {len(registry)} tools, mode={settings.tools_mode}{browser}",
+    )
+
+
+def _tools_health(state: Any) -> str:
+    """What the tool layer is actually offering, and what failed to load.
+
+    The failure list is the point. An MCP server that did not start leaves a model
+    with fewer tools and no error anywhere the user will see, which reads as "the
+    daemon decided not to use it" rather than as the misconfiguration it is.
+    """
+    status = str(getattr(state, "tools_status", "not started"))
+    bridge = getattr(state, "mcp", None)
+    failures = getattr(bridge, "failures", None) if bridge is not None else None
+    if failures:
+        broken = "; ".join(f"{name}: {why}" for name, why in sorted(failures.items()))
+        return f"{status}; mcp failed: {broken}"
+    return status
 
 
 def _recall_health(state: Any) -> str:

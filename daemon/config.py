@@ -19,6 +19,7 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from daemon.tasks import Task
+from daemon.tools.policy import MODES as TOOL_MODES
 
 OLLAMA = "ollama"
 ANTHROPIC = "anthropic"
@@ -54,6 +55,16 @@ opposite of local, and the offline preset never resolves HOSTED at all."""
 
 VOICE_TASKS = frozenset({Task.CHAT_VOICE})
 """Tasks that need a hosted native-audio model. The offline preset has none."""
+
+SENSITIVITIES = ("low", "high")
+"""What the two speech-sensitivity settings accept, plus empty for "the server
+decides".
+
+Repeated here rather than imported from `daemon/voice/gemini_live.py`, for the same
+reason the wake defaults below are repeated: this module is foundation, and
+importing the voice layer into it would invert the layering. The cost of the copy
+is one line; the cost of the import is that config cannot be read without
+PortAudio."""
 
 # docs/PLAN.md 3.2. Notes on the non-obvious cells:
 #   - RECALL_ESCALATION follows chat, because Lane 2 is a conversation turn.
@@ -205,15 +216,26 @@ class Settings(BaseSettings):
 
     preset: str = Field(default="balanced", alias="DAEMON_PRESET")
 
-    route_overrides: dict[Task, str] = Field(
+    route_overrides: Annotated[dict[Task, str], NoDecode] = Field(
         default_factory=dict, alias="DAEMON_ROUTE_OVERRIDES"
     )
     """Per-task override on top of the preset, as JSON:
-    `DAEMON_ROUTE_OVERRIDES={"reflection": "ollama"}`."""
+    `DAEMON_ROUTE_OVERRIDES={"reflection": "ollama"}`.
+
+    NoDecode for the same reason as TELEGRAM_ALLOWED_USER_IDS below, and it was
+    missed here: pydantic-settings JSON-decodes a complex field *before* field
+    validators run, so the empty value .env.example ships - the value most installs
+    hold, since that file says to copy it - made `json.loads("")` raise and took the
+    entire load down, `daemon run` and `daemon doctor` alike, with a SettingsError
+    naming neither the file nor the problem."""
 
     fallback_provider: str | None = Field(default=None, alias="DAEMON_FALLBACK_PROVIDER")
     """Opt-in. When unset, a ProviderError propagates instead of being retried
-    somewhere else - a silent switch to a weaker model is worse than an error."""
+    somewhere else - a silent switch to a weaker model is worse than an error.
+
+    `None` is what "unset" means to every reader of this field, and a dotenv can only
+    write that as an empty value - which `_blank_is_unset` below normalises, because
+    `""` reaching those readers reported a bogus unknown provider at startup."""
 
     hosted_provider: str = Field(default="", alias="DAEMON_HOSTED_PROVIDER")
     """Which commercial model answers wherever a preset says "hosted".
@@ -254,6 +276,38 @@ class Settings(BaseSettings):
     the text and realtime endpoints do not take the same ids. Deliberately has no
     default - a guessed model id fails at the first voice turn, which is exactly
     the kind of late failure this module exists to prevent."""
+
+    # --- how the server decides a turn ended (daemon/voice/gemini_live.py) ---
+    # All four are empty or None by default, and that is not laziness: an omitted
+    # field leaves the server's own default, which is ~800 ms of silence before a
+    # turn is considered over (https://ai.google.dev/gemini-api/docs/live-guide).
+    # Until these existed the daemon sent no `realtimeInputConfig` at all, so there
+    # was no knob - and the thing worth tuning is what happens *after* echo
+    # cancellation, because without it lowering the sensitivity is how you buy back
+    # the daemon interrupting itself, at the price of not being interruptible.
+
+    voice_start_sensitivity: str = Field(default="", alias="DAEMON_VOICE_START_SENSITIVITY")
+    """How eagerly the server decides the user has started talking: `low`, `high`,
+    or empty for the server's default. `low` is the setting that stops leaked
+    speaker audio from registering as a barge-in, and it is a workaround for a
+    missing echo canceller rather than a preference."""
+
+    voice_end_sensitivity: str = Field(default="", alias="DAEMON_VOICE_END_SENSITIVITY")
+    """How eagerly the server decides the user has stopped: `low`, `high`, or empty."""
+
+    voice_prefix_padding_ms: int | None = Field(
+        default=None, alias="DAEMON_VOICE_PREFIX_PADDING_MS"
+    )
+    """How much speech must accumulate before the server commits to a start."""
+
+    voice_silence_duration_ms: int | None = Field(
+        default=None, alias="DAEMON_VOICE_SILENCE_DURATION_MS"
+    )
+    """Silence before a turn is over. The one number that trades response latency
+    against being cut off mid-sentence, and the one worth measuring: 800 ms is the
+    server's default, and `VoiceStats.first_audio_seconds` read against
+    `interruptions` is what says whether a lower value cost anything - fewer seconds
+    to the first answer is only a win if the count of interruptions did not move."""
 
     # --- the wake gate (daemon/voice/wake.py) -----------------------------
     # A voice session bills per minute, so an always-open one costs about 48x what
@@ -389,12 +443,114 @@ class Settings(BaseSettings):
     hand, `dm_policy=allowlist` could not be configured at all, and `_split_ids`
     below was dead code that looked like it worked."""
 
+    tools_enabled: bool = Field(default=True, alias="DAEMON_TOOLS_ENABLED")
+    """On by default, because the alternative is a product that does not do what it
+    says. docs/PLAN.md 1 defines Daemon as a companion that lives on your machine,
+    and one that cannot open a file on it is a chat window with extra steps - so a
+    default of `false` would ship the definition unmet and call it caution.
+
+    What makes that safe is not this switch, it is the gate: `tools_mode` is `ask`,
+    so nothing that changes the machine runs without a one-shot code, and no tool at
+    all runs on a turn that is not the owner's own words (tools/policy.py). The two
+    capabilities that read more than that - the browser group and MCP - stay off and
+    have their own switches.
+
+    Turning it off is one line, and `daemon doctor` says which way it is set: a
+    capability the owner cannot see is the silent state this project keeps being
+    bitten by."""
+
+    tools_mode: str = Field(default="ask", alias="DAEMON_TOOLS_MODE")
+    """`off` | `allowlist` | `ask` | `full` - see daemon/tools/policy.py.
+
+    `ask` rather than `allowlist` as the default for a switched-on install: the
+    first sessions are when you find out what it wants to run, and `allowlist`
+    answers anything unlisted with a flat refusal that teaches nobody anything."""
+
+    tools_allowlist: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=(), alias="DAEMON_TOOLS_ALLOWLIST"
+    )
+    """Commands that run without asking, as argv prefixes: `ls,git status,date`.
+    Comma-separated only - an entry legitimately contains a space, so the
+    whitespace-splitting that TELEGRAM_ALLOWED_USER_IDS accepts would break
+    `git status` into two useless entries."""
+
+    tools_roots: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("~",), alias="DAEMON_TOOLS_ROOTS"
+    )
+    """Where the file tools may look. Comma-separated. Defaults to the home
+    directory: narrower is better, and anyone who wants that should say so, but a
+    default of "nothing" would make the file tools look broken rather than safe."""
+
+    tools_timeout_secs: float = Field(default=20.0, alias="DAEMON_TOOLS_TIMEOUT_SECS")
+    tools_max_output: int = Field(default=4000, alias="DAEMON_TOOLS_MAX_OUTPUT")
+    """Characters of tool output given to the model. Paid for on every subsequent
+    round of the same turn, since the result stays in the context."""
+
+    tools_max_rounds: int = Field(default=6, alias="DAEMON_TOOLS_MAX_ROUNDS")
+    """Tool round-trips allowed in one turn before it must answer."""
+
+    browser_enabled: bool = Field(default=False, alias="DAEMON_BROWSER_ENABLED")
+    """Whether Daemon may fetch web pages and read the owner's open browser tabs.
+
+    Its own switch rather than part of DAEMON_TOOLS_ENABLED, because this is the one
+    group that reads an authenticated session: the page in front of the owner may be
+    their bank. Letting it act on the machine and letting it read over their shoulder
+    are two decisions, so they are two settings (the same reasoning as
+    DAEMON_VOICE_ENABLED)."""
+
+    browser_app: str = Field(default="Google Chrome", alias="DAEMON_BROWSER_APP")
+    """Which browser to read. Brave, Arc and Edge share Chrome's AppleScript
+    dictionary, so naming one of those works. Safari's is a different shape and is
+    not supported."""
+
+    mcp_enabled: bool = Field(default=False, alias="DAEMON_MCP_ENABLED")
+    """Whether `<data_dir>/mcp.json` is read at all. Separate from
+    DAEMON_TOOLS_ENABLED so an MCP server can be configured and left switched off,
+    and because starting one means starting somebody else's subprocess."""
+
     data_dir: Path = Field(default=Path("./data"), alias="DAEMON_DATA_DIR")
 
     host: str = Field(default="127.0.0.1", alias="DAEMON_HOST")
     """Loopback by default. The HTTP surface is a local control plane, not a
     service to expose."""
     port: int = Field(default=8787, alias="DAEMON_PORT")
+
+    @field_validator("fallback_provider", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """`DAEMON_FALLBACK_PROVIDER=` means no fallback, which is what .env.example
+        documents it as. Normalised here rather than at each reader: `is None` is the
+        test at both the startup check and `fallback_route`, and a `""` slipping past
+        the second would give the gateway a fallback provider that cannot resolve.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("route_overrides", mode="before")
+    @classmethod
+    def _parse_overrides(cls, value: object) -> object:
+        """Empty means no overrides; anything else must be the documented JSON.
+
+        `NoDecode` on the field is what lets this run at all - see its docstring.
+        Unparseable text raises rather than quietly becoming `{}`: an override that
+        is dropped sends its task to the preset's provider instead of the chosen one
+        and says nothing, which is the degradation this module exists to prevent.
+        """
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            import json
+
+            try:
+                return json.loads(text)
+            except ValueError as exc:
+                raise ValueError(
+                    "DAEMON_ROUTE_OVERRIDES must be JSON per task, as in "
+                    f'{{"reflection": "ollama"}} - {exc}'
+                ) from exc
+        return value
 
     @field_validator("telegram_allowed_user_ids", mode="before")
     @classmethod
@@ -415,6 +571,30 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator(
+        "voice_prefix_padding_ms", "voice_silence_duration_ms", mode="before"
+    )
+    @classmethod
+    def _blank_is_the_servers_default(cls, value: object) -> object:
+        """`KEY=` in a .env file is an empty *string*, not an absent key.
+
+        pydantic does not coerce `""` to None for an `int | None`, and these two ship
+        blank in .env.example on purpose - so a .env copied from it failed every
+        `Settings()` with `int_parsing`, taking the whole daemon down rather than
+        voice. Worse, it raised `pydantic.ValidationError` rather than `ConfigError`,
+        which is the one exception `daemon doctor` catches: the command whose whole
+        job is explaining the breakage printed a traceback instead.
+
+        Not covered by the 1457 tests that passed, and the reason is worth keeping:
+        `make_settings` builds `Settings(_env_file=None, **kwargs)` with native
+        Python values, so nothing exercised the dotenv text path that turns `KEY=`
+        into `""`. These are also the first `int | None` settings here, so there was
+        no prior pattern to copy.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("wake_aliases", mode="before")
     @classmethod
     def _split_aliases(cls, value: object) -> object:
@@ -424,6 +604,24 @@ class Settings(BaseSettings):
         alias is a *phrase*, and splitting `헤이 대문` on the space would configure
         two wake words neither of which was ever said.
         """
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                import json
+
+                try:
+                    return tuple(str(item).strip() for item in json.loads(text))
+                except (ValueError, TypeError):
+                    return ()
+            return tuple(part.strip() for part in text.split(",") if part.strip())
+        return value
+
+    @field_validator("tools_allowlist", "tools_roots", mode="before")
+    @classmethod
+    def _split_csv(cls, value: object) -> object:
+        """Commas only, so an entry may contain spaces (`git status`, or a path with
+        one in it). `NoDecode` for the same reason as the ids above: pydantic-settings
+        JSON-decodes a complex field before validators run."""
         if isinstance(value, str):
             text = value.strip()
             if text.startswith("["):
@@ -478,6 +676,20 @@ class Settings(BaseSettings):
                 "DAEMON_VOICE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
                 "the native-audio endpoint needs its own model id"
             )
+
+        # Caught here rather than on the wire. The server answers a bad enum by
+        # closing with 1007, which the session classifies as permanent - so a typo
+        # in one of these would not be a bad setting, it would be voice mode gone
+        # with a message about an unknown name.
+        for env, chosen in (
+            ("DAEMON_VOICE_START_SENSITIVITY", self.voice_start_sensitivity),
+            ("DAEMON_VOICE_END_SENSITIVITY", self.voice_end_sensitivity),
+        ):
+            if chosen and chosen not in SENSITIVITIES:
+                problems.append(
+                    f"{env} is {chosen!r}; expected one of {', '.join(SENSITIVITIES)}, "
+                    "or empty to leave it to the server"
+                )
 
         if self.wake_enabled and not self.wake_aliases:
             problems.append(
@@ -565,6 +777,41 @@ class Settings(BaseSettings):
         ):
             if value < 0:
                 problems.append(f"{name} is {value}; it cannot be negative")
+        if self.tools_mode not in TOOL_MODES:
+            problems.append(
+                f"unknown DAEMON_TOOLS_MODE {self.tools_mode!r}; expected one of "
+                f"{', '.join(TOOL_MODES)}"
+            )
+        if self.tools_enabled:
+            # Only checked when tools are on: a text-only install should not have to
+            # hold a coherent tool configuration it never reaches.
+            if not self.tools_roots:
+                problems.append(
+                    "DAEMON_TOOLS_ENABLED is on but DAEMON_TOOLS_ROOTS is empty; "
+                    "the file tools would have nowhere they are allowed to look"
+                )
+            if self.tools_timeout_secs <= 0:
+                problems.append(
+                    f"DAEMON_TOOLS_TIMEOUT_SECS is {self.tools_timeout_secs}; it must be "
+                    "greater than 0 or every command is killed before it starts"
+                )
+            if self.tools_max_output < 200:
+                problems.append(
+                    f"DAEMON_TOOLS_MAX_OUTPUT is {self.tools_max_output}; below ~200 "
+                    "characters a tool result is truncated past the point of being useful"
+                )
+            if self.tools_max_rounds < 1:
+                problems.append(
+                    f"DAEMON_TOOLS_MAX_ROUNDS is {self.tools_max_rounds}; it must be at "
+                    "least 1 (to switch tools off, use DAEMON_TOOLS_ENABLED=false)"
+                )
+        if self.browser_enabled and not self.tools_enabled:
+            problems.append(
+                "DAEMON_BROWSER_ENABLED is on but DAEMON_TOOLS_ENABLED is off; the "
+                "browser tools are tools, so nothing would register them"
+            )
+        if self.browser_enabled and not self.browser_app.strip():
+            problems.append("DAEMON_BROWSER_APP is empty; name the browser to read")
         if not SERVICE_LABEL_RE.match(self.service_label):
             problems.append(
                 f"DAEMON_SERVICE_LABEL {self.service_label!r} is not a usable label; "

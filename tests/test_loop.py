@@ -147,6 +147,7 @@ class FlakyProvider:
         messages: list[Message],
         *,
         model: str,
+        tools: object = None,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
     ) -> Completion:

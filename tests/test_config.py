@@ -8,10 +8,12 @@ that holds four assertions.
 from __future__ import annotations
 
 import os
+import pathlib
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from daemon import clock
 from daemon.config import PRESETS, ConfigError, Route, Settings
@@ -144,6 +146,101 @@ def test_voice_is_refused_while_disabled_even_when_routed() -> None:
         settings.route_for(Task.CHAT_VOICE)
 
 
+def test_a_blank_endpointing_value_means_the_server_default(tmp_path: Any) -> None:
+    """`KEY=` in a .env file is an empty *string*, not an absent key.
+
+    Goes through a real .env file rather than keyword arguments, because that is the
+    gap: `make_settings` passes native Python values, so 1457 tests never exercised
+    the dotenv text path that turns `KEY=` into `""` - and pydantic does not coerce
+    that to None for an `int | None`. A .env copied from .env.example, where these
+    ship blank on purpose, took the whole daemon down with `int_parsing`, and did it
+    as `pydantic.ValidationError` rather than `ConfigError` - so `daemon doctor`,
+    whose whole job is explaining the breakage, printed a traceback instead.
+    """
+    env = tmp_path / ".env"
+    env.write_text(
+        "DAEMON_HOSTED_PROVIDER=anthropic\n"
+        "ANTHROPIC_API_KEY=k\n"
+        "DAEMON_VOICE_START_SENSITIVITY=\n"
+        "DAEMON_VOICE_END_SENSITIVITY=\n"
+        "DAEMON_VOICE_PREFIX_PADDING_MS=\n"
+        "DAEMON_VOICE_SILENCE_DURATION_MS=\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=str(env))
+
+    assert settings.voice_prefix_padding_ms is None
+    assert settings.voice_silence_duration_ms is None
+    assert settings.voice_start_sensitivity == ""
+
+
+def test_the_voice_lines_shipped_in_the_example_env_load(tmp_path: Any) -> None:
+    """The example file exists to be copied, so the lines it ships have to survive
+    being read back as a .env - verbatim, not paraphrased into this test.
+
+    Only the voice block. `DAEMON_ROUTE_OVERRIDES=` in the same file has had the
+    identical empty-string problem since f97595b ("Wire M1a end to end"), where it
+    raises `SettingsError` on a `dict[Task, str]` - a pre-existing defect this change
+    did not cause and does not touch.
+    """
+    example = pathlib.Path(__file__).resolve().parents[1] / ".env.example"
+    voice_lines = [
+        line
+        for line in example.read_text(encoding="utf-8").splitlines()
+        if line.startswith("DAEMON_VOICE_")
+    ]
+    assert voice_lines, "the example file stopped shipping the voice settings"
+    env = tmp_path / ".env"
+    env.write_text(
+        "\n".join([*voice_lines, "DAEMON_HOSTED_PROVIDER=anthropic", "ANTHROPIC_API_KEY=k"]),
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=str(env))
+
+    assert settings.voice_silence_duration_ms is None
+    assert settings.voice_prefix_padding_ms is None
+
+
+def test_a_real_endpointing_value_still_arrives_as_a_number(tmp_path: Any) -> None:
+    """The blank-is-unset rule must not swallow a value someone actually set."""
+    env = tmp_path / ".env"
+    env.write_text(
+        "DAEMON_HOSTED_PROVIDER=anthropic\nANTHROPIC_API_KEY=k\n"
+        "DAEMON_VOICE_SILENCE_DURATION_MS=400\n"
+        "DAEMON_VOICE_PREFIX_PADDING_MS=0\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=str(env))
+
+    assert settings.voice_silence_duration_ms == 400
+    # Zero is a choice, not an absence.
+    assert settings.voice_prefix_padding_ms == 0
+
+
+def test_a_misspelled_speech_sensitivity_fails_at_startup() -> None:
+    """Left to the wire, the server closes with 1007 and the session classifies
+    that as permanent - so a typo would take voice mode out entirely rather than
+    fail the setting that caused it."""
+    with pytest.raises(ConfigError, match="DAEMON_VOICE_START_SENSITIVITY"):
+        make_settings(voice_start_sensitivity="LOW")
+    with pytest.raises(ConfigError, match="DAEMON_VOICE_END_SENSITIVITY"):
+        make_settings(voice_end_sensitivity="medium")
+
+
+def test_endpointing_is_unset_by_default_so_the_server_decides() -> None:
+    """~800 ms of silence is the server's own default. A default of our own here
+    would be a number nobody measured, presented as a decision."""
+    settings = make_settings(anthropic_api_key="k")
+
+    assert settings.voice_start_sensitivity == ""
+    assert settings.voice_end_sensitivity == ""
+    assert settings.voice_prefix_padding_ms is None
+    assert settings.voice_silence_duration_ms is None
+
+
 def test_disabled_voice_needs_no_voice_key_but_enabled_voice_does() -> None:
     # The M1a default install is text-only, so it must not be asked for a key
     # it will never use.
@@ -176,6 +273,23 @@ def test_override_wins_over_the_preset() -> None:
 
 def test_no_fallback_by_default() -> None:
     assert make_settings(preset="offline").fallback_route() is None
+
+
+def test_an_empty_fallback_provider_means_no_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The only way a dotenv can say "unset" is an empty value, and .env.example
+    ships exactly that documented as "the error propagates". `None` is the sentinel
+    the rest of the code tests against, so a blank has to become one here: it used to
+    stay `""`, which failed startup as an unknown provider and - had that check ever
+    been passed - would have handed the gateway a fallback route to nowhere."""
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_FALLBACK_PROVIDER", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.fallback_provider is None
+    assert settings.fallback_route() is None
 
 
 def test_configured_fallback_resolves_to_a_route() -> None:
@@ -302,6 +416,46 @@ def test_allowlist_is_parsed_from_a_comma_separated_string() -> None:
     settings = make_settings(preset="offline", telegram_allowed_user_ids="123, 456 ,")
 
     assert settings.telegram_allowed_user_ids == ("123", "456")
+
+
+def test_an_empty_route_overrides_means_no_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.env.example ships `DAEMON_ROUTE_OVERRIDES=` and tells the reader to copy the
+    file, so this is the value most installs actually hold. It used to kill the whole
+    load - `daemon run`, `daemon doctor`, everything - with a SettingsError naming
+    neither the file nor the problem, because a complex field is JSON-decoded before
+    any validator runs and `json.loads("")` raises."""
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_ROUTE_OVERRIDES", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.route_overrides == {}
+    assert settings.routing[Task.REFLECTION] == "ollama"
+
+
+def test_route_overrides_reads_the_json_documented_in_env_example(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_ROUTE_OVERRIDES", '{"reflection": "ollama"}')
+
+    settings = Settings(_env_file=None)
+
+    assert settings.route_overrides == {Task.REFLECTION: "ollama"}
+
+
+def test_unparseable_route_overrides_names_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loud beats degraded: treating a typo as "no overrides" would route a task to
+    the preset's provider instead of the chosen one and say nothing about it."""
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_ROUTE_OVERRIDES", "reflection: ollama")
+
+    with pytest.raises(ValidationError, match="DAEMON_ROUTE_OVERRIDES"):
+        Settings(_env_file=None)
 
 
 def test_env_vars_are_read_with_their_documented_names(
@@ -448,3 +602,159 @@ def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:
     assert make_settings(
         preset="offline", proactive_daily_budget=0, proactive_open_loop_budget=0
     ).proactive_daily_budget == 0
+
+
+# --- tool use ---------------------------------------------------------------
+
+
+def test_tools_are_on_and_asking_by_default() -> None:
+    """On, because a companion that cannot open a file on the machine it lives on is
+    the definition unmet (docs/PLAN.md 1). What makes that safe is the rest of this
+    assertion, not a switch: `ask` means nothing that changes the machine runs
+    without a one-shot code, the allowlist is empty so nothing at all runs
+    unprompted, and the two groups that read more than the owner's own files - the
+    browser and MCP - are still off."""
+    settings = make_settings(preset="offline", ollama_model="gemma3:4b")
+    assert settings.tools_enabled is True
+    assert settings.tools_mode == "ask"
+    assert settings.tools_allowlist == (), "nothing runs without being asked about"
+    assert settings.tools_roots == ("~",)
+    assert settings.browser_enabled is False
+    assert settings.mcp_enabled is False
+
+
+def test_tools_can_be_switched_off_entirely() -> None:
+    """The other direction has to keep working, or "on by default" becomes
+    "on, and no way back"."""
+    settings = make_settings(
+        preset="offline", ollama_model="gemma3:4b", DAEMON_TOOLS_ENABLED=False
+    )
+    assert settings.tools_enabled is False
+
+
+def test_an_unknown_tool_mode_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_TOOLS_MODE"):
+        make_settings(preset="offline", ollama_model="gemma3:4b", DAEMON_TOOLS_MODE="yolo")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("ls", ("ls",)),
+        ("ls,git status", ("ls", "git status")),
+        ("ls, git status , date", ("ls", "git status", "date")),
+        ('["ls","git status"]', ("ls", "git status")),
+        ("", ()),
+    ],
+)
+def test_the_allowlist_splits_on_commas_only(raw: str, expected: tuple[str, ...]) -> None:
+    """Commas only, because an entry legitimately contains a space. Splitting on
+    whitespace as well would turn `git status` into two useless entries - and the
+    prefix `git` alone would cover `git push`."""
+    settings = make_settings(
+        preset="offline", ollama_model="gemma3:4b", DAEMON_TOOLS_ALLOWLIST=raw
+    )
+    assert settings.tools_allowlist == expected
+
+
+def test_roots_split_the_same_way() -> None:
+    """A path can contain a space too."""
+    settings = make_settings(
+        preset="offline",
+        ollama_model="gemma3:4b",
+        DAEMON_TOOLS_ROOTS="~/Documents,~/My Projects",
+    )
+    assert settings.tools_roots == ("~/Documents", "~/My Projects")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"DAEMON_TOOLS_ROOTS": ""}, "DAEMON_TOOLS_ROOTS is empty"),
+        ({"DAEMON_TOOLS_TIMEOUT_SECS": 0}, "DAEMON_TOOLS_TIMEOUT_SECS"),
+        ({"DAEMON_TOOLS_TIMEOUT_SECS": -1}, "DAEMON_TOOLS_TIMEOUT_SECS"),
+        ({"DAEMON_TOOLS_MAX_OUTPUT": 10}, "DAEMON_TOOLS_MAX_OUTPUT"),
+        ({"DAEMON_TOOLS_MAX_ROUNDS": 0}, "DAEMON_TOOLS_MAX_ROUNDS"),
+    ],
+)
+def test_an_incoherent_tool_setup_fails_at_startup(kwargs: dict, expected: str) -> None:
+    with pytest.raises(ConfigError, match=expected):
+        make_settings(
+            preset="offline",
+            ollama_model="gemma3:4b",
+            DAEMON_TOOLS_ENABLED=True,
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"DAEMON_TOOLS_ROOTS": ""},
+        {"DAEMON_TOOLS_TIMEOUT_SECS": 0},
+        {"DAEMON_TOOLS_MAX_ROUNDS": 0},
+    ],
+)
+def test_an_install_with_tools_off_is_not_held_to_a_tool_setup(kwargs: dict) -> None:
+    """The same rule voice follows: a configuration that is never reached must not be
+    a reason to refuse to start. Now that tools are on by default this needs the
+    switch stated - which is the point, since with them *on* the setting is reached
+    and an incoherent one should fail at startup rather than mid-conversation."""
+    make_settings(
+        preset="offline",
+        ollama_model="gemma3:4b",
+        DAEMON_TOOLS_ENABLED=False,
+        **kwargs,
+    )  # must not raise
+
+
+def test_no_new_task_was_added_for_tool_use() -> None:
+    """Tool-using chat is still `chat_text`, which is why tasks.py and the preset
+    tables stayed frozen. A new Task here would need a row in all three presets."""
+    for table in PRESETS.values():
+        assert set(table) <= set(Task)
+    assert Task.CHAT_TEXT in PRESETS["offline"]
+
+
+def test_the_browser_has_its_own_switch() -> None:
+    """Letting Daemon act on the machine and letting it read the owner's logged-in
+    browser are two decisions, so they are two settings."""
+    settings = make_settings(preset="offline", ollama_model="gemma3:4b")
+    assert settings.browser_enabled is False
+    assert settings.browser_app == "Google Chrome"
+
+
+def test_the_browser_cannot_be_on_while_tools_are_off() -> None:
+    """The browser tools are tools; with the layer off nothing would register them,
+    so the setting would silently do nothing."""
+    with pytest.raises(ConfigError, match="DAEMON_TOOLS_ENABLED is off"):
+        make_settings(
+            preset="offline",
+            ollama_model="gemma3:4b",
+            DAEMON_TOOLS_ENABLED=False,
+            DAEMON_BROWSER_ENABLED=True,
+        )
+
+
+def test_an_empty_browser_app_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_BROWSER_APP"):
+        make_settings(
+            preset="offline",
+            ollama_model="gemma3:4b",
+            DAEMON_TOOLS_ENABLED=True,
+            DAEMON_BROWSER_ENABLED=True,
+            DAEMON_BROWSER_APP="  ",
+        )
+
+
+def test_a_chromium_relative_can_be_named() -> None:
+    """Brave, Arc and Edge share Chrome's AppleScript dictionary, so one setting
+    covers the family."""
+    settings = make_settings(
+        preset="offline",
+        ollama_model="gemma3:4b",
+        DAEMON_TOOLS_ENABLED=True,
+        DAEMON_BROWSER_ENABLED=True,
+        DAEMON_BROWSER_APP="Arc",
+    )
+    assert settings.browser_app == "Arc"
