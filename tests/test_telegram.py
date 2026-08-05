@@ -17,7 +17,7 @@ import pytest
 from daemon.channels import telegram
 from daemon.channels.base import Channel, OutboundMessage
 from daemon.channels.pairing import MAX_PENDING, Pairing
-from daemon.channels.telegram import TelegramChannel, TelegramError
+from daemon.channels.telegram import TelegramChannel, TelegramError, TelegramNoRecipient
 from daemon.clock import now as _clock_now
 from daemon.memory.store import Store
 
@@ -58,6 +58,8 @@ class FakeAPI:
         self.requests.append((method, json.loads(request.content)))
         if method == "sendMessage":
             return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+        if method == "answerCallbackQuery":
+            return httpx.Response(200, json={"ok": True, "result": True})
         if not self.steps:
             raise StopPolling
         step = self.steps.pop(0)
@@ -83,8 +85,48 @@ def message_update(update_id: int, *, sender_id: int, text: str) -> dict[str, An
     }
 
 
-def channel(api: FakeAPI, allowed: Any = (OWNER,)) -> TelegramChannel:
-    return TelegramChannel(TOKEN, allowed, client=api.client(), poll_timeout=0)
+def callback_update(
+    update_id: int,
+    *,
+    sender_id: int,
+    data: Any = "label:up:u-1",
+    query_id: str | None = "cbq-1",
+) -> dict[str, Any]:
+    """A 👍/👎 press. `data=None` omits the field entirely, as a game button does."""
+    callback: dict[str, Any] = {
+        "id": query_id,
+        "from": {"id": sender_id, "first_name": "Someone", "username": "someone"},
+        "message": {"message_id": 77, "chat": {"id": sender_id, "type": "private"}},
+        "data": data,
+    }
+    if data is None:
+        del callback["data"]
+    if query_id is None:
+        del callback["id"]
+    return {"update_id": update_id, "callback_query": callback}
+
+
+def utterance(store: Store, utterance_id: str = "u-1") -> None:
+    store.insert_utterance(
+        utterance_id=utterance_id,
+        candidate_id=None,
+        kind="silence",
+        text="자기 전에 한마디",
+        route="telegram",
+        gate_snapshot=json.dumps({"allowed": True}),
+        now=OWNER_AT,
+    )
+
+
+def label_of(store: Store, utterance_id: str = "u-1") -> tuple[Any, Any]:
+    row = store.conn.execute(
+        "SELECT label, labeled_at FROM proactive_utterances WHERE id = ?", (utterance_id,)
+    ).fetchone()
+    return row["label"], row["labeled_at"]
+
+
+def channel(api: FakeAPI, allowed: Any = (OWNER,), labels: Any = None) -> TelegramChannel:
+    return TelegramChannel(TOKEN, allowed, client=api.client(), poll_timeout=0, labels=labels)
 
 
 def paired(api: FakeAPI, store: Store, allowed: Any = ()) -> TelegramChannel:
@@ -97,6 +139,8 @@ def paired(api: FakeAPI, store: Store, allowed: Any = ()) -> TelegramChannel:
         pairing=Pairing(store, "telegram"),
         client=api.client(),
         poll_timeout=0,
+        # app.py hands the one Store to both, so the tests do too.
+        labels=store,
     )
 
 
@@ -512,17 +556,352 @@ async def test_the_pairing_notice_round_trips_korean(db: sqlite3.Connection) -> 
     assert "누구세요?" not in text  # nothing the stranger wrote is quoted back
 
 
-async def test_an_unaddressed_message_with_nobody_approved_is_not_sent(
-    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+async def test_an_unaddressed_message_with_nobody_approved_raises(
+    db: sqlite3.Connection,
 ) -> None:
-    """Proactivity (M3) before pairing has happened. Loud rather than silent: an
-    utterance that goes nowhere is indistinguishable from one never generated."""
+    """Proactivity (M3) before pairing has happened. It must raise, not log: with a
+    quiet return, delivery recorded a delivered utterance, marked the candidate
+    fired and spent one of the day's three while the words reached nobody."""
     api = FakeAPI()
-    with caplog.at_level(logging.ERROR):
+    with pytest.raises(TelegramNoRecipient, match="no configured recipient"):
         await paired(api, Store(db)).send(OutboundMessage(text="thinking of you"))
 
     assert api.payloads("sendMessage") == []
-    assert "no configured recipient" in caplog.text
+
+
+async def test_an_addressed_reply_never_hits_the_no_recipient_path(
+    db: sqlite3.Connection,
+) -> None:
+    """The conversation loop always sets recipient_id (daemon/loop.py), so it must
+    not be able to turn a logged error into a failed turn - not even with an empty
+    static allowlist, which is the first-run state under dm_policy='pairing'."""
+    api = FakeAPI()
+    await paired(api, Store(db)).send(
+        OutboundMessage(text="반가워", recipient_id=str(STRANGER))
+    )
+
+    assert [p["chat_id"] for p in api.payloads("sendMessage")] == [STRANGER]
+
+
+async def test_a_no_recipient_failure_is_catchable_as_a_telegram_error(
+    db: sqlite3.Connection,
+) -> None:
+    """Callers that already handle TelegramError - `_send_pairing_notice` is one -
+    must not have to learn a new exception to keep working."""
+    with pytest.raises(TelegramError):
+        await paired(FakeAPI(), Store(db)).send(OutboundMessage(text="thinking of you"))
+
+
+# --- the label clock: 👍/👎 callback queries (PLAN 8.3) ----------------------
+
+
+async def test_callback_queries_are_requested_from_the_api() -> None:
+    """The `allowed_updates` filter is server-side, so leaving callback_query out
+    means Telegram never delivers a press and the label clock reads as "nobody
+    ever labels anything"."""
+    api = FakeAPI([])
+    await drain(channel(api))
+
+    assert api.payloads("getUpdates")[0]["allowed_updates"] == ["message", "callback_query"]
+
+
+async def test_a_thumbs_up_from_the_owner_is_recorded(db: sqlite3.Connection) -> None:
+    store = Store(db)
+    utterance(store)
+    api = FakeAPI([callback_update(1, sender_id=OWNER, data="label:up:u-1")])
+
+    received = await drain(channel(api, labels=store))
+
+    assert received == []  # a label is not a turn in the conversation
+    label, labeled_at = label_of(store)
+    assert label == "good"
+    assert labeled_at is not None
+    (answer,) = api.payloads("answerCallbackQuery")
+    assert answer["callback_query_id"] == "cbq-1"
+    assert "기록했어" in answer["text"]
+    assert answer["show_alert"] is False  # a toast: one tap in, no tap out
+
+
+async def test_a_thumbs_down_is_recorded_as_bad(db: sqlite3.Connection) -> None:
+    store = Store(db)
+    utterance(store)
+    api = FakeAPI([callback_update(1, sender_id=OWNER, data="label:down:u-1")])
+
+    await drain(channel(api, labels=store))
+
+    assert label_of(store)[0] == "bad"
+
+
+async def test_the_keyboard_it_sends_is_the_one_it_can_parse(db: sqlite3.Connection) -> None:
+    """The two halves are written apart and must not drift: this feeds back exactly
+    the callback_data the send path put on the button."""
+    store = Store(db)
+    utterance(store, "u-1")
+    send_api = FakeAPI()
+    await channel(send_api).send(
+        OutboundMessage(text="자다 깼어?", labelable=True, utterance_id="u-1")
+    )
+    buttons = send_api.payloads("sendMessage")[0]["reply_markup"]["inline_keyboard"][0]
+
+    api = FakeAPI([callback_update(1, sender_id=OWNER, data=buttons[1]["callback_data"])])
+    await drain(channel(api, labels=store))
+
+    assert label_of(store)[0] == "bad"  # buttons[1] is 👎
+
+
+async def test_a_label_from_a_non_allowlisted_sender_is_dropped_and_not_answered(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The most important test in this file's half of M3. A callback_query carries
+    its own `from` id, so pressing a button is not proof of being the recipient -
+    anyone who can reach the bot can send arbitrary callback_data."""
+    store = Store(db)
+    utterance(store)
+    api = FakeAPI(
+        [callback_update(1, sender_id=STRANGER, data="label:up:u-1")],
+        [message_update(2, sender_id=OWNER, text="still here")],
+    )
+    with caplog.at_level(logging.WARNING):
+        received = await drain(channel(api, labels=store))
+
+    assert label_of(store) == (None, None)  # nothing of theirs reached storage
+    assert api.payloads("answerCallbackQuery") == []  # nor did anything go back
+    assert api.payloads("sendMessage") == []
+    assert [m.text for m in received] == ["still here"]  # and the loop lives on
+    assert str(STRANGER) in caplog.text  # we still want to know someone knocked
+    assert [p.get("offset") for p in api.payloads("getUpdates")] == [None, 2, 3]
+
+
+async def test_a_display_name_cannot_authorise_a_label(db: sqlite3.Connection) -> None:
+    store = Store(db)
+    utterance(store)
+    update = callback_update(1, sender_id=STRANGER, data="label:up:u-1")
+    update["callback_query"]["from"]["username"] = str(OWNER)
+    update["callback_query"]["from"]["first_name"] = str(OWNER)
+
+    await drain(channel(FakeAPI([update]), labels=store))
+
+    assert label_of(store) == (None, None)
+
+
+async def test_a_paired_sender_may_label_and_an_unapproved_one_may_not(
+    db: sqlite3.Connection,
+) -> None:
+    """Under dm_policy='pairing' the approved set lives in storage, and the label
+    boundary is that same set - not a second allowlist."""
+    store = Store(db)
+    utterance(store)
+    store.create_pairing(
+        "telegram", str(STRANGER), code="OWNERCOD", created_at=OWNER_AT, expires_at=OWNER_AT
+    )
+    store.approve_pairing("telegram", str(STRANGER), approved_at=OWNER_AT)
+
+    api = FakeAPI(
+        [
+            callback_update(1, sender_id=8888, data="label:down:u-1"),  # never approved
+            callback_update(2, sender_id=STRANGER, data="label:up:u-1"),
+        ]
+    )
+    await drain(paired(api, store))
+
+    assert label_of(store)[0] == "good"  # the approved press, and only it
+    assert len(api.payloads("answerCallbackQuery")) == 1
+    # An unapproved press must not mint a pairing code either: three of them would
+    # otherwise fill the pending cap and lock the owner out of onboarding.
+    assert Pairing(store, "telegram").pending() == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,  # the field is absent
+        42,  # present and not a string
+        "",
+        "label",
+        "label:up",
+        "label:up:",  # no id
+        "label:sideways:u-1",  # a verb we never emit
+        "LABEL:up:u-1",  # the prefix is exact
+        "good:up:u-1",
+        "label:up:u-1:extra",  # extra fields, not a longer id
+        "label:up:u 1",  # a space is not in the id charset
+        "label:up:" + "a" * 200,  # Telegram caps callback_data at 64 bytes
+        "label:up:../../etc/passwd",
+        "label:up:u-1'; DROP TABLE proactive_utterances; --",
+    ],
+)
+async def test_malformed_callback_data_records_nothing_and_still_answers(
+    db: sqlite3.Connection, data: Any
+) -> None:
+    store = Store(db)
+    utterance(store)
+    api = FakeAPI([callback_update(1, sender_id=OWNER, data=data)])
+
+    received = await drain(channel(api, labels=store))  # must not raise out of listen()
+
+    assert received == []
+    assert label_of(store) == (None, None)
+    (answer,) = api.payloads("answerCallbackQuery")
+    assert "기록하지 않았어" in answer["text"]
+    assert answer["show_alert"] is True  # a lost label must not be a missable toast
+
+
+async def test_a_forged_or_stale_utterance_id_is_reported_not_silently_accepted(
+    db: sqlite3.Connection,
+) -> None:
+    """`label_utterance` returning False is the only signal that the id was never
+    ours - or was deleted because nothing was delivered."""
+    store = Store(db)
+    utterance(store, "u-1")
+    api = FakeAPI([callback_update(1, sender_id=OWNER, data="label:up:u-does-not-exist")])
+
+    await drain(channel(api, labels=store))
+
+    assert label_of(store, "u-1") == (None, None)
+    (answer,) = api.payloads("answerCallbackQuery")
+    assert "찾을 수 없어서" in answer["text"]
+    assert answer["show_alert"] is True
+
+
+async def test_every_label_path_answers_the_callback_query(db: sqlite3.Connection) -> None:
+    """An unanswered callback_query spins on the user's button until their client
+    gives up, which is indistinguishable from a dead daemon."""
+    store = Store(db)
+    utterance(store)
+    api = FakeAPI(
+        [
+            callback_update(1, sender_id=OWNER, data="label:up:u-1", query_id="q-ok"),
+            callback_update(2, sender_id=OWNER, data="nonsense", query_id="q-bad"),
+            callback_update(3, sender_id=OWNER, data="label:up:u-nope", query_id="q-stale"),
+            callback_update(4, sender_id=OWNER, data=None, query_id="q-empty"),
+        ]
+    )
+    await drain(channel(api, labels=store))
+
+    assert [p["callback_query_id"] for p in api.payloads("answerCallbackQuery")] == [
+        "q-ok",
+        "q-bad",
+        "q-stale",
+        "q-empty",
+    ]
+
+
+async def test_a_label_with_no_store_wired_says_so_instead_of_thanking(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api = FakeAPI([callback_update(1, sender_id=OWNER)])
+    with caplog.at_level(logging.ERROR):
+        await drain(channel(api))  # labels=None
+
+    (answer,) = api.payloads("answerCallbackQuery")
+    assert "저장할 수 없어" in answer["text"]
+    assert "no label store wired" in caplog.text  # loud: the label clock is stopped
+
+
+async def test_a_second_press_overwrites_the_first(db: sqlite3.Connection) -> None:
+    """👍 and 👎 are adjacent targets on a phone. The last press is the verdict, and
+    the buttons stay attached so correcting a mis-tap still costs one tap."""
+    store = Store(db)
+    utterance(store)
+    api = FakeAPI(
+        [callback_update(1, sender_id=OWNER, data="label:up:u-1")],
+        [callback_update(2, sender_id=OWNER, data="label:down:u-1")],
+    )
+    await drain(channel(api, labels=store))
+
+    assert label_of(store)[0] == "bad"
+    assert len(api.payloads("answerCallbackQuery")) == 2
+
+
+async def test_a_callback_query_with_no_numeric_sender_is_dropped(
+    db: sqlite3.Connection,
+) -> None:
+    store = Store(db)
+    utterance(store)
+    update = callback_update(1, sender_id=OWNER)
+    update["callback_query"]["from"] = {"username": "someone"}
+    api = FakeAPI([update])
+
+    await drain(channel(api, labels=store))
+
+    assert label_of(store) == (None, None)
+    # Unscreenable: there is no id to check against the allowlist, so it is treated
+    # as a stranger's - dropped, and nothing goes back.
+    assert [name for name, _ in api.requests] == ["getUpdates", "getUpdates"]
+
+
+async def test_a_callback_query_with_no_id_is_dropped(db: sqlite3.Connection) -> None:
+    """Without a query id there is nothing to answer, so there is no point storing
+    a label the user will never see confirmed."""
+    store = Store(db)
+    utterance(store)
+    api = FakeAPI([callback_update(1, sender_id=OWNER, query_id=None)])
+
+    await drain(channel(api, labels=store))
+
+    assert label_of(store) == (None, None)
+    assert api.payloads("answerCallbackQuery") == []
+
+
+async def test_a_storage_error_costs_one_label_not_the_inbound_loop(
+    db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    class BrokenStore(Store):
+        def label_utterance(self, utterance_id: str, label: str, *, now: Any) -> bool:
+            raise sqlite3.OperationalError("database is locked")
+
+    api = FakeAPI(
+        [callback_update(1, sender_id=OWNER)],
+        [message_update(2, sender_id=OWNER, text="still here")],
+    )
+    with caplog.at_level(logging.ERROR):
+        received = await drain(channel(api, labels=BrokenStore(db)))
+
+    assert [m.text for m in received] == ["still here"]
+    assert "문제가 생겼어" in api.payloads("answerCallbackQuery")[0]["text"]
+    assert "could not record a label" in caplog.text
+
+
+async def test_an_allowlist_lookup_error_fails_closed_and_the_loop_survives(
+    db: sqlite3.Connection,
+) -> None:
+    class BrokenStore(Store):
+        def is_allowed(self, channel: str, sender_id: str) -> bool:
+            raise sqlite3.OperationalError("database is locked")
+
+    store = BrokenStore(db)
+    utterance(store)
+    api = FakeAPI(
+        [callback_update(1, sender_id=STRANGER)],
+        [message_update(2, sender_id=OWNER, text="still here")],
+    )
+    received = await drain(paired(api, store, allowed=(OWNER,)))
+
+    assert label_of(store) == (None, None)
+    assert [m.text for m in received] == ["still here"]
+
+
+async def test_a_failed_answer_does_not_kill_the_loop(db: sqlite3.Connection) -> None:
+    """A callback query id is only good for about a minute; answering a stale one
+    fails, and the label is already stored by then."""
+    store = Store(db)
+    utterance(store)
+
+    class SourAnswers(FakeAPI):
+        def _handle(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("answerCallbackQuery"):
+                self.requests.append(("answerCallbackQuery", json.loads(request.content)))
+                return httpx.Response(400, text="query is too old")
+            return super()._handle(request)
+
+    api = SourAnswers(
+        [callback_update(1, sender_id=OWNER)],
+        [message_update(2, sender_id=OWNER, text="still here")],
+    )
+    received = await drain(channel(api, labels=store))
+
+    assert label_of(store)[0] == "good"
+    assert [m.text for m in received] == ["still here"]
 
 
 async def test_token_never_appears_in_logs(caplog: pytest.LogCaptureFixture) -> None:

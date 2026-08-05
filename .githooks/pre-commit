@@ -1,0 +1,8 @@
+#!/bin/sh
+# Optional. Enable with:  git config core.hooksPath .githooks
+#
+# Only the docs check runs here. The suite belongs in CI: a pre-commit hook that
+# takes minutes is a hook people bypass with --no-verify, and then it protects
+# nothing. This one is fast and catches the mistake most likely to reach a commit
+# unnoticed - a path written in backticks that does not exist.
+exec python3 scripts/check_docs.py

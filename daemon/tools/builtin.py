@@ -35,6 +35,7 @@ from typing import Any
 
 from daemon import clock
 from daemon.llm.base import ToolSpec
+from daemon.proactivity.base import Presence
 from daemon.tools.base import Risk, ToolError
 
 logger = logging.getLogger(__name__)
@@ -571,23 +572,19 @@ class Notify:
         return "shown"
 
 
-IDLE_RE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
-"""`ioreg` prints nanoseconds. Measured working on this project's machine
-(docs/PLAN.md 6.3)."""
-
-FRONTMOST_SCRIPT = (
-    'tell application "System Events" to get name of first application process '
-    "whose frontmost is true"
-)
-
-
 class SystemState:
     """Read-only: is the owner here, and what are they doing?
 
-    Here because a companion that lives on a machine and cannot tell whether
-    anyone is at it will speak into an empty room. The same three readings are
-    what docs/PLAN.md 6.1's proactivity gate needs, so M3 inherits this rather
-    than growing a second copy.
+    Delegates to `daemon/proactivity/presence.py`, which M3 needed first and which
+    measured the probes this tool originally guessed at: `HIDIdleTime` is
+    nanoseconds; `name of ... application process` returns the *executable* rather
+    than the app (`stable`, not `Warp`), so `lsappinfo` is used instead; and no
+    `ioreg` audio class answers on Apple Silicon, so audio comes from CoreAudio.
+    Keeping a second implementation would have meant shipping the wrong readings
+    next to the right ones.
+
+    Takes the `Presence` protocol rather than the class - `daemon/app.py` injects the
+    concrete one, which is the direction this repo's layering allows.
     """
 
     risk: Risk = "safe"
@@ -595,14 +592,14 @@ class SystemState:
         name="system_state",
         description=(
             "Check whether the owner is at this computer right now: how long the "
-            "keyboard and mouse have been idle, which app is in front, the local "
-            "time and the battery. Read-only."
+            "keyboard and mouse have been idle, which app is in front, whether "
+            "something is holding the audio device, and the local time. Read-only."
         ),
         parameters={"type": "object", "properties": {}},
     )
 
-    def __init__(self, *, timeout_secs: float = 5.0) -> None:
-        self._timeout = timeout_secs
+    def __init__(self, presence: Presence | None = None) -> None:
+        self._presence = presence
 
     def preview(self, arguments: Mapping[str, Any]) -> str:
         return "check whether the owner is at the machine"
@@ -615,73 +612,29 @@ class SystemState:
             f"local time: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M %Z')}",
             f"utc: {clock.now_iso()}",
         ]
-        idle = await self._idle_seconds()
-        lines.append(
-            f"input idle: {idle:.0f}s" if idle is not None else "input idle: unknown here"
-        )
-        front = await self._frontmost()
-        if front:
-            lines.append(f"frontmost app: {front}")
-        battery = await self._battery()
-        if battery:
-            lines.append(f"battery: {battery}")
+        if self._presence is None:
+            lines.append("machine readings: unavailable in this configuration")
+            return "\n".join(lines)
+
+        reading = await self._presence.read()
+        if reading.idle_seconds is None:
+            lines.append("input idle: unknown")
+        else:
+            lines.append(f"input idle: {reading.idle_seconds:.0f}s")
+            # The three-way answer, not the number's truthiness: `at_keyboard` is
+            # None when it cannot be known, and that is not "away".
+            at = reading.at_keyboard
+            answer = "yes" if at else "no" if at is False else "unknown"
+            lines.append(f"at the keyboard: {answer}")
+        if reading.foreground_app:
+            lines.append(f"frontmost app: {reading.foreground_app}")
+        if reading.audio_busy is not None:
+            lines.append(f"audio in use: {'yes' if reading.audio_busy else 'no'}")
+        for note in reading.unknown:
+            # Said rather than dropped: a probe that failed is a fact about the
+            # answer, and omitting it silently reads as "nothing to report".
+            lines.append(f"could not read: {note}")
         return "\n".join(lines)
-
-    async def _idle_seconds(self) -> float | None:
-        if platform.system() != "Darwin":
-            # Linux has no equivalent that works without an X/Wayland session, and
-            # guessing would put a wrong number in front of the model rather than
-            # an admission.
-            return None
-        out = await self._capture(["ioreg", "-c", "IOHIDSystem", "-d", "1"])
-        if out is None:
-            return None
-        match = IDLE_RE.search(out)
-        return int(match.group(1)) / 1_000_000_000 if match else None
-
-    async def _frontmost(self) -> str | None:
-        if platform.system() != "Darwin":
-            return None
-        out = await self._capture(["osascript", "-e", FRONTMOST_SCRIPT])
-        return out.strip() if out else None
-
-    async def _battery(self) -> str | None:
-        if platform.system() != "Darwin":
-            return None
-        out = await self._capture(["pmset", "-g", "batt"])
-        if not out:
-            return None
-        match = re.search(r"(\d+)%.*?;\s*([a-z ]+);", out)
-        return f"{match.group(1)}% {match.group(2).strip()}" if match else None
-
-    async def _capture(self, argv: list[str]) -> str | None:
-        """Run a reading command, or return None. Never raises.
-
-        Every caller treats a missing reading as "unknown", which is the honest
-        answer and better than failing the tool: the owner asked whether they are
-        at their desk, not for a stack trace about `pmset`.
-        """
-        executable = shutil.which(argv[0])
-        if executable is None:
-            return None
-        try:
-            process = await asyncio.create_subprocess_exec(
-                executable,
-                *argv[1:],
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-        except OSError:
-            return None
-        try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=self._timeout)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-            return None
-        if process.returncode != 0:
-            return None
-        return stdout.decode("utf-8", errors="replace")
 
 
 def builtin_tools(
@@ -689,6 +642,7 @@ def builtin_tools(
     roots: Sequence[str | Path],
     timeout_secs: float = DEFAULT_TIMEOUT_SECS,
     max_output: int = DEFAULT_MAX_OUTPUT,
+    presence: Presence | None = None,
 ) -> list[Any]:
     """Every built-in, in the order the model will see them.
 
@@ -699,7 +653,7 @@ def builtin_tools(
     return [
         ListDir(scope),
         ReadFile(scope, max_output=max_output),
-        SystemState(),
+        SystemState(presence),
         Notify(),
         WriteFile(scope),
         RunCommand(scope, timeout_secs=timeout_secs, max_output=max_output),

@@ -25,6 +25,8 @@ daemon/
     policy.py         ToolPolicy: the origin gate, modes, approvals. Read this first.
     builtin.py        the seven built-in tools
     browser.py        fetch_page, list_tabs, read_page. Read the module docstring.
+                      `system_state` delegates to proactivity/presence.py - one
+                      implementation of the machine probes, not two.
     mcp.py            MCP client; the only file that imports the `mcp` package
     runner.py         ToolRunner: decide -> execute -> audit, in that order
   tui.py              terminal presentation: colours, boxes, CJK-aware widths
@@ -60,9 +62,9 @@ FROZEN means: do not edit without flagging it first.
    Nothing outside `daemon/channels/` imports a channel implementation.
    Callers use `LLMGateway.complete(task, ...)` and the `Channel` protocol.
 
-5. **`persona/seed.md` is human-owned. Code must never write to it.**
+5. **`data/persona/seed.md` is human-owned. Code must never write to it.**
    That asymmetry is the anchor that prevents personality collapse.
-   `persona/learned.md` is AI-owned; humans only read it or request deletion.
+   `data/persona/learned.md` is AI-owned; humans only read it or request deletion.
 
 6. **`observations` is append-only.** No UPDATE, no DELETE. Only `consumed_by`
    may be set later.
@@ -81,7 +83,7 @@ FROZEN means: do not edit without flagging it first.
     with any setting, `full` included. `InboundMessage.authored_by_sender` is False
     for a forward or an inline-bot result, and recall replays arbitrary old text
     into every prompt - so without this gate, "look at this message" is a way to
-    hand a stranger a shell. Enforced twice on purpose: `loop.py` offers such a turn
+    hand a stranger a shell. Enforced twice on purpose: `daemon/loop.py` offers such a turn
     no tools at all, and `tools/policy.py:decide` refuses every call regardless of
     mode, allowlist or standing grant. The offering side is a convenience; `decide`
     is the guarantee. If you find yourself needing an exception, stop and flag it.
@@ -167,7 +169,7 @@ same as it working, and the difference is where every defect above lived.
 ## Milestone scope
 
 M1a is done: a Telegram message gets an answer and the exchange lands in
-`memory/log/YYYY-MM-DD.md`.
+`data/memory/log/YYYY-MM-DD.md`.
 
 Now building **M1b**:
 
@@ -195,7 +197,7 @@ And **M1c — PC control**, pulled forward from post-M4 (docs/PLAN.md 8.2, §10)
 > anything else - and a forwarded message can do none of it.
 
 One piece: `daemon/tools/`, plus tool calling in the provider contract and three
-tables in `schema.sql`. Both frozen files were extended additively; nothing that
+tables in `daemon/memory/schema.sql`. Both frozen files were extended additively; nothing that
 compiled before stopped compiling. No new `Task` - tool-using chat is still
 `chat_text`, so the preset tables are untouched.
 

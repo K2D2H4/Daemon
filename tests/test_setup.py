@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -20,8 +21,8 @@ from typing import Any
 import httpx
 import pytest
 
-from daemon import cli, setup
-from daemon.setup import Checks, OllamaState, Updates, Verdict
+from daemon import cli, setup, tui
+from daemon.setup import EXPAND, Checks, OllamaState, Updates, Verdict
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +37,7 @@ def _sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 GOOD_KEY = "sk-ant-api03-REALKEY9999"
 GOOD_TOKEN = "8012345678:AAH-realtokenABCD"
+GOOD_GEMINI = "AIzaSyFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
 
 
 def no_network(token: str, offset: int | None, timeout: int) -> Updates:
@@ -71,14 +73,20 @@ class Recorder:
     ollama: list[str] = field(default_factory=list)
     opened: list[str] = field(default_factory=list)
 
-    def checks(self, *, gemini_verdict: Verdict | None = None) -> Checks:
+    def checks(
+        self,
+        *,
+        gemini_verdict: Verdict | None = None,
+        openai_verdict: Verdict | None = None,
+        anthropic_verdict: Verdict | None = None,
+    ) -> Checks:
         def anthropic(key: str, model: str) -> Verdict:
             self.anthropic.append(key)
-            return Verdict(True, "key works")
+            return anthropic_verdict or Verdict(True, "key works")
 
         def openai(key: str, model: str) -> Verdict:
             self.openai.append(key)
-            return Verdict(True, "key works")
+            return openai_verdict or Verdict(True, "key works")
 
         def gemini(key: str) -> Verdict:
             self.gemini.append(key)
@@ -121,12 +129,19 @@ def drive(
     checks: Checks | None = None,
     opener: Callable[[str], object] | None = None,
     stdin: io.TextIOBase | None = None,
+    stdout: io.TextIOBase | None = None,
 ) -> Run:
-    """Run the whole wizard against `answers`, one per prompt."""
+    """Run the whole wizard against `answers`, one per prompt.
+
+    `stdout` defaults to a plain `StringIO`, which is not a terminal - so the
+    `Theme` the wizard builds from it cannot emit colour, and every assertion
+    below reads text rather than escape sequences. Pass a `FakeTty` to drive the
+    coloured path.
+    """
     env_path = tmp_path / ".env"
     if existing is not None:
         env_path.write_text(existing, encoding="utf-8")
-    out = io.StringIO()
+    out = stdout if stdout is not None else io.StringIO()
     code = setup.run(
         env_path=env_path,
         stdin=stdin if stdin is not None else io.StringIO("".join(f"{a}\n" for a in answers)),
@@ -135,6 +150,16 @@ def drive(
         opener=opener if opener is not None else (lambda url: True),
     )
     return Run(code, out.getvalue(), env_path)
+
+
+KEEP = ""
+"""Enter at a step whose answer is already in `.env`.
+
+The wizard used to skip a decided answer entirely, which made it unreachable: the
+only way to change a preset was to hand-edit the file. It now shows the current
+value and asks anyway, so a re-run is how you change your mind - and every test
+that drives a re-run answers one more question than it used to.
+"""
 
 
 def answers_for(*, persona: Sequence[str] = ("", "", ""), pairing: Sequence[str] = ()) -> list[str]:
@@ -179,6 +204,32 @@ def checks_with(updates: Callable[[str, int | None, int], Updates]) -> Checks:
     )
 
 
+def flat(rendered: str) -> str:
+    """Output with the layout taken back out.
+
+    A sentence the wizard passed to `tui` comes back wrapped to the width, so
+    asserting on content has to be independent of where the wrapper broke it -
+    otherwise every assertion about wording is secretly an assertion about
+    column 80.
+    """
+    return " ".join(rendered.split())
+
+
+def laid_out(rendered: str, tmp_path: Path) -> list[str]:
+    """The lines whose width this module is responsible for.
+
+    Two exclusions, both artefacts rather than layout. A prompt is written without
+    a trailing newline, so whatever prints next shares its line. And a pytest
+    temporary path is on its own longer than any terminal - a real install says
+    `./.env`, and no wrapper can shorten an absolute path anyway.
+    """
+    return [
+        line
+        for line in rendered.splitlines()
+        if "]: " not in line and "): " not in line and str(tmp_path) not in line
+    ]
+
+
 def seed_path(tmp_path: Path) -> Path:
     return tmp_path / "data" / "persona" / "seed.md"
 
@@ -207,14 +258,39 @@ class InterruptingAfter(io.StringIO):
 # --- what each preset asks for -----------------------------------------------
 
 
-def test_the_preset_menu_says_why_offline_has_no_voice(tmp_path: Path) -> None:
-    # docs/PLAN.md 7 rests on the offline preset being real. If the menu does not
-    # say that voice is the thing being traded away, the user cannot make the
-    # choice the privacy promise is built on.
+def test_the_folded_preset_menu_still_says_voice_is_the_trade(tmp_path: Path) -> None:
+    # docs/PLAN.md 7 rests on the offline preset being real, so the *trade* has to
+    # be legible without expanding anything - a person choosing offline must not
+    # discover afterwards that they gave voice up.
     result = drive(tmp_path, ["1", "gemma3:4b", GOOD_TOKEN, "y"])
 
-    assert "Voice is not available" in result.out
-    assert "privacy promise" in result.out
+    assert "Voice unavailable" in flat(result.out)
+    # And the argument is not printed unasked: folding is what made the menu
+    # short enough to read while choosing.
+    assert "privacy promise" not in result.out
+
+
+def test_the_reasoning_is_one_keypress_away_and_loses_nothing(tmp_path: Path) -> None:
+    # Folding is not omission (daemon/tui.py). The sentence that carries
+    # docs/PLAN.md 7 is the single most load-bearing line in this menu, and `?` has
+    # to be a route to it rather than a shorter paraphrase of it.
+    result = drive(tmp_path, [EXPAND, "1", "gemma3:4b", GOOD_TOKEN, "y"])
+
+    assert result.code == 0
+    flattened = " ".join(result.out.split())
+    assert "privacy promise true instead of aspirational" in flattened
+    assert "docs/PLAN.md 7" in flattened
+    # Every folded summary is still there too, so expanding adds and never replaces.
+    for choice in setup.PRESET_CHOICES:
+        assert choice.summary in flattened
+
+
+def test_an_unusable_answer_at_a_choice_says_what_is_usable(tmp_path: Path) -> None:
+    result = drive(tmp_path, ["cheap", "1", "gemma3:4b", GOOD_TOKEN, "y"])
+
+    assert result.code == 0
+    assert "Pick one of: offline, balanced, quality." in result.out
+    assert f"Or {EXPAND}." in result.out
 
 
 def test_offline_asks_for_no_hosted_key_at_all(tmp_path: Path) -> None:
@@ -240,7 +316,9 @@ def test_balanced_asks_for_anthropic_but_not_for_voice(tmp_path: Path) -> None:
     recorder = Recorder()
     result = drive(
         tmp_path,
-        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
+        # The "" after the key is Enter at the Anthropic model id, which now has a
+        # question of its own.
+        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "", GOOD_TOKEN, "y"],
         checks=recorder.checks(),
     )
 
@@ -255,7 +333,7 @@ def test_voice_asks_for_gemini_and_writes_both_model_ids(tmp_path: Path) -> None
     recorder = Recorder()
     result = drive(
         tmp_path,
-        ["2", "anthropic", "y", "gemma3:4b", GOOD_KEY, "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
+        ["2", "anthropic", "y", "gemma3:4b", GOOD_KEY, "", "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
         checks=recorder.checks(),
     )
 
@@ -273,7 +351,7 @@ def test_quality_does_not_make_ollama_a_condition_of_finishing(tmp_path: Path) -
     # only affects recall quality.
     recorder = Recorder()
     result = drive(
-        tmp_path, ["3", "anthropic", "n", GOOD_KEY, GOOD_TOKEN, "y"], checks=recorder.checks()
+        tmp_path, ["3", "anthropic", "n", GOOD_KEY, "", GOOD_TOKEN, "y"], checks=recorder.checks()
     )
 
     assert result.code == 0
@@ -338,7 +416,7 @@ def test_a_rejected_key_is_re_asked_and_the_bad_one_is_never_written(
     )
     result = drive(
         tmp_path,
-        ["2", "anthropic", "n", "gemma3:4b", "sk-ant-TYPO", GOOD_KEY, GOOD_TOKEN, "y"],
+        ["2", "anthropic", "n", "gemma3:4b", "sk-ant-TYPO", GOOD_KEY, "", GOOD_TOKEN, "y"],
         checks=checks,
     )
 
@@ -368,7 +446,7 @@ def test_the_key_is_checked_against_the_configured_model(tmp_path: Path) -> None
     existing = "DAEMON_PRESET=balanced\nDAEMON_ANTHROPIC_MODEL=claude-opus-4-1\n"
     drive(
         tmp_path,
-        ["anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
+        [KEEP, "anthropic", "n", "gemma3:4b", GOOD_KEY, GOOD_TOKEN, "y"],
         existing=existing,
         checks=checks,
     )
@@ -473,7 +551,10 @@ def test_anthropic_flags_a_model_id_that_is_not_on_the_account(
 
     assert verdict.ok
     assert "not in your model list" in verdict.detail
-    assert "DAEMON_ANTHROPIC_MODEL" in verdict.hint
+    # Same shape as OpenAI's: there is a `DAEMON_ANTHROPIC_MODEL` question now, so
+    # the hint sends them to it instead of telling them to edit the file.
+    assert "next question" in verdict.hint
+    assert verdict.models["DAEMON_ANTHROPIC_MODEL"] == ("claude-haiku-4",)
 
 
 def test_anthropic_reports_a_rejected_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -546,7 +627,7 @@ DAEMON_RECALL_LIMIT=12
 
 
 def test_an_existing_env_is_merged_not_replaced(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y"], existing=EXISTING)
+    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=EXISTING)
 
     assert result.code == 0
     written = result.written
@@ -564,15 +645,27 @@ def test_a_value_already_in_the_file_is_not_asked_for_again(tmp_path: Path) -> N
     existing = f"DAEMON_PRESET=balanced\nANTHROPIC_API_KEY={GOOD_KEY}\n"
     result = drive(
         tmp_path,
-        ["anthropic", "n", "gemma3:4b", GOOD_TOKEN, "y"],
+        [KEEP, "anthropic", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(),
     )
 
     assert result.code == 0
-    assert "already in .env, keeping it" in result.out
-    assert recorder.anthropic == []  # not re-verified, not re-asked
+    # Never *asked* for: the answer sequence is what proves it. If the key question
+    # had been printed, `GOOD_TOKEN` would have been consumed as the key and the
+    # token question would have got "y".
+    #
+    # Probed once, though, and that is `LISTED_BY` working: the saved key is what
+    # can list the ids for the model question two lines later, and on a re-install
+    # it is the only thing that can - otherwise the menu the wizard grew is exactly
+    # the menu a returning user never sees.
+    assert recorder.anthropic == [GOOD_KEY]
     assert f"ANTHROPIC_API_KEY={GOOD_KEY}" in result.written
+    # And absent from the change list, which is where "nothing to do about this
+    # one" is visible. The wizard used to say "already in .env, keeping it" and
+    # skip the step; keys were never the reason that phrase existed, and the three
+    # steps that were skipped now ask with the current value as the default.
+    assert "ANTHROPIC_API_KEY" not in result.out.split("── Review")[1]
 
 
 def test_an_in_place_update_does_not_duplicate_the_key(tmp_path: Path) -> None:
@@ -598,7 +691,9 @@ def test_a_world_readable_env_is_tightened_when_it_is_touched(tmp_path: Path) ->
     env_path.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
     env_path.chmod(0o644)
 
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n")
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
+    )
 
     assert result.code == 0
     assert result.env_path.stat().st_mode & 0o777 == 0o600
@@ -609,15 +704,17 @@ def test_nothing_left_to_do_is_not_a_rewrite(tmp_path: Path) -> None:
         f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
         f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
     )
-    result = drive(tmp_path, [], existing=existing)
+    result = drive(tmp_path, [KEEP], existing=existing)
 
     assert result.code == 0
     assert "already configured" in result.out
+    # Keeping an answer is not a change, so the file is not rewritten. That is what
+    # `_record` comparing against the current value buys.
     assert result.written == existing
 
 
 def test_declining_the_write_leaves_the_file_alone(tmp_path: Path) -> None:
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "n"], existing=EXISTING)
+    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "n"], existing=EXISTING)
 
     assert result.code == 1
     assert "Nothing was written." in result.out
@@ -657,7 +754,7 @@ def test_a_file_that_still_fails_validation_is_explained_not_traced(tmp_path: Pa
     # A hand-edited `.env` can be invalid in ways the wizard never asks about.
     # Startup would reject it; setup has to say so in words.
     existing = "DAEMON_PRESET=offline\nDAEMON_RECALL_LIMIT=0\n"
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y"], existing=existing)
+    result = drive(tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing=existing)
 
     assert result.code == 1
     assert "not usable yet" in result.out
@@ -670,7 +767,7 @@ def test_a_file_that_still_fails_validation_is_explained_not_traced(tmp_path: Pa
 def test_no_secret_is_ever_echoed_back(tmp_path: Path) -> None:
     result = drive(
         tmp_path,
-        ["2", "anthropic", "y", GOOD_KEY, "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
+        ["2", "anthropic", "y", GOOD_KEY, "", "AIzaGEMINIKEY", "", GOOD_TOKEN, "y"],
         existing="DAEMON_OLLAMA_MODEL=gemma3:4b\n",
     )
 
@@ -687,7 +784,7 @@ def test_no_secret_is_ever_echoed_back(tmp_path: Path) -> None:
 def test_a_replaced_secret_is_masked_in_the_change_list(tmp_path: Path) -> None:
     existing = "DAEMON_PRESET=offline\nTELEGRAM_BOT_TOKEN=1111:OLDTOKENZZZZ\n"
     result = drive(
-        tmp_path, ["gemma3:4b", "y"], existing=existing
+        tmp_path, [KEEP, "gemma3:4b", "y"], existing=existing
     )  # token already set, so only the model is asked
 
     assert result.code == 0
@@ -725,7 +822,9 @@ def test_an_existing_allowlist_suppresses_the_pairing_note(tmp_path: Path) -> No
     # rather than about a configuration that does not load - the parsing itself
     # belongs to daemon/config.py.
     existing = 'DAEMON_PRESET=offline\nTELEGRAM_ALLOWED_USER_IDS=["4242"]\n'
-    result = drive(tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", ""], existing=existing)
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""], existing=existing
+    )
 
     assert result.code == 0
     assert "pairing code" not in result.out
@@ -750,8 +849,37 @@ def test_check_reports_what_is_missing_and_fails(tmp_path: Path) -> None:
 
     assert code == 1
     assert "missing" in out.getvalue()
-    assert "ANTHROPIC_API_KEY" in out.getvalue()
     assert "TELEGRAM_BOT_TOKEN" in out.getvalue()
+    # The provider, not a vendor's key: nothing has chosen one yet, and naming
+    # Anthropic's key here is precisely how a default nobody was asked about
+    # became invisible. `daemon setup` asks the question this reports.
+    assert "DAEMON_HOSTED_PROVIDER" in out.getvalue()
+    assert "ANTHROPIC_API_KEY" not in out.getvalue()
+
+
+def test_check_reports_the_provider_question_as_blocking(tmp_path: Path) -> None:
+    # Settings refuses to start a hosted preset with no provider, so `--check`'s
+    # exit code has to agree with it. It used to pass, reporting a complete file
+    # for a configuration that could not run.
+    (tmp_path / ".env").write_text(
+        f"DAEMON_PRESET=balanced\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n",
+        encoding="utf-8",
+    )
+    out = io.StringIO()
+
+    assert setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out) == 1
+    assert "missing: DAEMON_HOSTED_PROVIDER" in out.getvalue()
+
+
+def test_check_does_not_ask_offline_for_a_provider(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        f"DAEMON_PRESET=offline\nTELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n", encoding="utf-8"
+    )
+    out = io.StringIO()
+
+    assert setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out) == 0
+    assert "DAEMON_HOSTED_PROVIDER" not in out.getvalue()
 
 
 def test_check_asks_nothing_and_opens_nothing(tmp_path: Path) -> None:
@@ -796,7 +924,37 @@ def test_check_does_not_fail_over_a_key_that_has_a_working_default(tmp_path: Pat
     out = io.StringIO()
 
     assert setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out) == 0
-    assert "[offered] DAEMON_OLLAMA_MODEL" in out.getvalue()
+    assert "warn:" in out.getvalue()
+    assert "DAEMON_OLLAMA_MODEL" in out.getvalue()
+
+
+def test_check_does_not_call_a_model_id_missing_while_printing_its_value(
+    tmp_path: Path,
+) -> None:
+    """A complete install has to read as complete.
+
+    `needs_for` keeps a `listed` model id in its list even once the file answers it,
+    because the *wizard* re-asks a decided model id - that is how you change one
+    without editing `.env`. `--check` is answering a different question, and it was
+    reading the same list: on a finished OpenAI install it printed
+    `ok: DAEMON_OPENAI_MODEL = gpt-5.1` and `missing: DAEMON_OPENAI_MODEL` on one
+    screen and exited non-zero. This got worse the moment Claude gained the same
+    kind of question, which is how it was found.
+    """
+    (tmp_path / ".env").write_text(
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai\n"
+        f"OPENAI_API_KEY=sk-real\nDAEMON_OPENAI_MODEL=gpt-5.1\n"
+        f"DAEMON_OLLAMA_MODEL=gemma3:4b\nTELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n",
+        encoding="utf-8",
+    )
+    out = io.StringIO()
+
+    code = setup.run(check_only=True, env_path=tmp_path / ".env", stdout=out)
+
+    assert code == 0
+    assert "ok:      DAEMON_OPENAI_MODEL = gpt-5.1" in out.getvalue()
+    assert "missing:" not in out.getvalue()
+    assert "Nothing missing." in out.getvalue()
 
 
 def test_check_masks_the_keys_it_found(tmp_path: Path) -> None:
@@ -852,7 +1010,7 @@ def test_the_three_answers_land_in_the_seed_file(tmp_path: Path) -> None:
     assert result.code == 0
     seed = seed_path(tmp_path).read_text(encoding="utf-8")
     assert "- My name is Rumi." in seed
-    assert setup.VOICE_PRESETS[1] in seed
+    assert setup.VOICE_CHOICES[1].summary in seed
     assert "call me Daehyun, and use 반말" in seed
 
 
@@ -878,7 +1036,7 @@ def test_pressing_enter_three_times_still_produces_a_usable_seed(tmp_path: Path)
     assert result.code == 0
     seed = seed_path(tmp_path).read_text(encoding="utf-8")
     assert f"- My name is {setup.DEFAULT_PERSONA_NAME}." in seed
-    assert setup.VOICE_PRESETS[0] in seed
+    assert setup.DEFAULT_VOICE.summary in seed
     # Nothing invented about how to address someone who did not say.
     assert "How I address the user" not in seed
 
@@ -1015,7 +1173,7 @@ def test_a_second_setup_can_still_write_the_seed_it_skipped(tmp_path: Path) -> N
         f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
         f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
     )
-    result = drive(tmp_path, ["루미", "1", ""], existing=existing)
+    result = drive(tmp_path, [KEEP, "루미", "1", ""], existing=existing)
 
     assert result.code == 0
     assert "already configured" in result.out
@@ -1033,7 +1191,7 @@ def test_a_data_dir_that_cannot_be_created_is_a_sentence_not_a_traceback(
     existing = f"DAEMON_PRESET=offline\nDAEMON_DATA_DIR={blocked / 'data'}\n"
 
     result = drive(
-        tmp_path, ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
     )
 
     assert result.code == 0
@@ -1049,7 +1207,7 @@ def test_a_pairing_database_that_cannot_be_opened_is_reported(tmp_path: Path) ->
 
     result = drive(
         tmp_path,
-        ["gemma3:4b", GOOD_TOKEN, "y", "", "", "", "y"],
+        [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "y"],
         existing=existing,
         checks=checks_with(inbox),
     )
@@ -1090,7 +1248,7 @@ def test_pairing_is_not_offered_when_the_ids_come_from_the_file(tmp_path: Path) 
     inbox = Inbox()
     result = drive(
         tmp_path,
-        ["gemma3:4b", GOOD_TOKEN, "y", "", "", ""],
+        [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", ""],
         existing=existing,
         checks=checks_with(inbox),
     )
@@ -1207,28 +1365,75 @@ def test_a_display_name_cannot_repaint_the_prompt(tmp_path: Path) -> None:
     assert "Owner[2Kid=4242 you" in result.out
 
 
-def test_setup_does_not_mint_a_second_owner(tmp_path: Path) -> None:
-    # Ownership is Pairing's to grant, once. If the wizard wrote the row itself,
-    # "the first approval is the owner" would live in two places.
+def own(tmp_path: Path, sender_id: str) -> None:
+    """Approve `sender_id` the way `daemon pairing approve` would, so a test can
+    start from an install that is already paired."""
     now = datetime.now(UTC)
     store = open_store(tmp_path)
     store.create_pairing(
-        "telegram", "111", "AAAAAAAA", created_at=now, expires_at=now + timedelta(hours=1)
+        "telegram", sender_id, "AAAAAAAA", created_at=now, expires_at=now + timedelta(hours=1)
     )
-    store.approve_pairing("telegram", "111", approved_at=now)
+    store.approve_pairing("telegram", sender_id, approved_at=now)
     store.close()
+
+
+def test_an_install_that_is_already_paired_is_not_asked_again(tmp_path: Path) -> None:
+    # A pairing install keeps its allowlist in sqlite, not in `.env`, so an empty
+    # TELEGRAM_ALLOWED_USER_IDS is *also* what a fully paired install looks like
+    # from the file. Reading only the file, a second `daemon setup` told someone
+    # who had been talking to their Daemon for weeks that it did not know them.
+    own(tmp_path, "5502877373")
     inbox = Inbox([(message(9, 4242, "hi", first_name="Second"),)])
 
-    result = drive(tmp_path, answers_for(pairing=["y", "y"]), checks=checks_with(inbox))
+    result = drive(tmp_path, answers_for(pairing=[]), checks=checks_with(inbox))
 
     assert result.code == 0
-    assert "guest" in result.out
+    assert "already paired" in result.out
+    assert "does not know who you are yet" not in result.out
+    assert inbox.calls == []  # nobody was asked to message anything
+    # And no second owner appeared, because nothing was approved at all.
     store = open_store(tmp_path)
     try:
+        assert not store.is_allowed("telegram", "4242")
+    finally:
+        store.close()
+
+
+def test_approving_someone_when_an_owner_exists_makes_a_guest(tmp_path: Path) -> None:
+    # Ownership is Pairing's to grant, once. The wizard can no longer reach this
+    # path (it does not offer pairing to an install that has an owner), but the
+    # helper it uses must still go through `Pairing.approve` rather than writing
+    # the row itself - otherwise "the first approval is the owner" would live in
+    # two places, and `daemon pairing approve` is the other one.
+    from daemon.channels.pairing import Pairing
+
+    own(tmp_path, "111")
+    store = open_store(tmp_path)
+    try:
+        approval = setup.approve_sender(Pairing(store, "telegram"), "4242")
+
+        assert approval is not None
+        assert approval.is_owner is False
         owners = store.conn.execute(
             "SELECT sender_id FROM channel_pairing WHERE is_owner = 1"
         ).fetchall()
         assert [row["sender_id"] for row in owners] == ["111"]
+    finally:
+        store.close()
+
+
+def test_approving_someone_already_allowed_is_reported_as_nothing_to_do(
+    tmp_path: Path,
+) -> None:
+    # Reachable during the wizard's own wait: a `daemon pairing approve` in another
+    # terminal can land between the message arriving and the answer to "is this
+    # you", and approving twice must not raise.
+    from daemon.channels.pairing import Pairing
+
+    own(tmp_path, "4242")
+    store = open_store(tmp_path)
+    try:
+        assert setup.approve_sender(Pairing(store, "telegram"), "4242") is None
     finally:
         store.close()
 
@@ -1336,20 +1541,22 @@ def test_a_second_message_from_a_refused_sender_is_not_a_second_question(
         store.close()
 
 
-def test_an_already_paired_sender_is_reported_not_re_approved(tmp_path: Path) -> None:
-    now = datetime.now(UTC)
-    store = open_store(tmp_path)
-    store.create_pairing(
-        "telegram", "4242", "BBBBBBBB", created_at=now, expires_at=now + timedelta(hours=1)
-    )
-    store.approve_pairing("telegram", "4242", approved_at=now)
-    store.close()
+def test_a_database_that_cannot_be_read_offers_pairing_rather_than_skipping_it(
+    tmp_path: Path,
+) -> None:
+    # "Is this install already paired" is read from sqlite, and an unreadable answer
+    # has to fall to offering: an offer nobody needed costs one keypress, and a skip
+    # somebody needed leaves a daemon that can hear nobody.
+    from daemon.app import DB_FILENAME
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / DB_FILENAME).write_text("this is not a database", encoding="utf-8")
     inbox = Inbox([(message(8, 4242, "hi", first_name="Owner"),)])
 
-    result = drive(tmp_path, answers_for(pairing=["y", "y"]), checks=checks_with(inbox))
+    result = drive(tmp_path, answers_for(pairing=["n"]), checks=checks_with(inbox))
 
     assert result.code == 0
-    assert "already paired" in result.out
+    assert "Pair your Telegram account now" in result.out
 
 
 def test_a_token_already_in_the_file_is_re_verified_before_the_wait(tmp_path: Path) -> None:
@@ -1363,7 +1570,7 @@ def test_a_token_already_in_the_file_is_re_verified_before_the_wait(tmp_path: Pa
     )
 
     result = drive(
-        tmp_path, ["gemma3:4b", "y", "", "", "", "y"], existing=existing, checks=checks
+        tmp_path, [KEEP, "gemma3:4b", "y", "", "", "", "y"], existing=existing, checks=checks
     )
 
     assert result.code == 0
@@ -1424,6 +1631,221 @@ def test_the_real_poll_asks_telegram_only_for_messages(
     # A bare list would render as `allowed_updates=message`, which the Bot API
     # refuses to parse.
     assert seen["params"] == {"timeout": 20, "allowed_updates": '["message"]', "offset": 7}
+
+
+# --- what Telegram said, not just which number it said it with ----------------
+# A real onboarding run failed at pairing with `fail: api.telegram.org returned
+# HTTP 409` and nothing else, then fell through to "start the daemon in one
+# terminal" - advice that polls the same endpoint and fails the same way. 409 has
+# two causes, one persistent and one transient, and the body says which.
+
+WEBHOOK_409 = {
+    "ok": False,
+    "error_code": 409,
+    "description": (
+        "Conflict: can't use getUpdates method while webhook is active; "
+        "use deleteWebhook to delete the webhook first"
+    ),
+}
+"""Telegram's body for the persistent cause: a webhook is set on the bot."""
+
+OTHER_POLLER_409 = {
+    "ok": False,
+    "error_code": 409,
+    "description": (
+        "Conflict: terminated by other getUpdates request; "
+        "make sure that only one bot instance is running"
+    ),
+}
+"""And for the transient one: something else is polling the same token."""
+
+
+def test_a_409_from_a_webhook_says_it_is_a_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup.httpx, "get", canned(409, WEBHOOK_409))
+
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert not result.ok
+    # Telegram's own words, which are the only thing that distinguishes this from
+    # the other 409.
+    assert "webhook is active" in result.detail
+    assert "409" in result.detail
+
+
+def test_a_409_from_another_poller_says_that_instead(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup.httpx, "get", canned(409, OTHER_POLLER_409))
+
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert not result.ok
+    assert "terminated by other getUpdates request" in result.detail
+    # The two are told apart by the description and by nothing else, so the same
+    # status code must not have produced the same sentence.
+    assert "webhook is active" not in result.detail
+
+
+@pytest.mark.parametrize("body", [WEBHOOK_409, OTHER_POLLER_409, {}])
+def test_a_409_names_both_causes_and_what_to_do_about_each(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, object]
+) -> None:
+    """Both, always - including when the body was unreadable.
+
+    Which cause it is comes from the description, and the description is the part
+    that can be missing. So the hint carries both diagnoses and both actions rather
+    than branching on the text: guessing from a body that may not be there is how a
+    wizard confidently sends someone to delete a webhook that does not exist.
+    """
+    monkeypatch.setattr(setup.httpx, "get", canned(409, body))
+
+    hint = flat("\n".join(setup.fetch_updates(GOOD_TOKEN, None, 1).hint))
+
+    assert "webhook" in hint
+    assert "deleteWebhook" in hint  # the command, for the persistent cause
+    assert "polling this token" in hint  # and the transient one
+    assert "daemon uninstall" in hint  # where the other poller usually is
+    # Named, not run. Deleting a webhook changes something the user may have set on
+    # purpose, and this wizard writes nothing but `.env`.
+    assert "curl -X POST" in hint
+
+
+def test_a_409_with_no_parseable_body_still_reports_the_code_and_the_causes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        # Not JSON at all - a proxy or a gateway in the way, which is exactly when
+        # a wizard must not raise.
+        return httpx.Response(409, text="<html>Conflict</html>", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(setup.httpx, "get", get)
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert not result.ok
+    assert "HTTP 409" in result.detail
+    # No description to quote, so the detail is exactly what it always was - and the
+    # explanation is still there, because it does not depend on the body.
+    assert result.detail.endswith("HTTP 409")
+    assert result.hint
+
+
+def test_a_non_409_poll_failure_still_says_what_telegram_said(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fix is not 409-shaped: every non-200 body carries a description, and
+    # throwing it away was the actual defect.
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(400, {"ok": False, "error_code": 400, "description": "Bad Request: invalid offset"}),
+    )
+
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert not result.ok
+    assert "HTTP 400" in result.detail
+    assert "invalid offset" in result.detail
+    # And no 409 advice, which would be a confident answer to a different question.
+    assert result.hint == ()
+
+
+def test_getme_reports_what_telegram_said_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `check_telegram` had the same status-code-only shape, over a body with the
+    # same field in it.
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(500, {"ok": False, "description": "Internal Server Error: restarting"}),
+    )
+
+    verdict = setup.check_telegram(GOOD_TOKEN)
+
+    assert not verdict.ok
+    assert "HTTP 500" in verdict.detail
+    assert "restarting" in verdict.detail
+
+
+def test_a_description_echoing_the_token_is_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The body is text off the network on its way to a terminal.
+
+    Telegram does not echo the token today, but the token is in the request path and
+    an error body is the sort of thing that quotes request context. One
+    `_redact` call is cheaper than finding out.
+    """
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(409, {"description": f"Conflict: bot{GOOD_TOKEN} is already polling"}),
+    )
+
+    result = setup.fetch_updates(GOOD_TOKEN, None, 1)
+
+    assert GOOD_TOKEN not in result.detail
+    assert "<token>" in result.detail
+    # And the placeholder is the same one the copyable commands use, so what is on
+    # screen and what has to be substituted read as the same thing.
+    assert "<token>" in "\n".join(result.hint)
+
+
+def test_a_description_cannot_repaint_the_terminal_or_fill_the_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(409, {"description": "Conflict:\n\x1b[2Jwiped\r " + "x" * 500}),
+    )
+
+    said = setup.fetch_updates(GOOD_TOKEN, None, 1).detail
+
+    assert "\x1b" not in said
+    assert "\n" not in said
+    assert "wiped" in said  # the words survive; only the control codes do not
+    assert tui.display_width(said) <= setup.BODY_LIMIT + 60
+
+
+def test_a_korean_description_is_bounded_by_columns_not_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`BODY_LIMIT` is a terminal width, and Korean is two columns per character.
+
+    Counting characters would let a Korean body take twice the screen it was
+    budgeted, on the one screen where the user is reading a diagnosis.
+    """
+    monkeypatch.setattr(
+        setup.httpx, "get", canned(409, {"description": "웹훅이 이미 설정되어 있습니다. " * 40})
+    )
+
+    said = setup.fetch_updates(GOOD_TOKEN, None, 1).detail
+
+    assert "웹훅이" in said
+    assert tui.display_width(said) <= setup.BODY_LIMIT + 60
+
+
+def test_the_wizard_prints_the_409_diagnosis_where_pairing_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole chain: a real 409 body, the real probe, and the real transcript.
+
+    The unit tests above prove the strings exist. This one proves they reach the
+    screen at the moment the user is looking at it - which is the gap the fakes in
+    this file cannot see, and the gap the original defect lived in.
+    """
+    monkeypatch.setattr(setup.httpx, "get", canned(409, WEBHOOK_409))
+
+    result = drive(
+        tmp_path,
+        answers_for(pairing=["y"]),
+        # The real `getUpdates`, over the canned body. Every other probe is a fake,
+        # so nothing else in this run touches httpx.
+        checks=checks_with(setup.fetch_updates),
+    )
+
+    out = flat(result.out)
+    assert "webhook is active" in out
+    assert "deleteWebhook" in out
+    assert GOOD_TOKEN not in result.out
+    # Still hands back the documented two-terminal route afterwards - it is still
+    # true - but now underneath a reason rather than instead of one.
+    assert "daemon pairing approve" in out
 
 
 # --- whose model, as a separate question --------------------------------------
@@ -1540,16 +1962,25 @@ def test_an_openai_key_is_masked_in_the_change_list(tmp_path: Path) -> None:
     assert secret in result.written
 
 
-def test_a_provider_already_chosen_is_not_asked_again(tmp_path: Path) -> None:
+def test_a_provider_already_chosen_is_offered_again_and_enter_keeps_it(
+    tmp_path: Path,
+) -> None:
+    """It used to be skipped outright, which made a decided answer unreachable: the
+    only way to change a preset or a provider was to hand-edit `.env`, and
+    hand-editing config is what this command exists to remove.
+    """
     existing = "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai\n"
     result = drive(
         tmp_path,
-        ["n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "", "n"],
+        [KEEP, KEEP, "n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "", "n"],
         existing=existing,
     )
 
     assert result.code == 0
-    assert "hosted provider: openai (already in .env, keeping it)" in result.out.lower()
+    assert "currently openai" in result.out.lower()
+    assert "enter keeps it" in result.out.lower()
+    # Kept, not rewritten.
+    assert "DAEMON_HOSTED_PROVIDER=openai" in result.written
 
 
 def test_check_reports_which_provider_the_file_chose(tmp_path: Path) -> None:
@@ -1587,7 +2018,11 @@ def test_openai_flags_a_model_id_that_is_not_on_the_account(
 
     assert verdict.ok
     assert "not in your model list" in verdict.detail
-    assert "DAEMON_OPENAI_MODEL" in verdict.hint
+    # The hint points at the question that comes next rather than naming five ids
+    # inline: that question prints the whole list, newest first, and an inline
+    # alphabetical five would contradict the order it shows.
+    assert "next question" in verdict.hint
+    assert verdict.models["DAEMON_OPENAI_MODEL"] == ("gpt-4.1",)
 
 
 def test_the_openai_key_travels_in_a_header_not_the_url(
@@ -1607,37 +2042,1191 @@ def test_the_openai_key_travels_in_a_header_not_the_url(
     assert seen["headers"] == {"authorization": "Bearer sk-SECRET"}
 
 
-def test_the_hosted_placeholder_is_resolved_before_a_key_is_asked_for() -> None:
-    # config.PRESETS names a HOSTED placeholder, not a provider. Reading it raw
-    # would have the wizard ask for a key for a provider called "hosted"; letting
-    # it default would ask someone who chose Gemini for an Anthropic key.
-    anthropic = {need.key for need in setup.needs_for({"DAEMON_PRESET": "balanced"})}
-    gemini = {
-        need.key
-        for need in setup.needs_for(
-            {"DAEMON_PRESET": "balanced", "DAEMON_HOSTED_PROVIDER": "gemini"}
+# --- the model id, offered from the account's own list -------------------------
+# Every one of these probes already fetches a model list - it is how a key is
+# proved without spending a token - and the ids were being thrown away, so the
+# wizard offered a hard-coded default and, when it was wrong, told the user to go
+# and edit `.env`. That is the dead end the preset question had before it started
+# offering itself again.
+
+GEMINI_BODY: dict[str, object] = {
+    "models": [
+        {
+            "name": "models/gemini-3.1-flash-live-preview",
+            "supportedGenerationMethods": ["bidiGenerateContent"],
+        },
+        {
+            "name": "models/gemini-2.5-flash",
+            "supportedGenerationMethods": ["generateContent", "countTokens"],
+        },
+        {
+            # The reason the filter exists: one list holds every capability.
+            "name": "models/text-embedding-004",
+            "supportedGenerationMethods": ["embedContent"],
+        },
+    ]
+}
+
+
+def block(rendered: str, key: str) -> str:
+    """What the wizard printed for one question: its header down to its prompt.
+
+    The whole transcript is the wrong haystack for "was this offered here" - the
+    preset menu prints `1) offline` two steps earlier, and every model list in the
+    run would otherwise count as an answer to every model question.
+    """
+    start = rendered.index(f"({key})")
+    # Either spelling of the prompt line ends the block. A question whose default
+    # the account did not list has no `[default]` at all - that is the point of
+    # dropping it, so Enter cannot accept an id the account never mentioned.
+    ends = [
+        rendered.find(marker, start) for marker in (f"  {key} [", f"  {key}:")
+    ]
+    end = min(pos for pos in ends if pos != -1)
+    return rendered[start:end]
+
+
+def gemini_listing(
+    live: Sequence[str] = (), text: Sequence[str] = (), **rest: object
+) -> Checks:
+    """A verified Gemini key that carried these lists back, through the seam the
+    real `check_gemini` uses."""
+    return Recorder().checks(
+        gemini_verdict=Verdict(
+            True,
+            "key works",
+            models={
+                "DAEMON_GEMINI_LIVE_MODEL": tuple(live),
+                "DAEMON_GEMINI_MODEL": tuple(text),
+            },
+            **rest,
         )
+    )
+
+
+VOICE_ANSWERS = ["2", "gemini", "y", "gemma3:4b", GOOD_GEMINI]
+"""balanced, Gemini for the hosted work, voice on, the local model, the key.
+
+The next two questions are the Live id and the text id, in that order, and the key
+comes first - which is what makes a list available by the time either is asked.
+"""
+
+
+def test_the_gemini_key_check_brings_back_both_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    # One response, two questions, two different filters.
+    monkeypatch.setattr(setup.httpx, "get", canned(200, GEMINI_BODY))
+
+    verdict = setup.check_gemini(GOOD_GEMINI)
+
+    assert verdict.ok
+    assert verdict.models["DAEMON_GEMINI_LIVE_MODEL"] == ("gemini-3.1-flash-live-preview",)
+    assert verdict.models["DAEMON_GEMINI_MODEL"] == ("gemini-2.5-flash",)
+
+
+def test_a_text_model_is_not_offered_as_the_realtime_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `bidiGenerateContent` filter, on its own.
+
+    `DAEMON_GEMINI_LIVE_MODEL` is the id that fails at the first voice turn rather
+    than at startup (docs/PLAN.md 9), so offering it a model that cannot open a
+    realtime session would reproduce exactly the failure this list is here to end -
+    and it would look like a considered answer while doing it.
+    """
+    monkeypatch.setattr(setup.httpx, "get", canned(200, GEMINI_BODY))
+
+    live = setup.check_gemini(GOOD_GEMINI).models["DAEMON_GEMINI_LIVE_MODEL"]
+
+    assert "gemini-2.5-flash" not in live
+    assert "text-embedding-004" not in live
+    assert live == ("gemini-3.1-flash-live-preview",)
+
+
+def test_an_embedding_model_is_offered_as_neither(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup.httpx, "get", canned(200, GEMINI_BODY))
+
+    everything = setup.check_gemini(GOOD_GEMINI).models
+
+    assert not [name for ids in everything.values() for name in ids if "embedding" in name]
+
+
+def test_the_models_prefix_is_stripped_before_it_is_offered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `models/x` is wire format. Both consumers accept either form and add it back
+    # (daemon/llm/providers/gemini.py, daemon/voice/gemini_live.py), so the bare id
+    # is what belongs in a menu and in `.env`.
+    monkeypatch.setattr(setup.httpx, "get", canned(200, GEMINI_BODY))
+
+    offered = [name for ids in setup.check_gemini(GOOD_GEMINI).models.values() for name in ids]
+
+    assert offered
+    assert not [name for name in offered if name.startswith("models/")]
+
+
+def test_the_model_list_is_asked_for_a_full_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`ListModels` pages, and the default page is short.
+
+    A previous investigation on a real account found all six `bidiGenerateContent`
+    ids only at `pageSize=200`; without it the Live list is silently missing the
+    entries a voice install needs, and nothing in a short list says it is short.
+    """
+    seen: dict[str, object] = {}
+
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        seen.update(kwargs)
+        return httpx.Response(200, json=GEMINI_BODY, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(setup.httpx, "get", get)
+    setup.check_gemini(GOOD_GEMINI)
+
+    assert seen["params"] == {"pageSize": 200}
+
+
+def test_the_openai_key_check_brings_back_the_ids_it_already_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        setup.httpx, "get", canned(200, {"data": [{"id": "gpt-5.1"}, {"id": "gpt-4.1"}]})
+    )
+
+    verdict = setup.check_openai("sk-real", setup.DEFAULT_OPENAI_MODEL)
+
+    assert verdict.models["DAEMON_OPENAI_MODEL"] == ("gpt-5.1", "gpt-4.1")
+
+
+def test_a_stale_openai_default_is_flagged_and_the_list_still_comes_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The two halves belong together: the warning is only useful because the next
+    # question can act on it.
+    monkeypatch.setattr(setup.httpx, "get", canned(200, {"data": [{"id": "gpt-4.1"}]}))
+
+    verdict = setup.check_openai("sk-real", setup.DEFAULT_OPENAI_MODEL)
+
+    assert "not in your model list" in verdict.detail
+    assert verdict.models["DAEMON_OPENAI_MODEL"] == ("gpt-4.1",)
+
+
+def test_choosing_claude_lets_you_choose_which_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gap this closes, and why the old shape was wrong.
+
+    `DAEMON_ANTHROPIC_MODEL` is the one hosted model id Settings has a default for,
+    and that was taken as a reason not to ask - so someone who picked Claude could
+    not choose *which* Claude without hand-editing `.env`, which is the exact chore
+    this module exists to remove. A working default is a reason for the question to
+    be non-blocking, not a reason for it to be absent: `DAEMON_OLLAMA_MODEL` has had
+    that shape all along.
+    """
+    monkeypatch.setattr(setup.httpx, "get", canned(200, {"data": [{"id": "claude-haiku-4"}]}))
+    need = next(
+        item for item in setup._all_needs() if item.key == "DAEMON_ANTHROPIC_MODEL"
+    )
+
+    assert need.listed
+    # Settings has a default, so an empty answer still starts. `--check` warns
+    # rather than failing, and its exit code agrees with that.
+    assert not need.blocking
+    # And the probe carries the ids, so the question is a menu rather than a guess.
+    assert setup.check_anthropic(GOOD_KEY, "claude-haiku-4").models == {
+        "DAEMON_ANTHROPIC_MODEL": ("claude-haiku-4",)
     }
 
-    assert "ANTHROPIC_API_KEY" in anthropic
-    assert "GEMINI_API_KEY" not in anthropic
-    assert "GEMINI_API_KEY" in gemini
-    assert "ANTHROPIC_API_KEY" not in gemini
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"models": "surprise"},
+        {"models": [{"name": 7, "supportedGenerationMethods": ["generateContent"]}]},
+        {"models": [{"name": "models/gemini-2.5-flash"}]},
+        {"models": [{"name": "models/x", "supportedGenerationMethods": "generateContent"}]},
+        {"models": ["gemini-2.5-flash"]},
+    ],
+)
+def test_a_malformed_list_costs_the_menu_and_not_the_wizard(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, object]
+) -> None:
+    monkeypatch.setattr(setup.httpx, "get", canned(200, body))
+
+    verdict = setup.check_gemini(GOOD_GEMINI)
+
+    # The key still works - that is what this call was for - and there is simply
+    # nothing to offer.
+    assert verdict.ok
+    assert verdict.models == {"DAEMON_GEMINI_MODEL": (), "DAEMON_GEMINI_LIVE_MODEL": ()}
+
+
+def test_a_body_that_is_not_even_an_object_is_no_list_either(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, json=["gemini-2.5-flash"], request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(setup.httpx, "get", get)
+
+    verdict = setup.check_gemini(GOOD_GEMINI)
+
+    assert verdict.ok
+    assert verdict.models["DAEMON_GEMINI_LIVE_MODEL"] == ()
+
+
+def test_an_id_with_a_newline_in_it_is_never_offered() -> None:
+    """A chosen id is written as a `KEY=value` line, so one carrying a newline
+    could write a line of its own into `.env` - and this list comes off the
+    network, not off the keyboard."""
+    offered = setup.order_models(
+        ("gemini-2.5-flash", "x\nDAEMON_DATA_DIR=/tmp/theirs", "y z", "a" * 200, "ok-1"),
+        "gemini-2.5-flash",
+    )
+
+    assert offered == ("gemini-2.5-flash", "ok-1")
+
+
+def test_the_default_is_first_so_enter_and_one_mean_the_same_thing() -> None:
+    # And the two undated, unversioned ids keep the order the provider sent them in
+    # - not alphabetical. Alphabetical is what buried `gemini-3.x` under
+    # `antigravity-…`, and there is no reason to believe 'a' before 'b' means
+    # anything about a model.
+    ordered = setup.order_models(("b-model", "a-model", "the-default"), "the-default")
+
+    assert ordered == ("the-default", "b-model", "a-model")
+
+
+# --- newest first, from whatever each provider actually publishes --------------
+# Three providers, two orderings, and the split is theirs rather than a preference:
+# OpenAI dates every model with `created`, Anthropic with `created_at`, and Gemini's
+# `models.list` publishes no creation date at all.
+
+REAL_TEXT_MODELS = (
+    # The 42-model list that started this, trimmed to the shapes that matter and in
+    # the order the alphabetical version printed them.
+    "antigravity-preview-05-2026",
+    "deep-research-max-preview-04-2026",
+    "deep-research-preview-04-2026",
+    "deep-research-pro-preview-12-2025",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-3.1-flash",
+    "gemini-3.2-pro-preview",
+)
+"""Real ids from the run that reported this, including the four that led the menu.
+
+Eleven rather than that run's 42, but keeping its proportions: the great majority of
+a real Gemini catalogue carries a dotted family version, which is what decides
+whether the four that do not fit above the fold."""
+
+
+def test_the_research_and_agent_models_no_longer_lead_the_gemini_menu() -> None:
+    """The reported defect, as a gate.
+
+    All four ids the user was offered first support `generateContent`, so the
+    capability filter passes them correctly - `supportedGenerationMethods` cannot
+    tell a research or agent model from a conversational one. What separates them
+    here is that none of them carries a dotted family version and every Gemini chat
+    model does, so recency alone sinks them below the fold.
+    """
+    ordered = setup.order_models(REAL_TEXT_MODELS, "gemini-2.5-flash")
+    reported = [name for name in REAL_TEXT_MODELS if not name.startswith("gemini-")]
+
+    assert ordered[0] == "gemini-2.5-flash"  # the default, so Enter and `1` agree
+    # Newest family first, and a tie inside 2.5 keeps the order Google sent.
+    assert ordered[1:4] == ("gemini-3.2-pro-preview", "gemini-3.1-flash", "gemini-2.5-flash-lite")
+    # Nothing the user did not mean to pick from is above the fold any more - and
+    # every one of the four is still in the list, just under it.
+    assert len(reported) == 4
+    for name in reported:
+        assert name not in ordered[: setup.MODEL_LIST_FOLD]
+        assert name in ordered
+    # The claim underneath that, which does not depend on where the fold happens to
+    # sit: every dated-by-name id outranks every id without a version in it.
+    assert max(ordered.index(name) for name in ordered if setup.model_version(name)) < min(
+        ordered.index(name) for name in reported
+    )
+
+
+def test_nothing_is_hidden_from_the_gemini_list_either() -> None:
+    """Demoted, not filtered - and this is the deliberate choice, not an oversight.
+
+    Nothing in `models.list` marks a model as not-for-chatting: `displayName` and
+    `description` are prose restating the name, and there is no family or modality
+    field. So narrowing would mean a hard-coded list of name families, which hides a
+    model the account can use the first time Google ships a family this file has not
+    heard of. `?` prints the whole thing instead.
+    """
+    ordered = setup.order_models(REAL_TEXT_MODELS, "gemini-2.5-flash")
+
+    assert set(ordered) == set(REAL_TEXT_MODELS)
+
+
+def test_openai_orders_the_menu_by_the_date_openai_published(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`created`, descending - a real field, not a guess at `gpt-` naming.
+
+    And it does the job a name filter would otherwise be handed: `whisper-1`,
+    `dall-e-3` and `tts-1` are not chat models, this endpoint says nothing to mark
+    them as such, and they are all years older than anything that is.
+    """
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(
+            200,
+            {
+                "data": [
+                    {"id": "whisper-1", "created": 1_677_532_384},
+                    {"id": "gpt-5.1", "created": 1_763_000_000},
+                    {"id": "dall-e-3", "created": 1_698_785_189},
+                    {"id": "gpt-5.2", "created": 1_770_000_000},
+                    {"id": "gpt-4.1", "created": 1_744_316_542},
+                ]
+            },
+        ),
+    )
+
+    ids = setup.check_openai("sk-real", "gpt-5.2").models["DAEMON_OPENAI_MODEL"]
+
+    assert ids == ("gpt-5.2", "gpt-5.1", "gpt-4.1", "dall-e-3", "whisper-1")
+
+
+def test_anthropic_orders_the_menu_by_created_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same idea over a different shape: Anthropic's date is an ISO-8601 string, not
+    # a unix integer, and both are reduced to one number so one code path sorts both.
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(
+            200,
+            {
+                "data": [
+                    {"id": "claude-haiku-4", "created_at": "2025-10-01T00:00:00Z"},
+                    {"id": "claude-opus-5", "created_at": "2026-05-14T00:00:00Z"},
+                    {"id": "claude-sonnet-5", "created_at": "2026-02-19T00:00:00Z"},
+                ]
+            },
+        ),
+    )
+
+    ids = setup.check_anthropic(GOOD_KEY, "claude-opus-5").models["DAEMON_ANTHROPIC_MODEL"]
+
+    assert ids == ("claude-opus-5", "claude-sonnet-5", "claude-haiku-4")
+
+
+def test_a_dated_list_is_not_second_guessed_by_reading_versions_out_of_names() -> None:
+    """Why `order_models` takes `dated` instead of always applying `model_version`.
+
+    `gpt-5` carries no dot and `gpt-4.1` does, so the name heuristic would rank the
+    older model above the newer one - confidently, and on the strength of
+    punctuation. Where the provider published a date, the date wins and this
+    function keeps its hands off the order.
+    """
+    # As `created` descending left it: 5.2, then 5, then the two older ones.
+    newest_first = ("gpt-5.2", "gpt-5", "gpt-4.1", "o3")
+
+    assert setup.order_models(newest_first, "gpt-5.2", dated=True) == newest_first
+    # The same ids read as an undated list, so it is visibly the flag doing this and
+    # not the fixture: the heuristic pulls `gpt-4.1` above `gpt-5` on the strength of
+    # a dot, which is the wrong answer and the reason `dated` exists.
+    assert setup.order_models(newest_first, "gpt-5.2", dated=False) == (
+        "gpt-5.2",
+        "gpt-4.1",
+        "gpt-5",
+        "o3",
+    )
+
+
+def test_which_lists_are_dated_is_settled_by_the_provider_not_by_taste() -> None:
+    # The asymmetry is worth pinning: it is the reason there are two orderings, and
+    # a future reader trying to unify them should fail this test first.
+    assert setup.DATED_LISTS == {"DAEMON_ANTHROPIC_MODEL", "DAEMON_OPENAI_MODEL"}
+    assert "DAEMON_GEMINI_MODEL" not in setup.DATED_LISTS
+    assert "DAEMON_GEMINI_LIVE_MODEL" not in setup.DATED_LISTS
+
+
+def test_a_model_the_provider_did_not_date_keeps_its_place_rather_than_vanishing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A missing field must cost the ordering, not the menu - the same rule
+    # `_gemini_models` follows for a body that changed shape.
+    monkeypatch.setattr(
+        setup.httpx,
+        "get",
+        canned(
+            200,
+            {
+                "data": [
+                    {"id": "gpt-undated"},
+                    {"id": "gpt-old", "created": 1_600_000_000},
+                    {"id": "gpt-new", "created": 1_770_000_000},
+                    {"id": "gpt-nonsense", "created": "the day before yesterday"},
+                ]
+            },
+        ),
+    )
+
+    ids = setup.check_openai("sk-real", "gpt-new").models["DAEMON_OPENAI_MODEL"]
+
+    assert ids == ("gpt-new", "gpt-old", "gpt-undated", "gpt-nonsense")
+
+
+def test_choosing_which_claude_is_a_question_with_a_menu_behind_it(
+    tmp_path: Path,
+) -> None:
+    """End to end, because a `Need` nothing asks is the defect this closes.
+
+    Previously there was no question at all, so `claude-sonnet-5` was whatever
+    `Settings` said and the only way to change it was to edit `.env` by hand.
+    """
+    recorder = Recorder()
+    checks = recorder.checks(
+        anthropic_verdict=Verdict(
+            True,
+            "key works",
+            # Newest first, as `_newest_first` would have left them.
+            models={"DAEMON_ANTHROPIC_MODEL": ("claude-opus-5", "claude-sonnet-5")},
+        ),
+    )
+    # balanced, anthropic, voice off, the local model, the key, then `2` at the model
+    # menu. `1` is the Settings default, because Enter and `1` have to agree.
+    result = drive(
+        tmp_path,
+        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "2", GOOD_TOKEN, "y"],
+        checks=checks,
+    )
+
+    assert result.code == 0
+    offered = block(result.out, "DAEMON_ANTHROPIC_MODEL")
+    assert "1) claude-sonnet-5" in offered  # the default
+    assert "2) claude-opus-5" in offered
+    # Which is a decision the wizard could not previously carry at all.
+    assert "DAEMON_ANTHROPIC_MODEL=claude-opus-5" in result.written
+
+
+def test_an_id_the_account_never_listed_is_still_accepted_for_claude(
+    tmp_path: Path,
+) -> None:
+    # The same contract as the other three model questions: a model released this
+    # morning is in no list, and refusing an id the API would take is a worse dead
+    # end than the one the list removed.
+    recorder = Recorder()
+    checks = recorder.checks(
+        anthropic_verdict=Verdict(
+            True, "key works", models={"DAEMON_ANTHROPIC_MODEL": ("claude-sonnet-5",)}
+        )
+    )
+    result = drive(
+        tmp_path,
+        ["2", "anthropic", "n", "gemma3:4b", GOOD_KEY, "claude-opus-6-20260901", GOOD_TOKEN, "y"],
+        checks=checks,
+    )
+
+    assert result.code == 0
+    assert "DAEMON_ANTHROPIC_MODEL=claude-opus-6-20260901" in result.written
+
+
+def test_a_saved_anthropic_key_still_produces_a_menu_on_a_re_install(
+    tmp_path: Path,
+) -> None:
+    """`LISTED_BY`, for the third credential.
+
+    The list normally rides back on the verdict from *asking* for a key, and a key
+    already in `.env` is never asked for - which on a re-install is the common case
+    and was the whole difference between a menu and "nothing listed this account's
+    models".
+    """
+    recorder = Recorder()
+    checks = recorder.checks(
+        anthropic_verdict=Verdict(
+            True,
+            "key works",
+            models={"DAEMON_ANTHROPIC_MODEL": ("claude-opus-5", "claude-sonnet-5")},
+        )
+    )
+    result = drive(
+        tmp_path,
+        [KEEP, "anthropic", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
+        existing=f"DAEMON_PRESET=balanced\nANTHROPIC_API_KEY={GOOD_KEY}\n",
+        checks=checks,
+    )
+
+    assert result.code == 0
+    assert "claude-opus-5" in block(result.out, "DAEMON_ANTHROPIC_MODEL")
+    assert setup.NO_LIST_NOTE not in result.out
+    # One probe, from the saved key, and never a second one for the same credential.
+    assert recorder.anthropic == [GOOD_KEY]
+
+
+def test_the_expand_key_still_prints_every_id_the_account_has(tmp_path: Path) -> None:
+    """`?` is what makes "demote, never hide" honest.
+
+    A wizard that cannot show what the account has is worse than a noisy one, so the
+    unfolded list has to be complete - all of it, including the research and agent
+    families that recency pushed below the fold.
+    """
+    # The Live id takes Enter, then the text question gets `?` and then Enter.
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, "", EXPAND, "", "", "y"],
+        checks=gemini_listing(
+            live=(setup.DEFAULT_GEMINI_LIVE_MODEL,), text=REAL_TEXT_MODELS
+        ),
+    )
+
+    assert result.code == 0
+    # Not `block`, which stops at the first prompt: the unfolded list is printed
+    # *after* it, in answer to `?`. This is the last model question in the run, so
+    # nothing further down prints a model id.
+    offered = result.out[result.out.index("(DAEMON_GEMINI_MODEL)") :]
+    assert f"{EXPAND} lists the other" in offered  # it was folded first
+    for name in REAL_TEXT_MODELS:
+        assert name in offered, f"{name} was not shown even after {EXPAND}"
+
+
+def test_the_live_id_comes_from_the_account_rather_than_from_a_guess(
+    tmp_path: Path,
+) -> None:
+    # The open item in docs/PLAN.md 9: the default was left a guess because a
+    # guessed Live id fails at the first voice turn, and two documented ids are
+    # already shut down. A list from the account is the actual fix.
+    live = ("gemini-3.1-flash-live-preview", "gemini-live-3-pro")
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, "2", "", "", "y"],
+        checks=gemini_listing(live=live, text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    assert "DAEMON_GEMINI_LIVE_MODEL=gemini-live-3-pro" in result.written
+    for name in live:
+        assert name in block(result.out, "DAEMON_GEMINI_LIVE_MODEL")
+
+
+def test_the_two_gemini_questions_are_offered_two_different_lists(tmp_path: Path) -> None:
+    # One response answers both, so the only thing keeping them apart is which key
+    # each list was filed under.
+    result = drive(
+        tmp_path,
+        # "1" for each, because neither hard-coded default is in these lists and a
+        # dropped default makes Enter re-ask.
+        [*VOICE_ANSWERS, "1", "1", "", "", "y"],
+        checks=gemini_listing(live=("live-a", "live-b"), text=("text-a", "text-b")),
+    )
+
+    assert result.code == 0
+    live_block = block(result.out, "DAEMON_GEMINI_LIVE_MODEL")
+    text_block = block(result.out, "DAEMON_GEMINI_MODEL")
+    assert "live-a" in live_block and "text-a" not in live_block
+    assert "text-a" in text_block and "live-a" not in text_block
+
+
+def test_the_openai_list_reaches_the_openai_question(tmp_path: Path) -> None:
+    verdict = Verdict(True, "key works", models={"DAEMON_OPENAI_MODEL": ("gpt-4.1", "o3-mini")})
+    result = drive(
+        tmp_path,
+        ["2", "openai", "n", "gemma3:4b", "sk-proj-REALOPENAI7777", "1", "", "y"],
+        checks=Recorder().checks(openai_verdict=verdict),
+    )
+
+    assert result.code == 0
+    # Sorted after the default, which this account does not have - so "1" is the
+    # first id it does have.
+    assert "DAEMON_OPENAI_MODEL=gpt-4.1" in result.written
+
+
+def test_an_id_of_your_own_is_taken_even_when_the_list_never_heard_of_it(
+    tmp_path: Path,
+) -> None:
+    """A model released this morning is in no list this wizard can fetch, and a
+    wizard that refused an id the API would have accepted would be a worse dead end
+    than the one with no list at all. So the list is an offer, not a gate."""
+    mine = "gemini-4.0-flash-live-preview-11-2026"
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, mine, "", "", "y"],
+        checks=gemini_listing(live=("gemini-3.1-flash-live-preview",), text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    assert f"DAEMON_GEMINI_LIVE_MODEL={mine}" in result.written
+
+
+def test_the_folded_tail_is_one_keypress_away_and_the_numbers_do_not_move(
+    tmp_path: Path,
+) -> None:
+    # A list of fifty would scroll the persona and pairing steps off the screen, so
+    # it folds - and a number has to mean the same id before and after `?`, or the
+    # fold has quietly changed the answer.
+    live = tuple(f"live-{index:02d}" for index in range(1, 21))
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, EXPAND, "9", "", "", "y"],
+        checks=gemini_listing(live=live, text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    shown = block(result.out, "DAEMON_GEMINI_LIVE_MODEL")
+    assert f"{setup.MODEL_LIST_FOLD}) live-{setup.MODEL_LIST_FOLD:02d}" in shown
+    assert f"live-{setup.MODEL_LIST_FOLD + 1:02d}" not in shown
+    assert f"{EXPAND} lists the other {20 - setup.MODEL_LIST_FOLD}." in shown
+    # Expanded, then the ninth - which is the ninth of the same order.
+    assert "live-20" in result.out
+    assert "DAEMON_GEMINI_LIVE_MODEL=live-09" in result.written
+
+
+def test_a_default_the_account_did_not_list_is_said_out_loud(tmp_path: Path) -> None:
+    """Named, not silently replaced - and the default is dropped so Enter cannot
+    take it.
+
+    Substituting a listed id would be the wizard deciding which model someone talks
+    to. But leaving a known-absent id as the default is a decision too, and the
+    worse one: `docs/PLAN.md` 9 records that a guessed Live id fails at the *first
+    voice turn*, not at startup, and that two documented ids are already shut down.
+    So the id is named, the default goes away, and Enter re-asks.
+    """
+    empty_then_choose = ["", "1"]
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, *empty_then_choose, "", "", "y"],
+        checks=gemini_listing(live=("gemini-live-3-pro",), text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    assert f"{setup.DEFAULT_GEMINI_LIVE_MODEL} is not in that list." in flat(result.out)
+    # Enter was refused rather than accepted...
+    assert "This one is required" in flat(result.out)
+    # ...and what landed is what the account actually lists.
+    assert "DAEMON_GEMINI_LIVE_MODEL=gemini-live-3-pro" in result.written
+    assert setup.DEFAULT_GEMINI_LIVE_MODEL not in result.written
+
+
+def test_no_list_falls_back_to_the_question_it_always_asked(tmp_path: Path) -> None:
+    # A listing that fails must cost the menu and not the wizard. `Recorder`'s
+    # default Gemini verdict carries no lists at all, which is also what a key
+    # already sitting in `.env` produces: nothing probed it this run.
+    result = drive(tmp_path, [*VOICE_ANSWERS, "", "", "", "y"], checks=Recorder().checks())
+
+    assert result.code == 0
+    assert setup.NO_LIST_NOTE in flat(result.out)
+    assert f"DAEMON_GEMINI_LIVE_MODEL={setup.DEFAULT_GEMINI_LIVE_MODEL}" in result.written
+    assert f"DAEMON_GEMINI_MODEL={setup.DEFAULT_GEMINI_MODEL}" in result.written
+
+
+def test_an_account_with_nothing_that_fits_says_that_instead(tmp_path: Path) -> None:
+    # A different sentence from the one above, because it is a different fact:
+    # the account answered, and had nothing.
+    result = drive(tmp_path, [*VOICE_ANSWERS, "", "", "", "y"], checks=gemini_listing())
+
+    assert result.code == 0
+    assert setup.EMPTY_LIST_NOTE in flat(result.out)
+    assert setup.NO_LIST_NOTE not in flat(result.out)
+    assert f"DAEMON_GEMINI_LIVE_MODEL={setup.DEFAULT_GEMINI_LIVE_MODEL}" in result.written
+
+
+def test_a_rejected_key_offers_no_list_and_fails_the_way_it_did_before(
+    tmp_path: Path,
+) -> None:
+    verdict = Verdict(
+        False, "Google refused the key (HTTP 403).", hint=setup.GEMINI_STANDARD_KEY_HINT
+    )
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, "AIza-2", "AIza-3"],
+        checks=Recorder().checks(gemini_verdict=verdict),
+    )
+
+    assert result.code == 1
+    assert not result.env_path.exists()
+    assert "September 2026" in result.out
+    # No model question was reached, so neither fallback sentence belongs here.
+    assert setup.NO_LIST_NOTE not in result.out
+    assert setup.EMPTY_LIST_NOTE not in result.out
+
+
+def test_a_long_model_list_still_fits_the_terminal(tmp_path: Path) -> None:
+    from daemon.tui import DEFAULT_WIDTH, display_width
+
+    live = tuple(f"gemini-{index}-flash-native-audio-preview-12-2026" for index in range(20))
+    result = drive(
+        tmp_path,
+        [*VOICE_ANSWERS, EXPAND, "1", "", "", "y"],
+        checks=gemini_listing(live=live, text=("gemini-2.5-flash",)),
+    )
+
+    assert result.code == 0
+    for line in laid_out(result.out, tmp_path):
+        assert display_width(line) <= DEFAULT_WIDTH, line
+
+
+# --- how it reads ------------------------------------------------------------
+
+
+class FakeTty(io.StringIO):
+    """A stream that claims to be a terminal, so the coloured path can be driven
+    without one. `io.StringIO.isatty()` answers False, which is what every other
+    test in this file relies on."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_no_escape_sequence_reaches_a_pipe(tmp_path: Path) -> None:
+    """The guarantee every other assertion in this file rests on.
+
+    `Theme` is built from the stream the wizard prints to, so a piped run cannot
+    emit colour at all. If it could, every string assertion here would silently
+    become an assertion about ANSI.
+    """
+    result = drive(tmp_path, answers_for(persona=("루미", "warm", "형이라고 불러줘")))
+
+    assert result.code == 0
+    assert "\033" not in result.out
+
+
+def test_a_real_terminal_gets_colour_without_changing_the_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from daemon.tui import DEFAULT_WIDTH, display_width
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    result = drive(
+        tmp_path,
+        answers_for(persona=("루미", "warm", "형이라고 불러줘")),
+        stdout=FakeTty(),
+    )
+
+    assert result.code == 0
+    assert "\033[1m" in result.out  # the wordmark and the headings are bold
+    assert "\033[32m" in result.out  # an `ok:` line is green
+    # And the escapes are only paint: nothing they wrap has changed shape.
+    for line in laid_out(_stripped(result.out), tmp_path):
+        assert display_width(line) <= DEFAULT_WIDTH, line
+
+
+def _stripped(rendered: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", rendered)
+
+
+def test_the_wordmark_is_drawn_once(tmp_path: Path) -> None:
+    result = drive(tmp_path, answers_for())
+
+    # The first row of the mark spells both the D and the M with the same corner,
+    # so the row is what gets counted rather than the glyph.
+    assert result.out.count("┌┬┐ ┌─┐ ┌─┐ ┌┬┐ ┌─┐ ┌┐┌") == 1
+    assert result.out.startswith("┌┬┐")
+    for part in tui.TAGLINE:
+        assert part in result.out
+
+
+def test_every_step_is_numbered_out_of_four(tmp_path: Path) -> None:
+    # A wizard that does not say how much is left is a wizard people abandon.
+    inbox = Inbox([(message(3, 4242, "hi", first_name="Owner"),)])
+
+    result = drive(
+        tmp_path, answers_for(pairing=["y", "y"]), checks=checks_with(inbox)
+    )
+
+    assert result.code == 0
+    for step in range(1, 5):
+        assert f"── {step}/4 ─" in result.out
+
+
+def test_nothing_the_wizard_prints_overflows_the_width(tmp_path: Path) -> None:
+    # Korean is where this breaks: every syllable is two columns and `len()` says
+    # one, so a table or box holding a Korean answer is crooked unless every pad
+    # went through `display_width`.
+    from daemon.tui import DEFAULT_WIDTH, display_width
+
+    inbox = Inbox([(message(3, 4242, "안녕", first_name="김대현", username="daze"),)])
+    result = drive(
+        tmp_path,
+        answers_for(persona=("루미", "짧고 건조하게. 빈말은 안 한다.", "형이라고 불러줘, 반말로")),
+        checks=checks_with(inbox),
+    )
+
+    assert result.code == 0
+    for line in laid_out(result.out, tmp_path):
+        assert display_width(line) <= DEFAULT_WIDTH, line
+
+
+def test_the_seed_box_aligns_around_a_korean_answer(tmp_path: Path) -> None:
+    from daemon.tui import display_width
+
+    result = drive(
+        tmp_path,
+        answers_for(persona=("루미", "짧고 건조하게. 빈말은 안 한다.", "형이라고 불러줘, 반말로")),
+    )
+
+    assert result.code == 0
+    box = [line for line in result.out.splitlines() if line.startswith(("╭", "│", "╰"))]
+    assert box, "the seed was not shown back"
+    assert len({display_width(line) for line in box}) == 1, box
+    # And it is the answers, in the words that went into the file.
+    assert "루미" in "\n".join(box)
+    assert "형이라고 불러줘, 반말로" in flat("\n".join(box))
+
+
+def test_the_sender_table_aligns_around_a_korean_display_name(tmp_path: Path) -> None:
+    # The name is the attacker-chosen field *and* the one most likely to be
+    # Korean, so this is where a `len()`-based table would visibly break.
+    inbox = Inbox([(message(3, 4242, "안녕", first_name="김대현", username="daze"),)])
+
+    result = drive(tmp_path, answers_for(pairing=["y", "y"]), checks=checks_with(inbox))
+
+    assert result.code == 0
+    lines = result.out.splitlines()
+    id_line = next(line for line in lines if line.strip().startswith("id "))
+    name_line = next(line for line in lines if line.strip().startswith("name "))
+    assert id_line.index("4242") == name_line.index("김대현")
+
+
+def test_the_change_list_is_a_table_and_still_masks_secrets(tmp_path: Path) -> None:
+    from daemon.tui import display_width
+
+    existing = "DAEMON_PRESET=offline\nDAEMON_DATA_DIR=./데이터\n"
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y", "", "", "", "n"], existing=existing
+    )
+
+    assert result.code == 0
+    assert "Review" in result.out
+    rows = [
+        line
+        for line in result.out.splitlines()
+        if line.startswith(("  DAEMON_OLLAMA_MODEL  ", "  TELEGRAM_BOT_TOKEN   "))
+    ]
+    assert len(rows) == 2, rows
+    # One value column, whatever the keys were long enough to need.
+    columns = {
+        line.index(value)
+        for line, value in zip(rows, ("gemma3:4b", "...ABCD"), strict=True)
+    }
+    assert len(columns) == 1, rows
+    assert GOOD_TOKEN not in result.out
+    assert all(display_width(line) <= 80 for line in rows)
+
+
+def test_no_vendor_key_is_asked_for_until_a_provider_is_chosen() -> None:
+    # config.PRESETS names a HOSTED placeholder, and DAEMON_HOSTED_PROVIDER has no
+    # default. An unanswered question has to contribute nothing rather than a
+    # guess: the guess used to be Anthropic, so someone who ran setup before this
+    # question existed silently got Claude and could not tell that from a choice.
+    unanswered = {need.key for need in setup.needs_for({"DAEMON_PRESET": "balanced"})}
+
+    assert unanswered == {"DAEMON_HOSTED_PROVIDER", "DAEMON_OLLAMA_MODEL", "TELEGRAM_BOT_TOKEN"}
+
+
+def test_the_chosen_provider_decides_which_key_is_asked_for() -> None:
+    def keys(hosted: str) -> set[str]:
+        return {
+            need.key
+            for need in setup.needs_for(
+                {"DAEMON_PRESET": "balanced", "DAEMON_HOSTED_PROVIDER": hosted}
+            )
+        }
+
+    assert "ANTHROPIC_API_KEY" in keys("anthropic")
+    assert "GEMINI_API_KEY" not in keys("anthropic")
+    assert "GEMINI_API_KEY" in keys("gemini")
+    assert "ANTHROPIC_API_KEY" not in keys("gemini")
+    assert "OPENAI_API_KEY" in keys("openai")
+    # And answering it removes it from the list of things still to answer.
+    for hosted in ("anthropic", "openai", "gemini"):
+        assert "DAEMON_HOSTED_PROVIDER" not in keys(hosted)
+
+
+def test_offline_is_never_asked_for_a_provider() -> None:
+    keys = {need.key for need in setup.needs_for({"DAEMON_PRESET": "offline"})}
+
+    assert "DAEMON_HOSTED_PROVIDER" not in keys
 
 
 def test_needs_come_from_the_preset_table(tmp_path: Path) -> None:
     # One assertion that the routing table in config is what drives the questions,
     # rather than a second copy of it living here.
-    offline = {need.key for need in setup.needs_for({"DAEMON_PRESET": "offline"})}
-    balanced = {need.key for need in setup.needs_for({"DAEMON_PRESET": "balanced"})}
-    voice = {
-        need.key
-        for need in setup.needs_for(
-            {"DAEMON_PRESET": "balanced", "DAEMON_VOICE_ENABLED": "true"}
-        )
-    }
+    def keys(**env: str) -> set[str]:
+        return {need.key for need in setup.needs_for(env)}
+
+    offline = keys(DAEMON_PRESET="offline", DAEMON_HOSTED_PROVIDER="anthropic")
+    balanced = keys(DAEMON_PRESET="balanced", DAEMON_HOSTED_PROVIDER="anthropic")
+    voice = keys(
+        DAEMON_PRESET="balanced",
+        DAEMON_HOSTED_PROVIDER="anthropic",
+        DAEMON_VOICE_ENABLED="true",
+    )
 
     assert "ANTHROPIC_API_KEY" not in offline
     assert "ANTHROPIC_API_KEY" in balanced
     assert "GEMINI_API_KEY" not in balanced
     assert "GEMINI_API_KEY" in voice
+
+
+# --- changing your mind -------------------------------------------------------
+# The wizard used to print "already in .env, keeping it" and move on, which made a
+# decided answer unreachable: the only way to switch preset was to hand-edit .env,
+# and hand-editing config is exactly what this command exists to remove - the same
+# reason nobody types their own numeric Telegram id. Reported from a real re-install.
+
+
+def test_a_decided_preset_is_offered_again(tmp_path: Path) -> None:
+    result = drive(
+        tmp_path, [KEEP, "gemma3:4b", GOOD_TOKEN, "y"], existing="DAEMON_PRESET=offline\n"
+    )
+
+    assert result.code == 0
+    assert "currently offline" in result.out.lower()
+    assert "enter keeps it" in result.out.lower()
+
+
+def test_a_preset_can_actually_be_changed_by_re_running(tmp_path: Path) -> None:
+    """The thing that was impossible. `offline` -> `balanced` through the wizard,
+    with no editor involved."""
+    result = drive(
+        tmp_path,
+        # Order matters and is the product: preset, provider, voice, then the
+        # credentials the chosen preset actually needs.
+        ["balanced", "gemini", "n", "gemma3:4b", GOOD_GEMINI, "", GOOD_TOKEN, "y"],
+        existing="DAEMON_PRESET=offline\n",
+    )
+
+    assert result.code == 0
+    assert "DAEMON_PRESET=balanced" in result.written
+    assert "DAEMON_HOSTED_PROVIDER=gemini" in result.written
+
+
+def test_keeping_every_answer_writes_nothing(tmp_path: Path) -> None:
+    """A re-run that changes nothing must stay harmless. `_record` compares against
+    the current value precisely so "already configured" keeps being true."""
+    existing = (
+        f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
+    )
+    result = drive(tmp_path, [KEEP], existing=existing)
+
+    assert result.code == 0
+    assert result.written == existing
+
+
+def test_voice_can_be_turned_off_again(tmp_path: Path) -> None:
+    """The switch has to work in both directions, and the failure costs are not
+    symmetric: someone turning voice off is withdrawing consent for audio to leave
+    the machine, and a wizard that cannot express that is worse than no wizard.
+    """
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "n", "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
+        existing=existing,
+    )
+
+    assert result.code == 0
+    assert "currently on" in result.out.lower()
+    assert "DAEMON_VOICE_ENABLED=false" in result.written
+
+
+def test_enter_at_the_voice_question_keeps_it_on(tmp_path: Path) -> None:
+    """The default has to be the *current* state, not `False`.
+
+    Added because a mutation survived: `test_voice_can_be_turned_off_again` answers
+    the question explicitly, so it could not tell a correct default from a wrong
+    one. With the default hard-coded to off, Enter would silently switch voice off
+    on every re-run - a setting the user turned on, withdrawn by pressing return.
+    """
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+        "DAEMON_GEMINI_LIVE_MODEL=gemini-3.1-flash-live-preview\n"
+    )
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, KEEP, "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
+        existing=existing,
+    )
+
+    assert result.code == 0
+    assert "currently on" in result.out.lower()
+    assert "DAEMON_VOICE_ENABLED=true" in result.written
+    # Unchanged, so not in the change list either.
+    assert "DAEMON_VOICE_ENABLED" not in result.out.split("── Review")[1]
+
+
+# --- a re-install is where the list matters most -------------------------------
+# Reported from a real one: the wizard printed `NO_LIST_NOTE` and skipped the Live
+# question entirely, because both the key and the Live id were already in `.env`.
+
+
+def test_a_saved_key_still_gets_the_account_a_list(tmp_path: Path) -> None:
+    """The list normally rides along on the verdict from *asking* for the key - and
+    a key already in `.env` is never asked for. On a re-install that is the common
+    case, and it was the whole difference between a menu and a built-in default:
+    the probe ran zero times, so there was nothing to show.
+    """
+    recorder = Recorder()
+    existing = (
+        "DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"GEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "n", "1", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=recorder.checks(
+            gemini_verdict=Verdict(
+                True, "key works", models={"DAEMON_GEMINI_MODEL": ("gemini-2.5-pro",)}
+            )
+        ),
+    )
+
+    assert result.code == 0
+    assert recorder.gemini == [GOOD_GEMINI], "the saved key was never used to list"
+    assert "gemini-2.5-pro" in block(result.out, "DAEMON_GEMINI_MODEL")
+    assert "DAEMON_GEMINI_MODEL=gemini-2.5-pro" in result.written
+
+
+def test_one_probe_answers_both_gemini_questions(tmp_path: Path) -> None:
+    """They share a key, so listing twice would be a second call for an answer
+    already in hand."""
+    recorder = Recorder()
+    existing = (
+        f"DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+
+    drive(
+        tmp_path,
+        [KEEP, KEEP, KEEP, "1", "1", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=recorder.checks(
+            gemini_verdict=Verdict(
+                True,
+                "key works",
+                models={
+                    "DAEMON_GEMINI_MODEL": ("gemini-2.5-pro",),
+                    "DAEMON_GEMINI_LIVE_MODEL": ("gemini-3.1-flash-live-preview",),
+                },
+            )
+        ),
+    )
+
+    assert len(recorder.gemini) == 1
+
+
+def test_a_model_id_already_in_the_file_is_still_offered(tmp_path: Path) -> None:
+    """`needs_for` drops a key that `.env` already has, which is right for a
+    credential and wrong for a model id: the Live question vanished entirely, so the
+    only way to change one was to hand-edit the file. Same defect as the preset had,
+    one layer down.
+    """
+    existing = (
+        f"DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+        "DAEMON_GEMINI_LIVE_MODEL=gemini-live-2.5-flash-preview\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, KEEP, "1", "1", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=gemini_listing(
+            live=("gemini-2.5-flash-native-audio",), text=("gemini-2.5-flash",)
+        ),
+    )
+
+    assert result.code == 0
+    assert "(DAEMON_GEMINI_LIVE_MODEL)" in result.out, "the question was skipped again"
+    # And the id the account does not list is named rather than kept.
+    assert "gemini-live-2.5-flash-preview is not in that list." in flat(result.out)
+    assert "DAEMON_GEMINI_LIVE_MODEL=gemini-2.5-flash-native-audio" in result.written
+
+
+def test_a_saved_model_id_is_the_default_not_the_built_in_one(tmp_path: Path) -> None:
+    """Enter has to mean "leave it alone". Defaulting to the built-in value would
+    make a re-run silently replace a model the user chose."""
+    existing = (
+        f"DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"GEMINI_API_KEY={GOOD_GEMINI}\nDAEMON_GEMINI_MODEL=gemini-2.5-pro\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "n", KEEP, GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=gemini_listing(text=("gemini-2.5-flash", "gemini-2.5-pro")),
+    )
+
+    assert result.code == 0
+    assert "DAEMON_GEMINI_MODEL=gemini-2.5-pro" in result.written
+    assert setup.DEFAULT_GEMINI_MODEL not in result.written
+
+
+def test_a_saved_key_that_stopped_working_is_said_out_loud(tmp_path: Path) -> None:
+    """Otherwise the only symptom is a missing menu, and "the account has no models"
+    is a different fact from "your key expired"."""
+    existing = (
+        "DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"GEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "n", "gemini-2.5-flash", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=Recorder().checks(
+            gemini_verdict=Verdict(False, "Google refused the key (HTTP 403).")
+        ),
+    )
+
+    assert result.code == 0
+    assert "GEMINI_API_KEY is in .env but" in flat(result.out)
+    assert "Google refused the key" in flat(result.out)
+
+
+def test_one_probe_even_when_only_one_of_the_two_lists_came_back(
+    tmp_path: Path,
+) -> None:
+    """Where the once-per-credential guard actually earns its place.
+
+    Found by mutation, and it took two attempts to place. With both lists present
+    the guard is redundant: the second question finds its entry in the catalog and
+    never asks to probe. It is also redundant when the *first* question is the one
+    with no list, because that question does the probing anyway.
+
+    It earns its place only when the question asked **second** is the one the
+    account has no list for - Live comes first, so that means an account with Live
+    models and no text models. Without the guard, that second question spends
+    another call to learn what the first already established.
+    """
+    recorder = Recorder()
+    existing = (
+        "DAEMON_PRESET=quality\nDAEMON_HOSTED_PROVIDER=gemini\n"
+        f"DAEMON_VOICE_ENABLED=true\nGEMINI_API_KEY={GOOD_GEMINI}\n"
+    )
+
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, KEEP, "1", "gemini-2.5-pro", GOOD_TOKEN, "y"],
+        existing=existing,
+        checks=recorder.checks(
+            gemini_verdict=Verdict(
+                True,
+                "key works",
+                models={"DAEMON_GEMINI_LIVE_MODEL": ("gemini-3.1-flash-live-preview",)},
+            )
+        ),
+    )
+
+    assert result.code == 0
+    assert len(recorder.gemini) == 1
+    # The text question still ran, just without a menu - free text is the contract.
+    assert "DAEMON_GEMINI_MODEL=gemini-2.5-pro" in result.written

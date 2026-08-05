@@ -14,6 +14,7 @@ those milestones need no migration.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Sequence
@@ -24,7 +25,7 @@ import numpy as np
 
 from daemon.fs import secure_dir, secure_file
 from daemon.memory.base import LoggedMessage
-from daemon.memory.log import utc_iso
+from daemon.memory.log import from_iso, utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -660,3 +661,518 @@ class Store:
         cursor = self.conn.execute("DELETE FROM embeddings WHERE model = ?", (model,))
         self.conn.commit()
         return cursor.rowcount
+
+    # --- M2: the curated tier -----------------------------------------------
+
+    def insert_entry(
+        self,
+        *,
+        body: str,
+        importance: int,
+        trigger_phrases: Sequence[str],
+        origin: str,
+        session_kind: str,
+        modality: str,
+        now: datetime,
+        supersession_key: str | None = None,
+        source_file: str | None = None,
+        source_anchor: str | None = None,
+        commit: bool = True,
+    ) -> int:
+        """Add one curated fact and retire whatever it supersedes, in ONE
+        transaction.
+
+        Atomic because the unique index on `supersession_key` only permits one
+        active row per key: as two commits there is a window with no active row for
+        that key, and if the second then fails the fact is gone from the mirror
+        entirely. All of it or none of it.
+
+        The order inside is forced by that same index - retire, insert, then point
+        the retired row at its replacement. Inserting first raises
+        `UNIQUE constraint failed` before anything has been retired, which is the
+        index doing its job.
+
+        `commit=False` leaves the transaction open so the caller can write the
+        markdown *before* the mirror is durable, which is what non-negotiable 1
+        requires. This connection then sees its own uncommitted rows, so the
+        caller can render the file from the post-insert state without
+        reimplementing the ordering. The caller owns the commit and the rollback -
+        see `memory.curated.CuratedMemory.add`.
+        """
+        stamp = utc_iso(now)
+        try:
+            previous = (
+                self.conn.execute(
+                    "SELECT id FROM memory_entries "
+                    "WHERE supersession_key = ? AND status = 'active'",
+                    (supersession_key,),
+                ).fetchone()
+                if supersession_key
+                else None
+            )
+            if previous is not None:
+                self.conn.execute(
+                    "UPDATE memory_entries SET status = 'retired', updated_at = ? WHERE id = ?",
+                    (stamp, int(previous["id"])),
+                )
+
+            cursor = self.conn.execute(
+                "INSERT INTO memory_entries "
+                "(body, importance, trigger_phrases, origin, session_kind, modality,"
+                " created_at, updated_at, supersession_key, source_file, source_anchor) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    body,
+                    importance,
+                    json.dumps(list(trigger_phrases), ensure_ascii=False),
+                    origin,
+                    session_kind,
+                    modality,
+                    stamp,
+                    stamp,
+                    supersession_key,
+                    source_file,
+                    source_anchor,
+                ),
+            )
+            new_id = int(cursor.lastrowid or 0)
+            if previous is not None:
+                self.conn.execute(
+                    "UPDATE memory_entries SET superseded_by = ? WHERE id = ?",
+                    (new_id, int(previous["id"])),
+                )
+        except Exception:
+            # Discards the retire too. Without this a failed insert would leave
+            # the old fact retired and nothing active for its key.
+            self.conn.rollback()
+            raise
+        if commit:
+            self.conn.commit()
+        return new_id
+
+    def active_entries(self, limit: int = 50) -> list[sqlite3.Row]:
+        """The curated tier, most important first, then most recent.
+
+        Ordered by importance rather than recency because this tier is *always*
+        injected under a budget (docs/PLAN.md 4.1): when the budget truncates, it
+        must drop the least important fact, not the oldest one.
+        """
+        return self.conn.execute(
+            "SELECT * FROM memory_entries WHERE status = 'active' "
+            "ORDER BY importance DESC, updated_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def count_entries(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_entries WHERE status = 'active'"
+        ).fetchone()
+        return int(row["n"])
+
+    # --- M2: entity notes ---------------------------------------------------
+
+    def upsert_entity(self, *, name: str, kind: str | None, file: str, now: datetime) -> int:
+        """Create or touch one entity, returning its id and counting the mention.
+
+        `kind` is only ever filled in, never overwritten with NULL: a later pass
+        that mentions someone without classifying them must not erase what an
+        earlier pass worked out.
+        """
+        stamp = utc_iso(now)
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO entities (name, kind, file, created_at, updated_at, mention_count) "
+                "VALUES (?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT (name) DO UPDATE SET "
+                "  kind = COALESCE(excluded.kind, entities.kind), "
+                "  file = excluded.file, "
+                "  updated_at = excluded.updated_at, "
+                "  mention_count = entities.mention_count + 1",
+                (name, kind, file, stamp, stamp),
+            )
+            row = self.conn.execute("SELECT id FROM entities WHERE name = ?", (name,)).fetchone()
+        return int(row["id"])
+
+    def set_mention_count(self, entity_id: int, count: int) -> None:
+        """Overwrite the count rather than increment it. Only the rebuild path uses
+        this: the count is implied by how many dated sections the note has, so a
+        rebuild that incremented would double it on every run."""
+        self.conn.execute(
+            "UPDATE entities SET mention_count = ? WHERE id = ?", (count, entity_id)
+        )
+        self.conn.commit()
+
+    def entity_by_name(self, name: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM entities WHERE name = ?", (name,)).fetchone()
+
+    def entities(self, limit: int = 500) -> list[sqlite3.Row]:
+        """Most-mentioned first - the reading order for a graph nobody curated."""
+        return self.conn.execute(
+            "SELECT * FROM entities ORDER BY mention_count DESC, name ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def link_entities(self, src_id: int, dst_id: int) -> None:
+        """Record that two entities appeared together. Undirected in meaning, so
+        both directions are stored - a graph read from either end shows the edge.
+        Self-links are dropped rather than rejected: the extractor naming the same
+        entity twice in one note is not an error worth failing a reflection over.
+        """
+        if src_id == dst_id:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO entity_links (src_id, dst_id) VALUES (?, ?)",
+                [(src_id, dst_id), (dst_id, src_id)],
+            )
+
+    def links_for(self, entity_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT e.* FROM entity_links l JOIN entities e ON e.id = l.dst_id "
+            "WHERE l.src_id = ? ORDER BY e.name",
+            (entity_id,),
+        ).fetchall()
+
+    # --- M2: observations (append-only) -------------------------------------
+
+    def insert_observation(
+        self,
+        *,
+        body: str,
+        observed_from: str,
+        now: datetime,
+        modality: str = "text",
+        origin: str = "agent",
+        confidence: float = 0.5,
+    ) -> int:
+        """Append one observation about how to deal with this person.
+
+        There is deliberately no update or delete for this table. It is the log
+        clock (docs/PLAN.md 8.1): persona evolution needs weeks of accumulated
+        real observations before it can be judged, and an observation that can be
+        rewritten later is not evidence of anything.
+        """
+        cursor = self.conn.execute(
+            "INSERT INTO observations "
+            "(body, created_at, observed_from, modality, origin, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (body, utc_iso(now), observed_from, modality, origin, confidence),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def unconsumed_observations(self, limit: int = 200) -> list[sqlite3.Row]:
+        """Observations no persona rule has used yet - M4's input, oldest first."""
+        return self.conn.execute(
+            "SELECT * FROM observations WHERE consumed_by IS NULL "
+            "ORDER BY created_at ASC, id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def count_observations(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()
+        return int(row["n"])
+
+    # --- M3: proactive candidates -------------------------------------------
+
+    def insert_candidate(
+        self,
+        *,
+        kind: str,
+        reason: str,
+        payload: str,
+        now: datetime,
+        due_at: datetime | None = None,
+        expires_at: datetime | None = None,
+        fire_budget: int = 1,
+        cooldown_secs: int = 86_400,
+    ) -> int:
+        """Mirror one candidate. Payload arrives already JSON-encoded so this layer
+        does not have to know what any generator puts in it."""
+        cursor = self.conn.execute(
+            "INSERT INTO proactive_candidates "
+            "(kind, reason, payload, created_at, due_at, expires_at, fire_budget, cooldown_secs) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                kind,
+                reason,
+                payload,
+                utc_iso(now),
+                None if due_at is None else utc_iso(due_at),
+                None if expires_at is None else utc_iso(expires_at),
+                fire_budget,
+                cooldown_secs,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    _LIVE = (
+        # `fired` is live too, as long as the candidate's own budget is not spent.
+        # Leaving it out meant a candidate allowed to fire twice was silently
+        # retired after the first - the state machine in schema.sql distinguishes
+        # `fired` from `done` precisely so that can be told apart, and a query that
+        # stops at 'armed' throws the distinction away.
+        "state IN ('pending', 'armed', 'fired') "
+        "AND fire_count < fire_budget "
+        "AND (expires_at IS NULL OR expires_at > :now)"
+    )
+
+    def live_candidates(self, *, now: datetime) -> list[sqlite3.Row]:
+        """Candidates still in play.
+
+        **Not the deduplication check**, which an earlier version of this docstring
+        claimed. It excludes `done`, `cancelled` and `expired`, and rows whose
+        budget is spent - so an open loop that already fired and was marked `done`
+        has no live row, is regenerated on the next tick, and the daemon asks about
+        the same presentation again. That is the stalker failure, arriving through
+        the one method that looked like it prevented it. Use
+        `existing_dedup_keys`, which reads *every* state.
+        """
+        return self.conn.execute(
+            f"SELECT * FROM proactive_candidates WHERE {self._LIVE} "
+            "ORDER BY due_at IS NULL, due_at ASC, id ASC",
+            {"now": utc_iso(now)},
+        ).fetchall()
+
+    def due_candidates(self, *, now: datetime) -> list[sqlite3.Row]:
+        """Live candidates whose moment has arrived - what the gate is offered.
+
+        Two separate cooldowns exist and this is the per-candidate one
+        (`cooldown_secs`): "do not raise *this* again for a day". The global gap
+        between any two utterances is the gate's, from settings. Conflating them
+        would let five different candidates fire in five minutes, each within its
+        own cooldown.
+        """
+        return self.conn.execute(
+            f"SELECT * FROM proactive_candidates WHERE {self._LIVE} "
+            "AND (due_at IS NULL OR due_at <= :now) "
+            "AND (last_fired_at IS NULL OR strftime('%Y-%m-%dT%H:%M:%SZ', last_fired_at, "
+            "     '+' || cooldown_secs || ' seconds') <= :now) "
+            "ORDER BY due_at IS NULL, due_at ASC, id ASC",
+            {"now": utc_iso(now)},
+        ).fetchall()
+
+    def set_candidate_state(self, candidate_id: int, state: str) -> None:
+        self.conn.execute(
+            "UPDATE proactive_candidates SET state = ? WHERE id = ?", (state, candidate_id)
+        )
+        self.conn.commit()
+
+    def mark_candidate_fired(self, candidate_id: int, *, now: datetime) -> None:
+        """One more firing against this candidate's own budget.
+
+        `state` becomes `done` once the budget is spent, so a candidate that may
+        fire twice is not silently retired after the first.
+        """
+        stamp = utc_iso(now)
+        with self.conn:
+            self.conn.execute(
+                "UPDATE proactive_candidates "
+                "SET fire_count = fire_count + 1, last_fired_at = ?, "
+                "    state = CASE WHEN fire_count + 1 >= fire_budget THEN 'done' ELSE 'fired' END "
+                "WHERE id = ?",
+                (stamp, candidate_id),
+            )
+
+    def expire_candidates(self, *, now: datetime) -> int:
+        """Retire what ran out of time. Returns how many.
+
+        Separate from `live_candidates` filtering it out: a row left `pending`
+        forever is indistinguishable from one still waiting, and the state machine
+        in schema.sql is the thing a human reads to understand why nothing spoke.
+        """
+        cursor = self.conn.execute(
+            "UPDATE proactive_candidates SET state = 'expired' "
+            "WHERE state IN ('pending', 'armed') AND expires_at IS NOT NULL AND expires_at <= ?",
+            (utc_iso(now),),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def existing_dedup_keys(self, keys: Sequence[str]) -> set[str]:
+        """Which of these dedup keys the candidate table has *ever* held.
+
+        Every state, on purpose - see `live_candidates`. A key is spent the moment
+        a candidate carrying it exists, whatever became of that candidate: fired,
+        cancelled by hand, or expired unspoken. "It has been quiet too long" is one
+        observation, and a version that retries is an alarm clock.
+
+        The key lives in `payload` rather than a column only because
+        `daemon/memory/schema.sql` is frozen; a column with a unique index is the
+        better shape whenever v5 opens.
+        """
+        if not keys:
+            return set()
+        placeholders = ",".join("?" * len(keys))
+        rows = self.conn.execute(
+            "SELECT json_extract(payload, '$.dedup') AS dedup FROM proactive_candidates "
+            f"WHERE json_extract(payload, '$.dedup') IN ({placeholders})",
+            tuple(keys),
+        ).fetchall()
+        return {row["dedup"] for row in rows}
+
+    # --- M3: what the generators read ---------------------------------------
+    # `session_kind IN ('interactive', 'voice')` in all three is load-bearing, not
+    # hygiene: without it one proactive utterance resets the silence clock, and
+    # speaking becomes its own excuse to stop noticing the silence.
+    #
+    # Bounds are rendered with `utc_iso`, never `to_iso`. `messages.ts` is written
+    # at second precision, and as strings "...T12:00:00Z" > "...T12:00:00.000Z"
+    # because 'Z' > '.', so a millisecond bound silently drops a row sitting
+    # exactly on it.
+
+    def last_conversation_at(self) -> datetime | None:
+        """When the user and the daemon last actually talked."""
+        row = self.conn.execute(
+            "SELECT MAX(ts) AS ts FROM messages WHERE session_kind IN ('interactive', 'voice')"
+        ).fetchone()
+        return None if row["ts"] is None else from_iso(row["ts"])
+
+    def conversation_between(self, start: datetime, end: datetime) -> list[sqlite3.Row]:
+        """Conversation in a window, inclusive at both ends, in reading order."""
+        return self.conn.execute(
+            "SELECT * FROM messages WHERE session_kind IN ('interactive', 'voice') "
+            "AND ts >= ? AND ts <= ? ORDER BY ts ASC, id ASC",
+            (utc_iso(start), utc_iso(end)),
+        ).fetchall()
+
+    def conversation_times(self, since: datetime) -> list[datetime]:
+        """Just the timestamps. `pattern_time` reads two months of them to learn
+        which hours this person talks in, and wants none of the text."""
+        rows = self.conn.execute(
+            "SELECT ts FROM messages WHERE session_kind IN ('interactive', 'voice') "
+            "AND ts >= ? ORDER BY ts ASC",
+            (utc_iso(since),),
+        ).fetchall()
+        return [from_iso(row["ts"]) for row in rows]
+
+    # --- M3: what was actually said -----------------------------------------
+
+    def insert_utterance(
+        self,
+        *,
+        utterance_id: str,
+        candidate_id: int | None,
+        kind: str,
+        text: str,
+        route: str,
+        gate_snapshot: str,
+        now: datetime,
+    ) -> None:
+        """Record one proactive utterance. `utterance_id` is a uuid the label
+        button echoes back, so it is chosen by the caller rather than by sqlite."""
+        self.conn.execute(
+            "INSERT INTO proactive_utterances "
+            "(id, candidate_id, kind, text, spoken_at, route, gate_snapshot) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (utterance_id, candidate_id, kind, text, utc_iso(now), route, gate_snapshot),
+        )
+        self.conn.commit()
+
+    def set_utterance_route(self, utterance_id: str, route: str) -> None:
+        """Correct the route to what delivery actually achieved.
+
+        The row is written *before* sending so the id on the label button resolves
+        the moment it is pressed, which means the route stored at that point is the
+        intended one. A speaker that failed while Telegram succeeded turns `both`
+        into `telegram`, and the snapshot has to say what happened rather than what
+        was planned.
+        """
+        self.conn.execute(
+            "UPDATE proactive_utterances SET route = ? WHERE id = ?", (route, utterance_id)
+        )
+        self.conn.commit()
+
+    def delete_utterance(self, utterance_id: str) -> None:
+        """Remove a row for an utterance that was never delivered.
+
+        Deliberate, and the one place this table is written destructively -
+        non-negotiable 6 makes `observations` append-only and says nothing about
+        this one, because these rows are a record of *what was said*. An utterance
+        that reached nobody was not said, and leaving the row would spend the day's
+        budget on silence and put an unlabelable message in the precision numbers.
+        """
+        self.conn.execute("DELETE FROM proactive_utterances WHERE id = ?", (utterance_id,))
+        self.conn.commit()
+
+    def last_utterance_at(self) -> datetime | None:
+        """When it last spoke first, of any kind - the cooldown's input."""
+        row = self.conn.execute(
+            "SELECT spoken_at FROM proactive_utterances ORDER BY spoken_at DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else from_iso(row["spoken_at"])
+
+    def utterances_since(self, *, since: datetime) -> list[sqlite3.Row]:
+        """Everything spoken since `since`, newest first.
+
+        The budget is per *local* day while `spoken_at` is UTC, so the caller
+        passes the local day's start converted to UTC rather than this method
+        trying to know which day it is - the same reason `messages_for_day`
+        filters on `log_file`.
+        """
+        return self.conn.execute(
+            "SELECT * FROM proactive_utterances WHERE spoken_at >= ? ORDER BY spoken_at DESC",
+            (utc_iso(since),),
+        ).fetchall()
+
+    def label_utterance(self, utterance_id: str, label: str, *, now: datetime) -> bool:
+        """Record the user's verdict. Returns whether the row existed.
+
+        This is the label clock (docs/PLAN.md 8.1): tuning proactivity needs weeks
+        of real "that was good" / "that was annoying", and no amount of thinking
+        substitutes for it.
+        """
+        cursor = self.conn.execute(
+            "UPDATE proactive_utterances SET label = ?, labeled_at = ? WHERE id = ?",
+            (label, utc_iso(now), utterance_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def mark_responded(self, utterance_id: str) -> None:
+        """The user replied to it, which is a label nobody had to press."""
+        self.conn.execute(
+            "UPDATE proactive_utterances SET responded = 1 WHERE id = ?", (utterance_id,)
+        )
+        self.conn.commit()
+
+    def label_counts(self) -> dict[str, int]:
+        """`good` / `bad` / `unlabeled` / `responded`. What `daemon doctor` prints,
+        because "is it a stalker or a dead bot" is the M3 gate and it is not
+        answerable from a log line."""
+        rows = self.conn.execute(
+            "SELECT COALESCE(label, 'unlabeled') AS verdict, COUNT(*) AS n "
+            "FROM proactive_utterances GROUP BY verdict"
+        ).fetchall()
+        counts = {row["verdict"]: int(row["n"]) for row in rows}
+        responded = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM proactive_utterances WHERE responded = 1"
+        ).fetchone()
+        counts["responded"] = int(responded["n"])
+        return counts
+
+    # --- M2: what reflection reads ------------------------------------------
+
+    def messages_for_day(self, date: str) -> list[sqlite3.Row]:
+        """One local day's conversation, in reading order, filtered by the two
+        hygiene rules in docs/PLAN.md 4.2.
+
+        `log_file` is the filter rather than a range over `ts`, because the log is
+        split on the *local* day while timestamps are UTC - a KST day legitimately
+        holds records whose UTC date is the day before, so a BETWEEN on `ts` would
+        silently reflect on a nine-hour-shifted window.
+
+          * rule 1: proactive and reflection sessions are excluded. Their content
+            is the daemon's own speech, and letting that become evidence is the
+            self-amplifying loop the rule exists to block.
+          * rule 2: rows recall already put in front of the model are excluded.
+            They informed a reply once; counting them again turns injected context
+            into new evidence.
+        """
+        return self.conn.execute(
+            "SELECT * FROM messages WHERE log_file = ? "
+            "AND session_kind IN ('interactive', 'voice') AND recalled = 0 "
+            "ORDER BY ts ASC, id ASC",
+            (f"memory/log/{date}.md",),
+        ).fetchall()

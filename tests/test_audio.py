@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import contextlib
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Any
 import pytest
 
 from daemon.voice import audio
-from daemon.voice.audio import AudioUnavailable, LocalSpeaker, SoundDeviceAudio
+from daemon.voice.audio import AudioUnavailable, SoundDeviceAudio
 from daemon.voice.base import AudioIO
 
 
@@ -208,6 +209,38 @@ async def test_record_yields_microphone_blocks(backend: FakeSoundDevice) -> None
     assert stream.closed  # a microphone nobody reads is a light left on
 
 
+async def test_the_microphone_queue_drops_the_oldest_audio_not_the_newest(
+    backend: FakeSoundDevice, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The audit finding: the queue was unbounded, so a consumer that fell behind
+    kept sending audio from tens of seconds ago. The session stayed alive and the
+    transcripts kept arriving while the conversation answered something the user had
+    said half a minute earlier. In real-time audio an old block is worth less than
+    nothing, so the oldest go."""
+    io = SoundDeviceAudio(backend=backend)
+    blocks = io.record()
+    pull = asyncio.create_task(anext(blocks))  # starts the generator and the stream
+    await settle()
+
+    fed = audio.MIC_QUEUE_BLOCKS + 10
+    stream = backend.inputs[0]
+    for index in range(fed):
+        stream.feed(bytes([index, 0]))
+
+    received = [await pull]
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(0.5):
+            while True:
+                received.append(await anext(blocks))
+    await blocks.aclose()
+
+    assert len(received) <= audio.MIC_QUEUE_BLOCKS + 1, "the bound did not hold"
+    assert io.dropped_blocks == fed - len(received)
+    assert received[-1] == bytes([fed - 1, 0]), "the newest block was thrown away"
+    assert received[0] != bytes([0, 0]), "the oldest block survived instead"
+    assert "dropped" in caplog.text, "audio went missing with nothing said about it"
+
+
 async def test_ending_recording_closes_the_stream(backend: FakeSoundDevice) -> None:
     io = SoundDeviceAudio(backend=backend)
     blocks = io.record()
@@ -337,6 +370,118 @@ async def test_close_stops_the_writer_and_the_device(backend: FakeSoundDevice) -
     assert stream.written == [b"\x01\x01"]
 
 
+async def test_closing_waits_for_the_write_in_flight_before_closing_the_device(
+    backend: FakeSoundDevice,
+) -> None:
+    """The audit finding: `close()` cancelled the writer, but
+    `to_thread(stream.write)` cannot be cancelled - cancelling only detaches the
+    await. So the device was closed while a thread was still inside PortAudio
+    writing to it, which at worst is a native crash. The fix is a cooperative stop,
+    and this asserts the ordering that proves it."""
+    io = SoundDeviceAudio(backend=backend)
+    order: list[str] = []
+    release = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+
+    await io.play(b"\x01\x01")
+    stream = await backend.speaker()
+
+    def slow_write(chunk: bytes) -> None:
+        order.append("write-start")
+        loop.call_soon_threadsafe(started.set)
+        # Blocks the worker thread the way a full PortAudio buffer does.
+        asyncio.run_coroutine_threadsafe(_wait(release), loop).result(5)
+        order.append("write-end")
+
+    stream.write = slow_write  # type: ignore[method-assign]
+    stream.close = lambda: order.append("close")  # type: ignore[method-assign]
+    await io.play(b"\x02\x02")
+    async with asyncio.timeout(5):
+        await started.wait()
+
+    closing = asyncio.create_task(io.close())
+    await settle()
+    assert order == ["write-start"], "close() got ahead of the write in flight"
+
+    release.set()
+    async with asyncio.timeout(5):
+        await closing
+
+    assert order == ["write-start", "write-end", "close"]
+
+
+async def _wait(event: asyncio.Event) -> None:
+    await event.wait()
+
+
+async def test_a_wedged_speaker_is_left_open_rather_than_closed_underneath(
+    backend: FakeSoundDevice, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the write never comes back, the thread is still inside PortAudio. Leaking
+    a handle on the way out of the process beats closing the device under it."""
+    monkeypatch.setattr(audio, "CLOSE_TIMEOUT_SECONDS", 0.05)
+    io = SoundDeviceAudio(backend=backend)
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    await io.play(b"\x01\x01")
+    stream = await backend.speaker()
+
+    def wedged(chunk: bytes) -> None:
+        loop.call_soon_threadsafe(started.set)
+        asyncio.run_coroutine_threadsafe(_wait(asyncio.Event()), loop).result(10)
+
+    stream.write = wedged  # type: ignore[method-assign]
+    await io.play(b"\x02\x02")
+    async with asyncio.timeout(5):
+        await started.wait()
+
+    async with asyncio.timeout(5):
+        await io.close()
+
+    assert not stream.closed
+    assert "leaving the device open" in caplog.text
+
+
+async def test_stopping_playback_does_not_abort_during_a_write(
+    backend: FakeSoundDevice,
+) -> None:
+    """`abort()` from one thread while another is inside `write()` is a race in C.
+    Barge-in is the moment it would happen, which is also the moment it matters."""
+    io = SoundDeviceAudio(backend=backend)
+    order: list[str] = []
+    release = asyncio.Event()
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    await io.play(b"\x01\x01")
+    stream = await backend.speaker()
+
+    def slow_write(chunk: bytes) -> None:
+        order.append("write-start")
+        loop.call_soon_threadsafe(started.set)
+        asyncio.run_coroutine_threadsafe(_wait(release), loop).result(5)
+        order.append("write-end")
+
+    stream.write = slow_write  # type: ignore[method-assign]
+    stream.abort = lambda: order.append("abort")  # type: ignore[method-assign]
+    await io.play(b"\x02\x02")
+    async with asyncio.timeout(5):
+        await started.wait()
+
+    stopping = asyncio.create_task(io.stop_playback())
+    await settle()
+    assert order == ["write-start"]
+
+    release.set()
+    async with asyncio.timeout(5):
+        await stopping
+
+    assert order == ["write-start", "write-end", "abort"]
+    await io.close()
+
+
 async def test_one_refused_chunk_does_not_end_playback(
     backend: FakeSoundDevice, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -365,13 +510,14 @@ async def test_one_refused_chunk_does_not_end_playback(
     await io.close()
 
 
+class NoSpeaker:
+    def RawOutputStream(self, **kwargs: Any) -> Any:  # noqa: N802 - mirrors sounddevice
+        raise AudioUnavailable("no output device")
+
+
 async def test_missing_speaker_is_logged_once_and_not_retried_per_chunk(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class NoSpeaker:
-        def RawOutputStream(self, **kwargs: Any) -> Any:  # noqa: N802 - mirrors sounddevice
-            raise AudioUnavailable("no output device")
-
     io = SoundDeviceAudio(backend=NoSpeaker())
     for _ in range(20):
         await io.play(b"\x01\x01")
@@ -383,142 +529,21 @@ async def test_missing_speaker_is_logged_once_and_not_retried_per_chunk(
     await io.close()
 
 
+async def test_a_dead_speaker_stops_the_queue_growing_for_ever() -> None:
+    """The audit finding: the writer returned on AudioUnavailable and `_closed`
+    stayed False, so `play` kept accepting chunks into a queue nothing would ever
+    drain - about 48 KB a second at 24 kHz 16-bit, on a process meant to stay up
+    for weeks."""
+    io = SoundDeviceAudio(backend=NoSpeaker())
+    await io.play(b"\x01\x01")
+    await asyncio.gather(io._writer)  # let it discover there is no speaker
+
+    for _ in range(500):
+        await io.play(b"\x02" * 960)
+
+    assert io._queue.qsize() == 0, "the queue is still growing behind a dead writer"
+    await io.close()
+
+
 # --- the local speaker ------------------------------------------------------
 
-
-def test_macos_reads_the_text_from_stdin_not_argv() -> None:
-    """An utterance starting with '-' would otherwise be read as an option, and
-    text in argv is visible to every other process on the machine."""
-    assert LocalSpeaker(platform="darwin").command() == ["/usr/bin/say", "-f", "-"]
-
-
-def test_macos_korean_voice_is_selectable() -> None:
-    """docs/PLAN.md 6.3: macOS ships ko_KR voices, so the Korean proactive path
-    needs nothing installed."""
-    assert LocalSpeaker(voice="Yuna", platform="darwin").command() == [
-        "/usr/bin/say",
-        "-v",
-        "Yuna",
-        "-f",
-        "-",
-    ]
-
-
-def test_a_platform_with_no_synthesiser_says_what_to_install(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(audio.shutil, "which", lambda _name: None)
-    speaker = LocalSpeaker(platform="linux")
-
-    assert not speaker.available
-    with pytest.raises(AudioUnavailable, match="espeak-ng"):
-        speaker.command()
-
-
-def test_linux_uses_whichever_synthesiser_is_installed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        audio.shutil, "which", lambda name: "/usr/bin/espeak-ng" if name == "espeak-ng" else None
-    )
-    assert LocalSpeaker(platform="linux").command() == ["/usr/bin/espeak-ng", "--stdin"]
-
-
-async def test_speaking_writes_the_text_to_the_process(monkeypatch: pytest.MonkeyPatch) -> None:
-    spoken: list[tuple[tuple[str, ...], bytes]] = []
-
-    class FakeProcess:
-        returncode: int | None = None
-
-        async def communicate(self, data: bytes) -> tuple[None, bytes]:
-            self.returncode = 0
-            spoken.append((command, data))
-            return None, b""
-
-    command: tuple[str, ...] = ()
-
-    async def fake_exec(*argv: str, **kwargs: Any) -> FakeProcess:
-        nonlocal command
-        command = argv
-        return FakeProcess()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    await LocalSpeaker(voice="Yuna", platform="darwin").say("자기 전에 물 한 잔 마셔")
-
-    (argv, data) = spoken[0]
-    assert argv == ("/usr/bin/say", "-v", "Yuna", "-f", "-")
-    assert data.decode("utf-8") == "자기 전에 물 한 잔 마셔"
-
-
-async def test_nothing_to_say_starts_no_process(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def refuse(*argv: str, **kwargs: Any) -> Any:
-        raise AssertionError("should not have started a process")
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse)
-    await LocalSpeaker(platform="darwin").say("   ")
-
-
-async def test_a_failing_synthesiser_reports_its_own_complaint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FailingProcess:
-        returncode: int | None = None
-
-        async def communicate(self, data: bytes) -> tuple[None, bytes]:
-            self.returncode = 1
-            return None, b"Voice 'Nonexistent' not found"
-
-    async def fake_exec(*argv: str, **kwargs: Any) -> FailingProcess:
-        return FailingProcess()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    with pytest.raises(AudioUnavailable, match="not found"):
-        await LocalSpeaker(voice="Nonexistent", platform="darwin").say("안녕")
-
-
-async def test_stopping_kills_the_utterance_mid_word(monkeypatch: pytest.MonkeyPatch) -> None:
-    """docs/PLAN.md 6.4: a voice out of the speaker during a meeting is an
-    accident, so cutting one off is not a nicety."""
-    started = asyncio.Event()
-    terminated: list[bool] = []
-
-    class SlowProcess:
-        returncode: int | None = None
-
-        async def communicate(self, data: bytes) -> tuple[None, bytes]:
-            started.set()
-            await asyncio.Event().wait()  # speaks until stopped
-            raise AssertionError("unreachable")  # pragma: no cover
-
-        def terminate(self) -> None:
-            terminated.append(True)
-            self.returncode = -15
-
-        async def wait(self) -> int:
-            return -15
-
-    async def fake_exec(*argv: str, **kwargs: Any) -> SlowProcess:
-        return SlowProcess()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    speaker = LocalSpeaker(platform="darwin")
-    task = asyncio.create_task(speaker.say("아주 긴 이야기를 시작하려고 하는데"))
-    async with asyncio.timeout(5):
-        await started.wait()
-        await speaker.stop()
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-    assert terminated == [True]
-
-
-def test_the_real_say_binary_exists_on_this_macos_machine() -> None:
-    """Not a mock: docs/PLAN.md 6.3 counts on /usr/bin/say being there, so if it
-    ever is not, that should fail here rather than at the first utterance."""
-    if sys.platform != "darwin":
-        pytest.skip("macOS only")
-    assert LocalSpeaker().available
-    voices = subprocess.run(
-        ["/usr/bin/say", "-v", "?"], capture_output=True, text=True, check=True
-    ).stdout
-    assert "ko_KR" in voices  # the Korean proactive path needs no install

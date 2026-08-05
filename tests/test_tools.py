@@ -329,19 +329,6 @@ async def test_notify_needs_something_to_say() -> None:
         await Notify().run({"title": "  ", "body": ""})
 
 
-# --- system_state -----------------------------------------------------------
-
-
-async def test_system_state_always_answers_something(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A reading that cannot be taken is reported as unknown rather than raising:
-    the owner asked whether they are at their desk, not for a stack trace."""
-    monkeypatch.setattr("daemon.tools.builtin.shutil.which", lambda _name, **kw: None)
-    out = await SystemState().run({})
-    assert "platform:" in out
-    assert "local time:" in out
-    assert "unknown here" in out
-
-
 # --- registry ---------------------------------------------------------------
 
 
@@ -842,97 +829,87 @@ async def test_open_path_needs_a_target(scope: PathScope, target: Any) -> None:
         OpenPath(scope).argv({"target": target})
 
 
-# --- system_state parsing ----------------------------------------------------
+# --- system_state, which now delegates --------------------------------------
+# The probes themselves are `daemon/proactivity/presence.py`'s and are tested in
+# tests/test_presence.py. What is left here is the rendering and the delegation:
+# that the three-way answers survive, that a failed probe is said rather than
+# dropped, and that no presence at all is admitted instead of guessed.
 
 
-IOREG = '  |   "HIDIdleTime" = 41000000000\n  |   "EventFlags" = 0\n'
+class FakePresence:
+    """A `Presence` that returns whatever a test hands it."""
+
+    def __init__(self, reading: Any) -> None:
+        self._reading = reading
+        self.reads = 0
+
+    async def read(self) -> Any:
+        self.reads += 1
+        return self._reading
 
 
-async def test_idle_seconds_are_read_from_nanoseconds(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`ioreg` reports nanoseconds. Dividing by the wrong power of ten would put a
-    confident, wrong number in front of the model rather than failing."""
-    monkeypatch.setattr("daemon.tools.builtin.platform.system", lambda: "Darwin")
-    state = SystemState()
-    monkeypatch.setattr(state, "_capture", lambda argv: _answer(IOREG))
-    assert await state._idle_seconds() == pytest.approx(41.0)
+def reading(**kw: Any) -> Any:
+    from daemon import clock
+    from daemon.proactivity.base import Reading
+
+    return Reading(at=kw.pop("at", clock.now()), **kw)
 
 
-async def test_battery_is_read_as_percent_and_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("daemon.tools.builtin.platform.system", lambda: "Darwin")
-    state = SystemState()
-    pmset = (
-        "Now drawing from 'Battery Power'\n"
-        " -InternalBattery-0 (id=1) 87%; discharging; 4:41 remaining present: true"
+async def test_system_state_reports_what_the_presence_measured() -> None:
+    presence = FakePresence(
+        reading(idle_seconds=41.0, foreground_app="Warp", audio_busy=False)
     )
-    monkeypatch.setattr(state, "_capture", lambda argv: _answer(pmset))
-    assert await state._battery() == "87% discharging"
-
-
-async def test_unparseable_readings_become_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Better than a wrong number: the owner asked whether they are at their desk."""
-    monkeypatch.setattr("daemon.tools.builtin.platform.system", lambda: "Darwin")
-    state = SystemState()
-    monkeypatch.setattr(state, "_capture", lambda argv: _answer("nothing like the format"))
-    assert await state._idle_seconds() is None
-    assert await state._battery() is None
-
-
-async def test_a_reading_reports_everything_it_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("daemon.tools.builtin.platform.system", lambda: "Darwin")
-    state = SystemState()
-
-    def capture(argv: list[str]) -> Any:
-        if argv[0] == "ioreg":
-            return _answer(IOREG)
-        if argv[0] == "osascript":
-            return _answer("Google Chrome\n")
-        return _answer(" -InternalBattery-0 (id=1) 55%; charging; 1:00 remaining")
-
-    monkeypatch.setattr(state, "_capture", capture)
-    out = await state.run({})
+    out = await SystemState(presence).run({})
     assert "input idle: 41s" in out
-    assert "frontmost app: Google Chrome" in out
-    assert "battery: 55% charging" in out
+    assert "frontmost app: Warp" in out
+    assert "audio in use: no" in out
+    assert presence.reads == 1, "it must ask the presence, not probe on its own"
 
 
-@pytest.mark.parametrize("system", ["Linux", "Windows"])
-async def test_the_mac_only_readings_say_unknown_elsewhere(
-    monkeypatch: pytest.MonkeyPatch, system: str
-) -> None:
-    """Guessing would be worse than admitting. Linux has no equivalent that works
-    without an X/Wayland session."""
-    monkeypatch.setattr("daemon.tools.builtin.platform.system", lambda: system)
+async def test_at_the_keyboard_keeps_its_three_way_answer() -> None:
+    """`at_keyboard` is None when it cannot be known, and None is not "away" -
+    flattening it to a boolean is the mistake `Reading` documents against."""
+    assert "at the keyboard: yes" in await SystemState(
+        FakePresence(reading(idle_seconds=2.0))
+    ).run({})
+    assert "at the keyboard: no" in await SystemState(
+        FakePresence(reading(idle_seconds=9999.0))
+    ).run({})
+    unknown = await SystemState(FakePresence(reading())).run({})
+    assert "input idle: unknown" in unknown
+    assert "at the keyboard:" not in unknown, "no idle reading means no verdict at all"
+
+
+async def test_a_probe_that_failed_is_said_not_dropped() -> None:
+    """Omitting it reads as "nothing to report", which is the silent degradation
+    this project keeps being bitten by."""
+    out = await SystemState(
+        FakePresence(reading(unknown=("audio_busy: CoreAudio did not answer",)))
+    ).run({})
+    assert "could not read: audio_busy: CoreAudio did not answer" in out
+
+
+async def test_no_presence_is_admitted_rather_than_guessed() -> None:
+    """`builtin_tools()` is callable without one - the CLI lists tools without
+    starting anything - and the honest answer then is that it does not know."""
     out = await SystemState().run({})
-    assert "unknown here" in out
-    assert "frontmost app" not in out
+    assert "unavailable in this configuration" in out
+    assert "input idle" not in out
 
 
-async def _answer(text: str) -> str:
-    return text
+async def test_the_local_clock_is_always_reported() -> None:
+    """The question is often "is it the middle of their night", and that needs no
+    probe - so it survives even when every probe fails."""
+    out = await SystemState(FakePresence(reading(unknown=("everything",)))).run({})
+    assert "local time:" in out and "utc:" in out and "platform:" in out
 
 
-async def test_capture_swallows_a_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("daemon.tools.builtin.shutil.which", lambda _n, **kw: None)
-    assert await SystemState()._capture(["nope"]) is None
-
-
-async def test_capture_swallows_a_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_spawn(monkeypatch, stdout=b"partial", code=1)
-    assert await SystemState()._capture(["ioreg"]) is None
-
-
-async def test_capture_swallows_a_hang(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_spawn(monkeypatch, hang=True)
-    assert await SystemState(timeout_secs=0.05)._capture(["ioreg"]) is None
-
-
-async def test_capture_swallows_a_spawn_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_spawn(monkeypatch, raises=OSError("no fork for you"))
-    assert await SystemState()._capture(["ioreg"]) is None
+async def test_the_factory_passes_the_presence_through(tmp_path: Path) -> None:
+    presence = FakePresence(reading(idle_seconds=1.0))
+    tools = builtin_tools(roots=[tmp_path], presence=presence)
+    state = next(t for t in tools if t.spec.name == "system_state")
+    await state.run({})
+    assert presence.reads == 1
 
 
 # --- notify failure paths ----------------------------------------------------

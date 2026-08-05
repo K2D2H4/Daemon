@@ -105,22 +105,47 @@ SERVICE_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 `~/Library/LaunchAgents`, so it is validated rather than trusted: a label
 containing `/` or `..` would write the plist somewhere else entirely."""
 
+QUIET_HOURS_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$")
+"""`HH:MM-HH:MM`, or empty for "no quiet window".
+
+Validated here rather than only where it is parsed, because the gate's honest
+answer to an unparseable window is to block everything - a typo would then turn
+proactivity off silently and stay off. Dying at startup with the bad value in the
+message is the same choice the rest of this file makes: loud beats degraded.
+
+A regex rather than importing the gate's parser: `config.py` is foundation and
+`daemon/proactivity/` sits above it, so the import would point the wrong way."""
+
 
 class ConfigError(RuntimeError):
     """Bad configuration. Raised at startup, never mid-conversation."""
 
 
-DEFAULT_HOSTED_PROVIDER = HOSTED_PROVIDERS[0]
+DEFAULT_HOSTED_PROVIDER = ""
+"""No default, expressed as a value so callers can name the absence.
+
+It used to be "anthropic", which meant a configuration that never chose a
+provider silently became Claude and the person who was never asked could not tell
+a choice from a fallback. Onboarding always runs, so the answer always exists by
+the time it is needed; before then this is the honest stand-in and hosted tasks
+drop out of any enumeration rather than being guessed at."""
 
 
-def preset_providers(preset: str, hosted: str = DEFAULT_HOSTED_PROVIDER) -> dict[Task, str]:
+def preset_providers(preset: str, hosted: str) -> dict[Task, str]:
     """A preset's table with HOSTED resolved to a real provider name.
 
     Anything reading PRESETS to decide what a configuration needs has to go
     through this, or it sees the placeholder and treats "hosted" as a provider.
+
+    `hosted` is required and has no default on purpose. It used to default to
+    anthropic, which meant a configuration that never named a provider silently
+    got Claude - and someone who had not been asked the question could not tell
+    the difference between a choice and a fallback. Onboarding always runs, so
+    the answer always exists; an empty one is a configuration to fix, not a
+    value to guess.
     """
     return {
-        task: (hosted if provider == HOSTED else provider)
+        task: (hosted if provider == HOSTED and hosted else provider)
         for task, provider in PRESETS[preset].items()
     }
 
@@ -137,10 +162,10 @@ def providers_for(
     `Settings.active_tasks`. That is what lets a text-only `balanced` install be
     set up without a hosted voice key (docs/PLAN.md 6.5).
 
-    `hosted` resolves the HOSTED placeholder. It defaults so that a caller which
-    has not yet asked the user still behaves as before, but a caller that knows
-    the answer must pass it - otherwise a user who chose GPT is asked for an
-    Anthropic key.
+    `hosted` resolves the HOSTED placeholder and is required: a caller that guesses
+    it asks the user for the wrong key, which is how a person who chose GPT ends up
+    being asked for an Anthropic one. Pass "" before the question has been answered
+    and hosted tasks simply drop out of the list.
     """
     if preset not in PRESETS:
         raise ConfigError(
@@ -150,7 +175,8 @@ def providers_for(
         {
             provider
             for task, provider in preset_providers(preset, hosted).items()
-            if voice_enabled or task not in VOICE_TASKS
+            # An unanswered question contributes nothing rather than a guess.
+            if (voice_enabled or task not in VOICE_TASKS) and provider != HOSTED
         }
     )
 
@@ -190,9 +216,13 @@ class Settings(BaseSettings):
     """Opt-in. When unset, a ProviderError propagates instead of being retried
     somewhere else - a silent switch to a weaker model is worse than an error."""
 
-    hosted_provider: str = Field(default="anthropic", alias="DAEMON_HOSTED_PROVIDER")
+    hosted_provider: str = Field(default="", alias="DAEMON_HOSTED_PROVIDER")
     """Which commercial model answers wherever a preset says "hosted".
-    One of HOSTED_PROVIDERS. Per-task overrides still win over this."""
+
+    One of HOSTED_PROVIDERS, and deliberately empty by default: a preset that
+    needs a hosted provider and does not have one fails at startup pointing at
+    `daemon setup`, rather than quietly becoming Claude. Per-task overrides still
+    win over this."""
 
     voice_enabled: bool = Field(default=False, alias="DAEMON_VOICE_ENABLED")
     """docs/PLAN.md 6.5: voice is the user's choice and text mode is a complete
@@ -225,6 +255,47 @@ class Settings(BaseSettings):
     the text and realtime endpoints do not take the same ids. Deliberately has no
     default - a guessed model id fails at the first voice turn, which is exactly
     the kind of late failure this module exists to prevent."""
+
+    # --- proactivity (M3, docs/PLAN.md 6) ---------------------------------
+    # Every one of these is a way to make it speak *less*. That asymmetry is the
+    # design: non-negotiable 7 makes silence the default, so the knobs are brakes.
+
+    proactive_enabled: bool = Field(default=False, alias="DAEMON_PROACTIVE_ENABLED")
+    """Off until the user turns it on. Something that decides on its own to speak
+    is not a default anyone should be opted into."""
+
+    proactive_daily_budget: int = Field(default=3, alias="DAEMON_PROACTIVE_DAILY_BUDGET")
+    """Utterances per local day, all kinds. Three, from PLAN 6.2."""
+
+    proactive_open_loop_budget: int = Field(
+        default=1, alias="DAEMON_PROACTIVE_OPEN_LOOP_BUDGET"
+    )
+    """Of the daily budget, at most this many may be `open_loop`.
+
+    A separate cap because open loops are the easy kind to generate: left to
+    compete on equal terms they eat the whole budget and the result is a competent
+    reminder app. PLAN 6.2 says the point of the product lives in the kinds that
+    have no errand attached."""
+
+    proactive_cooldown_minutes: int = Field(default=90, alias="DAEMON_PROACTIVE_COOLDOWN_MINUTES")
+    """Minimum gap between two proactive utterances, whatever their kind."""
+
+    proactive_quiet_hours: str = Field(default="23:00-09:00", alias="DAEMON_PROACTIVE_QUIET_HOURS")
+    """Local `HH:MM-HH:MM` when it never speaks. Wraps midnight when start > end."""
+
+    proactive_silence_hours: float = Field(default=20.0, alias="DAEMON_PROACTIVE_SILENCE_HOURS")
+    """Hours without conversation before the `silence` kind becomes a candidate."""
+
+    proactive_speaker_enabled: bool = Field(
+        default=False, alias="DAEMON_PROACTIVE_SPEAKER_ENABLED"
+    )
+    """Whether it may talk out of the machine's speaker when the user is present.
+
+    Off by default and gated separately from `proactive_enabled`, because the two
+    failure costs are not comparable: an ignored Telegram message costs nothing and
+    a voice in a meeting is an accident (PLAN 6.4). Telegram-only proactivity is a
+    complete product; this is the addition that needs the gate to be trustworthy
+    first."""
 
     service_label: str = Field(default="default", alias="DAEMON_SERVICE_LABEL")
     """Suffix of the OS service label (`ai.daemon.<label>`). Only interesting for
@@ -357,7 +428,17 @@ class Settings(BaseSettings):
                 f"{', '.join(sorted(PRESETS))}"
             )
 
-        if self.hosted_provider not in HOSTED_PROVIDERS:
+        needs_hosted = any(
+            provider == HOSTED for provider in PRESETS[self.preset].values()
+        )
+        if not self.hosted_provider:
+            if needs_hosted:
+                raise ConfigError(
+                    f"preset {self.preset!r} sends work to a hosted model but "
+                    "DAEMON_HOSTED_PROVIDER is empty; run `daemon setup` to choose one "
+                    f"({', '.join(HOSTED_PROVIDERS)})"
+                )
+        elif self.hosted_provider not in HOSTED_PROVIDERS:
             raise ConfigError(
                 f"unknown DAEMON_HOSTED_PROVIDER {self.hosted_provider!r}; expected one "
                 f"of {', '.join(HOSTED_PROVIDERS)}"
@@ -393,6 +474,30 @@ class Settings(BaseSettings):
             problems.append(
                 f"DAEMON_RECALL_HALF_LIFE_DAYS is {self.recall_half_life_days}; "
                 "it must be greater than 0 or recency decay is undefined"
+            )
+        quiet = self.proactive_quiet_hours.strip()
+        if quiet and not QUIET_HOURS_RE.match(quiet):
+            problems.append(
+                f"DAEMON_PROACTIVE_QUIET_HOURS {self.proactive_quiet_hours!r} is not "
+                "HH:MM-HH:MM (24-hour, local). Leave it empty for no quiet window"
+            )
+        if self.proactive_open_loop_budget > self.proactive_daily_budget:
+            problems.append(
+                f"DAEMON_PROACTIVE_OPEN_LOOP_BUDGET ({self.proactive_open_loop_budget}) is "
+                f"above DAEMON_PROACTIVE_DAILY_BUDGET ({self.proactive_daily_budget}); the "
+                "sub-cap exists to hold open loops *below* the overall budget"
+            )
+        for name, value in (
+            ("DAEMON_PROACTIVE_DAILY_BUDGET", self.proactive_daily_budget),
+            ("DAEMON_PROACTIVE_OPEN_LOOP_BUDGET", self.proactive_open_loop_budget),
+            ("DAEMON_PROACTIVE_COOLDOWN_MINUTES", self.proactive_cooldown_minutes),
+        ):
+            if value < 0:
+                problems.append(f"{name} is {value}; it cannot be negative")
+        if self.proactive_silence_hours <= 0:
+            problems.append(
+                f"DAEMON_PROACTIVE_SILENCE_HOURS is {self.proactive_silence_hours}; "
+                "at zero or below, every tick would be a silence candidate"
             )
         if self.tools_mode not in TOOL_MODES:
             problems.append(

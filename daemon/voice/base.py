@@ -64,6 +64,20 @@ class VoiceSession(Protocol):
         """One PCM chunk from the microphone."""
         ...
 
+    async def send_context(self, text: str) -> None:
+        """Put text in front of the model without asking it to respond.
+
+        This is how recall reaches a voice turn. `send_text` cannot do it: that is
+        a prompt, so delivering a memory through it makes the daemon narrate old
+        conversations unprompted.
+
+        Measured against the live API rather than inferred - `clientContent` with
+        `turnComplete: false` produced no audio and no transcript at all, while
+        the same payload with `turnComplete: true` produced a full answer. That
+        asymmetry is the seam.
+        """
+        ...
+
     async def send_text(self, text: str) -> None:
         """Send text as a turn, with no user audio.
 
@@ -76,7 +90,37 @@ class VoiceSession(Protocol):
         ...
 
     def receive(self) -> AsyncIterator[bytes | Transcript]:
-        """Interleaved output: audio chunks to play, transcripts to record."""
+        """Interleaved output for one turn: audio to play, transcripts to record.
+
+        **Ends at the turn boundary.** Measured: a turn that answered in 2.6 s
+        and delivered its final transcript then blocked forever, and the server
+        eventually aborted the session - reported as close 1008 "The operation was
+        aborted", which reads like a policy violation and is really an idle
+        timeout. An iterator that never ends cannot be consumed with `async for`,
+        which is the only way anyone will consume it.
+        """
+        ...
+
+    def pending_transcripts(self) -> list[Transcript]:
+        """Whatever accumulated but was never yielded, drained destructively.
+
+        In the protocol because it is the only cancellation-safe path memory has
+        in voice mode: transcripts are how anything is remembered from a spoken
+        turn, and a cancel between the last delta and the turn boundary otherwise
+        loses the utterance from both the markdown and the mirror.
+        """
+        ...
+
+    def partial_transcripts(self) -> AsyncIterator[Transcript]:
+        """In-progress user transcripts, for work that must start before the user
+        stops talking.
+
+        Separate from `receive()` because `receive()` yields nothing while the
+        user speaks, so there is no event to hang that work off - and because a
+        partial must never reach the code that records utterances. Recall uses it:
+        embedding costs ~117 ms of mostly fixed overhead, which is silence if it
+        starts when the user finishes and free if it starts while they talk.
+        """
         ...
 
     async def interrupt(self) -> None:

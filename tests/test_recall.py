@@ -23,6 +23,7 @@ import pytest
 
 from daemon.llm.base import Embedder, ProviderError
 from daemon.memory.base import LoggedMessage, Recall
+from daemon.memory.curated import MAX_INJECTED
 from daemon.memory.recall import HALF_LIFE_DAYS, MemoryRecall, fts_query
 from daemon.memory.store import Store
 
@@ -129,8 +130,54 @@ async def seed(store: Store, embedder: Embedder | None, *texts: str) -> MemoryRe
     return recall
 
 
+def entry(
+    store: Store,
+    body: str,
+    *,
+    importance: int = 5,
+    triggers: tuple[str, ...] = (),
+    origin: str = "agent",
+    key: str | None = None,
+) -> int:
+    """One curated fact in the mirror. The markdown side is `tests/test_curated.py`;
+    recall only ever reads `memory_entries`."""
+    return store.insert_entry(
+        body=body,
+        importance=importance,
+        trigger_phrases=triggers,
+        origin=origin,
+        session_kind="reflection",
+        modality="text",
+        now=NOW,
+        supersession_key=key,
+    )
+
+
 def contents(items: list) -> list[str]:
     return [item.content for item in items]
+
+
+def injected(items: list) -> list[str]:
+    return [item.content for item in items if item.reason.startswith("curated")]
+
+
+def searched(items: list) -> list[str]:
+    return [item.content for item in items if not item.reason.startswith("curated")]
+
+
+def spy_on_loads(store: Store) -> list[str]:
+    """Record every full load of the vector index, which is the thing that must stop
+    happening once per turn. Wrapping the store rather than reading a private: what
+    matters is the sqlite work, not how recall remembers it."""
+    calls: list[str] = []
+    original = store.load_embeddings
+
+    def counted(model: str) -> tuple[list[int], np.ndarray]:
+        calls.append(model)
+        return original(model)
+
+    store.load_embeddings = counted  # type: ignore[method-assign]
+    return calls
 
 
 # --- the protocol ------------------------------------------------------------
@@ -399,6 +446,256 @@ async def test_backfill_only_touches_what_is_missing(store: Store) -> None:
     assert len(store.load_embeddings("fake-gram")[0]) == 3
 
 
+# --- the cached matrix is updated, not thrown away ----------------------------
+# The audit item due before M2 (docs/PLAN.md): `index` used to invalidate the cache,
+# so the next search reloaded every vector from sqlite - synchronously, on the event
+# loop, on the voice latency path. Measured on an M4 Max at dim 1024: 23 ms at 10k
+# vectors, 121 ms at 50k, per turn.
+
+
+async def test_a_turn_does_not_reload_the_whole_vector_matrix(store: Store) -> None:
+    recall = await seed(store, GramEmbedder(), "어제 저녁에 김치찌개 먹었어")
+    loads = spy_on_loads(store)
+
+    await recall.search("찌개", limit=3)
+    assert len(loads) == 1  # the cold cache, once
+
+    for i in range(3):  # three turns' worth of new messages
+        text = f"새로운 이야기 {i} 클라이밍"
+        await recall.index(add(store, text), text)
+        assert text in contents(await recall.search(text, limit=5))
+
+    assert len(loads) == 1
+
+
+async def test_indexing_before_the_first_search_loads_nothing(store: Store) -> None:
+    """The load stays lazy. `index` runs on the turn path just after the reply, and a
+    process that has never searched has no matrix worth building yet."""
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    loads = spy_on_loads(store)
+
+    await recall.index(add(store, "김치찌개"), "김치찌개")
+
+    assert loads == []
+    assert contents(await recall.search("찌개", limit=3)) == ["김치찌개"]
+
+
+async def test_re_indexing_a_message_replaces_its_vector_rather_than_adding_one(
+    store: Store,
+) -> None:
+    """`upsert_embedding` is a REPLACE, so an id already in the cache is an overwrite.
+    A cache that appended would keep scoring the superseded vector for ever, under an
+    id that now means something else."""
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    # Message text the keyword lane cannot match, so only the vector answers.
+    message_id = add(store, "옛날 얘기")
+    await recall.index(message_id, "김치찌개")
+    assert contents(await recall.search("김치찌개", limit=3)) == ["옛날 얘기"]
+
+    await recall.index(message_id, "클라이밍")
+
+    assert await recall.search("김치찌개", limit=3) == []
+    assert contents(await recall.search("클라이밍", limit=3)) == ["옛날 얘기"]
+
+
+async def test_a_new_width_after_a_model_swap_reloads_instead_of_corrupting(
+    store: Store,
+) -> None:
+    """`WideEmbedder` is `FlatEmbedder`'s model name at a different width - a model
+    retagged in place. The cache is holding the old width, so appending the first
+    new-width vector into it would either raise on the turn path or, worse, score two
+    vector spaces against each other. Reloading is what lets the lane recover."""
+    await seed(store, FlatEmbedder(), "옛날 벡터")
+    swapped = MemoryRecall(store, WideEmbedder(), now=NOW)
+    assert await swapped.search("아무거나", limit=3) == []
+    assert "dimension mismatch" in swapped.vector_lane_status()
+
+    await swapped.index(add(store, "새 벡터"), "새 벡터")
+
+    assert contents(await swapped.search("아무거나", limit=3)) == ["새 벡터"]
+    assert swapped.vector_lane_status() == "ok"
+
+
+async def test_backfill_lands_in_a_warm_cache(store: Store) -> None:
+    """Backfill inserts a batch at a time, and it can run while the daemon is serving
+    turns (daemon/app.py runs it at startup in chunks). Whatever it embeds has to be
+    findable without a reload."""
+    recall = await seed(store, GramEmbedder(), "어제 저녁에 김치찌개 먹었어")
+    await recall.search("찌개", limit=3)
+    loads = spy_on_loads(store)
+    add(store, "클라이밍 갔어")
+
+    assert await recall.backfill() == 1
+
+    assert "클라이밍 갔어" in contents(await recall.search("클라이밍", limit=3))
+    assert loads == []
+
+
+async def test_a_zero_vector_never_becomes_nan_in_the_cache(store: Store) -> None:
+    """A single character has no bigrams, so `GramEmbedder` hands back a zero vector -
+    as a real embedder can for punctuation or an empty transcript. Dividing by that
+    norm would put NaN in the matrix every later search multiplies against, and
+    `Store.load_embeddings` guards it (`where=norms > 0`) precisely because unit rows
+    are what make a dot product a cosine. The incremental path has to guard it too."""
+    recall = await seed(store, GramEmbedder(), "어제 저녁에 김치찌개 먹었어")
+    await recall.search("찌개", limit=3)
+
+    await recall.index(add(store, "한"), "한")
+
+    _, matrix = recall._embeddings()  # noqa: SLF001 - the invariant, not a detail
+    assert np.isfinite(matrix).all()
+    assert contents(await recall.search("찌개", limit=3)) == ["어제 저녁에 김치찌개 먹었어"]
+
+
+# --- the curated tier: always injected, never searched -----------------------
+# docs/PLAN.md 4.1 layer 2. The whole point of the layer is the boundary: the
+# episodic log is large and searched, this is small and unconditional.
+
+
+async def test_the_curated_tier_is_injected_when_the_search_finds_nothing(store: Store) -> None:
+    """Unconditional means unconditional: a question that matches no message at all
+    still gets what we know about the user."""
+    entry(store, "김치찌개를 좋아한다")
+    recall = MemoryRecall(store, None, now=NOW)
+
+    items = await recall.search("전혀 관계없는 질문", limit=3)
+
+    assert contents(items) == ["김치찌개를 좋아한다"]
+    assert items[0].reason == "curated"
+
+
+async def test_injecting_the_curated_tier_costs_no_embedder_call(store: Store) -> None:
+    """docs/CONTRACTS.md non-negotiable 2. The tier is read on every turn including
+    voice turns, so one embedder round trip here would be 117 ms of unconditional
+    latency (docs/PLAN.md 4.3.1). The single call this makes is the query's."""
+    entry(store, "김치찌개를 좋아한다")
+    embedder = GramEmbedder()
+
+    items = await MemoryRecall(store, embedder, now=NOW).search("뭐 좋아해?", limit=3)
+
+    assert injected(items) == ["김치찌개를 좋아한다"]
+    assert embedder.calls == [["뭐 좋아해?"]]
+
+
+async def test_the_curated_tier_does_not_spend_the_search_limit(store: Store) -> None:
+    """Injected, not ranked: the tier is appended past the cut, so it neither
+    crowds out search hits nor moves their positions."""
+    recall = await seed(store, FlatEmbedder(), *[f"메시지 {i}" for i in range(10)])
+    for i in range(3):
+        entry(store, f"큐레이션된 사실 {i}")
+
+    items = await recall.search("메시지", limit=4)
+
+    assert len(searched(items)) == 4
+    assert len(injected(items)) == 3
+    assert [item.reason for item in items][-3:] == ["curated"] * 3
+
+
+async def test_the_injection_budget_drops_the_least_important_fact(store: Store) -> None:
+    """`Store.active_entries` orders by importance for exactly this moment: when the
+    budget truncates, the fact that goes must be the least important, not the
+    oldest."""
+    for i in range(MAX_INJECTED):
+        entry(store, f"중요한 사실 {i}", importance=9)
+    entry(store, "사소한 사실", importance=1)
+
+    items = await MemoryRecall(store, None, now=NOW).search("아무거나", limit=3)
+
+    assert len(items) == MAX_INJECTED
+    assert "사소한 사실" not in contents(items)
+
+
+async def test_a_trigger_phrase_rescues_a_fact_the_budget_would_have_dropped(
+    store: Store,
+) -> None:
+    """docs/PLAN.md 4.3, "+ 트리거 구절 매칭". Without this the phrases are decorative:
+    a fact the user just named by name stays invisible because fifty more important
+    ones exist."""
+    for i in range(MAX_INJECTED):
+        entry(store, f"중요한 사실 {i}", importance=9)
+    entry(store, "모카는 고양이 이름이다", importance=1, triggers=("모카",))
+    recall = MemoryRecall(store, None, now=NOW)
+
+    assert "모카는 고양이 이름이다" not in contents(await recall.search("오늘 뭐 하지", limit=3))
+
+    items = await recall.search("모카 밥 줬어?", limit=3)
+
+    assert items[0].content == "모카는 고양이 이름이다"
+    assert items[0].reason == "curated-trigger"
+
+
+async def test_a_trigger_phrase_matches_inside_an_inflected_korean_word(store: Store) -> None:
+    """Substring, not token. The premise of this whole module is that Korean
+    morphology defeats whole-token matching, so a phrase trigger that required token
+    boundaries would miss "어제" in "어제는" - the same failure as the FTS5 lane."""
+    entry(store, "어제 회의가 있었다", triggers=("어제",))
+
+    items = await MemoryRecall(store, None, now=NOW).search("어제는 뭐 했지", limit=3)
+
+    assert items[0].reason == "curated-trigger"
+
+
+async def test_a_trigger_phrase_is_a_phrase_not_a_bag_of_words(store: Store) -> None:
+    entry(store, "생일 선물로 등산화를 원한다", triggers=("생일 선물",))
+
+    items = await MemoryRecall(store, None, now=NOW).search("선물 뭐 살까", limit=3)
+
+    assert items[0].reason == "curated"  # injected anyway, but not as a trigger hit
+
+
+@pytest.mark.parametrize("stored", ["{}", "[1, 2]", '[""]', "null", '{"a": ["모카"]}'])
+async def test_unreadable_trigger_phrases_do_not_break_the_turn(store: Store, stored: str) -> None:
+    """The column's CHECK proves the JSON parses, not that it is a list of strings, so
+    a hand edit or a future writer can put any of these there. The tier is injected on
+    every turn, so raising here would break every turn rather than one."""
+    entry_id = entry(store, "김치찌개를 좋아한다", triggers=("모카",))
+    store.conn.execute(
+        "UPDATE memory_entries SET trigger_phrases = ? WHERE id = ?", (stored, entry_id)
+    )
+    store.conn.commit()
+
+    items = await MemoryRecall(store, None, now=NOW).search("모카 밥 줬어?", limit=3)
+
+    assert contents(items) == ["김치찌개를 좋아한다"]
+    assert items[0].reason == "curated"
+
+
+async def test_a_superseded_fact_is_not_injected(store: Store) -> None:
+    """Injecting a retired fact means telling the model something known to be false."""
+    entry(store, "여자친구가 있다", key="relationship")
+    entry(store, "여자친구가 없다", key="relationship")
+
+    items = await MemoryRecall(store, None, now=NOW).search("아무거나", limit=3)
+
+    assert contents(items) == ["여자친구가 없다"]
+
+
+async def test_an_injected_fact_from_relayed_text_keeps_its_origin(store: Store) -> None:
+    """Reflection can conclude something from a forwarded message, and `origin` is
+    the column that keeps that distinguishable. Recall replaying it as the owner's
+    own words is the failure the column exists to prevent."""
+    entry(store, "누군가 전달한 주장", origin="untrusted")
+
+    item = (await MemoryRecall(store, None, now=NOW).search("아무거나", limit=3))[0]
+
+    assert item.origin == "untrusted"
+
+
+async def test_an_injected_fact_carries_its_importance_and_is_nobody_s_words(
+    store: Store,
+) -> None:
+    entry(store, "김치찌개를 좋아한다", importance=9)
+
+    item = (await MemoryRecall(store, None, now=NOW).search("아무거나", limit=3))[0]
+
+    assert item.score == 9.0
+    # Not "user" and not "assistant": a curated fact is a conclusion about the user,
+    # and labelling it as either side's speech would make the daemon's own inference
+    # come back as something that was said.
+    assert item.role == "memory"
+    assert item.ts == NOW
+
+
 # --- provenance / hygiene ----------------------------------------------------
 
 
@@ -536,3 +833,126 @@ def test_deleting_a_message_takes_its_vector_with_it(store: Store) -> None:
 def test_upsert_rejects_an_empty_vector(store: Store) -> None:
     with pytest.raises(ValueError):
         store.upsert_embedding(add(store, "하나"), "test-model", [])
+
+
+# --- associate: PLAN 6.1 type E ----------------------------------------------
+# A separate entry point because `search` is wrong for this in two ways, and both
+# of them would fail silently rather than loudly.
+
+
+async def test_associate_finds_an_old_memory_search_would_have_buried(
+    store: Store,
+) -> None:
+    """Recency decay exists to bury old messages. Type E wants exactly those, so a
+    90-day-old memory must outrank nothing and still be returned."""
+    add(store, "제주도에서 본 바다가 아직 기억나", days_ago=90)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    hits = await recall.associate("바다", min_age_days=30)
+
+    assert [item.content for item in hits] == ["제주도에서 본 바다가 아직 기억나"]
+
+
+async def test_associate_never_marks_a_message_as_recalled(store: Store) -> None:
+    """The hazard that kept type E unbuilt.
+
+    `search` marks its hits so reflection does not re-extract what the model was
+    just shown (docs/PLAN.md 4.2 rule 2). From a five-minute background tick that
+    shows nobody anything, and `messages_for_day` would then drop those rows from
+    reflection **permanently** - a generator quietly starving the reflection pass.
+    """
+    message_id = add(store, "제주도에서 본 바다", days_ago=90)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    assert await recall.associate("바다", min_age_days=30)
+
+    row = store.messages_by_ids([message_id])[message_id]
+    assert row["recalled"] == 0
+
+
+async def test_search_still_marks_what_it_showed(store: Store) -> None:
+    """The guard above must not have turned the hygiene rule off for turns."""
+    message_id = add(store, "제주도에서 본 바다", days_ago=1)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    assert await recall.search("바다")
+
+    row = store.messages_by_ids([message_id])[message_id]
+    assert row["recalled"] == 1
+
+
+async def test_associate_excludes_anything_recent(store: Store) -> None:
+    """A memory from this morning is not an association, it is the conversation."""
+    add(store, "오늘 아침에 본 바다", days_ago=1)
+    add(store, "작년에 본 바다", days_ago=200)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    hits = await recall.associate("바다", min_age_days=30)
+
+    assert [item.content for item in hits] == ["작년에 본 바다"]
+
+
+async def test_associate_does_not_penalise_a_memory_for_being_old(store: Store) -> None:
+    """The property that makes this a separate entry point.
+
+    Two identical memories 260 days apart must score the *same*. Under `search` the
+    older one arrives at a fraction of the newer - at a 30-day half-life, 260 days
+    is about 1/400 - so type E would degenerate into a slow version of `search`.
+
+    Asserted on equal text rather than on which of two different texts wins:
+    repetition is not a stronger match in either lane. bm25 normalises for document
+    length and cosine similarity is unchanged by repeating a token, so an
+    "obviously stronger" longer match actually scores *lower*. Learned by writing
+    the wrong test first.
+    """
+    add(store, "제주도 바다", days_ago=300)
+    add(store, "제주도 바다", days_ago=40)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    hits = await recall.associate("바다", min_age_days=30, limit=2)
+
+    assert len(hits) == 2
+    assert hits[0].score == hits[1].score
+
+
+async def test_associate_with_nothing_old_enough_is_empty(store: Store) -> None:
+    add(store, "어제 본 바다", days_ago=1)
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    assert await recall.associate("바다", min_age_days=30) == []
+
+
+async def test_associate_with_an_empty_query_makes_no_call(store: Store) -> None:
+    """The tick runs every five minutes; an empty query must not cost an embedder
+    round trip to learn it found nothing."""
+    embedder = GramEmbedder()
+    recall = MemoryRecall(store, embedder, now=NOW)
+    before = len(getattr(embedder, "calls", []))
+
+    assert await recall.associate("   ") == []
+    assert len(getattr(embedder, "calls", [])) == before
+
+
+async def test_associate_degrades_to_the_keyword_lane_like_search_does(
+    store: Store,
+) -> None:
+    """No embedder is a degradation, not a shutdown - the same choice `search`
+    makes.
+
+    Keyword-only association is narrow, because `unicode61` matches a Korean token
+    only whole (docs/PLAN.md 4.3), so an exact word still hits and an inflected one
+    does not. Whether that is worth a proactive utterance is the *generator's*
+    call; recall's job is to return what it can find and score it honestly.
+    """
+    add(store, "제주도 바다", days_ago=90)
+    recall = MemoryRecall(store, None, now=NOW)
+
+    hits = await recall.associate("바다", min_age_days=30)
+
+    assert [item.reason for item in hits] == ["keyword"]
