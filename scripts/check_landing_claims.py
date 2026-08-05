@@ -29,6 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PAGE = ROOT / "site" / "index.html"
+README = ROOT / "README.md"
 CONFIG = ROOT / "daemon" / "config.py"
 
 # alias in config.py -> (what the page must contain, human name)
@@ -81,8 +82,42 @@ def read_defaults(text: str) -> dict[str, str]:
     return defaults
 
 
+def check_env_table(text: str, defaults: dict[str, str], where: str) -> list[str]:
+    """Any DAEMON_* alias a document names must show its real default on that line.
+
+    README.md documents the proactivity settings as a table. Rather than matching
+    prose, the rule is positional and so cannot rot: name the setting, state its
+    default beside it. A line that names an alias and then contradicts the code is
+    the failure this catches.
+
+    Fenced blocks are skipped. They hold pasted command output and shell lines -
+    `DAEMON_PROACTIVE_ENABLED=true to turn it on` is the product telling you how to
+    switch it on, not a document claiming that is the default.
+    """
+    problems = []
+    fenced = False
+    for i, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        for alias in re.findall(r"DAEMON_[A-Z_]+", line):
+            value = defaults.get(alias)
+            if value is None:
+                continue
+            # `false` in a document is the honest rendering of Python's False
+            wanted = {value, value.lower()}
+            if not any(w in line for w in wanted):
+                problems.append(
+                    f"{where}:{i} names {alias} but does not show its default "
+                    f"({value}) on the same line: {line.strip()[:70]!r}"
+                )
+    return problems
+
+
 def main() -> int:
-    missing = [p for p in (PAGE, CONFIG) if not p.exists()]
+    missing = [p for p in (PAGE, README, CONFIG) if not p.exists()]
     if missing:
         for p in missing:
             print(f"cannot check: {p.relative_to(ROOT)} does not exist", file=sys.stderr)
@@ -130,14 +165,19 @@ def main() -> int:
             "not in the copy deck. State a number the reader can count, or none."
         )
 
+    problems += check_env_table(README.read_text(encoding="utf-8"), defaults, "README.md")
+
     if problems:
-        print("landing page disagrees with the product:\n", file=sys.stderr)
+        print("documentation disagrees with the product:\n", file=sys.stderr)
         for p in problems:
             print(f"  - {p}\n", file=sys.stderr)
         return 1
 
     checked = len(CLAIMS) + len(BOOL_CLAIMS)
-    print(f"ok: {checked} landing-page claim(s) match daemon/config.py")
+    print(
+        f"ok: {checked} landing-page claim(s) and every DAEMON_* default named in "
+        f"README.md match daemon/config.py"
+    )
     return 0
 
 
