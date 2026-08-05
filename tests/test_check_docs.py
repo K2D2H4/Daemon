@@ -105,13 +105,13 @@ def test_the_module_docs_are_scanned_when_the_repo_lives_in_a_worktree(
     suite happens to run from a worktree is the same defect one level up.
     """
     root = tmp_path / ".claude" / "worktrees" / "some-branch"
-    for relative in (
+    for doc in (
         "CLAUDE.md",
         "daemon/CLAUDE.md",
         "docs/adr/0001-a-decision.md",
         ".claude/worktrees/a-copy/daemon/CLAUDE.md",  # a nested copy: still skipped
     ):
-        path = root / relative
+        path = root / doc
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# fake\n", encoding="utf-8")
     monkeypatch.setattr(check_docs, "ROOT", root)
