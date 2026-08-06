@@ -72,7 +72,11 @@ are required by [CONTRACTS.md](../docs/CONTRACTS.md), and why they exist at all 
 
 - **No test may touch the network, an API key, a microphone or a speaker.** One
   that needs any of those is broken. Use `conftest.py`'s `db`, `data_dir` and
-  `fake_provider`; do not invent parallel fixtures.
+  `fake_provider`; do not invent parallel fixtures. This is not "we don't verify
+  against the real thing" — that is [evals/](../evals/CLAUDE.md)'s job, run by hand
+  with a key and never in CI (e.g. `evals/m1c_text_tools_spike.py` for the Gemini
+  tool round-trip). Keeping *this* suite fast, deterministic and keyless is the
+  point; a live contract that a mock cannot see belongs in a spike, not here.
 - **Assert behaviour, and in Korean where the product is Korean** — CJK width,
   FTS5 tokenisation and transcript joining have all broken on Korean specifically.
 - **Cover the failure path, not only the happy one.** Most findings in this repo
