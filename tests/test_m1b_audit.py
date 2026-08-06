@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from daemon.channels.base import InboundMessage, OutboundMessage
+from daemon.companion import Companion
 from daemon.fs import DIR_MODE
 from daemon.llm.base import Completion
 from daemon.loop import ConversationLoop
@@ -103,9 +104,7 @@ async def _one_turn(data_dir: Path, recall: Any, text: str = "이거 뭐야?") -
         async def recent(self, limit: int = 20) -> list[LoggedMessage]:
             return self.records[-limit:]
 
-    loop = ConversationLoop(
-        Channel(), gateway, Mem(), data_dir=data_dir, recall=recall
-    )
+    loop = ConversationLoop(Channel(), gateway, Companion(Mem(), data_dir=data_dir, recall=recall))
     await loop.handle(_inbound(text))
     return gateway.prompts[0]
 
@@ -323,10 +322,7 @@ async def test_the_second_message_of_a_double_text_is_still_indexed(
     loop = ConversationLoop(
         Channel(),
         Gateway(),
-        writer,
-        data_dir=data_dir,
-        recall=Recall(),
-        resolve_id=_id_resolver(writer),
+        Companion(writer, data_dir=data_dir, recall=Recall(), resolve_id=_id_resolver(writer)),
     )
     # Both inbound messages carry a timestamp *older* than the assistant rows the
     # loop writes in between, which is exactly the reordering that broke it.

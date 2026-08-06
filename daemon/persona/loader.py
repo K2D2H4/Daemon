@@ -60,7 +60,13 @@ async def read_file(path: Path) -> str:
         return (await asyncio.to_thread(path.read_text, encoding="utf-8")).strip()
     except FileNotFoundError:
         return ""
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # UnicodeDecodeError is a ValueError, not an OSError, so it would escape a
+        # bare `except OSError` and raise straight through `load_persona` - which the
+        # module docstring above promises never happens. It is a live case here, not
+        # a hypothetical: `seed.md` is hand-edited by the owner, and a Korean owner's
+        # editor saving it in CP949/EUC-KR produces exactly this. A persona that
+        # cannot be decoded is treated the same as one that cannot be read.
         logger.exception("persona: could not read %s", path)
         return ""
 

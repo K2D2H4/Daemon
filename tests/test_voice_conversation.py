@@ -18,13 +18,14 @@ import json
 import pathlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from test_loop import Ids
 from websockets.exceptions import ConnectionClosedOK
 from websockets.frames import Close
 
+from daemon.companion import Companion
 from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.voice import conversation as conversation_module
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
@@ -327,6 +328,7 @@ class FakeRecall:
         self.delay = delay
         self.fail = fail
         self.queries: list[str] = []
+        self.indexed: list[tuple[int, str]] = []
 
     async def search(self, query: str, *, limit: int = 8) -> list[RecalledItem]:
         self.queries.append(query)
@@ -337,7 +339,9 @@ class FakeRecall:
             raise RuntimeError("the embedder is down")
         return list(self.items)
 
-    async def index(self, message_id: int, text: str) -> None: ...
+    async def index(self, message_id: int, text: str) -> None:
+        self.indexed.append((message_id, text))
+        self.events.append(f"index:{text}")
 
     async def backfill(self, limit: int = 500) -> int:
         return 0
@@ -366,13 +370,50 @@ class BlockingRecall:
         return 0
 
 
+NO_DATA_DIR = pathlib.Path("/nonexistent-voice-test-data-dir")
+"""What the companion's `data_dir` is pointed at here.
+
+Voice does not read the persona through the companion - `daemon/app.py` reads it
+once and hands it to the session as its system instruction - so nothing in this file
+should touch the filesystem for it. Pointing it at nothing keeps that true rather
+than assumed, and keeps a developer's own `seed.md` out of these assertions.
+"""
+
+
+def companion_for(
+    memory: FakeMemory | None = None,
+    *,
+    recall: Any = None,
+    recall_limit: int = 6,
+    resolve_id: Any = None,
+) -> Companion:
+    return Companion(
+        memory or FakeMemory(),
+        data_dir=NO_DATA_DIR,
+        recall=recall,
+        recall_limit=recall_limit,
+        resolve_id=resolve_id,
+    )
+
+
 def conversation(
     session: FakeSession,
     audio: FakeAudio | None = None,
     memory: FakeMemory | None = None,
+    *,
+    recall: Any = None,
+    recall_limit: int = 6,
+    resolve_id: Any = None,
     **kwargs: Any,
 ) -> VoiceConversation:
-    return VoiceConversation(session, audio or FakeAudio(), memory or FakeMemory(), **kwargs)
+    return VoiceConversation(
+        session,
+        audio or FakeAudio(),
+        companion_for(
+            memory, recall=recall, recall_limit=recall_limit, resolve_id=resolve_id
+        ),
+        **kwargs,
+    )
 
 
 RUN_LIMIT = 5.0
@@ -435,6 +476,50 @@ async def test_a_voice_turn_is_recorded_as_voice_in_every_column() -> None:
         assert record.modality == "voice"
         assert record.channel == "voice"
         assert record.ts.tzinfo is not None
+
+
+async def test_both_sides_of_a_voice_turn_are_embedded_during_the_session() -> None:
+    """The defect that came of two endpoints doing the same work by hand.
+
+    Voice wrote the markdown and the mirror and nobody ever called `recall.index`,
+    so a spoken turn had no vector until the next restart's backfill reached it -
+    and for Korean the vector lane is not a refinement: keyword-only recall is 50%
+    where the hybrid is 93% (daemon/CLAUDE.md). Nothing failed, nothing logged, and
+    "what did I say about the dentist" simply did not find it.
+
+    Both sides, because a vector index holding only the questions makes "what did
+    you suggest?" unanswerable while looking like it works.
+    """
+    session = FakeSession(
+        Says("user", "치과 예약은 8월 5일 오후 3시"),
+        Says("assistant", "그날 오후는 비워둘게"),
+        Turn(),
+    )
+    recall = FakeRecall()
+    await run(conversation(session, recall=recall, resolve_id=Ids()))
+
+    assert recall.indexed == [
+        (100, "치과 예약은 8월 5일 오후 3시"),
+        (101, "그날 오후는 비워둘게"),
+    ]
+
+
+async def test_an_embedder_that_is_down_does_not_cost_the_conversation() -> None:
+    """The markdown is the source of truth and the vector is an index, so losing one
+    must not take the turn with it - in voice mode a raised exception is silence."""
+
+    class Broken(FakeRecall):
+        async def index(self, message_id: int, text: str) -> None:
+            raise RuntimeError("ollama is not running")
+
+    session = FakeSession(Says("user", "치과 예약 언제였지"), b"\x01", Turn())
+    memory, audio = FakeMemory(), FakeAudio()
+    await run(
+        conversation(session, audio, memory, recall=Broken(), resolve_id=Ids())
+    )
+
+    assert [record.content for record in memory.records] == ["치과 예약 언제였지"]
+    assert audio.played == [b"\x01"]
 
 
 async def test_a_partial_transcript_is_never_recorded() -> None:
@@ -902,7 +987,9 @@ async def test_the_conversation_and_the_real_session_agree_about_a_turn() -> Non
     audio = FakeAudio(b"mic")
     memory = FakeMemory()
     recall = FakeRecall(_item())
-    conv = VoiceConversation(live, audio, memory, recall=recall, idle_timeout=1.0)
+    conv = VoiceConversation(
+        live, audio, companion_for(memory, recall=recall), idle_timeout=1.0
+    )
 
     async with asyncio.timeout(RUN_LIMIT):
         await conv.run()
@@ -1073,14 +1160,13 @@ def _attempts(*sessions: FakeSession, **kwargs: Any) -> Any:
         built.append(session)
         return session
 
-    settings = SimpleNamespace(recall_limit=6)
-    return app_module, new_session, built, settings
+    return app_module, new_session, built, companion_for()
 
 
 async def _drive(*sessions: FakeSession, audio: FakeAudio | None = None) -> tuple[int, list[Any]]:
-    app_module, new_session, built, settings = _attempts(*sessions)
+    app_module, new_session, built, companion = _attempts(*sessions)
     code = await app_module._voice_attempts(
-        new_session, audio or FakeAudio(), FakeMemory(), None, settings, Cut
+        new_session, audio or FakeAudio(), companion, Cut
     )
     return code, built
 
@@ -1388,11 +1474,10 @@ async def test_an_unanswered_opening_survives_a_reconnect(
     opening = b"\x11\x22" * 200
     failing = FakeSession(Cut("connection closed 1011: internal error"))
     working = FakeSession(Says("user", "다시"), b"\x01", Turn())
-    app_mod, new_session, built, settings = _attempts(failing, working)
+    app_mod, new_session, built, companion = _attempts(failing, working)
 
     code = await app_mod._voice_attempts(
-        new_session, FakeAudio(), FakeMemory(), None, settings, Cut,
-        opening_audio=opening,
+        new_session, FakeAudio(), companion, Cut, opening_audio=opening
     )
 
     assert code == 0
@@ -1413,11 +1498,10 @@ async def test_an_answered_opening_is_not_asked_again(
     answered = FakeSession(Says("user", "안녕"), b"\x01" * 4800, Turn())
     answered.going_away = True  # forces a reconnect after a turn that did answer
     resumed = FakeSession(Says("user", "계속"), Turn())
-    app_mod, new_session, built, settings = _attempts(answered, resumed)
+    app_mod, new_session, built, companion = _attempts(answered, resumed)
 
     await app_mod._voice_attempts(
-        new_session, FakeAudio(), FakeMemory(), None, settings, Cut,
-        opening_audio=opening,
+        new_session, FakeAudio(), companion, Cut, opening_audio=opening
     )
 
     assert opening not in built[1].sent, "the answered question was asked again"

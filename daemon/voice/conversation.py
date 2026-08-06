@@ -1,10 +1,13 @@
 """One voice conversation: microphone in, speaker out, transcripts recorded.
 
-The text path is daemon/loop.py and this is shaped after it on purpose -
-dependencies arrive as protocols only, what the user said is written before
-anything else can lose it, and recall never fails a turn. What differs is that in
-voice mode the audio model *is* the brain (docs/PLAN.md 6.5): there is no gateway
-call and no assembled prompt, so the session is the turn.
+What the daemon can do is `daemon/companion.py` - recalled memory, and writing an
+exchange down with its vector - and this file is the voice transport for it. The
+text endpoint carries the same companion over request/response
+(`daemon/loop.py`); what differs is that in voice mode the audio model *is* the
+brain (docs/PLAN.md 6.5): there is no gateway call and no assembled prompt, so the
+session is the turn, and a message sent at the wrong moment kills the answer. That
+asymmetry is why there is no shared single-turn pipeline; `daemon/companion.py` says
+so at more length.
 
 Four things here are load-bearing rather than incidental:
 
@@ -50,27 +53,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import secrets
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from daemon import clock
 
-# The recall block comes from the text loop, privates included, rather than being
-# rendered again here. It is not formatting: the nonce boundary is what stops a
-# recalled memory posing as an instruction, and `_label` is what stops relayed text
-# posing as the owner's own words - a fix an earlier audit made in the loop and
-# then found undone one layer up. A second copy is a second place for that to
-# happen, and voice is the weaker position to start from: the wire has no role that
-# means "reference material", so the block arrives as a *user* turn.
-from daemon.loop import render_recall
-from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
+# The recall block is rendered by the companion, not again here. It is not
+# formatting: the nonce boundary is what stops a recalled memory posing as an
+# instruction, and the origin label is what stops relayed text posing as the owner's
+# own words - a fix an earlier audit made in the loop and then found undone one layer
+# up. A second copy is a second place for that to happen, and voice is the weaker
+# position to start from: the wire has no role that means "reference material", so
+# the block arrives as a *user* turn.
+from daemon.companion import Companion
+from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 
 logger = logging.getLogger(__name__)
-
-_IDENTITY_NONCE = "same-memories"
-"""Nonce used only to compare two recall payloads for equality, never sent."""
 
 VOICE_CHANNEL = "voice"
 """`channel` for a recorded voice turn. Not the provider's name: the column says
@@ -169,19 +168,15 @@ class VoiceConversation:
         self,
         session: VoiceSession,
         audio: AudioIO,
-        memory: MemoryWriter,
+        companion: Companion,
         *,
-        recall: Recall | None = None,
-        recall_limit: int = 6,
         channel: str = VOICE_CHANNEL,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
         opening_audio: bytes = b"",
     ) -> None:
         self._session = session
         self._audio = audio
-        self._memory = memory
-        self._recall = recall
-        self._recall_limit = recall_limit
+        self._companion = companion
         self._channel = channel
         self._idle_timeout = idle_timeout
         self._opening_audio = opening_audio
@@ -416,7 +411,7 @@ class VoiceConversation:
         text = transcript.text.strip()
         if not text:
             return
-        await self._memory.record(
+        await self._companion.record(
             LoggedMessage(
                 # The wall clock, because a transcript carries no time of its own
                 # and the turn just happened.
@@ -432,6 +427,15 @@ class VoiceConversation:
                 channel=self._channel,
             )
         )
+        # Embedded now, in the session, rather than left to the next restart's
+        # backfill. Nothing indexed a voice turn at all until the companion owned
+        # both halves of this: the words were in the markdown and the mirror, and the
+        # vector lane simply did not have them - which for Korean is the difference
+        # between 50% keyword-only recall and 93% hybrid (daemon/CLAUDE.md). Here
+        # rather than at some later boundary because a voice turn has no wait left to
+        # protect: the transcript arrives in the same server event as the answer's
+        # first audio chunk, so the model is already talking.
+        await self._companion.index_recorded()
 
     async def _record_pending(self, session: VoiceSession) -> None:
         """Record what was said but never released.
@@ -487,7 +491,7 @@ class VoiceConversation:
         every delta would spend a round trip per syllable to arrive at the same
         answer.
         """
-        if self._recall is None or len(query) < PREFETCH_MIN_CHARS:
+        if not self._companion.has_recall or len(query) < PREFETCH_MIN_CHARS:
             return
         if self._speculative is not None and not self._speculative[1].done():
             return
@@ -507,7 +511,7 @@ class VoiceConversation:
         sending: one turn late is what the memory is for the *next* question, and the
         alternative is not sending it at all.
         """
-        items = await self._search(query)
+        items = await self._companion.search(query)
         await self._offer(session, items)
         return items
 
@@ -534,11 +538,11 @@ class VoiceConversation:
         mode an exception is silence, and answering with less memory beats not
         answering.
         """
-        # Identity is the same rendering under a fixed nonce, never sent. The real
+        # Identity is the same memories under a fixed nonce, never sent. The real
         # nonce differs every time by design, so comparing sent payloads directly
         # would make two blocks carrying identical memories always look different -
         # and the model would be handed the same facts on every partial transcript.
-        identity = render_recall(items, _IDENTITY_NONCE)
+        identity = self._companion.recall_key(items)
         if not identity or identity == self._offered:
             return
         if self._generating:
@@ -552,7 +556,7 @@ class VoiceConversation:
         self._deferred = None
         self._offered = identity
         try:
-            await session.send_context(render_recall(items, secrets.token_hex(4)))
+            await session.send_context(self._companion.recall_block(items))
         except Exception:
             logger.exception("voice: recall could not be put in front of the model")
 
@@ -570,7 +574,7 @@ class VoiceConversation:
         """Reuse the prefetched search if it was for close enough to this, else
         redo it. Reuse is the whole point - it is what makes recall cost the voice
         turn nothing (docs/PLAN.md 4.3.1)."""
-        if self._recall is None:
+        if not self._companion.has_recall:
             return
         prepared, task = self._speculative or (None, None)
         self._speculative = None
@@ -585,22 +589,6 @@ class VoiceConversation:
         # missed is the one the user actually made, and its memories are in front of
         # the model for the next thing they say.
         self.recalled = await self._prepare(session, said)
-
-    async def _search(self, query: str) -> list[RecalledItem]:
-        """Lane 1, with the same rule as the text loop: recall never fails a turn.
-
-        An implementation that raises anyway is swallowed here. Answering with
-        less memory beats answering with an apology, and in voice mode an
-        exception is silence.
-        """
-        recall = self._recall
-        if recall is None:
-            return []
-        try:
-            return await recall.search(query, limit=self._recall_limit)
-        except Exception:
-            logger.exception("voice: recall failed; the turn goes on without it")
-            return []
 
     async def _cancel_speculative(self) -> None:
         speculative, self._speculative = self._speculative, None

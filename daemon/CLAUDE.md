@@ -14,7 +14,8 @@ in `app.py`, which owns every concrete-implementation import here.
 | `setup.py` | the onboarding wizard: PC control, preset, hosted provider, keys, persona seed, pairing |
 | `wake_cli.py` | `daemon wake`: measure what the recognizer returns for the owner's phrase, save it as `DAEMON_WAKE_ALIASES`, then run the gate and print what fires. Writes `.env` through `setup.py`'s writer |
 | `config.py` | settings and the three presets. `HOSTED` resolves to the chosen provider |
-| `loop.py` | the text conversation: record → recall → complete → record → send |
+| `companion.py` | **what both endpoints can do, in one place**: `context` (persona + tool rules + the recall block), `record` + `index_recorded`, `specs` / `run_tools`. Add a capability here, not twice |
+| `loop.py` | the text transport: record → context → complete → record → send. Owns the tool loop's shape, `/approve`, and the wire |
 | `reflection.py` | the 04:00 pass: one local day → curated facts, entity notes, observations |
 | `tasks.py` | the `Task` enum. **Frozen** — it is the LLM routing key |
 | `tui.py` · `service.py` | terminal presentation, CJK-aware widths, plain text when not a tty · the LaunchAgent / systemd user unit, which holds no secrets |
@@ -24,7 +25,7 @@ in `app.py`, which owns every concrete-implementation import here.
 | `memory/` | `memory/schema.sql` (frozen) · `store` · `log` · `writer` · `recall` · `curated` · `entities` · `reindex` |
 | `voice/` | `voice/base.py` (frozen) · `voice/gemini_live.py` · `voice/audio.py` (PortAudio) · `voice/apple_audio.py` (macOS echo cancellation) · `voice/conversation.py` · `voice/vad.py` · `voice/apple_speech.py` · `voice/wake.py` |
 | `proactivity/` | `proactivity/base.py` (frozen) · `candidates` · `gate` · `presence` · `judge` · `delivery` · `speaker` · `tick` |
-| `persona/` | `persona/loader.py` (assembles `seed.md` + `learned.md` into one system message, read every turn) · `persona/rules.py` (the only write path for `data/persona/learned.md` and its `persona_rules` mirror) · `persona/evolve.py` (the weekly pass: observations → rule proposals, at most one model call) |
+| `persona/` | `persona/loader.py` (assembles `seed.md` + `learned.md` into one system message, read every turn — both conversation endpoints reach it through `companion.py`) · `persona/rules.py` (the only write path for `data/persona/learned.md` and its `persona_rules` mirror) · `persona/evolve.py` (the weekly pass: observations → rule proposals, at most one model call) |
 | `tools/` | `tools/base.py` (the `Tool` protocol, `Registry`, `ToolResult`) · `tools/policy.py` — **read this one first**: the origin gate, the modes, the standing approvals, and **zero model calls** · `tools/builtin.py` (the seven: `list_dir` · `read_file` · `write_file` · `run_command` · `open_path` · `notify` · `system_state`) · `tools/browser.py` (`fetch_page` · `list_tabs` · `read_page`, behind their own switch) · `tools/mcp.py` (the only file that imports the `mcp` package) · `tools/runner.py` (decide → execute → audit, in that order, in one object so none of the three can be skipped) |
 
 ## Layering
@@ -62,7 +63,8 @@ and linked rather than imported, so they cost nothing until something asks for t
 
 ## Depends on
 
-Downwards only: `daemon/loop.py`, `daemon/voice/conversation.py`, `daemon/reflection.py`
+Downwards only: `daemon/loop.py`, `daemon/voice/conversation.py`, `daemon/companion.py`,
+`daemon/reflection.py`
 and `daemon/proactivity/` depend on the protocols in `daemon/llm/base.py`,
 `daemon/channels/base.py`, `daemon/memory/base.py` and `daemon/proactivity/base.py`,
 never on what implements them; `daemon/memory/` depends on `daemon/fs.py` and
