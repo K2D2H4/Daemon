@@ -83,6 +83,7 @@ daemon proactive # one round of "is there a reason to speak?", and what it decid
 daemon tools list  # what it may do to this machine, and what needs your say-so
 daemon tools log   # every tool call it has made, refusals included
 daemon doctor    # what is configured, reachable, indexed and remembered
+daemon update    # reinstall the latest release in place (re-runs what the one-liner did)
 ```
 
 `daemon setup` asks whether it may act on this machine (`DAEMON_TOOLS_ENABLED=true`
