@@ -50,11 +50,15 @@ if [ -z "${ref}" ]; then
   fi
 fi
 
-# 3. Install. --python 3.13 tells uv to fetch a managed CPython if the host has
+# 3. Install from a source tarball, not git+, so the machine needs no git - a
+#    fresh Mac has none until the Command Line Tools are installed, and a bare
+#    Linux box may not either. GitHub's /archive/<ref>.tar.gz resolves a tag, a
+#    branch or a sha alike. uv fetches it, builds it (hatchling), and drops the
+#    `daemon` command in. --python 3.13 pulls a managed CPython if the host has
 #    none; --force makes a re-run an upgrade rather than a no-op.
 say "Installing ${PACKAGE} @ ${ref} ..."
 uv tool install --force --python 3.13 \
-  --from "git+https://github.com/${REPO}@${ref}" "${PACKAGE}"
+  --from "https://github.com/${REPO}/archive/${ref}.tar.gz" "${PACKAGE}"
 
 # Put uv's tool bin dir on PATH - for the version check below, and, persistently,
 # for the user's future shells.
