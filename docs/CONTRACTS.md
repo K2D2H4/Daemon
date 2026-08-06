@@ -172,28 +172,27 @@ same as it working, and the difference is where every defect above lived.
 
 ## Milestone scope
 
-M1a is done: a Telegram message gets an answer and the exchange lands in
-`data/memory/log/YYYY-MM-DD.md`.
+M1a, M1b, and M2 are done. M3's pipeline is done too — generators, gate,
+judge, delivery, and the label loop are all wired — but its own gate stays
+open: precision needs weeks of labels, not more code (docs/PLAN.md 8.2.2).
 
-Now building **M1b**:
+Now building **M4**:
 
-> It quotes yesterday accurately, it survives a reboot, voice works, and the
-> golden set gives recall a number.
+> Two weeks of real observations make the personality shift felt (by which
+> point the log is already three months old).
 
-Four pieces, one owner each:
+M4's code is done as well — `daemon/persona/loader.py` (assembles
+`seed.md` + `learned.md`, read every turn), `daemon/persona/rules.py` (the
+only write path for `data/persona/learned.md` and its `persona_rules` mirror),
+and `daemon/persona/evolve.py` (the weekly pass: observations → rule
+proposals, at most one model call) — wired into `daemon/app.py` (a Monday
+05:00 job, one hour after reflection) and `daemon/cli.py` (`daemon persona`,
+`daemon persona evolve --force`, `daemon persona forget <id> --why`).
 
-1. **Recall** — Lane 1, `daemon/memory/recall.py`. FTS5 **and** vectors, scored
-   `similarity × recency decay (30d half-life) × importance`. **Zero LLM calls**
-   (an embedder call is fine — local, milliseconds). Vectors are float32 BLOBs in
-   the `embeddings` table, searched brute-force with numpy: no sqlite extension,
-   because this Python build cannot load one and neither can many others.
-2. **Voice** — `daemon/voice/`. Gemini Live first, behind `VoiceSession`.
-   Audio hardware behind `AudioIO` so tests need none. Voice deps live in the
-   `voice` extra.
-3. **Residency** — LaunchAgent / systemd install, so proactivity (M3) has a
-   process to run in after the terminal closes and the machine reboots.
-4. **Golden set** — `evals/`. Recall gets a pass rate that moves when recall
-   changes, so M1b's gate is a number rather than an impression.
+Its gate has no input to measure yet, the same shape as M3's: the live
+database before M4 held 0 observations, 0 persona rules, and no resident
+process installed (no LaunchAgent). Blocked on wall-clock, not on code
+(docs/PLAN.md 8.2.3).
 
 And **M1c — PC control**, pulled forward from post-M4 (docs/PLAN.md 8.2, §10):
 
@@ -221,5 +220,14 @@ Then **the browser group** (`daemon/tools/browser.py`), behind its own
 > It can read the page the owner is looking at, so they can say "what does this
 > say?" instead of pasting it - and a forwarded message still cannot.
 
-Still out of scope: reflection, entity notes, observations, proactivity,
-persona rules. Their tables exist so those milestones need no migration.
+Still out of scope: the type-E associative candidate generator (PLAN.md §6.1),
+the `osascript`-under-LaunchAgent question (PLAN.md §6.3.1), and pointing
+`daemon/proactivity/judge.py` at learned rules — it deliberately stays
+seed-only, a separate decision from M4
+(docs/design/2026-08-05-m4-persona-design.md).
+
+The `recalled = 1` hygiene rule that was starving the observation table **was**
+fixed, after being scoped out first: PLAN.md §4.2's rule 2 is retired, because it
+cost 29 of 38 messages on a real day and blocked no loop — recall's hits are
+injected as a system block and never become rows. Read
+`Store.messages_for_day`'s docstring before reinstating any filter on that flag.

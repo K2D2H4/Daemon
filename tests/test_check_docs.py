@@ -80,6 +80,11 @@ def test_the_module_docs_are_still_scanned(check_docs: object) -> None:
     assert {
         "CLAUDE.md",
         "daemon/CLAUDE.md",
+        # The satellites `daemon/CLAUDE.md` was split into. Named because splitting a
+        # module doc is exactly how its path claims would leave this check's scope
+        # without anyone noticing - the text moves, the coverage silently does not.
+        "daemon/RECIPES.md",
+        "daemon/MEASURED.md",
         "tests/CLAUDE.md",
         "evals/CLAUDE.md",
         "scripts/CLAUDE.md",
