@@ -12,6 +12,7 @@ raises, so `?key=` leaks the key into logs and stack traces. daemon/setup.py's
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -28,8 +29,19 @@ from daemon.llm.base import (
     synthesise_call_id,
 )
 
+logger = logging.getLogger(__name__)
+
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_TIMEOUT = 60.0
+
+MALFORMED_FUNCTION_CALL = "MALFORMED_FUNCTION_CALL"
+"""A `finishReason` gemini-3 returns when it *tried* to call a tool and produced
+nothing parseable - an empty candidate, no parts, no `functionCall`. It is a
+sampling glitch, not a bad request: the identical call succeeds on a fresh sample
+(measured - 20/20 clean in isolation, yet it struck twice in a row on a real
+2900-token turn). So `complete` re-POSTs once rather than failing the whole turn,
+which is what surfaced to the owner as "Something went wrong on my side."
+"""
 
 ROLES = {"user": "user", "assistant": "model"}
 """`contents` only knows these two. A system turn is a separate field entirely.
@@ -55,6 +67,7 @@ class GeminiProvider:
         api_key: str,
         *,
         timeout: float = DEFAULT_TIMEOUT,
+        thinking_level: str = "",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not api_key:
@@ -62,6 +75,12 @@ class GeminiProvider:
         self._api_key = api_key
         """Kept only so `_redact` can strip it back out of an upstream body
         before that body reaches an exception message."""
+        self._thinking_level = thinking_level
+        """How hard a Gemini 3 model thinks before answering (`low`/`high`), or empty
+        to leave it to the model. `low` roughly a third of the per-call latency of the
+        default on a plain tool turn (config.py: DAEMON_GEMINI_THINKING_LEVEL). Sent
+        only when set, so an older model that does not know `thinkingConfig` is
+        untouched unless someone opts in."""
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._headers = {
@@ -108,6 +127,12 @@ class GeminiProvider:
             config["maxOutputTokens"] = max_output_tokens
         if temperature is not None:
             config["temperature"] = temperature
+        if self._thinking_level:
+            # A Gemini 3 knob. `low` cuts the per-call latency of a plain tool turn to
+            # about a third of the default (measured, gemini-3.6-flash) and still makes
+            # the call. Sent only when set, so an unconfigured install and older models
+            # send no `thinkingConfig` at all.
+            config["thinkingConfig"] = {"thinkingLevel": self._thinking_level}
         if config:
             payload["generationConfig"] = config
 
@@ -115,45 +140,71 @@ class GeminiProvider:
         # `models/gemini-2.5-flash` form that Google's own docs print get copied
         # into config, and only one of them makes a valid path.
         url = f"{API_BASE}/models/{model.removeprefix('models/')}:generateContent"
-        data = await self._post(url, payload)
-        try:
-            candidate = (data.get("candidates") or [{}])[0]
-            parts = (candidate.get("content") or {}).get("parts") or []
-            text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
-            calls = _tool_calls(parts)
-            usage = data.get("usageMetadata") or {}
-            input_tokens = int(usage.get("promptTokenCount", 0))
-            # On this API `candidatesTokenCount` already contains the thinking
-            # tokens - `thoughtsTokenCount` is a breakdown of it, not an extra
-            # charge - so adding the two would double-bill a reasoning model.
-            # (Vertex AI splits them; this is generativelanguage, which does not.)
-            output_tokens = int(usage.get("candidatesTokenCount", 0))
-            finish_reason = str(candidate.get("finishReason", ""))
-        except (AttributeError, IndexError, TypeError, ValueError) as exc:
-            # Per llm/base.py every failure leaves as ProviderError - including a
-            # body that simply is not shaped like the documented one.
-            raise ProviderError(
-                f"gemini returned an unreadable response: {self._redact(repr(data))}"
-            ) from exc
 
-        if not text and not calls:
+        # One re-sample, reserved for an empty MALFORMED_FUNCTION_CALL (see that
+        # constant): a fresh sample fixes it, while everything else - a real reply, a
+        # block, an unreadable body - returns or raises on the first pass. This is a
+        # second, orthogonal single-retry sitting on top of `_post`'s own transport
+        # retry, so a rare transient-then-malformed run can reach up to four POSTs;
+        # each axis still fires at most once and then raises, which is what keeps the
+        # gateway owning fallback rather than this becoming a chain (llm/base.py).
+        for attempt in (1, 2):
+            data = await self._post(url, payload)
+            try:
+                candidate = (data.get("candidates") or [{}])[0]
+                parts = (candidate.get("content") or {}).get("parts") or []
+                text = "".join(
+                    part.get("text", "") for part in parts if isinstance(part, dict)
+                )
+                calls = _tool_calls(parts)
+                usage = data.get("usageMetadata") or {}
+                input_tokens = int(usage.get("promptTokenCount", 0))
+                # On this API `candidatesTokenCount` already contains the thinking
+                # tokens - `thoughtsTokenCount` is a breakdown of it, not an extra
+                # charge - so adding the two would double-bill a reasoning model.
+                # (Vertex AI splits them; this is generativelanguage, which does not.)
+                output_tokens = int(usage.get("candidatesTokenCount", 0))
+                finish_reason = str(candidate.get("finishReason", ""))
+            except (AttributeError, IndexError, TypeError, ValueError) as exc:
+                # Per llm/base.py every failure leaves as ProviderError - including a
+                # body that simply is not shaped like the documented one.
+                raise ProviderError(
+                    f"gemini returned an unreadable response: {self._redact(repr(data))}"
+                ) from exc
+
+            if text or calls:
+                return Completion(
+                    text=text,
+                    # `modelVersion` is the id that actually served the call, which is
+                    # what Completion.model is for; an alias like `gemini-flash-latest`
+                    # resolves to something concrete here.
+                    model=str(data.get("modelVersion", model)),
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    meta={"stop_reason": finish_reason},
+                    tool_calls=calls,
+                )
+
+            if finish_reason == MALFORMED_FUNCTION_CALL and attempt == 1:
+                # The model tried to call a tool and emitted nothing. Re-sample once;
+                # the turn would otherwise die on a glitch a retry clears.
+                logger.warning(
+                    "gemini returned an empty %s; re-sampling once", MALFORMED_FUNCTION_CALL
+                )
+                continue
+
             # A blocked prompt lands here: `promptFeedback.blockReason` is set and
             # there is no candidate at all, which is not a reply. A turn that only
-            # asked for tools has no text either, and that one is a reply.
+            # asked for tools has no text either, and that one is a reply and already
+            # returned above. A MALFORMED that survived its retry lands here too - the
+            # honest end is a ProviderError the gateway may still fall back from.
             raise ProviderError(
                 f"gemini returned no text content: {self._redact(repr(data))}"
             )
 
-        return Completion(
-            text=text,
-            # `modelVersion` is the id that actually served the call, which is
-            # what Completion.model is for; an alias like `gemini-flash-latest`
-            # resolves to something concrete here.
-            model=str(data.get("modelVersion", model)),
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            meta={"stop_reason": finish_reason},
-            tool_calls=calls,
+        # Unreachable: the loop returns a reply or raises on every path above.
+        raise ProviderError(  # pragma: no cover
+            f"gemini returned no usable content: {self._redact(repr(data))}"
         )
 
     async def health(self) -> bool:

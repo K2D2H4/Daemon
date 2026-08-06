@@ -425,7 +425,6 @@ async def test_an_ask_parks_the_call_and_runs_nothing(store: Store, tmp_path: Pa
     assert not target.exists()
     assert outcome.approvals and outcome.approvals[0].code
     assert "waiting" in outcome.results[0].content
-    assert not outcome.notices, "nothing ran, so nothing should be reported as run"
     (row,) = store.recent_tool_calls()
     assert row["verdict"] == "ask" and row["ran"] == 0
 
@@ -535,17 +534,21 @@ async def test_calls_run_in_the_order_they_were_asked_for(store: Store, tmp_path
     assert outcome.results[1].content == "one"
 
 
-async def test_every_executed_call_is_reported_to_the_owner(
+async def test_every_executed_call_leaves_an_audit_row(
     store: Store, tmp_path: Path
 ) -> None:
-    """The notice is how someone notices a tool they did not expect, on the turn it
-    happens rather than in a log nobody reads."""
+    """The audit row - not a line in the reply - is how the owner sees a tool they
+    did not expect. It is the ground truth `daemon tools log` reads back, written for
+    every executed call and independent of whatever the model's prose chose to say."""
     (tmp_path / "notes.md").write_text("hi")
     outcome = await runner(store, tmp_path, mode="full").execute(
         [ToolCall(id="1", name="read_file", arguments={"path": str(tmp_path / "notes.md")})],
         CONTEXT,
     )
-    assert outcome.notices == [f"🔧 read {tmp_path / 'notes.md'}"]
+    assert outcome.results[0].ok
+    (row,) = store.recent_tool_calls()
+    assert row["tool"] == "read_file" and row["ran"] == 1
+    assert row["preview"] == f"read {tmp_path / 'notes.md'}"
 
 
 async def test_the_audit_row_keeps_an_excerpt_not_the_flood(

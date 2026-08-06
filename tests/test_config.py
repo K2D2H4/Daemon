@@ -607,20 +607,32 @@ def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:
 # --- tool use ---------------------------------------------------------------
 
 
-def test_tools_are_on_and_asking_by_default() -> None:
+def test_tools_are_on_and_full_by_default() -> None:
     """On, because a companion that cannot open a file on the machine it lives on is
-    the definition unmet (docs/PLAN.md 1). What makes that safe is the rest of this
-    assertion, not a switch: `ask` means nothing that changes the machine runs
-    without a one-shot code, the allowlist is empty so nothing at all runs
-    unprompted, and the two groups that read more than the owner's own files - the
-    browser and MCP - are still off."""
+    the definition unmet (docs/PLAN.md 1). And `full`, deliberately: on the owner's
+    own machine, a prompt before every action is the "chat with extra steps" the
+    product exists not to be. What keeps that from being reckless is not a mode - it
+    is the origin gate, which no mode can switch off (a turn that is not the owner's
+    own words reaches no tool). The two groups that read more than the owner's own
+    files - the browser and MCP - are still off behind their own switches."""
     settings = make_settings(preset="offline", ollama_model="gemma3:4b")
     assert settings.tools_enabled is True
-    assert settings.tools_mode == "ask"
-    assert settings.tools_allowlist == (), "nothing runs without being asked about"
+    assert settings.tools_mode == "full"
+    assert settings.tools_allowlist == ()
     assert settings.tools_roots == ("~",)
     assert settings.browser_enabled is False
     assert settings.mcp_enabled is False
+
+
+def test_gemini_thinking_defaults_to_low_and_rejects_junk() -> None:
+    """`low` by default - a latency decision (a Gemini 3 plain tool turn is ~3x
+    faster at `low` than the default, measured). A typo fails loudly at startup, the
+    same as any other bad enum here, rather than 400ing on the first turn."""
+    base = dict(preset="offline", ollama_model="gemma3:4b")
+    assert make_settings(**base).gemini_thinking_level == "low"
+    assert make_settings(**base, gemini_thinking_level="").gemini_thinking_level == ""
+    with pytest.raises(ConfigError, match="DAEMON_GEMINI_THINKING_LEVEL"):
+        make_settings(**base, gemini_thinking_level="medium")
 
 
 def test_tools_can_be_switched_off_entirely() -> None:

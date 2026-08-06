@@ -384,7 +384,9 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
         elif name == OPENAI:
             providers[name] = OpenAIProvider(settings.openai_api_key)
         elif name == GEMINI:
-            providers[name] = GeminiProvider(settings.gemini_api_key)
+            providers[name] = GeminiProvider(
+                settings.gemini_api_key, thinking_level=settings.gemini_thinking_level
+            )
         else:
             raise ConfigError(
                 f"routing names provider {name!r}, which has no implementation yet "

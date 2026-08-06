@@ -768,9 +768,9 @@ async def test_asking_it_to_do_something_to_the_machine_works_end_to_end(
         await loop.handle(owner_says(f"/approve {code.group(1)}", "2"))
 
         assert target.read_text() == "우유 사기", "approval did not run the command"
-        assert "🔧" in channel.sent[-1], "the owner was not told what ran"
 
-        # The audit trail: the ask, then the run.
+        # The owner's record of what ran is the audit trail, not a line in the reply:
+        # the ask, then the run.
         rows = list(reversed(store.recent_tool_calls()))
         assert [(r["verdict"], r["ran"]) for r in rows] == [("ask", 0), ("allow", 1)]
         assert all(r["origin"] == "owner" for r in rows)
@@ -948,8 +948,9 @@ def test_the_tool_layer_can_be_switched_off_entirely(tmp_path: Path) -> None:
     assert "DAEMON_TOOLS_ENABLED" in status
 
 
-def test_the_default_install_has_tools_and_asks_before_acting(tmp_path: Path) -> None:
-    """The default a person actually gets: tools assembled, `ask` in force, and the
+def test_the_default_install_has_tools_in_full_mode(tmp_path: Path) -> None:
+    """The default a person actually gets: tools assembled, `full` in force (a
+    guarded tool runs without asking - the origin gate is what stays), and the
     browser and MCP still off."""
     settings = Settings(
         _env_file=None,
@@ -967,7 +968,7 @@ def test_the_default_install_has_tools_and_asks_before_acting(tmp_path: Path) ->
         runner, bridge, status = asyncio.run(_build_tools(settings, store))
         assert runner is not None and len(runner) == 7, "the built-ins, and not the browser"
         assert bridge is None, "mcp is off by default"
-        assert "mode=ask" in status and "browser" not in status
+        assert "mode=full" in status and "browser" not in status
     finally:
         store.close()
 
@@ -990,7 +991,7 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
         runner, bridge, status = asyncio.run(_build_tools(settings, store))
         assert runner is not None and len(runner) == 7
         assert bridge is None, "mcp is off, so no server should have been started"
-        assert "mode=ask" in status
+        assert "mode=full" in status
     finally:
         store.close()
 
@@ -1013,7 +1014,7 @@ def test_the_tool_mode_can_be_pinned_past_the_setting(tmp_path: Path) -> None:
         DAEMON_TOOLS_ENABLED=True,
         DAEMON_TOOLS_ROOTS=str(tmp_path),
     )
-    assert settings.tools_mode == "ask", "the default a person gets; the override must win"
+    assert settings.tools_mode == "full", "the default a person gets; the override must win"
 
     from daemon.app import _build_tools
     from daemon.tools.runner import TurnContext
@@ -1426,7 +1427,9 @@ async def test_it_can_talk_about_the_page_the_owner_is_looking_at(
         # or the interaction becomes a form to fill in.
         assert len(channel.sent) == 1
         assert "목요일 3시, 연희동이네." in channel.sent[0]
-        assert "🔧 read the front tab" in channel.sent[0]
+        # The reply is the answer; the run is verified below by the page text
+        # reaching the model, not by a "🔧" line.
+        assert "🔧" not in channel.sent[0]
 
         # The page text reached the model, fenced as untrusted.
         tool_turn = provider.prompts[-1][-1]

@@ -1394,6 +1394,83 @@ async def test_gemini_still_fails_on_no_text_and_no_tools() -> None:
             await GeminiProvider(SECRET, client=client).complete(PROMPT, model="m")
 
 
+# The body gemini-3 returns when it tried to call a tool and emitted nothing: an
+# empty candidate with finishReason MALFORMED_FUNCTION_CALL. Copied from the real
+# crash the owner hit on gemini-3.1-pro-preview.
+GEMINI_MALFORMED = {
+    "modelVersion": "gemini-3.1-pro-preview",
+    "candidates": [
+        {
+            "content": {},
+            "finishReason": "MALFORMED_FUNCTION_CALL",
+            "finishMessage": "Malformed function call: Function call is empty - no input to parse.",
+        }
+    ],
+    "usageMetadata": {"promptTokenCount": 2923, "candidatesTokenCount": 0},
+}
+
+
+async def test_gemini_resamples_once_on_an_empty_malformed_function_call() -> None:
+    """An empty MALFORMED_FUNCTION_CALL is a sampling glitch, not a bad request, so
+    the provider re-POSTs once rather than failing the turn - the failure that
+    reached the owner as "Something went wrong on my side" mid tool use."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        # Malformed first, a real tool call on the re-sample.
+        body = GEMINI_MALFORMED if calls == 1 else GEMINI_TOOL_CALL
+        return httpx.Response(200, json=body)
+
+    async with mock_client(handler) as client:
+        completion = await GeminiProvider(SECRET, client=client).complete(
+            PROMPT, model="gemini-3.1-pro-preview", tools=TOOLS
+        )
+
+    assert calls == 2, "an empty MALFORMED_FUNCTION_CALL was not re-sampled"
+    assert [c.name for c in completion.tool_calls] == ["run_command"]
+
+
+async def test_gemini_gives_up_after_one_resample_on_a_persistent_malformed() -> None:
+    """The retry is bounded to one (llm/base.py: a provider must not build a retry
+    chain - the gateway owns fallback). A MALFORMED that survives the re-sample ends
+    as a ProviderError, not an infinite loop."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=GEMINI_MALFORMED)
+
+    async with mock_client(handler) as client:
+        with pytest.raises(ProviderError, match="no text content"):
+            await GeminiProvider(SECRET, client=client).complete(
+                PROMPT, model="gemini-3.1-pro-preview", tools=TOOLS
+            )
+
+    assert calls == 2, "MALFORMED must be retried exactly once, no more and no less"
+
+
+async def test_gemini_sends_the_thinking_level_when_configured() -> None:
+    """`thinkingLevel=low` is the latency lever (config.py): ~3x faster per call on a
+    plain tool turn, measured. Sent inside generationConfig when set."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, GEMINI_OK)) as client:
+        provider = GeminiProvider(SECRET, client=client, thinking_level="low")
+        await provider.complete(PROMPT, model="m")
+    assert payloads[0]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
+
+
+async def test_gemini_omits_thinking_config_when_unset() -> None:
+    """An unconfigured install and older models that do not know the field send no
+    thinkingConfig at all."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, GEMINI_OK)) as client:
+        await GeminiProvider(SECRET, client=client).complete(PROMPT, model="m")
+    assert "thinkingConfig" not in payloads[0].get("generationConfig", {})
+
+
 async def test_gemini_drops_an_assistant_turn_with_nothing_in_it() -> None:
     """An empty `parts` is rejected by the API, and such a turn carries nothing."""
     payloads: list[dict] = []

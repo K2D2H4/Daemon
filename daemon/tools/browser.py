@@ -484,12 +484,14 @@ def _reject_private(url: str) -> None:
 class FetchPage:
     """Fetch a URL and return its text.
 
-    `safe`, with three things standing in for an approval prompt: the private
-    network is unreachable (above), the owner sees `🔧 fetch <url>` in the reply on
-    the turn it happens, and the body comes back fenced. That visibility is the
-    real control - an outbound request whose URL a model chose is an exfiltration
-    channel, and the mitigation that works is the owner reading the URL, not a code
-    they would approve without looking.
+    `safe`, with two things standing in for an approval prompt: the private network
+    is unreachable (above), and the body comes back fenced. The URL a model chose is
+    an outbound request and thus an exfiltration channel, so it is recorded in the
+    `tool_calls` audit (`daemon tools log`) like every executed call. That used to
+    also surface as a `🔧 fetch <url>` line in the reply; the reply no longer carries
+    per-call lines, so the audit is now the sole record. A `safe` tool runs in every
+    mode, so the only switch over it is the browser group itself
+    (`DAEMON_BROWSER_ENABLED`) - which is off by default for this reason.
     """
 
     risk: Risk = "safe"

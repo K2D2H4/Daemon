@@ -811,17 +811,24 @@ def _tools_check(settings: Settings) -> Check:
         extras.append(f"browser={settings.browser_app}")
     if settings.mcp_enabled:
         extras.append("mcp=on")
-    allowed = ", ".join(settings.tools_allowlist) or "nothing"
-    detail = (
-        f"on mode={settings.tools_mode} roots={', '.join(settings.tools_roots)} "
-        f"runs-without-asking={allowed}"
-    )
+    detail = f"on mode={settings.tools_mode} roots={', '.join(settings.tools_roots)}"
+    if settings.tools_mode != "full":
+        # The allowlist is what runs without a prompt under `ask`/`allowlist`. Under
+        # `full` *everything* does, so naming the (usually empty) allowlist there
+        # reads as the exact opposite of the truth.
+        allowed = ", ".join(settings.tools_allowlist) or "nothing"
+        detail += f" runs-without-asking={allowed}"
     if extras:
         detail += " " + " ".join(extras)
-    # `full` is the one setting where nothing but the origin gate is left, so it is
-    # reported as a failed check rather than as a detail someone might skim past.
+    # `full` is the default (config.py) and the one setting where nothing but the
+    # origin gate is left, so it passes - marking the default as a failed check
+    # would make every fresh install's doctor read as broken - but the detail names
+    # the posture plainly rather than letting it be skimmed past. Use `ask` or
+    # `allowlist` for a prompt before anything changes.
     if settings.tools_mode == "full":
-        return Check("tools", False, detail + " - `full` asks about nothing")
+        return Check(
+            "tools", True, detail + " - runs everything without asking; only the origin gate holds"
+        )
     return Check("tools", True, detail)
 
 

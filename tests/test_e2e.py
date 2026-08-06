@@ -252,16 +252,17 @@ async def test_the_owner_asks_it_to_do_something_and_it_does(
             ],
         }
     )
-    app = boot(monkeypatch, settings_for(tmp_path), model, api)
+    app = boot(monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), model, api)
 
     async with app.router.lifespan_context(app):
         assert app.state.loop_task is not None, "the conversation loop never started"
 
-        # 1. a read: it just happens.
+        # 1. a read: it just happens. The reply is the model's answer alone - what
+        # ran is on the audit trail asserted at the end, not folded into the reply.
         api.send(1, "메모에 뭐라고 써있어?")
         await api.wait_for_reply(1)
-        assert "🔧 read" in api.texts()[0]
         assert "됐어." in api.texts()[0]
+        assert "🔧" not in api.texts()[0]
 
         # 2. a write: the owner is asked, and nothing has happened.
         api.send(2, "할 일에 우유 적어줘")
@@ -276,7 +277,6 @@ async def test_the_owner_asks_it_to_do_something_and_it_does(
         api.send(3, f"/approve {code.group(1)}")
         await api.wait_for_reply(4)
         assert todo.read_text() == "우유"
-        assert "🔧 write" in api.texts()[3]
 
         body = await health(app)
         assert body["conversation_loop"] == "running"
@@ -366,7 +366,9 @@ async def test_state_survives_a_restart(
 
     # --- first boot: ask, then die without answering ---
     api = FakeTelegram()
-    app = boot(monkeypatch, settings_for(tmp_path), ScriptedModel(calls), api)
+    app = boot(
+        monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), ScriptedModel(calls), api
+    )
     async with app.router.lifespan_context(app):
         api.send(1, "적어줘")
         await api.wait_for_reply(2)
@@ -376,7 +378,9 @@ async def test_state_survives_a_restart(
 
     # --- second boot: the same data dir, a new process worth of objects ---
     api2 = FakeTelegram()
-    app2 = boot(monkeypatch, settings_for(tmp_path), ScriptedModel(calls), api2)
+    app2 = boot(
+        monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), ScriptedModel(calls), api2
+    )
     async with app2.router.lifespan_context(app2):
         api2.send(2, f"/approve {code.group(1)}")
         await api2.wait_for_reply(1)
@@ -395,7 +399,9 @@ async def test_a_standing_grant_survives_a_restart(
     calls = {"날짜": [ToolCall(id="c1", name="run_command", arguments={"command": "date"})]}
 
     api = FakeTelegram()
-    app = boot(monkeypatch, settings_for(tmp_path), ScriptedModel(calls), api)
+    app = boot(
+        monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), ScriptedModel(calls), api
+    )
     async with app.router.lifespan_context(app):
         api.send(1, "날짜 알려줘")
         await api.wait_for_reply(2)
@@ -405,14 +411,25 @@ async def test_a_standing_grant_survives_a_restart(
         await api.wait_for_reply(3)
 
     api2 = FakeTelegram()
-    app2 = boot(monkeypatch, settings_for(tmp_path), ScriptedModel(calls), api2)
+    app2 = boot(
+        monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), ScriptedModel(calls), api2
+    )
     async with app2.router.lifespan_context(app2):
         api2.send(3, "날짜 알려줘")
         await api2.wait_for_reply(1)
         # One message: the answer. No approval request.
         await asyncio.sleep(0.2)
         assert len(api2.sent) == 1, f"it asked again: {api2.texts()}"
-        assert "🔧 run `date`" in api2.texts()[0]
+
+    # And it did not just stay silent - the granted command actually ran on the
+    # second boot, confirmed by the audit rather than a "🔧" line the reply no longer
+    # carries.
+    store = Store.open(tmp_path / DB_FILENAME)
+    try:
+        runs = [c for c in store.recent_tool_calls() if c["ran"] and c["tool"] == "run_command"]
+        assert runs and runs[0]["verdict"] == "allow", "the standing grant did not run"
+    finally:
+        store.close()
 
 
 async def test_tools_off_is_a_complete_product(
@@ -484,7 +501,7 @@ async def test_the_browser_group_is_reachable_end_to_end(
         api.send(1, "이 페이지 뭐라고 써있어?")
         await api.wait_for_reply(1)
         assert "목요일 3시라고 써있네." in api.texts()[0]
-        assert "🔧 read the front tab" in api.texts()[0]
+        assert "🔧" not in api.texts()[0]  # the reply is the answer; the run is in the audit below
 
         # The page text arrived fenced as untrusted.
         tool_turn = model.prompts[-1][-1]
@@ -831,9 +848,8 @@ async def test_a_page_that_tries_to_give_orders_is_quoted_not_obeyed(
         assert "(marker removed)" in tool_turn.content
         assert "Weather: fine." in tool_turn.content
 
-        # And no command ran off the back of it.
-        assert "🔧 run" not in api.texts()[0]
-
+    # And no command ran off the back of it - the audit is the record now, and it
+    # shows only the fetch.
     store = Store.open(tmp_path / DB_FILENAME)
     try:
         assert [r["tool"] for r in store.recent_tool_calls()] == ["fetch_page"]

@@ -1781,11 +1781,13 @@ class Wizard:
         self.prompt.say("notifications on this computer.")
         self.prompt.say()
         self._prose(
-            "Reading happens straight away. Anything that *changes* the machine - "
-            "writing a file, running a command - asks you first with a one-shot code "
-            "that lapses in five minutes. Nothing runs at all on a message you "
-            "forwarded from someone else, in any setting. `daemon tools log` shows "
-            "every call it has made, refusals included."
+            "Reading, writing, running and opening all happen straight away, without "
+            "asking - on your own machine, a prompt before every action is just in the "
+            "way. What always holds, in every setting, is that nothing runs at all on a "
+            "message you forwarded from someone else. Prefer to be asked first? Set "
+            "DAEMON_TOOLS_MODE=ask (each change waits on a one-shot code that lapses in "
+            "five minutes) or =allowlist. `daemon tools log` shows every call it has "
+            "made, refusals included."
         )
         if raw:
             self.prompt.say(f"  Currently {'on' if was else 'off'}. {KEEP_HINT}")

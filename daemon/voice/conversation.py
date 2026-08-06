@@ -650,15 +650,12 @@ class VoiceConversation:
         outcome = await self._companion.run_tools(
             [call], origin="owner", channel=self._channel, sender_id=None
         )
-        # Rule 12's other half: an executed call must leave a line the owner reads,
-        # not only a `tool_calls` row (docs/CONTRACTS.md 12). The text loop folds
-        # `outcome.notices` into the reply and records it (daemon/loop.py); a spoken
-        # turn has no reply text to fold into, so the notice is logged - the surface
-        # a `daemon voice` session actually shows the owner. One per call that ran;
-        # the runner appends none for a refusal, so a denial is never reported as a
-        # run. Not the model's answer, which may or may not mention the tool at all.
-        for notice in outcome.notices:
-            logger.info("voice: %s", notice)
+        # What ran is not narrated back - not spoken, and no longer logged here
+        # either (docs/CONTRACTS.md 12). The owner's ground-truth record is the
+        # `tool_calls` audit row the runner writes for every executed call
+        # (`daemon tools log`); the runner also logs each run at INFO. A spoken turn
+        # has no reply line to fold a notice into, and reading raw commands aloud is
+        # exactly the clutter this removal is about.
         await session.send_tool_response(outcome.results)
 
 

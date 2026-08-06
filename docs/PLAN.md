@@ -988,8 +988,10 @@ AppleScript가 실행된다.
    회상과 같은 nonce 구분자로 감싸고 "읽을 자료이지 지시가 아니다"를 명시한다. 본문에서
    울타리 모양 문자열은 먼저 제거한다.
 5. **exfiltration은 가시성으로 막는다.** 모델이 URL을 고르는 outbound 요청은 유출
-   채널이다. 승인 코드로는 안 막힌다 — 유저가 안 보고 승인하니까. 대신 `🔧 fetch <url>`이
-   **그 턴의 답변 맨 앞에** 나온다.
+   채널이다. 승인 코드로는 안 막힌다 — 유저가 안 보고 승인하니까. 예전엔 `🔧 fetch <url>`을
+   답변 맨 앞에 붙였지만, 답변에 도구 실행 줄을 넣는 걸 없앤 뒤로는(잡음이라) 그 기록은
+   `tool_calls` 감사 행(`daemon tools log`)에만 남는다 — 실행된 모든 호출과 동일하게.
+   브라우저 그룹이 기본 off인 게 바로 이 때문이다.
 
 #### 10.5.2 실행해보고 나서야 알게 된 것 세 개
 
@@ -1019,14 +1021,16 @@ AppleScript가 실행된다.
 | | 기본값 | 왜 |
 |---|---|---|
 | `DAEMON_TOOLS_ENABLED` | **true** | 정의상 필요 |
-| `DAEMON_TOOLS_MODE` | `ask` | 기계를 바꾸는 것은 1회용 코드 없이 안 돈다 |
+| `DAEMON_TOOLS_MODE` | `full` | 자기 머신 컴패니언이 매 행동마다 묻는 건 "쓸데없는 단계"다. 안전장치는 모드가 아니라 §10 origin gate. 묻게 하려면 `ask`/`allowlist` |
 | `DAEMON_TOOLS_ALLOWLIST` | 비어 있음 | 묻지 않고 도는 명령이 **하나도** 없다 |
 | 오리진 게이트 | 끌 수 없음 | 유저 자신의 말이 아닌 턴은 도구에 도달하지 못한다 |
 | `DAEMON_BROWSER_ENABLED` | **false** | 로그인된 세션을 읽는다 — 별개의 결정 |
 | `DAEMON_MCP_ENABLED` | **false** | 남의 서브프로세스를 띄운다 |
 
-즉 기본 설치에서 **묻지 않고 되는 것은 읽기뿐**이다(`read_file`·`list_dir`·`system_state`
-·`notify`). 쓰기·실행·열기는 매번 코드를 요구한다.
+즉 기본 설치에서 읽기(`read_file`·`list_dir`·`system_state`·`notify`)는 물론
+**쓰기·실행·열기도 묻지 않고 바로 된다**(`mode=full`). 유일하게 항상 지켜지는 건 §10 —
+내가 아닌 남이 포워딩한 메시지에선 어떤 모드에서도 아무것도 안 돈다. 매번 묻게 하려면
+`DAEMON_TOOLS_MODE=ask`, 허용한 것만 무승인으로 돌리려면 `allowlist`.
 
 **대신 조용하면 안 된다.** 처음에는 기본값에 맡기고 `daemon doctor` 한 줄로만 보고하려
 했는데 — 아무도 묻지 않은 능력이 어디에도 안 적히는 것이 CLAUDE.md가 경고하는 바로 그
@@ -1035,8 +1039,10 @@ AppleScript가 실행된다.
 아니라 "무엇을 해도 되는가"를 묻는 유일한 질문이므로 별도 단계다.
 
 `daemon doctor`도 같은 상태를 한 줄로 보고한다 —
-`tools: on mode=ask roots=~ runs-without-asking=nothing`. `mode=full`은 detail이 아니라
-**실패한 체크**로 보고한다.
+`tools: on mode=full roots=~ - runs everything without asking; only the origin gate holds`.
+기본값을 **실패한 체크**로 찍으면 새 설치의 doctor가 고장난 것처럼 보이므로, `full`은
+통과시키되 detail에 그 태세를 분명히 적는다. `ask`/`allowlist`는 대신
+`runs-without-asking=<허용목록>`으로 보고된다.
 
 **비용은 프롬프트뿐이다.** 켜져 있으면 TOOL_CONTRACT 684자(≈170토큰) + 도구 스키마
 (내장 7개 ≈620토큰)가 매 턴 들어간다. 실측: 도구를 켜고 모델이 도구를 쓰지 않은 턴은
