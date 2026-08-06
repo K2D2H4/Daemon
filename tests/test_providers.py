@@ -1452,6 +1452,25 @@ async def test_gemini_gives_up_after_one_resample_on_a_persistent_malformed() ->
     assert calls == 2, "MALFORMED must be retried exactly once, no more and no less"
 
 
+async def test_gemini_sends_the_thinking_level_when_configured() -> None:
+    """`thinkingLevel=low` is the latency lever (config.py): ~3x faster per call on a
+    plain tool turn, measured. Sent inside generationConfig when set."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, GEMINI_OK)) as client:
+        provider = GeminiProvider(SECRET, client=client, thinking_level="low")
+        await provider.complete(PROMPT, model="m")
+    assert payloads[0]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
+
+
+async def test_gemini_omits_thinking_config_when_unset() -> None:
+    """An unconfigured install and older models that do not know the field send no
+    thinkingConfig at all."""
+    payloads: list[dict] = []
+    async with mock_client(capture(payloads, GEMINI_OK)) as client:
+        await GeminiProvider(SECRET, client=client).complete(PROMPT, model="m")
+    assert "thinkingConfig" not in payloads[0].get("generationConfig", {})
+
+
 async def test_gemini_drops_an_assistant_turn_with_nothing_in_it() -> None:
     """An empty `parts` is rejected by the API, and such a turn carries nothing."""
     payloads: list[dict] = []

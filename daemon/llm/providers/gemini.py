@@ -67,6 +67,7 @@ class GeminiProvider:
         api_key: str,
         *,
         timeout: float = DEFAULT_TIMEOUT,
+        thinking_level: str = "",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not api_key:
@@ -74,6 +75,12 @@ class GeminiProvider:
         self._api_key = api_key
         """Kept only so `_redact` can strip it back out of an upstream body
         before that body reaches an exception message."""
+        self._thinking_level = thinking_level
+        """How hard a Gemini 3 model thinks before answering (`low`/`high`), or empty
+        to leave it to the model. `low` roughly a third of the per-call latency of the
+        default on a plain tool turn (config.py: DAEMON_GEMINI_THINKING_LEVEL). Sent
+        only when set, so an older model that does not know `thinkingConfig` is
+        untouched unless someone opts in."""
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._headers = {
@@ -120,6 +127,12 @@ class GeminiProvider:
             config["maxOutputTokens"] = max_output_tokens
         if temperature is not None:
             config["temperature"] = temperature
+        if self._thinking_level:
+            # A Gemini 3 knob. `low` cuts the per-call latency of a plain tool turn to
+            # about a third of the default (measured, gemini-3.6-flash) and still makes
+            # the call. Sent only when set, so an unconfigured install and older models
+            # send no `thinkingConfig` at all.
+            config["thinkingConfig"] = {"thinkingLevel": self._thinking_level}
         if config:
             payload["generationConfig"] = config
 

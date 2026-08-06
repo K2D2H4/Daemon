@@ -56,6 +56,10 @@ opposite of local, and the offline preset never resolves HOSTED at all."""
 VOICE_TASKS = frozenset({Task.CHAT_VOICE})
 """Tasks that need a hosted native-audio model. The offline preset has none."""
 
+THINKING_LEVELS = ("", "low", "high")
+"""What DAEMON_GEMINI_THINKING_LEVEL accepts: `low`, `high`, or empty to leave it
+to the model. A Gemini 3 knob; other providers ignore it."""
+
 SENSITIVITIES = ("low", "high")
 """What the two speech-sensitivity settings accept, plus empty for "the server
 decides".
@@ -254,6 +258,15 @@ class Settings(BaseSettings):
     anthropic_model: str = Field(default="claude-sonnet-5", alias="DAEMON_ANTHROPIC_MODEL")
     openai_model: str = Field(default="", alias="DAEMON_OPENAI_MODEL")
     gemini_model: str = Field(default="", alias="DAEMON_GEMINI_MODEL")
+
+    gemini_thinking_level: str = Field(default="low", alias="DAEMON_GEMINI_THINKING_LEVEL")
+    """How hard a Gemini 3 model thinks before answering: `low`, `high`, or empty
+    to leave it to the model. `low` by default, and that is a latency decision:
+    measured on gemini-3.6-flash, the default (high) spent ~300 thinking tokens and
+    ~3.6s *per call* on a plain weather lookup; `low` is ~1.3s with the tool call
+    still made, so a two-call turn lands near 4s instead of 12s. Set `high` for a
+    reasoning-heavy setup, or empty for a non-Gemini-3 model that rejects the field.
+    Ignored by providers other than Gemini."""
 
     embed_model: str = Field(default="bge-m3", alias="DAEMON_EMBED_MODEL")
     """Embedding model for recall, separate from the chat model even though both
@@ -795,6 +808,11 @@ class Settings(BaseSettings):
             problems.append(
                 f"unknown DAEMON_TOOLS_MODE {self.tools_mode!r}; expected one of "
                 f"{', '.join(TOOL_MODES)}"
+            )
+        if self.gemini_thinking_level not in THINKING_LEVELS:
+            problems.append(
+                f"unknown DAEMON_GEMINI_THINKING_LEVEL {self.gemini_thinking_level!r}; "
+                f"expected one of {', '.join(repr(x) for x in THINKING_LEVELS)}"
             )
         if self.tools_enabled:
             # Only checked when tools are on: a text-only install should not have to

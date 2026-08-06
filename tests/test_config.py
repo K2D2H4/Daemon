@@ -624,6 +624,17 @@ def test_tools_are_on_and_full_by_default() -> None:
     assert settings.mcp_enabled is False
 
 
+def test_gemini_thinking_defaults_to_low_and_rejects_junk() -> None:
+    """`low` by default - a latency decision (a Gemini 3 plain tool turn is ~3x
+    faster at `low` than the default, measured). A typo fails loudly at startup, the
+    same as any other bad enum here, rather than 400ing on the first turn."""
+    base = dict(preset="offline", ollama_model="gemma3:4b")
+    assert make_settings(**base).gemini_thinking_level == "low"
+    assert make_settings(**base, gemini_thinking_level="").gemini_thinking_level == ""
+    with pytest.raises(ConfigError, match="DAEMON_GEMINI_THINKING_LEVEL"):
+        make_settings(**base, gemini_thinking_level="medium")
+
+
 def test_tools_can_be_switched_off_entirely() -> None:
     """The other direction has to keep working, or "on by default" becomes
     "on, and no way back"."""

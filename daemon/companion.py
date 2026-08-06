@@ -120,6 +120,9 @@ that reach it. Rules, in order of importance:
 
 - Use a tool only when the answer genuinely needs one. Do not check the machine to \
 decide how to phrase something.
+- Get there in as few tool calls as you can, and never call a tool twice for the \
+same thing. If one fails or a source does not have what was asked, do not keep \
+trying variations - tell the owner what you found or could not find, and stop.
 - Prefer read_file and list_dir over run_command; they run without interrupting the \
 owner for approval.
 - Anything that changes the machine may need the owner's approval. If a tool comes \
