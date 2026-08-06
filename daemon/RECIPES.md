@@ -38,3 +38,12 @@ resolved path — a blocklist is not exhaustive. Date records by the day they ar
 **A new `Task`.** `daemon/tasks.py` is the routing key: add it to all three presets in
 `daemon/config.py` *and* give it a caller, or `tests/test_reachable.py` fails unless it is declared
 PENDING with the milestone that owns it.
+
+**Anything the daemon can *do*** — something new in front of the model, something new
+written down. It goes in `daemon/companion.py`, once, and both conversation endpoints
+get it. Adding it to `daemon/loop.py` is how voice ended up recording every spoken
+turn and embedding none of them: two implementations of one thing, and only one of
+them complete. What genuinely belongs to an endpoint is *transport* — the wire, and
+when it is safe to write to it. That includes voice's injection timing, which is
+measured and must stay in `daemon/voice/conversation.py`: `clientContent` sent
+mid-generation kills the answer.

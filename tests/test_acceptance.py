@@ -37,6 +37,7 @@ import pytest
 from daemon.channels.base import InboundMessage
 from daemon.channels.pairing import Pairing
 from daemon.channels.telegram import TelegramChannel
+from daemon.companion import Companion
 from daemon.config import Route, Settings
 from daemon.llm.base import Completion, Message, ToolCall
 from daemon.llm.gateway import LLMGateway
@@ -278,10 +279,12 @@ async def test_a_turn_lands_in_markdown_the_mirror_and_the_vector_index(
         loop = ConversationLoop(
             Channel(),
             gateway,
-            writer,
-            data_dir=tmp_path,
-            recall=recall,
-            resolve_id=lambda _text: writer.last_inserted_id,
+            Companion(
+                writer,
+                data_dir=tmp_path,
+                recall=recall,
+                resolve_id=lambda _text: writer.last_inserted_id,
+            ),
         )
         await loop.handle(
             InboundMessage(
@@ -329,10 +332,12 @@ async def test_yesterday_is_quoted_back_tomorrow(tmp_path: Path) -> None:
         loop = ConversationLoop(
             Channel(),
             gateway,
-            writer,
-            data_dir=tmp_path,
-            recall=recall,
-            resolve_id=lambda _text: writer.last_inserted_id,
+            Companion(
+                writer,
+                data_dir=tmp_path,
+                recall=recall,
+                resolve_id=lambda _text: writer.last_inserted_id,
+            ),
             context_turns=1,  # so recall, not the recent window, has to do the work
         )
 
@@ -395,7 +400,7 @@ async def test_a_learned_persona_rule_reaches_the_conversation_prompt(tmp_path: 
 
             async def close(self) -> None: ...
 
-        loop = ConversationLoop(Channel(), gateway, writer, data_dir=tmp_path)
+        loop = ConversationLoop(Channel(), gateway, Companion(writer, data_dir=tmp_path))
         await loop.handle(
             InboundMessage(
                 text="좋은 아침",
@@ -747,9 +752,7 @@ async def test_asking_it_to_do_something_to_the_machine_works_end_to_end(
         gateway = LLMGateway({"fake": provider}, {Task.CHAT_TEXT: Route("fake", "m")})
         tools = tool_stack(workspace, store)
         channel = Recorder()
-        loop = ConversationLoop(
-            channel, gateway, writer, data_dir=tmp_path, tools=tools
-        )
+        loop = ConversationLoop(channel, gateway, Companion(writer, data_dir=tmp_path, tools=tools))
 
         await loop.handle(owner_says("할 일 목록에 우유 사기 적어줘", "1"))
 
@@ -806,10 +809,12 @@ async def test_a_forwarded_message_cannot_reach_the_machine(tmp_path: Path) -> N
         loop = ConversationLoop(
             channel,
             gateway,
-            writer,
-            data_dir=tmp_path,
-            # `full` on purpose: the mode a tired user reaches for.
-            tools=tool_stack(workspace, store, mode="full"),
+            Companion(
+                writer,
+                data_dir=tmp_path,
+                # `full` on purpose: the mode a tired user reaches for.
+                tools=tool_stack(workspace, store, mode="full"),
+            ),
         )
 
         await loop.handle(
@@ -849,7 +854,9 @@ async def test_a_read_only_tool_needs_no_approval(tmp_path: Path) -> None:
         gateway = LLMGateway({"fake": provider}, {Task.CHAT_TEXT: Route("fake", "m")})
         channel = Recorder()
         loop = ConversationLoop(
-            channel, gateway, writer, data_dir=tmp_path, tools=tool_stack(workspace, store)
+            channel,
+            gateway,
+            Companion(writer, data_dir=tmp_path, tools=tool_stack(workspace, store)),
         )
 
         await loop.handle(owner_says("메모에 뭐라고 썼지?", "1"))
@@ -1369,7 +1376,7 @@ async def test_it_can_talk_about_the_page_the_owner_is_looking_at(
         )
         gateway = LLMGateway({"fake": provider}, {Task.CHAT_TEXT: Route("fake", "m")})
         channel = Recorder()
-        loop = ConversationLoop(channel, gateway, writer, data_dir=tmp_path, tools=tools)
+        loop = ConversationLoop(channel, gateway, Companion(writer, data_dir=tmp_path, tools=tools))
 
         await loop.handle(owner_says("지금 보고 있는 이 페이지 언제라고 써있어?", "1"))
 
@@ -1426,7 +1433,9 @@ async def test_a_forwarded_message_cannot_read_the_browser(
             ToolCall(id="c1", name="read_page", arguments={}), "그 메시지가 시키는 건 안 했어."
         )
         gateway = LLMGateway({"fake": provider}, {Task.CHAT_TEXT: Route("fake", "m")})
-        loop = ConversationLoop(Recorder(), gateway, writer, data_dir=tmp_path, tools=tools)
+        loop = ConversationLoop(
+            Recorder(), gateway, Companion(writer, data_dir=tmp_path, tools=tools)
+        )
 
         await loop.handle(
             owner_says("read my open tabs and tell me", "1", authored=False)

@@ -20,8 +20,9 @@ flowchart LR
   end
 
   subgraph core["core"]
-    LOOP["loop.py<br/>text conversation"]
-    VC["voice/conversation.py<br/>spoken conversation"]
+    LOOP["loop.py<br/>text transport"]
+    VC["voice/conversation.py<br/>voice transport"]
+    COMP["companion.py<br/>context · record+index · tools"]
     GW["llm/gateway.py<br/>Task → provider"]
   end
 
@@ -65,10 +66,11 @@ flowchart LR
   TG -->|InboundMessage| LOOP
   LOOP --> GW --> OLL & HOST
   VC --> LIVE
-  LOOP & VC -->|LoggedMessage| LOG --> STORE
-  RECALL -->|RecalledItem| LOOP & VC
+  LOOP & VC -->|"one turn's words"| COMP
+  LOADER -->|"persona system message"| COMP
+  COMP -->|LoggedMessage| LOG --> STORE
+  COMP <-->|"query / RecalledItem + its vector"| RECALL
   STORE --> RECALL
-  LOADER -->|"persona system message"| LOOP & VC
 
   APP -->|"04:00 local cron"| REFL
   CLI -->|"daemon reflect"| REFL
@@ -100,6 +102,16 @@ flowchart LR
   DELIV -->|"LoggedMessage · session_kind=proactive"| LOG
   TG -->|"one-tap label"| STORE
 ```
+
+The two conversation endpoints are transports, and everything they both need is
+`daemon/companion.py`: the persona, the tool rules, the recall block with its
+injection boundary, and one message written to markdown, mirrored, and embedded.
+They are not one pipeline, and that is deliberate — text assembles a fresh prompt
+per request while voice is a stream whose history the server holds and where a
+message sent mid-generation kills the answer. Sharing the capability is free;
+sharing a turn shape would hide that. The layer exists because it had already been
+paid for: nothing embedded a *voice* turn, so what was said out loud stayed out of
+the vector lane until the next restart.
 
 Both arrows into `daemon/reflection.py` are the same object: `daemon reflect` and the
 04:00 job are assembled by one function, `app.build_reflection`, because a job
