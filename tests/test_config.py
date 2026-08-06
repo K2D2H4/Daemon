@@ -613,15 +613,16 @@ def test_tools_are_on_and_full_by_default() -> None:
     own machine, a prompt before every action is the "chat with extra steps" the
     product exists not to be. What keeps that from being reckless is not a mode - it
     is the origin gate, which no mode can switch off (a turn that is not the owner's
-    own words reaches no tool). The two groups that read more than the owner's own
-    files - the browser and MCP - are still off behind their own switches."""
+    own words reaches no tool). The browser group - the one that reads an
+    authenticated session the owner never named - is still off behind its own
+    switch. MCP is on, but launches nothing until a server is configured."""
     settings = make_settings(preset="offline", ollama_model="gemma3:4b")
     assert settings.tools_enabled is True
     assert settings.tools_mode == "full"
     assert settings.tools_allowlist == ()
     assert settings.tools_roots == ("~",)
     assert settings.browser_enabled is False
-    assert settings.mcp_enabled is False
+    assert settings.mcp_enabled is True
 
 
 def test_tools_can_be_switched_off_entirely() -> None:

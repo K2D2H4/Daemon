@@ -1025,7 +1025,7 @@ AppleScript가 실행된다.
 | `DAEMON_TOOLS_ALLOWLIST` | 비어 있음 | 묻지 않고 도는 명령이 **하나도** 없다 |
 | 오리진 게이트 | 끌 수 없음 | 유저 자신의 말이 아닌 턴은 도구에 도달하지 못한다 |
 | `DAEMON_BROWSER_ENABLED` | **false** | 로그인된 세션을 읽는다 — 별개의 결정 |
-| `DAEMON_MCP_ENABLED` | **false** | 남의 서브프로세스를 띄운다 |
+| `DAEMON_MCP_ENABLED` | **true** | 켜도 `data/mcp.json`에 서버가 없으면 아무것도 안 뜬다 — 실제 opt-in은 extra 설치 + 서버 설정. 끄려면 이 한 줄 |
 
 즉 기본 설치에서 읽기(`read_file`·`list_dir`·`system_state`·`notify`)는 물론
 **쓰기·실행·열기도 묻지 않고 바로 된다**(`mode=full`). 유일하게 항상 지켜지는 건 §10 —

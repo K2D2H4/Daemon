@@ -452,9 +452,10 @@ class Settings(BaseSettings):
     The switch is not what makes it safe. The default `tools_mode` is `full`, so a
     guarded tool runs without asking (see that field for the trade and how to make it
     cautious again); the boundary that always holds is the origin gate - no tool at
-    all runs on a turn that is not the owner's own words (tools/policy.py). The two
-    capabilities that read more than that - the browser group and MCP - stay off and
-    have their own switches.
+    all runs on a turn that is not the owner's own words (tools/policy.py). The one
+    capability that reads an authenticated session the owner never named - the
+    browser group - stays off behind its own switch; MCP has its own switch too but
+    defaults on, because it launches nothing until the owner has configured a server.
 
     Turning it off is one line, and `daemon doctor` says which way it is set: a
     capability the owner cannot see is the silent state this project keeps being
@@ -517,10 +518,20 @@ class Settings(BaseSettings):
     dictionary, so naming one of those works. Safari's is a different shape and is
     not supported."""
 
-    mcp_enabled: bool = Field(default=False, alias="DAEMON_MCP_ENABLED")
-    """Whether `<data_dir>/mcp.json` is read at all. Separate from
-    DAEMON_TOOLS_ENABLED so an MCP server can be configured and left switched off,
-    and because starting one means starting somebody else's subprocess."""
+    mcp_enabled: bool = Field(default=True, alias="DAEMON_MCP_ENABLED")
+    """Whether `<data_dir>/mcp.json` is read at all.
+
+    On by default, for the same reason `tools_enabled` is: the switch is not what
+    makes it safe, and defaulting it off only hides a capability the owner asked
+    for. It reads nothing on its own - MCP does something only once the owner has
+    both installed the optional `mcp` extra *and* written server blocks into
+    `mcp.json`, and those two acts are the real opt-in. A machine with neither
+    degrades to zero MCP tools, not to a daemon that will not boot (tools/mcp.py).
+
+    It keeps its own switch rather than folding into DAEMON_TOOLS_ENABLED, because
+    starting a stdio server means starting somebody else's subprocess: setting this
+    `false` is the one line that turns every configured server off without editing
+    `mcp.json`."""
 
     data_dir: Path = Field(default=Path("./data"), alias="DAEMON_DATA_DIR")
 
