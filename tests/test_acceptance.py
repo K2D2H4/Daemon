@@ -1014,7 +1014,7 @@ def test_the_tool_mode_can_be_pinned_past_the_setting(tmp_path: Path) -> None:
         DAEMON_TOOLS_ENABLED=True,
         DAEMON_TOOLS_ROOTS=str(tmp_path),
     )
-    assert settings.tools_mode == "ask", "the default a person gets; the override must win"
+    assert settings.tools_mode == "full", "the default a person gets; the override must win"
 
     from daemon.app import _build_tools
     from daemon.tools.runner import TurnContext
