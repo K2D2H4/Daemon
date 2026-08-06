@@ -5,7 +5,9 @@
 # on both registries and unused on GitHub - if a distinct wake word is ever
 # wanted for voice.
 name = "daemon-ai"
-version = "0.0.1"
+# The version lives in `daemon/__init__.py:__version__`; hatchling reads it below.
+# One number, so `daemon --version` and the wheel metadata cannot drift apart.
+dynamic = ["version"]
 description = "An open-source, self-hosted AI companion that you shape - and that reshapes itself around you."
 requires-python = ">=3.13"
 license = { text = "MIT" }
@@ -69,6 +71,9 @@ daemon = "daemon.app:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "daemon/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["daemon"]
