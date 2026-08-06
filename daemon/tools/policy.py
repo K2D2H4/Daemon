@@ -170,11 +170,20 @@ def fingerprint(tool: str, arguments: Mapping[str, Any]) -> str:
 
 
 def parse_command(text: str) -> Command | None:
-    """Read `/approve CODE [always]` or `/deny CODE`, or return None.
+    """Read `/approve [CODE] [always]` or `/deny [CODE]`, or return None.
 
-    Recognised before the model sees the message (loop.py), which is why it is
-    strict: a first token that is not exactly one of the two commands is ordinary
-    conversation and must reach the model untouched.
+    Recognised before the model sees the message (loop.py), which is why the first
+    token must be *exactly* one of the two commands: anything else - `/approved`,
+    `approve`, "tell me about /approve" - is ordinary conversation and must reach
+    the model untouched.
+
+    A bare `/approve` with no code still parses, to `code=""`. That is the fix for
+    the loop the owner could not escape: returning None here sent the bare command
+    on to the model as conversation, which answered it by re-issuing the guarded
+    call, so the runner minted *another* approval code and asked all over again -
+    every `/approve` making it worse and the pending code never spendable. As a
+    command it lands in `loop._approve`, which turns the empty code into a nudge to
+    include one, with no model call and nothing run.
     """
     parts = text.strip().split()
     if not parts:
@@ -182,10 +191,8 @@ def parse_command(text: str) -> Command | None:
     head = parts[0].lower()
     if head not in (APPROVE_COMMAND, DENY_COMMAND):
         return None
-    if len(parts) < 2:
-        return None
     return Command(
-        code=normalise_code(parts[1]),
+        code=normalise_code(parts[1]) if len(parts) > 1 else "",
         denied=head == DENY_COMMAND,
         always=len(parts) > 2 and parts[2].lower() == ALWAYS,
     )

@@ -56,6 +56,10 @@ opposite of local, and the offline preset never resolves HOSTED at all."""
 VOICE_TASKS = frozenset({Task.CHAT_VOICE})
 """Tasks that need a hosted native-audio model. The offline preset has none."""
 
+THINKING_LEVELS = ("", "low", "high")
+"""What DAEMON_GEMINI_THINKING_LEVEL accepts: `low`, `high`, or empty to leave it
+to the model. A Gemini 3 knob; other providers ignore it."""
+
 SENSITIVITIES = ("low", "high")
 """What the two speech-sensitivity settings accept, plus empty for "the server
 decides".
@@ -255,6 +259,15 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="", alias="DAEMON_OPENAI_MODEL")
     gemini_model: str = Field(default="", alias="DAEMON_GEMINI_MODEL")
 
+    gemini_thinking_level: str = Field(default="low", alias="DAEMON_GEMINI_THINKING_LEVEL")
+    """How hard a Gemini 3 model thinks before answering: `low`, `high`, or empty
+    to leave it to the model. `low` by default, and that is a latency decision:
+    measured on gemini-3.6-flash, the default (high) spent ~300 thinking tokens and
+    ~3.6s *per call* on a plain weather lookup; `low` is ~1.3s with the tool call
+    still made, so a two-call turn lands near 4s instead of 12s. Set `high` for a
+    reasoning-heavy setup, or empty for a non-Gemini-3 model that rejects the field.
+    Ignored by providers other than Gemini."""
+
     embed_model: str = Field(default="bge-m3", alias="DAEMON_EMBED_MODEL")
     """Embedding model for recall, separate from the chat model even though both
     run on Ollama: chat may move to a hosted provider while embeddings stay local
@@ -449,8 +462,9 @@ class Settings(BaseSettings):
     and one that cannot open a file on it is a chat window with extra steps - so a
     default of `false` would ship the definition unmet and call it caution.
 
-    What makes that safe is not this switch, it is the gate: `tools_mode` is `ask`,
-    so nothing that changes the machine runs without a one-shot code, and no tool at
+    The switch is not what makes it safe. The default `tools_mode` is `full`, so a
+    guarded tool runs without asking (see that field for the trade and how to make it
+    cautious again); the boundary that always holds is the origin gate - no tool at
     all runs on a turn that is not the owner's own words (tools/policy.py). The two
     capabilities that read more than that - the browser group and MCP - stay off and
     have their own switches.
@@ -459,12 +473,25 @@ class Settings(BaseSettings):
     capability the owner cannot see is the silent state this project keeps being
     bitten by."""
 
-    tools_mode: str = Field(default="ask", alias="DAEMON_TOOLS_MODE")
+    tools_mode: str = Field(default="full", alias="DAEMON_TOOLS_MODE")
     """`off` | `allowlist` | `ask` | `full` - see daemon/tools/policy.py.
 
-    `ask` rather than `allowlist` as the default for a switched-on install: the
-    first sessions are when you find out what it wants to run, and `allowlist`
-    answers anything unlisted with a flat refusal that teaches nobody anything."""
+    `full` is the default, and it is a deliberate choice with real teeth: a guarded
+    tool - `run_command`, `write_file`, `open_path` - runs without asking, so the
+    model can `rm -rf` a directory or overwrite a file on the strength of one turn.
+    The reason it is still the default is the same argument `tools_enabled` makes one
+    line down: this is a companion that lives on the owner's own machine, and one
+    that stops to ask permission before every single action it takes there is the
+    "chat window with extra steps" the product exists not to be. The boundary that
+    stays is the one that cannot be configured off - **no tool runs on a turn that
+    is not the owner's own words** (tools/policy.py's origin gate), so a forward, an
+    inline-bot result or anything recall dug up still reaches nothing.
+
+    The cautious settings are one line away and `daemon doctor` prints which is in
+    force: `ask` asks about anything that changes the machine (each request carries a
+    one-shot code), `allowlist` runs only named commands and refuses the rest, `off`
+    refuses every guarded tool. Pick one of those if unattended `rm -rf` is a risk
+    worth a prompt to you."""
 
     tools_allowlist: Annotated[tuple[str, ...], NoDecode] = Field(
         default=(), alias="DAEMON_TOOLS_ALLOWLIST"
@@ -781,6 +808,11 @@ class Settings(BaseSettings):
             problems.append(
                 f"unknown DAEMON_TOOLS_MODE {self.tools_mode!r}; expected one of "
                 f"{', '.join(TOOL_MODES)}"
+            )
+        if self.gemini_thinking_level not in THINKING_LEVELS:
+            problems.append(
+                f"unknown DAEMON_GEMINI_THINKING_LEVEL {self.gemini_thinking_level!r}; "
+                f"expected one of {', '.join(repr(x) for x in THINKING_LEVELS)}"
             )
         if self.tools_enabled:
             # Only checked when tools are on: a text-only install should not have to

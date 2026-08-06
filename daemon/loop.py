@@ -47,6 +47,17 @@ ROUND_LIMIT_NOTICE = (
     "already know, and say what is still unresolved."
 )
 
+INCOMPLETE_NOTICE = (
+    "I went back and forth on that one and couldn't wrap it up cleanly. Could you try "
+    "again, or ask it a little differently?"
+)
+"""Sent when a turn ends with no answer text at all - the model kept asking for
+tools until the round cap and then, even with none on offer, returned another
+(often hallucinated) tool call instead of prose. The channel refuses an empty
+message, so without this the whole turn is silence the owner reads as being
+ignored, and they have to poke it again to get anything (measured on
+gemini-3.6-flash: a 'next week's weather' turn that no tool could satisfy)."""
+
 APPROVAL_REQUEST = (
     "That needs your say-so:\n\n{preview}\n\n"
     "Reply `/approve {code}` to let it run once, `/approve {code} always` to stop "
@@ -55,6 +66,10 @@ APPROVAL_REQUEST = (
 
 APPROVAL_UNKNOWN = (
     "That is not a code I am waiting on - it may have lapsed, or already been used."
+)
+APPROVAL_NO_CODE = (
+    "Add the code from the request, like `/approve A3F2K9QT` (or `/deny A3F2K9QT`). "
+    "`/approve` on its own does not say which pending request you mean."
 )
 APPROVAL_DENIED = "Understood, I have not run it."
 APPROVAL_NOT_OWNER = (
@@ -208,7 +223,6 @@ class ConversationLoop:
             round_outcome = await self._companion.run_tools(
                 completion.tool_calls, origin=origin, channel=channel, sender_id=sender_id
             )
-            outcome.notices.extend(round_outcome.notices)
             outcome.approvals.extend(round_outcome.approvals)
 
             messages.append(
@@ -224,7 +238,20 @@ class ConversationLoop:
             )
             completion = await self._gateway.complete(Task.CHAT_TEXT, messages, tools=specs)
 
-        return _with_notices(completion.text, outcome.notices), outcome
+        # Just the model's answer. What actually ran is not folded into the reply -
+        # a companion that narrates every `run`/`write`/`rm` reads as clutter, and the
+        # owner's ground-truth record lives in the `tool_calls` audit (`daemon tools
+        # log`) rather than in a line the model's prose sits on top of.
+        if not completion.text.strip():
+            # No answer text - the model spent the round cap on tool calls and then
+            # returned another one instead of prose, even with no tools offered. The
+            # channel refuses an empty message, so returning "" is silence; say
+            # something the owner can act on instead.
+            logger.warning(
+                "turn produced no answer text after tools; sending the incomplete notice"
+            )
+            return INCOMPLETE_NOTICE, outcome
+        return completion.text, outcome
 
     async def _ask_approvals(self, outcome: Outcome, recipient_id: str | None) -> None:
         """Send one approval request per parked call, after the reply.
@@ -262,6 +289,15 @@ class ConversationLoop:
             await say(APPROVAL_NOT_OWNER)
             return
 
+        if not command.code:
+            # A bare `/approve` with no code. Answered here, in the control plane,
+            # rather than handed to the model: the model would treat it as ordinary
+            # conversation and re-issue the guarded call, minting a fresh code and
+            # asking again - the loop this whole branch exists to close. No claim, no
+            # model call, and the pending code stays live for a real `/approve CODE`.
+            await say(APPROVAL_NO_CODE)
+            return
+
         claimed = self._companion.claim(command, sender_id=inbound.sender_id)
         if claimed is None:
             await say(APPROVAL_UNKNOWN)
@@ -280,7 +316,7 @@ class ConversationLoop:
             claimed.preview, result.content, said=inbound.text
         )
         completion = await self._gateway.complete(Task.CHAT_TEXT, messages)
-        text = _with_notices(completion.text, [f"🔧 {claimed.preview}"])
+        text = completion.text
 
         await self._companion.record(
             LoggedMessage(
@@ -364,18 +400,3 @@ class ConversationLoop:
         return messages
 
 
-def _with_notices(text: str, notices: list[str]) -> str:
-    """Put what was done in front of what was said.
-
-    Above the reply rather than below it: the model's answer can be long, and the
-    one line the owner needs in order to notice a tool they did not expect must not
-    be at the bottom of it. Deduplicated in order, because a model that reads the
-    same file twice in one turn should not produce the same line twice.
-    """
-    if not notices:
-        return text
-    seen: list[str] = []
-    for notice in notices:
-        if notice not in seen:
-            seen.append(notice)
-    return "\n".join([*seen, "", text]) if text else "\n".join(seen)

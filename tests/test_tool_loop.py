@@ -21,8 +21,8 @@ from test_loop import FakeChannel, FakeMemory, gateway_for
 
 from daemon.channels.base import InboundMessage
 from daemon.companion import TOOL_CONTRACT, Companion
-from daemon.llm.base import ToolCall
-from daemon.loop import ConversationLoop
+from daemon.llm.base import Completion, ToolCall
+from daemon.loop import APPROVAL_NO_CODE, INCOMPLETE_NOTICE, ConversationLoop
 from daemon.memory.store import Store
 from daemon.tools.base import Registry
 from daemon.tools.builtin import builtin_tools
@@ -143,69 +143,31 @@ async def test_a_tool_result_comes_back_and_the_model_answers(
     assert "목요일이라고 적어뒀네." in sent.text
 
 
-async def test_what_ran_is_put_in_front_of_what_was_said(
+async def test_the_reply_is_just_the_answer_and_the_run_is_only_in_the_audit(
     data_dir: Path, store: Store, tmp_path: Path
 ) -> None:
-    """Above the reply, not below it: the answer can be long, and the line that
-    lets the owner notice an unexpected tool must not be at the bottom of it."""
+    """What ran is not folded into the reply, in text or recorded turn. A companion
+    that narrates every call reads as clutter; the owner's ground-truth record is the
+    `tool_calls` audit row (`daemon tools log`), written for every executed call."""
     (tmp_path / "notes.md").write_text("hi")
     provider = FakeProvider(
         reply="Nothing much in there.",
         scripted_calls=[[read_file_call(tmp_path / "notes.md")]],
     )
+    memory = FakeMemory()
     channel = FakeChannel([inbound("what is in my notes?")])
 
     await loop_for(
-        channel, provider, FakeMemory(), data_dir, runner(store, tmp_path, mode="ask")
+        channel, provider, memory, data_dir, runner(store, tmp_path, mode="ask")
     ).run()
 
-    text = channel.sent[0].text
-    assert text.startswith(f"🔧 read {tmp_path / 'notes.md'}")
-    assert text.endswith("Nothing much in there.")
-
-
-async def test_the_notice_is_part_of_what_gets_recorded(
-    data_dir: Path, store: Store, tmp_path: Path
-) -> None:
-    """The markdown log is the source of truth for what the owner was told, so it
-    has to carry the same line they saw."""
-    (tmp_path / "notes.md").write_text("hi")
-    provider = FakeProvider(
-        reply="empty-ish", scripted_calls=[[read_file_call(tmp_path / "notes.md")]]
-    )
-    memory = FakeMemory()
-
-    await loop_for(
-        FakeChannel([inbound("read it")]),
-        provider,
-        memory,
-        data_dir,
-        runner(store, tmp_path, mode="ask"),
-    ).run()
-
+    # The reply and the recorded assistant turn are the model's answer alone.
+    assert channel.sent[0].text == "Nothing much in there."
     assistant = [m for m in memory.records if m.role == "assistant"]
-    assert "🔧 read" in assistant[0].content
-
-
-async def test_the_same_tool_twice_is_reported_once(
-    data_dir: Path, store: Store, tmp_path: Path
-) -> None:
-    (tmp_path / "notes.md").write_text("hi")
-    call = read_file_call(tmp_path / "notes.md")
-    provider = FakeProvider(
-        reply="done",
-        scripted_calls=[
-            [call],
-            [ToolCall(id="2", name="read_file", arguments=call.arguments)],
-        ],
-    )
-    channel = FakeChannel([inbound("read it twice")])
-
-    await loop_for(
-        channel, provider, FakeMemory(), data_dir, runner(store, tmp_path, mode="ask")
-    ).run()
-
-    assert channel.sent[0].text.count("🔧 read") == 1
+    assert "🔧" not in assistant[0].content
+    # But the call is on the record where it belongs, and exactly once.
+    ran = [row for row in store.recent_tool_calls() if row["ran"]]
+    assert [row["tool"] for row in ran] == ["read_file"]
 
 
 async def test_several_rounds_are_allowed(data_dir: Path, store: Store, tmp_path: Path) -> None:
@@ -252,6 +214,45 @@ async def test_the_round_cap_forces_an_answer(
     # The final call must offer no tools, or the answer could be another tool call.
     assert provider.offered_tools[-1] == ()
     assert "I will stop." in channel.sent[0].text
+
+
+async def test_an_empty_final_answer_is_never_delivered_as_silence(
+    data_dir: Path, store: Store, tmp_path: Path
+) -> None:
+    """A turn must never go silent. Measured on gemini-3.6-flash: a request no tool
+    could satisfy ('next week's weather') burned the round cap and then, on the
+    no-tools escape call, returned another bare tool call with no text - so the reply
+    was empty, the channel refused it, and the owner got nothing until they poked
+    again. When there is no answer text, a short admission goes out instead."""
+    (tmp_path / "notes.md").write_text("hi")
+
+    class NeverAnswers:
+        """Always a tool call, never any prose - even when no tools are offered, the
+        way flash hallucinated one on the escape call."""
+
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.offered_tools: list[tuple] = []
+
+        async def complete(self, messages, *, model, tools=None, **kw):  # type: ignore[no-untyped-def]
+            self.offered_tools.append(tuple(tools or ()))
+            return Completion(
+                text="", model=model, tool_calls=(read_file_call(tmp_path / "notes.md"),)
+            )
+
+        async def health(self) -> bool:
+            return True
+
+    channel = FakeChannel([inbound("what's next week's weather")])
+    await loop_for(
+        channel, NeverAnswers(), FakeMemory(), data_dir,
+        runner(store, tmp_path, mode="ask"), max_tool_rounds=2,
+    ).run()
+
+    assert channel.sent, "the turn delivered nothing at all"
+    assert channel.sent[0].text == INCOMPLETE_NOTICE
+    assert channel.sent[0].text.strip(), "an empty reply was sent as silence"
 
 
 async def test_a_denied_call_tells_the_model_why(
@@ -394,7 +395,6 @@ async def test_approving_runs_it_and_reports_back(
     await loop_for(approving, provider, memory, data_dir, tools).run()
 
     assert target.read_text() == "milk"
-    assert "🔧" in approving.sent[0].text
     # The result reached the model as context for what it says next.
     resumed = provider.calls[-1]
     assert any("has now run" in m.content for m in resumed if m.role == "system")
@@ -404,6 +404,54 @@ async def test_approving_runs_it_and_reports_back(
     assert resumed[-1].role == "user"
     assert resumed[-1].content.startswith("/approve")
     assert provider.offered_tools[-1] == (), "the approval authorised one call, not a turn"
+
+
+async def test_a_bare_approve_breaks_the_loop_instead_of_minting_another_code(
+    data_dir: Path, store: Store, tmp_path: Path
+) -> None:
+    """The reported bug. A `/approve` with no code must not reach the model.
+
+    When it did, the model answered it as ordinary conversation by re-issuing the
+    guarded call, the runner minted a *fresh* code, and the owner - who has just
+    tried to approve - is asked to approve all over again. Every `/approve` made it
+    worse; the pending code was never spendable this way. So a bare command is
+    handled in the control plane: one nudge back, no model call, and the original
+    code stays live for a real `/approve CODE`.
+    """
+    provider = FakeProvider(
+        reply="ok",
+        scripted_calls=[
+            [ToolCall(id="1", name="run_command", arguments={"command": "curl -s wttr.in/Seoul"})]
+        ],
+    )
+    tools = runner(store, tmp_path, mode="ask")
+    memory = FakeMemory()
+    channel = FakeChannel([inbound("서울 날씨 알려줘")])
+    await loop_for(channel, provider, memory, data_dir, tools).run()
+    first = CODE_RE.search(channel.sent[1].text)
+    assert first is not None
+    calls_before = len(provider.calls)
+
+    bare = FakeChannel([inbound("/approve")])
+    await loop_for(bare, provider, memory, data_dir, tools).run()
+
+    # One message back, and it is the nudge to include a code - not another
+    # "That needs your say-so" request carrying a fresh one.
+    assert len(bare.sent) == 1
+    assert bare.sent[0].text == APPROVAL_NO_CODE
+    assert "That needs your say-so" not in bare.sent[0].text
+    # The model was never asked, so no tool call and no new code could be minted -
+    # this is the loop being gone, at its source.
+    assert len(provider.calls) == calls_before, "a bare /approve reached the model"
+    # And it did not become a conversation memory recall could surface later.
+    assert not any("/approve" in record.content for record in memory.records)
+
+    # The original code is untouched, so a real approval still runs the command -
+    # confirmed by an executed audit row, since the reply no longer says "🔧".
+    ran = FakeChannel([inbound(f"/approve {first.group(1)}")])
+    await loop_for(ran, provider, memory, data_dir, tools).run()
+    executed = [row for row in store.recent_tool_calls() if row["ran"]]
+    assert [row["tool"] for row in executed] == ["run_command"]
 
 
 async def test_denying_runs_nothing_and_costs_no_model_call(
@@ -535,7 +583,8 @@ async def test_approving_always_stops_the_asking(
     await loop_for(granting, provider, FakeMemory(), data_dir, tools).run()
     assert store.tool_allowlist("run_command") == ["date"]
 
-    # Asked again, it just runs: one message out, no approval request.
+    # Asked again, it just runs: one message out, no approval request, and an
+    # executed audit row for the standing-granted command.
     again = FakeProvider(
         reply="It is Monday.",
         scripted_calls=[[ToolCall(id="1", name="run_command", arguments={"command": "date"})]],
@@ -543,4 +592,10 @@ async def test_approving_always_stops_the_asking(
     second = FakeChannel([inbound("and now?")])
     await loop_for(second, again, FakeMemory(), data_dir, tools).run()
     assert len(second.sent) == 1
-    assert "🔧 run `date`" in second.sent[0].text
+    assert second.sent[0].text == "It is Monday."
+    granted_runs = [
+        row
+        for row in store.recent_tool_calls()
+        if row["ran"] and row["reason"].startswith("allowlisted")
+    ]
+    assert granted_runs, "the standing-granted command did not run without asking"
