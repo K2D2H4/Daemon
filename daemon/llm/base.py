@@ -47,6 +47,14 @@ class ToolCall:
     arguments: dict[str, Any]
     """Already decoded. OpenAI hands these over as a JSON string and Ollama as a
     dict, and that difference stops at the provider boundary."""
+    provider_signature: str | None = None
+    """An opaque token a provider attaches to a call and requires echoed back
+    verbatim when the call is replayed in history. Gemini 3 calls it a
+    `thoughtSignature` and rejects a replayed tool turn that omits it (HTTP 400);
+    it has nowhere else to live, because a provider is rebuilt from these neutral
+    objects each call and keeps no state of its own. None for a provider that
+    issues none, and for the parallel calls after the first, which Gemini itself
+    leaves unsigned. Defaulted, so every existing constructor keeps working."""
 
 
 @dataclass(frozen=True, slots=True)
