@@ -253,6 +253,29 @@ def test_run_serves(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cli.main(["run"]) == 0
 
 
+def test_version_flag_prints_the_package_version(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`daemon --version` is the first line of any bug report, so it must work on a
+    machine where the install is broken. It reads the one place the version is
+    declared - `daemon.__version__` - which is the same number a source checkout and
+    an installed wheel both carry, so it needs no network and no metadata lookup."""
+    from daemon import __version__
+
+    assert cli.main(["--version"]) == 0
+    assert __version__ in capsys.readouterr().out
+
+
+def test_version_is_a_release_number() -> None:
+    """Guards the bump: an empty or malformed `__version__` would make `--version`
+    print nothing useful and would tag a release nobody can pin."""
+    import re
+
+    from daemon import __version__
+
+    assert re.fullmatch(r"\d+\.\d+\.\d+", __version__), __version__
+
+
 def test_run_warns_when_the_shell_overrides_the_env_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

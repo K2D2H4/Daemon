@@ -41,8 +41,15 @@ that overturned some of them: **[docs/adr/](docs/adr/)**.
 ## Try it
 
 ```bash
-git clone https://github.com/K2D2H4/Daemon.git && cd Daemon
-pip install -e ".[dev]"     # Python 3.13
+curl -fsSL https://raw.githubusercontent.com/K2D2H4/Daemon/main/install.sh | bash
+```
+
+One command, on a Mac with nothing set up. It bootstraps
+[uv](https://docs.astral.sh/uv/), which provisions Python 3.13 and installs the
+`daemon` command into an isolated environment — it does not touch your system
+Python. Then run onboarding in your own terminal:
+
+```bash
 daemon setup
 ```
 
@@ -50,6 +57,20 @@ daemon setup
 bot token from [@BotFather](https://t.me/BotFather). Then it waits for you to
 message the bot and asks whether that was you — nobody types a numeric user id.
 Pick `offline` and you need no API key at all, just [Ollama](https://ollama.com).
+
+Voice is an opt-in extra (needs PortAudio, macOS only): install with
+`uv tool install --force --from "git+https://github.com/K2D2H4/Daemon" "daemon-ai[voice]"`.
+
+<details>
+<summary>From source (development)</summary>
+
+```bash
+git clone https://github.com/K2D2H4/Daemon.git && cd Daemon
+pip install -e ".[dev]"     # Python 3.13; add ".[dev,voice]" for the voice extra
+daemon setup
+```
+
+</details>
 
 ```bash
 daemon run       # here, in this terminal
