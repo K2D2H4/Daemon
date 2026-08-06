@@ -22,7 +22,7 @@ from test_loop import FakeChannel, FakeMemory, gateway_for
 from daemon.channels.base import InboundMessage
 from daemon.companion import TOOL_CONTRACT, Companion
 from daemon.llm.base import ToolCall
-from daemon.loop import ConversationLoop
+from daemon.loop import APPROVAL_NO_CODE, ConversationLoop
 from daemon.memory.store import Store
 from daemon.tools.base import Registry
 from daemon.tools.builtin import builtin_tools
@@ -404,6 +404,52 @@ async def test_approving_runs_it_and_reports_back(
     assert resumed[-1].role == "user"
     assert resumed[-1].content.startswith("/approve")
     assert provider.offered_tools[-1] == (), "the approval authorised one call, not a turn"
+
+
+async def test_a_bare_approve_breaks_the_loop_instead_of_minting_another_code(
+    data_dir: Path, store: Store, tmp_path: Path
+) -> None:
+    """The reported bug. A `/approve` with no code must not reach the model.
+
+    When it did, the model answered it as ordinary conversation by re-issuing the
+    guarded call, the runner minted a *fresh* code, and the owner - who has just
+    tried to approve - is asked to approve all over again. Every `/approve` made it
+    worse; the pending code was never spendable this way. So a bare command is
+    handled in the control plane: one nudge back, no model call, and the original
+    code stays live for a real `/approve CODE`.
+    """
+    provider = FakeProvider(
+        reply="ok",
+        scripted_calls=[
+            [ToolCall(id="1", name="run_command", arguments={"command": "curl -s wttr.in/Seoul"})]
+        ],
+    )
+    tools = runner(store, tmp_path, mode="ask")
+    memory = FakeMemory()
+    channel = FakeChannel([inbound("서울 날씨 알려줘")])
+    await loop_for(channel, provider, memory, data_dir, tools).run()
+    first = CODE_RE.search(channel.sent[1].text)
+    assert first is not None
+    calls_before = len(provider.calls)
+
+    bare = FakeChannel([inbound("/approve")])
+    await loop_for(bare, provider, memory, data_dir, tools).run()
+
+    # One message back, and it is the nudge to include a code - not another
+    # "That needs your say-so" request carrying a fresh one.
+    assert len(bare.sent) == 1
+    assert bare.sent[0].text == APPROVAL_NO_CODE
+    assert "That needs your say-so" not in bare.sent[0].text
+    # The model was never asked, so no tool call and no new code could be minted -
+    # this is the loop being gone, at its source.
+    assert len(provider.calls) == calls_before, "a bare /approve reached the model"
+    # And it did not become a conversation memory recall could surface later.
+    assert not any("/approve" in record.content for record in memory.records)
+
+    # The original code is untouched, so a real approval still runs the command.
+    ran = FakeChannel([inbound(f"/approve {first.group(1)}")])
+    await loop_for(ran, provider, memory, data_dir, tools).run()
+    assert "🔧" in ran.sent[0].text
 
 
 async def test_denying_runs_nothing_and_costs_no_model_call(

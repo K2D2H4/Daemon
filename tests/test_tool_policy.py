@@ -759,13 +759,28 @@ async def test_approval_commands_are_recognised(
 
 
 @pytest.mark.parametrize(
+    ("text", "denied"),
+    [
+        ("/approve", False),
+        ("  /APPROVE  ", False),
+        ("/deny", True),
+    ],
+)
+async def test_a_bare_command_still_parses_with_no_code(text: str, denied: bool) -> None:
+    """A `/approve` with no code is still the control-plane verb, and must parse -
+    to an empty code - rather than return None. Returning None here fell through to
+    the model as conversation, which answered it by re-issuing the guarded call and
+    minting yet another approval code: the loop the owner could not escape by typing
+    `/approve` again. `loop._approve` turns the empty code into a nudge, not a call."""
+    assert parse_command(text) == Command(code="", denied=denied, always=False)
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "",
         "   ",
         "hello",
-        "/approve",
-        "/deny",
         "tell me about /approve A3F2K9QT",
         "approve A3F2K9QT",
         "/approved A3F2K9QT",
@@ -773,7 +788,8 @@ async def test_approval_commands_are_recognised(
 )
 async def test_ordinary_conversation_is_not_an_approval(text: str) -> None:
     """A false positive here would swallow a message the user meant for the model,
-    so the first token must be exactly the command."""
+    so the first token must be exactly the command. A bare `/approve` clears that
+    bar - the first token *is* the command - and is covered above, not here."""
     assert parse_command(text) is None
 
 

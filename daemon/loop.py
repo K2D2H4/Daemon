@@ -56,6 +56,10 @@ APPROVAL_REQUEST = (
 APPROVAL_UNKNOWN = (
     "That is not a code I am waiting on - it may have lapsed, or already been used."
 )
+APPROVAL_NO_CODE = (
+    "Add the code from the request, like `/approve A3F2K9QT` (or `/deny A3F2K9QT`). "
+    "`/approve` on its own does not say which pending request you mean."
+)
 APPROVAL_DENIED = "Understood, I have not run it."
 APPROVAL_NOT_OWNER = (
     "Approvals only count when they come from you directly, not forwarded on."
@@ -260,6 +264,15 @@ class ConversationLoop:
             # nothing and reveals nothing.
             logger.warning("refusing a relayed approval from sender=%s", inbound.sender_id)
             await say(APPROVAL_NOT_OWNER)
+            return
+
+        if not command.code:
+            # A bare `/approve` with no code. Answered here, in the control plane,
+            # rather than handed to the model: the model would treat it as ordinary
+            # conversation and re-issue the guarded call, minting a fresh code and
+            # asking again - the loop this whole branch exists to close. No claim, no
+            # model call, and the pending code stays live for a real `/approve CODE`.
+            await say(APPROVAL_NO_CODE)
             return
 
         claimed = self._companion.claim(command, sender_id=inbound.sender_id)
