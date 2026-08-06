@@ -128,11 +128,13 @@ class GeminiProvider:
         # into config, and only one of them makes a valid path.
         url = f"{API_BASE}/models/{model.removeprefix('models/')}:generateContent"
 
-        # At most two POSTs, and the second only for an empty MALFORMED_FUNCTION_CALL
-        # (see that constant). Everything else - a real reply, a block, an unreadable
-        # body - returns or raises on the first pass, so the retry is reserved for the
-        # one failure a fresh sample actually fixes and does not become a chain the
-        # gateway's fallback should own instead (llm/base.py).
+        # One re-sample, reserved for an empty MALFORMED_FUNCTION_CALL (see that
+        # constant): a fresh sample fixes it, while everything else - a real reply, a
+        # block, an unreadable body - returns or raises on the first pass. This is a
+        # second, orthogonal single-retry sitting on top of `_post`'s own transport
+        # retry, so a rare transient-then-malformed run can reach up to four POSTs;
+        # each axis still fires at most once and then raises, which is what keeps the
+        # gateway owning fallback rather than this becoming a chain (llm/base.py).
         for attempt in (1, 2):
             data = await self._post(url, payload)
             try:

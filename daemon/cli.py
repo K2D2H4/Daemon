@@ -723,11 +723,13 @@ def _tools_check(settings: Settings) -> Check:
         extras.append(f"browser={settings.browser_app}")
     if settings.mcp_enabled:
         extras.append("mcp=on")
-    allowed = ", ".join(settings.tools_allowlist) or "nothing"
-    detail = (
-        f"on mode={settings.tools_mode} roots={', '.join(settings.tools_roots)} "
-        f"runs-without-asking={allowed}"
-    )
+    detail = f"on mode={settings.tools_mode} roots={', '.join(settings.tools_roots)}"
+    if settings.tools_mode != "full":
+        # The allowlist is what runs without a prompt under `ask`/`allowlist`. Under
+        # `full` *everything* does, so naming the (usually empty) allowlist there
+        # reads as the exact opposite of the truth.
+        allowed = ", ".join(settings.tools_allowlist) or "nothing"
+        detail += f" runs-without-asking={allowed}"
     if extras:
         detail += " " + " ".join(extras)
     # `full` is the default (config.py) and the one setting where nothing but the
