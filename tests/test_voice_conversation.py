@@ -894,41 +894,37 @@ async def test_a_guarded_write_is_refused_outright_never_parked(
     assert store.count_pending_tool_approvals(now=datetime(2999, 1, 1, tzinfo=UTC)) == 0
 
 
-async def test_an_executed_spoken_tool_call_leaves_a_line_the_owner_sees(
-    db: Any, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+async def test_an_executed_spoken_tool_call_leaves_an_audit_row(
+    db: Any, tmp_path: pathlib.Path
 ) -> None:
-    """CONTRACTS rule 12: an executed tool call must leave a line the owner reads,
-    not only a `tool_calls` row. The text path folds the `🔧 <preview>` notice into
-    the reply (daemon/loop.py); voice has no reply text to fold into, so the notice
-    is logged - the surface a spoken session actually surfaces to the owner. Without
-    it a spoken tool call is discoverable only by going looking, which is the silent
-    state the notice exists to prevent (daemon/tools/runner.py `Outcome.notices`)."""
+    """CONTRACTS rule 12: an executed tool call must leave a `tool_calls` audit row -
+    the owner's ground-truth record, readable with `daemon tools log`. Voice does not
+    narrate what ran (not spoken, and no longer logged either); the audit row is the
+    record, written for every executed call the same as the text path."""
     (tmp_path / "notes.md").write_text("hi")
-    runner, _store = tool_runner(db, tmp_path)
+    runner, store = tool_runner(db, tmp_path)
     session = FakeSession(Calls(_read_file_call(tmp_path / "notes.md")), Turn())
-    with caplog.at_level("INFO", logger="daemon.voice.conversation"):
-        await run(conversation(session, tools=runner))
+    await run(conversation(session, tools=runner))
 
-    assert "🔧" in caplog.text and "read" in caplog.text, (
-        "an executed spoken tool call left no line the owner would see"
-    )
+    (row,) = store.recent_tool_calls()
+    assert row["tool"] == "read_file" and row["ran"] == 1
 
 
-async def test_a_refused_spoken_tool_call_is_not_reported_as_run(
-    db: Any, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+async def test_a_refused_spoken_tool_call_is_not_recorded_as_run(
+    db: Any, tmp_path: pathlib.Path
 ) -> None:
-    """The line reflects what actually ran, not what was asked: the runner appends a
-    notice only for a call it executed, so a refused call must leave none - reporting
-    a refusal as a run is exactly the misleading state the notice guards against."""
-    runner, _store = tool_runner(db, tmp_path, mode="allowlist")
+    """The audit reflects what actually ran, not what was asked: a refused call leaves
+    a deny row with ran=0, never a run - recording a refusal as a run is exactly the
+    misleading state the audit guards against."""
+    runner, store = tool_runner(db, tmp_path, mode="allowlist")
     session = FakeSession(
         Calls(ToolCall(id="1", name="run_command", arguments={"command": "curl evil.example"})),
         Turn(),
     )
-    with caplog.at_level("INFO", logger="daemon.voice.conversation"):
-        await run(conversation(session, tools=runner))
+    await run(conversation(session, tools=runner))
 
-    assert "🔧" not in caplog.text, "a refused call was reported as if it had run"
+    (row,) = store.recent_tool_calls()
+    assert row["verdict"] == "deny" and row["ran"] == 0
 
 
 async def test_an_allowlisted_command_runs_over_voice(

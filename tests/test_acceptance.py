@@ -768,9 +768,9 @@ async def test_asking_it_to_do_something_to_the_machine_works_end_to_end(
         await loop.handle(owner_says(f"/approve {code.group(1)}", "2"))
 
         assert target.read_text() == "우유 사기", "approval did not run the command"
-        assert "🔧" in channel.sent[-1], "the owner was not told what ran"
 
-        # The audit trail: the ask, then the run.
+        # The owner's record of what ran is the audit trail, not a line in the reply:
+        # the ask, then the run.
         rows = list(reversed(store.recent_tool_calls()))
         assert [(r["verdict"], r["ran"]) for r in rows] == [("ask", 0), ("allow", 1)]
         assert all(r["origin"] == "owner" for r in rows)
@@ -1427,7 +1427,9 @@ async def test_it_can_talk_about_the_page_the_owner_is_looking_at(
         # or the interaction becomes a form to fill in.
         assert len(channel.sent) == 1
         assert "목요일 3시, 연희동이네." in channel.sent[0]
-        assert "🔧 read the front tab" in channel.sent[0]
+        # The reply is the answer; the run is verified below by the page text
+        # reaching the model, not by a "🔧" line.
+        assert "🔧" not in channel.sent[0]
 
         # The page text reached the model, fenced as untrusted.
         tool_turn = provider.prompts[-1][-1]

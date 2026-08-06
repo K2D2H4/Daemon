@@ -64,13 +64,11 @@ class Outcome:
     results: list[ToolResult] = field(default_factory=list)
     """One per call, in order, to hand back to the model."""
     approvals: list[Approval] = field(default_factory=list)
-    """Calls the owner has to authorise before anything happens."""
-    notices: list[str] = field(default_factory=list)
-    """What to tell the owner was done, in the reply itself.
+    """Calls the owner has to authorise before anything happens.
 
-    Not a log line. A companion that quietly runs commands is one whose
-    misbehaviour is only discoverable by someone who goes looking, and the person
-    who most needs to notice is the one reading the reply.
+    What actually ran is not carried back for the reply: the owner's ground-truth
+    record of every executed call is the `tool_calls` audit row (`daemon tools log`),
+    not a line folded into the model's prose. `_run` writes that row for every call.
     """
 
 
@@ -204,9 +202,9 @@ class ToolRunner:
                 ok=False,
             )
 
-        result = await self._run(tool, call.id, call.name, call.arguments, decision.reason, context)
-        outcome.notices.append(f"🔧 {preview}")
-        return result
+        return await self._run(
+            tool, call.id, call.name, call.arguments, decision.reason, context
+        )
 
     async def resume(self, claimed: Claimed, context: TurnContext) -> ToolResult:
         """Run a call the owner has just approved.

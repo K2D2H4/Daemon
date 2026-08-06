@@ -212,7 +212,6 @@ class ConversationLoop:
             round_outcome = await self._companion.run_tools(
                 completion.tool_calls, origin=origin, channel=channel, sender_id=sender_id
             )
-            outcome.notices.extend(round_outcome.notices)
             outcome.approvals.extend(round_outcome.approvals)
 
             messages.append(
@@ -228,7 +227,11 @@ class ConversationLoop:
             )
             completion = await self._gateway.complete(Task.CHAT_TEXT, messages, tools=specs)
 
-        return _with_notices(completion.text, outcome.notices), outcome
+        # Just the model's answer. What actually ran is not folded into the reply -
+        # a companion that narrates every `run`/`write`/`rm` reads as clutter, and the
+        # owner's ground-truth record lives in the `tool_calls` audit (`daemon tools
+        # log`) rather than in a line the model's prose sits on top of.
+        return completion.text, outcome
 
     async def _ask_approvals(self, outcome: Outcome, recipient_id: str | None) -> None:
         """Send one approval request per parked call, after the reply.
@@ -293,7 +296,7 @@ class ConversationLoop:
             claimed.preview, result.content, said=inbound.text
         )
         completion = await self._gateway.complete(Task.CHAT_TEXT, messages)
-        text = _with_notices(completion.text, [f"🔧 {claimed.preview}"])
+        text = completion.text
 
         await self._companion.record(
             LoggedMessage(
@@ -377,18 +380,3 @@ class ConversationLoop:
         return messages
 
 
-def _with_notices(text: str, notices: list[str]) -> str:
-    """Put what was done in front of what was said.
-
-    Above the reply rather than below it: the model's answer can be long, and the
-    one line the owner needs in order to notice a tool they did not expect must not
-    be at the bottom of it. Deduplicated in order, because a model that reads the
-    same file twice in one turn should not produce the same line twice.
-    """
-    if not notices:
-        return text
-    seen: list[str] = []
-    for notice in notices:
-        if notice not in seen:
-            seen.append(notice)
-    return "\n".join([*seen, "", text]) if text else "\n".join(seen)

@@ -98,10 +98,15 @@ FROZEN means: do not edit without flagging it first.
     gate. OpenClaw's `auto` mode (an LLM reviewer for edge cases) was deliberately
     not ported.
 
-12. **Every executed tool call leaves a `tool_calls` row and a line in the reply
-    the owner reads.** A tool that ran without either is a defect, which is why
-    `ToolRunner` owns decide, execute and audit together instead of exposing them
-    separately. Tools are **on** by default, and the mode is **`full`** - a guarded
+12. **Every executed tool call leaves a `tool_calls` audit row.** That row is the
+    owner's ground-truth record of what touched the machine, readable with `daemon
+    tools log`; a tool that ran without one is a defect, which is why `ToolRunner`
+    owns decide, execute and audit together instead of exposing them separately. The
+    reply the owner reads carries **only the model's answer** - the raw
+    `run`/`write`/`rm` lines are not folded into it, in text or spoken aloud in
+    voice, because narrating every call reads as clutter and the audit is the record
+    that cannot be omitted or misrepresented by the model's prose. Tools are **on**
+    by default, and the mode is **`full`** - a guarded
     tool runs without asking. The safety is not the mode and not the switch: it is
     rule 10, the origin gate, which no mode can turn off. `full` is the default
     because a companion that stops to ask before every action on the owner's own
