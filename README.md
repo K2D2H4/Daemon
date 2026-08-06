@@ -90,18 +90,6 @@ daemon update    # reinstall the latest release in place (re-runs what the one-l
 by default); set it to false in `.env` to answer no later, and `daemon doctor` always
 says which way it is set.
 
-## Five faces
-
-<div align="center">
-<img src="docs/assets/states.png" alt="The five sprite states: running, responding, working, suspended, error" width="900">
-</div>
-
-One 28×28 sprite per state. Which face shows is decided by what the process is
-doing rather than by which one looks best — a mascot free to pick its own mood is
-a mascot that will eventually lie about the state of your machine. They drive the
-**[landing page](https://k2d2h4.github.io/Daemon/)**; there is no graphical status
-surface in the terminal, where `daemon doctor` reports plain text instead.
-
 ## Deciding whether to speak
 
 The proactive loop runs every five minutes and mostly decides to say nothing. The
@@ -180,12 +168,13 @@ is finished.
 | **M1c** ✅ | PC control — ten tools it can reach your machine with, and a gate in front of them |
 | **M2** ✅ | Reflection pass, entity graph, observations, and recall reads the curated tier |
 | **M3** ◐ | Proactivity — it speaks first, on a five-minute loop that mostly decides not to. Off until you switch it on; the speaker is a second switch. Tuning waits on labels |
-| M4 | Persona evolution |
+| **M4** ◐ | Persona evolution — a seed you own plus rules it learns about you, with an anchor that stops the personality collapsing. Code complete; the gate, like M3's, waits on ~2 weeks of real observations |
 
-Recall scores **93.3% on the golden set** — 28 of 30, top-5, `bge-m3`, with every
+Recall scores **94.0% on the golden set** — 47 of 50, top-5, `bge-m3`, with every
 embedding indexed. Those conditions are part of the number: the same suite reads
-50.0% keyword-only, and 83.3% on a smaller embedder. `evals/agent-results.json`
-holds the last run as data, and `python3 -m evals.golden_set --json` reproduces it.
+56.0% keyword-only, and 60.0% on the deterministic offline embedder it ships as a
+floor. `evals/agent-results.json` holds the last run as data, and
+`python3 -m evals.golden_set --embedder ollama --json` reproduces it.
 
 ## Contributing
 
