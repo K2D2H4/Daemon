@@ -21,8 +21,8 @@ from test_loop import FakeChannel, FakeMemory, gateway_for
 
 from daemon.channels.base import InboundMessage
 from daemon.companion import TOOL_CONTRACT, Companion
-from daemon.llm.base import ToolCall
-from daemon.loop import APPROVAL_NO_CODE, ConversationLoop
+from daemon.llm.base import Completion, ToolCall
+from daemon.loop import APPROVAL_NO_CODE, INCOMPLETE_NOTICE, ConversationLoop
 from daemon.memory.store import Store
 from daemon.tools.base import Registry
 from daemon.tools.builtin import builtin_tools
@@ -214,6 +214,45 @@ async def test_the_round_cap_forces_an_answer(
     # The final call must offer no tools, or the answer could be another tool call.
     assert provider.offered_tools[-1] == ()
     assert "I will stop." in channel.sent[0].text
+
+
+async def test_an_empty_final_answer_is_never_delivered_as_silence(
+    data_dir: Path, store: Store, tmp_path: Path
+) -> None:
+    """A turn must never go silent. Measured on gemini-3.6-flash: a request no tool
+    could satisfy ('next week's weather') burned the round cap and then, on the
+    no-tools escape call, returned another bare tool call with no text - so the reply
+    was empty, the channel refused it, and the owner got nothing until they poked
+    again. When there is no answer text, a short admission goes out instead."""
+    (tmp_path / "notes.md").write_text("hi")
+
+    class NeverAnswers:
+        """Always a tool call, never any prose - even when no tools are offered, the
+        way flash hallucinated one on the escape call."""
+
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.offered_tools: list[tuple] = []
+
+        async def complete(self, messages, *, model, tools=None, **kw):  # type: ignore[no-untyped-def]
+            self.offered_tools.append(tuple(tools or ()))
+            return Completion(
+                text="", model=model, tool_calls=(read_file_call(tmp_path / "notes.md"),)
+            )
+
+        async def health(self) -> bool:
+            return True
+
+    channel = FakeChannel([inbound("what's next week's weather")])
+    await loop_for(
+        channel, NeverAnswers(), FakeMemory(), data_dir,
+        runner(store, tmp_path, mode="ask"), max_tool_rounds=2,
+    ).run()
+
+    assert channel.sent, "the turn delivered nothing at all"
+    assert channel.sent[0].text == INCOMPLETE_NOTICE
+    assert channel.sent[0].text.strip(), "an empty reply was sent as silence"
 
 
 async def test_a_denied_call_tells_the_model_why(

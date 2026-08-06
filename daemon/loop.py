@@ -47,6 +47,17 @@ ROUND_LIMIT_NOTICE = (
     "already know, and say what is still unresolved."
 )
 
+INCOMPLETE_NOTICE = (
+    "I went back and forth on that one and couldn't wrap it up cleanly. Could you try "
+    "again, or ask it a little differently?"
+)
+"""Sent when a turn ends with no answer text at all - the model kept asking for
+tools until the round cap and then, even with none on offer, returned another
+(often hallucinated) tool call instead of prose. The channel refuses an empty
+message, so without this the whole turn is silence the owner reads as being
+ignored, and they have to poke it again to get anything (measured on
+gemini-3.6-flash: a 'next week's weather' turn that no tool could satisfy)."""
+
 APPROVAL_REQUEST = (
     "That needs your say-so:\n\n{preview}\n\n"
     "Reply `/approve {code}` to let it run once, `/approve {code} always` to stop "
@@ -231,6 +242,15 @@ class ConversationLoop:
         # a companion that narrates every `run`/`write`/`rm` reads as clutter, and the
         # owner's ground-truth record lives in the `tool_calls` audit (`daemon tools
         # log`) rather than in a line the model's prose sits on top of.
+        if not completion.text.strip():
+            # No answer text - the model spent the round cap on tool calls and then
+            # returned another one instead of prose, even with no tools offered. The
+            # channel refuses an empty message, so returning "" is silence; say
+            # something the owner can act on instead.
+            logger.warning(
+                "turn produced no answer text after tools; sending the incomplete notice"
+            )
+            return INCOMPLETE_NOTICE, outcome
         return completion.text, outcome
 
     async def _ask_approvals(self, outcome: Outcome, recipient_id: str | None) -> None:
