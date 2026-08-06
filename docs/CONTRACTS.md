@@ -155,7 +155,11 @@ same as it working, and the difference is where every defect above lived.
 - `pytest` + `pytest-asyncio` (`asyncio_mode = "auto"`, so no decorator needed).
 - **Every module you add ships with tests in the same PR-sized unit of work.**
 - **No test may hit the network or a real LLM.** Use the `fake_provider`
-  fixture. A test that needs an API key is a broken test.
+  fixture. A test that needs an API key is a broken test. Verifying against a live
+  API is not a test and lives in `evals/` — run by hand, never in CI — which is
+  where a real-key check like the Gemini tool round-trip
+  (`evals/m1c_text_tools_spike.py`) belongs. It is what catches a contract a mock
+  cannot see, the way `thoughtSignature` slipped a green 2.5-pinned suite.
 - Database tests use the `db` fixture (fresh schema in `tmp_path`). Never touch
   a developer's real data dir.
 - Assert behaviour, not implementation. Prefer one clear failing assertion over

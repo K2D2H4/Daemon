@@ -1299,6 +1299,94 @@ async def test_gemini_sends_a_result_as_a_function_response_part() -> None:
     assert response["response"] == {"result": "Mon 3 Aug 2026"}
 
 
+async def test_gemini_captures_the_thought_signature_on_a_tool_call() -> None:
+    """Gemini 3 attaches an opaque `thoughtSignature` to the functionCall part, and
+    the API rejects the turn on replay if it is not echoed back (HTTP 400). It has to
+    survive the parse to be echoed, so it rides on the `ToolCall`."""
+    body = {
+        **GEMINI_TOOL_CALL,
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": {"name": "run_command", "args": {"command": "date"}},
+                            "thoughtSignature": "Sig_A",
+                        }
+                    ]
+                },
+                "finishReason": "STOP",
+            }
+        ],
+    }
+    async with mock_client(lambda r: httpx.Response(200, json=body)) as client:
+        completion = await GeminiProvider(SECRET, client=client).complete(
+            PROMPT, model="m", tools=TOOLS
+        )
+    (call,) = completion.tool_calls
+    assert call.provider_signature == "Sig_A"
+
+
+async def test_gemini_echoes_the_thought_signature_back_on_replay() -> None:
+    """The failure in the field: Gemini 3 rejects a replayed functionCall that omits
+    the `thoughtSignature` it issued. It must come back on the same part, beside the
+    `functionCall` - not inside it, and not on the text part."""
+    payloads: list[dict] = []
+    turns = [
+        Message(role="user", content="what is the date?"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=(
+                ToolCall(
+                    id="run_command-0",
+                    name="run_command",
+                    arguments={"command": "date"},
+                    provider_signature="Sig_A",
+                ),
+            ),
+        ),
+        Message(role="tool", content="Mon 3 Aug 2026", tool_call_id="run_command-0"),
+    ]
+    async with mock_client(capture(payloads, GEMINI_OK)) as client:
+        await GeminiProvider(SECRET, client=client).complete(turns, model="m", tools=TOOLS)
+
+    part = payloads[0]["contents"][1]["parts"][0]
+    assert part["functionCall"] == {"name": "run_command", "args": {"command": "date"}}
+    assert part["thoughtSignature"] == "Sig_A"
+
+
+async def test_gemini_signs_only_the_first_of_parallel_calls() -> None:
+    """Gemini signs only the first of parallel calls and rejects the field on a call it
+    did not sign, so an unsigned `ToolCall` must emit no `thoughtSignature` key at all -
+    not a `null`."""
+    payloads: list[dict] = []
+    turns = [
+        Message(role="user", content="weather in paris and london?"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=(
+                ToolCall(
+                    id="run_command-0",
+                    name="run_command",
+                    arguments={"command": "paris"},
+                    provider_signature="Sig_A",
+                ),
+                ToolCall(id="run_command-1", name="run_command", arguments={"command": "london"}),
+            ),
+        ),
+        Message(role="tool", content="15C", tool_call_id="run_command-0"),
+        Message(role="tool", content="12C", tool_call_id="run_command-1"),
+    ]
+    async with mock_client(capture(payloads, GEMINI_OK)) as client:
+        await GeminiProvider(SECRET, client=client).complete(turns, model="m", tools=TOOLS)
+
+    parts = payloads[0]["contents"][1]["parts"]
+    assert parts[0]["thoughtSignature"] == "Sig_A"
+    assert "thoughtSignature" not in parts[1]
+
+
 async def test_gemini_still_fails_on_no_text_and_no_tools() -> None:
     body = {"candidates": [{"content": {"parts": []}}], "usageMetadata": {}}
     async with mock_client(lambda r: httpx.Response(200, json=body)) as client:
