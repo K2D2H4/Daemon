@@ -730,10 +730,15 @@ def _tools_check(settings: Settings) -> Check:
     )
     if extras:
         detail += " " + " ".join(extras)
-    # `full` is the one setting where nothing but the origin gate is left, so it is
-    # reported as a failed check rather than as a detail someone might skim past.
+    # `full` is the default (config.py) and the one setting where nothing but the
+    # origin gate is left, so it passes - marking the default as a failed check
+    # would make every fresh install's doctor read as broken - but the detail names
+    # the posture plainly rather than letting it be skimmed past. Use `ask` or
+    # `allowlist` for a prompt before anything changes.
     if settings.tools_mode == "full":
-        return Check("tools", False, detail + " - `full` asks about nothing")
+        return Check(
+            "tools", True, detail + " - runs everything without asking; only the origin gate holds"
+        )
     return Check("tools", True, detail)
 
 

@@ -449,8 +449,9 @@ class Settings(BaseSettings):
     and one that cannot open a file on it is a chat window with extra steps - so a
     default of `false` would ship the definition unmet and call it caution.
 
-    What makes that safe is not this switch, it is the gate: `tools_mode` is `ask`,
-    so nothing that changes the machine runs without a one-shot code, and no tool at
+    The switch is not what makes it safe. The default `tools_mode` is `full`, so a
+    guarded tool runs without asking (see that field for the trade and how to make it
+    cautious again); the boundary that always holds is the origin gate - no tool at
     all runs on a turn that is not the owner's own words (tools/policy.py). The two
     capabilities that read more than that - the browser group and MCP - stay off and
     have their own switches.
@@ -459,12 +460,25 @@ class Settings(BaseSettings):
     capability the owner cannot see is the silent state this project keeps being
     bitten by."""
 
-    tools_mode: str = Field(default="ask", alias="DAEMON_TOOLS_MODE")
+    tools_mode: str = Field(default="full", alias="DAEMON_TOOLS_MODE")
     """`off` | `allowlist` | `ask` | `full` - see daemon/tools/policy.py.
 
-    `ask` rather than `allowlist` as the default for a switched-on install: the
-    first sessions are when you find out what it wants to run, and `allowlist`
-    answers anything unlisted with a flat refusal that teaches nobody anything."""
+    `full` is the default, and it is a deliberate choice with real teeth: a guarded
+    tool - `run_command`, `write_file`, `open_path` - runs without asking, so the
+    model can `rm -rf` a directory or overwrite a file on the strength of one turn.
+    The reason it is still the default is the same argument `tools_enabled` makes one
+    line down: this is a companion that lives on the owner's own machine, and one
+    that stops to ask permission before every single action it takes there is the
+    "chat window with extra steps" the product exists not to be. The boundary that
+    stays is the one that cannot be configured off - **no tool runs on a turn that
+    is not the owner's own words** (tools/policy.py's origin gate), so a forward, an
+    inline-bot result or anything recall dug up still reaches nothing.
+
+    The cautious settings are one line away and `daemon doctor` prints which is in
+    force: `ask` asks about anything that changes the machine (each request carries a
+    one-shot code), `allowlist` runs only named commands and refuses the rest, `off`
+    refuses every guarded tool. Pick one of those if unattended `rm -rf` is a risk
+    worth a prompt to you."""
 
     tools_allowlist: Annotated[tuple[str, ...], NoDecode] = Field(
         default=(), alias="DAEMON_TOOLS_ALLOWLIST"

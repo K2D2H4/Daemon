@@ -948,8 +948,9 @@ def test_the_tool_layer_can_be_switched_off_entirely(tmp_path: Path) -> None:
     assert "DAEMON_TOOLS_ENABLED" in status
 
 
-def test_the_default_install_has_tools_and_asks_before_acting(tmp_path: Path) -> None:
-    """The default a person actually gets: tools assembled, `ask` in force, and the
+def test_the_default_install_has_tools_in_full_mode(tmp_path: Path) -> None:
+    """The default a person actually gets: tools assembled, `full` in force (a
+    guarded tool runs without asking - the origin gate is what stays), and the
     browser and MCP still off."""
     settings = Settings(
         _env_file=None,
@@ -967,7 +968,7 @@ def test_the_default_install_has_tools_and_asks_before_acting(tmp_path: Path) ->
         runner, bridge, status = asyncio.run(_build_tools(settings, store))
         assert runner is not None and len(runner) == 7, "the built-ins, and not the browser"
         assert bridge is None, "mcp is off by default"
-        assert "mode=ask" in status and "browser" not in status
+        assert "mode=full" in status and "browser" not in status
     finally:
         store.close()
 
@@ -990,7 +991,7 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
         runner, bridge, status = asyncio.run(_build_tools(settings, store))
         assert runner is not None and len(runner) == 7
         assert bridge is None, "mcp is off, so no server should have been started"
-        assert "mode=ask" in status
+        assert "mode=full" in status
     finally:
         store.close()
 

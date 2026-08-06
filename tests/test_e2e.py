@@ -252,7 +252,7 @@ async def test_the_owner_asks_it_to_do_something_and_it_does(
             ],
         }
     )
-    app = boot(monkeypatch, settings_for(tmp_path), model, api)
+    app = boot(monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), model, api)
 
     async with app.router.lifespan_context(app):
         assert app.state.loop_task is not None, "the conversation loop never started"
@@ -366,7 +366,9 @@ async def test_state_survives_a_restart(
 
     # --- first boot: ask, then die without answering ---
     api = FakeTelegram()
-    app = boot(monkeypatch, settings_for(tmp_path), ScriptedModel(calls), api)
+    app = boot(
+        monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), ScriptedModel(calls), api
+    )
     async with app.router.lifespan_context(app):
         api.send(1, "적어줘")
         await api.wait_for_reply(2)
@@ -376,7 +378,9 @@ async def test_state_survives_a_restart(
 
     # --- second boot: the same data dir, a new process worth of objects ---
     api2 = FakeTelegram()
-    app2 = boot(monkeypatch, settings_for(tmp_path), ScriptedModel(calls), api2)
+    app2 = boot(
+        monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), ScriptedModel(calls), api2
+    )
     async with app2.router.lifespan_context(app2):
         api2.send(2, f"/approve {code.group(1)}")
         await api2.wait_for_reply(1)
@@ -395,7 +399,9 @@ async def test_a_standing_grant_survives_a_restart(
     calls = {"날짜": [ToolCall(id="c1", name="run_command", arguments={"command": "date"})]}
 
     api = FakeTelegram()
-    app = boot(monkeypatch, settings_for(tmp_path), ScriptedModel(calls), api)
+    app = boot(
+        monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), ScriptedModel(calls), api
+    )
     async with app.router.lifespan_context(app):
         api.send(1, "날짜 알려줘")
         await api.wait_for_reply(2)
@@ -405,7 +411,9 @@ async def test_a_standing_grant_survives_a_restart(
         await api.wait_for_reply(3)
 
     api2 = FakeTelegram()
-    app2 = boot(monkeypatch, settings_for(tmp_path), ScriptedModel(calls), api2)
+    app2 = boot(
+        monkeypatch, settings_for(tmp_path, DAEMON_TOOLS_MODE="ask"), ScriptedModel(calls), api2
+    )
     async with app2.router.lifespan_context(app2):
         api2.send(3, "날짜 알려줘")
         await api2.wait_for_reply(1)
