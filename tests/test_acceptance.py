@@ -995,6 +995,48 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
         store.close()
 
 
+def test_the_tool_mode_can_be_pinned_past_the_setting(tmp_path: Path) -> None:
+    """`daemon voice` fixes the mode to `allowlist` in code, so the override has to
+    beat `DAEMON_TOOLS_MODE` rather than be it under another name.
+
+    The verdict is the whole difference: a guarded call the allowlist does not match
+    is refused, where `ask` would park it for an approval. A spoken turn has nowhere
+    to ask, so a parked call is one that lapses unanswered - the silent degradation
+    the pinning exists to make impossible.
+    """
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PRESET="offline",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN=TOKEN,
+        DAEMON_TOOLS_ENABLED=True,
+        DAEMON_TOOLS_ROOTS=str(tmp_path),
+    )
+    assert settings.tools_mode == "ask", "the default a person gets; the override must win"
+
+    from daemon.app import _build_tools
+    from daemon.tools.runner import TurnContext
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        runner, _bridge, status = asyncio.run(_build_tools(settings, store, mode="allowlist"))
+        assert runner is not None
+        assert "mode=allowlist" in status, "the effective mode is not reported"
+
+        outcome = asyncio.run(
+            runner.execute(
+                [ToolCall(id="1", name="run_command", arguments={"command": "curl x"})],
+                TurnContext(origin="owner", channel="voice", sender_id=None),
+            )
+        )
+        assert not outcome.results[0].ok
+        assert outcome.results[0].content.startswith("refused")
+        assert outcome.approvals == [], "allowlist must never park a call for approval"
+    finally:
+        store.close()
+
+
 async def test_a_label_press_lands_through_the_channel_the_app_builds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

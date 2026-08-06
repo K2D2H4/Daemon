@@ -48,22 +48,28 @@ PENDING_CLASSES: dict[str, str] = {
     # thing that speaks at the machine now exists and `app.build_proactive_tick`
     # constructs it.
     #
-    # And it stays empty through the tool-grant / voice-tool-frame work, which is
-    # worth writing down because that work *is* unreachable and this dict cannot
-    # say so: neither half is a class. A grant is rows plus methods on `Store`, and
-    # the voice tool frame is arguments to `GeminiLiveSession`, which `app.py`
-    # already constructs - so `_constructed` finds it and reports the whole thing
-    # wired. `test_the_voice_tool_frame_is_still_unwired` and
-    # `test_nothing_writes_a_tool_grant_yet` below are the both-directions
-    # declarations instead. Same blind spot `WakeGate`'s comment describes: this
-    # file asks whether something *calls* a name, never with what.
+    # And it stays empty through the tool-grant work, which is worth writing down
+    # because that work *is* unreachable and this dict cannot say so: it is not a
+    # class. A grant is rows plus methods on `Store`, which `app.py` already
+    # constructs - so `_constructed` finds it and reports the whole thing wired. The
+    # `tool_grant` entries in `PENDING_WIRING` below are the both-directions
+    # declaration instead. Same blind spot `WakeGate`'s comment describes: this file
+    # asks whether something *calls* a name, never with what.
+    #
+    # The voice tool frame was the other half of that, until PR-2b. `send_tool_response`
+    # was declared in `PENDING_WIRING`, not here, because `GeminiLiveSession(tools=...)`
+    # is an argument to a class `app.py` already builds - invisible to `_constructed`
+    # exactly like a grant. That entry is closed now: `daemon/voice/conversation.py`
+    # routes a spoken tool call through `Companion.run_tools` and answers it with
+    # `send_tool_response`, and `daemon/app.py`'s `run_voice` offers the session the
+    # owner's tool specs, pinned to `allowlist`.
 }
 
 PENDING_WIRING = {
-    "send_tool_response": (
-        "M1c+ / PR-2b - VoiceConversation routes a spoken tool call to ToolRunner",
-        ("base.py", "gemini_live.py"),
-    ),
+    # `send_tool_response` was here through PR-2a and is gone now: PR-2b wired it,
+    # `daemon/voice/conversation.py` calls it, and `test_declared_wiring_gaps_are_still_gaps`
+    # failing on it was the reminder to delete the entry. That is the file working.
+    #
     # The three write/read surfaces of the grant table, none of them called from
     # daemon/ yet. `tool_grants` (the read the policy makes) is deliberately absent:
     # it *is* wired, through `policy.py:_granted`, which is the point of the both-
@@ -470,6 +476,26 @@ def test_every_documented_env_key_is_a_real_setting() -> None:
     }
     unknown = documented - aliases
     assert not unknown, f".env.example documents keys nothing reads: {sorted(unknown)}"
+
+
+def test_voice_tool_mode_is_not_a_setting() -> None:
+    """Voice is pinned to `allowlist` in `run_voice`, in code, and deliberately not
+    configurable. A `DAEMON_TOOLS_VOICE_MODE` that could be turned back to `ask`
+    would let a spoken turn mint approval rows that lapse unanswered - nobody is
+    watching a voice turn for a code - which is the silent degradation this project
+    calls a dangerous failure. The one approval surface, shared with text, is the
+    only management point there should be. This fails the moment such a knob is added.
+    """
+    from daemon.config import Settings
+
+    aliases = {
+        field.alias for field in Settings.model_fields.values() if field.alias is not None
+    }
+    offenders = sorted(alias for alias in aliases if "VOICE" in alias and "MODE" in alias)
+    assert not offenders, (
+        f"a voice tool-mode knob exists ({offenders}); voice must stay pinned to "
+        "allowlist in code, not be configurable back to a mode that can park a call"
+    )
 
 
 # --- the check that was itself unreachable -----------------------------------
