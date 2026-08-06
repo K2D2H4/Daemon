@@ -23,13 +23,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
 from daemon.channels.base import Channel
+from daemon.companion import Companion, ResolveId
 from daemon.config import ANTHROPIC, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
 from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
-from daemon.loop import ConversationLoop, ResolveId
+from daemon.loop import ConversationLoop
 from daemon.memory.base import MemoryWriter, Recall
 from daemon.persona.evolve import PersonaEvolution
-from daemon.persona.loader import load_persona
 from daemon.proactivity.tick import ProactiveTick
 from daemon.reflection import Reflection
 from daemon.tasks import Task
@@ -243,12 +243,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         loop = ConversationLoop(
             channel,
             gateway,
-            memory,
-            data_dir=settings.data_dir,
-            recall=recall,
-            recall_limit=settings.recall_limit,
-            resolve_id=resolve_id,
-            tools=tools,
+            Companion(
+                memory,
+                data_dir=settings.data_dir,
+                recall=recall,
+                recall_limit=settings.recall_limit,
+                resolve_id=resolve_id,
+                tools=tools,
+            ),
             max_tool_rounds=settings.tools_max_rounds,
         )
         task = asyncio.create_task(loop.run(), name="conversation-loop")
@@ -878,13 +880,27 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
     store = Store.open(settings.data_dir / DB_FILENAME)
     try:
         reindex(settings.data_dir, store)
-        memory = FileMemoryWriter(settings.data_dir, store)
+        writer = FileMemoryWriter(settings.data_dir, store)
         recall, _status, embedder = _build_recall(settings, store)
-        # Seed and learned rules both, same as the text path (daemon/loop.py): a
-        # conversation surface is a conversation surface, and M4's learned half is
-        # meant to reach every one of them except the proactive judge, which stays
-        # seed-only on purpose (daemon/proactivity/judge.py).
-        seed = await load_persona(settings.data_dir)
+        # No tool runner: voice tools are their own piece of work, and rules about
+        # tools that are not there cost tokens and buy nothing.
+        companion = Companion(
+            writer,
+            data_dir=settings.data_dir,
+            recall=recall,
+            recall_limit=settings.recall_limit,
+            # The half the voice path never had. Without a resolver `record` cannot
+            # learn the row id, so nothing said out loud was embedded until the next
+            # restart's backfill got to it - the vector lane silently missing exactly
+            # the words the owner was most likely to ask about later.
+            resolve_id=_id_resolver(writer),
+        )
+        # Seed and learned rules both, same as the text path, and through the same
+        # `Companion.persona` -> `load_persona`: a conversation surface is a
+        # conversation surface, and M4's learned half reaches every one of them
+        # except the proactive judge, which stays seed-only on purpose
+        # (daemon/proactivity/judge.py).
+        seed = await companion.persona()
         audio = build_voice_audio()
         # Before the handshake, so the acknowledgement is as close to the wake word
         # as it can be. Nothing is feeding the session yet, so the cue cannot be
@@ -915,9 +931,7 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
             return await _voice_attempts(
                 new_session,
                 audio,
-                memory,
-                recall,
-                settings,
+                companion,
                 GeminiLiveError,
                 opening_audio=opening_audio,
             )
@@ -1001,9 +1015,7 @@ it turns a recoverable hiccup into an abandoned conversation."""
 async def _voice_attempts(
     new_session: Callable[[], Any],
     audio: AudioIO,
-    memory: MemoryWriter,
-    recall: Recall | None,
-    settings: Settings,
+    companion: Companion,
     session_error: type[Exception],
     opening_audio: bytes = b"",
 ) -> int:
@@ -1032,9 +1044,7 @@ async def _voice_attempts(
         conversation = VoiceConversation(
             session,
             audio,
-            memory,
-            recall=recall,
-            recall_limit=settings.recall_limit,
+            companion,
             opening_audio=pending_opening,
         )
         failure: Exception | None = None

@@ -13,6 +13,8 @@ daemon/
   tasks.py            Task enum — the LLM routing key. FROZEN.
   config.py           settings + the 3 presets
   app.py              single-process entrypoint (FastAPI + APScheduler)
+  companion.py        what the daemon can do, for both endpoints. Read this before
+                      adding a capability to loop.py or voice/conversation.py.
   llm/
     base.py           Provider protocol, Message, Completion. FROZEN.
     gateway.py        LLMGateway: routes Task -> Provider
@@ -83,10 +85,13 @@ FROZEN means: do not edit without flagging it first.
     with any setting, `full` included. `InboundMessage.authored_by_sender` is False
     for a forward or an inline-bot result, and recall replays arbitrary old text
     into every prompt - so without this gate, "look at this message" is a way to
-    hand a stranger a shell. Enforced twice on purpose: `daemon/loop.py` offers such a turn
-    no tools at all, and `tools/policy.py:decide` refuses every call regardless of
-    mode, allowlist or standing grant. The offering side is a convenience; `decide`
-    is the guarantee. If you find yourself needing an exception, stop and flag it.
+    hand a stranger a shell. Enforced twice on purpose: `Companion.specs`
+    (`daemon/companion.py`) offers such a turn no tools at all, and
+    `tools/policy.py:decide` refuses every call regardless of mode, allowlist or
+    standing grant. The offering side is a convenience; `decide` is the guarantee.
+    The offering side lives with the capability rather than in an endpoint so that a
+    second endpoint getting tools cannot get them ungated. If you find yourself
+    needing an exception, stop and flag it.
 
 11. **The tool policy makes no model calls.** Same rule as recall Lane 1 and for a
     different reason: a gate that asks a model whether to open the gate is not a
@@ -150,7 +155,11 @@ same as it working, and the difference is where every defect above lived.
 - `pytest` + `pytest-asyncio` (`asyncio_mode = "auto"`, so no decorator needed).
 - **Every module you add ships with tests in the same PR-sized unit of work.**
 - **No test may hit the network or a real LLM.** Use the `fake_provider`
-  fixture. A test that needs an API key is a broken test.
+  fixture. A test that needs an API key is a broken test. Verifying against a live
+  API is not a test and lives in `evals/` — run by hand, never in CI — which is
+  where a real-key check like the Gemini tool round-trip
+  (`evals/m1c_text_tools_spike.py`) belongs. It is what catches a contract a mock
+  cannot see, the way `thoughtSignature` slipped a green 2.5-pinned suite.
 - Database tests use the `db` fixture (fresh schema in `tmp_path`). Never touch
   a developer's real data dir.
 - Assert behaviour, not implementation. Prefer one clear failing assertion over
@@ -199,10 +208,20 @@ And **M1c — PC control**, pulled forward from post-M4 (docs/PLAN.md 8.2, §10)
 > It can read a file, run a command it has been allowed to run, and ask before
 > anything else - and a forwarded message can do none of it.
 
-One piece: `daemon/tools/`, plus tool calling in the provider contract and three
+One piece: `daemon/tools/`, plus tool calling in the provider contract and four
 tables in `daemon/memory/schema.sql`. Both frozen files were extended additively; nothing that
 compiled before stopped compiling. No new `Task` - tool-using chat is still
 `chat_text`, so the preset tables are untouched.
+
+The fourth table, `tool_grants`, was added later and is a *second* standing axis
+rather than a widening of the first. `tool_allowlist` holds argv prefixes, and a
+tool with no argv can never match one - so `mode=allowlist` was a permanent refusal
+for `write_file` and for **every** MCP tool (`McpTool` is deliberately not
+`Executable`), with no setting that reached it. `tool_grants` allows a whole tool;
+`tools/policy.py:decide` reads it only for tools that are *not* `Executable`,
+because a tool-level grant on `run_command` would be `mode=full` wearing one table
+row. Rule 10 above is unchanged and covers it: a grant does not reach past the
+origin gate, the switch, or `mode=off`.
 
 Then **the browser group** (`daemon/tools/browser.py`), behind its own
 `DAEMON_BROWSER_ENABLED`:
