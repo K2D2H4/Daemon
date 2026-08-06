@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
 from daemon.channels.base import Channel
-from daemon.companion import Companion, ResolveId
+from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
 from daemon.config import ANTHROPIC, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
 from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
@@ -882,8 +882,15 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
         reindex(settings.data_dir, store)
         writer = FileMemoryWriter(settings.data_dir, store)
         recall, _status, embedder = _build_recall(settings, store)
-        # No tool runner: voice tools are their own piece of work, and rules about
-        # tools that are not there cost tokens and buy nothing.
+        # Tools, pinned to `allowlist`. Not `settings.tools_mode`: a spoken turn has
+        # nowhere to ask, so `ask` here would pile up approval rows that lapse
+        # unanswered - the silent degradation this repo calls the dangerous failure.
+        # The allowlist and standing grants are the same table the text path edits,
+        # so voice reads the surface text writes to; it just never adds to it. Off
+        # entirely when `DAEMON_TOOLS_ENABLED` is false, exactly like text.
+        tools, mcp_bridge, _tools_status = await _build_tools(
+            settings, store, mode="allowlist"
+        )
         companion = Companion(
             writer,
             data_dir=settings.data_dir,
@@ -894,6 +901,7 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
             # restart's backfill got to it - the vector lane silently missing exactly
             # the words the owner was most likely to ask about later.
             resolve_id=_id_resolver(writer),
+            tools=tools,
         )
         # Seed and learned rules both, same as the text path, and through the same
         # `Companion.persona` -> `load_persona`: a conversation surface is a
@@ -901,6 +909,20 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
         # except the proactive judge, which stays seed-only on purpose
         # (daemon/proactivity/judge.py).
         seed = await companion.persona()
+        # Owner, always: a microphone has no relay path, so a spoken turn is the
+        # owner's own words (daemon/voice/conversation.py `_record`), and the origin
+        # gate offers tools only to it. Empty when tools are off, which leaves the
+        # session declaring none and so never yielding a tool call.
+        tool_specs = companion.specs(origin="owner")
+        # The tool contract rides with the persona in the system instruction, so the
+        # endpoint getting tools inherits the rules the text path already has instead
+        # of being written without them - which is exactly how voice came to have no
+        # index() call (daemon/companion.py, TOOL_CONTRACT). Only when there is a tool
+        # to use: 200 tokens of rules about a capability the model lacks buys nothing.
+        instruction_parts = [
+            block for block in (seed, TOOL_CONTRACT if tool_specs else "") if block
+        ]
+        system_instruction = "\n\n".join(instruction_parts) or None
         audio = build_voice_audio()
         # Before the handshake, so the acknowledgement is as close to the wake word
         # as it can be. Nothing is feeding the session yet, so the cue cannot be
@@ -914,10 +936,14 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
             return GeminiLiveSession(
                 api_key=settings.gemini_api_key,
                 model=route.model,
-                # The persona is the seed, same as the text path. Without it the
-                # model answers as a generic assistant, which is the one voice
-                # PLAN 5 says this product must not have.
-                system_instruction=seed or None,
+                # The persona, plus the tool contract when tools are on offer. Without
+                # the persona the model answers as a generic assistant, which is the
+                # one voice PLAN 5 says this product must not have.
+                system_instruction=system_instruction,
+                # What the model may reach this turn. Declared in setup, which is what
+                # lets `receive()` ever yield a tool call - a session offered none
+                # cannot be asked for one (daemon/voice/base.py).
+                tools=tool_specs,
                 # Empty and None pass straight through as "leave it to the server",
                 # so an unconfigured install sends no `realtimeInputConfig` at all -
                 # the behaviour every session had before these settings existed.
@@ -938,6 +964,17 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
         finally:
             with suppress(Exception):
                 await audio.close()
+            # Before the sqlite close below, because an MCP server is a child process:
+            # one left running is an orphan per `daemon voice` run, the same reason the
+            # lifespan closes the bridge ahead of the store.
+            if mcp_bridge is not None:
+                with suppress(Exception):
+                    await mcp_bridge.aclose()
+            if tools is not None:
+                # The runner walks its registry for anything holding a client -
+                # `fetch_page`'s, if the browser group is on - the same as the lifespan.
+                with suppress(Exception):
+                    await tools.aclose()
             if embedder is not None:
                 closer = getattr(embedder, "aclose", None)
                 if closer is not None:
@@ -1312,13 +1349,24 @@ async def build_wake_gate(
     return gate, close
 
 
-async def _build_tools(settings: Settings, store: Any) -> tuple[Any, Any, str]:
+async def _build_tools(
+    settings: Settings, store: Any, *, mode: str | None = None
+) -> tuple[Any, Any, str]:
     """Assemble the tool layer. Returns (runner, mcp bridge, status).
 
     Nothing here is fatal, on the same principle as `_build_recall`: a broken tool
     configuration should cost the user their tools, not their conversation. The
     difference from recall is that this one is off unless asked for, so "not
     configured" is the ordinary answer rather than a degradation.
+
+    `mode` overrides `DAEMON_TOOLS_MODE`, and only `run_voice` uses it - pinned to
+    `allowlist`, because a spoken turn has nowhere to ask for approval. `ask` mode
+    there would mint approval rows that lapse unanswered while nobody is watching,
+    which is the silent degradation this project treats as the dangerous failure.
+    A parameter and not a setting on purpose: a knob that could be turned back to
+    `ask` is a knob that would let that failure happen. The registry, the allowlist
+    and the standing grants are the same as the text path either way - the approval
+    surface is shared, text is its editor, and voice only reads it.
     """
     if not settings.tools_enabled:
         return None, None, "off (DAEMON_TOOLS_ENABLED)"
@@ -1380,21 +1428,22 @@ async def _build_tools(settings: Settings, store: Any) -> tuple[Any, Any, str]:
             landed = 0
         logger.info("MCP contributed %d tool(s)", landed)
 
+    effective_mode = mode or settings.tools_mode
     policy = ToolPolicy(
         store,
-        mode=settings.tools_mode,  # type: ignore[arg-type]
+        mode=effective_mode,  # type: ignore[arg-type]
         allowlist=settings.tools_allowlist,
         enabled=True,
     )
     runner = ToolRunner(registry, policy, store)
     logger.info(
-        "tool layer ready: %d tool(s), mode=%s", len(registry), settings.tools_mode
+        "tool layer ready: %d tool(s), mode=%s", len(registry), effective_mode
     )
     browser = f", browser={settings.browser_app}" if settings.browser_enabled else ""
     return (
         runner,
         bridge,
-        f"ready, {len(registry)} tools, mode={settings.tools_mode}{browser}",
+        f"ready, {len(registry)} tools, mode={effective_mode}{browser}",
     )
 
 

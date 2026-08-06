@@ -66,6 +66,7 @@ from daemon import clock
 # position to start from: the wire has no role that means "reference material", so
 # the block arrives as a *user* turn.
 from daemon.companion import Companion
+from daemon.llm.base import ToolCall
 from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 
@@ -354,6 +355,8 @@ class VoiceConversation:
                     await self._audio.play(item)
                 elif isinstance(item, Interrupted):
                     await self._barge_in(session)
+                elif isinstance(item, ToolCall):
+                    await self._run_tool_call(session, item)
                 else:
                     await self._on_transcript(session, item)
         finally:
@@ -620,6 +623,43 @@ class VoiceConversation:
         self._generating = False
         await session.interrupt()
         await self._audio.stop_playback()
+
+    # --- tools ---------------------------------------------------------------
+
+    async def _run_tool_call(self, session: VoiceSession, call: ToolCall) -> None:
+        """Run one tool the model asked for and hand the result back on the socket.
+
+        The same `Companion.run_tools` the text loop drives, so a spoken call goes
+        through the same policy, the same registry and the same `tool_calls` audit
+        row (docs/CONTRACTS.md 12) - `receive()` yields the neutral `ToolCall`
+        precisely so there is one tool path, not a voice-shaped copy of it.
+
+        `origin='owner'` without asking who is speaking: a microphone has no relay
+        path, so a spoken turn is the owner's own words (see `_record`). The gate in
+        `daemon/companion.py` only offered these tools because it agreed, and
+        `daemon/app.py` pins voice to `allowlist` mode - so the runner either runs
+        the call or refuses it with a reason the model can speak, and never parks it
+        for an approval nobody is watching a spoken turn to give.
+
+        Answered from inside `receive()`'s loop because a blocking call waits: the
+        tool call arrives before any audio and the model generates nothing until the
+        response goes back, measured against the live API (daemon/voice/base.py,
+        `send_tool_response`). The runner returns one result per call it was given,
+        so there is always something to send.
+        """
+        outcome = await self._companion.run_tools(
+            [call], origin="owner", channel=self._channel, sender_id=None
+        )
+        # Rule 12's other half: an executed call must leave a line the owner reads,
+        # not only a `tool_calls` row (docs/CONTRACTS.md 12). The text loop folds
+        # `outcome.notices` into the reply and records it (daemon/loop.py); a spoken
+        # turn has no reply text to fold into, so the notice is logged - the surface
+        # a `daemon voice` session actually shows the owner. One per call that ran;
+        # the runner appends none for a refusal, so a denial is never reported as a
+        # run. Not the model's answer, which may or may not mention the tool at all.
+        for notice in outcome.notices:
+            logger.info("voice: %s", notice)
+        await session.send_tool_response(outcome.results)
 
 
 def _covers(prepared: str, said: str) -> bool:

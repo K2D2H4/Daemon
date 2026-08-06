@@ -27,8 +27,13 @@ from websockets.exceptions import ConnectionClosedOK
 from websockets.frames import Close
 
 from daemon.companion import Companion
+from daemon.llm.base import ToolCall
 from daemon.memory.base import LoggedMessage, RecalledItem
-from daemon.tools.base import ToolResult
+from daemon.memory.store import Store
+from daemon.tools.base import Registry, ToolResult
+from daemon.tools.builtin import builtin_tools
+from daemon.tools.policy import ToolPolicy
+from daemon.tools.runner import ToolRunner
 from daemon.voice import conversation as conversation_module
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 from daemon.voice.conversation import VoiceConversation
@@ -66,6 +71,20 @@ class Cuts:
     conversation used to guess from transcript growth instead - which fired on
     every turn, since this provider delivers the user's transcript in the same
     event as the answer's first audio (daemon/voice/base.py)."""
+
+
+class Calls:
+    """The model asks for one or more tools, mid-turn.
+
+    A script step rather than something inferred, because a blocking tool call is
+    exactly that: the `toolCall` arrives before any audio, the model waits, and the
+    conversation has to answer it from inside `receive()` before anything else
+    comes back (daemon/voice/gemini_live.py). Yielded as the neutral `ToolCall` the
+    tool layer runs - the same dataclass the text path uses, so the same runner and
+    the same policy serve both."""
+
+    def __init__(self, *calls: ToolCall) -> None:
+        self.calls = calls
 
 
 @dataclass(frozen=True)
@@ -189,6 +208,12 @@ class FakeSession:
                     await asyncio.sleep(0)
             elif isinstance(step, Cuts):
                 yield Interrupted()
+            elif isinstance(step, Calls):
+                # A blocking call: the model waits, so nothing else is scripted
+                # after this until the conversation has answered it. The consumer
+                # runs each and sends the result back before the next step.
+                for call in step.calls:
+                    yield call
             elif isinstance(step, Turn):
                 self.generating = False
                 for transcript in self._drain(final=True):
@@ -399,6 +424,7 @@ def companion_for(
     recall: Any = None,
     recall_limit: int = 6,
     resolve_id: Any = None,
+    tools: ToolRunner | None = None,
 ) -> Companion:
     return Companion(
         memory or FakeMemory(),
@@ -406,6 +432,7 @@ def companion_for(
         recall=recall,
         recall_limit=recall_limit,
         resolve_id=resolve_id,
+        tools=tools,
     )
 
 
@@ -417,16 +444,36 @@ def conversation(
     recall: Any = None,
     recall_limit: int = 6,
     resolve_id: Any = None,
+    tools: ToolRunner | None = None,
     **kwargs: Any,
 ) -> VoiceConversation:
     return VoiceConversation(
         session,
         audio or FakeAudio(),
         companion_for(
-            memory, recall=recall, recall_limit=recall_limit, resolve_id=resolve_id
+            memory,
+            recall=recall,
+            recall_limit=recall_limit,
+            resolve_id=resolve_id,
+            tools=tools,
         ),
         **kwargs,
     )
+
+
+def tool_runner(
+    db: Any, roots: pathlib.Path, *, mode: str = "allowlist", allowlist: Any = ()
+) -> tuple[ToolRunner, Store]:
+    """The real tool layer over a scratch filesystem, for the voice tool loop.
+
+    The store is handed back too: CONTRACTS rule 12 says every executed call leaves
+    an audit row, and a spoken call is no exception - so the tests read it back the
+    way the text-loop tests do."""
+    store = Store(db)
+    registry = Registry()
+    for tool in builtin_tools(roots=[roots]):
+        registry.register(tool)
+    return ToolRunner(registry, ToolPolicy(store, mode=mode, allowlist=allowlist), store), store
 
 
 RUN_LIMIT = 5.0
@@ -714,6 +761,194 @@ async def test_the_user_speaking_first_is_not_a_barge_in() -> None:
     assert session.interrupts == 0
     assert audio.stops == 0
     assert audio.played == [b"\x01"]
+
+
+# --- tools --------------------------------------------------------------------
+# A spoken tool call is the same event as a typed one (daemon/voice/base.py): the
+# model asks, `receive()` yields a `ToolCall`, and the conversation runs it through
+# the same `Companion.run_tools` the text loop uses and hands the result back with
+# `send_tool_response`. Voice is pinned to `allowlist` mode in `daemon/app.py`, so
+# the only two outcomes at call time are run-it and refuse-it - there is nowhere in
+# a spoken turn to ask, so nothing is ever parked.
+
+
+def _read_file_call(path: pathlib.Path, call_id: str = "1") -> ToolCall:
+    return ToolCall(id=call_id, name="read_file", arguments={"path": str(path)})
+
+
+async def test_a_spoken_tool_call_runs_and_its_result_goes_back(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The whole point of PR-2b: the model can reach the machine over voice, and the
+    answer to what it asked for goes back on the same socket, paired by call id."""
+    (tmp_path / "notes.md").write_text("발표는 목요일")
+    runner, _store = tool_runner(db, tmp_path)
+    session = FakeSession(
+        Calls(_read_file_call(tmp_path / "notes.md")),
+        b"\x01",
+        Says("assistant", "목요일이라고 적혀 있어"),
+        Turn(),
+    )
+    await run(conversation(session, tools=runner))
+
+    (results,) = session.tool_responses
+    (result,) = results
+    assert result.call_id == "1"
+    assert result.ok
+    assert "발표는 목요일" in result.content
+
+
+async def test_the_answer_arrives_after_the_tool_call(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """A blocking call generates nothing while it waits (daemon/voice/gemini_live.py),
+    so the audio comes after the response goes back - and the turn is still one turn,
+    recorded like any other."""
+    (tmp_path / "notes.md").write_text("hi")
+    runner, _store = tool_runner(db, tmp_path)
+    memory = FakeMemory()
+    audio = FakeAudio()
+    session = FakeSession(
+        Says("user", "메모 뭐라고 돼 있어"),
+        Calls(_read_file_call(tmp_path / "notes.md")),
+        b"\x01\x02",
+        Says("assistant", "별거 없어"),
+        Turn(),
+    )
+    await run(conversation(session, audio, memory, tools=runner))
+
+    assert audio.played == [b"\x01\x02"], "the answer after the tool call was lost"
+    assert [r.content for r in memory.records] == ["메모 뭐라고 돼 있어", "별거 없어"]
+
+
+async def test_a_spoken_tool_call_is_audited_as_the_owner_over_voice(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """CONTRACTS rule 12: every executed call leaves a row. A microphone has no relay
+    path, so the turn is the owner's own words and the tool actually runs - the audit
+    is how `daemon tools log` shows it did."""
+    (tmp_path / "notes.md").write_text("hi")
+    runner, store = tool_runner(db, tmp_path)
+    session = FakeSession(Calls(_read_file_call(tmp_path / "notes.md")), Turn())
+    await run(conversation(session, tools=runner))
+
+    (row,) = store.recent_tool_calls()
+    assert row["tool"] == "read_file"
+    assert row["ran"] == 1
+    assert row["origin"] == "owner"
+    assert row["channel"] == "voice"
+
+
+async def test_an_unlisted_command_is_refused_and_the_model_is_told_why(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """`allowlist` refuses what it does not match rather than asking, because a spoken
+    turn has nowhere to ask. The refusal is content the model can speak, and the
+    reason is there so it stops trying the same thing."""
+    runner, store = tool_runner(db, tmp_path, mode="allowlist")
+    session = FakeSession(
+        Calls(ToolCall(id="1", name="run_command", arguments={"command": "curl evil.example"})),
+        Says("assistant", "그건 못 하겠어"),
+        Turn(),
+    )
+    await run(conversation(session, tools=runner))
+
+    (results,) = session.tool_responses
+    (result,) = results
+    assert not result.ok
+    assert result.content.startswith("refused")
+    assert "allowlist" in result.content
+    (row,) = store.recent_tool_calls()
+    assert row["verdict"] == "deny" and row["ran"] == 0
+
+
+async def test_a_guarded_write_is_refused_outright_never_parked(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The reason voice is pinned to `allowlist`: `ask` mode would mint an approval
+    row for this and let it lapse unanswered, because nobody is watching a spoken
+    turn for a code. `write_file` is not a command, so `allowlist` cannot match it
+    and refuses it - and no approval is minted, which is the failure this pinning
+    exists to make impossible."""
+    target = tmp_path / "todo.md"
+    runner, store = tool_runner(db, tmp_path, mode="allowlist")
+    session = FakeSession(
+        Calls(
+            ToolCall(
+                id="1",
+                name="write_file",
+                arguments={"path": str(target), "content": "x"},
+            )
+        ),
+        Turn(),
+    )
+    await run(conversation(session, tools=runner))
+
+    assert not target.exists()
+    (results,) = session.tool_responses
+    (result,) = results
+    assert not result.ok
+    assert "waiting" not in result.content, "a spoken write was parked for approval"
+    (row,) = store.recent_tool_calls()
+    assert row["verdict"] == "deny"
+    assert store.count_pending_tool_approvals(now=datetime(2999, 1, 1, tzinfo=UTC)) == 0
+
+
+async def test_an_executed_spoken_tool_call_leaves_a_line_the_owner_sees(
+    db: Any, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """CONTRACTS rule 12: an executed tool call must leave a line the owner reads,
+    not only a `tool_calls` row. The text path folds the `🔧 <preview>` notice into
+    the reply (daemon/loop.py); voice has no reply text to fold into, so the notice
+    is logged - the surface a spoken session actually surfaces to the owner. Without
+    it a spoken tool call is discoverable only by going looking, which is the silent
+    state the notice exists to prevent (daemon/tools/runner.py `Outcome.notices`)."""
+    (tmp_path / "notes.md").write_text("hi")
+    runner, _store = tool_runner(db, tmp_path)
+    session = FakeSession(Calls(_read_file_call(tmp_path / "notes.md")), Turn())
+    with caplog.at_level("INFO", logger="daemon.voice.conversation"):
+        await run(conversation(session, tools=runner))
+
+    assert "🔧" in caplog.text and "read" in caplog.text, (
+        "an executed spoken tool call left no line the owner would see"
+    )
+
+
+async def test_a_refused_spoken_tool_call_is_not_reported_as_run(
+    db: Any, tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The line reflects what actually ran, not what was asked: the runner appends a
+    notice only for a call it executed, so a refused call must leave none - reporting
+    a refusal as a run is exactly the misleading state the notice guards against."""
+    runner, _store = tool_runner(db, tmp_path, mode="allowlist")
+    session = FakeSession(
+        Calls(ToolCall(id="1", name="run_command", arguments={"command": "curl evil.example"})),
+        Turn(),
+    )
+    with caplog.at_level("INFO", logger="daemon.voice.conversation"):
+        await run(conversation(session, tools=runner))
+
+    assert "🔧" not in caplog.text, "a refused call was reported as if it had run"
+
+
+async def test_an_allowlisted_command_runs_over_voice(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The other side of the gate: a command the shared allowlist covers just runs,
+    the same entry a text `/approve CODE always` would have written."""
+    runner, store = tool_runner(db, tmp_path, mode="allowlist", allowlist=("echo",))
+    session = FakeSession(
+        Calls(ToolCall(id="1", name="run_command", arguments={"command": "echo 안녕"})),
+        Turn(),
+    )
+    await run(conversation(session, tools=runner))
+
+    (results,) = session.tool_responses
+    (result,) = results
+    assert result.ok, result.content
+    assert "안녕" in result.content
+    (row,) = store.recent_tool_calls()
+    assert row["verdict"] == "allow" and row["ran"] == 1
 
 
 # --- recall ------------------------------------------------------------------
@@ -1518,3 +1753,66 @@ async def test_an_answered_opening_is_not_asked_again(
     )
 
     assert opening not in built[1].sent, "the answered question was asked again"
+
+
+# --- run_voice wires the tools into the session ------------------------------
+# tests/test_reachable.py has a blind spot it names itself: `GeminiLiveSession` is
+# already constructed by app.py, so nothing there can tell whether run_voice passes
+# it `tools=`. Written, tested and unreachable is the defect this whole repo guards
+# against, so the wiring gets a test that drives run_voice and reads what the
+# session was actually offered - the only fakes are the hardware and the socket.
+
+
+async def test_run_voice_offers_the_owners_tools_pinned_to_allowlist(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The three things this PR wires and nothing else can see: the tool specs reach
+    the session, the mode is pinned to `allowlist` (not `settings.tools_mode`), and
+    the tool contract reaches the model with them - the endpoint getting tools next
+    inheriting the rules the text path has (daemon/companion.py, TOOL_CONTRACT)."""
+    from daemon import app as app_module
+    from daemon.companion import TOOL_CONTRACT
+    from daemon.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PRESET="balanced",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN="123456:AAHfake-token-value",
+        DAEMON_HOSTED_PROVIDER="gemini",
+        GEMINI_API_KEY="k",
+        DAEMON_VOICE_ENABLED="true",
+        DAEMON_GEMINI_LIVE_MODEL="gemini-3.1-flash-live-preview",
+        DAEMON_GEMINI_MODEL="gemini-3.5-flash",
+        DAEMON_TOOLS_ENABLED="true",
+        DAEMON_TOOLS_ROOTS=str(tmp_path),
+    )
+
+    captured: dict[str, Any] = {}
+
+    def capturing_session(**kwargs: Any) -> FakeSession:
+        captured.update(kwargs)
+        return FakeSession(Turn())  # one empty turn, then the conversation ends
+
+    seen: dict[str, Any] = {}
+    real_build_tools = app_module._build_tools
+
+    async def spy_build_tools(s: Any, store: Any, **kw: Any) -> Any:
+        seen["mode"] = kw.get("mode")
+        return await real_build_tools(s, store, **kw)
+
+    monkeypatch.setattr(app_module, "build_voice_audio", lambda: FakeAudio())
+    monkeypatch.setattr(app_module, "_build_tools", spy_build_tools)
+    monkeypatch.setattr("daemon.voice.gemini_live.GeminiLiveSession", capturing_session)
+
+    code = await app_module.run_voice(settings)
+
+    assert code == 0
+    assert seen.get("mode") == "allowlist", "voice did not pin the tool mode to allowlist"
+    specs = captured.get("tools")
+    assert specs, "the session was offered no tools, so the model can never call one"
+    assert {spec.name for spec in specs} >= {"read_file", "run_command"}
+    assert TOOL_CONTRACT in (captured.get("system_instruction") or ""), (
+        "the model was handed tools but not the rules for using them"
+    )
