@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -954,4 +955,126 @@ async def test_the_daemon_survives_a_message_it_cannot_parse(
         assert not api.sent, "junk got a reply"
         api.send(5, "이제 진짜 메시지")
         await api.wait_for_reply(1)
+        assert not app.state.loop_task.done()
+
+
+# --- boot-time reflection catch-up (docs/PLAN.md 8.1) ------------------------
+# The 04:00 reflection cron and the Monday 05:00 persona cron are local-time jobs a
+# machine powered off overnight sleeps through, so the log clock never advances for
+# that user. `create_app` runs the same passes once at boot to cover exactly that.
+# The clock is pinned so a seeded day sits firmly in the past, well before "today".
+
+FIXED_TODAY = datetime(2026, 8, 6, 12, 0, 0, tzinfo=UTC)
+SEED_DAY = "2026-08-04"
+
+
+def _seed_log(tmp_path: Path, date: str, turns: list[tuple[str, str]]) -> None:
+    """Write one day's markdown log the way `daemon/memory/log.py` renders it, so
+    the real `_build_io` -> reindex path mirrors messages the reflection pass reads."""
+    log_dir = tmp_path / "memory" / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    lines = [f"# {date}", ""]
+    for minute, (role, content) in enumerate(turns):
+        lines += [f"## {date}T02:{minute:02d}:00Z {role}", content, ""]
+    (log_dir / f"{date}.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+async def test_boot_catch_up_reflects_a_day_the_machine_was_off_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A day logged but never reflected on (nobody was awake at 04:00) is caught up
+    at boot. This drives the whole real path - `_build_io` -> reindex -> mirror ->
+    `catch_up` -> `run` - and asserts what the pass leaves behind: the reflection
+    artifact on disk and the observation it concluded in the mirror.
+    """
+    monkeypatch.setattr("daemon.reflection.clock_now", lambda: FIXED_TODAY)
+    _seed_log(
+        tmp_path,
+        SEED_DAY,
+        [("user", "답장이 너무 길어. 짧게 해줘."), ("assistant", "알았어, 짧게 할게.")],
+    )
+
+    api = FakeTelegram()
+    # Reflection makes one tool-free model call, and `extract_json` writes nothing
+    # unless the reply is valid JSON - so the reply is scripted to conclude exactly
+    # one observation.
+    reflection_reply = json.dumps(
+        {
+            "facts": [],
+            "entities": [],
+            "observations": [{"body": "사용자는 짧은 답을 선호한다.", "confidence": 0.6}],
+        },
+        ensure_ascii=False,
+    )
+    model = ScriptedModel({}, reply=reflection_reply)
+    app = boot(monkeypatch, settings_for(tmp_path), model, api)
+
+    async with app.router.lifespan_context(app):
+        assert app.state.reflection_boot_task is not None, "boot catch-up was never scheduled"
+        # A background task, so nothing is guaranteed until it is awaited.
+        await app.state.reflection_boot_task
+
+    assert (tmp_path / "memory" / "reflections" / f"{SEED_DAY}.md").exists(), (
+        "the seeded day was never reflected on at boot"
+    )
+    store = Store.open(tmp_path / DB_FILENAME)
+    try:
+        assert store.count_observations() == 1, "the reflection pass landed no observation"
+    finally:
+        store.close()
+
+
+async def test_boot_catch_up_makes_no_model_call_when_nothing_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The steady state: every day already has its artifact and no observation is
+    waiting. Reflection's per-day artifact and persona's observation gate both
+    short-circuit deterministically, so boot catch-up reaches no model at all.
+    """
+    monkeypatch.setattr("daemon.reflection.clock_now", lambda: FIXED_TODAY)
+    _seed_log(tmp_path, SEED_DAY, [("user", "잘 지내?"), ("assistant", "응.")])
+    # Seed the reflection artifact too: with it present `pending_days` excludes the
+    # day and `catch_up` never calls `run`. No observation is seeded, so persona's
+    # gate 2 (<min_observations) short-circuits before its own model call as well.
+    reflections = tmp_path / "memory" / "reflections"
+    reflections.mkdir(parents=True, exist_ok=True)
+    (reflections / f"{SEED_DAY}.md").write_text("# 2026-08-04 성찰\n", encoding="utf-8")
+
+    api = FakeTelegram()
+    model = ScriptedModel({}, reply="이 답은 나가면 안 된다.")
+    app = boot(monkeypatch, settings_for(tmp_path), model, api)
+
+    async with app.router.lifespan_context(app):
+        await app.state.reflection_boot_task
+        # No Telegram was sent, so the conversation loop never reaches the model
+        # either - the only thing that could have called it is the catch-up.
+        assert model.prompts == [], f"boot catch-up reached the model: {model.prompts}"
+
+
+async def test_boot_catch_up_that_raises_does_not_take_the_daemon_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reflection pass that blows up at boot must cost nothing but itself: the same
+    degrade-don't-die stance the crons take. `/health` stays OK and the conversation
+    loop keeps answering.
+    """
+
+    async def boom(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("catch-up exploded")
+
+    monkeypatch.setattr("daemon.reflection.Reflection.catch_up", boom)
+
+    api = FakeTelegram()
+    app = boot(monkeypatch, settings_for(tmp_path), ScriptedModel({}), api)
+
+    async with app.router.lifespan_context(app):
+        # The wrapper swallows the failure, so the task completes rather than
+        # surfacing as an unretrieved background exception.
+        await app.state.reflection_boot_task
+
+        api.send(1, "안녕")
+        await api.wait_for_reply(1)
+
+        body = await health(app)
+        assert body["conversation_loop"] == "running"
         assert not app.state.loop_task.done()

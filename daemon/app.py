@@ -15,7 +15,7 @@ import asyncio
 import logging
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -101,6 +101,7 @@ def create_app(
     app.state.recall = recall
     app.state.recall_status = "injected" if recall is not None else "not started"
     app.state.loop_task = None
+    app.state.reflection_boot_task = None
     app.state.wake_round = wake
     app.state.wake_task = None
     app.state.wake_status = "off"
@@ -147,6 +148,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.gateway = gateway
 
     scheduler = AsyncIOScheduler(timezone="UTC")
+    # One lock shared by the two catch-up crons and the boot task below. Each cron's
+    # `max_instances=1` only stops it overlapping *itself*; it says nothing about the
+    # boot task, which fires at startup and can land on top of a ~04:00 cron with a
+    # backlog. Two `run(date)` for one day would double-write the append-only
+    # reflection artifact and double-insert its observations (append-only, no dedup),
+    # corrupting the M4 log clock (docs/PLAN.md 8.1). Whoever acquires it second finds
+    # the day's artifact/diary already written and skips.
+    catchup_lock = asyncio.Lock()
     # Local time, not UTC: "overnight" is a fact about the person asleep next to
     # the machine, and a UTC 04:00 lands mid-afternoon in KST. The 5-minute
     # proactivity tick (M3) lands here too.
@@ -156,7 +165,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         hour=REFLECT_HOUR,
         minute=0,
         timezone=None,
-        args=[settings],
+        args=[settings, catchup_lock],
         id="reflection",
         # A pass that overruns until the next night's must not stack up, and a
         # machine that was asleep at 04:00 should still reflect when it wakes -
@@ -172,7 +181,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         hour=PERSONA_HOUR,
         minute=0,
         timezone=None,
-        args=[settings],
+        args=[settings, catchup_lock],
         id="persona-evolution",
         # Same guards as reflection: an overrunning pass must not stack, and a
         # machine asleep on Monday morning should still evolve when it wakes -
@@ -263,6 +272,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             _backfill(recall), name="recall-backfill"
         )
 
+    if memory is not None:
+        # Boot-time catch-up for the reflection and persona passes. Their crons are
+        # local-time jobs (04:00, and Monday 05:00) that a machine powered off
+        # overnight sleeps straight through, so without this the log clock
+        # (docs/PLAN.md 8.1) never advances for that user. Not awaited, and for the
+        # same reason as the backfill just above: a cold-boot backlog is up to 14
+        # sequential model calls, and awaiting it before the `yield` would block
+        # uvicorn's "startup complete" and /health. Gated on the writer because
+        # catch-up reads the mirror `_build_io` has just rebuilt from markdown - if
+        # that failed (`memory is None`) there is nothing to read.
+        app.state.reflection_boot_task = asyncio.create_task(
+            _boot_catchup(settings, catchup_lock), name="reflection-boot-catchup"
+        )
+
     # The always-on gate. This is what makes "it hears me when I call it" a property
     # of the resident process rather than of a command somebody remembered to run -
     # `daemon wake test` proves the gate works, and this is what uses it.
@@ -301,7 +324,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # that escaped the finally block - skipping the channel close, the sqlite
         # close, the scheduler shutdown and every provider aclose below it. A
         # revoked bot token was enough to leak the lot on every restart.
-        for name in ("backfill_task", "loop_task", "wake_task"):
+        for name in ("backfill_task", "loop_task", "wake_task", "reflection_boot_task"):
             pending = getattr(app.state, name, None)
             if pending is None:
                 continue
@@ -719,17 +742,23 @@ async def _proactive_tick(settings: Settings) -> None:
     )
 
 
-async def _reflect_tick(settings: Settings) -> None:
+async def _reflect_tick(settings: Settings, lock: asyncio.Lock | None = None) -> None:
     """The scheduled pass. Catches everything: a job that raises inside
     APScheduler is logged once and then the schedule carries on, which reads as a
-    working reflection loop that has silently done nothing for a month."""
+    working reflection loop that has silently done nothing for a month.
+
+    `lock`, when passed, serialises the actual `catch_up` against the boot task
+    (`_boot_catchup`) running the same pass: both walk the unreflected days, and two
+    `run(date)` for one day double-write its append-only artifact and observations.
+    A lock-less call (`lock=None`) still works via `nullcontext`."""
     try:
         reflection, close = await build_reflection(settings)
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
         logger.error("reflection tick could not start: %s", exc)
         return
     try:
-        results = await reflection.catch_up()
+        async with lock if lock is not None else nullcontext():
+            results = await reflection.catch_up()
     except Exception as exc:  # noqa: BLE001
         logger.error("reflection tick failed: %s", exc)
         return
@@ -749,7 +778,7 @@ async def _reflect_tick(settings: Settings) -> None:
         )
 
 
-async def _persona_tick(settings: Settings) -> None:
+async def _persona_tick(settings: Settings, lock: asyncio.Lock | None = None) -> None:
     """The weekly persona-evolution pass. Catches everything, same reason as
     reflection and the proactive tick: a job that raises inside APScheduler is
     logged once and then the schedule carries on, which reads as a working
@@ -759,6 +788,11 @@ async def _persona_tick(settings: Settings) -> None:
     observations yet" and "already ran this week" both have to be visible
     without opening sqlite - the same reasoning as the reflection tick's log
     line.
+
+    `lock`, when passed, serialises the actual `run` against the boot task the
+    same way the reflection tick does: two `run()` in one week would both write
+    the week's diary and re-consume observations. A lock-less call (`lock=None`)
+    still works via `nullcontext`.
     """
     try:
         evolution, close = await build_persona_evolution(settings)
@@ -766,7 +800,8 @@ async def _persona_tick(settings: Settings) -> None:
         logger.error("persona evolution tick could not start: %s", exc)
         return
     try:
-        result = await evolution.run()
+        async with lock if lock is not None else nullcontext():
+            result = await evolution.run()
     except Exception as exc:  # noqa: BLE001
         logger.error("persona evolution tick failed: %s", exc)
         return
@@ -785,6 +820,33 @@ async def _persona_tick(settings: Settings) -> None:
         result.retired,
         f" problems={result.problems}" if result.problems else "",
     )
+
+
+async def _boot_catchup(settings: Settings, lock: asyncio.Lock) -> None:
+    """Run the reflection and persona passes once at startup.
+
+    The 04:00 reflection cron and the Monday 05:00 persona cron are local-time
+    APScheduler jobs, so a user who powers the machine off overnight is never on
+    when they fire and the M4 "two weeks of observations" log clock (docs/PLAN.md
+    8.1) never advances. This complements those crons rather than replacing them: it
+    calls the very same ticks once at boot, so the passes still run for a machine
+    that is only ever on during the day.
+
+    Reflection first, then persona - the crons' own order (04:00 then 05:00) - so
+    persona reads the observations this catch-up has just written. Neither pass needs
+    a guard for "was it already run": reflection's per-day artifact and persona's
+    weekly diary already make each a no-op when nothing is pending, at zero model
+    cost, and `lock` covers the one race a boot near 04:00 introduces.
+
+    Both ticks already catch and log their own failures; this wrapper is
+    defence-in-depth, so nothing can escape as an unretrieved exception on a
+    background task.
+    """
+    try:
+        await _reflect_tick(settings, lock)
+        await _persona_tick(settings, lock)
+    except Exception:
+        logger.exception("boot catch-up failed")
 
 
 async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
