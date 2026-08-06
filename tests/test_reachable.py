@@ -65,15 +65,32 @@ PENDING_WIRING = {
         "M1c+ / PR-2b - VoiceConversation routes a spoken tool call to ToolRunner",
         ("base.py", "gemini_live.py"),
     ),
+    # The three write/read surfaces of the grant table, none of them called from
+    # daemon/ yet. `tool_grants` (the read the policy makes) is deliberately absent:
+    # it *is* wired, through `policy.py:_granted`, which is the point of the both-
+    # directions check. All three below are built and tested (test_tools.py) and
+    # reachable from nothing, which is exactly the state this dict exists to name -
+    # tracking only the write path would have been the same inconsistency, one layer
+    # down, that PENDING_CLASSES' comment warns about.
     "add_tool_grant": (
-        "M1c+ / PR-2b - the surface an owner grants a whole tool through. Whatever "
-        "closes this must also make the grant visible: CONTRACTS rule 12 says a "
-        "capability reported nowhere is the silent state this project keeps being "
-        "bitten by, and `_tools_check` in cli.py reads config only, so a granted "
-        "tool would run without asking while `daemon doctor` said "
-        "runs-without-asking=nothing. There is nothing to under-report while "
-        "nothing writes a row, and that stops being true the moment this closes. "
-        "M1c",
+        "M1c+ / PR-2b - the surface an owner grants a whole tool through. M1c",
+        ("store.py",),
+    ),
+    "remove_tool_grant": (
+        "M1c+ / PR-2b - revocation, the `daemon tools forget` of grants. M1c",
+        ("store.py",),
+    ),
+    "all_tool_grants": (
+        # This is the one the reviewer was right to single out. CONTRACTS rule 12:
+        # a capability reported nowhere is the silent state this project keeps being
+        # bitten by, and `_tools_check` in cli.py reads config only - so once
+        # something writes a grant, a granted tool runs without asking while
+        # `daemon doctor` still says runs-without-asking=nothing. `all_tool_grants`
+        # is *how* doctor would show them, so leaving it untracked is how PR-2b could
+        # wire `add_tool_grant` and forget visibility with every test still green.
+        # Tracked here so wiring the write path and wiring the view are two conscious
+        # acts, not one that silently drops the other.
+        "M1c+ / PR-2b - the read `daemon doctor` needs so a grant is visible (rule 12). M1c",
         ("store.py",),
     ),
 }
@@ -83,7 +100,12 @@ an unbuilt class, because these are functions and that dict only holds types.
 The value is (owning milestone, the files allowed to mention it): the module that
 declares it and the module that implements it. Any *other* file under `daemon/`
 mentioning the name means it has been wired, and the test below then fails - which
-is the reminder to delete the entry rather than leave a closed gap declared open."""
+is the reminder to delete the entry rather than leave a closed gap declared open.
+
+Not a "load-bearing seams only" list. The file's whole subject is built-tested-
+unreachable, and picking which unreachable symbols to track by how important they
+feel is how the untracked one turns out to be the one that mattered - here, the
+rule-12 visibility read."""
 
 WIRED_CLASSES = (
     "TelegramChannel",
