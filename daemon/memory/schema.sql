@@ -337,7 +337,7 @@ CREATE INDEX IF NOT EXISTS idx_utterances_label ON proactive_utterances (spoken_
 -- ---------------------------------------------------------------------------
 -- M1c: tool use (PC control)
 -- ---------------------------------------------------------------------------
--- Like channel_pairing and channel_cursor above, these three are NOT rebuildable
+-- Like channel_pairing and channel_cursor above, these four are NOT rebuildable
 -- from the markdown, and for the same reason: they are not what the user said,
 -- they are what the machine did and what it was allowed to do. Losing them costs
 -- an audit trail and a set of standing approvals, not conversation.
@@ -406,3 +406,33 @@ CREATE TABLE IF NOT EXISTS tool_allowlist (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_allowlist_entry
     ON tool_allowlist (tool, pattern);
+
+-- Standing approvals for a whole tool, which is a different axis from the table
+-- above and not a generalisation of it. `tool_allowlist` holds argv prefixes, and
+-- a tool with no argv cannot have one: measured on this build, `write_file` is
+-- the only *built-in* in that position, but every MCP tool is (tools/mcp.py -
+-- `McpTool` is deliberately not `Executable`), so `mode=allowlist` refused every
+-- remote tool an owner added and no setting could change it.
+--
+-- Not merged into tool_allowlist with an empty pattern. The two are read by
+-- different code for different questions - "does this argv match a prefix" and
+-- "is this tool allowed at all" - and one table serving both would make a row
+-- with an empty pattern mean "any command", which is `mode=full` reachable by
+-- anything that can write one row.
+--
+-- `channel` is '*' - every channel - in every row written today, so today's
+-- behaviour is exactly that of a table without the column. It exists now for the
+-- reason the unused tables further up exist (see the header of this file): "this
+-- tool over text, never over voice" is a sentence a later milestone wants, and
+-- adding the column then would mean a migration. `tools/policy.py:_granted`
+-- matches on it from the start rather than after, because a row the gate ignored
+-- would be a grant that reads as granted and is not.
+CREATE TABLE IF NOT EXISTS tool_grants (
+    id         INTEGER PRIMARY KEY,
+    tool       TEXT    NOT NULL,
+    channel    TEXT    NOT NULL DEFAULT '*',
+    created_at TEXT    NOT NULL
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_grants_entry
+    ON tool_grants (tool, channel);

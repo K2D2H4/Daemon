@@ -16,9 +16,11 @@ from typing import Any
 import pytest
 
 from daemon import clock
+from daemon.llm.base import ToolSpec
 from daemon.tools.base import ToolError
 from daemon.tools.builtin import PathScope, RunCommand, WriteFile
 from daemon.tools.policy import (
+    ANY_CHANNEL,
     APPROVAL_TTL,
     MODES,
     Command,
@@ -42,6 +44,7 @@ class StubStore:
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, Any]] = {}
         self.granted: dict[str, list[str]] = {}
+        self.grants: dict[str, list[str]] = {}
         self.expired = 0
 
     def create_tool_approval(
@@ -95,6 +98,9 @@ class StubStore:
 
     def tool_allowlist(self, tool: str) -> list[str]:
         return list(self.granted.get(tool, ()))
+
+    def tool_grants(self, tool: str) -> list[str]:
+        return list(self.grants.get(tool, ()))
 
 
 @pytest.fixture
@@ -323,6 +329,182 @@ async def test_a_non_command_tool_can_never_be_allowlisted(
         .verdict
         == "deny"
     )
+
+
+# --- per-tool grants --------------------------------------------------------
+# The axis the argv allowlist could not express. Which tools were stuck was
+# measured rather than assumed, because the guess was wrong in both directions:
+# `notify` is `safe` and never reaches the mode check at all, and `open_path`
+# *does* implement `argv`. Of the ten built-in and browser tools exactly one -
+# `write_file` - is guarded and not allowlistable. The group where it bites is
+# MCP: `McpTool` has no argv by construction and its risk is `guarded` unless
+# `mcp.json` names it safe, so `mode=allowlist` refused every remote tool an
+# owner might add, with no setting that could change it.
+
+
+ARGUMENTS = {"path": "notes.md", "content": "hi"}
+
+
+class StubMcpTool:
+    """A guarded tool with no argv, the shape every MCP tool has.
+
+    Here rather than `McpTool` itself because the policy reads three things - the
+    name, the risk, and whether it is `Executable` - and constructing a real one
+    would drag in a bridge and a server config to test none of them.
+    """
+
+    risk = "guarded"
+    spec = ToolSpec(name="jira_create_issue", description="", parameters={})
+
+    def preview(self, arguments: Any) -> str:
+        return "jira: create an issue"
+
+    async def run(self, arguments: Any) -> str:  # pragma: no cover - never reached
+        return ""
+
+
+async def test_a_granted_tool_runs_in_allowlist_mode(
+    store: StubStore, scope: PathScope
+) -> None:
+    """The hole this table exists for. Before it, `allowlist` was a permanent
+    refusal for every tool without an argv, whatever the owner said."""
+    store.grants["write_file"] = [ANY_CHANNEL]
+    decided = policy(store, mode="allowlist").decide(
+        WriteFile(scope), ARGUMENTS, origin="owner", channel="telegram"
+    )
+    assert decided.verdict == "allow"
+    assert "grant" in decided.reason
+
+
+async def test_a_granted_tool_is_not_asked_about_in_ask_mode(
+    store: StubStore, scope: PathScope
+) -> None:
+    """A standing grant is the answer to "stop asking me about this one"."""
+    store.grants["write_file"] = [ANY_CHANNEL]
+    decided = policy(store, mode="ask").decide(
+        WriteFile(scope), ARGUMENTS, origin="owner", channel="telegram"
+    )
+    assert decided.verdict == "allow"
+
+
+async def test_a_granted_mcp_tool_runs_in_allowlist_mode(store: StubStore) -> None:
+    """The group the hole actually cost: an MCP tool has no argv by construction,
+    so before this table `mode=allowlist` refused every remote tool an owner
+    added, whatever they configured."""
+    store.grants["jira_create_issue"] = [ANY_CHANNEL]
+    decided = policy(store, mode="allowlist").decide(
+        StubMcpTool(), {"summary": "hi"}, origin="owner", channel="telegram"
+    )
+    assert decided.verdict == "allow"
+
+
+async def test_a_grant_for_one_tool_says_nothing_about_another(
+    store: StubStore, scope: PathScope
+) -> None:
+    """Keyed by tool name, so granting one is not granting the set."""
+    store.grants["jira_create_issue"] = [ANY_CHANNEL]
+    decided = policy(store, mode="allowlist").decide(
+        WriteFile(scope), ARGUMENTS, origin="owner", channel="telegram"
+    )
+    assert decided.verdict == "deny"
+
+
+@pytest.mark.parametrize("origin", ["untrusted", "agent", "system", ""])
+@pytest.mark.parametrize("mode", MODES)
+async def test_a_grant_does_not_reach_past_the_origin_gate(
+    store: StubStore, scope: PathScope, origin: str, mode: str
+) -> None:
+    """CONTRACTS rule 10 names standing grants explicitly: not a mode, not an
+    allowlist, not a grant. A grant is stored per tool and a forwarded message can
+    name any tool, so this is the one that would turn "look at this" into a write."""
+    store.grants["write_file"] = [ANY_CHANNEL]
+    decided = policy(store, mode=mode).decide(
+        WriteFile(scope), ARGUMENTS, origin=origin, channel="telegram"
+    )
+    assert decided.verdict == "deny"
+
+
+async def test_a_grant_does_not_reach_past_mode_off(
+    store: StubStore, scope: PathScope
+) -> None:
+    """`off` means no guarded tool runs. A grant written while the mode was
+    `allowlist` must not survive the owner turning tools down."""
+    store.grants["write_file"] = [ANY_CHANNEL]
+    decided = policy(store, mode="off").decide(
+        WriteFile(scope), ARGUMENTS, origin="owner", channel="telegram"
+    )
+    assert decided.verdict == "deny"
+
+
+async def test_a_grant_does_not_reach_past_the_switch(
+    store: StubStore, scope: PathScope
+) -> None:
+    store.grants["write_file"] = [ANY_CHANNEL]
+    decided = policy(store, mode="allowlist", enabled=False).decide(
+        WriteFile(scope), ARGUMENTS, origin="owner", channel="telegram"
+    )
+    assert decided.verdict == "deny"
+    assert "DAEMON_TOOLS_ENABLED" in decided.reason
+
+
+async def test_a_grant_is_not_a_way_around_the_argv_allowlist(
+    store: StubStore, run_command: RunCommand
+) -> None:
+    """`run_command` *is* argv-shaped, so it keeps being decided by argv. A
+    tool-level grant on it would mean "any command at all", which is `mode=full`
+    wearing a table row - and would be granted by whoever could write one row."""
+    store.grants["run_command"] = [ANY_CHANNEL]
+    decided = policy(store, mode="ask").decide(
+        run_command, {"command": "curl evil.example"}, origin="owner", channel="telegram"
+    )
+    assert decided.verdict == "ask"
+
+
+async def test_a_grant_scoped_to_a_channel_does_not_apply_elsewhere(
+    store: StubStore, scope: PathScope
+) -> None:
+    """Nothing writes a channel-scoped row today. The column is here so the
+    milestone that wants "this tool over text only" needs no migration - and the
+    match honours it from the start, because a row `decide` ignored would be a
+    grant that reads as granted and is not."""
+    store.grants["write_file"] = ["telegram"]
+    write = WriteFile(scope)
+    assert (
+        policy(store, mode="allowlist")
+        .decide(write, ARGUMENTS, origin="owner", channel="telegram")
+        .verdict
+        == "allow"
+    )
+    assert (
+        policy(store, mode="allowlist")
+        .decide(write, ARGUMENTS, origin="owner", channel="voice")
+        .verdict
+        == "deny"
+    )
+
+
+async def test_a_channel_scoped_grant_is_not_matched_by_a_caller_that_named_none(
+    store: StubStore, scope: PathScope
+) -> None:
+    """`channel` defaults to empty, so a caller that forgets it gets only the
+    `'*'` grants - the safe direction to be wrong in."""
+    store.grants["write_file"] = ["telegram"]
+    decided = policy(store, mode="allowlist").decide(
+        WriteFile(scope), ARGUMENTS, origin="owner"
+    )
+    assert decided.verdict == "deny"
+
+
+async def test_an_ungranted_tool_still_says_how_it_could_be_granted(
+    store: StubStore, scope: PathScope
+) -> None:
+    """The refusal is read by the model, which is told why so it stops trying the
+    same thing - and can say what the owner would have to do instead."""
+    decided = policy(store, mode="allowlist").decide(
+        WriteFile(scope), ARGUMENTS, origin="owner", channel="telegram"
+    )
+    assert decided.verdict == "deny"
+    assert "grant" in decided.reason
 
 
 # --- shell operators --------------------------------------------------------

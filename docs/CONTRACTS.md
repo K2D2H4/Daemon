@@ -204,10 +204,20 @@ And **M1c — PC control**, pulled forward from post-M4 (docs/PLAN.md 8.2, §10)
 > It can read a file, run a command it has been allowed to run, and ask before
 > anything else - and a forwarded message can do none of it.
 
-One piece: `daemon/tools/`, plus tool calling in the provider contract and three
+One piece: `daemon/tools/`, plus tool calling in the provider contract and four
 tables in `daemon/memory/schema.sql`. Both frozen files were extended additively; nothing that
 compiled before stopped compiling. No new `Task` - tool-using chat is still
 `chat_text`, so the preset tables are untouched.
+
+The fourth table, `tool_grants`, was added later and is a *second* standing axis
+rather than a widening of the first. `tool_allowlist` holds argv prefixes, and a
+tool with no argv can never match one - so `mode=allowlist` was a permanent refusal
+for `write_file` and for **every** MCP tool (`McpTool` is deliberately not
+`Executable`), with no setting that reached it. `tool_grants` allows a whole tool;
+`tools/policy.py:decide` reads it only for tools that are *not* `Executable`,
+because a tool-level grant on `run_command` would be `mode=full` wearing one table
+row. Rule 10 above is unchanged and covers it: a grant does not reach past the
+origin gate, the switch, or `mode=off`.
 
 Then **the browser group** (`daemon/tools/browser.py`), behind its own
 `DAEMON_BROWSER_ENABLED`:

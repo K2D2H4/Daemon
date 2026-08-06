@@ -69,6 +69,14 @@ DENY_COMMAND = "/deny"
 ALWAYS = "always"
 """`/approve CODE always` also writes a standing allowlist entry."""
 
+ANY_CHANNEL = "*"
+"""A grant that is not about one channel. The only value written today.
+
+The alternative - no channel column, add one later - is the migration
+`docs/CONTRACTS.md` says these tables exist to avoid, and `decide` matches on the
+column from the start rather than after: a row it ignored would be a grant that
+reads as granted and is not, which is this project's worst failure shape."""
+
 
 @dataclass(frozen=True, slots=True)
 class Decision:
@@ -105,11 +113,17 @@ class Command:
     always: bool
 
 
-class ApprovalStore(Protocol):
+class PolicyStore(Protocol):
     """The slice of `memory.store.Store` this module needs.
 
     A protocol rather than the class, so the policy can be tested against a stub
     and so nothing here imports storage.
+
+    Named for the policy rather than for approvals, which is what it was called
+    while approvals were all it carried. Two standing things are now read through
+    it and they are different axes - `tool_allowlist` is an argv pattern,
+    `tool_grants` is a whole tool - so a name that promised only one of them was
+    the wrong name to add the second to.
     """
 
     def create_tool_approval(
@@ -137,6 +151,10 @@ class ApprovalStore(Protocol):
     def add_tool_allowlist_entry(self, tool: str, pattern: str, *, now: datetime) -> None: ...
 
     def tool_allowlist(self, tool: str) -> list[str]: ...
+
+    def tool_grants(self, tool: str) -> list[str]:
+        """Channels this tool is granted on, `ANY_CHANNEL` meaning all of them."""
+        ...
 
 
 def fingerprint(tool: str, arguments: Mapping[str, Any]) -> str:
@@ -176,7 +194,7 @@ def parse_command(text: str) -> Command | None:
 class ToolPolicy:
     def __init__(
         self,
-        store: ApprovalStore,
+        store: PolicyStore,
         *,
         mode: Mode = "ask",
         allowlist: Sequence[str] = (),
@@ -206,7 +224,14 @@ class ToolPolicy:
     def enabled(self) -> bool:
         return self._enabled
 
-    def decide(self, tool: Tool, arguments: Mapping[str, Any], *, origin: str) -> Decision:
+    def decide(
+        self,
+        tool: Tool,
+        arguments: Mapping[str, Any],
+        *,
+        origin: str,
+        channel: str = "",
+    ) -> Decision:
         """The whole decision. No model call, and no I/O beyond standing grants."""
         if not self._enabled:
             return Decision("deny", "tool use is switched off (DAEMON_TOOLS_ENABLED)")
@@ -229,15 +254,23 @@ class ToolPolicy:
             return Decision("allow", "tool mode is 'full'")
 
         if not isinstance(tool, Executable):
-            # Nothing to match a pattern against, so there is no such thing as an
-            # allowlisted `write_file`. In `ask` that is a question; in `allowlist`
-            # it is a refusal, which is what "run only allowlisted commands" means.
+            # Nothing to match an argv pattern against, so there is no such thing
+            # as an allowlisted `write_file`. The grant is the other axis, and it
+            # is read *first*: without it `allowlist` was a permanent refusal for
+            # every tool with no argv, and nothing a user could configure reached
+            # it. That was `write_file` among the built-ins and - the group it
+            # actually cost - every MCP tool, which has no argv by construction
+            # (tools/mcp.py) and is `guarded` unless mcp.json names it safe.
+            granted = self._granted(tool.spec.name, channel)
+            if granted is not None:
+                return Decision("allow", f"standing grant: {tool.spec.name} on {granted}")
             if self._mode == "ask":
                 return Decision("ask", f"{tool.spec.name} is not allowlistable")
             return Decision(
                 "deny",
                 f"{tool.spec.name} is not a command, so it cannot be allowlisted, "
-                "and tool mode is 'allowlist'",
+                "and tool mode is 'allowlist'. The owner would have to grant the "
+                "tool itself; asking again with the same arguments will not help",
             )
 
         try:
@@ -255,6 +288,26 @@ class ToolPolicy:
         return Decision(
             "deny", f"{argv[0]} is not allowlisted and tool mode is 'allowlist'"
         )
+
+    def _granted(self, tool_name: str, channel: str) -> str | None:
+        """Which channel's grant covers this call, or None.
+
+        Deliberately not consulted for an `Executable` tool. A tool-level grant on
+        `run_command` would mean "any command at all" - `mode=full` wearing one
+        table row, and reachable by anything that can write one - so a command
+        keeps being decided by its argv. That asymmetry is the whole reason there
+        are two tables rather than one.
+
+        An empty `channel` matches only `ANY_CHANNEL`, so a caller that does not
+        say where it is calling from gets the narrower answer rather than the
+        wider one.
+        """
+        channels = self._store.tool_grants(tool_name)
+        if ANY_CHANNEL in channels:
+            return ANY_CHANNEL
+        if channel and channel in channels:
+            return channel
+        return None
 
     def _match(self, tool_name: str, argv: Sequence[str]) -> str | None:
         """The allowlist entry covering this argv, or None.

@@ -80,3 +80,23 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   (the Monday job and a hand-run `evolve`) raced: one `O_TRUNC`ed the other's bytes, then the
   loser's `os.replace` raised. Random suffix now. Two concurrent writers still do not merge —
   the later `replace` wins outright, and that is not fixed.
+- **A voice `toolResponse` does not interrupt generation, and the reason is more
+  useful than the fact.** Measured on `gemini-3.1-flash-live-preview`: a blocking
+  reply ran **13.69 s past** our answer and spoke the value we returned, with
+  **0.0 s of audio before** it — the `toolCall` arrives before the model says
+  anything, so there is no generation for the response to land inside. That is what
+  makes it unlike `clientContent`, which killed a 46.7 s turn down to 2.2 s; that
+  failure *needed* a mid-answer arrival. Meanwhile `behavior: NON_BLOCKING` was
+  **accepted and then ignored** — all three `scheduling` values gave 0.0 s of audio
+  after the answer, no `interrupted`, and no second turn in 60 s, including the
+  `INTERRUPT` that is documented to make the model break off. A field the server
+  accepts and ignores is worse than one it rejects, so neither is sent.
+- **Which tools `mode=allowlist` could never run was guessed wrong in both
+  directions.** The guess was `write_file`, `open_path` and `notify`. Enumerated
+  instead: `notify` is `risk="safe"` and never reaches the mode check at all, and
+  `open_path` *does* implement `argv`, so of the ten built-in and browser tools
+  exactly **one** — `write_file` — was stuck. The group it actually cost is MCP:
+  `McpTool` has no argv by construction and is `guarded` unless `data/mcp.json` names it
+  safe, so `allowlist` refused every remote tool an owner added. `tool_grants` is
+  that second axis, and it is read only for tools that are *not* `Executable` —
+  a tool-level grant on `run_command` would be `mode=full` wearing one table row.
