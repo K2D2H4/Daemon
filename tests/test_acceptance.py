@@ -367,6 +367,59 @@ async def test_yesterday_is_quoted_back_tomorrow(tmp_path: Path) -> None:
         store.close()
 
 
+# --- M4 gate: a learned persona rule reaches the prompt ----------------------
+
+
+async def test_a_learned_persona_rule_reaches_the_conversation_prompt(tmp_path: Path) -> None:
+    """docs/design/2026-08-05-m4-persona-design.md's acceptance check: a rule
+    sitting in `persona/learned.md` has to reach the real conversation prompt on
+    the very next turn, the same way `seed.md` already does. Written directly to
+    the file rather than produced by `PersonaEvolution` - that pass is
+    `persona-dev`'s own gate (tests/test_persona_evolve.py); this one is whether
+    the wiring between the file and the loop actually holds.
+    """
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        writer = FileMemoryWriter(tmp_path, store)
+        provider = Provider()
+        gateway = LLMGateway({"fake": provider}, {Task.CHAT_TEXT: Route("fake", "m")})
+
+        persona_dir = tmp_path / "persona"
+        persona_dir.mkdir(exist_ok=True)
+        (persona_dir / "learned.md").write_text(
+            "- 아침엔 인사만 짧게 한다\n", encoding="utf-8"
+        )
+
+        class Channel:
+            name = "telegram"
+
+            async def send(self, message: Any) -> None: ...
+
+            def listen(self) -> Any:  # pragma: no cover - driven directly
+                raise NotImplementedError
+
+            async def close(self) -> None: ...
+
+        loop = ConversationLoop(Channel(), gateway, Companion(writer, data_dir=tmp_path))
+        await loop.handle(
+            InboundMessage(
+                text="좋은 아침",
+                sender_id=str(OWNER),
+                received_at=datetime.now(UTC),
+                channel="telegram",
+                external_id="1",
+            )
+        )
+
+        systems = [m.content for m in provider.prompts[0] if m.role == "system"]
+        assert any("아침엔 인사만 짧게 한다" in text for text in systems), (
+            "a learned persona rule in learned.md did not reach the conversation "
+            "prompt - the M4 wiring gate, failing"
+        )
+    finally:
+        store.close()
+
+
 # --- what the product says about itself --------------------------------------
 
 

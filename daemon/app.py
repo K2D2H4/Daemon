@@ -29,6 +29,7 @@ from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
 from daemon.memory.base import MemoryWriter, Recall
+from daemon.persona.evolve import PersonaEvolution
 from daemon.proactivity.tick import ProactiveTick
 from daemon.reflection import Reflection
 from daemon.tasks import Task
@@ -69,6 +70,12 @@ subprocess probes, not a model call."""
 REFLECT_HOUR = 4
 """Local hour for the nightly pass. Late enough that the day is over, early enough
 that the morning's first message already sees what it concluded."""
+
+PERSONA_DAY = "mon"
+PERSONA_HOUR = 5
+"""Weekly persona-evolution pass: Monday, 05:00 local - one hour after reflection
+so a week's worth of observations has already had its last night's reflection
+land before evolution reads them."""
 
 
 def create_app(
@@ -154,6 +161,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # A pass that overruns until the next night's must not stack up, and a
         # machine that was asleep at 04:00 should still reflect when it wakes -
         # `catch_up` covers every missed day anyway, so one late run is enough.
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=None,
+    )
+    scheduler.add_job(
+        _persona_tick,
+        "cron",
+        day_of_week=PERSONA_DAY,
+        hour=PERSONA_HOUR,
+        minute=0,
+        timezone=None,
+        args=[settings],
+        id="persona-evolution",
+        # Same guards as reflection: an overrunning pass must not stack, and a
+        # machine asleep on Monday morning should still evolve when it wakes -
+        # `PersonaEvolution.run`'s own diary-file gate covers a late run, so one
+        # catch-up is enough and there is no `catch_up` loop here to misfire.
         max_instances=1,
         coalesce=True,
         misfire_grace_time=None,
@@ -617,6 +641,45 @@ async def build_reflection(settings: Settings) -> tuple[Reflection, Callable[[],
     return Reflection(settings.data_dir, store, gateway), close
 
 
+async def build_persona_evolution(
+    settings: Settings,
+) -> tuple[PersonaEvolution, Callable[[], Awaitable[None]]]:
+    """A `PersonaEvolution` and the coroutine that releases what it holds.
+
+    Follows `build_reflection` exactly, for the same reason: this is the only
+    file allowed to import concrete providers, and `daemon persona evolve` needs
+    the same object the Monday scheduler job runs - a scheduled pass nobody can
+    run by hand is a pass nobody can verify.
+    """
+    from daemon.fs import harden_existing
+    from daemon.memory.store import Store
+
+    harden_existing(settings.data_dir)
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    providers = _build_providers(settings)
+    gateway = LLMGateway(providers, settings.routing_table(), fallback=settings.fallback_route())
+
+    async def close() -> None:
+        store.close()
+        for provider in providers.values():
+            closer = getattr(provider, "aclose", None)
+            if closer is not None:
+                with suppress(Exception):
+                    await closer()
+
+    return (
+        PersonaEvolution(
+            settings.data_dir,
+            store,
+            gateway,
+            max_active=settings.persona_max_active_rules,
+            max_new=settings.persona_max_new_per_cycle,
+            min_observations=settings.persona_min_observations,
+        ),
+        close,
+    )
+
+
 async def _proactive_tick(settings: Settings) -> None:
     """The five-minute round. Catches everything, for the same reason the reflection
     tick does: a job that raises inside APScheduler is logged once and then the
@@ -688,6 +751,44 @@ async def _reflect_tick(settings: Settings) -> None:
         )
 
 
+async def _persona_tick(settings: Settings) -> None:
+    """The weekly persona-evolution pass. Catches everything, same reason as
+    reflection and the proactive tick: a job that raises inside APScheduler is
+    logged once and then the schedule carries on, which reads as a working
+    weekly pass that has silently done nothing for months.
+
+    Logged at INFO even when the pass was skipped, because "not enough
+    observations yet" and "already ran this week" both have to be visible
+    without opening sqlite - the same reasoning as the reflection tick's log
+    line.
+    """
+    try:
+        evolution, close = await build_persona_evolution(settings)
+    except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
+        logger.error("persona evolution tick could not start: %s", exc)
+        return
+    try:
+        result = await evolution.run()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("persona evolution tick failed: %s", exc)
+        return
+    finally:
+        with suppress(Exception):
+            await close()
+
+    logger.info(
+        "persona evolve %s: %s (%d observation(s) read -> %d proposed, %d added, "
+        "%d retired)%s",
+        result.date,
+        result.skipped or "ran",
+        result.observations_read,
+        result.proposed,
+        result.added,
+        result.retired,
+        f" problems={result.problems}" if result.problems else "",
+    )
+
+
 async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
     """One spoken conversation at this machine, then exit.
 
@@ -732,8 +833,11 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
             # the words the owner was most likely to ask about later.
             resolve_id=_id_resolver(writer),
         )
-        # The persona is the seed, same as the text path, and read through the same
-        # loader so M4 changes one file.
+        # Seed and learned rules both, same as the text path, and through the same
+        # `Companion.persona` -> `load_persona`: a conversation surface is a
+        # conversation surface, and M4's learned half reaches every one of them
+        # except the proactive judge, which stays seed-only on purpose
+        # (daemon/proactivity/judge.py).
         seed = await companion.persona()
         audio = build_voice_audio()
         # Before the handshake, so the acknowledgement is as close to the wake word

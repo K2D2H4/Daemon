@@ -374,6 +374,41 @@ def test_new_env_vars_are_read_with_their_documented_names(
     assert settings.gemini_live_model == "gemini-live-x"
 
 
+# --- M4 fields: persona evolution -------------------------------------------
+
+
+def test_persona_evolution_defaults() -> None:
+    settings = make_settings(preset="offline")
+
+    assert settings.persona_max_active_rules == 20
+    assert settings.persona_max_new_per_cycle == 3
+    assert settings.persona_min_observations == 5
+
+
+def test_persona_evolution_env_vars_are_read_with_their_documented_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PERSONA_MAX_ACTIVE_RULES", "10")
+    monkeypatch.setenv("DAEMON_PERSONA_MAX_NEW_PER_CYCLE", "1")
+    monkeypatch.setenv("DAEMON_PERSONA_MIN_OBSERVATIONS", "8")
+
+    settings = Settings(_env_file=None, hosted_provider="anthropic")
+
+    assert settings.persona_max_active_rules == 10
+    assert settings.persona_max_new_per_cycle == 1
+    assert settings.persona_min_observations == 8
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["persona_max_active_rules", "persona_max_new_per_cycle", "persona_min_observations"],
+)
+def test_a_negative_persona_setting_fails_at_startup(field: str) -> None:
+    with pytest.raises(ConfigError, match="DAEMON_PERSONA_"):
+        make_settings(preset="offline", **{field: -1})
+
+
 # --- misc fields ------------------------------------------------------------
 
 

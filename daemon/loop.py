@@ -7,13 +7,13 @@ sends. The voice endpoint carries the same companion over a stream instead
 (`daemon/voice/conversation.py`), and the two are deliberately not one pipeline;
 `daemon/companion.py` says why.
 
-Recall and tools are both optional here, and that is deliberate. Each arrives as
-one more injected protocol, so a half-finished layer - an embedder that will not
-load, a tool policy still being written - degrades to exactly the behaviour that
-already works instead of taking the log clock down with it (docs/PLAN.md 8.1).
-
-Dependencies arrive through the constructor as protocols only: this module must
-not know that the channel is Telegram or that memory is markdown.
+Recall and tools are both optional, and that is deliberate - but the loop no
+longer sees that: they are injected into the `Companion`, and a half-finished
+layer (an embedder that will not load, a tool policy still being written) degrades
+inside it to exactly the behaviour that already works instead of taking the log
+clock down with it (docs/PLAN.md 8.1). What arrives here is the channel, the
+gateway and that companion; this module still must not know that the channel is
+Telegram, that memory is markdown, or which of recall and tools the companion has.
 """
 
 from __future__ import annotations

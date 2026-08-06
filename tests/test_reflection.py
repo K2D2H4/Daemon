@@ -184,12 +184,27 @@ async def test_the_daemons_own_speech_is_not_evidence(data_dir: Path, store: Sto
     assert result.status == "nothing"
 
 
-async def test_recalled_messages_are_not_re_extracted(data_dir: Path, store: Store) -> None:
-    """Hygiene rule 2. Counting injected context again turns it into new evidence."""
-    reused = record(store, "이미 주입된 것")
-    store.mark_recalled([reused])
+async def test_a_recalled_message_is_still_read(data_dir: Path, store: Store) -> None:
+    """Hygiene rule 2 used to drop these, and that is what starved M4.
 
-    assert (await pass_for(data_dir, store).run(DAY)).status == "nothing"
+    Measured on one real day: 29 of 38 messages carried the flag, and they were the
+    persona-relevant ones - "짧게 대답해줄래", "답장이 왜케 오래걸려" - while the 9
+    survivors were wake-word noise. Reflection returned nothing because it was
+    handed nothing.
+
+    The rule also never blocked what it named: recall injects its hits as a system
+    block, and `loop.py` records only the user turn and the reply, so injected text
+    is never a row. Something the user said is evidence of what the user said,
+    whether or not recall later surfaced it.
+    """
+    said_and_later_recalled = record(store, "너무 말이 길어. 짧게 대답해줄래")
+    store.mark_recalled([said_and_later_recalled])
+
+    result = await pass_for(data_dir, store).run(DAY)
+
+    assert result.status == "written"
+    assert result.messages_read == 1
+    assert result.observations == 1
 
 
 # --- a model that misbehaves -------------------------------------------------

@@ -185,14 +185,15 @@ class Companion:
         return self._tools is not None
 
     async def persona(self) -> str:
-        """Who the daemon is, as prompt text. Empty if there is no seed yet.
+        """Who the daemon is, as prompt text. Empty if there is no persona yet.
 
         Re-read per call, which is a promise the product makes: `seed.md` is the
         file the owner edits to change how they are spoken to, and the edit lands on
-        the next turn (docs/PLAN.md 5.1). Assembly - seed plus learned rules in M4 -
-        belongs to `daemon/persona/loader.py`, so this is one call and stays one call.
+        the next turn (docs/PLAN.md 5.1). Assembly - the human-owned seed plus M4's
+        accumulated learned rules - is `daemon/persona/loader.py`'s job, so this is
+        one call and stays one call.
         """
-        return await persona.load(self._data_dir)
+        return await persona.load_persona(self._data_dir)
 
     async def context(
         self,
