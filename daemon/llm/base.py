@@ -52,9 +52,10 @@ class ToolCall:
     verbatim when the call is replayed in history. Gemini 3 calls it a
     `thoughtSignature` and rejects a replayed tool turn that omits it (HTTP 400);
     it has nowhere else to live, because a provider is rebuilt from these neutral
-    objects each call and keeps no state of its own. None for a provider that
-    issues none, and for the parallel calls after the first, which Gemini itself
-    leaves unsigned. Defaulted, so every existing constructor keeps working."""
+    objects each call and keeps no state of its own. Only `providers/gemini.py`
+    sets it today; the other three leave it None, as does a Gemini parallel call
+    after the first, which Gemini itself leaves unsigned. Defaulted, so every
+    existing constructor keeps working."""
 
 
 @dataclass(frozen=True, slots=True)

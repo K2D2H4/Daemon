@@ -127,9 +127,13 @@ async def main() -> int:
 
     configured = args.model.strip() or os.environ.get("DAEMON_GEMINI_MODEL", "").strip()
     model = configured or RECOMMENDED_MODEL
+    enforces = "gemini-3" in model
+    """Whether the signature contract is expected to bite. On a gemini-3 id steps 2
+    and 3 are the real guard and their failure is this spike's failure; elsewhere
+    they are narrated as vacuous and the run stays green on purpose."""
     print(f"key: ...{api_key[-4:]} (never printed in full, never written anywhere)")
     print(f"model: {model}{'' if configured else '  (falling back to the incident id)'}")
-    if "gemini-3" not in model:
+    if not enforces:
         print(
             "  ! not a gemini-3 id. The thoughtSignature contract is 3-only, so steps "
             "2 and 3 cannot fail here - the run looks green and proves nothing. Pass "
@@ -168,16 +172,25 @@ async def main() -> int:
                 model=model,
                 tools=[_spec()],
             )
-            print("   NO error - the API accepted a stripped turn. On a gemini-3 model")
-            print("   that would mean the contract is gone; here it means this model")
-            print("   never enforced it, so nothing below is a real guard.")
+            print("   NO error - the API accepted a stripped turn.")
+            if enforces:
+                print("   ^ but this IS a gemini-3 id, where a stripped turn MUST 400.")
+                print("     The reproduction no longer reproduces - failing the run so")
+                print("     that a green result never means 'proved nothing' here.")
+                exit_code = 1
+            else:
+                print("   Expected here: this model never enforced the contract, so")
+                print("   nothing below is a real guard.")
         except ProviderError as exc:
             leaked = api_key in str(exc)
             named = "thought_signature" in str(exc) or "thoughtSignature" in str(exc)
             print(f"   ProviderError (expected): {_oneline(exc)}")
             print(f"   names the missing signature: {named}  <- the shipped 400")
             print(f"   key present in the error text: {leaked}  <- must be False")
-            if leaked:
+            if leaked or (enforces and not named):
+                # On a gemini-3 id a 400 that does not name the signature is a
+                # different failure wearing the same status code, not a clean
+                # reproduction - so it does not count as green.
                 exit_code = 1
 
         # 3. Replay with the signature kept: the fix, against the live contract.
