@@ -10,7 +10,7 @@ is in [PLAN.md](PLAN.md); the rules that follow from it are in
 ```mermaid
 flowchart LR
   subgraph entry["entrypoint"]
-    CLI["cli.py<br/>run · setup · voice · install · reflect · proactive"]
+    CLI["cli.py<br/>run · setup · voice · install · reflect · proactive · persona"]
     APP["app.py<br/>composition root + lifespan + scheduler"]
   end
 
@@ -27,6 +27,12 @@ flowchart LR
 
   subgraph nightly["nightly"]
     REFL["reflection.py<br/>one local day → facts · entities · observations"]
+  end
+
+  subgraph pers["persona/ · Monday 05:00, one hour after reflection"]
+    LOADER["loader.py<br/>seed.md + learned.md → one system message, read every turn"]
+    EVOLVE["evolve.py<br/>observations → rule proposals · at most one model call"]
+    RULES["rules.py<br/>learned.md + persona_rules mirror · the only write path"]
   end
 
   subgraph proact["proactivity/ · every 5 min"]
@@ -62,6 +68,7 @@ flowchart LR
   LOOP & VC -->|LoggedMessage| LOG --> STORE
   RECALL -->|RecalledItem| LOOP & VC
   STORE --> RECALL
+  LOADER -->|"persona system message"| LOOP & VC
 
   APP -->|"04:00 local cron"| REFL
   CLI -->|"daemon reflect"| REFL
@@ -71,6 +78,14 @@ flowchart LR
   REFL -->|EntityDraft| ENT
   REFL -->|Observation| STORE
   CUR & ENT --> STORE
+
+  APP -->|"05:00 local cron, Monday"| EVOLVE
+  CLI -->|"daemon persona evolve"| EVOLVE
+  CLI -->|"daemon persona forget"| RULES
+  STORE -->|"unconsumed observations"| EVOLVE
+  EVOLVE -->|"Task.PERSONA_RULE"| GW
+  EVOLVE -->|Proposal| RULES
+  RULES --> STORE
 
   APP -->|"5-min interval, registered only when enabled"| TICK
   CLI -->|"daemon proactive · --speak"| TICK
@@ -91,7 +106,9 @@ Both arrows into `daemon/reflection.py` are the same object: `daemon reflect` an
 nobody can run by hand is a job nobody can verify. The two into
 `daemon/proactivity/tick.py` work the same way, through `app.build_proactive_tick` —
 and there the CLI's default assembles *less*: no gateway, no channel, no speaker, so
-`daemon proactive` cannot speak even by mistake.
+`daemon proactive` cannot speak even by mistake. So do the two into
+`daemon/persona/evolve.py`, through `app.build_persona_evolution`: the Monday job and
+`daemon persona evolve` run the identical `PersonaEvolution`.
 
 ## The nightly pass
 
@@ -133,6 +150,66 @@ resolved path), `importance` and `confidence` are clamped rather than rejected,
 supersession keys are narrowed to `[a-z0-9_]`, and a reply with no parseable JSON
 writes nothing at all. A half-applied reflection is worse than a skipped one,
 because the day gets marked done either way.
+
+## The weekly persona pass
+
+`daemon/persona/evolve.py` runs at **05:00 local time on Monday** — one hour after
+reflection, so a week's `observations` have already had the last night's reflection
+land before evolution reads them. Registered the same way as reflection:
+`max_instances=1`, `coalesce=True`, no misfire grace, so a laptop asleep at 05:00
+Monday evolves once when it wakes rather than queuing a run per missed week.
+
+Three gates run **before any model call**, in order, and `daemon doctor` checks
+each of them the same way `PersonaEvolution.run` does:
+
+1. this week's diary already exists (`data/persona/diary/YYYY-MM-DD.md`, dated by
+   the Monday of the local week `now` falls in, not the day the pass happens to
+   execute — so a scheduled Monday run and an hour-run `daemon persona evolve` on
+   a Wednesday agree on which week's marker they are reading);
+2. fewer than `persona_min_observations` (default 5) unconsumed observations exist
+   — a handful must not be enough to conclude a pattern;
+3. the active-rule budget (`persona_max_active_rules`, default 20) is already full.
+
+Only past all three is `Task.PERSONA_RULE` called, with the identity anchor
+(`seed.md`), the currently active rules, and up to `OBSERVATION_BUDGET` (60,
+a ceiling on the prompt, separate from the gate-2 minimum) unconsumed
+observations. The reply is treated as hostile the same way reflection's is:
+bodies are clamped to `MAX_BODY_CHARS`, supersession keys are narrowed to
+`[a-z0-9_]`, and any evidence id that was not actually in the unconsumed set
+handed to the prompt is dropped. Proposals past `persona_max_new_per_cycle`
+(default 3) for this cycle are **reported, not silently discarded** — the diary
+records how many were dropped and why, the same asymmetry PLAN.md 6's proactivity
+budgets and reflection's clamps both take.
+
+**Write order is markdown, then mirror, then observation consumption** —
+non-negotiable 1, same direction as every other writer. Unlike
+`data/memory/core.md`, `data/persona/learned.md` has no unique index to make a
+single insert atomic with its own retire, so `LearnedRules.add` computes the
+whole batch's file content in Python first (current active bodies, minus
+whatever this batch supersedes, plus the new ones), writes it durably via
+`fs.write_private_replace`, and only then
+retires the superseded mirror rows, inserts the new ones, and marks their
+evidence `consumed_by`. A crash before the mirror write leaves a markdown file
+ahead of the mirror — recoverable, because the diary marker was not written
+either, so the pass simply reruns. A crash after would leave a mirror row with
+nothing in the file, which non-negotiable 1 forbids.
+
+Two proposals sharing a `supersession_key` in the same batch are resolved
+**before either is written** — keeping the first, reporting the second as
+discarded. This is the same defect PLAN.md 8.2.1 recorded for the curated tier
+(two facts both keyed `location`, applied in order, the important half lost),
+guarded against here before it can happen rather than after.
+
+`daemon persona forget <id> --why "..."` is the one human-initiated write: it
+rewrites `learned.md` without that rule's body and retires its mirror row, but
+never touches `consumed_by` on the observations the rule was built from —
+non-negotiable 6 makes `observations` append-only, and reverting it would let
+next week's pass revive the same rule from the same evidence.
+
+`daemon/proactivity/judge.py` deliberately does not go through
+`daemon/persona/loader.py`: it reads `seed.md` alone, because its prompt is kept
+intentionally minimal and widening it to learned rules is a separate decision
+this milestone does not make.
 
 ## Proactivity: three stages, and exactly one model call
 
@@ -264,17 +341,19 @@ otherwise speaking is its own excuse to speak.
 | `Presence` | `daemon/proactivity/base.py` | `MachinePresence` — macOS probes, unknown elsewhere |
 | `Judgement` · `Speaker` | `daemon/proactivity/base.py` | `Judge` · a local speaker |
 | `Reflection`'s collaborators | `daemon/reflection.py` | `CuratedMemory` (`daemon/memory/curated.py`) · `EntityNotes` (`daemon/memory/entities.py`) |
+| `PersonaEvolution`'s collaborator | `daemon/persona/evolve.py` | `LearnedRules` (`daemon/persona/rules.py`) |
 
 `Speaker` is deliberately not a special case of `VoiceSession`. The Live API has no
 verbatim TTS path — `realtimeInput.text` is a prompt, so the model answers the text
 instead of reading it — which makes saying a sentence we already chose a local job,
 and one where nothing leaves the machine.
 
-The last row is not a protocol, and deliberately so: there is one writer per tier
-and a second would be speculation. It is a seam because `Reflection` takes both
-writers and an `LLMGateway` as constructor arguments, which is what lets a test
-drive the pass without a filesystem and lets `app.build_reflection` be the single
-place they are assembled for both the CLI and the scheduler.
+The last two rows are not protocols, and deliberately so: there is one writer per
+tier (or per rule set) and a second would be speculation. Each is a seam because
+`Reflection` and `PersonaEvolution` take their collaborators and an `LLMGateway`
+as constructor arguments, which is what lets a test drive either pass without a
+filesystem and lets `app.build_reflection` / `app.build_persona_evolution` be the
+single place each is assembled for both the CLI and the scheduler.
 
 Nothing outside `daemon/app.py` imports an implementation. `tests/test_reachable.py`
 enforces the other half of that bargain: every implementation must be constructed
@@ -295,6 +374,11 @@ somebody would.
 `Task.CHAT_VOICE` is pinned to Gemini: in native audio the model *is* both the
 brain and the voice, so it cannot be pointed at a provider without a voice
 session.
+
+`Task.PERSONA_RULE` follows `Task.REFLECTION`'s routing in every preset: both
+write conclusions that propagate into everything downstream of them — the
+curated tier and entity graph for one, the whole personality for the other —
+so both get the same preference for a hosted model.
 
 ## Latency budget (measured)
 

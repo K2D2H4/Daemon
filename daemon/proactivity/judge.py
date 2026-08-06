@@ -141,6 +141,17 @@ class Judge:
         self._gateway = gateway
         # The same file `daemon/loop.py` reads, read the same way: seed.md is
         # human-owned and an edit takes effect without a restart (PLAN 5.1).
+        #
+        # Deliberately seed-only, not `persona.loader.load_persona` - unlike the
+        # text loop and voice, both of which now carry M4's learned rules too
+        # (daemon/app.py, daemon/loop.py). This prompt is already the minimum the
+        # module docstring above describes: the seed, one system instruction, and
+        # `Candidate.reason`, nothing else, so an unsolicited utterance cannot be
+        # steered by anything but that reason. Adding accumulated learned rules
+        # here is a real question - what an *unprompted* line should sound like
+        # is not obviously "everything a prompted one gets" - and it wants its
+        # own judgement call, not a side effect of wiring M4 elsewhere. Left
+        # for whoever makes that call on purpose.
         self._seed_path = Path(data_dir) / "persona" / "seed.md"
 
     async def decide(self, candidate: Candidate) -> Utterance:

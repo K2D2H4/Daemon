@@ -400,6 +400,24 @@ class Settings(BaseSettings):
     complete product; this is the addition that needs the gate to be trustworthy
     first."""
 
+    # --- persona evolution (M4, docs/PLAN.md 5.5) -------------------------
+    # No on/off switch, deliberately: the failure cost is the same shape as
+    # reflection's (an AI-owned file plus a cap on top of it), and reflection has
+    # no switch either.
+
+    persona_max_active_rules: int = Field(default=20, alias="DAEMON_PERSONA_MAX_ACTIVE_RULES")
+    """Ceiling on active learned rules. The weekly pass makes no model call once
+    this is reached (`daemon/persona/evolve.py`'s gate 3), so a personality
+    cannot grow without bound just because the process keeps running."""
+
+    persona_max_new_per_cycle: int = Field(default=3, alias="DAEMON_PERSONA_MAX_NEW_PER_CYCLE")
+    """Rules added per weekly pass, at most - a rate limit on how fast the
+    learned half can change, not a quality filter."""
+
+    persona_min_observations: int = Field(default=5, alias="DAEMON_PERSONA_MIN_OBSERVATIONS")
+    """Unconsumed observations required before a pass runs at all (gate 2). A
+    handful of observations must not be enough to conclude a pattern."""
+
     service_label: str = Field(default="default", alias="DAEMON_SERVICE_LABEL")
     """Suffix of the OS service label (`ai.daemon.<label>`). Only interesting for
     a second instance with its own data dir."""
@@ -752,6 +770,13 @@ class Settings(BaseSettings):
                 f"DAEMON_PROACTIVE_SILENCE_HOURS is {self.proactive_silence_hours}; "
                 "at zero or below, every tick would be a silence candidate"
             )
+        for name, value in (
+            ("DAEMON_PERSONA_MAX_ACTIVE_RULES", self.persona_max_active_rules),
+            ("DAEMON_PERSONA_MAX_NEW_PER_CYCLE", self.persona_max_new_per_cycle),
+            ("DAEMON_PERSONA_MIN_OBSERVATIONS", self.persona_min_observations),
+        ):
+            if value < 0:
+                problems.append(f"{name} is {value}; it cannot be negative")
         if self.tools_mode not in TOOL_MODES:
             problems.append(
                 f"unknown DAEMON_TOOLS_MODE {self.tools_mode!r}; expected one of "

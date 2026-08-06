@@ -36,7 +36,17 @@ funnier version of the bug this script exists for: the document whose entire job
 to say where things live was the one document nobody verified.
 """
 
-EXTRA_GLOBS = ("**/CLAUDE.md", "**/AGENTS.md", "docs/adr/*.md")
+EXTRA_GLOBS = (
+    "**/CLAUDE.md",
+    "**/AGENTS.md",
+    "docs/adr/*.md",
+    # A module doc's satellites: the recipes and the measurements that were split out
+    # of it to keep it orientation-sized. They are the same kind of navigation prose
+    # and carry most of the path claims, so leaving them unscanned would have moved
+    # the coverage out of this check along with the text.
+    "**/RECIPES.md",
+    "**/MEASURED.md",
+)
 
 SKIP_DIRS = {".venv", "venv", ".git", "node_modules", ".claude"}
 """Directories the recursive globs must not descend into.

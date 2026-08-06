@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -113,6 +114,26 @@ def build_parser() -> argparse.ArgumentParser:
     approve = pairing_sub.add_parser("approve", help="approve a pairing code")
     approve.add_argument("code", help="the 8-character code the bot replied with")
 
+    persona = sub.add_parser(
+        "persona", help="see active learned persona rules (M4); no subcommand just lists them"
+    )
+    persona_sub = persona.add_subparsers(dest="persona_command")
+    evolve = persona_sub.add_parser(
+        "evolve", help="run the weekly persona-evolution pass now"
+    )
+    evolve.add_argument(
+        "--force",
+        action="store_true",
+        help="run even if this week's diary already exists",
+    )
+    # `persona_forget`, not `forget`: `daemon tools forget` below binds that name
+    # too, and two parsers sharing one variable is a trap for whoever adds an
+    # argument to the first of them.
+    persona_forget = persona_sub.add_parser(
+        "forget", help="retire a learned rule - a human's deletion request"
+    )
+    persona_forget.add_argument("id", type=int, help="the rule id, from `daemon persona`")
+    persona_forget.add_argument("--why", required=True, help="why this rule should be retired")
     tools = sub.add_parser("tools", help="what Daemon may do to this machine, and what it did")
     tools_sub = tools.add_subparsers(dest="tools_command", required=True)
     tools_sub.add_parser("list", help="the tools that are loaded, and the policy in force")
@@ -204,6 +225,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return listen(settings, seconds=args.seconds)
     if command == "pairing":
         return _pairing(settings, args)
+    if command == "persona":
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+        return asyncio.run(_persona(settings, args))
     if command == "tools":
         return _tools(settings, args)
 
@@ -391,16 +415,18 @@ def _reindex(settings: Settings) -> int:
     from daemon.memory.entities import rebuild as rebuild_entities
     from daemon.memory.reindex import reindex
     from daemon.memory.store import Store
+    from daemon.persona.rules import rebuild as rebuild_persona_rules
 
     store = Store.open(settings.data_dir / DB_FILENAME)
     try:
         inserted = reindex(settings.data_dir, store)
-        # The other two markdown tiers are mirrors too, and a rebuild that only
-        # restored messages would silently drop every curated fact and entity note
-        # the reflection pass had concluded - which is the thing non-negotiable 1
-        # exists to make impossible.
+        # The other markdown tiers are mirrors too, and a rebuild that only
+        # restored messages would silently drop every curated fact, entity note
+        # and persona rule the daemon had concluded - which is the thing
+        # non-negotiable 1 exists to make impossible.
         rebuild_curated(settings.data_dir, store)
         rebuild_entities(settings.data_dir, store)
+        rebuild_persona_rules(settings.data_dir, store)
         return inserted
     finally:
         store.close()
@@ -500,6 +526,78 @@ async def _reflect(settings: Settings, *, date: str | None, force: bool) -> int:
     return OK if all(result.ok for result in results) else PROBLEM
 
 
+async def _persona(settings: Settings, args: Any) -> int:
+    """See and manage learned persona rules (M4).
+
+    Plain `daemon persona` costs no model call and no provider: it just reads
+    the mirror, the same way `daemon persona` is meant to be safe to run on an
+    install with no hosted key configured yet. `evolve` is the only subcommand
+    that reaches a model - it is also the only way anyone can verify the weekly
+    pass without waiting for Monday 05:00, the same reason `daemon reflect` and
+    `daemon proactive` exist.
+    """
+    from daemon.app import DB_FILENAME, build_persona_evolution
+    from daemon.memory.store import Store
+    from daemon.persona.evolve import DIARY_SUBDIR
+    from daemon.persona.rules import LearnedFileDiverged, LearnedRules
+
+    sub = getattr(args, "persona_command", None)
+
+    if sub == "evolve":
+        evolution, closing = await build_persona_evolution(settings)
+        try:
+            result = await evolution.run(force=args.force)
+        finally:
+            await closing()
+        print(
+            f"{result.date}: {result.skipped or 'ran'} "
+            f"({result.observations_read} observation(s) read -> {result.proposed} proposed, "
+            f"{result.added} added, {result.retired} retired)"
+        )
+        for problem in result.problems:
+            print(f"  ! {problem}")
+        return OK
+
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    try:
+        if sub == "forget":
+            try:
+                retired = await LearnedRules(settings.data_dir, store).retire(
+                    args.id, why=args.why
+                )
+            except LearnedFileDiverged as diverged:
+                # Refused rather than done: the rewrite would have taken the
+                # orphaned bullets with it, so a request to forget one rule would
+                # have cost the user rules they never named.
+                print(f"daemon: {diverged}", file=sys.stderr)
+                return USAGE
+            if not retired:
+                print(f"daemon: no active rule with id {args.id}", file=sys.stderr)
+                return USAGE
+            print(f"retired rule {args.id}: {args.why}")
+            return OK
+
+        # No subcommand: what is active right now, for a person checking whether
+        # the weekly pass has done anything.
+        rows = store.active_persona_rules()
+        if not rows:
+            print("no active persona rules yet.")
+        else:
+            for row in rows:
+                evidence = json.loads(row["evidence"])
+                print(f"[{row['id']}] {row['body']}")
+                print(f"     created {row['created_at']} - {len(evidence)} observation(s)")
+        last = store.last_persona_rule_created_at()
+        print(f"\nlast rule created: {last or 'never'}")
+
+        diary_dir = settings.data_dir / DIARY_SUBDIR
+        diaries = sorted(diary_dir.glob("*.md")) if diary_dir.exists() else []
+        print(f"last diary: {diaries[-1].stem if diaries else 'none yet'}")
+        return OK
+    finally:
+        store.close()
+
+
 async def probe_ollama(settings: Settings) -> tuple[bool, str]:
     """Is Ollama reachable? Every preset routes embeddings there, so recall is
     dead without it even under a fully hosted setup."""
@@ -542,6 +640,7 @@ def _doctor() -> int:
             _data_dir_check(settings),
             _schema_check(settings),
             _memory_check(settings),
+            _persona_check(settings),
             _proactivity_check(settings),
             _tools_check(settings),
             *_ollama_checks(settings),
@@ -711,7 +810,9 @@ def _memory_check(settings: Settings) -> Check:
     The backlog is in here for the same reason: a reflection loop that has run
     zero times leaves no trace anywhere else.
     """
+    from daemon import clock
     from daemon.app import DB_FILENAME
+    from daemon.memory import log
     from daemon.memory.entities import EntityNotes
     from daemon.memory.store import Store
     from daemon.reflection import pending_days
@@ -720,7 +821,15 @@ def _memory_check(settings: Settings) -> Check:
     # not. That ordering is the fix for a real hole: with the sqlite file deleted -
     # which non-negotiable 1 calls a legitimate state - this reported "nothing
     # recorded yet" and hid a month of unreflected log behind it.
-    backlog = pending_days(settings.data_dir)
+    #
+    # Today is dropped, because `Reflection.catch_up` drops it: the day is still
+    # being written to. Counting it made doctor report "1 day(s) not reflected on
+    # yet - run `daemon reflect`" every single day, and the command it named
+    # answered "nothing to reflect on: no day has a log without a reflection
+    # already". Two commands disagreeing about one day is worse than either being
+    # wrong, because it teaches you to stop reading both.
+    today = log.local_date(clock.now())
+    backlog = [day for day in pending_days(settings.data_dir) if day != today]
     behind = (
         f"{len(backlog)} day(s) not reflected on yet (oldest {backlog[0]})"
         " - run `daemon reflect`"
@@ -754,6 +863,91 @@ def _memory_check(settings: Settings) -> Check:
             arrow = f" -> {', '.join(linked)}" if linked else ""
             detail += f"\n         {name} ({mentions}){arrow}"
         return Check("memory", True, detail)
+    finally:
+        store.close()
+
+
+def _persona_check(settings: Settings) -> Check:
+    """What the weekly persona-evolution pass has actually built (M4).
+
+    Same reasoning as `_memory_check`: an empty rule set and a working weekly
+    pass look identical from the outside, and "it stayed silent" has to be
+    diagnosable without opening sqlite or waiting for a Monday. So this reports
+    not just what exists but whether *the next run* would even attempt
+    anything - each of `PersonaEvolution.run`'s three zero-model-call gates,
+    checked here the same way it checks them.
+    """
+    from daemon.app import DB_FILENAME
+    from daemon.clock import now as clock_now
+    from daemon.memory.store import Store
+    from daemon.persona.evolve import DIARY_SUBDIR, _week_start
+    from daemon.persona.loader import learned_path, rule_bodies
+    from daemon.persona.rules import diverged_bodies
+
+    path = settings.data_dir / DB_FILENAME
+
+    # Read before touching the mirror at all, and before the "no database"
+    # shortcut below - `rm daemon.sqlite3` (non-negotiable 1 calls that
+    # legitimate) means `path.exists()` is False with the file still full of
+    # rules the (absent) mirror cannot confirm. Reporting "nothing recorded
+    # yet" in that state would hide exactly what `daemon reindex` exists to
+    # repair - the same hole `_memory_check` already had to close for its own
+    # backlog.
+    learned_file = learned_path(settings.data_dir)
+    learned_text = learned_file.read_text(encoding="utf-8") if learned_file.exists() else ""
+    file_bodies = rule_bodies(learned_text)
+
+    if not path.exists():
+        if not file_bodies:
+            return Check("persona", True, "nothing recorded yet")
+        return Check(
+            "persona",
+            False,
+            f"learned.md has {len(file_bodies)} rule(s) but there is no database yet "
+            "- run `daemon reindex` to rebuild the mirror before the next evolve",
+        )
+
+    try:
+        store = Store.open(path)
+    except Exception as exc:  # noqa: BLE001 - doctor reports state, it does not die
+        return Check("persona", True, f"not readable ({exc.__class__.__name__}); see schema above")
+
+    try:
+        active_rows = store.active_persona_rules()
+        active = len(active_rows)
+        unconsumed = len(store.unconsumed_observations(limit=10_000))
+        last = store.last_persona_rule_created_at()
+
+        diverged = diverged_bodies(file_bodies, (row["body"] for row in active_rows))
+
+        week = _week_start(clock_now())
+        diary = settings.data_dir / DIARY_SUBDIR / f"{week}.md"
+        if diary.exists():
+            next_run = "already ran this week"
+        elif unconsumed < settings.persona_min_observations:
+            next_run = (
+                f"not enough observations ({unconsumed}<{settings.persona_min_observations})"
+            )
+        elif active >= settings.persona_max_active_rules:
+            next_run = f"rule budget full ({active}/{settings.persona_max_active_rules})"
+        else:
+            next_run = ""
+
+        detail = (
+            f"{active} active rule(s), {unconsumed} unconsumed observation(s), "
+            f"last evolved {last or 'never'}"
+        )
+        if next_run:
+            detail += f"; next run would skip: {next_run}"
+
+        if diverged:
+            detail += (
+                f"; learned.md has {len(diverged)} rule(s) the mirror does not know "
+                "about - run `daemon reindex` to repair"
+            )
+            return Check("persona", False, detail)
+
+        return Check("persona", True, detail)
     finally:
         store.close()
 
