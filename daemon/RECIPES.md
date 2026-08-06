@@ -28,7 +28,12 @@ time, `max_instances=1` + `coalesce=True` so a slow run cannot stack, a top-leve
 `except` in the tick because a raising job is logged once and the schedule then reads
 healthy forever, and **a CLI command running the same object** — nobody is awake at
 04:00 to read a log. Register it only when its switch is on — an absent job is a clearer
-"off" than a disabled one — and give polling a floor; see the last bullet.
+"off" than a disabled one — and give polling a floor; see the last bullet. And if it is a
+local-time cron doing work that must not simply be skipped, add a **boot-time catch-up**:
+a machine that is off at that hour never fires it and cron does not backfill, so the same
+tick is run once from the lifespan at startup (reflection and persona do this — a shared
+`asyncio.Lock` keeps boot and cron from double-processing a day, and each pass's own
+idempotency marker makes a boot with nothing pending a zero-cost no-op).
 
 **Anything a model writes into a path, a score or a date.** Reflection's output names files, scales
 the recall score and can retire a fact the user stated, so `daemon/reflection.py` clamps every number,

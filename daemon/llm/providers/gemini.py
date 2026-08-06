@@ -250,10 +250,17 @@ def _contents(messages: list[Message]) -> list[dict[str, Any]]:
         parts: list[dict[str, Any]] = []
         if message.content:
             parts.append({"text": message.content})
-        parts.extend(
-            {"functionCall": {"name": call.name, "args": call.arguments}}
-            for call in message.tool_calls
-        )
+        for call in message.tool_calls:
+            # The signature sits on the part beside `functionCall`, and is present
+            # only where Gemini issued one - the first of a parallel batch. Sending
+            # the key on a call it did not sign is itself a 400, so an absent
+            # signature emits no key rather than a null.
+            part: dict[str, Any] = {
+                "functionCall": {"name": call.name, "args": call.arguments}
+            }
+            if call.provider_signature:
+                part["thoughtSignature"] = call.provider_signature
+            parts.append(part)
         if not parts:
             # An empty `parts` is rejected, and an assistant turn with neither text
             # nor calls carries nothing worth sending anyway.
@@ -271,6 +278,10 @@ def _tool_calls(parts: list[Any]) -> tuple[ToolCall, ...]:
         name = call.get("name")
         if not isinstance(name, str) or not name:
             continue
+        # A sibling of `functionCall` on the part, not a field inside it. Gemini 3
+        # requires it echoed back on replay (base.py: `provider_signature`); losing
+        # it here is what a dropped tool turn returns HTTP 400 for.
+        signature = part.get("thoughtSignature")
         calls.append(
             ToolCall(
                 # Synthesised: this API issues none, and the loop needs something
@@ -278,6 +289,7 @@ def _tool_calls(parts: list[Any]) -> tuple[ToolCall, ...]:
                 id=synthesise_call_id(name, index),
                 name=name,
                 arguments=decode_tool_arguments(call.get("args")),
+                provider_signature=signature if isinstance(signature, str) else None,
             )
         )
     return tuple(calls)
