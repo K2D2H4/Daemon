@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
+from daemon import __version__
 from daemon.channels.base import Channel
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
 from daemon.config import ANTHROPIC, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
@@ -94,7 +95,7 @@ def create_app(
     opens a microphone and then a billed session, and neither belongs in a test.
     """
     resolved = settings or Settings()
-    app = FastAPI(title="Daemon", version="0.0.1", lifespan=_lifespan)
+    app = FastAPI(title="Daemon", version=__version__, lifespan=_lifespan)
     app.state.settings = resolved
     app.state.channel = channel
     app.state.memory = memory

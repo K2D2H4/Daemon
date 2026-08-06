@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from daemon import __version__
 from daemon.config import OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
 from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus
@@ -35,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="daemon",
         description="Self-hosted AI companion. `daemon run` with no arguments is the default.",
+    )
+    # Handled in `main` rather than argparse's `action="version"`, which raises
+    # SystemExit - every other command here returns an int, and a bug report's
+    # first line should not depend on catching an exception.
+    parser.add_argument(
+        "--version", action="store_true", help="print the installed version and exit"
     )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="run the daemon in the foreground (what the service supervises)")
@@ -152,6 +159,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args_list = ["run"]
 
     args = build_parser().parse_args(args_list)
+
+    if args.version:
+        print(f"daemon {__version__}")
+        return OK
+
     command: str = args.command
 
     if command == "doctor":
