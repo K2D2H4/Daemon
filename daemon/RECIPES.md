@@ -20,7 +20,12 @@ call's* specifics — the command, the path — because it is what the approval 
 the `tool_calls` row records. **Do not decide anything about permission inside the tool**:
 `tools/policy.py` owns that, makes no model calls, and its origin gate refuses every call on a turn
 that is not the owner's in every mode, `full` included. And per CONTRACTS 13, never build code from
-data — the script is a constant, the values travel as `argv`.
+data — the script is a constant, the values travel as `argv`. Two wrinkles screen introduced: a tool
+that produces an image returns `ToolOutput(content, images)` instead of a bare `str` — `tools/runner.py`
+normalises either into `ToolResult.images`, which `loop.py` carries onto its own turn — and a
+session-scoped tool that needs a live collaborator (the screen-share pair need a `VoiceSession`) is
+registered through a keyword-only param on `app._build_tools` (`screen_share=...`) that only
+`run_voice` passes; the global text registry passes none, so it never offers that tool at all.
 
 **A new background job.** Register it on the scheduler in `daemon/app.py`'s lifespan
 and copy the reflection job or the proactivity tick: `timezone=None` to fire on *local*
