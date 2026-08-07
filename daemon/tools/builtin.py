@@ -37,6 +37,7 @@ from daemon import clock
 from daemon.llm.base import ToolSpec
 from daemon.proactivity.base import Presence
 from daemon.tools.base import Risk, ToolError
+from daemon.tools.extract import extract_document
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,24 @@ def _truncate(text: str, limit: int) -> str:
     return f"{text[:limit]}\n… [{dropped} more characters, not shown]"
 
 
+def _looks_binary(raw: bytes) -> bool:
+    """Whether a file should be refused as text rather than decoded to gibberish.
+
+    A NUL byte is the classic signal - text files effectively never carry one,
+    and images, archives, executables and PDF streams almost always do. The
+    replacement-ratio is the backstop for a binary that happens to have no NUL in
+    the read prefix. The 0.30 threshold sits above a real log with an odd byte or
+    two (`test_read_file_survives_a_bad_byte` is ~11%) and below the 32% measured
+    on the PDF that started all this.
+    """
+    if b"\x00" in raw:
+        return True
+    text = raw.decode("utf-8", errors="replace")
+    if not text:
+        return False
+    return text.count("�") / len(text) > 0.30
+
+
 async def _drain(process: asyncio.subprocess.Process, cap: int) -> bytes:
     """Read a child's output, keeping at most `cap` bytes of it.
 
@@ -223,8 +242,10 @@ class ReadFile:
     spec = ToolSpec(
         name="read_file",
         description=(
-            "Read a text file on this computer. Use this instead of running `cat`, "
-            "so it works without asking the owner for approval."
+            "Read a file's text on this computer. Handles plain text and also PDF, "
+            "Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) documents, pulling "
+            "out their text. Use this instead of running `cat`, so it works without "
+            "asking the owner for approval."
         ),
         parameters={
             "type": "object",
@@ -246,8 +267,21 @@ class ReadFile:
         path = self._scope.resolve(arguments.get("path"))
 
         def _read() -> str:
+            extracted = extract_document(path)
+            if extracted is not None:
+                text = extracted.strip()
+                if not text:
+                    # A scanned PDF is images, not text. Saying so beats returning
+                    # nothing and letting the model claim it read the file.
+                    return f"{path.name} has no extractable text (it may be a scanned image)."
+                return text
             with path.open("rb") as handle:
                 raw = handle.read(READ_MAX_BYTES)
+            if _looks_binary(raw):
+                raise ToolError(
+                    f"{path.name} is not a text file, so I cannot read it as text. I can "
+                    "read text files and PDF, Word, Excel and PowerPoint documents."
+                )
             # `replace` rather than raising: a log file with one bad byte is still
             # worth reading, and a tool that refuses it teaches the model nothing.
             return raw.decode("utf-8", errors="replace")
