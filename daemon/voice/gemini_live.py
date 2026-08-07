@@ -507,6 +507,29 @@ class GeminiLiveSession:
             }
         )
 
+    async def send_frame(self, jpeg: bytes) -> None:
+        """One JPEG screen frame, as realtime video input (ADR 0009).
+
+        `realtimeInput.video` mirrors the named `realtimeInput.audio` field
+        `send_audio` uses above, both part of the same `BidiGenerateContentRealtimeInput`
+        message - not the older `mediaChunks` list form. Grounded in that
+        symmetry rather than confirmed against the live socket: this repo's
+        "socket wins over docs" rule (see `send_context` below) still applies,
+        and that confirmation is pending a run with a real API key.
+        """
+        if not jpeg:
+            return
+        await self._send(
+            {
+                "realtimeInput": {
+                    "video": {
+                        "data": base64.b64encode(jpeg).decode("ascii"),
+                        "mimeType": "image/jpeg",
+                    }
+                }
+            }
+        )
+
     async def send_context(self, text: str) -> None:
         """Put text in the model's history without asking it to answer.
 

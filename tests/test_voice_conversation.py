@@ -110,9 +110,9 @@ class Hang:
 class FakeSession:
     """A scripted `VoiceSession`, protocol-complete.
 
-    All seven methods are the protocol's now, including the three the audit added
-    and `send_tool_response`, so the conversation calls them rather than hunting for
-    them - and a fake that lacked one would fail
+    All eight methods are the protocol's now, including the three the audit added,
+    `send_tool_response`, and `send_frame` (ADR 0009), so the conversation calls
+    them rather than hunting for them - and a fake that lacked one would fail
     `test_the_fakes_satisfy_the_protocols` instead of quietly exercising a fallback
     the product does not have.
 
@@ -127,6 +127,7 @@ class FakeSession:
         self.script = list(script)
         self.events = events if events is not None else []
         self.sent: list[bytes] = []
+        self.frames: list[bytes] = []
         self.texts: list[str] = []
         self.contexts: list[str] = []
         self.sent_while_generating: list[str] = []
@@ -152,6 +153,9 @@ class FakeSession:
 
     async def send_audio(self, chunk: bytes) -> None:
         self.sent.append(chunk)
+
+    async def send_frame(self, jpeg: bytes) -> None:
+        self.frames.append(jpeg)
 
     async def send_text(self, text: str) -> None:
         self.texts.append(text)
