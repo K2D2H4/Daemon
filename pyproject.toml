@@ -38,6 +38,9 @@ voice = [
     # text-only install does not need PortAudio.
     "websockets>=14.0",
     "sounddevice>=0.5",
+    # screen-share only — resize + perceptual-hash dedup; capture itself is
+    # dependency-free.
+    "Pillow>=10.0",
     # Declared rather than relied on transitively through httpx, because the voice
     # session imports it directly. websockets uses ssl.create_default_context(),
     # which on a python.org framework build has zero CAs unless someone ran
