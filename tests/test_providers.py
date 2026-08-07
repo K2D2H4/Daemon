@@ -470,6 +470,34 @@ async def test_openai_needs_a_key() -> None:
         OpenAIProvider("")
 
 
+def test_openai_encodes_image_block() -> None:
+    from daemon.llm.providers.openai import _input_items
+
+    items = _input_items(
+        [
+            Message(
+                role="user",
+                content="what is this",
+                images=(ImageBlock(b"\xff\xd8\xff", "image/jpeg"),),
+            )
+        ]
+    )
+    content = items[-1]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "what is this"}
+    img = next(c for c in content if c["type"] == "image_url")
+    assert img["image_url"]["url"] == (
+        f"data:image/jpeg;base64,{base64.b64encode(b'\xff\xd8\xff').decode()}"
+    )
+
+
+def test_openai_leaves_an_image_free_message_untouched() -> None:
+    from daemon.llm.providers.openai import _input_items
+
+    items = _input_items([Message(role="user", content="yo")])
+    assert items[-1]["content"] == "yo"
+
+
 async def test_openai_needs_at_least_one_non_system_turn() -> None:
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
         raise AssertionError("must not reach the network")
