@@ -150,6 +150,27 @@ async def test_ollama_reports_a_malformed_response_instead_of_returning_empty() 
             await provider.complete(PROMPT, model="qwen3:14b")
 
 
+def test_ollama_encodes_image_block() -> None:
+    from daemon.llm.providers.ollama import _turn
+
+    turn = _turn(
+        Message(
+            role="user",
+            content="what is this",
+            images=(ImageBlock(b"\xff\xd8\xff", "image/jpeg"),),
+        )
+    )
+    assert turn["images"] == [base64.b64encode(b"\xff\xd8\xff").decode()]
+
+
+def test_ollama_leaves_an_image_free_message_untouched() -> None:
+    from daemon.llm.providers.ollama import _turn
+
+    turn = _turn(Message(role="user", content="yo"))
+    assert "images" not in turn
+    assert turn["content"] == "yo"
+
+
 async def test_ollama_health_never_raises() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("down")
