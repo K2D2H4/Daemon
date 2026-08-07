@@ -11,7 +11,7 @@ in `app.py`, which owns every concrete-implementation import here.
 |---|---|
 | `app.py` | composition root and lifespan. **The only file allowed to import concrete providers, channels and writers** — its imports are function-local to keep that exception visible. Also `run_voice`, `build_reflection` and `build_proactive_tick` |
 | `cli.py` | `run` · `setup` · `install` · `uninstall` · `status` · `doctor` · `reindex` · `update` · `reflect` · `voice` · `proactive` · `persona` · `tools` · `pairing` · `wake calibrate` · `wake test` |
-| `setup.py` | the onboarding wizard: PC control, preset, hosted provider, keys, persona seed, pairing |
+| `setup.py` | the onboarding wizard: PC control, preset, hosted provider, keys, persona seed, pairing, then the residency finish — offer `daemon install` and confirm the resident woke up via `service.status()` + `/health` |
 | `wake_cli.py` | `daemon wake`: measure what the recognizer returns for the owner's phrase, save it as `DAEMON_WAKE_ALIASES`, then run the gate and print what fires. Writes `.env` through `setup.py`'s writer |
 | `config.py` | settings and the three presets. `HOSTED` resolves to the chosen provider |
 | `companion.py` | **what both endpoints can do, in one place**: `context` (persona + tool rules + the recall block), `record` + `index_recorded`, `specs` / `run_tools`. Add a capability here, not twice |
