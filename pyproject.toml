@@ -23,6 +23,13 @@ dependencies = [
     # sqlite extension - this very Python build has enable_load_extension
     # disabled, so sqlite-vec cannot load, and self-hosters would hit the same.
     "numpy>=2.0",
+    # read_file's PDF path (daemon/tools/extract.py). Pure Python, no system
+    # libraries - deliberately not PyMuPDF, whose compiled wheels a self-hoster on
+    # an odd platform can't always get. The Office formats (.docx/.xlsx/.pptx)
+    # need nothing beyond the standard library, so only PDF costs a dependency;
+    # a companion asked to "read this file" should not choke on the commonest
+    # document there is.
+    "pypdf>=5.0",
 ]
 
 [project.optional-dependencies]
