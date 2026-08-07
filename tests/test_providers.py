@@ -7,6 +7,7 @@ failure comes out as ProviderError with at most one retry.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from collections.abc import Callable
@@ -15,6 +16,7 @@ import httpx
 import pytest
 
 from daemon.llm.base import (
+    ImageBlock,
     Message,
     ProviderError,
     ToolCall,
@@ -227,6 +229,35 @@ async def test_anthropic_does_not_retry_a_bad_key() -> None:
 async def test_anthropic_needs_a_key() -> None:
     with pytest.raises(ProviderError, match="ANTHROPIC_API_KEY"):
         AnthropicProvider("")
+
+
+def test_anthropic_encodes_image_block() -> None:
+    from daemon.llm.providers.anthropic import _turns
+
+    turns = _turns(
+        [
+            Message(
+                role="user",
+                content="what is this",
+                images=(ImageBlock(b"\xff\xd8\xff", "image/jpeg"),),
+            )
+        ]
+    )
+    blocks = turns[-1]["content"]
+    assert any(b.get("type") == "image" for b in blocks)
+    img = next(b for b in blocks if b["type"] == "image")
+    assert img["source"] == {
+        "type": "base64",
+        "media_type": "image/jpeg",
+        "data": base64.b64encode(b"\xff\xd8\xff").decode(),
+    }
+
+
+def test_anthropic_leaves_an_image_free_message_untouched() -> None:
+    from daemon.llm.providers.anthropic import _turns
+
+    turns = _turns([Message(role="user", content="yo")])
+    assert turns[-1]["content"] == "yo"
 
 
 async def test_anthropic_needs_at_least_one_non_system_turn() -> None:

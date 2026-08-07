@@ -7,6 +7,7 @@ stays visible next to the provider contract.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Sequence
 from typing import Any
 
@@ -195,6 +196,23 @@ def _turns(messages: list[Message]) -> list[dict[str, Any]]:
                 for call in message.tool_calls
             )
             turns.append({"role": "assistant", "content": content})
+            continue
+        if message.role == "user" and message.images:
+            content = []
+            if message.content:
+                content.append({"type": "text", "text": message.content})
+            content.extend(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.media_type,
+                        "data": base64.b64encode(img.data).decode(),
+                    },
+                }
+                for img in message.images
+            )
+            turns.append({"role": "user", "content": content})
             continue
         turns.append({"role": message.role, "content": message.content})
     return turns
