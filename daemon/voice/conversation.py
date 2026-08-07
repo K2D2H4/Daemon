@@ -53,7 +53,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
 from daemon import clock
@@ -69,6 +69,7 @@ from daemon.companion import Companion
 from daemon.llm.base import ToolCall
 from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
+from daemon.voice.screen_share import ScreenShareController, ScreenSharePump
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,8 @@ class VoiceConversation:
         channel: str = VOICE_CHANNEL,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
         opening_audio: bytes = b"",
+        screen_share: ScreenShareController | None = None,
+        screen_pump_factory: Callable[[VoiceSession], ScreenSharePump] | None = None,
     ) -> None:
         self._session = session
         self._audio = audio
@@ -187,6 +190,17 @@ class VoiceConversation:
         matched the alias, and used to throw the sound away - so the session began
         deaf to the question it was opened for and the owner said it again. At
         `AudioIO.sample_rate`, because that is what a session must be fed."""
+
+        self._screen_share = screen_share
+        """Owns the live screen-share pump, if screen sharing is on at all
+        (Task 2.3). `None` for the text path and for a voice conversation with
+        `DAEMON_SCREEN_ENABLED` off - both cases where there is nothing to bind."""
+        self._screen_pump_factory = screen_pump_factory
+        """Builds a fresh `ScreenSharePump` bound to *this* session, once it is
+        live. A factory rather than a pump handed in directly, because
+        `run_voice`'s reconnect loop (`_voice_attempts`) opens a new session per
+        attempt and each one needs its own pump - never the previous, dropped
+        session's."""
 
         self.recalled: list[RecalledItem] = []
         """What recall had ready for the last completed utterance.
@@ -258,35 +272,49 @@ class VoiceConversation:
         # A provider is allowed 20s of setup budget before it gives up, and a report
         # that started the clock afterwards would hide exactly that.
         self._started_at = asyncio.get_running_loop().time()
-        async with self._session as session:
-            # Before the microphone, so the utterance that opened the session is the
-            # first thing the model hears rather than racing live audio for its place
-            # in the turn.
-            await self._send_opening(session)
-            microphone = self._audio.record()
-            # The microphone keeps feeding the session while the model talks. It
-            # has to: server-side activity detection is what notices a barge-in,
-            # and it can only notice it in audio we actually send.
-            pump = asyncio.create_task(
-                self._forward_microphone(session, microphone), name="voice-microphone"
-            )
-            watch = asyncio.create_task(self._watch_partials(session), name="voice-prefetch")
-            try:
-                await self._receive(session)
-            finally:
-                for task in (pump, watch):
-                    task.cancel()
-                await asyncio.gather(pump, watch, return_exceptions=True)
-                await _aclose(microphone)
-                await self._cancel_speculative()
-                # Reached on cancellation too, which is the point: the transcript
-                # is the only record voice mode produces, and a shutdown arriving
-                # before `turnComplete` would otherwise drop the utterance from
-                # the markdown and the mirror both. Shielded so a second
-                # cancellation - a shutdown that does not wait - cannot lose it
-                # either.
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.shield(self._record_pending(session))
+        try:
+            async with self._session as session:
+                # As soon as the session is live and before the turn loop starts:
+                # the pump needs a live session to send frames on, and binding it
+                # here (rather than earlier) is what gives a reconnect a fresh pump
+                # for its fresh session. Not started - `start_screen_share` does
+                # that, and only if the owner asks.
+                if self._screen_share is not None and self._screen_pump_factory is not None:
+                    self._screen_share.bind(self._screen_pump_factory(session))
+                # Before the microphone, so the utterance that opened the session is
+                # the first thing the model hears rather than racing live audio for
+                # its place in the turn.
+                await self._send_opening(session)
+                microphone = self._audio.record()
+                # The microphone keeps feeding the session while the model talks. It
+                # has to: server-side activity detection is what notices a barge-in,
+                # and it can only notice it in audio we actually send.
+                pump = asyncio.create_task(
+                    self._forward_microphone(session, microphone), name="voice-microphone"
+                )
+                watch = asyncio.create_task(self._watch_partials(session), name="voice-prefetch")
+                try:
+                    await self._receive(session)
+                finally:
+                    for task in (pump, watch):
+                        task.cancel()
+                    await asyncio.gather(pump, watch, return_exceptions=True)
+                    await _aclose(microphone)
+                    await self._cancel_speculative()
+                    # Reached on cancellation too, which is the point: the transcript
+                    # is the only record voice mode produces, and a shutdown arriving
+                    # before `turnComplete` would otherwise drop the utterance from
+                    # the markdown and the mirror both. Shielded so a second
+                    # cancellation - a shutdown that does not wait - cannot lose it
+                    # either.
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.shield(self._record_pending(session))
+        finally:
+            # A share must never outlive its session: reached on every exit path,
+            # including cancellation and a session that never finished opening (in
+            # which case `bind` never ran and this is a no-op).
+            if self._screen_share is not None:
+                await self._screen_share.stop_and_unbind()
 
     async def _send_opening(self, session: VoiceSession) -> None:
         """Hand over what was already said, if anything was.

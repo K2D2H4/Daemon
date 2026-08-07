@@ -152,3 +152,67 @@ async def test_see_screen_run_rejects_non_integer_window():
 async def test_see_screen_run_rejects_negative_window():
     with pytest.raises(ToolError):
         await _tool().run({"window": -1})
+
+
+# --- StartScreenShare / StopScreenShare ----------------------------------------
+
+
+class _FakeControl:
+    """A fake `ScreenShareControl` - the tools only store and delegate to it."""
+
+    def __init__(self) -> None:
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self) -> str:
+        self.start_calls += 1
+        return "started-message"
+
+    async def stop(self) -> str:
+        self.stop_calls += 1
+        return "stopped-message"
+
+
+def test_start_screen_share_spec_name():
+    assert screen.StartScreenShare(_FakeControl()).spec.name == "start_screen_share"
+
+
+def test_stop_screen_share_spec_name():
+    assert screen.StopScreenShare(_FakeControl()).spec.name == "stop_screen_share"
+
+
+def test_start_screen_share_is_safe_risk():
+    assert screen.StartScreenShare(_FakeControl()).risk == "safe"
+
+
+def test_stop_screen_share_is_safe_risk():
+    assert screen.StopScreenShare(_FakeControl()).risk == "safe"
+
+
+def test_start_screen_share_preview():
+    assert "start" in screen.StartScreenShare(_FakeControl()).preview({}).lower()
+
+
+def test_stop_screen_share_preview():
+    assert "stop" in screen.StopScreenShare(_FakeControl()).preview({}).lower()
+
+
+async def test_start_screen_share_run_delegates_to_control():
+    control = _FakeControl()
+    result = await screen.StartScreenShare(control).run({})
+    assert result == "started-message"
+    assert control.start_calls == 1
+
+
+async def test_stop_screen_share_run_delegates_to_control():
+    control = _FakeControl()
+    result = await screen.StopScreenShare(control).run({})
+    assert result == "stopped-message"
+    assert control.stop_calls == 1
+
+
+def test_screen_share_tools_returns_both():
+    tools = screen.screen_share_tools(_FakeControl())
+    assert len(tools) == 2
+    assert isinstance(tools[0], screen.StartScreenShare)
+    assert isinstance(tools[1], screen.StopScreenShare)

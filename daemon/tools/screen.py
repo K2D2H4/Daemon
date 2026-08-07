@@ -29,7 +29,7 @@ import shutil
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from daemon.llm.base import ImageBlock, ToolSpec
 from daemon.tools.base import Risk, Tool, ToolError, ToolOutput
@@ -259,3 +259,74 @@ def screen_tools(*, max_px: int, timeout_secs: float) -> list[Tool]:
     the live-share pump (Task 2.2) reads `screen_frame_px` from settings directly
     rather than through this factory, since it is not a tool."""
     return [SeeScreen(max_px=max_px, timeout_secs=timeout_secs)]
+
+
+@runtime_checkable
+class ScreenShareControl(Protocol):
+    """What `start_screen_share`/`stop_screen_share` need from the thing that
+    owns the live pump - a minimal structural protocol so this module never has
+    to import `daemon.voice.*` (voice is an extra; core tools are not). The real
+    implementation is `daemon.voice.screen_share.ScreenShareController`, but
+    nothing here names it."""
+
+    def start(self) -> str: ...
+    async def stop(self) -> str: ...
+
+
+class StartScreenShare:
+    """Start sharing the owner's screen live, for the rest of this voice
+    conversation. Only offered in voice mode (Task 2.3): the pump this drives
+    needs a live `VoiceSession`, which the text path never has.
+
+    `safe` for the same boundary as `see_screen`: the origin gate and
+    `DAEMON_SCREEN_ENABLED` staying off until the owner turns it on are what
+    protect this, not a per-call approval a spoken turn has nowhere to ask for.
+    """
+
+    risk: Risk = "safe"
+    spec = ToolSpec(
+        name="start_screen_share",
+        description=(
+            "Start sharing the owner's screen live during this voice "
+            "conversation, so you can see what they are doing while they talk. "
+            "Only works in a voice conversation. Use stop_screen_share to end it."
+        ),
+        parameters={"type": "object", "properties": {}},
+    )
+
+    def __init__(self, control: ScreenShareControl) -> None:
+        self._control = control
+
+    def preview(self, arguments: Mapping[str, Any]) -> str:
+        return "start sharing the screen"
+
+    async def run(self, arguments: Mapping[str, Any]) -> str:
+        return self._control.start()
+
+
+class StopScreenShare:
+    """Stop the live screen share started with `start_screen_share`."""
+
+    risk: Risk = "safe"
+    spec = ToolSpec(
+        name="stop_screen_share",
+        description="Stop the live screen share started with start_screen_share.",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    def __init__(self, control: ScreenShareControl) -> None:
+        self._control = control
+
+    def preview(self, arguments: Mapping[str, Any]) -> str:
+        return "stop sharing the screen"
+
+    async def run(self, arguments: Mapping[str, Any]) -> str:
+        return await self._control.stop()
+
+
+def screen_share_tools(control: ScreenShareControl) -> list[Tool]:
+    """The live-share voice tools, in the order the model sees them. Registered
+    only by the voice path (`daemon/app.py`'s `run_voice`), and only when
+    `screen_enabled` - the text loop never passes a control, so it never offers
+    these."""
+    return [StartScreenShare(control), StopScreenShare(control)]

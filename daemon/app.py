@@ -885,6 +885,18 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
         reindex(settings.data_dir, store)
         writer = FileMemoryWriter(settings.data_dir, store)
         recall, _status, embedder = _build_recall(settings, store)
+        # The controller for the live-share start/stop tools (Task 2.3). Built
+        # only when screen sharing is on at all - `None` otherwise, which is what
+        # keeps those two tools off `_build_tools`'s registry entirely. Built here
+        # rather than inside `_voice_attempts` because the same instance has to
+        # survive a reconnect: the tools registered below hold a reference to it,
+        # and a fresh controller per attempt would leave them pointing at a stale
+        # one.
+        screen_share = None
+        if settings.screen_enabled:
+            from daemon.voice.screen_share import ScreenShareController
+
+            screen_share = ScreenShareController()
         # Tools, pinned to `allowlist`. Not `settings.tools_mode`: a spoken turn has
         # nowhere to ask, so `ask` here would pile up approval rows that lapse
         # unanswered - the silent degradation this repo calls the dangerous failure.
@@ -892,7 +904,7 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
         # so voice reads the surface text writes to; it just never adds to it. Off
         # entirely when `DAEMON_TOOLS_ENABLED` is false, exactly like text.
         tools, mcp_bridge, _tools_status = await _build_tools(
-            settings, store, mode="allowlist"
+            settings, store, mode="allowlist", screen_share=screen_share
         )
         companion = Companion(
             writer,
@@ -956,6 +968,28 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
                 silence_duration_ms=settings.voice_silence_duration_ms,
             )
 
+        screen_pump_factory = None
+        if screen_share is not None:
+            from daemon.tools.screen import capture_display
+            from daemon.voice.screen_share import ScreenSharePump
+
+            def screen_pump_factory(session: Any) -> ScreenSharePump:
+                """A fresh pump bound to `session`, built once it is live.
+                `_voice_attempts` calls this again on every reconnect, so a
+                dropped session's pump is never reused against a new one."""
+
+                async def _capture() -> bytes:
+                    jpeg, _w, _h = await capture_display(long_edge=settings.screen_frame_px)
+                    return jpeg
+
+                return ScreenSharePump(
+                    session=session,
+                    capture=_capture,
+                    fps=settings.screen_fps,
+                    dedup_threshold=settings.screen_dedup_threshold,
+                    keepalive_secs=settings.screen_keepalive_secs,
+                )
+
         try:
             return await _voice_attempts(
                 new_session,
@@ -963,6 +997,8 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
                 companion,
                 GeminiLiveError,
                 opening_audio=opening_audio,
+                screen_share=screen_share,
+                screen_pump_factory=screen_pump_factory,
             )
         finally:
             with suppress(Exception):
@@ -1058,6 +1094,8 @@ async def _voice_attempts(
     companion: Companion,
     session_error: type[Exception],
     opening_audio: bytes = b"",
+    screen_share: Any = None,
+    screen_pump_factory: Callable[[Any], Any] | None = None,
 ) -> int:
     """Hold a conversation, and pick it back up if the session is cut.
 
@@ -1071,6 +1109,13 @@ async def _voice_attempts(
     What is *not* resumed: a permanent failure (a bad key, a wrong model id, a
     malformed setup), because retrying leaves the process alive, healthy-looking and
     mute; and an ordinary idle timeout, because that is the conversation being over.
+
+    `screen_share` and `screen_pump_factory`, if given, are passed to every
+    `VoiceConversation` this loop builds - the same controller across every
+    attempt (its tools hold a reference to it), but a fresh pump built from
+    `screen_pump_factory(session)` for each attempt's own session. A share left
+    running by a dropped session must not survive into the next attempt's, and
+    `VoiceConversation.run`'s teardown is what guarantees that per session.
     """
     from daemon.voice.conversation import VoiceConversation
 
@@ -1086,6 +1131,8 @@ async def _voice_attempts(
             audio,
             companion,
             opening_audio=pending_opening,
+            screen_share=screen_share,
+            screen_pump_factory=screen_pump_factory,
         )
         failure: Exception | None = None
         try:
@@ -1353,7 +1400,7 @@ async def build_wake_gate(
 
 
 async def _build_tools(
-    settings: Settings, store: Any, *, mode: str | None = None
+    settings: Settings, store: Any, *, mode: str | None = None, screen_share: Any = None
 ) -> tuple[Any, Any, str]:
     """Assemble the tool layer. Returns (runner, mcp bridge, status).
 
@@ -1370,6 +1417,11 @@ async def _build_tools(
     `ask` is a knob that would let that failure happen. The registry, the allowlist
     and the standing grants are the same as the text path either way - the approval
     surface is shared, text is its editor, and voice only reads it.
+
+    `screen_share`, likewise, is only ever passed by `run_voice` - a
+    `ScreenShareController` for the live-share start/stop tools to toggle. `None`
+    (the default, and always what `create_app`'s text path passes) means those two
+    tools are never registered at all, so the text loop can never offer them.
     """
     if not settings.tools_enabled:
         return None, None, "off (DAEMON_TOOLS_ENABLED)"
@@ -1433,6 +1485,23 @@ async def _build_tools(
             logger.info("screen tools on")
         except Exception as exc:
             logger.error("screen tools could not be built, continuing without: %s", exc)
+
+        if screen_share is not None:
+            # The live-share start/stop tools. Only `run_voice` ever passes
+            # `screen_share` - the pump they toggle needs a live `VoiceSession`,
+            # which the text path never has - so this is voice-only by
+            # construction, not by a mode check. Guarded like the block above:
+            # losing these two tools should not cost the rest of the tool layer.
+            try:
+                from daemon.tools.screen import screen_share_tools
+
+                for tool in screen_share_tools(screen_share):
+                    registry.register(tool)
+                logger.info("screen-share tools on")
+            except Exception as exc:
+                logger.error(
+                    "screen-share tools could not be built, continuing without: %s", exc
+                )
 
     bridge: Any = None
     if settings.mcp_enabled:

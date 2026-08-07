@@ -171,3 +171,157 @@ async def test_start_is_idempotent():
     pump.start()
     assert pump._task is task
     await pump.stop()
+
+
+async def test_send_frame_failure_is_logged_and_the_loop_continues(monkeypatch, caplog):
+    """2.2's deferred minor: a broken sink must not kill the share silently."""
+    import logging
+
+    async def fake_sleep(_secs: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    frame_a, _, frame_b = _make_frames()
+    script = [frame_a, frame_b]
+
+    calls = {"n": 0}
+
+    async def capture() -> bytes:
+        i = calls["n"]
+        calls["n"] += 1
+        if i >= len(script):
+            raise asyncio.CancelledError
+        return script[i]
+
+    class _BrokenSession:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def send_frame(self, jpeg: bytes) -> None:
+            self.attempts += 1
+            raise RuntimeError("socket is gone")
+
+    session = _BrokenSession()
+    pump = ScreenSharePump(session=session, capture=capture, fps=1.0)
+    with caplog.at_level(logging.WARNING):
+        pump.start()
+        task = pump._task
+        assert task is not None
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Both frames were changed enough to send, both attempts failed, and the loop
+    # kept running instead of dying on the first one.
+    assert session.attempts == 2
+    assert any("send" in record.message.lower() for record in caplog.records)
+
+
+# --- ScreenShareController -----------------------------------------------------
+
+
+class _FakePump:
+    """Records start/stop rather than driving a real capture loop."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+def test_controller_start_with_no_pump_bound_apologises_and_does_not_crash():
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    message = controller.start()
+    assert "voice conversation" in message
+    assert controller.active is False
+
+
+async def test_controller_stop_with_no_pump_bound_says_not_sharing():
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    message = await controller.stop()
+    assert "not sharing" in message.lower()
+    assert controller.active is False
+
+
+def test_controller_bind_then_start_flips_the_pump_and_acknowledges():
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    pump = _FakePump()
+    controller.bind(pump)
+    message = controller.start()
+    assert pump.started is True
+    assert controller.active is True
+    assert "watching your screen" in message.lower()
+
+
+def test_controller_start_twice_says_already_watching():
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    pump = _FakePump()
+    controller.bind(pump)
+    controller.start()
+    message = controller.start()
+    assert "already" in message.lower()
+
+
+async def test_controller_stop_stops_the_pump_and_deactivates():
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    pump = _FakePump()
+    controller.bind(pump)
+    controller.start()
+    message = await controller.stop()
+    assert pump.stopped is True
+    assert controller.active is False
+    assert "stopped" in message.lower()
+
+
+async def test_stop_and_unbind_stops_an_active_pump_and_clears_it():
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    pump = _FakePump()
+    controller.bind(pump)
+    controller.start()
+    await controller.stop_and_unbind()
+    assert pump.stopped is True
+    assert controller.active is False
+    # A second start with nothing bound must not crash and must not report success.
+    assert "voice conversation" in controller.start()
+
+
+async def test_stop_and_unbind_never_raises_even_if_the_pump_stop_fails():
+    from daemon.voice.screen_share import ScreenShareController
+
+    class _BrokenPump:
+        def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            raise RuntimeError("boom")
+
+    controller = ScreenShareController()
+    controller.bind(_BrokenPump())
+    controller.start()
+    await controller.stop_and_unbind()  # must not raise
+    assert controller.active is False
+
+
+async def test_stop_and_unbind_with_nothing_bound_is_a_no_op():
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    await controller.stop_and_unbind()  # must not raise
+    assert controller.active is False

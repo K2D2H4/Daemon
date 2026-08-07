@@ -18,7 +18,7 @@ import io
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from typing import Any, Protocol
 
 from PIL import Image
 
@@ -120,7 +120,79 @@ class ScreenSharePump:
                     threshold=self._dedup_threshold,
                     keepalive_secs=self._keepalive_secs,
                 ):
-                    await self._session.send_frame(jpeg)
-                    last_hash = new_hash
-                    last_sent_at = now
+                    try:
+                        await self._session.send_frame(jpeg)
+                    except Exception:
+                        # A dead sink (dropped socket, closed session) must not
+                        # kill the share silently - the same principle as the
+                        # capture-failure branch above. Logged and skipped rather
+                        # than raised, so a transient send failure costs one frame
+                        # instead of the whole share (2.2 review, deferred Minor).
+                        logger.warning(
+                            "screen-share send_frame failed, skipping this frame",
+                            exc_info=True,
+                        )
+                    else:
+                        last_hash = new_hash
+                        last_sent_at = now
             await asyncio.sleep(1 / self._fps)
+
+
+class ScreenShareController:
+    """Owns the live screen-share pump for one voice conversation.
+
+    The pump needs a live `VoiceSession`, so the conversation binds it once the
+    session is open; the `start_screen_share`/`stop_screen_share` tools toggle it.
+    Off until the owner asks - and never silent (start logs and returns a spoken
+    acknowledgement; a live share must always be announced, per the plan's
+    explicit-signal rule).
+    """
+
+    def __init__(self) -> None:
+        self._pump: Any = None
+        self._active = False
+
+    def bind(self, pump: Any) -> None:
+        """The conversation hands over the pump for its now-live session."""
+        self._pump = pump
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def start(self) -> str:
+        """Turn the share on. `pump.start()` is sync; this returns the spoken
+        acknowledgement the model relays - the explicit signal is carried in the
+        tool result, not left to the model to invent."""
+        if self._pump is None:
+            return (
+                "I can only share your screen during a voice conversation. Ask me "
+                "to look at your screen for a one-off view instead."
+            )
+        if self._active:
+            return "I'm already watching your screen."
+        self._pump.start()
+        self._active = True
+        logger.info("screen share on")
+        return "I'm watching your screen now — tell me to stop sharing when you're done."
+
+    async def stop(self) -> str:
+        if self._pump is None or not self._active:
+            return "I'm not sharing your screen right now."
+        await self._pump.stop()
+        self._active = False
+        logger.info("screen share off")
+        return "I've stopped watching your screen."
+
+    async def stop_and_unbind(self) -> None:
+        """Conversation teardown. Never raises: a share must never outlive its
+        session, but a failure to stop cleanly must not take the shutdown with it.
+        """
+        try:
+            if self._pump is not None and self._active:
+                await self._pump.stop()
+        except Exception:
+            logger.exception("stopping the screen-share pump failed")
+        finally:
+            self._pump = None
+            self._active = False
