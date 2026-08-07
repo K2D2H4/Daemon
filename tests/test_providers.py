@@ -858,6 +858,34 @@ async def test_gemini_needs_a_key() -> None:
         GeminiProvider("")
 
 
+def test_gemini_encodes_image_block() -> None:
+    from daemon.llm.providers.gemini import _contents
+
+    contents = _contents(
+        [
+            Message(
+                role="user",
+                content="what is this",
+                images=(ImageBlock(b"\xff\xd8\xff", "image/jpeg"),),
+            )
+        ]
+    )
+    parts = contents[-1]["parts"]
+    assert parts[0] == {"text": "what is this"}
+    part = next(p for p in parts if "inlineData" in p)
+    assert part["inlineData"] == {
+        "mimeType": "image/jpeg",
+        "data": base64.b64encode(b"\xff\xd8\xff").decode(),
+    }
+
+
+def test_gemini_leaves_an_image_free_message_untouched() -> None:
+    from daemon.llm.providers.gemini import _contents
+
+    contents = _contents([Message(role="user", content="yo")])
+    assert contents[-1]["parts"] == [{"text": "yo"}]
+
+
 async def test_gemini_needs_at_least_one_non_system_turn() -> None:
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
         raise AssertionError("must not reach the network")

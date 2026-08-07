@@ -12,6 +12,7 @@ raises, so `?key=` leaks the key into logs and stack traces. daemon/setup.py's
 
 from __future__ import annotations
 
+import base64
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -301,6 +302,16 @@ def _contents(messages: list[Message]) -> list[dict[str, Any]]:
         parts: list[dict[str, Any]] = []
         if message.content:
             parts.append({"text": message.content})
+        if message.role == "user":
+            parts.extend(
+                {
+                    "inlineData": {
+                        "mimeType": img.media_type,
+                        "data": base64.b64encode(img.data).decode(),
+                    }
+                }
+                for img in message.images
+            )
         for call in message.tool_calls:
             # The signature sits on the part beside `functionCall`, and is present
             # only where Gemini issued one - the first of a parallel batch. Sending
