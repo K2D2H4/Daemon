@@ -326,6 +326,35 @@ async def test_read_file_refuses_an_opaque_binary_honestly(
     assert "text" in message  # it explains it is not text, not a fake error
 
 
+async def test_read_file_refuses_a_document_too_large_on_disk(
+    scope: PathScope, tmp_path: Path
+) -> None:
+    """The document path must honour the same input-size ceiling READ_MAX_BYTES
+    gives the text path - a measured guard (a huge file blew RSS past 600 MB).
+    Extraction runs before any bounded read, so the ceiling has to be checked up
+    front from the file size on disk."""
+    (tmp_path / "huge.pdf").write_bytes(b"%PDF-1.4\n" + b"x" * 500)
+    reader = ReadFile(scope, max_document_bytes=200)
+    with pytest.raises(ToolError) as caught:
+        await reader.run({"path": str(tmp_path / "huge.pdf")})
+    assert "large" in str(caught.value).lower()
+
+
+async def test_read_file_refuses_a_decompression_bomb_document(
+    scope: PathScope, tmp_path: Path
+) -> None:
+    """An OOXML file is tiny on disk but can expand to gigabytes - the realistic
+    hazard when the owner reads a document a third party sent. A member that
+    decompresses past the ceiling must be refused, not fully expanded into memory."""
+    (tmp_path / "bomb.docx").write_bytes(_make_docx(["A" * 3_000_000]))
+    assert (tmp_path / "bomb.docx").stat().st_size < 100_000  # tiny on disk
+    reader = ReadFile(scope, max_uncompressed=1_000_000)
+    with pytest.raises(ToolError) as caught:
+        await reader.run({"path": str(tmp_path / "bomb.docx")})
+    message = str(caught.value).lower()
+    assert "large" in message or "expand" in message
+
+
 async def test_write_file_creates_then_overwrites(scope: PathScope, tmp_path: Path) -> None:
     write = WriteFile(scope)
     target = str(tmp_path / "deep" / "notes.md")

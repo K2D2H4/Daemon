@@ -37,7 +37,7 @@ from daemon import clock
 from daemon.llm.base import ToolSpec
 from daemon.proactivity.base import Presence
 from daemon.tools.base import Risk, ToolError
-from daemon.tools.extract import extract_document
+from daemon.tools.extract import DOC_MAX_BYTES, DOC_MAX_UNCOMPRESSED, extract_document
 
 logger = logging.getLogger(__name__)
 
@@ -256,9 +256,18 @@ class ReadFile:
         },
     )
 
-    def __init__(self, scope: PathScope, *, max_output: int = DEFAULT_MAX_OUTPUT) -> None:
+    def __init__(
+        self,
+        scope: PathScope,
+        *,
+        max_output: int = DEFAULT_MAX_OUTPUT,
+        max_document_bytes: int = DOC_MAX_BYTES,
+        max_uncompressed: int = DOC_MAX_UNCOMPRESSED,
+    ) -> None:
         self._scope = scope
         self._max_output = max_output
+        self._max_document_bytes = max_document_bytes
+        self._max_uncompressed = max_uncompressed
 
     def preview(self, arguments: Mapping[str, Any]) -> str:
         return f"read {arguments.get('path', '?')}"
@@ -267,7 +276,11 @@ class ReadFile:
         path = self._scope.resolve(arguments.get("path"))
 
         def _read() -> str:
-            extracted = extract_document(path)
+            extracted = extract_document(
+                path,
+                max_bytes=self._max_document_bytes,
+                max_uncompressed=self._max_uncompressed,
+            )
             if extracted is not None:
                 text = extracted.strip()
                 if not text:
