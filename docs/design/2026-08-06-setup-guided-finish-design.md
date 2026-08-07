@@ -91,15 +91,27 @@ Next:
      판정으로.
 
 2. **살아있음 판정** (부팅 레이스 처리 위해 짧게 폴링, 최대 ~10초):
-   - 먼저 `service.status().running`이 참이 되길 기다린다.
-   - 그다음 `GET http://{settings.host}:{settings.port}/health`가 200 +
-     `status == "ok"`로 응답하길 기다린다.
-   - 둘 다 만족 → ✅ **"Daemon is running and answering."**
-   - 타임아웃(프로세스가 안 뜸/응답 없음) → ⚠️ **"Installed, but it isn't
-     answering yet."** + `status().detail` + 아래 안내.
+   - `service.status().running`(init이 띄웠나) → `GET /health`가 200 +
+     `status == "ok"`(부팅해서 서빙하나) → 그리고 **채널이 설정된 경우
+     `conversation_loop == "running"`**(실제로 메시지를 받을 수 있나).
+   - `/health`의 최상위 `status`는 app.py에서 **하드코딩된 리터럴**이라 대화
+     루프가 죽어도 `status: ok`가 나온다. 그래서 "answering"의 진짜 신호는
+     `conversation_loop`다. 다만 토큰이 없으면 채널 자체가 없어 루프가 정상적으로
+     stopped이므로, 루프 요구는 **토큰이 있을 때만** 건다(판정은 프로브가 아니라
+     settings를 아는 `_await_awake`가 내린다).
+   - 토큰 있음 + 루프 running → ✅ **"Daemon is awake - running and answering."**
+   - 토큰 없음 + 서빙 → ✅ **"Daemon is running."** (+ 토큰 추가 안내; answering이
+     아니라 running이라고만 말한다)
+   - 타임아웃 → ⚠️ **"installed, but it is not answering yet."** + (서빙하는데
+     루프만 죽었으면 "conversation loop is not running — 보통 잘못된/폐기된
+     토큰") + `status().detail` + 아래 안내.
 
    crash-loop(잘못된 설정으로 프로세스가 죽고 launchd가 `THROTTLE_SECONDS=30`s
-   대기) 도 이 경로로 정확히 "문제있다"가 된다.
+   대기) 과 폐기된 토큰(프로세스는 살아 /health는 응답하나 루프가 죽음) 모두 이
+   경로로 정확히 "문제있다"가 된다.
+
+   `_health_url`은 `DAEMON_HOST`가 `0.0.0.0`/`::`(bind-all)이면 접속용으로
+   `127.0.0.1`을 쓴다 — bind 주소로 접속하는 건 이식성이 없으므로.
 
 3. **문제있다일 때 안내** (doctor를 자동 실행하지 않는다 — 포인터만, 사용자
    확인 완료):

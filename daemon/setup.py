@@ -468,12 +468,21 @@ class OllamaState:
 
 @dataclass(frozen=True, slots=True)
 class HealthState:
-    """What the running daemon's `/health` said about itself, reduced to a yes/no
-    and one printable line. Never a secret - `/health` reports no credentials, only
-    which subsystems are up."""
+    """What the running daemon's `/health` said about itself. Never a secret -
+    `/health` reports no credentials, only which subsystems are up.
+
+    `ok` means the process booted and is serving the endpoint. `loop` is its
+    conversation-loop state ("running" / "stopped" / "" when the body did not say)
+    kept *separate* from `ok` on purpose: `/health`'s top-level `status` is a
+    hardcoded literal (daemon/app.py), so a served page with a dead loop still
+    reads `status: ok` - the healthy-looking-but-deaf state the endpoint exists to
+    expose. Whether a stopped loop is a problem depends on whether a channel is
+    even configured, which the caller knows and this probe does not, so the caller
+    decides (see `Wizard._await_awake`)."""
 
     ok: bool
     detail: str = ""
+    loop: str = ""
 
 
 def check_anthropic(key: str, model: str) -> Verdict:
@@ -711,13 +720,17 @@ def check_ollama(base_url: str) -> OllamaState:
 
 
 def check_health(base_url: str) -> HealthState:
-    """Ask the running daemon whether it is actually serving.
+    """Ask the running daemon whether it is serving, and read its loop state.
 
-    Its own `GET /health` (daemon/app.py) is the truest "it woke up" signal:
-    `service.status()` only says the init system spawned a process, while this says
-    the conversation loop is up and answering. Treated as a black box over HTTP,
-    exactly like every other probe here - so nothing in setup imports the server it
-    is checking (docs/CONTRACTS.md 4).
+    Its own `GET /health` (daemon/app.py) is a truer "it woke up" signal than
+    `service.status()`, which only says the init system spawned a process. Treated
+    as a black box over HTTP, exactly like every other probe here - so nothing in
+    setup imports the server it is checking (docs/CONTRACTS.md 4).
+
+    `ok` is "the process answered 200 with `status: ok`" - i.e. it booted and
+    binds. The conversation-loop state comes back in `loop` rather than folded into
+    `ok`, because whether a stopped loop is a fault depends on whether a channel
+    was configured at all (see `HealthState`); the caller settles that.
     """
     root = base_url.rstrip("/")
     try:
@@ -736,8 +749,9 @@ def check_health(base_url: str) -> HealthState:
     if not isinstance(body, dict) or body.get("status") != "ok":
         got = body.get("status") if isinstance(body, dict) else "?"
         return HealthState(False, f"/health reports status={got!r}")
-    loop = body.get("conversation_loop")
-    return HealthState(True, f"conversation loop {loop}" if isinstance(loop, str) else "answering")
+    raw = body.get("conversation_loop")
+    loop = raw if isinstance(raw, str) else ""
+    return HealthState(True, f"conversation loop {loop}" if loop else "serving", loop=loop)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2207,7 +2221,17 @@ class Wizard:
             self._residency_hint()
             return OK
         say()
-        return self._install_and_check(settings)
+        try:
+            return self._install_and_check(settings)
+        except (Cancelled, KeyboardInterrupt):
+            # Ctrl-C during the install or the (up to ~10s, silent) liveness poll.
+            # The service may already be registered, so - unlike the question above
+            # - do not send them back to `daemon install`; point at `daemon status`,
+            # and still never let run() claim `.env` was untouched.
+            say()
+            say("Stopped there. `daemon status` shows whether the service came up.")
+            say()
+            return OK
 
     def _install_and_check(self, settings: Settings) -> int:
         say = self.prompt.say
@@ -2241,36 +2265,70 @@ class Wizard:
         return self._await_awake(service, settings)
 
     def _await_awake(self, service: Service, settings: Settings) -> int:
-        """Poll until the resident is answering, or say where to look if it is not.
+        """Poll until the resident is up, or say where to look if it is not.
 
-        Two signals in order: `service.status().running` (the init system spawned
-        it) then `GET /health` (it is actually serving). Polled because the process
-        takes a moment to boot; bounded (`HEALTH_ATTEMPTS`) because a bad config
-        crash-loops and would otherwise be waited on forever.
+        Three signals, and what counts as "up" depends on the config just written:
+
+          * `service.status().running` - the init system spawned it.
+          * `GET /health` answering (`HealthState.ok`) - it booted and binds.
+          * the conversation loop running - it can actually take a message. Only
+            required when a channel is configured (a Telegram token): with no
+            token there is no channel, so the loop is legitimately stopped and
+            "answering" would be the wrong word rather than a fault. This is the
+            distinction `/health`'s hardcoded `status: ok` cannot make on its own.
+
+        Polled because the process takes a moment to boot; bounded
+        (`HEALTH_ATTEMPTS`) because a bad token or config leaves the loop stopped
+        (or the process crash-looping) and would otherwise be waited on forever.
         """
         say = self.prompt.say
         theme = self.prompt.theme
-        base_url = f"http://{settings.host}:{settings.port}"
+        base_url = self._health_url(settings)
+        expect_loop = bool(settings.telegram_bot_token)
+        running = False
+        health = HealthState(False)
         for attempt in range(HEALTH_ATTEMPTS):
-            if service.status().running and self.checks.health(base_url).ok:
-                say(status(theme, "ok", "Daemon is awake - running and answering."))
+            running = service.status().running
+            health = self.checks.health(base_url) if running else HealthState(False)
+            if running and health.ok and (health.loop == "running" or not expect_loop):
+                if expect_loop:
+                    say(status(theme, "ok", "Daemon is awake - running and answering."))
+                else:
+                    say(status(theme, "ok", "Daemon is running."))
+                    say("  No Telegram token yet, so there is no channel to answer on -")
+                    say("  re-run `daemon setup` to add one, and it is picked up on restart.")
                 say()
                 return OK
             if attempt + 1 < HEALTH_ATTEMPTS:
                 self.sleep(HEALTH_INTERVAL)
-        # Installed, but nothing answered inside the window. Not a setup failure -
-        # the file is written and the service is registered - so this returns OK
-        # like the seed and pairing warnings do, and names where the answer is.
-        detail = service.status().detail
+        # Installed, but not up inside the window. Not a setup failure - the file is
+        # written and the service is registered - so this returns OK like the seed
+        # and pairing warnings do, and names which of the two failures it is.
         say(status(theme, "warn", "installed, but it is not answering yet."))
+        if running and health.ok and expect_loop and health.loop != "running":
+            # It serves /health but its loop is down - almost always a bad or
+            # revoked token, and invisible to `service.status()` alone.
+            say("  The process is up but its conversation loop is not running,")
+            say("  which usually means a bad or revoked token.")
+        detail = service.status().detail
         if detail:
             say(f"  {detail}")
-        say("It may still be starting, or the configuration may be wrong. Look with:")
+        say("Look with:")
         say("  daemon status  - is the service loaded and running")
         say("  daemon doctor  - is the configuration usable")
         say(f"  {service.err_log}  - what it wrote on the way down")
         say()
         return OK
+
+    @staticmethod
+    def _health_url(settings: Settings) -> str:
+        """Where to reach the resident's `/health`.
+
+        `DAEMON_HOST` is a *bind* address, not a connect one: `0.0.0.0` (or `::`)
+        means "listen on every interface", and connecting to it is not portable, so
+        the loopback is the address to actually poll."""
+        host = settings.host if settings.host not in ("0.0.0.0", "::", "") else "127.0.0.1"
+        return f"http://{host}:{settings.port}"
 
     def _residency_hint(self) -> None:
         """How to reach residency by hand - printed when the offer was declined,

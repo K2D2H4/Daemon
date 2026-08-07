@@ -3422,8 +3422,14 @@ def test_one_probe_even_when_only_one_of_the_two_lists_came_back(
 
 # Offline so no hosted key is asked, and the Telegram token is skipped so the
 # pairing step (which polls the network) never runs - leaving a clean path to the
-# residency question at the very end.
+# residency question at the very end. No token means no channel, so the residency
+# step expects the conversation loop to be legitimately stopped.
 OFFLINE_TO_RESIDENCY = [TOOLS_YES, "1", "gemma3:4b", "", "y", "", "", ""]
+
+# The same, but WITH a Telegram token, so a channel exists and the residency step
+# expects the conversation loop to be running. "n" declines the pairing offer, so
+# nothing polls the network.
+TOKEN_TO_RESIDENCY = answers_for(pairing=["n"])
 
 
 @dataclass
@@ -3493,20 +3499,29 @@ def residency_service(
 
 
 def healthy(_base_url: str) -> HealthState:
-    return HealthState(True, "conversation loop running")
+    """Serving, and the conversation loop is running."""
+    return HealthState(True, "conversation loop running", loop="running")
+
+
+def loop_down(_base_url: str) -> HealthState:
+    """Serving /health (status: ok), but the conversation loop is dead - the
+    healthy-looking-but-deaf state a revoked token leaves behind."""
+    return HealthState(True, "conversation loop stopped", loop="stopped")
 
 
 def unhealthy(_base_url: str) -> HealthState:
-    return HealthState(False, "conversation loop stopped")
+    """Not serving at all - connection refused during boot, or a crash."""
+    return HealthState(False, "not answering")
 
 
 def test_residency_is_offered_and_a_yes_installs_and_reports_awake(tmp_path: Path) -> None:
     # The whole point: setup ends by putting Daemon into residency and then saying,
-    # from the running process itself, that it woke up.
+    # from the running process itself, that it woke up. A token is set, so the loop
+    # running is what "answering" is allowed to mean.
     service = residency_service(tmp_path, running=[True])
     result = drive(
         tmp_path,
-        [*OFFLINE_TO_RESIDENCY, "y"],
+        [*TOKEN_TO_RESIDENCY, "y"],
         tty=True,
         service_factory=lambda settings: service,
         checks=replace(working_checks(), health=healthy),
@@ -3561,22 +3576,48 @@ def test_installed_but_not_answering_is_reported_as_trouble_with_where_to_look(
     assert str(service.err_log) in out
 
 
-def test_running_but_health_still_failing_is_trouble(tmp_path: Path) -> None:
-    # launchd says the process exists, but /health says the conversation loop is
-    # down - the quiet degradation the endpoint exists to name. Not "awake".
+def test_serving_but_the_loop_is_dead_with_a_token_is_trouble(tmp_path: Path) -> None:
+    # launchd says the process exists and /health answers 200 - but its status
+    # field is hardcoded, so the real signal is conversation_loop, which is
+    # "stopped" (a revoked token, say). With a channel configured, that is NOT
+    # awake: it must be named, not painted over as "answering".
+    service = residency_service(tmp_path, running=[True])
+    result = drive(
+        tmp_path,
+        [*TOKEN_TO_RESIDENCY, "y"],
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=loop_down),
+    )
+
+    assert result.code == 0
+    out = flat(result.out).lower()
+    assert "not answering" in out
+    assert "conversation loop is not running" in out
+    assert "awake" not in out
+
+
+def test_without_a_token_serving_is_enough_and_it_does_not_claim_to_answer(
+    tmp_path: Path,
+) -> None:
+    # No token means no channel, so the conversation loop is legitimately stopped.
+    # The process being up is the whole signal available, and "answering" would be
+    # the wrong word - there is nothing to answer on yet.
     service = residency_service(tmp_path, running=[True])
     result = drive(
         tmp_path,
         [*OFFLINE_TO_RESIDENCY, "y"],
         tty=True,
         service_factory=lambda settings: service,
-        checks=replace(working_checks(), health=unhealthy),
+        checks=replace(working_checks(), health=loop_down),
     )
 
     assert result.code == 0
+    assert service.installs == 1
     out = flat(result.out).lower()
-    assert "not answering" in out
-    assert "awake" not in out
+    assert "daemon is running" in out
+    assert "running and answering" not in out
+    assert "not answering" not in out  # not a failure - it is up
 
 
 def test_residency_is_not_offered_on_a_pipe(tmp_path: Path) -> None:
@@ -3656,18 +3697,32 @@ def test_a_service_error_during_install_is_a_sentence_not_a_traceback(
 # --- the /health probe -------------------------------------------------------
 
 
-def test_check_health_reports_ok_when_the_endpoint_says_ok(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_check_health_reports_a_running_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        setup.httpx,
-        "get",
-        canned(200, {"status": "ok", "conversation_loop": "running"}),
+        setup.httpx, "get", canned(200, {"status": "ok", "conversation_loop": "running"})
     )
 
     state = setup.check_health("http://127.0.0.1:8787")
 
     assert state.ok
+    assert state.loop == "running"
+
+
+def test_check_health_reports_a_dead_loop_on_a_page_that_still_serves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The case the whole HIGH finding turned on: `status` is a hardcoded literal in
+    # the endpoint, so a served page with a dead loop still reads `status: ok`.
+    # `ok` (it is serving) must stay True, and `loop` must carry the truth so the
+    # caller can refuse to call it "answering".
+    monkeypatch.setattr(
+        setup.httpx, "get", canned(200, {"status": "ok", "conversation_loop": "stopped"})
+    )
+
+    state = setup.check_health("http://127.0.0.1:8787")
+
+    assert state.ok  # it IS serving /health
+    assert state.loop == "stopped"
 
 
 def test_check_health_is_not_ok_when_the_process_is_not_answering(
@@ -3683,10 +3738,9 @@ def test_check_health_is_not_ok_when_the_process_is_not_answering(
     assert not state.ok
 
 
-def test_check_health_is_not_ok_when_status_is_not_ok(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(setup.httpx, "get", canned(200, {"status": "degraded"}))
+def test_check_health_is_not_ok_on_a_non_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A 503 (or anything but 200) means it is not serving yet, whatever a body says.
+    monkeypatch.setattr(setup.httpx, "get", canned(503, {"status": "ok"}))
 
     state = setup.check_health("http://127.0.0.1:8787")
 
