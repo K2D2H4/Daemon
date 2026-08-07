@@ -23,12 +23,15 @@ its caller to gate what commands reach it.
 from __future__ import annotations
 
 import asyncio
+import logging
 import platform
 import shutil
 import tempfile
 from pathlib import Path
 
 from daemon.tools.base import ToolError
+
+logger = logging.getLogger(__name__)
 
 SCREENCAPTURE_ARGS = lambda path, window_id: (  # noqa: E731
     ["screencapture", "-x", "-l", str(window_id), "-t", "jpg", path]
@@ -53,8 +56,14 @@ TCC_HINT = (
 )
 """macOS TCC denial for Screen Recording does not raise an error `screencapture`
 can report - it either exits non-zero or writes a zero-byte file, silently. Both
-are mapped to this one sentence, the same way `browser.py`'s `_explain` turns a
-`-1743` AppleScript failure into an owner-facing instruction."""
+are mapped to this sentence, the same way `browser.py`'s `_explain` turns a
+`-1743` AppleScript failure into an owner-facing instruction. Permission denial
+is the most likely cause of a non-zero exit and `screencapture`'s stderr is often
+unhelpful on its own, so this stays the *primary* message - but unlike a bare
+guess, `_run` appends whatever `screencapture` actually said (Finding 1, task
+0.1 review): a transient failure unrelated to TCC - `could not create image from
+display`, measured on this machine - must not be laundered into a permission
+story with no trace of what really happened."""
 
 
 async def _run(
@@ -65,9 +74,14 @@ async def _run(
     `argv[0]` is a resolved absolute path (see `shutil.which` below); `name` is
     the short program name to speak in an error, so a failure reads "sips
     failed" rather than naming its `/usr/bin` location. `on_failure`, if given,
-    replaces the generic message for a non-zero exit - used only by
-    `screencapture`, whose failure exit *is* how a Screen Recording (TCC) denial
-    shows up. A timeout is never remapped: that is a real timeout either way.
+    is the *primary* message for a non-zero exit - used only by `screencapture`,
+    whose failure exit is how a Screen Recording (TCC) denial usually shows up.
+    A timeout is never remapped: that is a real timeout either way.
+
+    Either way, the real stderr is never thrown away: it is logged at `warning`
+    with the return code, and - mirroring `browser.py`'s `_explain`, which picks
+    the last non-empty stderr line as `detail` - appended to `on_failure` when
+    there is anything to append, so a non-permission failure still names itself.
     """
     process = await asyncio.create_subprocess_exec(
         *argv,
@@ -83,10 +97,12 @@ async def _run(
         raise ToolError(f"{name} did not finish in time") from None
 
     if process.returncode != 0:
+        lines = stderr.decode("utf-8", errors="replace").strip().splitlines()
+        detail = lines[-1] if lines else ""
+        logger.warning("%s exited %d: %s", name, process.returncode, detail or "(no stderr)")
         if on_failure is not None:
-            raise ToolError(on_failure)
-        detail = stderr.decode("utf-8", errors="replace").strip() or "unknown error"
-        raise ToolError(f"{name} failed: {detail}")
+            raise ToolError(f"{on_failure} ({name} said: {detail})" if detail else on_failure)
+        raise ToolError(f"{name} failed: {detail or 'unknown error'}")
     return stdout.decode("utf-8", errors="replace")
 
 
