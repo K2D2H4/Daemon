@@ -82,3 +82,10 @@ async def test_run_tcc_hint_alone_when_screencapture_says_nothing(monkeypatch):
         await screen._run(
             "screencapture", ["screencapture", "-x"], timeout_secs=5, on_failure=screen.TCC_HINT
         )
+
+
+def test_screen_note_marks_content_as_data():
+    note = screen.screen_note("main display")
+    assert "screenshot" in note.lower()
+    assert "not instruction" in note.lower() or "not an instruction" in note.lower()
+    assert "main display" in note

@@ -15,8 +15,12 @@ import asyncio
 import json
 import logging
 import os
+import platform
+import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -411,6 +415,7 @@ def _tools(settings: Settings, args: Any) -> int:
         print(f"allowlist:  {', '.join(settings.tools_allowlist) or '(none)'}")
         browser = f"on ({settings.browser_app})" if settings.browser_enabled else "off"
         print(f"browser:    {browser}")
+        print(f"screen:     {'on' if settings.screen_enabled else 'off'}")
         print(f"mcp:        {'on' if settings.mcp_enabled else 'off'}")
         print()
         try:
@@ -717,6 +722,7 @@ def _doctor() -> int:
             _persona_check(settings),
             _proactivity_check(settings),
             _tools_check(settings),
+            _screen_check(settings),
             *_ollama_checks(settings),
         ]
 
@@ -816,6 +822,56 @@ def _tools_check(settings: Settings) -> Check:
             "tools", True, detail + " - runs everything without asking; only the origin gate holds"
         )
     return Check("tools", True, detail)
+
+
+def _screen_check(settings: Settings) -> Check:
+    """Whether Daemon may capture the screen and, on macOS, whether the OS has
+    actually granted it.
+
+    Screen capture is TCC-gated the same way microphone/camera access is, and a
+    denial does not surface as an ordinary error - `screencapture` either exits
+    non-zero or silently writes a zero-byte file (see `daemon/tools/screen.py`'s
+    TCC_HINT). Since this is the one place that finds out *before* the owner asks
+    for a screenshot and gets a confusing failure, it is worth a real probe - a
+    throwaway capture to a temp file, discarded either way. It must never be the
+    reason `doctor` itself fails to run, so any problem running the probe is
+    reported as a failed check rather than raised.
+    """
+    if not settings.screen_enabled:
+        return Check("screen", True, "off (DAEMON_SCREEN_ENABLED=true to turn it on)")
+    if platform.system() != "Darwin":
+        return Check("screen", True, "on (screen capture is macOS-only)")
+
+    from daemon.tools.screen import SCREENCAPTURE_ARGS
+
+    screencapture = shutil.which("screencapture")
+    if screencapture is None:
+        return Check("screen", False, "on, but screencapture is not on PATH")
+
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = str(Path(scratch) / "probe.jpg")
+            argv = SCREENCAPTURE_ARGS(path, None)
+            argv[0] = screencapture
+            subprocess.run(
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            probe = Path(path)
+            size = probe.stat().st_size if probe.exists() else 0
+    except Exception as exc:  # best-effort: a probe failure is not a doctor crash
+        return Check("screen", False, f"on, but the Screen Recording probe failed: {exc}")
+
+    if size == 0:
+        return Check(
+            "screen",
+            False,
+            "on, but Screen Recording not yet granted - allow it in System "
+            "Settings > Privacy & Security > Screen Recording, then restart me",
+        )
+    return Check("screen", True, "on, Screen Recording granted")
 
 
 def _proactivity_check(settings: Settings) -> Check:
