@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from daemon.config import SERVICE_LABEL_RE
+from daemon.config import SERVICE_LABEL_RE, Settings
 from daemon.fs import DIR_MODE, FILE_MODE, secure_dir, secure_file, write_private_replace
 
 DARWIN = "darwin"
@@ -455,6 +455,23 @@ WantedBy=default.target
             "process alive the way residency needs (docs/PLAN.md 3.1). Run "
             "`daemon run` yourself, or use WSL2 where the systemd path applies."
         )
+
+
+def service_for(settings: Settings) -> Service:
+    """Build the service definition from settings.
+
+    The working directory is where `.env` lives - the current directory, which is
+    the directory the user is standing in when they install. The unit file carries
+    that path and nothing else, so the secrets stay in one file.
+
+    Here rather than in `cli.py` so that `daemon setup`'s guided finish and the
+    `daemon install` command build the resident the same way from one place.
+    """
+    return Service(
+        label=settings.service_label,
+        working_dir=Path.cwd(),
+        log_dir=settings.data_dir / "logs",
+    )
 
 
 def _diff(before: str, after: str, path: Path) -> tuple[str, ...]:

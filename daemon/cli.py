@@ -25,7 +25,7 @@ from typing import Any
 from daemon import __version__
 from daemon.config import OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
-from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus
+from daemon.service import ServiceAction, ServiceError, ServiceStatus, service_for
 
 OK = 0
 PROBLEM = 1
@@ -272,20 +272,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 # --- seams the tests replace -------------------------------------------------
-
-
-def service_for(settings: Settings) -> Service:
-    """Build the service definition from settings.
-
-    The working directory is where `.env` lives - the current directory, which is
-    the directory the user is standing in when they install. The unit file carries
-    that path and nothing else, so the secrets stay in one file.
-    """
-    return Service(
-        label=settings.service_label,
-        working_dir=Path.cwd(),
-        log_dir=settings.data_dir / "logs",
-    )
 
 
 def _setup(*, check_only: bool) -> int:
