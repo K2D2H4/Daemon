@@ -46,6 +46,10 @@ tests/
 
 FROZEN means: do not edit without flagging it first.
 
+`daemon/llm/base.py`'s `Message` now carries `images` and `daemon/voice/base.py`'s
+`VoiceSession` now has `send_frame` - both additive, both for screen sharing,
+justified in [docs/adr/0009-images-in-the-message-contract.md](adr/0009-images-in-the-message-contract.md).
+
 ## Non-negotiables
 
 1. **Markdown is the source of truth. SQLite is a rebuildable index.**
