@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from daemon.llm.base import ToolSpec
+from daemon.llm.base import ImageBlock, ToolSpec
 
 Risk = Literal["safe", "guarded"]
 
@@ -45,6 +45,9 @@ class ToolResult:
     content: str
     ok: bool = True
     elapsed_ms: int = 0
+    images: tuple[ImageBlock, ...] = ()
+    """Images this call captured, carried back so the loop can attach them as a
+    user turn (Task 1.6)."""
 
 
 @runtime_checkable
