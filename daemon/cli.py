@@ -434,6 +434,13 @@ def _tools(settings: Settings, args: Any) -> int:
                     timeout_secs=settings.tools_timeout_secs,
                     max_output=settings.tools_max_output,
                 )
+            if settings.screen_enabled:
+                from daemon.tools.screen import screen_tools
+
+                available += screen_tools(
+                    max_px=settings.screen_max_px,
+                    timeout_secs=settings.tools_timeout_secs,
+                )
         except Exception as exc:
             print(f"daemon: the built-in tools cannot be built: {exc}", file=sys.stderr)
             return PROBLEM

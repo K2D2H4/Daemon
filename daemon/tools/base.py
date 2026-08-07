@@ -50,6 +50,17 @@ class ToolResult:
     user turn (Task 1.6)."""
 
 
+@dataclass(frozen=True, slots=True)
+class ToolOutput:
+    """What a tool returns when it produces more than text - today, images. A tool
+    may still return a bare `str`; `ToolRunner` normalises both into a `ToolResult`.
+    Deliberately minimal: only what the tool can produce, not the audit identity
+    (call_id/name/ok) the runner owns."""
+
+    content: str
+    images: tuple[ImageBlock, ...] = ()
+
+
 @runtime_checkable
 class Tool(Protocol):
     spec: ToolSpec
@@ -59,8 +70,10 @@ class Tool(Protocol):
         """One line describing this specific call, for approval and audit."""
         ...
 
-    async def run(self, arguments: Mapping[str, Any]) -> str:
-        """Do the thing. Raise `ToolError` for anything the model should see."""
+    async def run(self, arguments: Mapping[str, Any]) -> str | ToolOutput:
+        """Do the thing. Raise `ToolError` for anything the model should see.
+
+        May return a `ToolOutput` instead of a bare `str` to carry images."""
         ...
 
 

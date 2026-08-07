@@ -1419,6 +1419,21 @@ async def _build_tools(
         except Exception as exc:
             logger.error("browser tools could not be built, continuing without: %s", exc)
 
+    if settings.screen_enabled:
+        # Guarded like the browser block above: a failure here loses only the
+        # screen tool, not startup.
+        try:
+            from daemon.tools.screen import screen_tools
+
+            for tool in screen_tools(
+                max_px=settings.screen_max_px,
+                timeout_secs=settings.tools_timeout_secs,
+            ):
+                registry.register(tool)
+            logger.info("screen tools on")
+        except Exception as exc:
+            logger.error("screen tools could not be built, continuing without: %s", exc)
+
     bridge: Any = None
     if settings.mcp_enabled:
         from daemon.tools.mcp import McpBridge, load_config
@@ -1443,10 +1458,11 @@ async def _build_tools(
         "tool layer ready: %d tool(s), mode=%s", len(registry), effective_mode
     )
     browser = f", browser={settings.browser_app}" if settings.browser_enabled else ""
+    screen = ", screen=on" if settings.screen_enabled else ""
     return (
         runner,
         bridge,
-        f"ready, {len(registry)} tools, mode={effective_mode}{browser}",
+        f"ready, {len(registry)} tools, mode={effective_mode}{browser}{screen}",
     )
 
 

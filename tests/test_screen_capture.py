@@ -3,7 +3,7 @@ import platform
 import pytest
 
 from daemon.tools import screen
-from daemon.tools.base import ToolError
+from daemon.tools.base import ToolError, ToolOutput
 
 
 def test_screencapture_argv_full_display_omits_cursor():
@@ -89,3 +89,66 @@ def test_screen_note_marks_content_as_data():
     assert "screenshot" in note.lower()
     assert "not instruction" in note.lower() or "not an instruction" in note.lower()
     assert "main display" in note
+
+
+# --- SeeScreen ----------------------------------------------------------------
+
+
+def _tool() -> "screen.SeeScreen":
+    return screen.SeeScreen(max_px=1536, timeout_secs=20.0)
+
+
+def test_see_screen_spec_name():
+    assert _tool().spec.name == "see_screen"
+
+
+def test_see_screen_preview_names_the_main_display():
+    assert "main display" in _tool().preview({})
+
+
+def test_see_screen_preview_names_a_window():
+    preview = _tool().preview({"window": 42})
+    assert "42" in preview
+    assert "window" in preview.lower()
+
+
+def test_screen_tools_returns_a_see_screen():
+    tools = screen.screen_tools(max_px=1536, timeout_secs=20.0)
+    assert len(tools) == 1
+    assert isinstance(tools[0], screen.SeeScreen)
+
+
+async def test_see_screen_run_returns_tool_output_with_image(monkeypatch):
+    async def fake_capture_display(*, long_edge, window_id=None, timeout_secs=20.0):
+        assert window_id is None
+        return b"\xff\xd8\xff", 1512, 982
+
+    monkeypatch.setattr(screen, "capture_display", fake_capture_display)
+
+    result = await _tool().run({})
+    assert isinstance(result, ToolOutput)
+    assert result.content == "captured the main display (1512x982)"
+    assert len(result.images) == 1
+    assert result.images[0].media_type == "image/jpeg"
+    assert result.images[0].data == b"\xff\xd8\xff"
+
+
+async def test_see_screen_run_passes_window_id(monkeypatch):
+    async def fake_capture_display(*, long_edge, window_id=None, timeout_secs=20.0):
+        assert window_id == 7
+        return b"\xff\xd8\xff", 100, 200
+
+    monkeypatch.setattr(screen, "capture_display", fake_capture_display)
+
+    result = await _tool().run({"window": 7})
+    assert result.content == "captured the window 7 (100x200)"
+
+
+async def test_see_screen_run_rejects_non_integer_window():
+    with pytest.raises(ToolError):
+        await _tool().run({"window": "not-a-number"})
+
+
+async def test_see_screen_run_rejects_negative_window():
+    with pytest.raises(ToolError):
+        await _tool().run({"window": -1})

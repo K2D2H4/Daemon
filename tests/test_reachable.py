@@ -357,7 +357,7 @@ def test_every_declared_wiring_gap_names_a_real_seam() -> None:
 # --- tools -------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("module", ["builtin", "browser"])
+@pytest.mark.parametrize("module", ["builtin", "browser", "screen"])
 def test_every_tool_class_is_in_its_factory(module: str, tmp_path: pathlib.Path) -> None:
     """A tool class its factory does not return is invisible to the model, and its
     own unit tests pass regardless.
@@ -370,11 +370,12 @@ def test_every_tool_class_is_in_its_factory(module: str, tmp_path: pathlib.Path)
     from daemon.tools.base import Tool
 
     loaded = importlib.import_module(f"daemon.tools.{module}")
-    factory, kwargs = (
-        (loaded.builtin_tools, {"roots": [tmp_path]})
-        if module == "builtin"
-        else (loaded.browser_tools, {})
-    )
+    if module == "builtin":
+        factory, kwargs = loaded.builtin_tools, {"roots": [tmp_path]}
+    elif module == "screen":
+        factory, kwargs = loaded.screen_tools, {"max_px": 1536, "timeout_secs": 20.0}
+    else:
+        factory, kwargs = loaded.browser_tools, {}
 
     defined = {
         name
@@ -397,10 +398,13 @@ def test_no_two_tools_answer_to_the_same_name(tmp_path: pathlib.Path) -> None:
     the browser group would surface as a crash at startup rather than here."""
     from daemon.tools.browser import browser_tools
     from daemon.tools.builtin import builtin_tools
+    from daemon.tools.screen import screen_tools
 
-    names = [t.spec.name for t in builtin_tools(roots=[tmp_path])] + [
-        t.spec.name for t in browser_tools()
-    ]
+    names = (
+        [t.spec.name for t in builtin_tools(roots=[tmp_path])]
+        + [t.spec.name for t in browser_tools()]
+        + [t.spec.name for t in screen_tools(max_px=1536, timeout_secs=20.0)]
+    )
     assert len(names) == len(set(names)), f"duplicate tool name in {names}"
 
 
