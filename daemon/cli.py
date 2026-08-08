@@ -363,8 +363,52 @@ def _update() -> int:
     if _run(install) != 0:
         print("update failed - the install output above says why.")
         return PROBLEM
-    print(f"updated to {ref}. Restart `daemon run` or the service to pick it up.")
+    print(f"updated to {ref}.")
+    # uv replaced the code in place, but a running supervisor holds the old code
+    # until it re-execs - so an update that stops here is one the resident never
+    # sees, which is exactly the "did it even update?" confusion this avoids.
+    _restart_after_update()
     return OK
+
+
+def _restart_after_update() -> None:
+    """Restart the resident service so it runs the code just installed.
+
+    Best-effort and after the fact: the reinstall already succeeded, so a config
+    that will not load or a machine with no service installed must not turn into a
+    failure - it turns into a line telling the user what to do by hand. Only the
+    installed OS service is restarted; a `daemon run` in a terminal is a foreground
+    process this command cannot reach, so it is told, not touched.
+    """
+    try:
+        settings = Settings()
+    except ConfigError:
+        print(
+            "the code is updated; restart the service yourself to pick it up "
+            "(config did not load here, so I could not do it automatically)."
+        )
+        return
+    try:
+        service = service_for(settings)
+        status = service.status()
+    except ServiceError as exc:
+        print(f"the code is updated; I could not check the service ({exc}) - "
+              "restart it yourself to pick it up.")
+        return
+    if not status.installed:
+        print(
+            "the code is updated. It is not installed as a background service, so "
+            "there is nothing to restart - run `daemon run`, or `daemon install` to "
+            "keep it resident."
+        )
+        return
+    try:
+        service.restart()
+    except ServiceError as exc:
+        print(f"the code is updated, but restarting the service failed ({exc}) - "
+              "restart it yourself to pick it up.")
+        return
+    print("restarted the resident service on the new version.")
 
 
 def _pairing(settings: Settings, args: Any) -> int:

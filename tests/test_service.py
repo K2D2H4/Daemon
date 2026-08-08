@@ -408,13 +408,53 @@ def test_status_on_linux_reads_systemctl(tmp_path: Path) -> None:
     assert (status.loaded, status.running) == (True, True)
 
 
+# --- restart -----------------------------------------------------------------
+
+
+def test_restart_kickstarts_the_agent_on_macos(tmp_path: Path) -> None:
+    """`daemon update` reinstalls the code in place; the running job keeps the old
+    code until it re-execs, so restart kickstarts it - `-k` kills the current
+    instance and starts a fresh one from the same plist."""
+    runner = FakeRunner()
+    service = make_service(tmp_path, runner=runner)
+
+    action = service.restart()
+
+    assert runner.commands == [
+        ("launchctl", "kickstart", "-k", "gui/501/ai.daemon.default"),
+    ]
+    assert action.applied
+
+
+def test_restart_on_linux_uses_systemctl_restart(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    service = make_service(tmp_path, platform="linux", runner=runner)
+
+    service.restart()
+
+    assert runner.commands == [
+        ("systemctl", "--user", "restart", "ai.daemon.default.service"),
+    ]
+
+
+def test_a_failing_restart_becomes_a_ServiceError(tmp_path: Path) -> None:
+    """A job that is not loaded fails here loudly - the caller (`daemon update`)
+    checks `status().installed` first, but a lie from launchd must not pass as a
+    restart that happened."""
+    runner = FakeRunner({"kickstart": RunResult(3, stderr="No such process")})
+    service = make_service(tmp_path, runner=runner)
+
+    with pytest.raises(ServiceError, match="kickstart"):
+        service.restart()
+
+
 # --- refusals ----------------------------------------------------------------
 
 
 def test_windows_is_refused_with_a_reason(tmp_path: Path) -> None:
     service = make_service(tmp_path, platform="win32")
 
-    for call in (service.install, service.uninstall, service.status):
+    for call in (service.install, service.uninstall, service.status, service.restart):
         with pytest.raises(ServiceError, match="not supported on 'win32'"):
             call()
 
