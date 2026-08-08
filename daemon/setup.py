@@ -2297,6 +2297,10 @@ class Wizard:
                     say(status(theme, "ok", "Daemon is running."))
                     say("  No Telegram token yet, so there is no channel to answer on -")
                     say("  re-run `daemon setup` to add one, and it is picked up on restart.")
+                # The web console is channel-independent, so it is worth pointing at
+                # even in the no-token case above - it is how the owner watches
+                # health, tests a turn, edits settings and adds an MCP server.
+                say(f"  Admin console: {base_url}/admin/")
                 say()
                 return OK
             if attempt + 1 < HEALTH_ATTEMPTS:
