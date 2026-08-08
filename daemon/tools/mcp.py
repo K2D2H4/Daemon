@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -150,6 +151,15 @@ def load_config(data_dir: Path) -> McpConfig:
     return McpConfig(configs, rejected)
 
 
+_EXTRA_BIN_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
+"""Where user-installed launchers live but a supervised process cannot see them.
+
+A LaunchAgent/systemd service runs with a minimal PATH (`/usr/bin:/bin:...`), which
+omits `~/.local/bin` - exactly where `uv tool install` puts `uvx`. So a catalog
+server configured as `uvx mcp-server-<x>` died with `[Errno 2] No such file or
+directory` under the service while working fine from a shell `daemon run`. These
+dirs are added when resolving the command and to the child's PATH."""
+
 _SAFE_STDIO_ENV = ("PATH", "HOME")
 """The only variables inherited by a stdio child, and deliberately not `os.environ`.
 
@@ -174,10 +184,32 @@ def _secret_value(config: ServerConfig, secret: str | None) -> str | None:
     return os.environ.get(config.key_env)
 
 
+def _augmented_path() -> str:
+    """The current PATH with the user bin dirs appended, so `uvx` (and whatever it
+    shells out to) is findable even under a service's minimal PATH."""
+    extra = os.pathsep.join(os.path.expanduser(d) for d in _EXTRA_BIN_DIRS)
+    current = os.environ.get("PATH", "")
+    return os.pathsep.join(p for p in (current, extra) if p)
+
+
+def _resolve_command(command: str) -> str:
+    """Absolute path to `command`, searching the user bin dirs too, or `command`
+    unchanged if not found (so a bad command still fails honestly, by name).
+
+    Handing subprocess an absolute path is what actually fixes the service case:
+    on POSIX the executable is looked up against the *parent's* PATH, not the child
+    env we pass, so augmenting the child's PATH alone would not let it find `uvx`."""
+    if os.path.isabs(command):
+        return command
+    return shutil.which(command, path=_augmented_path()) or command
+
+
 def _stdio_env(config: ServerConfig, secret: str | None = None) -> dict[str, str]:
-    """The environment a stdio child is started with: the safe passthrough, then the
-    static env the owner set in `mcp.json`, then at most the one named secret."""
+    """The environment a stdio child is started with: the safe passthrough (with the
+    user bin dirs added to PATH), then the static env the owner set in `mcp.json`,
+    then at most the one named secret."""
     env = {name: os.environ[name] for name in _SAFE_STDIO_ENV if name in os.environ}
+    env["PATH"] = _augmented_path()
     env.update({str(k): str(v) for k, v in dict(config.env).items()})
     value = _secret_value(config, secret)
     if config.key_env and value is not None:
@@ -602,7 +634,9 @@ class McpBridge:
                 read, write = await stack.enter_async_context(
                     stdio_client(
                         stdio_params(
-                            command=config.command,
+                            # Resolved to an absolute path so a service's minimal
+                            # PATH does not turn `uvx` into [Errno 2].
+                            command=_resolve_command(config.command),
                             args=list(config.args),
                             # Not `os.environ`: the safe passthrough plus the owner's
                             # static env plus at most the one named secret. See

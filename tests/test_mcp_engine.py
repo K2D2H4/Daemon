@@ -15,6 +15,7 @@ and dropping them.
 from __future__ import annotations
 
 import asyncio
+import os
 import stat
 from pathlib import Path
 from typing import Any
@@ -23,11 +24,13 @@ import pytest
 
 from daemon.llm.base import ToolSpec
 from daemon.mcp_catalog import CatalogEntry
+from daemon.tools import mcp as mcp_module
 from daemon.tools.base import Registry, Tool, ToolError
 from daemon.tools.mcp import (
     McpBridge,
     ServerConfig,
     _bearer_headers,
+    _resolve_command,
     _stdio_env,
     load_config,
     remove_server,
@@ -313,7 +316,9 @@ def test_stdio_env_injects_only_the_named_secret(monkeypatch: pytest.MonkeyPatch
 
     assert env["TAVILY_API_KEY"] == "tvly-123"
     assert "ANTHROPIC_API_KEY" not in env  # the leak we refuse
-    assert env.get("PATH") == "/usr/bin:/bin"  # but `uvx` must still be findable
+    # The base PATH is preserved and the user bin dirs are added, so `uvx` is findable.
+    assert "/usr/bin" in env["PATH"].split(os.pathsep)
+    assert os.path.expanduser("~/.local/bin") in env["PATH"].split(os.pathsep)
 
 
 def test_stdio_env_does_not_carry_a_secret_it_was_not_given(
@@ -339,6 +344,39 @@ def test_an_explicit_secret_overrides_the_environment(
 def test_static_env_from_mcp_json_is_still_passed() -> None:
     config = ServerConfig(name="t", command="uvx", env={"FOO": "bar"})
     assert _stdio_env(config)["FOO"] == "bar"
+
+
+# --- finding uvx under a service's minimal PATH -----------------------------
+
+
+def test_stdio_env_adds_the_user_bin_dirs_to_path() -> None:
+    """A LaunchAgent/systemd PATH omits ~/.local/bin, where uvx lives, so the child's
+    PATH is augmented or a uvx server dies with [Errno 2]."""
+    path = _stdio_env(ServerConfig(name="t", command="uvx"))["PATH"]
+    assert os.path.expanduser("~/.local/bin") in path.split(os.pathsep)
+
+
+def test_resolve_command_finds_a_launcher_in_a_user_bin_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`uvx` on a bare service PATH is unfindable; resolution searches the user bin
+    dirs and hands subprocess an absolute path (POSIX looks the executable up on the
+    parent's PATH, so augmenting only the child env would not be enough)."""
+    fake = tmp_path / "uvx"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(mcp_module, "_EXTRA_BIN_DIRS", (str(tmp_path),))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")  # a service-like minimal PATH
+    assert _resolve_command("uvx") == str(fake)
+
+
+def test_resolve_command_leaves_an_unknown_command_to_fail_by_name() -> None:
+    missing = "definitely-not-a-real-binary-xyz"
+    assert _resolve_command(missing) == missing
+
+
+def test_resolve_command_passes_an_absolute_path_through() -> None:
+    assert _resolve_command("/usr/bin/env") == "/usr/bin/env"
 
 
 # --- secret indirection: bearer header --------------------------------------
@@ -604,7 +642,8 @@ async def test_connect_hands_the_minimal_env_to_the_stdio_client(
     config = ServerConfig(name="t", command="uvx", args=("x",), key_env="TAVILY_API_KEY")
     await bridge._connect(config)
 
-    assert captured["command"] == "uvx"
+    # Resolved to an absolute path where uvx is installed, or left bare if not found.
+    assert captured["command"].endswith("uvx")
     assert captured["env"]["TAVILY_API_KEY"] == "tvly-xyz"
     assert "ANTHROPIC_API_KEY" not in captured["env"]
 
