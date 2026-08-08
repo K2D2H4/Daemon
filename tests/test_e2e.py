@@ -1094,3 +1094,68 @@ async def test_boot_catch_up_that_raises_does_not_take_the_daemon_down(
         body = await health(app)
         assert body["conversation_loop"] == "running"
         assert not app.state.loop_task.done()
+
+
+async def test_build_io_closes_the_store_when_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Store.open` succeeds, then `reindex` (or anything before the `_IO` is
+    returned) raises. The sqlite handle must be closed, not leaked - the process now
+    keeps running degraded, so a leak here would accumulate across restarts
+    (finding #7). Regression: the open store must be closed before the error escapes.
+    """
+    import sqlite3
+
+    from daemon import app as app_module
+    from daemon.memory.store import Store
+
+    opened: list[Store] = []
+    real_open = Store.open
+
+    def spy_open(path: Any) -> Store:
+        store = real_open(path)
+        opened.append(store)
+        return store
+
+    monkeypatch.setattr("daemon.memory.store.Store.open", staticmethod(spy_open))
+    monkeypatch.setattr(
+        "daemon.memory.reindex.reindex",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("mirror is corrupt")),
+    )
+
+    with pytest.raises(RuntimeError):
+        app_module._build_io(settings_for(tmp_path))
+
+    assert opened, "the store was never opened"
+    # A closed connection raises on use; a leaked one would answer instead.
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].conn.execute("SELECT 1")
+
+
+async def test_a_missing_channel_still_brings_up_memory_tools_and_mcp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A channel that will not build (the shape a missing bot token takes) must not
+    cost the daemon its memory, tool layer and MCP bridge. Those are
+    channel-independent, and the admin web (M5) is explicitly a local-only,
+    tokenless surface - coupling the bridge to a working channel left
+    `/admin/api/mcp/connect` dead in exactly that deployment. Regression for that
+    coupling: with the channel gone, `app.state.mcp` must still be a live bridge and
+    the conversation loop simply does not start.
+    """
+
+    def no_channel(*_a: Any, **_k: Any) -> Any:
+        raise ValueError("no bot token")
+
+    monkeypatch.setattr("daemon.app._build_channel", no_channel)
+    monkeypatch.setattr("daemon.app._build_providers", lambda _s: {"ollama": ScriptedModel({})})
+    monkeypatch.setattr(
+        "daemon.llm.embedders.ollama.OllamaEmbedder", lambda *a, **k: Embedder()
+    )
+
+    app = create_app(settings_for(tmp_path, DAEMON_MCP_ENABLED=True))
+    async with app.router.lifespan_context(app):
+        assert app.state.memory is not None, "memory must survive a dead channel"
+        assert app.state.tools is not None, "the tool layer must come up without a channel"
+        assert app.state.mcp is not None, "the MCP bridge must come up without a channel"
+        assert app.state.loop_task is None, "no channel means no conversation loop"

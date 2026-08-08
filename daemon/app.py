@@ -17,6 +17,7 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,7 +26,7 @@ from fastapi import FastAPI
 from daemon import __version__
 from daemon.channels.base import Channel
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
-from daemon.config import ANTHROPIC, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
+from daemon.config import ANTHROPIC, ENV_FILE, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
 from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
@@ -109,34 +110,62 @@ def create_app(
     app.state.tools = None
     app.state.tools_status = "not started"
     app.state.mcp = None
+    # Serialises the admin's persist-then-(dis)connect MCP routes so two of them
+    # cannot interleave the `mcp.json` read-modify-write and lose an update
+    # (daemon/admin/routes.py, finding #6). Constructed here, not in the lifespan,
+    # because the routes run under `TestClient` without one; it binds to the running
+    # loop on first use.
+    app.state.mcp_persist_lock = asyncio.Lock()
+    # Where a settings patch is written and where `.env` is read from - the same
+    # file Settings loaded (config.ENV_FILE, cwd-relative), so the admin edits the
+    # one source of truth rather than a second copy. A test overrides it.
+    app.state.env_path = Path(ENV_FILE)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        task = app.state.loop_task
-        return {
-            "status": "ok",
-            "preset": resolved.preset,
-            "voice_enabled": resolved.voice_enabled,
-            "routing": {
-                task_key.value: route.provider
-                for task_key, route in resolved.routing_table().items()
-            },
-            "conversation_loop": "running" if task is not None and not task.done() else "stopped",
-            # Recall can be absent while the rest of the process is healthy (the
-            # embedder is down, the module is mid-rewrite). Saying so here is the
-            # difference between a degraded daemon and one that quietly forgets.
-            "recall": _recall_health(app.state),
-            # Same reason, and the failure is even quieter: a wake gate that died
-            # leaves a daemon that answers Telegram normally and has simply stopped
-            # hearing the room, with nothing anywhere saying so.
-            "wake_gate": _wake_health(app.state),
-            # Same reasoning: an MCP server that failed to start leaves the model
-            # with fewer tools and nothing else different, which is exactly the kind
-            # of quiet degradation this endpoint exists to name.
-            "tools": _tools_health(app.state),
-        }
+        return health_payload(app.state, resolved)
+
+    # The operator-facing control plane: health, a side-effect-free chat test, and
+    # validated settings edits (docs/design/2026-08-07-m5-admin-web-design.md). It
+    # talks only to `app.state` handles and protocols; importing a concrete
+    # provider/channel stays this file's exception alone (CONTRACTS 4), so the
+    # import is here and function-local like every other one in this module.
+    from daemon.admin.routes import router as admin_router
+
+    app.include_router(admin_router)
 
     return app
+
+
+def health_payload(state: Any, settings: Settings) -> dict[str, Any]:
+    """The `/health` body, built from `app.state`.
+
+    A module-level function rather than a closure so the admin's own health
+    endpoint returns byte-for-byte the same thing - "the chat version of /health"
+    is only honest if the health it shows is the same health (docs/design)."""
+    task = getattr(state, "loop_task", None)
+    return {
+        "status": "ok",
+        "preset": settings.preset,
+        "voice_enabled": settings.voice_enabled,
+        "routing": {
+            task_key.value: route.provider
+            for task_key, route in settings.routing_table().items()
+        },
+        "conversation_loop": "running" if task is not None and not task.done() else "stopped",
+        # Recall can be absent while the rest of the process is healthy (the
+        # embedder is down, the module is mid-rewrite). Saying so here is the
+        # difference between a degraded daemon and one that quietly forgets.
+        "recall": _recall_health(state),
+        # Same reason, and the failure is even quieter: a wake gate that died
+        # leaves a daemon that answers Telegram normally and has simply stopped
+        # hearing the room, with nothing anywhere saying so.
+        "wake_gate": _wake_health(state),
+        # Same reasoning: an MCP server that failed to start leaves the model
+        # with fewer tools and nothing else different, which is exactly the kind
+        # of quiet degradation this endpoint exists to name.
+        "tools": _tools_health(state),
+    }
 
 
 @asynccontextmanager
@@ -238,9 +267,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             app.state.tools = tools
 
+    # Set regardless of the channel: memory, recall and the tool layer are
+    # channel-independent capabilities, and tying their `app.state` handles to a
+    # working channel made `/health` under-report them - and left the admin surface
+    # (M5) without the memory it is entitled to - in a tokenless boot. The
+    # conversation loop, and only the loop, needs the channel; that guard stays
+    # below.
+    app.state.channel = channel
+    app.state.memory = memory
     if channel is not None and memory is not None:
-        app.state.channel = channel
-        app.state.memory = memory
         loop = ConversationLoop(
             channel,
             gateway,
@@ -397,7 +432,7 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
 
 @dataclass(frozen=True, slots=True)
 class _IO:
-    channel: Channel
+    channel: Channel | None
     memory: MemoryWriter
     recall: Recall | None
     recall_status: str
@@ -462,27 +497,50 @@ def _build_io(settings: Settings) -> _IO:
     # Built before the channel: the channel takes the cursor from it, so a
     # restart does not re-receive and re-answer what it already handled.
     store = Store.open(settings.data_dir / DB_FILENAME)
-    # Repairs a mirror that fell behind its markdown - a failed mirror write, a
-    # crash between the two writes, or a deleted database. Without this the
-    # markdown being the source of truth is a claim nothing acts on.
-    reindex(settings.data_dir, store)
-    # Pairing by default: on a first run the env allowlist is empty, and in
-    # `allowlist` mode that refuses to start - correct as a policy, useless as an
-    # onboarding step. The owner's id is captured from their first message
-    # instead of transcribed by hand.
-    channel = _build_channel(settings, store)
-    recall, recall_status, embedder = _build_recall(settings, store)
-    writer = FileMemoryWriter(settings.data_dir, store)
-    return _IO(
-        channel=channel,
-        memory=writer,
-        recall=recall,
-        recall_status=recall_status,
-        resolve_id=_id_resolver(writer),
-        close=store.close,
-        embedder=embedder,
-        store=store,
-    )
+    # Everything after the open is guarded so a failure between here and the return
+    # closes the sqlite handle rather than leaking it (finding #7): `reindex` can
+    # raise on a corrupt mirror, and the process now keeps running degraded rather
+    # than crashing, so a leaked handle would accumulate across restarts.
+    try:
+        # Repairs a mirror that fell behind its markdown - a failed mirror write, a
+        # crash between the two writes, or a deleted database. Without this the
+        # markdown being the source of truth is a claim nothing acts on.
+        reindex(settings.data_dir, store)
+        # Pairing by default: on a first run the env allowlist is empty, and in
+        # `allowlist` mode that refuses to start - correct as a policy, useless as an
+        # onboarding step. The owner's id is captured from their first message
+        # instead of transcribed by hand.
+        # A missing bot token must not cost the daemon its memory, tools and admin
+        # surface: those are channel-independent, and the admin web (M5) is explicitly
+        # a local-only, tokenless-deployment surface. So a channel that will not build
+        # degrades to "no inbound conversation path" rather than taking the whole
+        # process down - the same tolerance `build_proactive_tick` already applies to
+        # its own `_build_channel`. `_lifespan` starts the conversation loop only when
+        # the channel is present, so None here simply means no Telegram loop.
+        try:
+            channel: Channel | None = _build_channel(settings, store)
+        except Exception as exc:
+            logger.error(
+                "channel not started; continuing with memory, tools and admin "
+                "(no inbound conversation path): %s",
+                exc,
+            )
+            channel = None
+        recall, recall_status, embedder = _build_recall(settings, store)
+        writer = FileMemoryWriter(settings.data_dir, store)
+        return _IO(
+            channel=channel,
+            memory=writer,
+            recall=recall,
+            recall_status=recall_status,
+            resolve_id=_id_resolver(writer),
+            close=store.close,
+            embedder=embedder,
+            store=store,
+        )
+    except Exception:
+        store.close()
+        raise
 
 
 BACKFILL_CHUNK = 500

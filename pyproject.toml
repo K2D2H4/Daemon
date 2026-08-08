@@ -67,7 +67,14 @@ mcp = [
     # beyond the standard library, so an install that only wants Daemon to reach
     # its own machine does not take this on. Imported from daemon/tools/mcp.py
     # alone, which is also where a v2 API change would land.
-    "mcp>=1.9",
+    #
+    # Capped below 2.0: mcp 2.0.0 is a major with a different client surface
+    # (`mcp.client.streamable_http.streamablehttp_client` is gone, among others),
+    # and daemon/tools/mcp.py is written against the 1.x client. Left uncapped, a
+    # fresh install resolved 2.0.0 and url/remote servers broke at import - green
+    # locally on a pinned 1.x, ImportError in CI. Lift this when that one file is
+    # ported to the v2 surface.
+    "mcp>=1.9,<2",
 ]
 dev = [
     "pytest>=8.3",
