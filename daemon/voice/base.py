@@ -107,6 +107,11 @@ class VoiceSession(Protocol):
         """One PCM chunk from the microphone."""
         ...
 
+    async def send_frame(self, jpeg: bytes) -> None:
+        """One JPEG frame of the owner's screen, sent as realtime video input
+        during a live screen share. Added by ADR 0009."""
+        ...
+
     async def send_context(self, text: str) -> None:
         """Put text in front of the model without asking it to respond.
 

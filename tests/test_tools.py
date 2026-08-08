@@ -17,9 +17,9 @@ from typing import Any
 import pytest
 
 from daemon import clock
-from daemon.llm.base import ToolCall, ToolSpec
+from daemon.llm.base import ImageBlock, ToolCall, ToolSpec
 from daemon.memory.store import Store
-from daemon.tools.base import Registry, ToolError, canonical_arguments
+from daemon.tools.base import Registry, ToolError, ToolOutput, canonical_arguments
 from daemon.tools.builtin import (
     NOTIFY_SCRIPT,
     ListDir,
@@ -685,6 +685,48 @@ async def test_a_tool_that_raises_unexpectedly_does_not_end_the_round(
     assert not outcome.results[0].ok
     assert "upstream fell over" in outcome.results[0].content
     assert outcome.results[1].ok, "one broken tool must not take the round down"
+
+
+async def test_a_tool_returning_tool_output_carries_its_images(
+    store: Store, tmp_path: Path
+) -> None:
+    """The bridge Task 1.7 adds: a tool may return `ToolOutput` instead of a bare
+    `str`, and the runner must carry its images into the `ToolResult` the loop
+    turns into a framed user message (Task 1.6)."""
+
+    class SeesSomething:
+        risk = "safe"
+        spec = ToolSpec(name="sees_something", description="looks", parameters={"type": "object"})
+
+        def preview(self, arguments: Any) -> str:
+            return "look"
+
+        async def run(self, arguments: Any) -> ToolOutput:
+            return ToolOutput("txt", (ImageBlock(b"..", "image/jpeg"),))
+
+    registry = Registry()
+    registry.register(SeesSomething())
+    tools = ToolRunner(registry, ToolPolicy(store, mode="full"), store)
+
+    outcome = await tools.execute(
+        [ToolCall(id="1", name="sees_something", arguments={})], CONTEXT
+    )
+    result = outcome.results[0]
+    assert result.content == "txt"
+    assert result.images == (ImageBlock(b"..", "image/jpeg"),)
+
+
+async def test_a_tool_returning_a_plain_string_carries_no_images(
+    store: Store, tmp_path: Path
+) -> None:
+    """Every existing tool returns a bare `str`; the bridge must not force images
+    onto them."""
+    (tmp_path / "notes.md").write_text("hello")
+    outcome = await runner(store, tmp_path, mode="full").execute(
+        [ToolCall(id="1", name="read_file", arguments={"path": str(tmp_path / "notes.md")})],
+        CONTEXT,
+    )
+    assert outcome.results[0].images == ()
 
 
 async def test_calls_run_in_the_order_they_were_asked_for(store: Store, tmp_path: Path) -> None:

@@ -29,6 +29,7 @@ from daemon.memory.base import LoggedMessage
 from daemon.tasks import Task
 from daemon.tools.policy import Command, parse_command
 from daemon.tools.runner import Outcome
+from daemon.tools.screen import screen_note
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +236,17 @@ class ConversationLoop:
             messages.extend(
                 Message(role="tool", content=result.content, tool_call_id=result.call_id)
                 for result in round_outcome.results
+            )
+            # A captured image rides on its own plain `user` turn, never inside the
+            # `tool`-role message above: a user turn holding an image is the one
+            # shape all four providers accept (Task 1.2-1.5), where a `tool`-role
+            # image is not. The note is the untrusted-data framing (security stance
+            # A) - the same fencing spirit as recall/browser, adapted because
+            # pixels cannot be nonce-fenced the way text can (`screen.screen_note`).
+            messages.extend(
+                Message(role="user", content=screen_note("the screen"), images=result.images)
+                for result in round_outcome.results
+                if result.images
             )
             completion = await self._gateway.complete(Task.CHAT_TEXT, messages, tools=specs)
 

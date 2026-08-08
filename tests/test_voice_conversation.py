@@ -110,9 +110,9 @@ class Hang:
 class FakeSession:
     """A scripted `VoiceSession`, protocol-complete.
 
-    All seven methods are the protocol's now, including the three the audit added
-    and `send_tool_response`, so the conversation calls them rather than hunting for
-    them - and a fake that lacked one would fail
+    All eight methods are the protocol's now, including the three the audit added,
+    `send_tool_response`, and `send_frame` (ADR 0009), so the conversation calls
+    them rather than hunting for them - and a fake that lacked one would fail
     `test_the_fakes_satisfy_the_protocols` instead of quietly exercising a fallback
     the product does not have.
 
@@ -127,6 +127,7 @@ class FakeSession:
         self.script = list(script)
         self.events = events if events is not None else []
         self.sent: list[bytes] = []
+        self.frames: list[bytes] = []
         self.texts: list[str] = []
         self.contexts: list[str] = []
         self.sent_while_generating: list[str] = []
@@ -152,6 +153,9 @@ class FakeSession:
 
     async def send_audio(self, chunk: bytes) -> None:
         self.sent.append(chunk)
+
+    async def send_frame(self, jpeg: bytes) -> None:
+        self.frames.append(jpeg)
 
     async def send_text(self, text: str) -> None:
         self.texts.append(text)
@@ -1812,3 +1816,154 @@ async def test_run_voice_offers_the_owners_tools_pinned_to_allowlist(
     assert TOOL_CONTRACT in (captured.get("system_instruction") or ""), (
         "the model was handed tools but not the rules for using them"
     )
+
+
+# --- screen-share lifecycle (Task 2.3) ----------------------------------------
+#
+# The pump needs a live VoiceSession, so the conversation binds it once the
+# session is open and stops+unbinds it when the conversation ends - a share must
+# never outlive its session. These tests drive the real `ScreenShareController`
+# and the real `start_screen_share`/`stop_screen_share` tools through the same
+# `_run_tool_call` path a spoken call actually takes, with a fake pump standing in
+# for `ScreenSharePump` so nothing here touches a real screen or socket.
+
+
+class _FakeContextSession:
+    """Records `send_context` calls, standing in for the live session the
+    pump would otherwise hold (Finding 3: the framing seed on share start)."""
+
+    def __init__(self) -> None:
+        self.context_sent: list[str] = []
+
+    async def send_context(self, text: str) -> None:
+        self.context_sent.append(text)
+
+
+class _FakePump:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+        self.session = _FakeContextSession()
+
+    def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+async def test_screen_share_binds_a_fresh_pump_when_the_session_opens() -> None:
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    created: list[_FakePump] = []
+
+    def factory(session: Any) -> _FakePump:
+        assert session is not None
+        pump = _FakePump()
+        created.append(pump)
+        return pump
+
+    session = FakeSession(Turn())
+    conv = conversation(session, screen_share=controller, screen_pump_factory=factory)
+    await run(conv)
+
+    assert len(created) == 1, "the conversation must bind exactly one pump per session"
+
+
+async def test_screen_share_start_stop_tools_drive_the_bound_pump(
+    db: Any,
+) -> None:
+    """The full spoken path: `start_screen_share` flips the bound pump on through
+    `_run_tool_call`, exactly as a real tool call from the model would."""
+    from daemon.tools.screen import screen_share_tools
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    created: list[_FakePump] = []
+
+    def factory(session: Any) -> _FakePump:
+        pump = _FakePump()
+        created.append(pump)
+        return pump
+
+    store = Store(db)
+    registry = Registry()
+    for tool in screen_share_tools(controller):
+        registry.register(tool)
+    runner = ToolRunner(registry, ToolPolicy(store, mode="allowlist", enabled=True), store)
+
+    session = FakeSession(
+        Calls(ToolCall(id="1", name="start_screen_share", arguments={})),
+        Turn(),
+    )
+    conv = conversation(
+        session, screen_share=controller, screen_pump_factory=factory, tools=runner
+    )
+    await run(conv)
+
+    assert len(created) == 1
+    assert created[0].started is True, "the tool call must have started the bound pump"
+    # The conversation ended, so `stop_and_unbind` must have run in `finally` -
+    # a share must never outlive its session.
+    assert created[0].stopped is True
+    assert controller.active is False
+
+
+async def test_screen_share_is_stopped_and_unbound_when_the_conversation_ends() -> None:
+    """Even with no `start_screen_share` call at all: an active share left over
+    from an earlier turn (or a controller reused across a reconnect) must not
+    survive past this session's `run()`."""
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    pump = _FakePump()
+    controller.bind(pump)
+    await controller.start()
+    assert controller.active is True
+
+    session = FakeSession(Turn())
+    conv = conversation(session, screen_share=controller, screen_pump_factory=lambda s: pump)
+    await run(conv)
+
+    assert pump.stopped is True
+    assert controller.active is False
+
+
+async def test_screen_share_unbinds_even_when_run_is_cancelled() -> None:
+    """`run()`'s teardown is a `finally`, so cancellation must not leak a pump -
+    the same guarantee the transcript-recording teardown already has."""
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    created: list[_FakePump] = []
+
+    def factory(session: Any) -> _FakePump:
+        pump = _FakePump()
+        created.append(pump)
+        return pump
+
+    session = FakeSession(Hang())
+    conv = conversation(session, screen_share=controller, screen_pump_factory=factory)
+    task = asyncio.ensure_future(conv.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # The share is on when the cancellation lands - the case that actually risks
+    # a leak, since `stop_and_unbind` only calls `pump.stop()` while active.
+    await controller.start()
+    assert created[0].started is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=RUN_LIMIT)
+
+    assert len(created) == 1
+    assert created[0].stopped is True
+    assert controller.active is False
+
+
+async def test_conversation_without_screen_share_never_touches_the_controller() -> None:
+    """The default (`screen_share=None`) - the text path never even constructs a
+    controller, and this is the voice case with screen sharing off entirely."""
+    session = FakeSession(Turn())
+    conv = conversation(session)  # no screen_share, no screen_pump_factory
+    await run(conv)  # must not raise
