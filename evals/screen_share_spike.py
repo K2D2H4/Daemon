@@ -41,7 +41,7 @@ PROMPT = (
 async def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--all", action="store_true", help="capture every display, one image each")
-    parser.add_argument("--model", default="gemma3:4b", help="Ollama vision model (default gemma3:4b)")
+    parser.add_argument("--model", default="gemma3:4b", help="Ollama vision model")
     parser.add_argument("--long-edge", type=int, default=1536)
     parser.add_argument("--base-url", default="http://127.0.0.1:11434")
     parser.add_argument("--prompt", default=PROMPT)
