@@ -771,9 +771,10 @@ async def test_the_user_speaking_first_is_not_a_barge_in() -> None:
 # A spoken tool call is the same event as a typed one (daemon/voice/base.py): the
 # model asks, `receive()` yields a `ToolCall`, and the conversation runs it through
 # the same `Companion.run_tools` the text loop uses and hands the result back with
-# `send_tool_response`. Voice is pinned to `allowlist` mode in `daemon/app.py`, so
-# the only two outcomes at call time are run-it and refuse-it - there is nowhere in
-# a spoken turn to ask, so nothing is ever parked.
+# `send_tool_response`. Voice follows the owner's `DAEMON_TOOLS_MODE` but degrades
+# `ask` to `allowlist` in `daemon/app.py`, so the only two outcomes at call time are
+# run-it and refuse-it - there is nowhere in a spoken turn to ask, so nothing is ever
+# parked.
 
 
 def _read_file_call(path: pathlib.Path, call_id: str = "1") -> ToolCall:
@@ -869,11 +870,11 @@ async def test_an_unlisted_command_is_refused_and_the_model_is_told_why(
 async def test_a_guarded_write_is_refused_outright_never_parked(
     db: Any, tmp_path: pathlib.Path
 ) -> None:
-    """The reason voice is pinned to `allowlist`: `ask` mode would mint an approval
-    row for this and let it lapse unanswered, because nobody is watching a spoken
-    turn for a code. `write_file` is not a command, so `allowlist` cannot match it
-    and refuses it - and no approval is minted, which is the failure this pinning
-    exists to make impossible."""
+    """The reason voice degrades `ask` to `allowlist`: `ask` mode would mint an
+    approval row for this and let it lapse unanswered, because nobody is watching a
+    spoken turn for a code. `write_file` is not a command, so `allowlist` cannot match
+    it and refuses it - and no approval is minted, which is the failure this
+    degradation exists to make impossible."""
     target = tmp_path / "todo.md"
     runner, store = tool_runner(db, tmp_path, mode="allowlist")
     session = FakeSession(
@@ -1763,31 +1764,33 @@ async def test_an_answered_opening_is_not_asked_again(
 # session was actually offered - the only fakes are the hardware and the socket.
 
 
-async def test_run_voice_offers_the_owners_tools_pinned_to_allowlist(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The three things this PR wires and nothing else can see: the tool specs reach
-    the session, the mode is pinned to `allowlist` (not `settings.tools_mode`), and
-    the tool contract reaches the model with them - the endpoint getting tools next
-    inheriting the rules the text path has (daemon/companion.py, TOOL_CONTRACT)."""
-    from daemon import app as app_module
-    from daemon.companion import TOOL_CONTRACT
+def _voice_settings(tmp_path: pathlib.Path, **overrides: str) -> Any:
     from daemon.config import Settings
 
-    settings = Settings(
-        _env_file=None,
-        DAEMON_PRESET="balanced",
-        DAEMON_OLLAMA_MODEL="gemma3:4b",
-        DAEMON_DATA_DIR=str(tmp_path),
-        TELEGRAM_BOT_TOKEN="123456:AAHfake-token-value",
-        DAEMON_HOSTED_PROVIDER="gemini",
-        GEMINI_API_KEY="k",
-        DAEMON_VOICE_ENABLED="true",
-        DAEMON_GEMINI_LIVE_MODEL="gemini-3.1-flash-live-preview",
-        DAEMON_GEMINI_MODEL="gemini-3.5-flash",
-        DAEMON_TOOLS_ENABLED="true",
-        DAEMON_TOOLS_ROOTS=str(tmp_path),
-    )
+    base = {
+        "_env_file": None,
+        "DAEMON_PRESET": "balanced",
+        "DAEMON_OLLAMA_MODEL": "gemma3:4b",
+        "DAEMON_DATA_DIR": str(tmp_path),
+        "TELEGRAM_BOT_TOKEN": "123456:AAHfake-token-value",
+        "DAEMON_HOSTED_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "k",
+        "DAEMON_VOICE_ENABLED": "true",
+        "DAEMON_GEMINI_LIVE_MODEL": "gemini-3.1-flash-live-preview",
+        "DAEMON_GEMINI_MODEL": "gemini-3.5-flash",
+        "DAEMON_TOOLS_ENABLED": "true",
+        "DAEMON_TOOLS_ROOTS": str(tmp_path),
+    }
+    base.update(overrides)
+    return Settings(**base)
+
+
+async def _run_voice_capturing(
+    settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    """Run `run_voice` once with a fake session and spy on the mode `_build_tools`
+    is asked for and the kwargs the session is built with."""
+    from daemon import app as app_module
 
     captured: dict[str, Any] = {}
 
@@ -1807,9 +1810,26 @@ async def test_run_voice_offers_the_owners_tools_pinned_to_allowlist(
     monkeypatch.setattr("daemon.voice.gemini_live.GeminiLiveSession", capturing_session)
 
     code = await app_module.run_voice(settings)
+    return code, seen, captured
+
+
+async def test_run_voice_follows_the_owners_tool_mode(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Voice honours the owner's configured `DAEMON_TOOLS_MODE` - `full` here, the
+    install default - rather than pinning `allowlist` and silently refusing guarded
+    tools the owner asked for by voice. A microphone has no relay path, so a spoken
+    turn is the owner's own words and the origin gate is the real boundary; running
+    `full` there is the same authority the text path already has (memory: tools
+    default to full). Also checks the specs reach the session and the tool contract
+    rides with them (daemon/companion.py, TOOL_CONTRACT)."""
+    from daemon.companion import TOOL_CONTRACT
+
+    settings = _voice_settings(tmp_path, DAEMON_TOOLS_MODE="full")
+    code, seen, captured = await _run_voice_capturing(settings, monkeypatch)
 
     assert code == 0
-    assert seen.get("mode") == "allowlist", "voice did not pin the tool mode to allowlist"
+    assert seen.get("mode") == "full", "voice did not follow the owner's tool mode"
     specs = captured.get("tools")
     assert specs, "the session was offered no tools, so the model can never call one"
     assert {spec.name for spec in specs} >= {"read_file", "run_command"}
@@ -1967,3 +1987,18 @@ async def test_conversation_without_screen_share_never_touches_the_controller() 
     session = FakeSession(Turn())
     conv = conversation(session)  # no screen_share, no screen_pump_factory
     await run(conv)  # must not raise
+
+
+async def test_run_voice_degrades_ask_to_allowlist(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one mode a spoken turn cannot honour is `ask`: it has nowhere to surface an
+    approval, so `ask` would mint rows that lapse unanswered - the silent degradation
+    this repo calls the dangerous failure. Voice degrades `ask` to `allowlist` (run
+    what is listed, refuse the rest, never park), so `full` reaches voice but `ask`
+    never does."""
+    settings = _voice_settings(tmp_path, DAEMON_TOOLS_MODE="ask")
+    code, seen, _captured = await _run_voice_capturing(settings, monkeypatch)
+
+    assert code == 0
+    assert seen.get("mode") == "allowlist", "voice did not degrade `ask` to `allowlist`"

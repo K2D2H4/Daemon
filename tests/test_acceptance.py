@@ -1001,13 +1001,14 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
 
 
 def test_the_tool_mode_can_be_pinned_past_the_setting(tmp_path: Path) -> None:
-    """`daemon voice` fixes the mode to `allowlist` in code, so the override has to
-    beat `DAEMON_TOOLS_MODE` rather than be it under another name.
+    """`_build_tools`'s `mode` override has to beat `DAEMON_TOOLS_MODE` rather than be
+    it under another name - the seam `daemon voice` uses to degrade `ask` to
+    `allowlist`, where a spoken turn has nowhere to answer an approval.
 
     The verdict is the whole difference: a guarded call the allowlist does not match
     is refused, where `ask` would park it for an approval. A spoken turn has nowhere
     to ask, so a parked call is one that lapses unanswered - the silent degradation
-    the pinning exists to make impossible.
+    the degrade exists to make impossible.
     """
     settings = Settings(
         _env_file=None,
