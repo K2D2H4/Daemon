@@ -955,14 +955,20 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
             from daemon.voice.screen_share import ScreenShareController
 
             screen_share = ScreenShareController()
-        # Tools, pinned to `allowlist`. Not `settings.tools_mode`: a spoken turn has
-        # nowhere to ask, so `ask` here would pile up approval rows that lapse
-        # unanswered - the silent degradation this repo calls the dangerous failure.
+        # Tools follow the owner's configured mode - `full` for this install, so a
+        # spoken turn runs guarded tools the same as the text path does. A microphone
+        # has no relay path, so a spoken turn is the owner's own words and the origin
+        # gate is the real boundary; pinning `allowlist` here silently refused every
+        # guarded call the owner made by voice, `open_path` among them. The one mode a
+        # spoken turn cannot honour is `ask`: it has nowhere to surface an approval, so
+        # `ask` would pile up rows that lapse unanswered - the silent degradation this
+        # repo calls the dangerous failure - and so degrades to `allowlist` here.
         # The allowlist and standing grants are the same table the text path edits,
         # so voice reads the surface text writes to; it just never adds to it. Off
         # entirely when `DAEMON_TOOLS_ENABLED` is false, exactly like text.
+        voice_mode = "allowlist" if settings.tools_mode == "ask" else settings.tools_mode
         tools, mcp_bridge, _tools_status = await _build_tools(
-            settings, store, mode="allowlist", screen_share=screen_share
+            settings, store, mode=voice_mode, screen_share=screen_share
         )
         companion = Companion(
             writer,
@@ -1467,14 +1473,14 @@ async def _build_tools(
     difference from recall is that this one is off unless asked for, so "not
     configured" is the ordinary answer rather than a degradation.
 
-    `mode` overrides `DAEMON_TOOLS_MODE`, and only `run_voice` uses it - pinned to
-    `allowlist`, because a spoken turn has nowhere to ask for approval. `ask` mode
+    `mode` overrides `DAEMON_TOOLS_MODE`, and only `run_voice` uses it - to degrade
+    `ask` to `allowlist`, because a spoken turn has nowhere to ask for approval. `ask`
     there would mint approval rows that lapse unanswered while nobody is watching,
     which is the silent degradation this project treats as the dangerous failure.
-    A parameter and not a setting on purpose: a knob that could be turned back to
-    `ask` is a knob that would let that failure happen. The registry, the allowlist
-    and the standing grants are the same as the text path either way - the approval
-    surface is shared, text is its editor, and voice only reads it.
+    Every other mode passes straight through, so `full` reaches voice exactly as the
+    owner configured it. The registry, the allowlist and the standing grants are the
+    same as the text path either way - the approval surface is shared, text is its
+    editor, and voice only reads it.
 
     `screen_share`, likewise, is only ever passed by `run_voice` - a
     `ScreenShareController` for the live-share start/stop tools to toggle. `None`
