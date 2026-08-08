@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -287,6 +288,9 @@ def test_update_installs_the_latest_release(
     monkeypatch.setattr(cli, "_uv_present", lambda: True)
     monkeypatch.setattr(cli, "_latest_ref", lambda: "v9.9.9")
     monkeypatch.setattr(cli, "_run", lambda cmd: ran.append(cmd) or 0)
+    # This test pins the install command, not the restart that follows it; the
+    # restart has its own tests and must not reach a real service here.
+    monkeypatch.setattr(cli, "_restart_after_update", lambda: None)
     monkeypatch.delenv("DAEMON_VERSION", raising=False)
 
     assert cli.main(["update"]) == 0
@@ -300,6 +304,83 @@ def test_update_installs_the_latest_release(
     assert "daemon-ai[mcp]" in ran[0]
 
 
+class _FakeService:
+    """Records whether `restart` was called; reports a fixed status."""
+
+    def __init__(self, *, installed: bool, running: bool = True) -> None:
+        self._status = SimpleNamespace(installed=installed, running=running)
+        self.restarted = False
+
+    def status(self) -> Any:
+        return self._status
+
+    def restart(self) -> Any:
+        self.restarted = True
+        return SimpleNamespace(applied=True)
+
+
+def test_update_restarts_the_resident_service(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The point of the whole command: after the reinstall, the running resident is
+    still on the old code (uv replaced the binary, but the supervisor holds the old
+    one until it re-execs). So a successful update of an installed service restarts
+    it - the user does not have to."""
+    monkeypatch.setattr(cli, "_uv_present", lambda: True)
+    monkeypatch.setattr(cli, "_latest_ref", lambda: "v9.9.9")
+    monkeypatch.setattr(cli, "_run", lambda cmd: 0)
+    monkeypatch.setattr(cli, "Settings", lambda: object())
+    service = _FakeService(installed=True, running=True)
+    monkeypatch.setattr(cli, "service_for", lambda settings: service)
+    monkeypatch.delenv("DAEMON_VERSION", raising=False)
+
+    assert cli.main(["update"]) == 0
+    assert service.restarted, "an installed service was not restarted after update"
+    assert "restarted the resident service" in capsys.readouterr().out
+
+
+def test_update_without_an_installed_service_does_not_restart(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `daemon run` in a terminal is a foreground process this command cannot
+    reach, and a machine with no service has nothing to restart - so update says so
+    rather than shelling out to a job that is not there."""
+    monkeypatch.setattr(cli, "_uv_present", lambda: True)
+    monkeypatch.setattr(cli, "_latest_ref", lambda: "v9.9.9")
+    monkeypatch.setattr(cli, "_run", lambda cmd: 0)
+    monkeypatch.setattr(cli, "Settings", lambda: object())
+    service = _FakeService(installed=False)
+    monkeypatch.setattr(cli, "service_for", lambda settings: service)
+    monkeypatch.delenv("DAEMON_VERSION", raising=False)
+
+    assert cli.main(["update"]) == 0
+    assert not service.restarted
+    assert "nothing to restart" in capsys.readouterr().out
+
+
+def test_update_skips_restart_when_config_will_not_load(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """You may be updating precisely because a version is broken, so the reinstall
+    must still count as done even when the config cannot load - update degrades to
+    telling the user to restart by hand, and never touches the service."""
+    monkeypatch.setattr(cli, "_uv_present", lambda: True)
+    monkeypatch.setattr(cli, "_latest_ref", lambda: "v9.9.9")
+    monkeypatch.setattr(cli, "_run", lambda cmd: 0)
+
+    def _raise() -> Any:
+        raise cli.ConfigError("bad configuration")
+
+    monkeypatch.setattr(cli, "Settings", _raise)
+    monkeypatch.setattr(
+        cli, "service_for", lambda settings: pytest.fail("service must not be built")
+    )
+    monkeypatch.delenv("DAEMON_VERSION", raising=False)
+
+    assert cli.main(["update"]) == 0
+    assert "restart the service yourself" in capsys.readouterr().out
+
+
 def test_update_honours_the_version_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """`DAEMON_VERSION=<ref>` pins the update, and skips the latest-release lookup -
     the same override install.sh honours."""
@@ -309,6 +390,7 @@ def test_update_honours_the_version_override(monkeypatch: pytest.MonkeyPatch) ->
         cli, "_latest_ref", lambda: pytest.fail("must not resolve latest when pinned")
     )
     monkeypatch.setattr(cli, "_run", lambda cmd: ran.append(cmd) or 0)
+    monkeypatch.setattr(cli, "_restart_after_update", lambda: None)
     monkeypatch.setenv("DAEMON_VERSION", "v0.1.0")
 
     assert cli.main(["update"]) == 0
