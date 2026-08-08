@@ -10,7 +10,7 @@ in `app.py`, which owns every concrete-implementation import here.
 | | |
 |---|---|
 | `app.py` | composition root and lifespan. **The only file allowed to import concrete providers, channels and writers** — its imports are function-local to keep that exception visible. Also `run_voice`, `build_reflection` and `build_proactive_tick` |
-| `cli.py` | `run` · `setup` · `install` · `uninstall` · `status` · `doctor` · `reindex` · `reflect` · `voice` · `proactive` · `persona` · `tools` · `pairing` · `wake calibrate` · `wake test` |
+| `cli.py` | `run` · `setup` · `install` · `uninstall` · `status` · `doctor` · `reindex` · `reflect` · `voice` · `proactive` · `persona` · `tools` · `pairing` · `wake calibrate` · `wake test` · `request-mic` |
 | `setup.py` | the onboarding wizard: PC control, preset, hosted provider, keys, persona seed, pairing |
 | `wake_cli.py` | `daemon wake`: measure what the recognizer returns for the owner's phrase, save it as `DAEMON_WAKE_ALIASES`, then run the gate and print what fires. Writes `.env` through `setup.py`'s writer |
 | `config.py` | settings and the three presets. `HOSTED` resolves to the chosen provider |
@@ -23,7 +23,8 @@ in `app.py`, which owns every concrete-implementation import here.
 | `channels/` | `channels/base.py` (frozen) · `channels/telegram.py` · `channels/pairing.py` |
 | `llm/` | `llm/base.py` (frozen) · `llm/gateway.py` · `llm/providers/` (4) · `llm/embedders/` |
 | `memory/` | `memory/schema.sql` (frozen) · `store` · `log` · `writer` · `recall` · `curated` · `entities` · `reindex` |
-| `voice/` | `voice/base.py` (frozen) · `voice/gemini_live.py` · `voice/audio.py` (PortAudio) · `voice/apple_audio.py` (macOS echo cancellation) · `voice/conversation.py` · `voice/vad.py` · `voice/apple_speech.py` · `voice/wake.py` |
+| `voice/` | `voice/base.py` (frozen) · `voice/gemini_live.py` · `voice/audio.py` (PortAudio) · `voice/apple_audio.py` (macOS echo cancellation) · `voice/conversation.py` · `voice/vad.py` · `voice/apple_speech.py` · `voice/wake.py` · `voice/mic_access.py` (mic TCC request + status, Apple-guarded) |
+| `macapp/` | the thin native-launcher `Daemon.app` (macOS): `build_bundle` assembles and ad-hoc-signs the bundle whose code identity is the microphone grant; `launcher.c`/`launcher` is the committed universal2 Mach-O it copies in |
 | `proactivity/` | `proactivity/base.py` (frozen) · `candidates` · `gate` · `presence` · `judge` · `delivery` · `speaker` · `tick` |
 | `persona/` | `persona/loader.py` (assembles `seed.md` + `learned.md` into one system message, read every turn — both conversation endpoints reach it through `companion.py`) · `persona/rules.py` (the only write path for `data/persona/learned.md` and its `persona_rules` mirror) · `persona/evolve.py` (the weekly pass: observations → rule proposals, at most one model call) |
 | `tools/` | `tools/base.py` (the `Tool` protocol, `Registry`, `ToolResult`) · `tools/policy.py` — **read this one first**: the origin gate, the modes, the standing approvals, and **zero model calls** · `tools/builtin.py` (the seven: `list_dir` · `read_file` · `write_file` · `run_command` · `open_path` · `notify` · `system_state`) · `tools/browser.py` (`fetch_page` · `list_tabs` · `read_page`, behind their own switch) · `tools/mcp.py` (the only file that imports the `mcp` package) · `tools/runner.py` (decide → execute → audit, in that order, in one object so none of the three can be skipped) |
