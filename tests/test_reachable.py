@@ -357,24 +357,59 @@ def test_every_declared_wiring_gap_names_a_real_seam() -> None:
 # --- tools -------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("module", ["builtin", "browser"])
+class _DummyScreenShareControl:
+    """A stand-in for `ScreenShareControl`. The tools only store and delegate to
+    it, so any object with the two methods is enough to construct them - this
+    file's job is to check they are *returned by their factory*, not to drive a
+    real pump."""
+
+    async def start(self) -> str:
+        return "started"
+
+    async def stop(self) -> str:
+        return "stopped"
+
+
+@pytest.mark.parametrize("module", ["builtin", "browser", "screen"])
 def test_every_tool_class_is_in_its_factory(module: str, tmp_path: pathlib.Path) -> None:
     """A tool class its factory does not return is invisible to the model, and its
     own unit tests pass regardless.
 
     This is the same defect as the provider list, one layer down: writing the thing
     and wiring the thing are separate acts, and only the second one ships.
+
+    `screen.py` is the one module with two factories - `screen_tools` (SeeScreen)
+    and `screen_share_tools` (the start/stop voice tools, Task 2.3) - because the
+    live-share tools need a `ScreenShareControl` that only a voice conversation can
+    supply, and never through the same factory `_build_tools` calls for text. So
+    "wired" for this module is the union of both factories' output, not either one
+    alone.
     """
     import importlib
 
     from daemon.tools.base import Tool
 
     loaded = importlib.import_module(f"daemon.tools.{module}")
-    factory, kwargs = (
-        (loaded.builtin_tools, {"roots": [tmp_path]})
-        if module == "builtin"
-        else (loaded.browser_tools, {})
-    )
+    if module == "builtin":
+        factory, kwargs = loaded.builtin_tools, {"roots": [tmp_path]}
+        wired = {type(tool).__name__ for tool in factory(**kwargs)}
+        tools = list(factory(**kwargs))
+    elif module == "screen":
+        wired = {
+            type(tool).__name__
+            for tool in loaded.screen_tools(max_px=1536, timeout_secs=20.0)
+        } | {
+            type(tool).__name__
+            for tool in loaded.screen_share_tools(_DummyScreenShareControl())
+        }
+        tools = [
+            *loaded.screen_tools(max_px=1536, timeout_secs=20.0),
+            *loaded.screen_share_tools(_DummyScreenShareControl()),
+        ]
+    else:
+        factory, kwargs = loaded.browser_tools, {}
+        wired = {type(tool).__name__ for tool in factory(**kwargs)}
+        tools = list(factory(**kwargs))
 
     defined = {
         name
@@ -384,12 +419,11 @@ def test_every_tool_class_is_in_its_factory(module: str, tmp_path: pathlib.Path)
         # methods, so the risk attribute is what separates them.
         if isinstance(value, type) and hasattr(value, "spec") and hasattr(value, "risk")
     }
-    wired = {type(tool).__name__ for tool in factory(**kwargs)}
     assert defined == wired, (
         f"{', '.join(sorted(defined - wired))} is defined in {module}.py but not "
         f"returned by its factory, so nothing registers it and no model can call it."
     )
-    assert all(isinstance(tool, Tool) for tool in factory(**kwargs))
+    assert all(isinstance(tool, Tool) for tool in tools)
 
 
 def test_no_two_tools_answer_to_the_same_name(tmp_path: pathlib.Path) -> None:
@@ -397,10 +431,14 @@ def test_no_two_tools_answer_to_the_same_name(tmp_path: pathlib.Path) -> None:
     the browser group would surface as a crash at startup rather than here."""
     from daemon.tools.browser import browser_tools
     from daemon.tools.builtin import builtin_tools
+    from daemon.tools.screen import screen_share_tools, screen_tools
 
-    names = [t.spec.name for t in builtin_tools(roots=[tmp_path])] + [
-        t.spec.name for t in browser_tools()
-    ]
+    names = (
+        [t.spec.name for t in builtin_tools(roots=[tmp_path])]
+        + [t.spec.name for t in browser_tools()]
+        + [t.spec.name for t in screen_tools(max_px=1536, timeout_secs=20.0)]
+        + [t.spec.name for t in screen_share_tools(_DummyScreenShareControl())]
+    )
     assert len(names) == len(set(names)), f"duplicate tool name in {names}"
 
 

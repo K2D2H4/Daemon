@@ -681,6 +681,25 @@ async def test_send_audio_uses_the_input_rate_and_base64() -> None:
     assert gemini_live.INPUT_SAMPLE_RATE != gemini_live.OUTPUT_SAMPLE_RATE
 
 
+async def test_send_frame_emits_a_realtimeInput_video_chunk() -> None:
+    connection = FakeConnection(SETUP_COMPLETE)
+    jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF"
+    async with session(connection) as live:
+        await live.send_frame(jpeg)
+
+    (realtime,) = connection.messages("realtimeInput")
+    assert realtime["video"]["mimeType"] == "image/jpeg"
+    assert realtime["video"]["data"] == base64.b64encode(jpeg).decode("ascii")
+
+
+async def test_send_frame_ignores_empty_bytes() -> None:
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection) as live:
+        await live.send_frame(b"")
+
+    assert connection.messages("realtimeInput") == []
+
+
 async def test_send_text_speaks_without_any_user_audio() -> None:
     """The proactive path: nothing has been recorded, and something still has to
     come out of the session."""

@@ -760,6 +760,25 @@ def test_an_empty_browser_app_fails_at_startup() -> None:
         )
 
 
+def test_screen_defaults_off() -> None:
+    """Seeing the screen is its own decision, separate from browser and tools -
+    off until asked for, the same as browser_enabled."""
+    settings = make_settings(preset="offline", ollama_model="gemma3:4b")
+    assert settings.screen_enabled is False
+
+
+def test_screen_enabled_requires_tools() -> None:
+    """The screen tools are tools; with the layer off nothing would register them,
+    so the setting would silently do nothing (mirrors the browser check)."""
+    with pytest.raises(ConfigError, match="DAEMON_TOOLS_ENABLED"):
+        make_settings(
+            preset="offline",
+            ollama_model="gemma3:4b",
+            DAEMON_TOOLS_ENABLED=False,
+            DAEMON_SCREEN_ENABLED=True,
+        )
+
+
 def test_a_chromium_relative_can_be_named() -> None:
     """Brave, Arc and Edge share Chrome's AppleScript dictionary, so one setting
     covers the family."""

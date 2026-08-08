@@ -546,6 +546,33 @@ class Settings(BaseSettings):
     `false` is the one line that turns every configured server off without editing
     `mcp.json`."""
 
+    screen_enabled: bool = Field(default=False, alias="DAEMON_SCREEN_ENABLED")
+    """Whether Daemon may capture the owner's screen.
+
+    Its own switch rather than part of DAEMON_TOOLS_ENABLED or DAEMON_BROWSER_ENABLED,
+    because seeing the whole screen is a distinct decision from reading the browser's
+    open tabs or acting on the machine: a screenshot can show a password manager, a
+    DM, or a document that neither of those touches (the same reasoning as
+    DAEMON_BROWSER_ENABLED and DAEMON_VOICE_ENABLED)."""
+
+    screen_max_px: int = Field(default=1536, alias="DAEMON_SCREEN_MAX_PX")
+    """Long edge, in pixels, for an on-demand screenshot."""
+
+    screen_frame_px: int = Field(default=1024, alias="DAEMON_SCREEN_FRAME_PX")
+    """Long edge, in pixels, for a live-sharing frame - smaller than
+    DAEMON_SCREEN_MAX_PX because frames are sent repeatedly, not once."""
+
+    screen_fps: float = Field(default=1.0, alias="DAEMON_SCREEN_FPS")
+    """Frames per second while live screen sharing is active."""
+
+    screen_keepalive_secs: float = Field(default=8.0, alias="DAEMON_SCREEN_KEEPALIVE_SECS")
+    """How long a live screen-sharing session stays open with no activity before
+    it closes itself."""
+
+    screen_dedup_threshold: int = Field(default=6, alias="DAEMON_SCREEN_DEDUP_THRESHOLD")
+    """Maximum dhash Hamming distance for two frames to count as duplicates and be
+    skipped, so an unchanging screen does not resend the same frame every tick."""
+
     data_dir: Path = Field(default=Path("./data"), alias="DAEMON_DATA_DIR")
 
     host: str = Field(default="127.0.0.1", alias="DAEMON_HOST")
@@ -855,6 +882,11 @@ class Settings(BaseSettings):
             )
         if self.browser_enabled and not self.browser_app.strip():
             problems.append("DAEMON_BROWSER_APP is empty; name the browser to read")
+        if self.screen_enabled and not self.tools_enabled:
+            problems.append(
+                "DAEMON_SCREEN_ENABLED is on but DAEMON_TOOLS_ENABLED is off; the "
+                "screen tools are tools, so nothing would register them"
+            )
         if not SERVICE_LABEL_RE.match(self.service_label):
             problems.append(
                 f"DAEMON_SERVICE_LABEL {self.service_label!r} is not a usable label; "

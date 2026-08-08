@@ -15,8 +15,8 @@ from datetime import datetime
 from time import perf_counter
 from typing import Any, Protocol
 
-from daemon.llm.base import ToolCall, ToolSpec
-from daemon.tools.base import Registry, Tool, ToolError, ToolResult, canonical_arguments
+from daemon.llm.base import ImageBlock, ToolCall, ToolSpec
+from daemon.tools.base import Registry, Tool, ToolError, ToolOutput, ToolResult, canonical_arguments
 from daemon.tools.policy import Approval, Claimed, Command, ToolPolicy
 
 logger = logging.getLogger(__name__)
@@ -254,8 +254,13 @@ class ToolRunner:
     ) -> ToolResult:
         started = perf_counter()
         ok = True
+        images: tuple[ImageBlock, ...] = ()
         try:
-            content = await tool.run(arguments)
+            raw = await tool.run(arguments)
+            if isinstance(raw, ToolOutput):
+                content, images = raw.content, raw.images
+            else:
+                content, images = raw, ()
         except ToolError as exc:
             # The tool's own refusal or failure: expected, and the message is
             # written for the model.
@@ -285,7 +290,7 @@ class ToolRunner:
         )
         logger.info("tool.ran tool=%s ok=%s ms=%d", name, ok, elapsed_ms)
         return ToolResult(
-            call_id=call_id, name=name, content=content, ok=ok, elapsed_ms=elapsed_ms
+            call_id=call_id, name=name, content=content, ok=ok, elapsed_ms=elapsed_ms, images=images
         )
 
 
