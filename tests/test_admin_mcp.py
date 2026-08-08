@@ -449,9 +449,15 @@ async def test_pending_flows_do_not_grow_without_bound(
             bridge, tmp_path, lookup("notion"),
             redirect_uri=OAUTH_REDIRECT, build_provider=_fake_build_provider,
         )
-    assert len(mcp_oauth._FLOWS) == 5, "each pending flow should be registered while live"
-
-    await asyncio.sleep(0.2)  # past CALLBACK_TIMEOUT for all of them
+    # Each abandoned flow (its callback never arrives) reaps itself when
+    # CALLBACK_TIMEOUT fires. Don't assert the intermediate "all 5 live" count: with
+    # a 50ms timeout a slow runner reaps the early flows before the last one starts
+    # (that raced on CI). Assert only the invariant the name promises - none linger -
+    # polling generously so the reaper cannot lose the race.
+    for _ in range(200):
+        if not mcp_oauth._FLOWS:
+            break
+        await asyncio.sleep(0.02)
     assert mcp_oauth._FLOWS == {}, "abandoned flows were never reaped"
 
 
