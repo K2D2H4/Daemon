@@ -298,10 +298,14 @@ def test_update_installs_the_latest_release(
     cmd = " ".join(ran[0])
     assert "uv" in ran[0] and "tool" in ran[0] and "install" in ran[0]
     assert "--force" in ran[0]
-    assert "archive/v9.9.9.tar.gz" in cmd and "git+" not in cmd
-    # The `[mcp]` extra must ride along, or an update silently drops MCP (which
-    # defaults on) - the same spec install.sh uses, so the two do not drift.
-    assert "daemon-ai[mcp]" in ran[0]
+    assert "git+" not in cmd
+    # The `[mcp]` extra rides a PEP 508 direct reference - `name[extra] @ url` - as a
+    # single requirement, because uv rejects extras on the positional alongside
+    # `--from`. The extra must ride along or an update silently drops MCP (defaults
+    # on); install.sh uses the same spec, so the two do not drift.
+    assert "daemon-ai[mcp] @ " in cmd
+    assert "archive/v9.9.9.tar.gz" in cmd
+    assert "--from" not in ran[0], "extras + --from is the combination uv rejects"
 
 
 class _FakeService:

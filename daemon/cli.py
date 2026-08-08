@@ -365,8 +365,11 @@ def _update() -> int:
     ref = os.environ.get("DAEMON_VERSION") or _latest_ref()
     source = f"https://github.com/{GITHUB_REPO}/archive/{ref}.tar.gz"
     print(f"updating to {ref} ...")
+    # One requirement string, not `--from <url> <name>`: uv rejects extras on the
+    # positional when `--from` is also given ("conflicts with install request"), so
+    # the extra rides a PEP 508 direct reference - `daemon-ai[mcp] @ <url>`.
     install = [
-        "uv", "tool", "install", "--force", "--python", "3.13", "--from", source, INSTALL_SPEC
+        "uv", "tool", "install", "--force", "--python", "3.13", f"{INSTALL_SPEC} @ {source}"
     ]
     if _run(install) != 0:
         print("update failed - the install output above says why.")
