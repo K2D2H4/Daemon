@@ -196,16 +196,42 @@ def _bearer_headers(config: ServerConfig, secret: str | None = None) -> dict[str
     return None
 
 
+def _mcp_pin() -> tuple[str, ...]:
+    """`--with mcp==<the version this daemon speaks>`, or empty if unknown.
+
+    A bare `uvx mcp-server-<x>` resolves the server's `mcp` dependency freshly, and
+    the reference servers still `from mcp.shared.exceptions import McpError` while a
+    newer `mcp` has renamed it - so the server dies at import before it can speak a
+    word, and the only symptom is a connect that "did not connect". Pinning the
+    server's `mcp` to the exact one the daemon imports keeps both ends on one
+    protocol library. Empty tuple if `mcp` somehow has no metadata: no pin is better
+    than a broken argument, and the connect then fails honestly as before."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return ("--with", f"mcp=={version('mcp')}")
+    except PackageNotFoundError:
+        return ()
+
+
 def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
     """Turn a trusted catalog entry into a `ServerConfig` the bridge can connect.
 
     The field mapping lives here, in one place, so the admin route need not know how
     a catalog `kind` becomes a command or a url. Only structured fields cross over -
-    a `key_env` name, never a secret (CONTRACTS 13)."""
+    a `key_env` name, never a secret (CONTRACTS 13).
+
+    A `uvx` server is launched with the daemon's own `mcp` pinned in (see
+    `_mcp_pin`), so a curated catalog server actually starts rather than failing on a
+    resolved-too-new `mcp`. The pin is a plain argv prefix - structured, no secret,
+    and persisted transparently into `mcp.json`."""
+    args = tuple(entry.args)
+    if entry.kind == "uvx":
+        args = (*_mcp_pin(), *args)
     return ServerConfig(
         name=entry.name,
         command=entry.command,
-        args=tuple(entry.args),
+        args=args,
         url=entry.url,
         key_env=entry.key_env or "",
     )

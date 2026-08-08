@@ -8,12 +8,33 @@ requires. These tests pin the shape the admin routes and the connect flow read.
 
 from __future__ import annotations
 
+from importlib.metadata import version
+
 from daemon.mcp_catalog import CATALOG, CatalogEntry, lookup
+from daemon.tools.mcp import server_config_from_catalog
 
 
 def test_lookup_finds_an_entry_by_name() -> None:
     entry = lookup("fetch")
     assert entry is not None and entry.name == "fetch"
+
+
+def test_a_uvx_server_is_launched_against_the_daemons_own_mcp() -> None:
+    """A bare `uvx <server>` resolves an `mcp` that can be too new for the reference
+    server, which then dies at import. The catalog config pins the daemon's own mcp
+    so the server actually starts - the pin rides as a plain argv prefix."""
+    entry = lookup("time")
+    assert entry is not None and entry.kind == "uvx"
+    config = server_config_from_catalog(entry)
+    assert config.args[:2] == ("--with", f"mcp=={version('mcp')}")
+    assert "mcp-server-time" in config.args  # the tool itself still runs
+
+
+def test_a_url_server_gets_no_uvx_pin() -> None:
+    entry = lookup("tavily")
+    assert entry is not None and entry.kind == "url"
+    config = server_config_from_catalog(entry)
+    assert "--with" not in config.args
 
 
 def test_lookup_of_an_unknown_name_is_none() -> None:

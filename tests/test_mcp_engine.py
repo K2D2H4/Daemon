@@ -484,7 +484,10 @@ def test_a_uvx_catalog_entry_becomes_a_stdio_config() -> None:
     )
     config = server_config_from_catalog(entry)
     assert config.name == "fetch"
-    assert config.command == "uvx" and config.args == ("mcp-server-fetch",)
+    # uvx servers are pinned to the daemon's own mcp (see `_mcp_pin`); the tool
+    # itself is still the last argument.
+    assert config.command == "uvx"
+    assert config.args[0] == "--with" and config.args[-1] == "mcp-server-fetch"
     assert not config.is_remote
 
 
