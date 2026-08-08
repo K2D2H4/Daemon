@@ -62,7 +62,7 @@ say "Installing ${PACKAGE} @ ${ref} ..."
 # the same spec, so an update does not drop it. (The extra pins mcp<2 - the v2 client
 # surface is incompatible - so this stays on the working 1.x.)
 uv tool install --force --python 3.13 \
-  --from "https://github.com/${REPO}/archive/${ref}.tar.gz" "${PACKAGE}[mcp]"
+  "${PACKAGE}[mcp] @ https://github.com/${REPO}/archive/${ref}.tar.gz"
 
 # Put uv's tool bin dir on PATH - for the version check below, and, persistently,
 # for the user's future shells.
