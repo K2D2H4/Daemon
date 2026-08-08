@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Daemon — admin</title>
+<meta name="theme-color" content="#120F18">
+<!--
+  Self-contained and offline by contract: no CDN font, no external stylesheet,
+  no remote script (docs/design decision 4). The palette is site/index.html's
+  `:root` tokens verbatim; the display face falls back to the system monospace
+  because Silkscreen/DM Mono are not vendored here and a webfont over the network
+  would break the offline promise. Keep it that way.
+-->
+<style>
+:root{
+--accent:#A78BFA;--accent-mid:#8B5CF6;--accent-deep:#6D3FD4;--outline:#2B1B3D;
+--canvas:#120F18;--surface:#1B1626;--raised:#241D33;--well:#0D0B12;
+--line:#2E2740;--line-strong:#493D66;
+--tp:#FFFFFF;--tb:#ECE7F5;--tm:#8E85A3;--tf:#7A7192;--td:#5A5470;
+--ok:#5EE1A4;--warn:#FFC75A;--error:#FF6B5E;
+--pix:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html{background:var(--canvas)}
+body{margin:0;background:var(--canvas);color:var(--tb);font-family:var(--mono);font-size:14px;line-height:1.7;-webkit-font-smoothing:antialiased}
+h1,h2,h3{font-family:var(--pix);color:var(--tp);margin:0;line-height:1.25;font-weight:700;letter-spacing:.02em}
+a{color:var(--accent);text-decoration:none}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.wrap{max-width:920px;margin:0 auto;padding:0 24px}
+header{position:sticky;top:0;z-index:9;background:var(--canvas);border-bottom:2px solid var(--line)}
+header .wrap{display:flex;align-items:center;gap:16px;height:64px}
+.mark{font-family:var(--pix);font-size:16px;color:var(--tp);letter-spacing:.06em}
+.mark .d{color:var(--accent)}
+header nav{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+.tab{font-family:var(--pix);font-size:12px;padding:9px 14px;border:2px solid var(--line);background:var(--surface);color:var(--tm)}
+.tab[aria-selected=true]{border-color:var(--accent);color:var(--tp);background:var(--well)}
+section{padding:40px 0;border-bottom:2px solid var(--line);display:none}
+section.on{display:block}
+.lab{font-family:var(--pix);font-size:11px;letter-spacing:2px;color:var(--accent);display:block;margin-bottom:14px}
+.muted{color:var(--tm)}.cap{font-size:12px;color:var(--tf)}
+.card{background:var(--surface);border:2px solid var(--line);padding:24px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:640px){.grid{grid-template-columns:1fr}}
+.kv{display:flex;justify-content:space-between;gap:16px;padding:8px 0;border-bottom:2px solid var(--line)}
+.kv:last-child{border-bottom:none}
+.kv .k{color:var(--tm)}.kv .v{color:var(--tb);text-align:right;word-break:break-word}
+.badge{font-family:var(--pix);font-size:11px;padding:5px 10px;border:2px solid;display:inline-block}
+.b-ok{color:var(--ok);background:#10221C;border-color:#1C5F45}
+.b-warn{color:var(--warn);background:#241C0C;border-color:#6B4F13}
+.b-err{color:var(--error);background:#2A1210;border-color:#6B241E}
+label.field{display:block;margin:0 0 16px}
+label.field .n{display:block;font-family:var(--pix);font-size:11px;letter-spacing:1px;color:var(--tm);margin-bottom:6px}
+input[type=text],input[type=number],input[type=password],select,textarea{
+width:100%;font:inherit;color:var(--tb);background:var(--well);border:2px solid var(--line);
+padding:11px 12px;box-shadow:inset 2px 2px 0 0 #08060C}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
+textarea{min-height:96px;resize:vertical}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;font-family:var(--pix);font-size:12px;padding:12px 18px;border:2px solid var(--line-strong);background:var(--raised);color:var(--tb)}
+.btn:hover{border-color:var(--accent);color:var(--tp)}
+.btn.pri{color:var(--canvas);background:var(--accent);border-color:var(--outline);box-shadow:4px 4px 0 0 var(--accent-deep)}
+.btn.pri:hover{background:#C9B8FF}
+.btn[disabled]{opacity:.5;cursor:not-allowed}
+.chat{background:var(--well);border:2px solid var(--line);padding:16px;min-height:120px;white-space:pre-wrap;color:var(--tb);box-shadow:inset 2px 2px 0 0 #08060C}
+.note{margin-top:12px;font-size:12px}
+.note.ok{color:var(--ok)}.note.err{color:var(--error)}
+.overlay{position:fixed;inset:0;background:rgba(13,11,18,.92);display:none;align-items:center;justify-content:center;z-index:99}
+.overlay.on{display:flex}
+.overlay .box{text-align:center}
+.overlay h2{margin-bottom:12px}
+.spin{display:inline-block;font-family:var(--pix);color:var(--accent)}
+</style>
+</head>
+<body>
+<header><div class="wrap">
+  <span class="mark"><span class="d">◆</span> DAEMON ADMIN</span>
+  <nav>
+    <button class="tab" data-tab="health" aria-selected="true">Health</button>
+    <button class="tab" data-tab="chat" aria-selected="false">Chat test</button>
+    <button class="tab" data-tab="mcp" aria-selected="false">MCP</button>
+    <button class="tab" data-tab="settings" aria-selected="false">Settings</button>
+  </nav>
+</div></header>
+
+<main class="wrap">
+  <section id="health" class="on">
+    <span class="lab">HEALTH</span>
+    <div class="card" id="health-card"><p class="muted">Loading…</p></div>
+    <p class="cap note" style="margin-top:16px">Read-only view of the same data <code>/health</code> serves.</p>
+  </section>
+
+  <section id="chat">
+    <span class="lab">CHAT TEST</span>
+    <p class="muted" style="margin-bottom:16px">A routed provider round-trip only — no memory, no tools, nothing recorded. The chat version of the health check.</p>
+    <div class="chat" id="chat-out"><span class="muted">The reply appears here.</span></div>
+    <div class="row" style="margin-top:16px">
+      <input type="text" id="chat-in" placeholder="Say something…" style="flex:1;min-width:220px">
+      <button class="btn pri" id="chat-send">Send</button>
+    </div>
+    <p class="note" id="chat-note"></p>
+  </section>
+
+  <section id="mcp">
+    <span class="lab">MCP SERVERS</span>
+    <p class="muted" style="margin-bottom:16px">Install a server from the trusted catalog. Its tools still pass the origin gate — nothing here runs on a turn that is not yours.</p>
+    <div id="mcp-off" class="card" style="display:none"><p class="note err" id="mcp-off-msg"></p></div>
+    <div id="mcp-body" style="display:none">
+      <h3 style="margin-bottom:14px">Configured</h3>
+      <div id="mcp-servers" class="card"><p class="muted">Loading…</p></div>
+      <h3 style="margin:28px 0 14px">Catalog</h3>
+      <div id="mcp-catalog" class="grid"></div>
+    </div>
+    <p class="note" id="mcp-note"></p>
+  </section>
+
+  <section id="settings">
+    <span class="lab">SETTINGS</span>
+    <div class="card" id="settings-form"><p class="muted">Loading…</p></div>
+    <div class="row" style="margin-top:20px">
+      <button class="btn pri" id="settings-save">Save to .env</button>
+      <span class="cap muted">Changes apply on the next restart.</span>
+    </div>
+    <p class="note" id="settings-note"></p>
+    <div id="restart-row" style="display:none;margin-top:20px">
+      <div class="card">
+        <p style="margin-bottom:12px">Saved. Restart now to apply?</p>
+        <button class="btn pri" id="restart-btn">Restart daemon</button>
+        <p class="cap muted note" id="restart-note"></p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="overlay" id="overlay"><div class="box">
+  <h2>Applying…</h2>
+  <p class="muted">Restarting and reconnecting. This page reloads when the daemon is back.</p>
+  <p class="spin" id="spin">●</p>
+</div></div>
+
+<script>
+const $=(s,r=document)=>r.querySelector(s);
+const api=(p,o)=>fetch(p,o).then(async r=>{const b=await r.json().catch(()=>({}));if(!r.ok)throw new Error(b.detail||('HTTP '+r.status));return b;});
+
+// tabs
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.setAttribute('aria-selected',x===t));
+  document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id===t.dataset.tab));
+});
+
+// health
+function badge(v){const s=String(v);let c='b-ok';if(/degraded|stopped|unavailable|fail/i.test(s))c='b-err';else if(/not started|off|nothing/i.test(s))c='b-warn';return `<span class="badge ${c}">${esc(s)}</span>`;}
+function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+async function loadHealth(){
+  try{const h=await api('/admin/api/health');
+    const rows=[['status',h.status],['preset',h.preset],['voice_enabled',h.voice_enabled],
+      ['conversation_loop',h.conversation_loop],['recall',h.recall],['wake_gate',h.wake_gate],['tools',h.tools]];
+    let html=rows.map(([k,v])=>`<div class="kv"><span class="k">${k}</span><span class="v">${badge(v)}</span></div>`).join('');
+    html+=`<div class="kv"><span class="k">routing</span><span class="v">${esc(JSON.stringify(h.routing))}</span></div>`;
+    $('#health-card').innerHTML=html;
+  }catch(e){$('#health-card').innerHTML=`<p class="note err">${esc(e.message)}</p>`;}
+}
+
+// chat
+async function sendChat(){
+  const text=$('#chat-in').value.trim();if(!text)return;
+  $('#chat-send').disabled=true;$('#chat-note').textContent='';
+  $('#chat-out').textContent='…';
+  try{const r=await api('/admin/api/chat-test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text})});
+    $('#chat-out').textContent=r.reply||'(empty reply)';
+  }catch(e){$('#chat-out').innerHTML=`<span class="muted">The reply appears here.</span>`;$('#chat-note').className='note err';$('#chat-note').textContent=e.message;}
+  $('#chat-send').disabled=false;
+}
+$('#chat-send').onclick=sendChat;
+$('#chat-in').addEventListener('keydown',e=>{if(e.key==='Enter')sendChat();});
+
+// settings
+let SETTINGS=null;
+function fieldStr(name,val,opts){
+  if(opts){const o=opts.map(x=>`<option ${x===val?'selected':''}>${esc(x)}</option>`).join('');
+    return `<label class="field"><span class="n">${name}</span><select data-f="${name}">${o}</select></label>`;}
+  return `<label class="field"><span class="n">${name}</span><input type="text" data-f="${name}" value="${esc(val??'')}"></label>`;
+}
+function fieldBool(name,val){return `<label class="field"><span class="n">${name}</span><select data-f="${name}"><option value="true" ${val?'selected':''}>true</option><option value="false" ${!val?'selected':''}>false</option></select></label>`;}
+function fieldNum(name,val){return `<label class="field"><span class="n">${name}</span><input type="number" step="any" data-f="${name}" value="${esc(val)}"></label>`;}
+function fieldSecret(name,val){const set=val==='set';return `<label class="field"><span class="n">${name} ${set?'· set':'· unset'}</span><input type="password" data-f="${name}" placeholder="${set?'leave blank to keep':'not set'}"></label>`;}
+async function loadSettings(){
+  try{SETTINGS=await api('/admin/api/settings');const e=SETTINGS.editable,o=SETTINGS.options,r=SETTINGS.readonly;
+    let h='<div class="grid">';
+    h+=fieldStr('preset',e.preset,o.presets);
+    h+=fieldStr('hosted_provider',e.hosted_provider,['',...o.hosted_providers]);
+    h+=fieldStr('tools_mode',e.tools_mode,o.tool_modes);
+    h+=fieldBool('voice_enabled',e.voice_enabled);
+    h+=fieldBool('mcp_enabled',e.mcp_enabled);
+    h+=fieldBool('browser_enabled',e.browser_enabled);
+    h+=fieldNum('recall_limit',e.recall_limit);
+    h+=fieldNum('recall_half_life_days',e.recall_half_life_days);
+    h+=fieldSecret('anthropic_api_key',e.anthropic_api_key);
+    h+=fieldSecret('openai_api_key',e.openai_api_key);
+    h+=fieldSecret('gemini_api_key',e.gemini_api_key);
+    h+='</div>';
+    h+=`<div style="margin-top:20px"><span class="lab">READ-ONLY</span>
+      <div class="kv"><span class="k">host</span><span class="v">${esc(r.host)}</span></div>
+      <div class="kv"><span class="k">port</span><span class="v">${esc(r.port)}</span></div>
+      <div class="kv"><span class="k">data_dir</span><span class="v">${esc(r.data_dir)}</span></div></div>`;
+    $('#settings-form').innerHTML=h;
+  }catch(err){$('#settings-form').innerHTML=`<p class="note err">${esc(err.message)}</p>`;}
+}
+function collectPatch(){
+  const e=SETTINGS.editable,patch={};
+  document.querySelectorAll('#settings-form [data-f]').forEach(el=>{
+    const f=el.dataset.f;let v=el.value;
+    if(['voice_enabled','mcp_enabled','browser_enabled'].includes(f)){v=(v==='true');if(v!==e[f])patch[f]=v;return;}
+    if(['recall_limit'].includes(f)){v=parseInt(v,10);if(v!==e[f])patch[f]=v;return;}
+    if(['recall_half_life_days'].includes(f)){v=parseFloat(v);if(v!==e[f])patch[f]=v;return;}
+    if(['anthropic_api_key','openai_api_key','gemini_api_key'].includes(f)){if(v.trim())patch[f]=v;return;}
+    if(v!==(e[f]??''))patch[f]=v;
+  });
+  return patch;
+}
+$('#settings-save').onclick=async()=>{
+  const patch=collectPatch();const n=$('#settings-note');
+  if(Object.keys(patch).length===0){n.className='note';n.textContent='Nothing changed.';return;}
+  $('#settings-save').disabled=true;
+  try{const r=await api('/admin/api/settings',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify(patch)});
+    n.className='note ok';n.textContent='Written to .env. '+(r.restart_required?'A restart is needed to apply.':'');
+    if(r.restart_required){$('#restart-row').style.display='block';
+      $('#restart-btn').dataset.sup=r.supervised;}
+    await loadSettings();
+  }catch(e){n.className='note err';n.textContent=e.message;}
+  $('#settings-save').disabled=false;
+};
+
+// restart + reconnect
+async function pollBack(){
+  try{await api('/admin/api/health');location.reload();}
+  catch(e){$('#spin').textContent=$('#spin').textContent.length>=4?'●':$('#spin').textContent+'●';setTimeout(pollBack,1500);}
+}
+$('#restart-btn').onclick=async()=>{
+  const n=$('#restart-note');
+  try{const r=await api('/admin/api/restart',{method:'POST'});
+    if(r.restarted){$('#overlay').classList.add('on');setTimeout(pollBack,2000);}
+  }catch(e){n.className='cap note err';n.textContent=e.message;}
+};
+
+// mcp
+function mcpNote(msg,ok){const n=$('#mcp-note');n.className='note '+(ok?'ok':'err');n.textContent=msg;}
+async function loadMcp(){
+  $('#mcp-note').textContent='';
+  try{
+    const cat=await api('/admin/api/mcp/catalog');
+    $('#mcp-off').style.display='none';$('#mcp-body').style.display='block';
+    await loadMcpServers();
+    $('#mcp-catalog').innerHTML=cat.catalog.map(mcpCard).join('');
+  }catch(e){
+    // 409 = the switch is off. Say which setting turns it on rather than an error.
+    $('#mcp-body').style.display='none';$('#mcp-off').style.display='block';
+    $('#mcp-off-msg').textContent=e.message;
+  }
+}
+function mcpCard(c){
+  let action;
+  if(c.auth==='oauth'){
+    const off=c.oauth_verified?'':' disabled title="not yet verified against a live flow"';
+    action=`<button class="btn pri" data-oauth="${esc(c.name)}"${off}>Connect with OAuth</button>`;
+  }else if(c.needs_key){
+    action=`<input type="password" data-key="${esc(c.name)}" placeholder="API key" style="margin-bottom:10px">
+      <button class="btn pri" data-connect="${esc(c.name)}">Connect</button>`;
+  }else{
+    action=`<button class="btn pri" data-connect="${esc(c.name)}">Connect</button>`;
+  }
+  return `<div class="card"><div class="row" style="justify-content:space-between">
+    <strong>${esc(c.name)}</strong><span class="badge b-warn">${esc(c.auth)}</span></div>
+    <p class="cap" style="margin:10px 0 14px">${esc(c.description)}</p>${action}</div>`;
+}
+async function loadMcpServers(){
+  const {servers}=await api('/admin/api/mcp/servers');
+  if(!servers.length){$('#mcp-servers').innerHTML='<p class="muted">None configured yet.</p>';return;}
+  $('#mcp-servers').innerHTML=servers.map(s=>{
+    const b=s.connected?'<span class="badge b-ok">connected</span>':`<span class="badge b-err">${esc(s.reason||'not connected')}</span>`;
+    return `<div class="kv"><span class="k">${esc(s.name)} ${b}</span>
+      <span class="v"><button class="btn" data-remove="${esc(s.name)}">Remove</button></span></div>`;
+  }).join('');
+}
+async function connectServer(name,secret){
+  mcpNote('Connecting '+name+'…',true);
+  try{const body={name};if(secret)body.secret=secret;
+    await api('/admin/api/mcp/connect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    mcpNote(name+' connected.',true);await loadMcp();
+  }catch(e){mcpNote(e.message,false);await loadMcpServers().catch(()=>{});}
+}
+async function oauthConnect(name){
+  mcpNote('Starting OAuth for '+name+'…',true);
+  try{const r=await api('/admin/api/mcp/oauth/start',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name})});
+    // The provider's page finishes at our own callback route, which tells the user
+    // to return here; a poll picks the new connection up.
+    window.location.href=r.authorize_url;
+  }catch(e){mcpNote(e.message,false);}
+}
+async function removeServer(name){
+  try{await api('/admin/api/mcp/servers/'+encodeURIComponent(name),{method:'DELETE'});
+    mcpNote(name+' removed.',true);await loadMcp();
+  }catch(e){mcpNote(e.message,false);}
+}
+$('#mcp').addEventListener('click',e=>{
+  const b=e.target.closest('button');if(!b)return;
+  if(b.dataset.connect!==undefined){const key=$(`[data-key="${b.dataset.connect}"]`,$('#mcp'));connectServer(b.dataset.connect,key&&key.value.trim());}
+  else if(b.dataset.oauth!==undefined&&!b.disabled)oauthConnect(b.dataset.oauth);
+  else if(b.dataset.remove!==undefined)removeServer(b.dataset.remove);
+});
+// Load the MCP tab the first time it is opened, and refresh when returning to it.
+document.querySelector('.tab[data-tab="mcp"]').addEventListener('click',loadMcp);
+
+loadHealth();loadSettings();setInterval(loadHealth,15000);
+</script>
+</body>
+</html>

@@ -368,7 +368,7 @@ async def test_start_connects_and_registers(monkeypatch: pytest.MonkeyPatch) -> 
     bridge = McpBridge([config])
     session = Session([RemoteTool("search"), RemoteTool("write")])
 
-    async def connect(cfg: Any) -> Any:
+    async def connect(cfg: Any, **_: Any) -> Any:
         return session
 
     monkeypatch.setattr(bridge, "_connect", connect)
@@ -385,7 +385,7 @@ async def test_one_server_failing_does_not_stop_the_next(
     bad = ServerConfig(name="bad", command="y")
     bridge = McpBridge([bad, good])
 
-    async def connect(cfg: Any) -> Any:
+    async def connect(cfg: Any, **_: Any) -> Any:
         if cfg.name == "bad":
             raise RuntimeError("it exited immediately")
         return Session([RemoteTool("search")])
@@ -411,7 +411,7 @@ async def test_a_server_that_never_lists_its_tools_is_recorded(
     config = ServerConfig(name="slow", command="x")
     bridge = McpBridge([config])
 
-    async def connect(cfg: Any) -> Any:
+    async def connect(cfg: Any, **_: Any) -> Any:
         return Slow([])
 
     monkeypatch.setattr(bridge, "_connect", connect)
@@ -473,10 +473,12 @@ async def test_closing_reports_a_failure_without_raising(
     raising here would mask whatever else the lifespan is unwinding."""
     bridge = McpBridge([])
 
-    async def boom() -> None:
-        raise RuntimeError("the pipe was already gone")
+    class BoomStack:
+        async def aclose(self) -> None:
+            raise RuntimeError("the pipe was already gone")
 
-    monkeypatch.setattr(bridge._stack, "aclose", boom)
+    # Per-server stacks now: one whose close raises must not stop the rest.
+    bridge._stacks["notes"] = BoomStack()  # type: ignore[assignment]
     with caplog.at_level("ERROR"):
         await bridge.aclose()
-    assert any("closing MCP sessions failed" in r.message for r in caplog.records)
+    assert any("closing MCP session" in r.message for r in caplog.records)

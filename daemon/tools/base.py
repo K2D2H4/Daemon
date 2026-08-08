@@ -98,6 +98,18 @@ class Registry:
             raise ValueError(f"tool {name!r} is already registered")
         self._tools[name] = tool
 
+    def unregister(self, name: str) -> bool:
+        """Take a tool back out, returning whether one was there.
+
+        The inverse of `register`, for MCP hot-reload: disconnecting a server removes
+        its tools so the model stops being offered something that will now fail, and
+        so the server can reconnect and take its old name back past `register`'s
+        collision guard. Idempotent on purpose - a disconnect that half-happened must
+        be safe to retry, so removing a name that is already gone is a no-op, not an
+        error.
+        """
+        return self._tools.pop(name, None) is not None
+
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 

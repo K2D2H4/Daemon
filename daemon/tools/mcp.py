@@ -32,6 +32,7 @@ about a specific tool they have read about, not about a server they trust.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -41,7 +42,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from daemon.fs import write_private_replace
 from daemon.llm.base import ToolSpec
+from daemon.mcp_catalog import CatalogEntry
 from daemon.tools.base import Registry, Risk, ToolError
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,11 @@ class ServerConfig:
     env: Mapping[str, str] = ()  # type: ignore[assignment]
     url: str = ""
     safe: frozenset[str] = frozenset()
+    key_env: str = ""
+    """The NAME of the environment variable holding this server's secret, never the
+    value. The value lives in `.env` (0600); `mcp.json` stores only the name, so the
+    config file stays shareable. At connect time it becomes one child env var for a
+    stdio server or an `Authorization: Bearer` header for a url one."""
 
     @property
     def is_remote(self) -> bool:
@@ -136,9 +144,134 @@ def load_config(data_dir: Path) -> McpConfig:
                 env={str(k): str(v) for k, v in (block.get("env") or {}).items()},
                 url=url,
                 safe=frozenset(str(s) for s in block.get("safe", ()) or ()),
+                key_env=str(block.get("key_env", "") or ""),
             )
         )
     return McpConfig(configs, rejected)
+
+
+_SAFE_STDIO_ENV = ("PATH", "HOME")
+"""The only variables inherited by a stdio child, and deliberately not `os.environ`.
+
+The environment Daemon runs in holds its own provider secrets - `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `GEMINI_API_KEY`, the Telegram token - and a curated third-party
+MCP server has no business reading any of them, so the old `{**os.environ, ...}`
+merge is refused. What a `uvx` server does need is a `PATH` to be found on and a
+`HOME`; those are not secrets, so they pass through by name. Everything else the
+server sees is what the owner wrote in `mcp.json` plus the single secret they named
+for it. Allowlist, not denylist: a new secret in Daemon's environment is invisible
+to servers by default, never leaked until someone adds it here on purpose."""
+
+
+def _secret_value(config: ServerConfig, secret: str | None) -> str | None:
+    """The secret for this server: the caller's if given, else read from `.env` by
+    the name the config carries. None when the server names no key or the named
+    variable is unset - the honest 'no secret configured', not an empty one."""
+    if not config.key_env:
+        return None
+    if secret is not None:
+        return secret
+    return os.environ.get(config.key_env)
+
+
+def _stdio_env(config: ServerConfig, secret: str | None = None) -> dict[str, str]:
+    """The environment a stdio child is started with: the safe passthrough, then the
+    static env the owner set in `mcp.json`, then at most the one named secret."""
+    env = {name: os.environ[name] for name in _SAFE_STDIO_ENV if name in os.environ}
+    env.update({str(k): str(v) for k, v in dict(config.env).items()})
+    value = _secret_value(config, secret)
+    if config.key_env and value is not None:
+        env[config.key_env] = value
+    return env
+
+
+def _bearer_headers(config: ServerConfig, secret: str | None = None) -> dict[str, str] | None:
+    """`Authorization: Bearer <value>` for a url server whose secret is available, or
+    None. This header path is net-new: the SDK's `streamablehttp_client` accepts
+    `headers=`, and passing the owner's key here is what authenticates a hosted
+    server without ever writing the value into `mcp.json`."""
+    value = _secret_value(config, secret)
+    if config.key_env and value is not None:
+        return {"Authorization": f"Bearer {value}"}
+    return None
+
+
+def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
+    """Turn a trusted catalog entry into a `ServerConfig` the bridge can connect.
+
+    The field mapping lives here, in one place, so the admin route need not know how
+    a catalog `kind` becomes a command or a url. Only structured fields cross over -
+    a `key_env` name, never a secret (CONTRACTS 13)."""
+    return ServerConfig(
+        name=entry.name,
+        command=entry.command,
+        args=tuple(entry.args),
+        url=entry.url,
+        key_env=entry.key_env or "",
+    )
+
+
+def _block_of(config: ServerConfig) -> dict[str, Any]:
+    """The `mcp.json` block for one server - structured fields only, no secret."""
+    block: dict[str, Any] = {}
+    if config.is_remote:
+        block["url"] = config.url
+    else:
+        block["command"] = config.command
+        if config.args:
+            block["args"] = list(config.args)
+    if config.env:
+        block["env"] = dict(config.env)
+    if config.safe:
+        block["safe"] = sorted(config.safe)
+    if config.key_env:
+        block["key_env"] = config.key_env
+    return block
+
+
+def _read_raw(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_server(data_dir: Path, config: ServerConfig) -> None:
+    """Write (or replace) one server's block in `mcp.json`, atomically and 0600.
+
+    The connect flow calls this *before* connecting: a connect that then fails
+    leaves the entry, so `/health` can report 'configured but not connected' rather
+    than the install vanishing. Owner-only because the file lives under the data dir
+    with everything else private, and atomic because a half-written `mcp.json` would
+    read as no servers at all on the next start.
+
+    Only `_block_of`'s structured fields are written - crucially `key_env`, the name
+    of the variable, never its value."""
+    path = Path(data_dir) / CONFIG_FILENAME
+    raw = _read_raw(path)
+    servers = raw.get("servers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[config.name] = _block_of(config)
+    raw["servers"] = servers
+    write_private_replace(path, json.dumps(raw, ensure_ascii=False, indent=2) + "\n")
+
+
+def remove_server(data_dir: Path, name: str) -> bool:
+    """Drop one server's block from `mcp.json`, returning whether it was there.
+
+    The persisted half of `disconnect_server`. Idempotent: removing an absent server
+    is not an error, so a disconnect that half-happened is safe to retry."""
+    path = Path(data_dir) / CONFIG_FILENAME
+    raw = _read_raw(path)
+    servers = raw.get("servers")
+    if not isinstance(servers, dict) or name not in servers:
+        return False
+    del servers[name]
+    raw["servers"] = servers
+    write_private_replace(path, json.dumps(raw, ensure_ascii=False, indent=2) + "\n")
+    return True
 
 
 class McpTool:
@@ -166,11 +299,18 @@ class McpTool:
 
 
 class McpBridge:
-    """Owns the sessions and their teardown.
+    """Owns the sessions and their teardown, one exit stack *per server*.
 
-    One `AsyncExitStack` for every server, closed in reverse: a stdio server is a
-    child process, and leaking one per restart is how a machine ends up with forty
-    of them.
+    A stdio server is a child process, so every server gets its own `AsyncExitStack`
+    that closes only it: that is what lets one server connect or disconnect while the
+    others stay up, which the admin "add a server" flow needs and a single shared
+    stack could not give. Leaking a stack per restart is how a machine ends up with
+    forty orphaned children, so `disconnect_server` and `aclose` both close them.
+
+    `register`, `unregister` and `specs` are synchronous and need no lock, but a rare
+    cross-turn install (the admin route connecting while a turn is mid-flight) could
+    race the session and stack dicts, so those mutations are serialised by
+    `self._lock`.
     """
 
     def __init__(self, config: McpConfig | list[ServerConfig]) -> None:
@@ -178,8 +318,15 @@ class McpBridge:
         # without also stating that nothing was rejected.
         resolved = McpConfig(config, {}) if isinstance(config, list) else config
         self._configs = resolved.servers
-        self._stack = AsyncExitStack()
+        self._stacks: dict[str, AsyncExitStack] = {}
         self._sessions: dict[str, Any] = {}
+        self._registered: dict[str, tuple[str, ...]] = {}
+        """Server name -> the local tool names it put in the registry, so a
+        disconnect removes exactly those and nothing it does not own."""
+        self._registry: Registry | None = None
+        """The registry `start` was handed. Kept so a later hot connect/disconnect
+        adds to and removes from the same one the app built."""
+        self._lock = asyncio.Lock()
         self.failures: dict[str, str] = dict(resolved.rejected)
         """Server name -> why it is not available, for `/health`. A silently absent
         tool is indistinguishable from a model that chose not to use it. Seeded with
@@ -188,27 +335,17 @@ class McpBridge:
     async def start(self, registry: Registry) -> int:
         """Connect every configured server and register what it offers.
 
-        Returns how many tools landed. Never raises: the caller is startup.
+        Returns how many tools landed. Never raises: the caller is startup. Records
+        the registry so `connect_server`/`disconnect_server` act on the same one.
         """
+        self._registry = registry
         if not self._configs:
             return 0
 
         registered = 0
         for config in self._configs:
             try:
-                # The SDK import lives in `_connect`, not here. Hoisting it made
-                # `start()` unrunnable without the optional extra, so the two tests
-                # that patch `_connect` passed only on a machine that happened to
-                # have `mcp` installed - which is to say they passed here and failed
-                # in CI. Per-server also reports better: one server's problem is
-                # recorded against that server.
-                session = await self._connect(config)
-                self._sessions[config.name] = session
-                # Inside the same guard as the connect, deliberately. It used to sit
-                # after it, so a server that connected and then hung on `list_tools`
-                # raised out of `start()` and cost every *remaining* server its tools
-                # as well - one slow server disabling the others.
-                registered += await self._register(config, session, registry)
+                registered += await self._bring_up(config, registry)
             except Exception as exc:
                 # Anything at all: a missing executable, a protocol mismatch, a
                 # server that exits immediately, a TLS failure, a listing that never
@@ -218,10 +355,80 @@ class McpBridge:
                 continue
         return registered
 
-    async def _connect(self, config: ServerConfig) -> Any:
-        """Open one session. Raises, and `start` records it against this server."""
-        import asyncio
+    async def connect_server(
+        self, config: ServerConfig, *, secret: str | None = None, auth: Any = None
+    ) -> int:
+        """Connect one server after startup and register its tools; returns how many.
 
+        The caller persists `mcp.json` first (see `save_server`), then calls this. A
+        failure is recorded in `failures` and re-raised, so the route can report it
+        while `/health` still shows "configured but not connected". A reconnect of a
+        name already present tears the old registration down first, so `register`'s
+        collision guard does not refuse it. `auth` is the 2b seam: an
+        `OAuthClientProvider` passed here reaches `streamablehttp_client(auth=...)`
+        without any further rewrite.
+        """
+        if self._registry is None:
+            raise ToolError("the MCP bridge has not started; there is no registry to register into")
+        async with self._lock:
+            await self._teardown(config.name)
+            try:
+                landed = await self._bring_up(
+                    config, self._registry, secret=secret, auth=auth
+                )
+            except Exception as exc:
+                self.failures[config.name] = str(exc) or exc.__class__.__name__
+                logger.error("MCP server %r did not connect: %s", config.name, exc)
+                raise
+            self.failures.pop(config.name, None)
+            logger.info("MCP server %r connected, %d tool(s)", config.name, landed)
+            return landed
+
+    async def disconnect_server(self, name: str) -> None:
+        """Unregister a server's tools and close its session and stack. Idempotent -
+        disconnecting a server that is not connected is a no-op, so it is safe to
+        call after a persisted removal whether or not the connect ever succeeded."""
+        async with self._lock:
+            await self._teardown(name)
+            self.failures.pop(name, None)
+
+    async def _bring_up(
+        self,
+        config: ServerConfig,
+        registry: Registry,
+        *,
+        secret: str | None = None,
+        auth: Any = None,
+    ) -> int:
+        session = await self._connect(config, secret=secret, auth=auth)
+        self._sessions[config.name] = session
+        # Registration is inside the same call as the connect, deliberately. It used
+        # to sit after it in `start`, so a server that connected and then hung on
+        # `list_tools` raised out and cost every *remaining* server its tools as well
+        # - one slow server disabling the others.
+        return await self._register(config, session, registry)
+
+    async def _teardown(self, name: str) -> None:
+        """Undo one server: unregister its tools, drop its session, close its stack.
+        Runs under `self._lock` (its callers hold it)."""
+        if self._registry is not None:
+            for tool_name in self._registered.get(name, ()):
+                self._registry.unregister(tool_name)
+        self._registered.pop(name, None)
+        self._sessions.pop(name, None)
+        stack = self._stacks.pop(name, None)
+        if stack is not None:
+            try:
+                await stack.aclose()
+            except Exception:
+                logger.exception("closing MCP session %r failed", name)
+
+    async def _connect(
+        self, config: ServerConfig, *, secret: str | None = None, auth: Any = None
+    ) -> Any:
+        """Open one session on its own stack. Raises, and the caller records it
+        against this server; the partial stack is closed first so a failed connect
+        leaks no child process."""
         try:
             from mcp import ClientSession as client_session
             from mcp import StdioServerParameters as stdio_params
@@ -231,36 +438,48 @@ class McpBridge:
                 f"the 'mcp' extra is not installed (pip install 'daemon-ai[mcp]'): {exc}"
             ) from exc
 
-        if config.is_remote:
-            from mcp.client.streamable_http import streamablehttp_client
+        stack = AsyncExitStack()
+        try:
+            if config.is_remote:
+                from mcp.client.streamable_http import streamablehttp_client
 
-            # The first two of the three streams; the third is a session-id getter
-            # this code has no use for.
-            read, write, *_ = await self._stack.enter_async_context(
-                streamablehttp_client(config.url)
-            )
-        else:
-            read, write = await self._stack.enter_async_context(
-                stdio_client(
-                    stdio_params(
-                        command=config.command,
-                        args=list(config.args),
-                        # Inherit, then overlay: a server started with an empty
-                        # environment has no PATH and no HOME, and most of them
-                        # need both.
-                        env={**os.environ, **dict(config.env)},
+                # The first two of the three streams; the third is a session-id
+                # getter this code has no use for. `headers` carries the bearer
+                # secret; `auth` is the OAuth provider seam for 2b (None today).
+                read, write, *_ = await stack.enter_async_context(
+                    streamablehttp_client(
+                        config.url,
+                        headers=_bearer_headers(config, secret),
+                        auth=auth,
                     )
                 )
-            )
-        session = await self._stack.enter_async_context(client_session(read, write))
-        await asyncio.wait_for(session.initialize(), timeout=STARTUP_TIMEOUT)
+            else:
+                read, write = await stack.enter_async_context(
+                    stdio_client(
+                        stdio_params(
+                            command=config.command,
+                            args=list(config.args),
+                            # Not `os.environ`: the safe passthrough plus the owner's
+                            # static env plus at most the one named secret. See
+                            # `_stdio_env` for why the full environment is refused.
+                            env=_stdio_env(config, secret),
+                        )
+                    )
+                )
+            session = await stack.enter_async_context(client_session(read, write))
+            await asyncio.wait_for(session.initialize(), timeout=STARTUP_TIMEOUT)
+        except BaseException:
+            # A connect that got partway has a live child or socket on the stack;
+            # close it before the error propagates rather than orphaning it.
+            await stack.aclose()
+            raise
+        self._stacks[config.name] = stack
         return session
 
     async def _register(self, config: ServerConfig, session: Any, registry: Registry) -> int:
-        import asyncio
-
         listing = await asyncio.wait_for(session.list_tools(), timeout=STARTUP_TIMEOUT)
         count = 0
+        landed: list[str] = []
         for tool in getattr(listing, "tools", ()):
             local_name = f"{config.name}{NAME_SEPARATOR}{tool.name}"
             schema = getattr(tool, "inputSchema", None)
@@ -281,13 +500,14 @@ class McpBridge:
             except ValueError as exc:
                 logger.error("MCP tool %s could not be registered: %s", local_name, exc)
                 continue
+            landed.append(local_name)
             count += 1
+        # Recorded so `disconnect_server` unregisters exactly what this connect added.
+        self._registered[config.name] = tuple(landed)
         logger.info("MCP server %r offered %d tool(s)", config.name, count)
         return count
 
     async def call(self, server: str, name: str, arguments: Mapping[str, Any]) -> str:
-        import asyncio
-
         session = self._sessions.get(server)
         if session is None:
             raise ToolError(f"the MCP server {server!r} is not connected")
@@ -307,13 +527,16 @@ class McpBridge:
 
     async def aclose(self) -> None:
         self._sessions.clear()
-        try:
-            await self._stack.aclose()
-        except Exception:
-            # Shutdown: a server that dies while being closed has nothing left to
-            # break, and raising here would mask whatever else the lifespan is
-            # unwinding.
-            logger.exception("closing MCP sessions failed")
+        self._registered.clear()
+        for name, stack in list(self._stacks.items()):
+            try:
+                await stack.aclose()
+            except Exception:
+                # Shutdown: a server that dies while being closed has nothing left to
+                # break, and raising here would mask whatever else the lifespan is
+                # unwinding.
+                logger.exception("closing MCP session %r failed", name)
+        self._stacks.clear()
 
 
 def _text_of(result: Any) -> str:
