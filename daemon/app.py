@@ -297,6 +297,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.wake_task = asyncio.create_task(_rounds(wake_round), name="wake-gate")
     elif settings.wake_enabled:
         try:
+            await _claim_microphone(settings)
             # Built once here so an unavailable recognizer or a missing model is
             # reported at startup instead of five seconds into a retry loop that
             # looks like a quiet room.
@@ -1245,6 +1246,26 @@ async def _wake_forever(settings: Settings) -> None:
             await asyncio.sleep(WAKE_RETRY_SECONDS)
         else:
             await asyncio.sleep(0)  # yield, so a stream that ends instantly cannot pin the loop
+
+
+async def _claim_microphone(settings: Settings) -> None:
+    """macOS: claim the mic grant under the .app identity before PortAudio opens a
+    stream that would otherwise return silence (spec D1). Headless-and-granted this
+    is instant; ungranted it is the harmless no-op that only `daemon request-mic`
+    (foreground, under Daemon.app) can turn into a prompt. Off the event loop
+    because the runloop pump is blocking.
+    """
+    if sys.platform != "darwin":
+        return
+    from daemon.voice.mic_access import request_microphone_access
+
+    status = await asyncio.to_thread(request_microphone_access, timeout=2.0)
+    if status != "authorized":
+        logger.warning(
+            "wake gate: microphone not granted (%s); run `daemon install` and click "
+            "Allow so it can hear the wake word",
+            status,
+        )
 
 
 # --- the wake gate ------------------------------------------------------------

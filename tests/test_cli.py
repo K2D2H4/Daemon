@@ -355,6 +355,21 @@ def test_an_unknown_command_is_a_usage_error() -> None:
     assert exit_info.value.code == 2
 
 
+def test_request_mic_reports_status_and_exit_code(monkeypatch, capsys) -> None:
+    import daemon.cli as cli
+
+    monkeypatch.setattr(
+        "daemon.voice.mic_access.request_microphone_access", lambda **_: "authorized"
+    )
+    assert cli.main(["request-mic"]) == 0
+    assert "authorized" in capsys.readouterr().out
+
+    monkeypatch.setattr(
+        "daemon.voice.mic_access.request_microphone_access", lambda **_: "denied"
+    )
+    assert cli.main(["request-mic"]) == 1
+
+
 def test_a_broken_config_stops_a_command_that_needs_it(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -80,6 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("voice", help="hold one spoken conversation at this machine")
 
+    sub.add_parser(
+        "request-mic",
+        help="claim macOS microphone access (used by Daemon.app during install)",
+    )
+
     wake = sub.add_parser(
         "wake", help="the always-on wake phrase: measure it on your voice, then hear it work"
     )
@@ -162,6 +167,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Same reason, more so: setup exists for the machine that has no usable
         # configuration yet, so it must not require one to start.
         return _setup(check_only=args.check)
+    if command == "request-mic":
+        # Also before Settings: this is the foreground grant Daemon.app execs
+        # during `daemon install`, and it needs no config to pop the prompt.
+        return _request_mic()
     if command == "wake" and args.wake_command == "calibrate":
         # Also before Settings, and for setup's reason: calibration reads nothing
         # out of the configuration and writes one key into `.env`, so it has to work
@@ -266,6 +275,20 @@ def _setup(*, check_only: bool) -> int:
     from daemon.setup import run
 
     return run(check_only=check_only)
+
+
+def _request_mic() -> int:
+    """Pop the macOS microphone prompt (or report the cached decision) and exit.
+
+    This is what Daemon.app's launcher execs during `daemon install`'s one-time
+    foreground grant. It only claims the grant - it does not start a daemon - so it
+    never collides with the resident LaunchAgent (spec §4.4, design decision 3).
+    """
+    from daemon.voice.mic_access import request_microphone_access
+
+    status = request_microphone_access(timeout=60.0)  # a human has to click Allow
+    print(f"microphone: {status}")
+    return 0 if status == "authorized" else 1
 
 
 def _serve(settings: Settings) -> int:
