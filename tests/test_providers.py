@@ -702,6 +702,51 @@ async def test_gemini_puts_the_system_turn_in_system_instruction() -> None:
     assert completion.meta["stop_reason"] == "STOP"
 
 
+async def test_gemini_sanitizes_a_tool_schema_it_would_otherwise_reject() -> None:
+    """An MCP server forwards its own inputSchema untouched, and Gemini 400s on
+    keywords like `additionalProperties`/`title`/`$schema`. They must be stripped at
+    every level, or one connected MCP server breaks every tool-enabled turn - even
+    a plain greeting, since tools are offered on every owner turn."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=GEMINI_OK)
+
+    dirty = ToolSpec(
+        name="tavily__search",
+        description="web search",
+        parameters={
+            "type": "object",
+            "title": "SearchArgs",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": False,
+            "properties": {
+                "query": {"type": "string", "title": "Query", "default": ""},
+                "max": {"type": ["integer", "null"], "additionalProperties": False},
+            },
+            "required": ["query"],
+        },
+    )
+    async with mock_client(handler) as client:
+        await GeminiProvider(SECRET, client=client).complete(
+            PROMPT, model="gemini-2.5-flash", tools=[dirty]
+        )
+
+    params = json.loads(seen[0].content)["tools"][0]["function_declarations"][0]["parameters"]
+    assert "additionalProperties" not in params
+    assert "title" not in params and "$schema" not in params
+    assert "title" not in params["properties"]["query"]
+    assert "default" not in params["properties"]["query"]
+    assert "additionalProperties" not in params["properties"]["max"]
+    # The valid shape survives, and a `[integer, null]` union becomes type+nullable.
+    assert params["type"] == "object"
+    assert params["properties"]["query"]["type"] == "string"
+    assert params["properties"]["max"]["type"] == "integer"
+    assert params["properties"]["max"]["nullable"] is True
+    assert params["required"] == ["query"]
+
+
 async def test_gemini_maps_assistant_turns_to_the_model_role() -> None:
     seen: list[httpx.Request] = []
 

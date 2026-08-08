@@ -117,7 +117,7 @@ class GeminiProvider:
                         {
                             "name": spec.name,
                             "description": spec.description,
-                            "parameters": spec.parameters,
+                            "parameters": _gemini_schema(spec.parameters),
                         }
                         for spec in tools
                     ]
@@ -269,6 +269,57 @@ class GeminiProvider:
             return data
 
         raise ProviderError(f"gemini call to {url} failed")  # unreachable
+
+
+_SCHEMA_KEYS = frozenset(
+    {
+        "type", "description", "nullable", "enum", "items", "properties",
+        "required", "minItems", "maxItems", "minimum", "maximum",
+        "minLength", "maxLength", "pattern", "anyOf",
+    }
+)
+"""The JSON-Schema keywords Gemini's function declarations accept (an OpenAPI 3.0
+subset). Everything else - `additionalProperties`, `$schema`, `title`, `$ref`,
+`default`, `format` - is rejected with a 400."""
+
+
+def _gemini_schema(node: Any) -> Any:
+    """Reduce a JSON Schema to the subset Gemini's function declarations accept.
+
+    An MCP server forwards its own `inputSchema` untouched (tools/mcp.py: a server's
+    schema is its own business), and those routinely carry `additionalProperties`,
+    `title`, `$schema` or `$ref`. Passing them raw makes Gemini 400 the whole
+    request, so a single connected MCP server broke *every* tool-enabled turn - even
+    "hello", because tools are offered on every owner turn. Anthropic and OpenAI
+    tolerate the extra keywords; this narrowing is Gemini's alone, so it lives here.
+    """
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key not in _SCHEMA_KEYS:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            out[key] = {k: _gemini_schema(v) for k, v in value.items()}
+        elif key == "items":
+            out[key] = _gemini_schema(value)
+        elif key == "anyOf" and isinstance(value, list):
+            out[key] = [_gemini_schema(v) for v in value]
+        else:
+            out[key] = value
+    # JSON Schema allows `type: ["string", "null"]`; Gemini wants one type plus a
+    # `nullable` flag.
+    declared = node.get("type")
+    if isinstance(declared, list):
+        concrete = [t for t in declared if t != "null"]
+        out["type"] = concrete[0] if concrete else "string"
+        if "null" in declared:
+            out["nullable"] = True
+    # An object schema Gemini can read has to say so, even when the server left the
+    # `type` implicit and only gave `properties`.
+    if "properties" in out and "type" not in out:
+        out["type"] = "object"
+    return out
 
 
 def _contents(messages: list[Message]) -> list[dict[str, Any]]:
