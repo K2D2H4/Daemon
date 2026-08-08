@@ -284,11 +284,23 @@ def _setup(*, check_only: bool) -> int:
     return run(check_only=check_only)
 
 
+def _admin_url(settings: Settings) -> str:
+    """The admin console's *connect* URL. `DAEMON_HOST` is a bind address, so
+    `0.0.0.0`/`::` is not something a browser connects to - fall back to loopback,
+    the address that actually reaches a control plane that binds every interface."""
+    host = settings.host if settings.host not in ("0.0.0.0", "::", "") else "127.0.0.1"
+    return f"http://{host}:{settings.port}/admin/"
+
+
 def _serve(settings: Settings) -> int:
     import uvicorn
 
     from daemon.app import create_app
 
+    # Printed before uvicorn takes the terminal (its own logging is off,
+    # log_config=None): the admin web has no other way to announce where it is, and
+    # "how do I open the console" should not need reading the source.
+    print(f"admin console: {_admin_url(settings)}")
     uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
     return OK
 
@@ -712,6 +724,7 @@ def _doctor() -> int:
         settings = Settings()
     except ConfigError as exc:
         checks = [Check("config", False, str(exc))]
+        admin = None
     else:
         table = ", ".join(
             f"{task.value}->{route.provider}" for task, route in settings.routing_table().items()
@@ -732,11 +745,16 @@ def _doctor() -> int:
             _screen_check(settings),
             *_ollama_checks(settings),
         ]
+        admin = _admin_url(settings)
 
     failed = 0
     for check in checks:
         print(f"[{'ok' if check.ok else 'FAIL'}] {check.name}: {check.detail}")
         failed += not check.ok
+    if admin:
+        # Where the operator opens the web console - the one capability doctor knows
+        # about that has a URL rather than a yes/no.
+        print(f"\nadmin console: {admin}  (while the daemon is running)")
     if failed:
         # Flushed first, or the summary lands above the checks it summarises when
         # stdout is a pipe and stderr is not.
