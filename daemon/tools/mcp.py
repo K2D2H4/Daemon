@@ -228,6 +228,18 @@ def _bearer_headers(config: ServerConfig, secret: str | None = None) -> dict[str
     return None
 
 
+def _leaf_message(exc: BaseException) -> str:
+    """A readable reason from a connect failure, unwrapping ExceptionGroups.
+
+    The streamable-HTTP client runs inside an anyio task group, so a failed url
+    connection surfaces as `unhandled errors in a taskgroup (1 sub-exception)` -
+    which hides the 401 or closed stream that actually happened (a url server with a
+    missing bearer looked exactly like this). Dig to the first leaf and report it."""
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return str(exc) or exc.__class__.__name__
+
+
 def _mcp_pin() -> tuple[str, ...]:
     """`--with mcp==<the version this daemon speaks>`, or empty if unknown.
 
@@ -504,7 +516,7 @@ class McpBridge:
                 # Anything at all: a missing executable, a protocol mismatch, a
                 # server that exits immediately, a TLS failure, a listing that never
                 # arrives.
-                self.failures[config.name] = str(exc) or exc.__class__.__name__
+                self.failures[config.name] = _leaf_message(exc)
                 logger.error("MCP server %r did not start: %s", config.name, exc)
                 continue
         return registered
@@ -531,9 +543,12 @@ class McpBridge:
                     config, self._registry, secret=secret, auth=auth
                 )
             except Exception as exc:
-                self.failures[config.name] = str(exc) or exc.__class__.__name__
+                reason = _leaf_message(exc)
+                self.failures[config.name] = reason
                 logger.error("MCP server %r did not connect: %s", config.name, exc)
-                raise
+                # Re-raised as a clean, unwrapped message so the admin route reports
+                # the real reason rather than "unhandled errors in a taskgroup".
+                raise ToolError(reason) from exc
             self.failures.pop(config.name, None)
             logger.info("MCP server %r connected, %d tool(s)", config.name, landed)
             return landed

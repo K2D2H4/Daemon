@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from daemon import __version__
-from daemon.config import OLLAMA, ConfigError, Settings
+from daemon.config import ENV_FILE, OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
 from daemon.service import ServiceAction, ServiceError, ServiceStatus, service_for
 
@@ -230,6 +230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         override = _env_override_check(settings)
         if not override.ok:
             logging.getLogger(__name__).warning("%s", override.detail)
+        _load_env_secrets()
         return _serve(settings)
     if command == "reindex":
         inserted = _reindex(settings)
@@ -298,6 +299,33 @@ def _admin_url(settings: Settings) -> str:
     the address that actually reaches a control plane that binds every interface."""
     host = settings.host if settings.host not in ("0.0.0.0", "::", "") else "127.0.0.1"
     return f"http://{host}:{settings.port}/admin/"
+
+
+def _load_env_secrets() -> None:
+    """Make `.env` values visible in `os.environ`, so secret indirection survives a
+    restart.
+
+    The admin writes an MCP key into `.env` under its variable name
+    (daemon/admin/settings_io.py) and the engine reads it back with
+    `os.environ.get(name)` at connect time (daemon/tools/mcp.py `_secret_value`).
+    But pydantic pulls `.env` only into its own `Settings` fields, never into
+    `os.environ`, so `TAVILY_API_KEY` and the like were invisible after a restart -
+    a url MCP server connected once (the admin passed the key inline) and then lost
+    its bearer on the next boot, failing with a taskgroup error. `setdefault`, not
+    overwrite: a value the shell already exported still wins, matching how Settings
+    resolves precedence."""
+    path = Path(ENV_FILE)
+    if not path.exists():
+        return
+    from daemon.setup import parse_env
+
+    try:
+        loaded = parse_env(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        logging.getLogger(__name__).warning("could not read %s for its secrets: %s", path, exc)
+        return
+    for key, value in loaded.items():
+        os.environ.setdefault(key, value)
 
 
 def _serve(settings: Settings) -> int:
