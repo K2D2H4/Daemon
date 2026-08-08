@@ -33,7 +33,7 @@ from daemon.memory.store import Store
 from daemon.memory.writer import FileMemoryWriter
 from daemon.persona.evolve import PersonaEvolution
 from daemon.reflection import Reflection, artifact_path
-from daemon.service import ServiceAction, ServiceStatus
+from daemon.service import RunResult, Service, ServiceAction, ServiceStatus
 from daemon.tasks import Task
 
 DAY = "2026-08-03"
@@ -115,6 +115,12 @@ class FakeService:
 def service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> FakeService:
     fake = FakeService(tmp_path / "ai.daemon.default.plist")
     monkeypatch.setattr(cli, "service_for", lambda settings: fake)
+    # These tests exercise the generic (non-macOS) dispatch, which is what
+    # `service_for` stood in for before install/uninstall grew a macOS-specific
+    # branch. Pin the platform so the test is deterministic on every dev machine
+    # and never takes the real `.app`/launchctl/mic path (tests/CLAUDE.md: no test
+    # may touch a microphone).
+    monkeypatch.setattr(cli.sys, "platform", "linux")
     return fake
 
 
@@ -313,6 +319,52 @@ def test_install_force_is_passed_through(service: FakeService) -> None:
 def test_uninstall_calls_uninstall(service: FakeService) -> None:
     assert cli.main(["uninstall"]) == 0
     assert service.calls == [("uninstall", None)]
+
+
+def test_macos_program_puts_launcher_first_then_daemon_argv() -> None:
+    program = cli._macos_program(
+        Path("/Users/x/Applications/Daemon.app/Contents/MacOS/launcher"),
+        ("/Users/x/.local/bin/daemon", "run"),
+    )
+    assert program == (
+        "/Users/x/Applications/Daemon.app/Contents/MacOS/launcher",
+        "/Users/x/.local/bin/daemon",
+        "run",
+    )
+
+
+def test_macos_install_writes_launcher_first_in_the_plist(tmp_path: Path) -> None:
+    """The load-bearing wiring: launchd must exec Daemon.app's launcher (argv[0]),
+    which then execs the daemon path with `run` - in that order, or a real machine
+    starts the wrong thing (or nothing). Proven on a real plist on disk, not a mock
+    of launchctl/codesign/open (tests/CLAUDE.md: a test that passes for the wrong
+    reason is worse than none).
+    """
+    launcher = tmp_path / "Applications" / "Daemon.app" / "Contents" / "MacOS" / "launcher"
+    daemon_path = "/x/.local/bin/daemon"
+    program = cli._macos_program(launcher, (daemon_path, "run"))
+
+    def fake_runner(command: object) -> RunResult:
+        return RunResult(0)
+
+    svc = Service(
+        label="default",
+        working_dir=tmp_path,
+        log_dir=tmp_path,
+        program=program,
+        home=tmp_path,
+        platform="darwin",
+        runner=fake_runner,
+    )
+    svc.install()
+
+    plist_path = tmp_path / "Library" / "LaunchAgents" / f"{svc.label}.plist"
+    written = plist_path.read_text(encoding="utf-8")
+
+    launcher_index = written.index(str(launcher))
+    daemon_index = written.index(daemon_path)
+    run_index = written.index("<string>run</string>")
+    assert launcher_index < daemon_index < run_index
 
 
 def test_status_calls_status(service: FakeService, capsys: pytest.CaptureFixture[str]) -> None:

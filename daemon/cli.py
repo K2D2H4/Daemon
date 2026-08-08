@@ -15,7 +15,9 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -24,7 +26,7 @@ from typing import Any
 
 from daemon.config import OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
-from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus
+from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus, default_program
 
 OK = 0
 PROBLEM = 1
@@ -242,9 +244,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if command == "install":
-            return _print_action(service_for(settings).install(force=args.force))
+            return _install(settings, force=args.force)
         if command == "uninstall":
-            return _print_action(service_for(settings).uninstall(), verb="removed")
+            return _uninstall(settings)
         if command == "status":
             return _print_status(service_for(settings).status())
     except ServiceError as exc:
@@ -269,6 +271,66 @@ def service_for(settings: Settings) -> Service:
         working_dir=Path.cwd(),
         log_dir=settings.data_dir / "logs",
     )
+
+
+APP_DIR = Path.home() / "Applications" / "Daemon.app"
+"""Where the TCC-identity bundle lives (spec Q2). Holds no secrets."""
+
+
+def _macos_program(launcher: Path, daemon_argv: tuple[str, ...]) -> tuple[str, ...]:
+    """The plist ProgramArguments: the launcher, then the daemon argv it execs.
+
+    Order is load-bearing - the launcher is argv[0] (what launchd starts native,
+    giving the .app's TCC identity) and it execs argv[1] (the daemon path) with the
+    rest (the subcommand). service.py renders this tuple verbatim.
+    """
+    return (str(launcher), *daemon_argv)
+
+
+def _install(settings: Settings, *, force: bool) -> int:
+    if sys.platform != "darwin":
+        return _print_action(service_for(settings).install(force=force))
+
+    # macOS: the LaunchAgent must start Daemon.app's launcher, not the bare console
+    # script - a launchd-spawned bare Python is silently denied the microphone
+    # (spec §1). The launcher execs the real `daemon run` under the .app identity.
+    from daemon.macapp import build_bundle
+
+    launcher = build_bundle(APP_DIR)
+    daemon_argv = default_program()  # (…/daemon, "run") - what the launcher execs
+    service = Service(
+        label=settings.service_label,
+        working_dir=Path.cwd(),
+        log_dir=settings.data_dir / "logs",
+        program=_macos_program(launcher, daemon_argv),
+    )
+    rc = _print_action(service.install(force=force))
+    _grant_microphone_once(launcher, daemon_argv)
+    return rc
+
+
+def _uninstall(settings: Settings) -> int:
+    rc = _print_action(service_for(settings).uninstall(), verb="removed")
+    if sys.platform == "darwin" and APP_DIR.exists():
+        shutil.rmtree(APP_DIR, ignore_errors=True)
+        print(f"removed {APP_DIR}")
+        print("(the microphone grant is kept - harmless, and a reinstall skips the prompt)")
+    return rc
+
+
+def _grant_microphone_once(launcher: Path, daemon_argv: tuple[str, ...]) -> None:
+    """Launch the .app foreground so the mic prompt appears under its TCC identity.
+
+    Runs `daemon request-mic` (via the launcher), which claims the grant and exits -
+    NOT a second `daemon run`, so it never collides with the LaunchAgent (design
+    decision 3). Fire-and-forget: the grant persists once the user clicks Allow.
+    """
+    app = launcher.parents[2]  # …/Daemon.app
+    print("\nA microphone permission dialog will appear - click Allow.")
+    print("(Daemon listens for its wake word; the grant persists across reboots and updates.)")
+    # Fixed argv vector, no shell (CONTRACTS 13): open the bundle and pass the
+    # launcher the daemon path + the request-mic subcommand.
+    subprocess.run(["open", str(app), "--args", daemon_argv[0], "request-mic"], check=False)
 
 
 def _setup(*, check_only: bool) -> int:

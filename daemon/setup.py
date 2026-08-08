@@ -2084,6 +2084,8 @@ class Wizard:
         say("  daemon doctor     - checks Ollama, the data dir and the schema")
         say("  daemon run        - runs it here, in this terminal")
         say("  daemon install    - keeps it running after you close the terminal or reboot")
+        if sys.platform == "darwin":
+            say("                      on macOS it also asks once for mic access - click Allow")
         return OK
 
     # --- the persona seed ----------------------------------------------------
