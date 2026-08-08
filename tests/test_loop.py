@@ -761,6 +761,34 @@ def test_health_reports_whether_recall_is_wired(_isolated_env: None) -> None:
         assert client.get("/health").json()["recall"] == "injected"
 
 
+def test_health_reports_microphone_status(
+    _isolated_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A wake gate can be "running" while the mic is denied, which reads as a quiet
+    # room. Monkeypatching `_mic_health` keeps this hermetic - no real AVFoundation
+    # call - while still proving the value flows into the response body.
+    from fastapi.testclient import TestClient
+
+    import daemon.app as app_module
+
+    monkeypatch.setattr(app_module, "_mic_health", lambda: "authorized")
+
+    app = create_app(Settings(_env_file=None, preset="offline"))
+
+    with TestClient(app) as client:
+        body = client.get("/health").json()
+
+    assert body["mic"] == "authorized"
+
+
+def test_mic_health_is_na_off_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
+    import daemon.app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+
+    assert app_module._mic_health() == "n/a"
+
+
 def test_a_recall_stack_that_will_not_load_does_not_stop_the_boot(_isolated_env: None) -> None:
     """docs/PLAN.md 8.1: the log clock is the thing that cannot be caught up
     later, so a missing embedder must cost memory, never the conversation loop."""

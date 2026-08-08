@@ -129,6 +129,10 @@ def create_app(
             # leaves a daemon that answers Telegram normally and has simply stopped
             # hearing the room, with nothing anywhere saying so.
             "wake_gate": _wake_health(app.state),
+            # macOS: a wake gate can be "running" while the mic is denied, which
+            # reads as a quiet room. Naming the grant here is the difference between
+            # a diagnosable and an invisible failure (spec §6).
+            "mic": _mic_health(),
             # Same reasoning: an MCP server that failed to start leaves the model
             # with fewer tools and nothing else different, which is exactly the kind
             # of quiet degradation this endpoint exists to name.
@@ -1157,6 +1161,16 @@ def _wake_health(state: Any) -> str:
     if not task.done():
         return "running"
     return "stopped"
+
+
+def _mic_health() -> str:
+    """The microphone TCC decision, read (never prompted) at request time. `n/a`
+    off macOS, where there is no TCC gate."""
+    if sys.platform != "darwin":
+        return "n/a"
+    from daemon.voice.mic_access import microphone_authorization_status
+
+    return microphone_authorization_status()
 
 
 async def _wake_round(settings: Settings) -> None:
