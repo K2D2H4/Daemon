@@ -283,11 +283,11 @@ async def mcp_catalog(request: Request) -> JSONResponse:
 async def mcp_servers(request: Request) -> JSONResponse:
     """The configured servers and whether each is actually connected.
 
-    The same "configured but not connected" model `/health` uses: a name is
-    connected iff it is in `mcp.json` and *not* in the bridge's `failures` (which is
-    seeded with the blocks that never parsed and added to as servers fail to start).
-    The failure reason rides along for the rest, because a silently absent tool is
-    indistinguishable from a model that chose not to use it."""
+    "Connected" is the bridge's *live session* for that name, not "absent from
+    `failures`" - a persisted server that no connect ever succeeded for is in neither
+    dict, and the old "not in failures" test showed it falsely green (bug 3). The
+    failure reason still rides along for the not-connected ones, because a silently
+    absent tool is indistinguishable from a model that chose not to use it."""
     if not request.app.state.settings.mcp_enabled:
         return _mcp_off()
     data_dir = request.app.state.settings.data_dir
@@ -295,7 +295,7 @@ async def mcp_servers(request: Request) -> JSONResponse:
     failures: dict[str, str] = dict(getattr(bridge, "failures", {}) or {})
     servers = []
     for config in load_config(data_dir).servers:
-        connected = bridge is not None and config.name not in failures
+        connected = bridge is not None and bridge.is_connected(config.name)
         servers.append(
             {
                 "name": config.name,
@@ -305,7 +305,11 @@ async def mcp_servers(request: Request) -> JSONResponse:
                     None
                     if connected
                     else failures.get(config.name)
-                    or (None if bridge is not None else "the MCP bridge is not running")
+                    or (
+                        "not connected"
+                        if bridge is not None
+                        else "the MCP bridge is not running"
+                    )
                 ),
             }
         )
@@ -440,13 +444,21 @@ async def mcp_oauth_start(request: Request) -> JSONResponse:
     redirect_uri = (
         f"http://{settings.host}:{settings.port}/admin/api/mcp/oauth/callback"
     )
+    # `start_oauth_flow` writes the server to mcp.json before connecting, so it takes
+    # the same lock the key connect/disconnect routes do (finding #6) - two starts, or
+    # a start racing a disconnect, must not interleave the read-modify-write.
     try:
-        authorize_url = await start_oauth_flow(
-            bridge, settings.data_dir, entry, redirect_uri=redirect_uri
-        )
+        async with request.app.state.mcp_persist_lock:
+            result = await start_oauth_flow(
+                bridge, settings.data_dir, entry, redirect_uri=redirect_uri
+            )
     except OAuthError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=502)
-    return JSONResponse({"authorize_url": authorize_url})
+    # authorize_url null + connected true means the provider used a stored token and
+    # connected without a browser step; the frontend refreshes instead of redirecting.
+    return JSONResponse(
+        {"authorize_url": result.authorize_url, "connected": result.connected}
+    )
 
 
 CALLBACK_PAGE = """<!doctype html><meta charset="utf-8">

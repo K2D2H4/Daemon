@@ -63,6 +63,16 @@ class FakeBridge:
         self.connected: list[tuple[ServerConfig, str | None, Any]] = []
         self.disconnected: list[str] = []
         self.fail_connect = False
+        self.live: set[str] = set()
+        """Names with a live session, the way the real bridge tracks `_sessions`.
+        `/servers` reads `is_connected`, so a test states liveness here rather than
+        inferring it from `failures`."""
+
+    def is_connected(self, name: str) -> bool:
+        return name in self.live
+
+    def connected_names(self) -> tuple[str, ...]:
+        return tuple(self.live)
 
     async def connect_server(
         self, config: ServerConfig, *, secret: str | None = None, auth: Any = None
@@ -71,6 +81,7 @@ class FakeBridge:
         if self.fail_connect:
             self.failures[config.name] = "the server refused the connection"
             raise RuntimeError("the server refused the connection")
+        self.live.add(config.name)
         if auth is not None:
             # What the SDK's streamable-HTTP client does when it hits a 401: hand the
             # authorize URL to the redirect handler, wait for the code+state on the
@@ -238,6 +249,7 @@ def test_servers_reports_connection_state(tmp_path: Path) -> None:
     save_server(tmp_path, server_config_from_catalog(lookup("fetch")))
     save_server(tmp_path, server_config_from_catalog(lookup("tavily")))
     bridge = FakeBridge()
+    bridge.live.add("fetch")  # fetch has a live session; tavily does not
     bridge.failures["tavily"] = "bad key"
     client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
 
@@ -246,6 +258,19 @@ def test_servers_reports_connection_state(tmp_path: Path) -> None:
     assert servers["fetch"]["reason"] is None
     assert servers["tavily"]["connected"] is False
     assert servers["tavily"]["reason"] == "bad key"
+
+
+def test_servers_configured_but_never_connected_is_not_green(tmp_path: Path) -> None:
+    """Bug 3: a server persisted in mcp.json that no connect ever succeeded for is in
+    neither `live` nor `failures`. "not in failures" showed it falsely connected; the
+    live-session check reports it honestly as not connected."""
+    save_server(tmp_path, server_config_from_catalog(lookup("notion")))
+    bridge = FakeBridge()  # nothing live, nothing failed
+    client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
+
+    servers = {s["name"]: s for s in client.get("/admin/api/mcp/servers").json()["servers"]}
+    assert servers["notion"]["connected"] is False
+    assert servers["notion"]["reason"] == "not connected"
 
 
 # --- delete -------------------------------------------------------------------
@@ -273,7 +298,7 @@ async def test_oauth_flow_start_then_callback_persists_token_0600(tmp_path: Path
     entry = lookup("notion")
     bridge = FakeBridge()
 
-    authorize_url = await mcp_oauth.start_oauth_flow(
+    result = await mcp_oauth.start_oauth_flow(
         bridge,
         tmp_path,
         entry,
@@ -282,9 +307,14 @@ async def test_oauth_flow_start_then_callback_persists_token_0600(tmp_path: Path
     )
     # start returns the URL the browser must open, and connect was invoked with the
     # provider as `auth=` (the 2b seam), not as a bearer secret.
-    assert "state=STATE-XYZ" in authorize_url
+    assert result.connected is False
+    assert result.authorize_url is not None and "state=STATE-XYZ" in result.authorize_url
     _config, secret, auth = bridge.connected[0]
     assert secret is None and auth is not None
+    # Bug 1: the server is persisted to mcp.json before the connect, carrying
+    # auth="oauth" so a restart knows to reconnect it through its stored token.
+    saved = {c.name: c for c in load_config(tmp_path).servers}
+    assert "notion" in saved and saved["notion"].auth == "oauth"
 
     name = await mcp_oauth.complete_oauth_flow("the-code", "STATE-XYZ")
     assert name == "notion"
@@ -296,6 +326,76 @@ async def test_oauth_flow_start_then_callback_persists_token_0600(tmp_path: Path
     assert stored["tokens"]["access_token"] == "tok-the-code"
     # The completed flow is cleaned out of the registry.
     assert "STATE-XYZ" not in mcp_oauth._FLOWS
+
+
+class _StoredTokenBridge(FakeBridge):
+    """The second-connect path (bug 2): the provider already has a stored token, so
+    the SDK connects without ever hitting a 401. `redirect_handler` never fires,
+    `authorize_url` stays empty, and the connect simply finishes."""
+
+    async def connect_server(
+        self, config: ServerConfig, *, secret: str | None = None, auth: Any = None
+    ) -> int:
+        self.connected.append((config, secret, auth))
+        self.live.add(config.name)
+        # No redirect: a valid stored token means the SDK connects straight through.
+        return 3
+
+
+async def test_oauth_stored_token_is_success_not_a_false_error(tmp_path: Path) -> None:
+    """Bug 2: after the first auth, a second connect uses the stored token and returns
+    without a redirect. `start_oauth_flow` must report that as connected, not raise
+    the old "no authorization URL was produced"."""
+    bridge = _StoredTokenBridge()
+    result = await mcp_oauth.start_oauth_flow(
+        bridge, tmp_path, lookup("notion"),
+        redirect_uri=OAUTH_REDIRECT, build_provider=_fake_build_provider,
+    )
+    assert result.connected is True
+    assert result.authorize_url is None
+    # Persisted, and no dead flow or task left behind (no redirect ever registered).
+    assert "notion" in {c.name for c in load_config(tmp_path).servers}
+    assert mcp_oauth._FLOWS == {}
+
+
+def test_oauth_start_route_reports_a_stored_token_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route turns a stored-token connect into {authorize_url: null,
+    connected: true}, so the frontend refreshes instead of redirecting."""
+    monkeypatch.setattr(mcp_oauth, "_build_provider", _fake_build_provider)
+    app = create_app(_settings(tmp_path, mcp_enabled=True))
+    app.state.env_path = tmp_path / ".env"
+    with TestClient(app, base_url=LOOPBACK) as client:
+        app.state.mcp = _StoredTokenBridge()
+        start = client.post("/admin/api/mcp/oauth/start", json={"name": "notion"})
+        assert start.status_code == 200
+        body = start.json()
+        assert body["authorize_url"] is None
+        assert body["connected"] is True
+
+
+async def test_reconnect_provider_handlers_raise_rather_than_block(tmp_path: Path) -> None:
+    """The startup provider has no browser behind it, so both handlers must raise a
+    clean 'reauthorize' message rather than blocking - a boot with a dead token fails
+    fast rather than hanging on a redirect nobody can follow."""
+    captured: dict[str, Any] = {}
+
+    def build(
+        url: str, redirect_uri: str, storage: Any, redirect_handler: Any, callback_handler: Any
+    ) -> SimpleNamespace:
+        captured["redirect"] = redirect_handler
+        captured["callback"] = callback_handler
+        return SimpleNamespace()
+
+    config = server_config_from_catalog(lookup("notion"))
+    mcp_oauth.build_reconnect_provider(
+        tmp_path, config, redirect_uri=OAUTH_REDIRECT, build_provider=build
+    )
+    with pytest.raises(mcp_oauth.OAuthError):
+        await captured["redirect"]("https://auth.example/authorize")
+    with pytest.raises(mcp_oauth.OAuthError):
+        await captured["callback"]()
 
 
 async def test_complete_oauth_flow_rejects_unknown_state() -> None:
