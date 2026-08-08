@@ -1342,8 +1342,19 @@ def test_asking_for_a_gate_with_nothing_to_hear_with_is_reported(tmp_path: Path)
     # meant to change. The first version of this test asserted `unavailable` and got
     # `running` for exactly that reason - and on a machine without the voice extra
     # it would have passed anyway, which is the worse half of the mistake.
+    async def _no_claim(_settings: Settings) -> None:
+        return None
+
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("daemon.app.build_wake_recognizer", lambda: Deaf())
+        # Without this, the real `elif settings.wake_enabled:` branch this test
+        # deliberately takes (no `wake=` injection) reaches `_claim_microphone`,
+        # which on darwin calls the real AVFoundation `request_microphone_access` -
+        # a live OS side effect tests/CLAUDE.md forbids ("no test may touch ... a
+        # microphone"). It only stayed quiet on a machine already authorized;
+        # elsewhere it would pump the runloop for up to 2s trying to raise a
+        # system prompt.
+        patch.setattr("daemon.app._claim_microphone", _no_claim)
         with TestClient(app) as client:
             body = client.get("/health").json()
 
