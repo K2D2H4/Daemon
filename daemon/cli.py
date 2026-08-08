@@ -37,6 +37,14 @@ USAGE = 2
 
 GITHUB_REPO = "K2D2H4/Daemon"
 PACKAGE_NAME = "daemon-ai"
+INSTALL_SPEC = f"{PACKAGE_NAME}[mcp]"
+"""What `uv tool install` requests, extra included. MCP defaults on (config.py),
+so a plain `daemon-ai` install shows the admin's MCP tab and then fails every
+connect with "No module named 'mcp'". `install.sh` installs this same spec - the
+docstring on `_update` promises the two do not drift, and a bare-name reinstall
+here would silently drop the extra on the next `daemon update`. The version cap
+lives in the extra (pyproject `mcp>=1.9,<2`), so `[mcp]` also keeps `daemon update`
+off the incompatible mcp 2.0."""
 """The repo and the distributable. `daemon update` and install.sh must agree on
 both, because update re-installs exactly what the one-liner does."""
 
@@ -358,7 +366,7 @@ def _update() -> int:
     source = f"https://github.com/{GITHUB_REPO}/archive/{ref}.tar.gz"
     print(f"updating to {ref} ...")
     install = [
-        "uv", "tool", "install", "--force", "--python", "3.13", "--from", source, PACKAGE_NAME
+        "uv", "tool", "install", "--force", "--python", "3.13", "--from", source, INSTALL_SPEC
     ]
     if _run(install) != 0:
         print("update failed - the install output above says why.")

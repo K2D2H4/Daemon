@@ -57,8 +57,12 @@ fi
 #    `daemon` command in. --python 3.13 pulls a managed CPython if the host has
 #    none; --force makes a re-run an upgrade rather than a no-op.
 say "Installing ${PACKAGE} @ ${ref} ..."
+# The `[mcp]` extra is included because MCP defaults on: without it the admin's MCP
+# tab shows but every connect fails "No module named 'mcp'". `daemon update` installs
+# the same spec, so an update does not drop it. (The extra pins mcp<2 - the v2 client
+# surface is incompatible - so this stays on the working 1.x.)
 uv tool install --force --python 3.13 \
-  --from "https://github.com/${REPO}/archive/${ref}.tar.gz" "${PACKAGE}"
+  --from "https://github.com/${REPO}/archive/${ref}.tar.gz" "${PACKAGE}[mcp]"
 
 # Put uv's tool bin dir on PATH - for the version check below, and, persistently,
 # for the user's future shells.

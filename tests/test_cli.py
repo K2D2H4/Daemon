@@ -295,7 +295,9 @@ def test_update_installs_the_latest_release(
     assert "uv" in ran[0] and "tool" in ran[0] and "install" in ran[0]
     assert "--force" in ran[0]
     assert "archive/v9.9.9.tar.gz" in cmd and "git+" not in cmd
-    assert "daemon-ai" in ran[0]
+    # The `[mcp]` extra must ride along, or an update silently drops MCP (which
+    # defaults on) - the same spec install.sh uses, so the two do not drift.
+    assert "daemon-ai[mcp]" in ran[0]
 
 
 def test_update_honours_the_version_override(monkeypatch: pytest.MonkeyPatch) -> None:
