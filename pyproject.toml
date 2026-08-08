@@ -21,6 +21,18 @@ dependencies = [
     # sqlite extension - this very Python build has enable_load_extension
     # disabled, so sqlite-vec cannot load, and self-hosters would hit the same.
     "numpy>=2.0",
+    # Voice is default-on for macOS (spec §4.6). The recognizer used to live only
+    # behind the `voice` extra, and both the one-liner installer and `daemon
+    # update` install bare `daemon-ai` — so an update silently dropped voice and
+    # the wake gate went deaf while /health still said running. Making these core
+    # on darwin removes the extra that kept getting stripped. Linux keeps the lean
+    # core and reaches voice through the `[voice]` extra below.
+    "websockets>=14.0; sys_platform == 'darwin'",
+    "sounddevice>=0.5; sys_platform == 'darwin'",
+    "certifi>=2024.0; sys_platform == 'darwin'",
+    "onnxruntime>=1.20; sys_platform == 'darwin'",
+    "pyobjc-framework-Speech>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-AVFoundation>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
