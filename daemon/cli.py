@@ -296,7 +296,17 @@ def _install(settings: Settings, *, force: bool) -> int:
     # (spec §1). The launcher execs the real `daemon run` under the .app identity.
     from daemon.macapp import build_bundle
 
-    launcher = build_bundle(APP_DIR)
+    try:
+        launcher = build_bundle(APP_DIR)
+    except (RuntimeError, OSError) as exc:
+        # build_bundle raises a bare RuntimeError on a codesign failure and
+        # FileNotFoundError (an OSError) when codesign is not on PATH (an
+        # Xcode-less machine). ServiceError is a RuntimeError subclass, so
+        # `except ServiceError` above this branch would NOT catch either one -
+        # it would escape main() as a raw traceback, which is exactly what an
+        # operator command must not do (module docstring).
+        print(f"daemon: could not build {APP_DIR.name}: {exc}", file=sys.stderr)
+        return PROBLEM
     daemon_argv = default_program()  # (…/daemon, "run") - what the launcher execs
     service = Service(
         label=settings.service_label,
@@ -318,6 +328,19 @@ def _uninstall(settings: Settings) -> int:
     return rc
 
 
+def _grant_open_argv(app: Path, daemon_argv: tuple[str, ...]) -> list[str]:
+    """The `open` argv for the one-time foreground grant.
+
+    `daemon_argv` is `default_program()`'s result - either the 2-tuple
+    `(daemon, "run")` or the 4-tuple `(python, "-m", "daemon.cli", "run")` (a
+    checkout with no console script installed). Either way the trailing element is
+    the `run` subcommand, which must become `request-mic`; everything before it
+    (the interpreter and, in the checkout case, `-m daemon.cli`) has to be kept, or
+    the launcher execs `python request-mic` and silently fails to pop the prompt.
+    """
+    return ["open", str(app), "--args", *daemon_argv[:-1], "request-mic"]
+
+
 def _grant_microphone_once(launcher: Path, daemon_argv: tuple[str, ...]) -> None:
     """Launch the .app foreground so the mic prompt appears under its TCC identity.
 
@@ -329,8 +352,9 @@ def _grant_microphone_once(launcher: Path, daemon_argv: tuple[str, ...]) -> None
     print("\nA microphone permission dialog will appear - click Allow.")
     print("(Daemon listens for its wake word; the grant persists across reboots and updates.)")
     # Fixed argv vector, no shell (CONTRACTS 13): open the bundle and pass the
-    # launcher the daemon path + the request-mic subcommand.
-    subprocess.run(["open", str(app), "--args", daemon_argv[0], "request-mic"], check=False)
+    # launcher the daemon path (+ any `-m daemon.cli` prefix) + the request-mic
+    # subcommand.
+    subprocess.run(_grant_open_argv(app, daemon_argv), check=False)
 
 
 def _setup(*, check_only: bool) -> int:

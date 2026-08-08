@@ -367,6 +367,65 @@ def test_macos_install_writes_launcher_first_in_the_plist(tmp_path: Path) -> Non
     assert launcher_index < daemon_index < run_index
 
 
+def test_grant_open_argv_keeps_only_the_console_script_path() -> None:
+    """default_program()'s console-script shape: (daemon, "run")."""
+    argv = cli._grant_open_argv(Path("/A/Daemon.app"), ("/x/daemon", "run"))
+
+    assert argv[-3:] == ["--args", "/x/daemon", "request-mic"]
+    assert "run" not in argv
+
+
+def test_grant_open_argv_keeps_the_module_prefix_for_a_checkout() -> None:
+    """default_program()'s checkout-fallback shape: (python, "-m", "daemon.cli",
+    "run") - the bug this covers: the old code took only daemon_argv[0] (the
+    python executable) and dropped `-m daemon.cli`, so the launcher execed
+    `python request-mic`, which fails silently and never pops the prompt.
+    """
+    argv = cli._grant_open_argv(
+        Path("/A/Daemon.app"), ("/usr/bin/python3", "-m", "daemon.cli", "run")
+    )
+
+    assert argv[-5:] == ["--args", "/usr/bin/python3", "-m", "daemon.cli", "request-mic"]
+    assert "run" not in argv
+
+
+def test_install_reports_a_codesign_failure_instead_of_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """build_bundle raises a bare RuntimeError on a codesign failure. It is a
+    RuntimeError subclass of ServiceError's own base, so `except ServiceError` in
+    main() would NOT catch it - it must be handled inside `_install` itself, before
+    any Service is constructed (no launchctl/codesign/open is reached).
+    """
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+
+    def fail(app_path: Path) -> Path:
+        raise RuntimeError("codesign failed: errSecInternalComponent")
+
+    monkeypatch.setattr("daemon.macapp.build_bundle", fail)
+
+    settings = Settings()
+    assert cli._install(settings, force=False) == 1
+    assert "daemon:" in capsys.readouterr().err
+
+
+def test_install_reports_missing_codesign_instead_of_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FileNotFoundError (an OSError) is what a subprocess call raises when
+    `codesign` is not on PATH at all - an Xcode-less acceptance Mac."""
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+
+    def fail(app_path: Path) -> Path:
+        raise FileNotFoundError("codesign")
+
+    monkeypatch.setattr("daemon.macapp.build_bundle", fail)
+
+    settings = Settings()
+    assert cli._install(settings, force=False) == 1
+    assert "daemon:" in capsys.readouterr().err
+
+
 def test_status_calls_status(service: FakeService, capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["status"]) == 0
     assert service.calls == [("status", None)]
