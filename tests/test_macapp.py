@@ -7,17 +7,25 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from daemon.macapp import BUNDLE_ID, build_bundle
-from daemon.service import RunResult
-
-pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS bundle tooling")
+from daemon import macapp
+from daemon.config import Settings
+from daemon.macapp import (
+    APP_DIR,
+    BUNDLE_ID,
+    build_bundle,
+    build_resident_service,
+    grant_after_install,
+)
+from daemon.service import RunResult, Service, default_program
 
 LAUNCHER = Path(__file__).resolve().parent.parent / "daemon" / "macapp" / "launcher"
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="lipo is macOS-only")
 def test_committed_launcher_is_universal2_macho() -> None:
     assert LAUNCHER.exists(), "the prebuilt launcher must be committed (spec §7)"
     archs = subprocess.run(
@@ -82,3 +90,80 @@ def test_build_bundle_raises_when_codesign_fails(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="codesign"):
         build_bundle(tmp_path / "Daemon.app", runner=Failing())
+
+
+# --- the shared residency builder + grant gate (daemon install AND setup use it) --
+
+
+def test_build_resident_service_is_the_plain_service_off_darwin(monkeypatch) -> None:
+    """Off macOS, residency is the plain console-script service - no .app, and no
+    launcher in its ProgramArguments."""
+    monkeypatch.setattr(macapp.sys, "platform", "linux")
+    service = build_resident_service(Settings(_env_file=None, preset="offline"))
+    assert service.program == default_program()
+
+
+def test_build_resident_service_points_the_launchagent_at_the_launcher_on_darwin(
+    monkeypatch, tmp_path
+) -> None:
+    """On macOS the LaunchAgent must start Daemon.app's launcher (argv[0]), which
+    then execs the real daemon argv. build_bundle is stubbed so no codesign runs."""
+    monkeypatch.setattr(macapp.sys, "platform", "darwin")
+    fake_launcher = tmp_path / "Daemon.app" / "Contents" / "MacOS" / "launcher"
+    monkeypatch.setattr(macapp, "build_bundle", lambda app_dir: fake_launcher)
+
+    service = build_resident_service(Settings(_env_file=None, preset="offline"))
+
+    assert service.program == (str(fake_launcher), *default_program())
+
+
+def test_grant_after_install_pops_the_grant_for_a_real_launcher_service(
+    monkeypatch, tmp_path
+) -> None:
+    """The one place the mic prompt fires: a resident whose ProgramArguments point at
+    Daemon.app's launcher. grant_microphone_once is stubbed so no real `open` runs."""
+    monkeypatch.setattr(macapp.sys, "platform", "darwin")
+    launcher = str(APP_DIR / "Contents" / "MacOS" / "launcher")
+    calls: list[tuple[Path, tuple[str, ...]]] = []
+    monkeypatch.setattr(
+        macapp, "grant_microphone_once", lambda lp, argv: calls.append((lp, argv))
+    )
+    service = Service(
+        label="default",
+        working_dir=tmp_path,
+        log_dir=tmp_path,
+        program=(launcher, "/x/daemon", "run"),
+        home=tmp_path,
+        platform="darwin",
+        runner=lambda command: RunResult(0),
+    )
+
+    grant_after_install(service)
+
+    assert calls == [(Path(launcher), ("/x/daemon", "run"))]
+
+
+def test_grant_after_install_is_a_noop_for_a_plain_or_fake_service(monkeypatch) -> None:
+    """A plain (Linux) service or a FakeService (setup's residency tests inject one
+    with no `program`) has no Daemon.app launcher, so the grant never runs. That gate
+    is what keeps setup's tests off AVFoundation on a developer's Mac."""
+    monkeypatch.setattr(macapp.sys, "platform", "darwin")
+    calls: list[int] = []
+    monkeypatch.setattr(macapp, "grant_microphone_once", lambda lp, argv: calls.append(1))
+
+    grant_after_install(SimpleNamespace())  # no `program` at all, like FakeService
+    grant_after_install(SimpleNamespace(program=("/usr/local/bin/daemon", "run")))
+
+    assert calls == []
+
+
+def test_grant_after_install_is_a_noop_off_darwin(monkeypatch) -> None:
+    """Even a launcher-shaped program does not prompt off macOS - there is no TCC."""
+    monkeypatch.setattr(macapp.sys, "platform", "linux")
+    calls: list[int] = []
+    monkeypatch.setattr(macapp, "grant_microphone_once", lambda lp, argv: calls.append(1))
+    launcher = str(APP_DIR / "Contents" / "MacOS" / "launcher")
+
+    grant_after_install(SimpleNamespace(program=(launcher, "/x/daemon", "run")))
+
+    assert calls == []

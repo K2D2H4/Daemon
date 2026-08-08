@@ -23,7 +23,7 @@ import pytest
 from conftest import FakeProvider
 
 from daemon import app as daemon_app
-from daemon import cli
+from daemon import cli, macapp
 from daemon.config import Route, Settings
 from daemon.fs import DIR_MODE
 from daemon.llm.gateway import LLMGateway
@@ -115,12 +115,15 @@ class FakeService:
 @pytest.fixture
 def service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> FakeService:
     fake = FakeService(tmp_path / "ai.daemon.default.plist")
+    # `_uninstall` builds the service via `cli.service_for`; `_install` goes through
+    # the shared, .app-aware `daemon.macapp.build_resident_service`. Patch both so the
+    # generic dispatch tests never construct a real Service.
     monkeypatch.setattr(cli, "service_for", lambda settings: fake)
-    # These tests exercise the generic (non-macOS) dispatch, which is what
-    # `service_for` stood in for before install/uninstall grew a macOS-specific
-    # branch. Pin the platform so the test is deterministic on every dev machine
-    # and never takes the real `.app`/launchctl/mic path (tests/CLAUDE.md: no test
-    # may touch a microphone).
+    monkeypatch.setattr("daemon.macapp.build_resident_service", lambda settings: fake)
+    # Pin the platform so the test is deterministic on every dev machine and never
+    # takes the real `.app`/launchctl/mic path - and, for uninstall, never rmtrees a
+    # developer's real ~/Applications/Daemon.app (tests/CLAUDE.md: no test may touch
+    # a microphone, and none may delete real user files).
     monkeypatch.setattr(cli.sys, "platform", "linux")
     return fake
 
@@ -507,7 +510,7 @@ def test_uninstall_calls_uninstall(service: FakeService) -> None:
 
 
 def test_macos_program_puts_launcher_first_then_daemon_argv() -> None:
-    program = cli._macos_program(
+    program = macapp.macos_program(
         Path("/Users/x/Applications/Daemon.app/Contents/MacOS/launcher"),
         ("/Users/x/.local/bin/daemon", "run"),
     )
@@ -527,7 +530,7 @@ def test_macos_install_writes_launcher_first_in_the_plist(tmp_path: Path) -> Non
     """
     launcher = tmp_path / "Applications" / "Daemon.app" / "Contents" / "MacOS" / "launcher"
     daemon_path = "/x/.local/bin/daemon"
-    program = cli._macos_program(launcher, (daemon_path, "run"))
+    program = macapp.macos_program(launcher, (daemon_path, "run"))
 
     def fake_runner(command: object) -> RunResult:
         return RunResult(0)
@@ -554,7 +557,7 @@ def test_macos_install_writes_launcher_first_in_the_plist(tmp_path: Path) -> Non
 
 def test_grant_open_argv_keeps_only_the_console_script_path() -> None:
     """default_program()'s console-script shape: (daemon, "run")."""
-    argv = cli._grant_open_argv(Path("/A/Daemon.app"), ("/x/daemon", "run"))
+    argv = macapp.grant_open_argv(Path("/A/Daemon.app"), ("/x/daemon", "run"))
 
     assert argv[-3:] == ["--args", "/x/daemon", "request-mic"]
     assert "run" not in argv
@@ -566,7 +569,7 @@ def test_grant_open_argv_keeps_the_module_prefix_for_a_checkout() -> None:
     python executable) and dropped `-m daemon.cli`, so the launcher execed
     `python request-mic`, which fails silently and never pops the prompt.
     """
-    argv = cli._grant_open_argv(
+    argv = macapp.grant_open_argv(
         Path("/A/Daemon.app"), ("/usr/bin/python3", "-m", "daemon.cli", "run")
     )
 

@@ -91,8 +91,9 @@ from daemon.config import (
     providers_for,
 )
 from daemon.fs import secure_dir, write_private_replace
+from daemon.macapp import build_resident_service, grant_after_install
 from daemon.service import SUPPORTED as SERVICE_PLATFORMS
-from daemon.service import Service, ServiceError, service_for
+from daemon.service import Service, ServiceError
 from daemon.tasks import Task
 from daemon.tui import (
     Choice,
@@ -1605,7 +1606,7 @@ class Wizard:
     prompt: Prompt
     checks: Checks = field(default_factory=Checks)
     opener: Callable[[str], object] = webbrowser.open
-    service_factory: Callable[[Settings], Service] = service_for
+    service_factory: Callable[[Settings], Service] = build_resident_service
     """Builds the OS service for the residency step. Injected so tests drive it
     without `launchctl` - the default is the same builder `daemon install` uses."""
     sleep: Callable[[float], None] = time.sleep
@@ -2236,7 +2237,16 @@ class Wizard:
     def _install_and_check(self, settings: Settings) -> int:
         say = self.prompt.say
         theme = self.prompt.theme
-        service = self.service_factory(settings)
+        try:
+            service = self.service_factory(settings)
+        except (RuntimeError, OSError) as exc:
+            # macOS: build_resident_service builds Daemon.app, which raises on a
+            # codesign failure or a missing codesign. A sentence, not a traceback -
+            # the same rule the ServiceError branch below follows.
+            say(status(theme, "warn", f"could not build the app bundle: {exc}"))
+            say()
+            self._residency_hint()
+            return OK
         try:
             action = service.install()
         except ServiceError as exc:
@@ -2261,6 +2271,10 @@ class Wizard:
             # e.g. systemd's linger warning - the difference between surviving a
             # reboot and not.
             say(f"  {note}")
+        # macOS: pop the one-time mic prompt under the .app identity, once installed.
+        # Gated inside grant_after_install to a real launcher-Service, so a
+        # FakeService (tests) or a Linux service never runs it.
+        grant_after_install(service)
         say()
         return self._await_awake(service, settings)
 
@@ -2661,7 +2675,7 @@ def run(
     stdout: TextIO | None = None,
     checks: Checks | None = None,
     opener: Callable[[str], object] = webbrowser.open,
-    service_factory: Callable[[Settings], Service] = service_for,
+    service_factory: Callable[[Settings], Service] = build_resident_service,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     path = Path(env_path) if env_path is not None else Path.cwd() / ENV_FILE
