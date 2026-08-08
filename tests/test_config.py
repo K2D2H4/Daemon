@@ -613,15 +613,16 @@ def test_tools_are_on_and_full_by_default() -> None:
     own machine, a prompt before every action is the "chat with extra steps" the
     product exists not to be. What keeps that from being reckless is not a mode - it
     is the origin gate, which no mode can switch off (a turn that is not the owner's
-    own words reaches no tool). The two groups that read more than the owner's own
-    files - the browser and MCP - are still off behind their own switches."""
+    own words reaches no tool). The browser group - the one that reads an
+    authenticated session the owner never named - is still off behind its own
+    switch. MCP is on, but launches nothing until a server is configured."""
     settings = make_settings(preset="offline", ollama_model="gemma3:4b")
     assert settings.tools_enabled is True
     assert settings.tools_mode == "full"
     assert settings.tools_allowlist == ()
     assert settings.tools_roots == ("~",)
     assert settings.browser_enabled is False
-    assert settings.mcp_enabled is False
+    assert settings.mcp_enabled is True
 
 
 def test_gemini_thinking_defaults_to_low_and_rejects_junk() -> None:
@@ -756,6 +757,25 @@ def test_an_empty_browser_app_fails_at_startup() -> None:
             DAEMON_TOOLS_ENABLED=True,
             DAEMON_BROWSER_ENABLED=True,
             DAEMON_BROWSER_APP="  ",
+        )
+
+
+def test_screen_defaults_off() -> None:
+    """Seeing the screen is its own decision, separate from browser and tools -
+    off until asked for, the same as browser_enabled."""
+    settings = make_settings(preset="offline", ollama_model="gemma3:4b")
+    assert settings.screen_enabled is False
+
+
+def test_screen_enabled_requires_tools() -> None:
+    """The screen tools are tools; with the layer off nothing would register them,
+    so the setting would silently do nothing (mirrors the browser check)."""
+    with pytest.raises(ConfigError, match="DAEMON_TOOLS_ENABLED"):
+        make_settings(
+            preset="offline",
+            ollama_model="gemma3:4b",
+            DAEMON_TOOLS_ENABLED=False,
+            DAEMON_SCREEN_ENABLED=True,
         )
 
 

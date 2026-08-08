@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from daemon.llm.base import ToolSpec
+from daemon.llm.base import ImageBlock, ToolSpec
 
 Risk = Literal["safe", "guarded"]
 
@@ -45,6 +45,20 @@ class ToolResult:
     content: str
     ok: bool = True
     elapsed_ms: int = 0
+    images: tuple[ImageBlock, ...] = ()
+    """Images this call captured, carried back so the loop can attach them as a
+    user turn (Task 1.6)."""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolOutput:
+    """What a tool returns when it produces more than text - today, images. A tool
+    may still return a bare `str`; `ToolRunner` normalises both into a `ToolResult`.
+    Deliberately minimal: only what the tool can produce, not the audit identity
+    (call_id/name/ok) the runner owns."""
+
+    content: str
+    images: tuple[ImageBlock, ...] = ()
 
 
 @runtime_checkable
@@ -56,8 +70,10 @@ class Tool(Protocol):
         """One line describing this specific call, for approval and audit."""
         ...
 
-    async def run(self, arguments: Mapping[str, Any]) -> str:
-        """Do the thing. Raise `ToolError` for anything the model should see."""
+    async def run(self, arguments: Mapping[str, Any]) -> str | ToolOutput:
+        """Do the thing. Raise `ToolError` for anything the model should see.
+
+        May return a `ToolOutput` instead of a bare `str` to carry images."""
         ...
 
 
@@ -97,6 +113,18 @@ class Registry:
             # collides with a built-in is the realistic way to get here.
             raise ValueError(f"tool {name!r} is already registered")
         self._tools[name] = tool
+
+    def unregister(self, name: str) -> bool:
+        """Take a tool back out, returning whether one was there.
+
+        The inverse of `register`, for MCP hot-reload: disconnecting a server removes
+        its tools so the model stops being offered something that will now fail, and
+        so the server can reconnect and take its old name back past `register`'s
+        collision guard. Idempotent on purpose - a disconnect that half-happened must
+        be safe to retry, so removing a name that is already gone is a no-op, not an
+        error.
+        """
+        return self._tools.pop(name, None) is not None
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)

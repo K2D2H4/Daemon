@@ -17,9 +17,9 @@ from typing import Any
 import pytest
 
 from daemon import clock
-from daemon.llm.base import ToolCall, ToolSpec
+from daemon.llm.base import ImageBlock, ToolCall, ToolSpec
 from daemon.memory.store import Store
-from daemon.tools.base import Registry, ToolError, canonical_arguments
+from daemon.tools.base import Registry, ToolError, ToolOutput, canonical_arguments
 from daemon.tools.builtin import (
     NOTIFY_SCRIPT,
     ListDir,
@@ -185,6 +185,174 @@ async def test_read_file_that_is_missing_explains_itself(
     with pytest.raises(ToolError) as caught:
         await ReadFile(scope).run({"path": str(tmp_path / "nope.md")})
     assert "does not exist" in str(caught.value)
+
+
+# --- read_file: documents, not just text ------------------------------------
+#
+# The measured bug: `read_file` on a PDF decoded its bytes as UTF-8 and handed
+# back 32% replacement characters, which the model turned into a confabulated
+# "internal error". These build the four common document formats by hand - no
+# library, no network, no fixture files - and assert the *content* comes out.
+
+
+def _make_pdf(text: str) -> bytes:
+    """A minimal one-page PDF whose text object is Flate-compressed, exactly like
+    the real resume that surfaced the bug - so the raw bytes do NOT contain the
+    text and the test can only pass through genuine extraction. Offsets are
+    computed so the xref is valid. ASCII only: a simple Helvetica font cannot
+    encode CJK, so Korean coverage lives in the Office formats below."""
+    import zlib
+
+    content = zlib.compress(f"BT /F1 24 Tf 72 700 Td ({text}) Tj ET".encode("latin-1"))
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+        b"/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>",
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+        b"<</Length %d/Filter/FlateDecode>>stream\n%s\nendstream" % (len(content), content),
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for index, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % index + body + b"\nendobj\n"
+    xref_pos = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    out += b"trailer\n<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF" % (
+        len(objects) + 1,
+        xref_pos,
+    )
+    return bytes(out)
+
+
+def _zip_bytes(members: dict[str, str]) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    # DEFLATED, not the default STORED: a stored member leaves its text as
+    # plaintext inside the archive, and a raw UTF-8 decode would then "find" it
+    # without any real extraction - a test that passes for the wrong reason.
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, body in members.items():
+            archive.writestr(name, body)
+    return buf.getvalue()
+
+
+def _make_docx(paragraphs: list[str]) -> bytes:
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = "".join(f"<w:p><w:r><w:t>{p}</w:t></w:r></w:p>" for p in paragraphs)
+    doc = f'<?xml version="1.0"?><w:document xmlns:w="{ns}"><w:body>{body}</w:body></w:document>'
+    return _zip_bytes({"word/document.xml": doc})
+
+
+def _make_pptx(slides: list[str]) -> bytes:
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    members = {}
+    for index, text in enumerate(slides, start=1):
+        pns = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        members[f"ppt/slides/slide{index}.xml"] = (
+            f'<?xml version="1.0"?><p:sld xmlns:p="{pns}" xmlns:a="{ns}">'
+            f"<a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:sld>"
+        )
+    return _zip_bytes(members)
+
+
+def _make_xlsx(strings: list[str]) -> bytes:
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    shared = "".join(f"<si><t>{s}</t></si>" for s in strings)
+    cells = "".join(
+        f'<row><c t="s"><v>{i}</v></c></row>' for i in range(len(strings))
+    )
+    return _zip_bytes(
+        {
+            "xl/sharedStrings.xml": f'<sst xmlns="{ns}">{shared}</sst>',
+            "xl/worksheets/sheet1.xml": (
+                f'<worksheet xmlns="{ns}"><sheetData>{cells}</sheetData></worksheet>'
+            ),
+        }
+    )
+
+
+async def test_read_file_extracts_text_from_a_pdf(scope: PathScope, tmp_path: Path) -> None:
+    (tmp_path / "resume.pdf").write_bytes(_make_pdf("Daehyun Kim Senior Engineer"))
+    out = await ReadFile(scope).run({"path": str(tmp_path / "resume.pdf")})
+    assert "Daehyun Kim Senior Engineer" in out
+
+
+async def test_read_file_says_when_a_pdf_has_no_extractable_text(
+    scope: PathScope, tmp_path: Path
+) -> None:
+    """A scanned resume is images, not text. Better to say so than return empty
+    and let the model claim it read something."""
+    (tmp_path / "scan.pdf").write_bytes(_make_pdf(""))
+    out = await ReadFile(scope).run({"path": str(tmp_path / "scan.pdf")})
+    assert "no" in out.lower() and "text" in out.lower()
+
+
+async def test_read_file_extracts_korean_from_a_docx(scope: PathScope, tmp_path: Path) -> None:
+    (tmp_path / "note.docx").write_bytes(_make_docx(["대현 님 이력서", "시니어 엔지니어"]))
+    out = await ReadFile(scope).run({"path": str(tmp_path / "note.docx")})
+    assert "대현 님 이력서" in out
+    assert "시니어 엔지니어" in out
+
+
+async def test_read_file_extracts_text_from_a_pptx(scope: PathScope, tmp_path: Path) -> None:
+    (tmp_path / "deck.pptx").write_bytes(_make_pptx(["첫 슬라이드", "두 번째 슬라이드"]))
+    out = await ReadFile(scope).run({"path": str(tmp_path / "deck.pptx")})
+    assert "첫 슬라이드" in out
+    assert "두 번째 슬라이드" in out
+
+
+async def test_read_file_extracts_text_from_an_xlsx(scope: PathScope, tmp_path: Path) -> None:
+    (tmp_path / "sheet.xlsx").write_bytes(_make_xlsx(["매출", "이름", "김대현"]))
+    out = await ReadFile(scope).run({"path": str(tmp_path / "sheet.xlsx")})
+    assert "매출" in out
+    assert "김대현" in out
+
+
+async def test_read_file_refuses_an_opaque_binary_honestly(
+    scope: PathScope, tmp_path: Path
+) -> None:
+    """The heart of the bug: don't hand back binary garbage as if it were text.
+    A PNG (has a NUL byte) is not readable, and read_file must say that plainly."""
+    (tmp_path / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 40)
+    with pytest.raises(ToolError) as caught:
+        await ReadFile(scope).run({"path": str(tmp_path / "photo.png")})
+    message = str(caught.value).lower()
+    assert "text" in message  # it explains it is not text, not a fake error
+
+
+async def test_read_file_refuses_a_document_too_large_on_disk(
+    scope: PathScope, tmp_path: Path
+) -> None:
+    """The document path must honour the same input-size ceiling READ_MAX_BYTES
+    gives the text path - a measured guard (a huge file blew RSS past 600 MB).
+    Extraction runs before any bounded read, so the ceiling has to be checked up
+    front from the file size on disk."""
+    (tmp_path / "huge.pdf").write_bytes(b"%PDF-1.4\n" + b"x" * 500)
+    reader = ReadFile(scope, max_document_bytes=200)
+    with pytest.raises(ToolError) as caught:
+        await reader.run({"path": str(tmp_path / "huge.pdf")})
+    assert "large" in str(caught.value).lower()
+
+
+async def test_read_file_refuses_a_decompression_bomb_document(
+    scope: PathScope, tmp_path: Path
+) -> None:
+    """An OOXML file is tiny on disk but can expand to gigabytes - the realistic
+    hazard when the owner reads a document a third party sent. A member that
+    decompresses past the ceiling must be refused, not fully expanded into memory."""
+    (tmp_path / "bomb.docx").write_bytes(_make_docx(["A" * 3_000_000]))
+    assert (tmp_path / "bomb.docx").stat().st_size < 100_000  # tiny on disk
+    reader = ReadFile(scope, max_uncompressed=1_000_000)
+    with pytest.raises(ToolError) as caught:
+        await reader.run({"path": str(tmp_path / "bomb.docx")})
+    message = str(caught.value).lower()
+    assert "large" in message or "expand" in message
 
 
 async def test_write_file_creates_then_overwrites(scope: PathScope, tmp_path: Path) -> None:
@@ -517,6 +685,48 @@ async def test_a_tool_that_raises_unexpectedly_does_not_end_the_round(
     assert not outcome.results[0].ok
     assert "upstream fell over" in outcome.results[0].content
     assert outcome.results[1].ok, "one broken tool must not take the round down"
+
+
+async def test_a_tool_returning_tool_output_carries_its_images(
+    store: Store, tmp_path: Path
+) -> None:
+    """The bridge Task 1.7 adds: a tool may return `ToolOutput` instead of a bare
+    `str`, and the runner must carry its images into the `ToolResult` the loop
+    turns into a framed user message (Task 1.6)."""
+
+    class SeesSomething:
+        risk = "safe"
+        spec = ToolSpec(name="sees_something", description="looks", parameters={"type": "object"})
+
+        def preview(self, arguments: Any) -> str:
+            return "look"
+
+        async def run(self, arguments: Any) -> ToolOutput:
+            return ToolOutput("txt", (ImageBlock(b"..", "image/jpeg"),))
+
+    registry = Registry()
+    registry.register(SeesSomething())
+    tools = ToolRunner(registry, ToolPolicy(store, mode="full"), store)
+
+    outcome = await tools.execute(
+        [ToolCall(id="1", name="sees_something", arguments={})], CONTEXT
+    )
+    result = outcome.results[0]
+    assert result.content == "txt"
+    assert result.images == (ImageBlock(b"..", "image/jpeg"),)
+
+
+async def test_a_tool_returning_a_plain_string_carries_no_images(
+    store: Store, tmp_path: Path
+) -> None:
+    """Every existing tool returns a bare `str`; the bridge must not force images
+    onto them."""
+    (tmp_path / "notes.md").write_text("hello")
+    outcome = await runner(store, tmp_path, mode="full").execute(
+        [ToolCall(id="1", name="read_file", arguments={"path": str(tmp_path / "notes.md")})],
+        CONTEXT,
+    )
+    assert outcome.results[0].images == ()
 
 
 async def test_calls_run_in_the_order_they_were_asked_for(store: Store, tmp_path: Path) -> None:

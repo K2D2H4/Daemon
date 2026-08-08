@@ -110,9 +110,9 @@ class Hang:
 class FakeSession:
     """A scripted `VoiceSession`, protocol-complete.
 
-    All seven methods are the protocol's now, including the three the audit added
-    and `send_tool_response`, so the conversation calls them rather than hunting for
-    them - and a fake that lacked one would fail
+    All eight methods are the protocol's now, including the three the audit added,
+    `send_tool_response`, and `send_frame` (ADR 0009), so the conversation calls
+    them rather than hunting for them - and a fake that lacked one would fail
     `test_the_fakes_satisfy_the_protocols` instead of quietly exercising a fallback
     the product does not have.
 
@@ -127,6 +127,7 @@ class FakeSession:
         self.script = list(script)
         self.events = events if events is not None else []
         self.sent: list[bytes] = []
+        self.frames: list[bytes] = []
         self.texts: list[str] = []
         self.contexts: list[str] = []
         self.sent_while_generating: list[str] = []
@@ -152,6 +153,9 @@ class FakeSession:
 
     async def send_audio(self, chunk: bytes) -> None:
         self.sent.append(chunk)
+
+    async def send_frame(self, jpeg: bytes) -> None:
+        self.frames.append(jpeg)
 
     async def send_text(self, text: str) -> None:
         self.texts.append(text)
@@ -767,9 +771,10 @@ async def test_the_user_speaking_first_is_not_a_barge_in() -> None:
 # A spoken tool call is the same event as a typed one (daemon/voice/base.py): the
 # model asks, `receive()` yields a `ToolCall`, and the conversation runs it through
 # the same `Companion.run_tools` the text loop uses and hands the result back with
-# `send_tool_response`. Voice is pinned to `allowlist` mode in `daemon/app.py`, so
-# the only two outcomes at call time are run-it and refuse-it - there is nowhere in
-# a spoken turn to ask, so nothing is ever parked.
+# `send_tool_response`. Voice follows the owner's `DAEMON_TOOLS_MODE` but degrades
+# `ask` to `allowlist` in `daemon/app.py`, so the only two outcomes at call time are
+# run-it and refuse-it - there is nowhere in a spoken turn to ask, so nothing is ever
+# parked.
 
 
 def _read_file_call(path: pathlib.Path, call_id: str = "1") -> ToolCall:
@@ -865,11 +870,11 @@ async def test_an_unlisted_command_is_refused_and_the_model_is_told_why(
 async def test_a_guarded_write_is_refused_outright_never_parked(
     db: Any, tmp_path: pathlib.Path
 ) -> None:
-    """The reason voice is pinned to `allowlist`: `ask` mode would mint an approval
-    row for this and let it lapse unanswered, because nobody is watching a spoken
-    turn for a code. `write_file` is not a command, so `allowlist` cannot match it
-    and refuses it - and no approval is minted, which is the failure this pinning
-    exists to make impossible."""
+    """The reason voice degrades `ask` to `allowlist`: `ask` mode would mint an
+    approval row for this and let it lapse unanswered, because nobody is watching a
+    spoken turn for a code. `write_file` is not a command, so `allowlist` cannot match
+    it and refuses it - and no approval is minted, which is the failure this
+    degradation exists to make impossible."""
     target = tmp_path / "todo.md"
     runner, store = tool_runner(db, tmp_path, mode="allowlist")
     session = FakeSession(
@@ -1759,31 +1764,33 @@ async def test_an_answered_opening_is_not_asked_again(
 # session was actually offered - the only fakes are the hardware and the socket.
 
 
-async def test_run_voice_offers_the_owners_tools_pinned_to_allowlist(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The three things this PR wires and nothing else can see: the tool specs reach
-    the session, the mode is pinned to `allowlist` (not `settings.tools_mode`), and
-    the tool contract reaches the model with them - the endpoint getting tools next
-    inheriting the rules the text path has (daemon/companion.py, TOOL_CONTRACT)."""
-    from daemon import app as app_module
-    from daemon.companion import TOOL_CONTRACT
+def _voice_settings(tmp_path: pathlib.Path, **overrides: str) -> Any:
     from daemon.config import Settings
 
-    settings = Settings(
-        _env_file=None,
-        DAEMON_PRESET="balanced",
-        DAEMON_OLLAMA_MODEL="gemma3:4b",
-        DAEMON_DATA_DIR=str(tmp_path),
-        TELEGRAM_BOT_TOKEN="123456:AAHfake-token-value",
-        DAEMON_HOSTED_PROVIDER="gemini",
-        GEMINI_API_KEY="k",
-        DAEMON_VOICE_ENABLED="true",
-        DAEMON_GEMINI_LIVE_MODEL="gemini-3.1-flash-live-preview",
-        DAEMON_GEMINI_MODEL="gemini-3.5-flash",
-        DAEMON_TOOLS_ENABLED="true",
-        DAEMON_TOOLS_ROOTS=str(tmp_path),
-    )
+    base = {
+        "_env_file": None,
+        "DAEMON_PRESET": "balanced",
+        "DAEMON_OLLAMA_MODEL": "gemma3:4b",
+        "DAEMON_DATA_DIR": str(tmp_path),
+        "TELEGRAM_BOT_TOKEN": "123456:AAHfake-token-value",
+        "DAEMON_HOSTED_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "k",
+        "DAEMON_VOICE_ENABLED": "true",
+        "DAEMON_GEMINI_LIVE_MODEL": "gemini-3.1-flash-live-preview",
+        "DAEMON_GEMINI_MODEL": "gemini-3.5-flash",
+        "DAEMON_TOOLS_ENABLED": "true",
+        "DAEMON_TOOLS_ROOTS": str(tmp_path),
+    }
+    base.update(overrides)
+    return Settings(**base)
+
+
+async def _run_voice_capturing(
+    settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    """Run `run_voice` once with a fake session and spy on the mode `_build_tools`
+    is asked for and the kwargs the session is built with."""
+    from daemon import app as app_module
 
     captured: dict[str, Any] = {}
 
@@ -1803,12 +1810,195 @@ async def test_run_voice_offers_the_owners_tools_pinned_to_allowlist(
     monkeypatch.setattr("daemon.voice.gemini_live.GeminiLiveSession", capturing_session)
 
     code = await app_module.run_voice(settings)
+    return code, seen, captured
+
+
+async def test_run_voice_follows_the_owners_tool_mode(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Voice honours the owner's configured `DAEMON_TOOLS_MODE` - `full` here, the
+    install default - rather than pinning `allowlist` and silently refusing guarded
+    tools the owner asked for by voice. A microphone has no relay path, so a spoken
+    turn is the owner's own words and the origin gate is the real boundary; running
+    `full` there is the same authority the text path already has (memory: tools
+    default to full). Also checks the specs reach the session and the tool contract
+    rides with them (daemon/companion.py, TOOL_CONTRACT)."""
+    from daemon.companion import TOOL_CONTRACT
+
+    settings = _voice_settings(tmp_path, DAEMON_TOOLS_MODE="full")
+    code, seen, captured = await _run_voice_capturing(settings, monkeypatch)
 
     assert code == 0
-    assert seen.get("mode") == "allowlist", "voice did not pin the tool mode to allowlist"
+    assert seen.get("mode") == "full", "voice did not follow the owner's tool mode"
     specs = captured.get("tools")
     assert specs, "the session was offered no tools, so the model can never call one"
     assert {spec.name for spec in specs} >= {"read_file", "run_command"}
     assert TOOL_CONTRACT in (captured.get("system_instruction") or ""), (
         "the model was handed tools but not the rules for using them"
     )
+
+
+# --- screen-share lifecycle (Task 2.3) ----------------------------------------
+#
+# The pump needs a live VoiceSession, so the conversation binds it once the
+# session is open and stops+unbinds it when the conversation ends - a share must
+# never outlive its session. These tests drive the real `ScreenShareController`
+# and the real `start_screen_share`/`stop_screen_share` tools through the same
+# `_run_tool_call` path a spoken call actually takes, with a fake pump standing in
+# for `ScreenSharePump` so nothing here touches a real screen or socket.
+
+
+class _FakeContextSession:
+    """Records `send_context` calls, standing in for the live session the
+    pump would otherwise hold (Finding 3: the framing seed on share start)."""
+
+    def __init__(self) -> None:
+        self.context_sent: list[str] = []
+
+    async def send_context(self, text: str) -> None:
+        self.context_sent.append(text)
+
+
+class _FakePump:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+        self.session = _FakeContextSession()
+
+    def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+async def test_screen_share_binds_a_fresh_pump_when_the_session_opens() -> None:
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    created: list[_FakePump] = []
+
+    def factory(session: Any) -> _FakePump:
+        assert session is not None
+        pump = _FakePump()
+        created.append(pump)
+        return pump
+
+    session = FakeSession(Turn())
+    conv = conversation(session, screen_share=controller, screen_pump_factory=factory)
+    await run(conv)
+
+    assert len(created) == 1, "the conversation must bind exactly one pump per session"
+
+
+async def test_screen_share_start_stop_tools_drive_the_bound_pump(
+    db: Any,
+) -> None:
+    """The full spoken path: `start_screen_share` flips the bound pump on through
+    `_run_tool_call`, exactly as a real tool call from the model would."""
+    from daemon.tools.screen import screen_share_tools
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    created: list[_FakePump] = []
+
+    def factory(session: Any) -> _FakePump:
+        pump = _FakePump()
+        created.append(pump)
+        return pump
+
+    store = Store(db)
+    registry = Registry()
+    for tool in screen_share_tools(controller):
+        registry.register(tool)
+    runner = ToolRunner(registry, ToolPolicy(store, mode="allowlist", enabled=True), store)
+
+    session = FakeSession(
+        Calls(ToolCall(id="1", name="start_screen_share", arguments={})),
+        Turn(),
+    )
+    conv = conversation(
+        session, screen_share=controller, screen_pump_factory=factory, tools=runner
+    )
+    await run(conv)
+
+    assert len(created) == 1
+    assert created[0].started is True, "the tool call must have started the bound pump"
+    # The conversation ended, so `stop_and_unbind` must have run in `finally` -
+    # a share must never outlive its session.
+    assert created[0].stopped is True
+    assert controller.active is False
+
+
+async def test_screen_share_is_stopped_and_unbound_when_the_conversation_ends() -> None:
+    """Even with no `start_screen_share` call at all: an active share left over
+    from an earlier turn (or a controller reused across a reconnect) must not
+    survive past this session's `run()`."""
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    pump = _FakePump()
+    controller.bind(pump)
+    await controller.start()
+    assert controller.active is True
+
+    session = FakeSession(Turn())
+    conv = conversation(session, screen_share=controller, screen_pump_factory=lambda s: pump)
+    await run(conv)
+
+    assert pump.stopped is True
+    assert controller.active is False
+
+
+async def test_screen_share_unbinds_even_when_run_is_cancelled() -> None:
+    """`run()`'s teardown is a `finally`, so cancellation must not leak a pump -
+    the same guarantee the transcript-recording teardown already has."""
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    created: list[_FakePump] = []
+
+    def factory(session: Any) -> _FakePump:
+        pump = _FakePump()
+        created.append(pump)
+        return pump
+
+    session = FakeSession(Hang())
+    conv = conversation(session, screen_share=controller, screen_pump_factory=factory)
+    task = asyncio.ensure_future(conv.run())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # The share is on when the cancellation lands - the case that actually risks
+    # a leak, since `stop_and_unbind` only calls `pump.stop()` while active.
+    await controller.start()
+    assert created[0].started is True
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=RUN_LIMIT)
+
+    assert len(created) == 1
+    assert created[0].stopped is True
+    assert controller.active is False
+
+
+async def test_conversation_without_screen_share_never_touches_the_controller() -> None:
+    """The default (`screen_share=None`) - the text path never even constructs a
+    controller, and this is the voice case with screen sharing off entirely."""
+    session = FakeSession(Turn())
+    conv = conversation(session)  # no screen_share, no screen_pump_factory
+    await run(conv)  # must not raise
+
+
+async def test_run_voice_degrades_ask_to_allowlist(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one mode a spoken turn cannot honour is `ask`: it has nowhere to surface an
+    approval, so `ask` would mint rows that lapse unanswered - the silent degradation
+    this repo calls the dangerous failure. Voice degrades `ask` to `allowlist` (run
+    what is listed, refuse the rest, never park), so `full` reaches voice but `ask`
+    never does."""
+    settings = _voice_settings(tmp_path, DAEMON_TOOLS_MODE="ask")
+    code, seen, _captured = await _run_voice_capturing(settings, monkeypatch)
+
+    assert code == 0
+    assert seen.get("mode") == "allowlist", "voice did not degrade `ask` to `allowlist`"

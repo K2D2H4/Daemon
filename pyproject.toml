@@ -5,7 +5,9 @@
 # on both registries and unused on GitHub - if a distinct wake word is ever
 # wanted for voice.
 name = "daemon-ai"
-version = "0.0.1"
+# The version lives in `daemon/__init__.py:__version__`; hatchling reads it below.
+# One number, so `daemon --version` and the wheel metadata cannot drift apart.
+dynamic = ["version"]
 description = "An open-source, self-hosted AI companion that you shape - and that reshapes itself around you."
 requires-python = ">=3.13"
 license = { text = "MIT" }
@@ -33,6 +35,13 @@ dependencies = [
     "onnxruntime>=1.20; sys_platform == 'darwin'",
     "pyobjc-framework-Speech>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-AVFoundation>=10.0; sys_platform == 'darwin'",
+    # read_file's PDF path (daemon/tools/extract.py). Pure Python, no system
+    # libraries - deliberately not PyMuPDF, whose compiled wheels a self-hoster on
+    # an odd platform can't always get. The Office formats (.docx/.xlsx/.pptx)
+    # need nothing beyond the standard library, so only PDF costs a dependency;
+    # a companion asked to "read this file" should not choke on the commonest
+    # document there is.
+    "pypdf>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +50,9 @@ voice = [
     # text-only install does not need PortAudio.
     "websockets>=14.0",
     "sounddevice>=0.5",
+    # screen-share only — resize + perceptual-hash dedup; capture itself is
+    # dependency-free.
+    "Pillow>=10.0",
     # Declared rather than relied on transitively through httpx, because the voice
     # session imports it directly. websockets uses ssl.create_default_context(),
     # which on a python.org framework build has zero CAs unless someone ran
@@ -67,7 +79,14 @@ mcp = [
     # beyond the standard library, so an install that only wants Daemon to reach
     # its own machine does not take this on. Imported from daemon/tools/mcp.py
     # alone, which is also where a v2 API change would land.
-    "mcp>=1.9",
+    #
+    # Capped below 2.0: mcp 2.0.0 is a major with a different client surface
+    # (`mcp.client.streamable_http.streamablehttp_client` is gone, among others),
+    # and daemon/tools/mcp.py is written against the 1.x client. Left uncapped, a
+    # fresh install resolved 2.0.0 and url/remote servers broke at import - green
+    # locally on a pinned 1.x, ImportError in CI. Lift this when that one file is
+    # ported to the v2 surface.
+    "mcp>=1.9,<2",
 ]
 dev = [
     "pytest>=8.3",
@@ -81,6 +100,9 @@ daemon = "daemon.app:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "daemon/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["daemon"]

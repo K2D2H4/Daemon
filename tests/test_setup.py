@@ -22,7 +22,8 @@ import httpx
 import pytest
 
 from daemon import cli, setup, tui
-from daemon.setup import EXPAND, Checks, OllamaState, Updates, Verdict
+from daemon.service import ServiceAction, ServiceError, ServiceStatus
+from daemon.setup import EXPAND, Checks, HealthState, OllamaState, Updates, Verdict
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +51,15 @@ def no_network(token: str, offset: int | None, timeout: int) -> Updates:
     raise AssertionError("a test reached the real getUpdates")
 
 
+def no_health(base_url: str) -> HealthState:
+    """The default `health` probe for tests that are not about residency.
+
+    Like `no_network`: `Checks.health` defaults to the real `/health` GET, so a
+    test that reached the residency step by accident would poll a local port.
+    This turns that into a named failure instead."""
+    raise AssertionError("a test reached the real /health")
+
+
 def working_checks() -> Checks:
     """Every provider says yes. Records nothing; use `Recorder` for that."""
     return Checks(
@@ -59,6 +69,7 @@ def working_checks() -> Checks:
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
         ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ("gemma3:4b",)),
         updates=no_network,
+        health=no_health,
     )
 
 
@@ -130,6 +141,8 @@ def drive(
     opener: Callable[[str], object] | None = None,
     stdin: io.TextIOBase | None = None,
     stdout: io.TextIOBase | None = None,
+    tty: bool = False,
+    service_factory: Callable[[Any], Any] | None = None,
 ) -> Run:
     """Run the whole wizard against `answers`, one per prompt.
 
@@ -137,6 +150,11 @@ def drive(
     `Theme` the wizard builds from it cannot emit colour, and every assertion
     below reads text rather than escape sequences. Pass a `FakeTty` to drive the
     coloured path.
+
+    `tty=True` makes *stdin* claim to be a terminal, which is what the guided
+    finish reads to decide whether to offer residency at all. `service_factory`
+    injects a fake `Service` so that step touches no `launchctl`; `sleep` is a
+    no-op so its liveness poll never actually waits.
     """
     env_path = tmp_path / ".env"
     if existing is not None:
@@ -149,12 +167,19 @@ def drive(
             existing = "DAEMON_TOOLS_ENABLED=true\n" + existing
         env_path.write_text(existing, encoding="utf-8")
     out = stdout if stdout is not None else io.StringIO()
+    scripted = "".join(f"{a}\n" for a in answers)
+    default_stdin = FakeTty(scripted) if tty else io.StringIO(scripted)
+    kwargs: dict[str, Any] = {}
+    if service_factory is not None:
+        kwargs["service_factory"] = service_factory
     code = setup.run(
         env_path=env_path,
-        stdin=stdin if stdin is not None else io.StringIO("".join(f"{a}\n" for a in answers)),
+        stdin=stdin if stdin is not None else default_stdin,
         stdout=out,
         checks=checks if checks is not None else working_checks(),
         opener=opener if opener is not None else (lambda url: True),
+        sleep=lambda _seconds: None,
+        **kwargs,
     )
     return Run(code, out.getvalue(), env_path)
 
@@ -3384,3 +3409,339 @@ def test_one_probe_even_when_only_one_of_the_two_lists_came_back(
     assert len(recorder.gemini) == 1
     # The text question still ran, just without a menu - free text is the contract.
     assert "DAEMON_GEMINI_MODEL=gemini-2.5-pro" in result.written
+
+
+# --- keeping it running: the guided finish -----------------------------------
+#
+# The wizard used to end with a printed "Next:" block leaving `daemon install`
+# and the health check as separate chores. It now offers residency and confirms
+# the resident actually woke up, reusing service.Service and the /health endpoint
+# (no second install or health implementation). These tests inject a fake Service
+# so nothing here touches launchctl, and a fake /health probe so nothing polls a
+# port.
+
+# Offline so no hosted key is asked, and the Telegram token is skipped so the
+# pairing step (which polls the network) never runs - leaving a clean path to the
+# residency question at the very end. No token means no channel, so the residency
+# step expects the conversation loop to be legitimately stopped.
+OFFLINE_TO_RESIDENCY = [TOOLS_YES, "1", "gemma3:4b", "", "y", "", "", ""]
+
+# The same, but WITH a Telegram token, so a channel exists and the residency step
+# expects the conversation loop to be running. "n" declines the pairing offer, so
+# nothing polls the network.
+TOKEN_TO_RESIDENCY = answers_for(pairing=["n"])
+
+
+@dataclass
+class FakeService:
+    """Stands in for `daemon.service.Service` in the residency step.
+
+    No plist, no `launchctl`, no server. `install()` returns a scripted
+    `ServiceAction`; `status()` walks `running` one entry per poll (repeating the
+    last), which is how a test says "it came up on the third check" or "it never
+    did"."""
+
+    unit_path: Path
+    err_log: Path
+    action: ServiceAction
+    running: list[bool]
+    detail: str = ""
+    install_error: str = ""
+    installs: int = 0
+    status_calls: int = 0
+
+    def install(self, *, force: bool = False) -> ServiceAction:
+        self.installs += 1
+        if self.install_error:
+            raise ServiceError(self.install_error)
+        return self.action
+
+    def status(self) -> ServiceStatus:
+        running = self.running[min(self.status_calls, len(self.running) - 1)]
+        self.status_calls += 1
+        return ServiceStatus(
+            label="ai.daemon.default",
+            unit_path=self.unit_path,
+            installed=True,
+            loaded=True,
+            running=running,
+            detail=self.detail,
+        )
+
+
+def residency_service(
+    tmp_path: Path,
+    *,
+    running: Sequence[bool] = (True,),
+    applied: bool = True,
+    changes: Sequence[str] = (),
+    notes: Sequence[str] = (),
+    detail: str = "",
+    install_error: str = "",
+) -> FakeService:
+    unit = tmp_path / "ai.daemon.default.plist"
+    err = tmp_path / "logs" / "ai.daemon.default.err.log"
+    action = ServiceAction(
+        label="ai.daemon.default",
+        unit_path=unit,
+        applied=applied,
+        changes=tuple(changes),
+        notes=tuple(notes),
+    )
+    return FakeService(
+        unit_path=unit,
+        err_log=err,
+        action=action,
+        running=list(running),
+        detail=detail,
+        install_error=install_error,
+    )
+
+
+def healthy(_base_url: str) -> HealthState:
+    """Serving, and the conversation loop is running."""
+    return HealthState(True, "conversation loop running", loop="running")
+
+
+def loop_down(_base_url: str) -> HealthState:
+    """Serving /health (status: ok), but the conversation loop is dead - the
+    healthy-looking-but-deaf state a revoked token leaves behind."""
+    return HealthState(True, "conversation loop stopped", loop="stopped")
+
+
+def unhealthy(_base_url: str) -> HealthState:
+    """Not serving at all - connection refused during boot, or a crash."""
+    return HealthState(False, "not answering")
+
+
+def test_residency_is_offered_and_a_yes_installs_and_reports_awake(tmp_path: Path) -> None:
+    # The whole point: setup ends by putting Daemon into residency and then saying,
+    # from the running process itself, that it woke up. A token is set, so the loop
+    # running is what "answering" is allowed to mean.
+    service = residency_service(tmp_path, running=[True])
+    result = drive(
+        tmp_path,
+        [*TOKEN_TO_RESIDENCY, "y"],
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=healthy),
+    )
+
+    assert result.code == 0
+    assert service.installs == 1
+    out = flat(result.out).lower()
+    assert "awake" in out or "running and answering" in out
+
+
+def test_a_no_at_the_residency_question_installs_nothing_and_leaves_a_hint(
+    tmp_path: Path,
+) -> None:
+    service = residency_service(tmp_path)
+    result = drive(
+        tmp_path,
+        [*OFFLINE_TO_RESIDENCY, "n"],
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=healthy),
+    )
+
+    assert result.code == 0
+    assert service.installs == 0
+    # The "아니오" guidance: how to do it by hand later.
+    assert "daemon install" in result.out
+
+
+def test_installed_but_not_answering_is_reported_as_trouble_with_where_to_look(
+    tmp_path: Path,
+) -> None:
+    # A bad config makes the process crash-loop: installed, but /health never
+    # answers. That is "문제있다", and it must name where to look rather than
+    # claiming success.
+    service = residency_service(
+        tmp_path, running=[False], detail="state = not running"
+    )
+    result = drive(
+        tmp_path,
+        [*OFFLINE_TO_RESIDENCY, "y"],
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=unhealthy),
+    )
+
+    assert result.code == 0  # setup itself finished; the daemon not waking is a warning
+    assert service.installs == 1
+    out = result.out
+    assert "not answering" in flat(out).lower()
+    assert "daemon doctor" in out
+    assert str(service.err_log) in out
+
+
+def test_serving_but_the_loop_is_dead_with_a_token_is_trouble(tmp_path: Path) -> None:
+    # launchd says the process exists and /health answers 200 - but its status
+    # field is hardcoded, so the real signal is conversation_loop, which is
+    # "stopped" (a revoked token, say). With a channel configured, that is NOT
+    # awake: it must be named, not painted over as "answering".
+    service = residency_service(tmp_path, running=[True])
+    result = drive(
+        tmp_path,
+        [*TOKEN_TO_RESIDENCY, "y"],
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=loop_down),
+    )
+
+    assert result.code == 0
+    out = flat(result.out).lower()
+    assert "not answering" in out
+    assert "conversation loop is not running" in out
+    assert "awake" not in out
+
+
+def test_without_a_token_serving_is_enough_and_it_does_not_claim_to_answer(
+    tmp_path: Path,
+) -> None:
+    # No token means no channel, so the conversation loop is legitimately stopped.
+    # The process being up is the whole signal available, and "answering" would be
+    # the wrong word - there is nothing to answer on yet.
+    service = residency_service(tmp_path, running=[True])
+    result = drive(
+        tmp_path,
+        [*OFFLINE_TO_RESIDENCY, "y"],
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=loop_down),
+    )
+
+    assert result.code == 0
+    assert service.installs == 1
+    out = flat(result.out).lower()
+    assert "daemon is running" in out
+    assert "running and answering" not in out
+    assert "not answering" not in out  # not a failure - it is up
+
+
+def test_residency_is_not_offered_on_a_pipe(tmp_path: Path) -> None:
+    # Non-interactive (the default StringIO stdin is not a tty): the wizard is
+    # inherently interactive and CI uses `--check`, so the question is skipped and
+    # the manual hint is printed instead. No install is attempted.
+    service = residency_service(tmp_path)
+    result = drive(
+        tmp_path,
+        OFFLINE_TO_RESIDENCY,
+        service_factory=lambda settings: service,
+    )
+
+    assert result.code == 0
+    assert service.installs == 0
+    assert "daemon install" in result.out
+
+
+def test_aborting_the_residency_question_does_not_claim_nothing_was_written(
+    tmp_path: Path,
+) -> None:
+    # Ctrl-D / Ctrl-C at the residency question must not fall through to run()'s
+    # "was not touched" handler: .env was already written by then, the same reason
+    # _finish already shields the seed and pairing steps.
+    service = residency_service(tmp_path)
+    result = drive(
+        tmp_path,
+        OFFLINE_TO_RESIDENCY,  # no trailing install answer: stdin runs out at the question
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=healthy),
+    )
+
+    assert result.code == 0
+    assert service.installs == 0
+    assert "was not touched" not in result.out
+    assert "daemon install" in result.out  # the manual route is still offered
+
+
+def test_an_existing_unit_that_differs_is_not_overwritten(tmp_path: Path) -> None:
+    # service.install() returns applied=False with a diff when a hand-edited unit
+    # file differs. The wizard must not claim it installed, and must point at
+    # --force rather than silently doing nothing.
+    service = residency_service(
+        tmp_path, applied=False, changes=("--- old", "+++ new")
+    )
+    result = drive(
+        tmp_path,
+        [*OFFLINE_TO_RESIDENCY, "y"],
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=healthy),
+    )
+
+    assert result.code == 0
+    assert service.installs == 1
+    assert "--force" in result.out
+
+
+def test_a_service_error_during_install_is_a_sentence_not_a_traceback(
+    tmp_path: Path,
+) -> None:
+    service = residency_service(tmp_path, install_error="not supported on 'win32'")
+    result = drive(
+        tmp_path,
+        [*OFFLINE_TO_RESIDENCY, "y"],
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=healthy),
+    )
+
+    assert result.code == 0
+    assert "not supported" in result.out
+    assert "daemon install" in result.out  # still tells them how to do it by hand
+
+
+# --- the /health probe -------------------------------------------------------
+
+
+def test_check_health_reports_a_running_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        setup.httpx, "get", canned(200, {"status": "ok", "conversation_loop": "running"})
+    )
+
+    state = setup.check_health("http://127.0.0.1:8787")
+
+    assert state.ok
+    assert state.loop == "running"
+
+
+def test_check_health_reports_a_dead_loop_on_a_page_that_still_serves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The case the whole HIGH finding turned on: `status` is a hardcoded literal in
+    # the endpoint, so a served page with a dead loop still reads `status: ok`.
+    # `ok` (it is serving) must stay True, and `loop` must carry the truth so the
+    # caller can refuse to call it "answering".
+    monkeypatch.setattr(
+        setup.httpx, "get", canned(200, {"status": "ok", "conversation_loop": "stopped"})
+    )
+
+    state = setup.check_health("http://127.0.0.1:8787")
+
+    assert state.ok  # it IS serving /health
+    assert state.loop == "stopped"
+
+
+def test_check_health_is_not_ok_when_the_process_is_not_answering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refused(url: str, **kwargs: object) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(setup.httpx, "get", refused)
+
+    state = setup.check_health("http://127.0.0.1:8787")
+
+    assert not state.ok
+
+
+def test_check_health_is_not_ok_on_a_non_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A 503 (or anything but 200) means it is not serving yet, whatever a body says.
+    monkeypatch.setattr(setup.httpx, "get", canned(503, {"status": "ok"}))
+
+    state = setup.check_health("http://127.0.0.1:8787")
+
+    assert not state.ok

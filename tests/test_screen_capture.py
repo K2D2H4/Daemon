@@ -1,0 +1,378 @@
+import asyncio
+import platform
+import re
+from pathlib import Path
+
+import pytest
+
+from daemon.tools import screen
+from daemon.tools.base import ToolError, ToolOutput
+
+
+def test_screencapture_argv_full_display_omits_cursor():
+    argv = screen.SCREENCAPTURE_ARGS("/tmp/x.jpg", None)
+    assert argv[0] == "screencapture"
+    assert "-C" not in argv           # cursor never captured — Global Constraints
+    assert "-x" in argv               # silent, no shutter sound
+    assert argv[-1] == "/tmp/x.jpg"
+
+
+def test_screencapture_argv_window_uses_l_flag():
+    argv = screen.SCREENCAPTURE_ARGS("/tmp/x.jpg", 42)
+    assert "-l" in argv and "42" in argv
+    assert "-C" not in argv          # cursor never captured, window branch too
+
+
+def test_sips_resize_caps_long_edge():
+    argv = screen.SIPS_RESIZE_ARGS("/tmp/x.jpg", 1536)
+    assert argv[:2] == ["sips", "-Z"]
+    assert "1536" in argv
+    assert "jpeg" in argv             # force jpeg output
+
+
+def test_screencapture_display_argv_uses_d_flag():
+    argv = screen.SCREENCAPTURE_DISPLAY_ARGS("/tmp/x.jpg", 2)
+    assert argv[0] == "screencapture"
+    assert "-D" in argv and "2" in argv
+    assert "-x" in argv               # silent, no shutter sound
+    assert "-C" not in argv          # cursor never captured
+    assert argv[-1] == "/tmp/x.jpg"
+
+
+@pytest.mark.skipif(platform.system() == "Darwin", reason="guard is for non-mac")
+async def test_capture_refuses_off_darwin():
+    with pytest.raises(ToolError, match="macOS"):
+        await screen.capture_display(long_edge=1536)
+
+
+class _FakeProcess:
+    """Just enough of `asyncio.subprocess.Process` for `_run` to drive."""
+
+    def __init__(self, returncode: int, stderr: bytes = b"") -> None:
+        self.returncode = returncode
+        self._stderr = stderr
+
+    async def communicate(self):
+        return b"", self._stderr
+
+    def kill(self) -> None:  # pragma: no cover - not exercised by this test
+        pass
+
+    async def wait(self) -> None:  # pragma: no cover - not exercised by this test
+        pass
+
+
+async def test_run_keeps_tcc_hint_but_preserves_real_stderr(monkeypatch):
+    """Regression for task 0.1 review Finding 1: a non-zero `screencapture` exit
+    used to be laundered into the TCC hint with the real reason thrown away. A
+    transient failure ("could not create image from display", measured on a real
+    Mac - see task-0.1-report.md) must still name itself, even though the TCC
+    hint stays the primary message.
+    """
+
+    async def fake_exec(*argv, **kwargs):
+        return _FakeProcess(1, stderr=b"could not create image from display\n")
+
+    monkeypatch.setattr(screen.asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(ToolError) as excinfo:
+        await screen._run(
+            "screencapture", ["screencapture", "-x"], timeout_secs=5, on_failure=screen.TCC_HINT
+        )
+    message = str(excinfo.value)
+    assert screen.TCC_HINT in message
+    assert "could not create image from display" in message
+
+
+async def test_run_tcc_hint_alone_when_screencapture_says_nothing(monkeypatch):
+    async def fake_exec(*argv, **kwargs):
+        return _FakeProcess(1, stderr=b"")
+
+    monkeypatch.setattr(screen.asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(ToolError, match=f"^{screen.TCC_HINT}$"):
+        await screen._run(
+            "screencapture", ["screencapture", "-x"], timeout_secs=5, on_failure=screen.TCC_HINT
+        )
+
+
+def test_screen_note_marks_content_as_data():
+    note = screen.screen_note("main display")
+    assert "screenshot" in note.lower()
+    assert "not instruction" in note.lower() or "not an instruction" in note.lower()
+    assert "main display" in note
+
+
+# --- capture_all_displays ------------------------------------------------------
+
+
+async def test_capture_all_displays_stops_at_first_missing_display(monkeypatch):
+    """Enumeration starts at 1 and stops as soon as a display doesn't exist -
+    display 3 here doesn't exist, so exactly 2 shots come back."""
+
+    shots = {
+        1: (b"\xff\xd8one", 1536, 864),
+        2: (b"\xff\xd8two", 1536, 993),
+    }
+
+    async def fake_capture_one(index, *, screencapture, sips, long_edge, timeout_secs):
+        return shots.get(index)
+
+    # Skip the macOS/tool guard so the enumeration logic is exercised on any
+    # platform (CI is Linux); the guard itself is covered by
+    # test_capture_refuses_off_darwin.
+    monkeypatch.setattr(screen, "_require_capture_tools", lambda: ("screencapture", "sips"))
+    monkeypatch.setattr(screen, "_capture_one_display", fake_capture_one)
+
+    result = await screen.capture_all_displays(long_edge=1536)
+
+    assert result == [shots[1], shots[2]]
+
+
+async def test_capture_all_displays_raises_when_main_display_fails(monkeypatch):
+    """Display 1 failing is a genuine problem (permission/real failure), not the
+    normal loop terminator - it must raise the TCC hint, not be swallowed."""
+
+    async def fake_capture_one(index, *, screencapture, sips, long_edge, timeout_secs):
+        raise ToolError(screen.TCC_HINT)
+
+    monkeypatch.setattr(screen, "_require_capture_tools", lambda: ("screencapture", "sips"))
+    monkeypatch.setattr(screen, "_capture_one_display", fake_capture_one)
+
+    with pytest.raises(ToolError, match=re.escape(screen.TCC_HINT)):
+        await screen.capture_all_displays(long_edge=1536)
+
+
+# --- _capture_one_display index asymmetry --------------------------------------
+#
+# The tests above mock `_capture_one_display` itself, so they never exercise the
+# index==1-raises / index>=2-stops branching *inside* it - the crux of the
+# feature. These mock one level lower, `_run`, so the same failure/zero-byte
+# signal is fed to both a display-1 and a display-2 call and the asymmetric
+# response is what gets asserted.
+
+
+async def test_capture_one_display_index_one_raises_on_screencapture_failure(monkeypatch):
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        if name == "screencapture":
+            raise ToolError(on_failure or "screencapture failed")
+        raise AssertionError("sips should not run after a screencapture failure")
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    with pytest.raises(ToolError, match=screen.TCC_HINT):
+        await screen._capture_one_display(
+            1, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+        )
+
+
+async def test_capture_one_display_index_two_returns_none_on_identical_failure(monkeypatch):
+    """The IDENTICAL screencapture failure signal, on display 2, means "no such
+    display" - the normal loop terminator, not an error."""
+
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        if name == "screencapture":
+            raise ToolError(on_failure or "screencapture failed")
+        raise AssertionError("sips should not run after a screencapture failure")
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    result = await screen._capture_one_display(
+        2, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+    )
+    assert result is None
+
+
+async def test_capture_one_display_index_one_raises_on_zero_byte_file(monkeypatch):
+    """A TCC denial can also show up as screencapture exiting 0 having written
+    nothing - display 1 must still raise."""
+
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        return ""  # screencapture "succeeds" but writes no file
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    with pytest.raises(ToolError, match=screen.TCC_HINT):
+        await screen._capture_one_display(
+            1, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+        )
+
+
+async def test_capture_one_display_index_two_returns_none_on_zero_byte_file(monkeypatch):
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        return ""  # screencapture "succeeds" but writes no file
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    result = await screen._capture_one_display(
+        2, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+    )
+    assert result is None
+
+
+async def test_capture_one_display_returns_bytes_and_dims_on_success(monkeypatch):
+    """A real capture (any index) downscales and reads the file back, exactly
+    like `capture_display` does."""
+
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        if name == "screencapture":
+            await asyncio.to_thread(Path(argv[-1]).write_bytes, b"\xff\xd8fake")
+            return ""
+        if "-Z" in argv:  # sips resize - the file already has the right bytes
+            return ""
+        return "  pixelWidth: 1536\n  pixelHeight: 864\n"  # sips -g dims
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    result = await screen._capture_one_display(
+        3, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+    )
+    assert result == (b"\xff\xd8fake", 1536, 864)
+
+
+# --- SeeScreen ----------------------------------------------------------------
+
+
+def _tool() -> "screen.SeeScreen":
+    return screen.SeeScreen(max_px=1536, timeout_secs=20.0)
+
+
+def test_see_screen_spec_name():
+    assert _tool().spec.name == "see_screen"
+
+
+def test_see_screen_preview_names_the_main_display():
+    assert "main display" in _tool().preview({})
+
+
+def test_see_screen_preview_names_a_window():
+    preview = _tool().preview({"window": 42})
+    assert "42" in preview
+    assert "window" in preview.lower()
+
+
+def test_screen_tools_returns_a_see_screen():
+    tools = screen.screen_tools(max_px=1536, timeout_secs=20.0)
+    assert len(tools) == 1
+    assert isinstance(tools[0], screen.SeeScreen)
+
+
+async def test_see_screen_run_returns_tool_output_with_image(monkeypatch):
+    async def fake_capture_display(*, long_edge, window_id=None, timeout_secs=20.0):
+        assert window_id is None
+        return b"\xff\xd8\xff", 1512, 982
+
+    monkeypatch.setattr(screen, "capture_display", fake_capture_display)
+
+    result = await _tool().run({})
+    assert isinstance(result, ToolOutput)
+    assert result.content == "captured the main display (1512x982)"
+    assert len(result.images) == 1
+    assert result.images[0].media_type == "image/jpeg"
+    assert result.images[0].data == b"\xff\xd8\xff"
+
+
+async def test_see_screen_run_passes_window_id(monkeypatch):
+    async def fake_capture_display(*, long_edge, window_id=None, timeout_secs=20.0):
+        assert window_id == 7
+        return b"\xff\xd8\xff", 100, 200
+
+    monkeypatch.setattr(screen, "capture_display", fake_capture_display)
+
+    result = await _tool().run({"window": 7})
+    assert result.content == "captured the window 7 (100x200)"
+
+
+async def test_see_screen_run_rejects_non_integer_window():
+    with pytest.raises(ToolError):
+        await _tool().run({"window": "not-a-number"})
+
+
+async def test_see_screen_run_rejects_negative_window():
+    with pytest.raises(ToolError):
+        await _tool().run({"window": -1})
+
+
+async def test_see_screen_preview_all_displays():
+    assert "all displays" in _tool().preview({"all_displays": True})
+
+
+async def test_see_screen_run_all_displays_returns_one_image_per_display(monkeypatch):
+    async def fake_capture_all_displays(*, long_edge, timeout_secs=20.0):
+        return [(b"\xff\xd8a", 100, 80), (b"\xff\xd8b", 120, 90)]
+
+    monkeypatch.setattr(screen, "capture_all_displays", fake_capture_all_displays)
+
+    result = await _tool().run({"all_displays": True})
+
+    assert isinstance(result, ToolOutput)
+    assert len(result.images) == 2
+    assert result.images[0].data == b"\xff\xd8a"
+    assert result.images[1].data == b"\xff\xd8b"
+    assert "2" in result.content
+    assert "100x80" in result.content
+    assert "120x90" in result.content
+
+
+# --- StartScreenShare / StopScreenShare ----------------------------------------
+
+
+class _FakeControl:
+    """A fake `ScreenShareControl` - the tools only store and delegate to it."""
+
+    def __init__(self) -> None:
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    async def start(self) -> str:
+        self.start_calls += 1
+        return "started-message"
+
+    async def stop(self) -> str:
+        self.stop_calls += 1
+        return "stopped-message"
+
+
+def test_start_screen_share_spec_name():
+    assert screen.StartScreenShare(_FakeControl()).spec.name == "start_screen_share"
+
+
+def test_stop_screen_share_spec_name():
+    assert screen.StopScreenShare(_FakeControl()).spec.name == "stop_screen_share"
+
+
+def test_start_screen_share_is_safe_risk():
+    assert screen.StartScreenShare(_FakeControl()).risk == "safe"
+
+
+def test_stop_screen_share_is_safe_risk():
+    assert screen.StopScreenShare(_FakeControl()).risk == "safe"
+
+
+def test_start_screen_share_preview():
+    assert "start" in screen.StartScreenShare(_FakeControl()).preview({}).lower()
+
+
+def test_stop_screen_share_preview():
+    assert "stop" in screen.StopScreenShare(_FakeControl()).preview({}).lower()
+
+
+async def test_start_screen_share_run_delegates_to_control():
+    control = _FakeControl()
+    result = await screen.StartScreenShare(control).run({})
+    assert result == "started-message"
+    assert control.start_calls == 1
+
+
+async def test_stop_screen_share_run_delegates_to_control():
+    control = _FakeControl()
+    result = await screen.StopScreenShare(control).run({})
+    assert result == "stopped-message"
+    assert control.stop_calls == 1
+
+
+def test_screen_share_tools_returns_both():
+    tools = screen.screen_share_tools(_FakeControl())
+    assert len(tools) == 2
+    assert isinstance(tools[0], screen.StartScreenShare)
+    assert isinstance(tools[1], screen.StopScreenShare)

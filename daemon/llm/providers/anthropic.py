@@ -7,6 +7,7 @@ stays visible next to the provider contract.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Sequence
 from typing import Any
 
@@ -195,6 +196,35 @@ def _turns(messages: list[Message]) -> list[dict[str, Any]]:
                 for call in message.tool_calls
             )
             turns.append({"role": "assistant", "content": content})
+            continue
+        if message.role == "user" and message.images:
+            blocks: list[dict[str, Any]] = []
+            if message.content:
+                blocks.append({"type": "text", "text": message.content})
+            blocks.extend(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.media_type,
+                        "data": base64.b64encode(img.data).decode(),
+                    },
+                }
+                for img in message.images
+            )
+            # A see_screen round is assistant(tool_calls) -> tool -> user(images):
+            # the `tool` branch above already opened a user turn for the
+            # tool_result. Appending a second user turn here would put two user
+            # turns back to back, which this function's docstring says the API
+            # rejects - so merge into the preceding one instead, same as the
+            # tool-result merge above.
+            previous = turns[-1] if turns else None
+            if previous is not None and previous.get("role") == "user" and isinstance(
+                previous.get("content"), list
+            ):
+                previous["content"].extend(blocks)
+            else:
+                turns.append({"role": "user", "content": blocks})
             continue
         turns.append({"role": message.role, "content": message.content})
     return turns

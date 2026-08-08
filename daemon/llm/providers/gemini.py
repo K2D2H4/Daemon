@@ -12,6 +12,7 @@ raises, so `?key=` leaks the key into logs and stack traces. daemon/setup.py's
 
 from __future__ import annotations
 
+import base64
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -116,7 +117,7 @@ class GeminiProvider:
                         {
                             "name": spec.name,
                             "description": spec.description,
-                            "parameters": spec.parameters,
+                            "parameters": _gemini_schema(spec.parameters),
                         }
                         for spec in tools
                     ]
@@ -270,6 +271,57 @@ class GeminiProvider:
         raise ProviderError(f"gemini call to {url} failed")  # unreachable
 
 
+_SCHEMA_KEYS = frozenset(
+    {
+        "type", "description", "nullable", "enum", "items", "properties",
+        "required", "minItems", "maxItems", "minimum", "maximum",
+        "minLength", "maxLength", "pattern", "anyOf",
+    }
+)
+"""The JSON-Schema keywords Gemini's function declarations accept (an OpenAPI 3.0
+subset). Everything else - `additionalProperties`, `$schema`, `title`, `$ref`,
+`default`, `format` - is rejected with a 400."""
+
+
+def _gemini_schema(node: Any) -> Any:
+    """Reduce a JSON Schema to the subset Gemini's function declarations accept.
+
+    An MCP server forwards its own `inputSchema` untouched (tools/mcp.py: a server's
+    schema is its own business), and those routinely carry `additionalProperties`,
+    `title`, `$schema` or `$ref`. Passing them raw makes Gemini 400 the whole
+    request, so a single connected MCP server broke *every* tool-enabled turn - even
+    "hello", because tools are offered on every owner turn. Anthropic and OpenAI
+    tolerate the extra keywords; this narrowing is Gemini's alone, so it lives here.
+    """
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key not in _SCHEMA_KEYS:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            out[key] = {k: _gemini_schema(v) for k, v in value.items()}
+        elif key == "items":
+            out[key] = _gemini_schema(value)
+        elif key == "anyOf" and isinstance(value, list):
+            out[key] = [_gemini_schema(v) for v in value]
+        else:
+            out[key] = value
+    # JSON Schema allows `type: ["string", "null"]`; Gemini wants one type plus a
+    # `nullable` flag.
+    declared = node.get("type")
+    if isinstance(declared, list):
+        concrete = [t for t in declared if t != "null"]
+        out["type"] = concrete[0] if concrete else "string"
+        if "null" in declared:
+            out["nullable"] = True
+    # An object schema Gemini can read has to say so, even when the server left the
+    # `type` implicit and only gave `properties`.
+    if "properties" in out and "type" not in out:
+        out["type"] = "object"
+    return out
+
+
 def _contents(messages: list[Message]) -> list[dict[str, Any]]:
     """Neutral messages as `contents`.
 
@@ -301,6 +353,16 @@ def _contents(messages: list[Message]) -> list[dict[str, Any]]:
         parts: list[dict[str, Any]] = []
         if message.content:
             parts.append({"text": message.content})
+        if message.role == "user":
+            parts.extend(
+                {
+                    "inlineData": {
+                        "mimeType": img.media_type,
+                        "data": base64.b64encode(img.data).decode(),
+                    }
+                }
+                for img in message.images
+            )
         for call in message.tool_calls:
             # The signature sits on the part beside `functionCall`, and is present
             # only where Gemini issued one - the first of a parallel batch. Sending
@@ -316,8 +378,36 @@ def _contents(messages: list[Message]) -> list[dict[str, Any]]:
             # An empty `parts` is rejected, and an assistant turn with neither text
             # nor calls carries nothing worth sending anyway.
             continue
-        contents.append({"role": ROLES[message.role], "parts": parts})
+        role = ROLES[message.role]
+        previous = contents[-1] if contents else None
+        # A see_screen round is assistant(tool_calls) -> tool -> user(images): the
+        # `tool` branch above already appended a `role: user` content for the
+        # functionResponse. Appending a second user content here would put two
+        # user contents back to back - Gemini is more lenient than Anthropic about
+        # this, but avoid the risky shape consistently with the Anthropic fix
+        # (the functionResponse+inlineData-in-one-content shape is grounded but
+        # pending live-socket confirmation, Task 1.7/2.1 deferred). Merge only
+        # into a *tool-result* user content, not a genuine prior user turn - two
+        # real user turns can land adjacent when a contentless assistant turn in
+        # between was dropped (see the no-image path test), and those must stay
+        # separate.
+        if role == "user" and previous is not None and _is_function_responses(previous):
+            previous["parts"].extend(parts)
+        else:
+            contents.append({"role": role, "parts": parts})
     return contents
+
+
+def _is_function_responses(content: dict[str, Any]) -> bool:
+    """A `user` content whose parts are all `functionResponse`s, so a following
+    image (or text) message can join it instead of opening a second user
+    content (mirrors Anthropic's `_is_results`)."""
+    if content.get("role") != "user":
+        return False
+    parts = content.get("parts")
+    return isinstance(parts, list) and bool(parts) and all(
+        isinstance(part, dict) and "functionResponse" in part for part in parts
+    )
 
 
 def _tool_calls(parts: list[Any]) -> tuple[ToolCall, ...]:

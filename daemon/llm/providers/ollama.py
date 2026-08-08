@@ -9,6 +9,7 @@ tokens, and it complicates the token accounting the gateway logs.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Sequence
 from typing import Any
 
@@ -158,6 +159,8 @@ def _turn(message: Message) -> dict[str, Any]:
     itself here - unlike Anthropic, where it has to become a user turn.
     """
     turn: dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.role == "user" and message.images:
+        turn["images"] = [base64.b64encode(img.data).decode() for img in message.images]
     if message.tool_calls:
         turn["tool_calls"] = [
             {"function": {"name": call.name, "arguments": call.arguments}}

@@ -13,6 +13,7 @@ so all three hosted providers hoist system turns the same way.
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Sequence
 from typing import Any
@@ -251,6 +252,22 @@ def _input_items(messages: list[Message]) -> list[dict[str, Any]]:
                 }
                 for call in message.tool_calls
             )
+            continue
+        if message.role == "user" and message.images:
+            content: list[dict[str, Any]] = []
+            if message.content:
+                content.append({"type": "text", "text": message.content})
+            content.extend(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{img.media_type};base64,"
+                        f"{base64.b64encode(img.data).decode()}"
+                    },
+                }
+                for img in message.images
+            )
+            items.append({"role": "user", "content": content})
             continue
         items.append({"role": message.role, "content": message.content})
     return items

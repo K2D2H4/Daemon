@@ -22,11 +22,13 @@ from daemon.app import create_app
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
 from daemon.config import Route, Settings
-from daemon.llm.base import Completion, Message, ProviderError
+from daemon.llm.base import Completion, ImageBlock, Message, ProviderError, ToolCall
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import FAILURE_NOTICE, ConversationLoop
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
 from daemon.tasks import Task
+from daemon.tools.base import ToolResult
+from daemon.tools.runner import Outcome
 
 
 class FakeMemory:
@@ -614,6 +616,76 @@ async def test_yesterday_can_be_quoted_through_the_real_recall_stack(
 
     (block,) = [m for m in fake_provider.calls[-1] if m.content.startswith(RECALL_PREFIX)]
     assert "the talk is on thursday at three" in block.content
+
+
+# --- a captured screenshot rides in as a framed user turn (Task 1.6) --------
+
+
+class FakeImageToolCompanion(Companion):
+    """A `Companion` whose tool round always returns one canned, image-bearing
+    `ToolResult` - standing in for `see_screen` (Task 1.7, not yet built) so the
+    loop's image-injection path can be exercised without the runner-to-tool
+    bridge."""
+
+    async def run_tools(
+        self, calls: Any, *, origin: str, channel: str, sender_id: str | None
+    ) -> Outcome:
+        return Outcome(
+            results=[
+                ToolResult(
+                    call_id=calls[0].id,
+                    name="see_screen",
+                    content="captured the main display (1512x982)",
+                    images=(ImageBlock(b"\xff\xd8\xff", "image/jpeg"),),
+                )
+            ]
+        )
+
+
+async def test_a_captured_screenshot_rides_in_as_a_framed_user_turn_with_the_image(
+    data_dir: Path,
+) -> None:
+    """The image must reach the model on a plain `user` turn - the one shape all
+    four providers accept - never inside the `tool`-role message, and carrying
+    the untrusted-data note (security stance A) rather than arriving bare."""
+    from daemon.tools.base import Registry
+    from daemon.tools.builtin import builtin_tools
+    from daemon.tools.policy import ToolPolicy
+    from daemon.tools.runner import ToolRunner
+
+    # `run_tools` is fully overridden below, so the real `ToolRunner.execute` is
+    # never reached and its store/audit dependencies are never called - only
+    # `len(tools)` (via `Companion.specs`) is, which reads the registry alone.
+    registry = Registry()
+    for tool in builtin_tools(roots=[data_dir]):
+        registry.register(tool)
+    tools = ToolRunner(registry, ToolPolicy(object()), object())
+
+    provider = FakeProvider(
+        scripted_calls=[[ToolCall(id="1", name="see_screen", arguments={})]]
+    )
+    companion = FakeImageToolCompanion(FakeMemory(), data_dir=data_dir, tools=tools)
+
+    await ConversationLoop(
+        FakeChannel([inbound("what's on my screen?")]), gateway_for(provider), companion
+    ).run()
+
+    second_call = provider.calls[1]
+
+    tool_messages = [m for m in second_call if m.role == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].images == ()
+    assert tool_messages[0].content == "captured the main display (1512x982)"
+
+    image_user_messages = [m for m in second_call if m.role == "user" and m.images]
+    assert len(image_user_messages) == 1
+    note = image_user_messages[0]
+    assert note.images == (ImageBlock(b"\xff\xd8\xff", "image/jpeg"),)
+    assert "screenshot" in note.content.lower()
+    assert (
+        "not instruction" in note.content.lower()
+        or "not an instruction" in note.content.lower()
+    )
 
 
 # --- a bad turn must not end the loop ---------------------------------------

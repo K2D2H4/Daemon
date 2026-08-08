@@ -122,6 +122,24 @@ and there the CLI's default assembles *less*: no gateway, no channel, no speaker
 `daemon/persona/evolve.py`, through `app.build_persona_evolution`: the Monday job and
 `daemon persona evolve` run the identical `PersonaEvolution`.
 
+## Screen data flow
+
+Two paths, both behind `DAEMON_SCREEN_ENABLED` (needing `DAEMON_TOOLS_ENABLED` too) and
+both macOS-only. On demand, `see_screen` (`daemon/tools/screen.py`) shells out to
+`screencapture`+`sips` — no new dependency — and returns `ToolOutput(content, images)`;
+`daemon/tools/runner.py` carries `images` onto `ToolResult`, and `daemon/loop.py` attaches
+them as a fresh `user` turn framed by `screen_note` rather than inside the `tool`-role
+message, because a `user` turn holding an image is the one shape all four providers
+accept (ADR 0009). Live and voice-only, `start_screen_share`/`stop_screen_share` toggle a
+`ScreenSharePump` (`daemon/voice/screen_share.py`, the one file in this stack that imports
+Pillow) that captures at `screen_fps` (default 1), dhashes each frame against the last one
+*sent*, and forwards a frame to `VoiceSession.send_frame` only on real change or an elapsed
+keepalive. Those two tools exist only because `app._build_tools` takes a keyword-only
+`screen_share` param that only `run_voice` passes — the text registry passes none, so it
+never offers them. Starting a share always speaks an acknowledgement (the explicit-signal
+rule); a frame actually landing on Gemini Live's socket is implemented, not yet confirmed
+against a live connection.
+
 ## The nightly pass
 
 `daemon/reflection.py` runs at **04:00 local time** — not UTC, because "overnight" is a

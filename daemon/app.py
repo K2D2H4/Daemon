@@ -17,14 +17,16 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
+from daemon import __version__
 from daemon.channels.base import Channel
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
-from daemon.config import ANTHROPIC, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
+from daemon.config import ANTHROPIC, ENV_FILE, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
 from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
@@ -94,7 +96,7 @@ def create_app(
     opens a microphone and then a billed session, and neither belongs in a test.
     """
     resolved = settings or Settings()
-    app = FastAPI(title="Daemon", version="0.0.1", lifespan=_lifespan)
+    app = FastAPI(title="Daemon", version=__version__, lifespan=_lifespan)
     app.state.settings = resolved
     app.state.channel = channel
     app.state.memory = memory
@@ -108,38 +110,66 @@ def create_app(
     app.state.tools = None
     app.state.tools_status = "not started"
     app.state.mcp = None
+    # Serialises the admin's persist-then-(dis)connect MCP routes so two of them
+    # cannot interleave the `mcp.json` read-modify-write and lose an update
+    # (daemon/admin/routes.py, finding #6). Constructed here, not in the lifespan,
+    # because the routes run under `TestClient` without one; it binds to the running
+    # loop on first use.
+    app.state.mcp_persist_lock = asyncio.Lock()
+    # Where a settings patch is written and where `.env` is read from - the same
+    # file Settings loaded (config.ENV_FILE, cwd-relative), so the admin edits the
+    # one source of truth rather than a second copy. A test overrides it.
+    app.state.env_path = Path(ENV_FILE)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        task = app.state.loop_task
-        return {
-            "status": "ok",
-            "preset": resolved.preset,
-            "voice_enabled": resolved.voice_enabled,
-            "routing": {
-                task_key.value: route.provider
-                for task_key, route in resolved.routing_table().items()
-            },
-            "conversation_loop": "running" if task is not None and not task.done() else "stopped",
-            # Recall can be absent while the rest of the process is healthy (the
-            # embedder is down, the module is mid-rewrite). Saying so here is the
-            # difference between a degraded daemon and one that quietly forgets.
-            "recall": _recall_health(app.state),
-            # Same reason, and the failure is even quieter: a wake gate that died
-            # leaves a daemon that answers Telegram normally and has simply stopped
-            # hearing the room, with nothing anywhere saying so.
-            "wake_gate": _wake_health(app.state),
-            # macOS: a wake gate can be "running" while the mic is denied, which
-            # reads as a quiet room. Naming the grant here is the difference between
-            # a diagnosable and an invisible failure (spec §6).
-            "mic": _mic_health(),
-            # Same reasoning: an MCP server that failed to start leaves the model
-            # with fewer tools and nothing else different, which is exactly the kind
-            # of quiet degradation this endpoint exists to name.
-            "tools": _tools_health(app.state),
-        }
+        return health_payload(app.state, resolved)
+
+    # The operator-facing control plane: health, a side-effect-free chat test, and
+    # validated settings edits (docs/design/2026-08-07-m5-admin-web-design.md). It
+    # talks only to `app.state` handles and protocols; importing a concrete
+    # provider/channel stays this file's exception alone (CONTRACTS 4), so the
+    # import is here and function-local like every other one in this module.
+    from daemon.admin.routes import router as admin_router
+
+    app.include_router(admin_router)
 
     return app
+
+
+def health_payload(state: Any, settings: Settings) -> dict[str, Any]:
+    """The `/health` body, built from `app.state`.
+
+    A module-level function rather than a closure so the admin's own health
+    endpoint returns byte-for-byte the same thing - "the chat version of /health"
+    is only honest if the health it shows is the same health (docs/design)."""
+    task = getattr(state, "loop_task", None)
+    return {
+        "status": "ok",
+        "preset": settings.preset,
+        "voice_enabled": settings.voice_enabled,
+        "routing": {
+            task_key.value: route.provider
+            for task_key, route in settings.routing_table().items()
+        },
+        "conversation_loop": "running" if task is not None and not task.done() else "stopped",
+        # Recall can be absent while the rest of the process is healthy (the
+        # embedder is down, the module is mid-rewrite). Saying so here is the
+        # difference between a degraded daemon and one that quietly forgets.
+        "recall": _recall_health(state),
+        # Same reason, and the failure is even quieter: a wake gate that died
+        # leaves a daemon that answers Telegram normally and has simply stopped
+        # hearing the room, with nothing anywhere saying so.
+        "wake_gate": _wake_health(state),
+        # macOS: a wake gate can be "running" while the mic is denied, which
+        # reads as a quiet room. Naming the grant here is the difference between
+        # a diagnosable and an invisible failure (spec §6).
+        "mic": _mic_health(),
+        # Same reasoning: an MCP server that failed to start leaves the model
+        # with fewer tools and nothing else different, which is exactly the kind
+        # of quiet degradation this endpoint exists to name.
+        "tools": _tools_health(state),
+    }
 
 
 @asynccontextmanager
@@ -241,9 +271,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             app.state.tools = tools
 
+    # Set regardless of the channel: memory, recall and the tool layer are
+    # channel-independent capabilities, and tying their `app.state` handles to a
+    # working channel made `/health` under-report them - and left the admin surface
+    # (M5) without the memory it is entitled to - in a tokenless boot. The
+    # conversation loop, and only the loop, needs the channel; that guard stays
+    # below.
+    app.state.channel = channel
+    app.state.memory = memory
     if channel is not None and memory is not None:
-        app.state.channel = channel
-        app.state.memory = memory
         loop = ConversationLoop(
             channel,
             gateway,
@@ -401,7 +437,7 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
 
 @dataclass(frozen=True, slots=True)
 class _IO:
-    channel: Channel
+    channel: Channel | None
     memory: MemoryWriter
     recall: Recall | None
     recall_status: str
@@ -466,27 +502,50 @@ def _build_io(settings: Settings) -> _IO:
     # Built before the channel: the channel takes the cursor from it, so a
     # restart does not re-receive and re-answer what it already handled.
     store = Store.open(settings.data_dir / DB_FILENAME)
-    # Repairs a mirror that fell behind its markdown - a failed mirror write, a
-    # crash between the two writes, or a deleted database. Without this the
-    # markdown being the source of truth is a claim nothing acts on.
-    reindex(settings.data_dir, store)
-    # Pairing by default: on a first run the env allowlist is empty, and in
-    # `allowlist` mode that refuses to start - correct as a policy, useless as an
-    # onboarding step. The owner's id is captured from their first message
-    # instead of transcribed by hand.
-    channel = _build_channel(settings, store)
-    recall, recall_status, embedder = _build_recall(settings, store)
-    writer = FileMemoryWriter(settings.data_dir, store)
-    return _IO(
-        channel=channel,
-        memory=writer,
-        recall=recall,
-        recall_status=recall_status,
-        resolve_id=_id_resolver(writer),
-        close=store.close,
-        embedder=embedder,
-        store=store,
-    )
+    # Everything after the open is guarded so a failure between here and the return
+    # closes the sqlite handle rather than leaking it (finding #7): `reindex` can
+    # raise on a corrupt mirror, and the process now keeps running degraded rather
+    # than crashing, so a leaked handle would accumulate across restarts.
+    try:
+        # Repairs a mirror that fell behind its markdown - a failed mirror write, a
+        # crash between the two writes, or a deleted database. Without this the
+        # markdown being the source of truth is a claim nothing acts on.
+        reindex(settings.data_dir, store)
+        # Pairing by default: on a first run the env allowlist is empty, and in
+        # `allowlist` mode that refuses to start - correct as a policy, useless as an
+        # onboarding step. The owner's id is captured from their first message
+        # instead of transcribed by hand.
+        # A missing bot token must not cost the daemon its memory, tools and admin
+        # surface: those are channel-independent, and the admin web (M5) is explicitly
+        # a local-only, tokenless-deployment surface. So a channel that will not build
+        # degrades to "no inbound conversation path" rather than taking the whole
+        # process down - the same tolerance `build_proactive_tick` already applies to
+        # its own `_build_channel`. `_lifespan` starts the conversation loop only when
+        # the channel is present, so None here simply means no Telegram loop.
+        try:
+            channel: Channel | None = _build_channel(settings, store)
+        except Exception as exc:
+            logger.error(
+                "channel not started; continuing with memory, tools and admin "
+                "(no inbound conversation path): %s",
+                exc,
+            )
+            channel = None
+        recall, recall_status, embedder = _build_recall(settings, store)
+        writer = FileMemoryWriter(settings.data_dir, store)
+        return _IO(
+            channel=channel,
+            memory=writer,
+            recall=recall,
+            recall_status=recall_status,
+            resolve_id=_id_resolver(writer),
+            close=store.close,
+            embedder=embedder,
+            store=store,
+        )
+    except Exception:
+        store.close()
+        raise
 
 
 BACKFILL_CHUNK = 500
@@ -889,14 +948,32 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
         reindex(settings.data_dir, store)
         writer = FileMemoryWriter(settings.data_dir, store)
         recall, _status, embedder = _build_recall(settings, store)
-        # Tools, pinned to `allowlist`. Not `settings.tools_mode`: a spoken turn has
-        # nowhere to ask, so `ask` here would pile up approval rows that lapse
-        # unanswered - the silent degradation this repo calls the dangerous failure.
+        # The controller for the live-share start/stop tools (Task 2.3). Built
+        # only when screen sharing is on at all - `None` otherwise, which is what
+        # keeps those two tools off `_build_tools`'s registry entirely. Built here
+        # rather than inside `_voice_attempts` because the same instance has to
+        # survive a reconnect: the tools registered below hold a reference to it,
+        # and a fresh controller per attempt would leave them pointing at a stale
+        # one.
+        screen_share = None
+        if settings.screen_enabled:
+            from daemon.voice.screen_share import ScreenShareController
+
+            screen_share = ScreenShareController()
+        # Tools follow the owner's configured mode - `full` for this install, so a
+        # spoken turn runs guarded tools the same as the text path does. A microphone
+        # has no relay path, so a spoken turn is the owner's own words and the origin
+        # gate is the real boundary; pinning `allowlist` here silently refused every
+        # guarded call the owner made by voice, `open_path` among them. The one mode a
+        # spoken turn cannot honour is `ask`: it has nowhere to surface an approval, so
+        # `ask` would pile up rows that lapse unanswered - the silent degradation this
+        # repo calls the dangerous failure - and so degrades to `allowlist` here.
         # The allowlist and standing grants are the same table the text path edits,
         # so voice reads the surface text writes to; it just never adds to it. Off
         # entirely when `DAEMON_TOOLS_ENABLED` is false, exactly like text.
+        voice_mode = "allowlist" if settings.tools_mode == "ask" else settings.tools_mode
         tools, mcp_bridge, _tools_status = await _build_tools(
-            settings, store, mode="allowlist"
+            settings, store, mode=voice_mode, screen_share=screen_share
         )
         companion = Companion(
             writer,
@@ -960,6 +1037,28 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
                 silence_duration_ms=settings.voice_silence_duration_ms,
             )
 
+        screen_pump_factory = None
+        if screen_share is not None:
+            from daemon.tools.screen import capture_display
+            from daemon.voice.screen_share import ScreenSharePump
+
+            def screen_pump_factory(session: Any) -> ScreenSharePump:
+                """A fresh pump bound to `session`, built once it is live.
+                `_voice_attempts` calls this again on every reconnect, so a
+                dropped session's pump is never reused against a new one."""
+
+                async def _capture() -> bytes:
+                    jpeg, _w, _h = await capture_display(long_edge=settings.screen_frame_px)
+                    return jpeg
+
+                return ScreenSharePump(
+                    session=session,
+                    capture=_capture,
+                    fps=settings.screen_fps,
+                    dedup_threshold=settings.screen_dedup_threshold,
+                    keepalive_secs=settings.screen_keepalive_secs,
+                )
+
         try:
             return await _voice_attempts(
                 new_session,
@@ -967,6 +1066,8 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
                 companion,
                 GeminiLiveError,
                 opening_audio=opening_audio,
+                screen_share=screen_share,
+                screen_pump_factory=screen_pump_factory,
             )
         finally:
             with suppress(Exception):
@@ -1062,6 +1163,8 @@ async def _voice_attempts(
     companion: Companion,
     session_error: type[Exception],
     opening_audio: bytes = b"",
+    screen_share: Any = None,
+    screen_pump_factory: Callable[[Any], Any] | None = None,
 ) -> int:
     """Hold a conversation, and pick it back up if the session is cut.
 
@@ -1075,6 +1178,13 @@ async def _voice_attempts(
     What is *not* resumed: a permanent failure (a bad key, a wrong model id, a
     malformed setup), because retrying leaves the process alive, healthy-looking and
     mute; and an ordinary idle timeout, because that is the conversation being over.
+
+    `screen_share` and `screen_pump_factory`, if given, are passed to every
+    `VoiceConversation` this loop builds - the same controller across every
+    attempt (its tools hold a reference to it), but a fresh pump built from
+    `screen_pump_factory(session)` for each attempt's own session. A share left
+    running by a dropped session must not survive into the next attempt's, and
+    `VoiceConversation.run`'s teardown is what guarantees that per session.
     """
     from daemon.voice.conversation import VoiceConversation
 
@@ -1090,6 +1200,8 @@ async def _voice_attempts(
             audio,
             companion,
             opening_audio=pending_opening,
+            screen_share=screen_share,
+            screen_pump_factory=screen_pump_factory,
         )
         failure: Exception | None = None
         try:
@@ -1387,7 +1499,7 @@ async def build_wake_gate(
 
 
 async def _build_tools(
-    settings: Settings, store: Any, *, mode: str | None = None
+    settings: Settings, store: Any, *, mode: str | None = None, screen_share: Any = None
 ) -> tuple[Any, Any, str]:
     """Assemble the tool layer. Returns (runner, mcp bridge, status).
 
@@ -1396,14 +1508,19 @@ async def _build_tools(
     difference from recall is that this one is off unless asked for, so "not
     configured" is the ordinary answer rather than a degradation.
 
-    `mode` overrides `DAEMON_TOOLS_MODE`, and only `run_voice` uses it - pinned to
-    `allowlist`, because a spoken turn has nowhere to ask for approval. `ask` mode
+    `mode` overrides `DAEMON_TOOLS_MODE`, and only `run_voice` uses it - to degrade
+    `ask` to `allowlist`, because a spoken turn has nowhere to ask for approval. `ask`
     there would mint approval rows that lapse unanswered while nobody is watching,
     which is the silent degradation this project treats as the dangerous failure.
-    A parameter and not a setting on purpose: a knob that could be turned back to
-    `ask` is a knob that would let that failure happen. The registry, the allowlist
-    and the standing grants are the same as the text path either way - the approval
-    surface is shared, text is its editor, and voice only reads it.
+    Every other mode passes straight through, so `full` reaches voice exactly as the
+    owner configured it. The registry, the allowlist and the standing grants are the
+    same as the text path either way - the approval surface is shared, text is its
+    editor, and voice only reads it.
+
+    `screen_share`, likewise, is only ever passed by `run_voice` - a
+    `ScreenShareController` for the live-share start/stop tools to toggle. `None`
+    (the default, and always what `create_app`'s text path passes) means those two
+    tools are never registered at all, so the text loop can never offer them.
     """
     if not settings.tools_enabled:
         return None, None, "off (DAEMON_TOOLS_ENABLED)"
@@ -1453,6 +1570,38 @@ async def _build_tools(
         except Exception as exc:
             logger.error("browser tools could not be built, continuing without: %s", exc)
 
+    if settings.screen_enabled:
+        # Guarded like the browser block above: a failure here loses only the
+        # screen tool, not startup.
+        try:
+            from daemon.tools.screen import screen_tools
+
+            for tool in screen_tools(
+                max_px=settings.screen_max_px,
+                timeout_secs=settings.tools_timeout_secs,
+            ):
+                registry.register(tool)
+            logger.info("screen tools on")
+        except Exception as exc:
+            logger.error("screen tools could not be built, continuing without: %s", exc)
+
+        if screen_share is not None:
+            # The live-share start/stop tools. Only `run_voice` ever passes
+            # `screen_share` - the pump they toggle needs a live `VoiceSession`,
+            # which the text path never has - so this is voice-only by
+            # construction, not by a mode check. Guarded like the block above:
+            # losing these two tools should not cost the rest of the tool layer.
+            try:
+                from daemon.tools.screen import screen_share_tools
+
+                for tool in screen_share_tools(screen_share):
+                    registry.register(tool)
+                logger.info("screen-share tools on")
+            except Exception as exc:
+                logger.error(
+                    "screen-share tools could not be built, continuing without: %s", exc
+                )
+
     bridge: Any = None
     if settings.mcp_enabled:
         from daemon.tools.mcp import McpBridge, load_config
@@ -1477,10 +1626,11 @@ async def _build_tools(
         "tool layer ready: %d tool(s), mode=%s", len(registry), effective_mode
     )
     browser = f", browser={settings.browser_app}" if settings.browser_enabled else ""
+    screen = ", screen=on" if settings.screen_enabled else ""
     return (
         runner,
         bridge,
-        f"ready, {len(registry)} tools, mode={effective_mode}{browser}",
+        f"ready, {len(registry)} tools, mode={effective_mode}{browser}{screen}",
     )
 
 

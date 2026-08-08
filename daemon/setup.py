@@ -37,6 +37,14 @@ install that skipped it talked like a stock assistant instead of like anyone
     those are the same process, so the code would be transcription with nothing
     to protect. What still holds is that the numeric id is what gets approved and
     that `Pairing` decides ownership.
+  * residency, at the very end (`_offer_residency`). Installing the OS service is
+    the precondition for proactivity (docs/PLAN.md 3.1) - a process that only
+    exists while a terminal is open can never speak first - and it used to be a
+    line of homework printed after the wizard. Now the wizard offers it and then
+    confirms the resident actually woke up, reusing `service.status()` and the
+    running daemon's own `/health` rather than a second health notion. Skipped
+    without a question on a pipe or on a platform with no per-user service; the
+    manual route is printed instead.
 
 Synchronous on purpose: the rest of the I/O path is async because it shares a
 loop with the conversation, but this module's I/O is a human typing, and one
@@ -44,8 +52,10 @@ blocking request per answered question reads better than an event loop wrapped
 around `input()`.
 
 Every side effect is a seam - stdin/stdout (`Prompt`), the network probes
-(`Checks`), the browser (`opener`), the file path (`env_path`) - so the tests
-need no network, no keys and no browser.
+(`Checks`, including the `/health` one the residency step reads), the OS service
+(`service_factory`), the sleep between liveness polls (`sleep`), the browser
+(`opener`), the file path (`env_path`) - so the tests need no network, no keys,
+no browser and no `launchctl`.
 """
 
 from __future__ import annotations
@@ -81,6 +91,8 @@ from daemon.config import (
     providers_for,
 )
 from daemon.fs import secure_dir, write_private_replace
+from daemon.service import SUPPORTED as SERVICE_PLATFORMS
+from daemon.service import Service, ServiceError, service_for
 from daemon.tasks import Task
 from daemon.tui import (
     Choice,
@@ -454,6 +466,25 @@ class OllamaState:
     models: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class HealthState:
+    """What the running daemon's `/health` said about itself. Never a secret -
+    `/health` reports no credentials, only which subsystems are up.
+
+    `ok` means the process booted and is serving the endpoint. `loop` is its
+    conversation-loop state ("running" / "stopped" / "" when the body did not say)
+    kept *separate* from `ok` on purpose: `/health`'s top-level `status` is a
+    hardcoded literal (daemon/app.py), so a served page with a dead loop still
+    reads `status: ok` - the healthy-looking-but-deaf state the endpoint exists to
+    expose. Whether a stopped loop is a problem depends on whether a channel is
+    even configured, which the caller knows and this probe does not, so the caller
+    decides (see `Wizard._await_awake`)."""
+
+    ok: bool
+    detail: str = ""
+    loop: str = ""
+
+
 def check_anthropic(key: str, model: str) -> Verdict:
     """Validate the key against the model list.
 
@@ -688,6 +719,41 @@ def check_ollama(base_url: str) -> OllamaState:
     return OllamaState(True, f"reachable at {root} ({label})", installed)
 
 
+def check_health(base_url: str) -> HealthState:
+    """Ask the running daemon whether it is serving, and read its loop state.
+
+    Its own `GET /health` (daemon/app.py) is a truer "it woke up" signal than
+    `service.status()`, which only says the init system spawned a process. Treated
+    as a black box over HTTP, exactly like every other probe here - so nothing in
+    setup imports the server it is checking (docs/CONTRACTS.md 4).
+
+    `ok` is "the process answered 200 with `status: ok`" - i.e. it booted and
+    binds. The conversation-loop state comes back in `loop` rather than folded into
+    `ok`, because whether a stopped loop is a fault depends on whether a channel
+    was configured at all (see `HealthState`); the caller settles that.
+    """
+    root = base_url.rstrip("/")
+    try:
+        response = httpx.get(f"{root}/health", timeout=HTTP_TIMEOUT)
+    except httpx.HTTPError as exc:
+        # The ordinary case while the process is still booting: nothing is
+        # listening yet, so the connection is refused. Not an error to print - the
+        # caller retries.
+        return HealthState(False, f"not answering at {root}: {exc}")
+    if response.status_code != 200:
+        return HealthState(False, f"{root}/health returned HTTP {response.status_code}")
+    try:
+        body = response.json()
+    except ValueError:
+        return HealthState(False, f"{root}/health returned a non-JSON body")
+    if not isinstance(body, dict) or body.get("status") != "ok":
+        got = body.get("status") if isinstance(body, dict) else "?"
+        return HealthState(False, f"/health reports status={got!r}")
+    raw = body.get("conversation_loop")
+    loop = raw if isinstance(raw, str) else ""
+    return HealthState(True, f"conversation loop {loop}" if loop else "serving", loop=loop)
+
+
 @dataclass(frozen=True, slots=True)
 class Checks:
     """The network probes, in one injectable bundle."""
@@ -698,6 +764,7 @@ class Checks:
     telegram: Callable[[str], Verdict] = check_telegram
     ollama: Callable[[str], OllamaState] = check_ollama
     updates: Callable[[str, int | None, int], Updates] = fetch_updates
+    health: Callable[[str], HealthState] = check_health
 
 
 def _string_field(response: httpx.Response, container: str, key: str) -> tuple[str, ...]:
@@ -1332,6 +1399,18 @@ class Prompt:
     def say(self, text: str = "") -> None:
         print(text, file=self._out)
 
+    @property
+    def interactive(self) -> bool:
+        """Is there a human at a keyboard to answer an optional question?
+
+        The guided finish reads this to decide whether to *offer* residency at all.
+        Piped input - a scripted run, CI - answers False, so the offer is skipped
+        and the manual route is printed instead. Just `isatty`, not the stricter
+        `self._in is sys.stdin` the secret path needs (getpass reads the real fd):
+        this asks through the ordinary readline path, which a fake terminal drives.
+        """
+        return self._in.isatty()
+
     def ask(self, question: str, *, default: str = "", secret: bool = False) -> str:
         label = f"{question} [{default}]: " if default else f"{question}: "
         if secret and self._in is sys.stdin and self._in.isatty():
@@ -1385,6 +1464,14 @@ class Prompt:
 MAX_ATTEMPTS = 3
 """Tries per credential before giving up. A fourth prompt is not going to help,
 and abandoning the run writes nothing."""
+
+HEALTH_ATTEMPTS = 20
+HEALTH_INTERVAL = 0.5
+"""How the residency step waits for the resident to come up: 20 polls half a
+second apart, so ~10s. Long enough for a real boot (open sqlite, build providers,
+start the Telegram poll), bounded because a bad config crash-loops and would
+otherwise be waited on forever - launchd's own restart throttle is 30s, so a
+process that is going to die has already died inside this window."""
 
 MIN_PROSE_WIDTH = 20
 """Floor for wrapped prose, so a terminal narrow enough to make the indent bigger
@@ -1518,6 +1605,12 @@ class Wizard:
     prompt: Prompt
     checks: Checks = field(default_factory=Checks)
     opener: Callable[[str], object] = webbrowser.open
+    service_factory: Callable[[Settings], Service] = service_for
+    """Builds the OS service for the residency step. Injected so tests drive it
+    without `launchctl` - the default is the same builder `daemon install` uses."""
+    sleep: Callable[[float], None] = time.sleep
+    """Between liveness polls. Injected as a no-op in tests so the failure path
+    does not actually wait ten seconds."""
     bot_handle: str = field(default="", init=False)
     """The bot's `@username`, kept from verifying the token so the pairing step
     can say which bot to message."""
@@ -2080,13 +2173,175 @@ class Wizard:
                 say(line)
             say()
 
-        say("Next:")
-        say("  daemon doctor     - checks Ollama, the data dir and the schema")
-        say("  daemon run        - runs it here, in this terminal")
-        say("  daemon install    - keeps it running after you close the terminal or reboot")
-        if sys.platform == "darwin":
-            say("                      on macOS it also asks once for mic access - click Allow")
+        return self._offer_residency(settings)
+
+    # --- residency: keep it running ------------------------------------------
+
+    def _offer_residency(self, settings: Settings) -> int:
+        """Offer to install the OS service, and confirm it woke up.
+
+        The wizard used to end by printing `daemon install` as homework. But
+        residency is the precondition for proactivity (docs/PLAN.md 3.1) - a
+        process that only exists while a terminal is open can never speak first -
+        so first run is where it belongs, next to the other two chores this module
+        already folded in (the seed and pairing).
+
+        Skipped without a question when there is nobody to answer (a piped run, CI)
+        or on a platform with no per-user service (Windows): both get the manual
+        route printed instead. Everything the step does is reversible with `daemon
+        uninstall`, which is why the question defaults to yes.
+        """
+        say = self.prompt.say
+        theme = self.prompt.theme
+        if not self.prompt.interactive or sys.platform not in SERVICE_PLATFORMS:
+            self._residency_hint()
+            return OK
+        say(heading(theme, "Keep it running?"))
+        say()
+        say("Right now Daemon only runs while `daemon run` is open. Installing it")
+        say("as a background service keeps it running after you close this terminal")
+        say("and across reboots - which is what lets it reach out on its own.")
+        say()
+        try:
+            install_now = self.prompt.ask_yes_no(
+                "Install it as a background service now", default=True
+            )
+        except (Cancelled, KeyboardInterrupt):
+            # Ctrl-C/Ctrl-D here must not reach run()'s "was not touched" handler:
+            # by now `.env` (and maybe the seed) is on disk, so the same shield the
+            # seed and pairing steps get above applies - stop, keep what was
+            # written, and still leave the manual route.
+            say()
+            say("Stopped there. Everything already written above stays written.")
+            say()
+            self._residency_hint()
+            return OK
+        if not install_now:
+            say()
+            self._residency_hint()
+            return OK
+        say()
+        try:
+            return self._install_and_check(settings)
+        except (Cancelled, KeyboardInterrupt):
+            # Ctrl-C during the install or the (up to ~10s, silent) liveness poll.
+            # The service may already be registered, so - unlike the question above
+            # - do not send them back to `daemon install`; point at `daemon status`,
+            # and still never let run() claim `.env` was untouched.
+            say()
+            say("Stopped there. `daemon status` shows whether the service came up.")
+            say()
+            return OK
+
+    def _install_and_check(self, settings: Settings) -> int:
+        say = self.prompt.say
+        theme = self.prompt.theme
+        service = self.service_factory(settings)
+        try:
+            action = service.install()
+        except ServiceError as exc:
+            # Defensive: the platform was already checked, so this is a path or
+            # permission problem rather than Windows. A sentence, not a traceback -
+            # the same rule the seed and pairing steps above follow.
+            say(status(theme, "warn", f"could not install the service: {exc}"))
+            say()
+            self._residency_hint()
+            return OK
+        if not action.applied and action.changes:
+            # A hand-edited unit file differs; install() refuses to overwrite it
+            # without --force and hands back the diff instead. Say so plainly rather
+            # than claim an install that did not happen.
+            say(status(theme, "warn", f"{action.unit_path} already exists and differs."))
+            say("Replace it with `daemon install --force` if you meant to. The")
+            say("resident already on disk is what runs until you do.")
+            say()
+            return OK
+        say(status(theme, "ok", f"installed the service: {action.unit_path}"))
+        for note in action.notes:
+            # e.g. systemd's linger warning - the difference between surviving a
+            # reboot and not.
+            say(f"  {note}")
+        say()
+        return self._await_awake(service, settings)
+
+    def _await_awake(self, service: Service, settings: Settings) -> int:
+        """Poll until the resident is up, or say where to look if it is not.
+
+        Three signals, and what counts as "up" depends on the config just written:
+
+          * `service.status().running` - the init system spawned it.
+          * `GET /health` answering (`HealthState.ok`) - it booted and binds.
+          * the conversation loop running - it can actually take a message. Only
+            required when a channel is configured (a Telegram token): with no
+            token there is no channel, so the loop is legitimately stopped and
+            "answering" would be the wrong word rather than a fault. This is the
+            distinction `/health`'s hardcoded `status: ok` cannot make on its own.
+
+        Polled because the process takes a moment to boot; bounded
+        (`HEALTH_ATTEMPTS`) because a bad token or config leaves the loop stopped
+        (or the process crash-looping) and would otherwise be waited on forever.
+        """
+        say = self.prompt.say
+        theme = self.prompt.theme
+        base_url = self._health_url(settings)
+        expect_loop = bool(settings.telegram_bot_token)
+        running = False
+        health = HealthState(False)
+        for attempt in range(HEALTH_ATTEMPTS):
+            running = service.status().running
+            health = self.checks.health(base_url) if running else HealthState(False)
+            if running and health.ok and (health.loop == "running" or not expect_loop):
+                if expect_loop:
+                    say(status(theme, "ok", "Daemon is awake - running and answering."))
+                else:
+                    say(status(theme, "ok", "Daemon is running."))
+                    say("  No Telegram token yet, so there is no channel to answer on -")
+                    say("  re-run `daemon setup` to add one, and it is picked up on restart.")
+                # The web console is channel-independent, so it is worth pointing at
+                # even in the no-token case above - it is how the owner watches
+                # health, tests a turn, edits settings and adds an MCP server.
+                say(f"  Admin console: {base_url}/admin/")
+                say()
+                return OK
+            if attempt + 1 < HEALTH_ATTEMPTS:
+                self.sleep(HEALTH_INTERVAL)
+        # Installed, but not up inside the window. Not a setup failure - the file is
+        # written and the service is registered - so this returns OK like the seed
+        # and pairing warnings do, and names which of the two failures it is.
+        say(status(theme, "warn", "installed, but it is not answering yet."))
+        if running and health.ok and expect_loop and health.loop != "running":
+            # It serves /health but its loop is down - almost always a bad or
+            # revoked token, and invisible to `service.status()` alone.
+            say("  The process is up but its conversation loop is not running,")
+            say("  which usually means a bad or revoked token.")
+        detail = service.status().detail
+        if detail:
+            say(f"  {detail}")
+        say("Look with:")
+        say("  daemon status  - is the service loaded and running")
+        say("  daemon doctor  - is the configuration usable")
+        say(f"  {service.err_log}  - what it wrote on the way down")
+        say()
         return OK
+
+    @staticmethod
+    def _health_url(settings: Settings) -> str:
+        """Where to reach the resident's `/health`.
+
+        `DAEMON_HOST` is a *bind* address, not a connect one: `0.0.0.0` (or `::`)
+        means "listen on every interface", and connecting to it is not portable, so
+        the loopback is the address to actually poll."""
+        host = settings.host if settings.host not in ("0.0.0.0", "::", "") else "127.0.0.1"
+        return f"http://{host}:{settings.port}"
+
+    def _residency_hint(self) -> None:
+        """How to reach residency by hand - printed when the offer was declined,
+        skipped (a pipe, CI) or impossible (Windows)."""
+        say = self.prompt.say
+        say("Next:")
+        say("  daemon install    - keep it running after you close the terminal or reboot")
+        say("  daemon run        - run it here in this terminal meanwhile")
+        say("  daemon doctor     - check Ollama, the data dir and the schema")
 
     # --- the persona seed ----------------------------------------------------
 
@@ -2406,6 +2661,8 @@ def run(
     stdout: TextIO | None = None,
     checks: Checks | None = None,
     opener: Callable[[str], object] = webbrowser.open,
+    service_factory: Callable[[Settings], Service] = service_for,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     path = Path(env_path) if env_path is not None else Path.cwd() / ENV_FILE
     prompt = Prompt(stdin, stdout)
@@ -2417,6 +2674,8 @@ def run(
             prompt=prompt,
             checks=checks if checks is not None else Checks(),
             opener=opener,
+            service_factory=service_factory,
+            sleep=sleep,
         ).run()
     except Cancelled as exc:
         prompt.say()

@@ -59,6 +59,15 @@ class ToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageBlock:
+    """Raw image bytes plus their media type, carried to the model as true
+    multimodal input (ADR 0009)."""
+
+    data: bytes
+    media_type: str = "image/jpeg"
+
+
+@dataclass(frozen=True, slots=True)
 class Message:
     role: Role
     content: str
@@ -67,6 +76,9 @@ class Message:
     existing constructor keeps working."""
     tool_call_id: str | None = None
     """Set on a `tool` turn: which call this is the result of."""
+    images: tuple[ImageBlock, ...] = ()
+    """Images attached to this turn. Defaulted, so every existing constructor
+    keeps working."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -368,7 +368,7 @@ async def test_start_connects_and_registers(monkeypatch: pytest.MonkeyPatch) -> 
     bridge = McpBridge([config])
     session = Session([RemoteTool("search"), RemoteTool("write")])
 
-    async def connect(cfg: Any) -> Any:
+    async def connect(cfg: Any, **_: Any) -> Any:
         return session
 
     monkeypatch.setattr(bridge, "_connect", connect)
@@ -385,7 +385,7 @@ async def test_one_server_failing_does_not_stop_the_next(
     bad = ServerConfig(name="bad", command="y")
     bridge = McpBridge([bad, good])
 
-    async def connect(cfg: Any) -> Any:
+    async def connect(cfg: Any, **_: Any) -> Any:
         if cfg.name == "bad":
             raise RuntimeError("it exited immediately")
         return Session([RemoteTool("search")])
@@ -411,7 +411,7 @@ async def test_a_server_that_never_lists_its_tools_is_recorded(
     config = ServerConfig(name="slow", command="x")
     bridge = McpBridge([config])
 
-    async def connect(cfg: Any) -> Any:
+    async def connect(cfg: Any, **_: Any) -> Any:
         return Slow([])
 
     monkeypatch.setattr(bridge, "_connect", connect)
@@ -472,11 +472,19 @@ async def test_closing_reports_a_failure_without_raising(
     """Shutdown: a server that dies while being closed has nothing left to break, and
     raising here would mask whatever else the lifespan is unwinding."""
     bridge = McpBridge([])
+    await bridge.start(Registry())
 
-    async def boom() -> None:
-        raise RuntimeError("the pipe was already gone")
+    class BoomStack:
+        async def aclose(self) -> None:
+            raise RuntimeError("the pipe was already gone")
 
-    monkeypatch.setattr(bridge._stack, "aclose", boom)
+    async def connect(config: ServerConfig, *, secret: Any = None, auth: Any = None) -> Any:
+        # Leave a stack whose close raises, as the real `_connect` leaves one.
+        bridge._stacks[config.name] = BoomStack()  # type: ignore[assignment]
+        return Session([])
+
+    monkeypatch.setattr(bridge, "_connect", connect)
+    await bridge.connect_server(ServerConfig(name="notes", command="x"))
     with caplog.at_level("ERROR"):
         await bridge.aclose()
-    assert any("closing MCP sessions failed" in r.message for r in caplog.records)
+    assert any("closing MCP session" in r.message for r in caplog.records)

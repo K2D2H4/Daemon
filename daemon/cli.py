@@ -15,28 +15,57 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from daemon import __version__
 from daemon.config import OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
-from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus, default_program
+from daemon.service import (
+    Service,
+    ServiceAction,
+    ServiceError,
+    ServiceStatus,
+    default_program,
+    service_for,
+)
 
 OK = 0
 PROBLEM = 1
 USAGE = 2
+
+GITHUB_REPO = "K2D2H4/Daemon"
+PACKAGE_NAME = "daemon-ai"
+"""The repo and the distributable. `daemon update` and install.sh must agree on
+both, because update re-installs exactly what the one-liner does."""
+INSTALL_SPEC = f"{PACKAGE_NAME}[mcp]"
+"""What `uv tool install` requests, extra included. MCP defaults on (config.py),
+so a plain `daemon-ai` install shows the admin's MCP tab and then fails every
+connect with "No module named 'mcp'". `install.sh` installs this same spec - the
+docstring on `_update` promises the two do not drift, and a bare-name reinstall
+here would silently drop the extra on the next `daemon update`. The version cap
+lives in the extra (pyproject `mcp>=1.9,<2`), so `[mcp]` also keeps `daemon update`
+off the incompatible mcp 2.0."""
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="daemon",
         description="Self-hosted AI companion. `daemon run` with no arguments is the default.",
+    )
+    # Handled in `main` rather than argparse's `action="version"`, which raises
+    # SystemExit - every other command here returns an int, and a bug report's
+    # first line should not depend on catching an exception.
+    parser.add_argument(
+        "--version", action="store_true", help="print the installed version and exit"
     )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="run the daemon in the foreground (what the service supervises)")
@@ -58,6 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="is the service installed and running")
     sub.add_parser("doctor", help="check configuration, Ollama, data dir and schema")
     sub.add_parser("reindex", help="rebuild the sqlite mirror from the markdown log")
+    sub.add_parser(
+        "update",
+        help="reinstall the latest release in place (needs uv; source installs use git pull)",
+    )
     reflect = sub.add_parser(
         "reflect", help="consolidate a day of conversation into memory and observations"
     )
@@ -159,6 +192,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args_list = ["run"]
 
     args = build_parser().parse_args(args_list)
+
+    if args.version:
+        print(f"daemon {__version__}")
+        return OK
+
     command: str = args.command
 
     if command == "doctor":
@@ -181,6 +219,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from daemon.wake_cli import calibrate
 
         return calibrate(takes=args.takes)
+    if command == "update":
+        # Before Settings, and for setup's reason: you may be updating precisely
+        # because a version is broken, and the new code should land regardless of
+        # whether this one's configuration loads.
+        return _update()
 
     try:
         settings = Settings()
@@ -257,20 +300,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 # --- seams the tests replace -------------------------------------------------
-
-
-def service_for(settings: Settings) -> Service:
-    """Build the service definition from settings.
-
-    The working directory is where `.env` lives - the current directory, which is
-    the directory the user is standing in when they install. The unit file carries
-    that path and nothing else, so the secrets stay in one file.
-    """
-    return Service(
-        label=settings.service_label,
-        working_dir=Path.cwd(),
-        log_dir=settings.data_dir / "logs",
-    )
 
 
 APP_DIR = Path.home() / "Applications" / "Daemon.app"
@@ -377,13 +406,134 @@ def _request_mic() -> int:
     return 0 if status == "authorized" else 1
 
 
+def _admin_url(settings: Settings) -> str:
+    """The admin console's *connect* URL. `DAEMON_HOST` is a bind address, so
+    `0.0.0.0`/`::` is not something a browser connects to - fall back to loopback,
+    the address that actually reaches a control plane that binds every interface."""
+    host = settings.host if settings.host not in ("0.0.0.0", "::", "") else "127.0.0.1"
+    return f"http://{host}:{settings.port}/admin/"
+
+
 def _serve(settings: Settings) -> int:
     import uvicorn
 
     from daemon.app import create_app
 
+    # Printed before uvicorn takes the terminal (its own logging is off,
+    # log_config=None): the admin web has no other way to announce where it is, and
+    # "how do I open the console" should not need reading the source.
+    print(f"admin console: {_admin_url(settings)}")
     uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
     return OK
+
+
+def _uv_present() -> bool:
+    """A seam so tests do not probe the real PATH."""
+    import shutil
+
+    return shutil.which("uv") is not None
+
+
+def _latest_ref() -> str:
+    """The tag of the latest published GitHub release, or `main` if there is none
+    (or the lookup fails). Mirrors install.sh, so `daemon update` and the one-liner
+    resolve the same thing."""
+    import httpx
+
+    try:
+        response = httpx.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            timeout=15.0,
+            follow_redirects=True,
+        )
+    except httpx.HTTPError:
+        return "main"
+    if response.status_code != 200:
+        return "main"
+    return response.json().get("tag_name") or "main"
+
+
+def _run(cmd: list[str]) -> int:
+    """Run an external command, letting its output through. A seam so tests never
+    shell out."""
+    import subprocess
+
+    return subprocess.run(cmd, check=False).returncode
+
+
+def _update() -> int:
+    """Reinstall the latest release through uv - the same tarball the one-liner
+    installs, so the two cannot drift. Not available to a source/pip install, which
+    has no uv and updates with `git pull` instead.
+
+    A source tarball, not a git ref: a bare machine (a fresh Mac before the Command
+    Line Tools) has no git, which is the same reason install.sh stopped using git+.
+    """
+    if not _uv_present():
+        print(
+            "daemon update needs uv, which this install does not have - you are "
+            "probably running from source. Update with `git pull`, or reinstall "
+            "with the one-liner in the README."
+        )
+        return PROBLEM
+    ref = os.environ.get("DAEMON_VERSION") or _latest_ref()
+    source = f"https://github.com/{GITHUB_REPO}/archive/{ref}.tar.gz"
+    print(f"updating to {ref} ...")
+    # One requirement string, not `--from <url> <name>`: uv rejects extras on the
+    # positional when `--from` is also given ("conflicts with install request"), so
+    # the extra rides a PEP 508 direct reference - `daemon-ai[mcp] @ <url>`.
+    install = [
+        "uv", "tool", "install", "--force", "--python", "3.13", f"{INSTALL_SPEC} @ {source}"
+    ]
+    if _run(install) != 0:
+        print("update failed - the install output above says why.")
+        return PROBLEM
+    print(f"updated to {ref}.")
+    # uv replaced the code in place, but a running supervisor holds the old code
+    # until it re-execs - so an update that stops here is one the resident never
+    # sees, which is exactly the "did it even update?" confusion this avoids.
+    _restart_after_update()
+    return OK
+
+
+def _restart_after_update() -> None:
+    """Restart the resident service so it runs the code just installed.
+
+    Best-effort and after the fact: the reinstall already succeeded, so a config
+    that will not load or a machine with no service installed must not turn into a
+    failure - it turns into a line telling the user what to do by hand. Only the
+    installed OS service is restarted; a `daemon run` in a terminal is a foreground
+    process this command cannot reach, so it is told, not touched.
+    """
+    try:
+        settings = Settings()
+    except ConfigError:
+        print(
+            "the code is updated; restart the service yourself to pick it up "
+            "(config did not load here, so I could not do it automatically)."
+        )
+        return
+    try:
+        service = service_for(settings)
+        status = service.status()
+    except ServiceError as exc:
+        print(f"the code is updated; I could not check the service ({exc}) - "
+              "restart it yourself to pick it up.")
+        return
+    if not status.installed:
+        print(
+            "the code is updated. It is not installed as a background service, so "
+            "there is nothing to restart - run `daemon run`, or `daemon install` to "
+            "keep it resident."
+        )
+        return
+    try:
+        service.restart()
+    except ServiceError as exc:
+        print(f"the code is updated, but restarting the service failed ({exc}) - "
+              "restart it yourself to pick it up.")
+        return
+    print("restarted the resident service on the new version.")
 
 
 def _pairing(settings: Settings, args: Any) -> int:
@@ -446,6 +596,7 @@ def _tools(settings: Settings, args: Any) -> int:
         print(f"allowlist:  {', '.join(settings.tools_allowlist) or '(none)'}")
         browser = f"on ({settings.browser_app})" if settings.browser_enabled else "off"
         print(f"browser:    {browser}")
+        print(f"screen:     {'on' if settings.screen_enabled else 'off'}")
         print(f"mcp:        {'on' if settings.mcp_enabled else 'off'}")
         print()
         try:
@@ -463,6 +614,13 @@ def _tools(settings: Settings, args: Any) -> int:
                     app=settings.browser_app,
                     timeout_secs=settings.tools_timeout_secs,
                     max_output=settings.tools_max_output,
+                )
+            if settings.screen_enabled:
+                from daemon.tools.screen import screen_tools
+
+                available += screen_tools(
+                    max_px=settings.screen_max_px,
+                    timeout_secs=settings.tools_timeout_secs,
                 )
         except Exception as exc:
             print(f"daemon: the built-in tools cannot be built: {exc}", file=sys.stderr)
@@ -735,6 +893,7 @@ def _doctor() -> int:
         settings = Settings()
     except ConfigError as exc:
         checks = [Check("config", False, str(exc))]
+        admin = None
     else:
         table = ", ".join(
             f"{task.value}->{route.provider}" for task, route in settings.routing_table().items()
@@ -752,13 +911,19 @@ def _doctor() -> int:
             _persona_check(settings),
             _proactivity_check(settings),
             _tools_check(settings),
+            _screen_check(settings),
             *_ollama_checks(settings),
         ]
+        admin = _admin_url(settings)
 
     failed = 0
     for check in checks:
         print(f"[{'ok' if check.ok else 'FAIL'}] {check.name}: {check.detail}")
         failed += not check.ok
+    if admin:
+        # Where the operator opens the web console - the one capability doctor knows
+        # about that has a URL rather than a yes/no.
+        print(f"\nadmin console: {admin}  (while the daemon is running)")
     if failed:
         # Flushed first, or the summary lands above the checks it summarises when
         # stdout is a pipe and stderr is not.
@@ -851,6 +1016,56 @@ def _tools_check(settings: Settings) -> Check:
             "tools", True, detail + " - runs everything without asking; only the origin gate holds"
         )
     return Check("tools", True, detail)
+
+
+def _screen_check(settings: Settings) -> Check:
+    """Whether Daemon may capture the screen and, on macOS, whether the OS has
+    actually granted it.
+
+    Screen capture is TCC-gated the same way microphone/camera access is, and a
+    denial does not surface as an ordinary error - `screencapture` either exits
+    non-zero or silently writes a zero-byte file (see `daemon/tools/screen.py`'s
+    TCC_HINT). Since this is the one place that finds out *before* the owner asks
+    for a screenshot and gets a confusing failure, it is worth a real probe - a
+    throwaway capture to a temp file, discarded either way. It must never be the
+    reason `doctor` itself fails to run, so any problem running the probe is
+    reported as a failed check rather than raised.
+    """
+    if not settings.screen_enabled:
+        return Check("screen", True, "off (DAEMON_SCREEN_ENABLED=true to turn it on)")
+    if platform.system() != "Darwin":
+        return Check("screen", True, "on (screen capture is macOS-only)")
+
+    from daemon.tools.screen import SCREENCAPTURE_ARGS
+
+    screencapture = shutil.which("screencapture")
+    if screencapture is None:
+        return Check("screen", False, "on, but screencapture is not on PATH")
+
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = str(Path(scratch) / "probe.jpg")
+            argv = SCREENCAPTURE_ARGS(path, None)
+            argv[0] = screencapture
+            subprocess.run(
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            probe = Path(path)
+            size = probe.stat().st_size if probe.exists() else 0
+    except Exception as exc:  # best-effort: a probe failure is not a doctor crash
+        return Check("screen", False, f"on, but the Screen Recording probe failed: {exc}")
+
+    if size == 0:
+        return Check(
+            "screen",
+            False,
+            "on, but Screen Recording not yet granted - allow it in System "
+            "Settings > Privacy & Security > Screen Recording, then restart me",
+        )
+    return Check("screen", True, "on, Screen Recording granted")
 
 
 def _proactivity_check(settings: Settings) -> Check:
