@@ -345,8 +345,13 @@ async function loadMcp(){
 function mcpCard(c){
   let action;
   if(c.auth==='oauth'){
-    const off=c.oauth_verified?'':' disabled title="not yet verified against a live flow"';
-    action=`<button class="btn pri" data-oauth="${esc(c.name)}"${off}>Connect with OAuth</button>`;
+    // Always clickable: this is a loopback, owner-only surface, and the owner is
+    // the one who does the browser login. Disabling an unverified server made a
+    // circular gate - you cannot verify a flow you are not allowed to start - so an
+    // unverified one is just labelled experimental, not blocked.
+    const hint=c.oauth_verified?'':' title="experimental - not yet verified against a live flow"';
+    const tag=c.oauth_verified?'':' <span class="cap muted">(experimental)</span>';
+    action=`<button class="btn pri" data-oauth="${esc(c.name)}"${hint}>Connect with OAuth</button>${tag}`;
   }else if(c.needs_key){
     action=`<input type="password" data-key="${esc(c.name)}" placeholder="API key" style="margin-bottom:10px">
       <button class="btn pri" data-connect="${esc(c.name)}">Connect</button>`;
