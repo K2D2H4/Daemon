@@ -22,12 +22,14 @@ the coordination this module owns, not Notion's token endpoint.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -36,6 +38,12 @@ from daemon.app import create_app
 from daemon.config import Settings
 from daemon.mcp_catalog import lookup
 from daemon.tools.mcp import ServerConfig, load_config, save_server, server_config_from_catalog
+
+# The admin router is loopback-only (routes.py `_loopback_only`); a real browser on
+# 127.0.0.1 sends this Host, and `TestClient`'s default `testserver` is rejected.
+LOOPBACK = "http://127.0.0.1"
+
+OAUTH_REDIRECT = "http://127.0.0.1:8787/admin/api/mcp/oauth/callback"
 
 
 def _settings(tmp_path: Path, **kw: object) -> Settings:
@@ -126,7 +134,7 @@ def _enabled_app(tmp_path: Path, bridge: FakeBridge | None = None) -> Any:
 def test_mcp_routes_are_409_when_disabled(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))  # mcp_enabled defaults False
     app.state.env_path = tmp_path / ".env"
-    client = TestClient(app)
+    client = TestClient(app, base_url=LOOPBACK)
 
     assert client.get("/admin/api/mcp/catalog").status_code == 409
     assert client.get("/admin/api/mcp/servers").status_code == 409
@@ -141,7 +149,7 @@ def test_mcp_routes_are_409_when_disabled(tmp_path: Path) -> None:
 
 
 def test_catalog_lists_entries_without_leaking_commands(tmp_path: Path) -> None:
-    client = TestClient(_enabled_app(tmp_path))
+    client = TestClient(_enabled_app(tmp_path), base_url=LOOPBACK)
     body = client.get("/admin/api/mcp/catalog").json()
     by_name = {c["name"]: c for c in body["catalog"]}
 
@@ -162,7 +170,7 @@ def test_catalog_lists_entries_without_leaking_commands(tmp_path: Path) -> None:
 
 def test_connect_keyless_saves_then_connects(tmp_path: Path) -> None:
     bridge = FakeBridge()
-    client = TestClient(_enabled_app(tmp_path, bridge))
+    client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
 
     resp = client.post("/admin/api/mcp/connect", json={"name": "fetch"})
     assert resp.status_code == 200
@@ -176,7 +184,7 @@ def test_connect_keyless_saves_then_connects(tmp_path: Path) -> None:
 
 def test_connect_key_server_writes_env_then_passes_secret(tmp_path: Path) -> None:
     bridge = FakeBridge()
-    client = TestClient(_enabled_app(tmp_path, bridge))
+    client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
 
     resp = client.post(
         "/admin/api/mcp/connect", json={"name": "tavily", "secret": "tvly-abc123"}
@@ -195,7 +203,7 @@ def test_connect_key_server_writes_env_then_passes_secret(tmp_path: Path) -> Non
 
 
 def test_connect_key_server_needs_a_secret(tmp_path: Path) -> None:
-    client = TestClient(_enabled_app(tmp_path))
+    client = TestClient(_enabled_app(tmp_path), base_url=LOOPBACK)
     resp = client.post("/admin/api/mcp/connect", json={"name": "tavily"})
     assert resp.status_code == 400
     # Nothing written when the secret is missing.
@@ -203,7 +211,7 @@ def test_connect_key_server_needs_a_secret(tmp_path: Path) -> None:
 
 
 def test_connect_rejects_unknown_and_oauth_names(tmp_path: Path) -> None:
-    client = TestClient(_enabled_app(tmp_path))
+    client = TestClient(_enabled_app(tmp_path), base_url=LOOPBACK)
     assert client.post("/admin/api/mcp/connect", json={"name": "nope"}).status_code == 400
     # OAuth goes through oauth/start, not here.
     resp = client.post("/admin/api/mcp/connect", json={"name": "notion"})
@@ -214,7 +222,7 @@ def test_connect_rejects_unknown_and_oauth_names(tmp_path: Path) -> None:
 def test_a_failed_connect_leaves_the_entry_persisted(tmp_path: Path) -> None:
     bridge = FakeBridge()
     bridge.fail_connect = True
-    client = TestClient(_enabled_app(tmp_path, bridge))
+    client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
 
     resp = client.post("/admin/api/mcp/connect", json={"name": "fetch"})
     assert resp.status_code == 502
@@ -231,7 +239,7 @@ def test_servers_reports_connection_state(tmp_path: Path) -> None:
     save_server(tmp_path, server_config_from_catalog(lookup("tavily")))
     bridge = FakeBridge()
     bridge.failures["tavily"] = "bad key"
-    client = TestClient(_enabled_app(tmp_path, bridge))
+    client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
 
     servers = {s["name"]: s for s in client.get("/admin/api/mcp/servers").json()["servers"]}
     assert servers["fetch"]["connected"] is True
@@ -246,7 +254,7 @@ def test_servers_reports_connection_state(tmp_path: Path) -> None:
 def test_delete_removes_and_disconnects_idempotently(tmp_path: Path) -> None:
     save_server(tmp_path, server_config_from_catalog(lookup("fetch")))
     bridge = FakeBridge()
-    client = TestClient(_enabled_app(tmp_path, bridge))
+    client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
 
     first = client.delete("/admin/api/mcp/servers/fetch")
     assert first.status_code == 200 and first.json()["removed"] is True
@@ -318,7 +326,7 @@ def test_oauth_routes_bridge_two_requests(tmp_path: Path, monkeypatch: pytest.Mo
 
     # `with` keeps one event loop for the client's lifetime, so the connect task the
     # start request suspends survives until the callback request resolves it.
-    with TestClient(app) as client:
+    with TestClient(app, base_url=LOOPBACK) as client:
         app.state.mcp = FakeBridge()
 
         start = client.post("/admin/api/mcp/oauth/start", json={"name": "notion"})
@@ -334,15 +342,153 @@ def test_oauth_routes_bridge_two_requests(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def test_oauth_start_rejects_a_non_oauth_name(tmp_path: Path) -> None:
-    client = TestClient(_enabled_app(tmp_path))
+    client = TestClient(_enabled_app(tmp_path), base_url=LOOPBACK)
     resp = client.post("/admin/api/mcp/oauth/start", json={"name": "fetch"})
     assert resp.status_code == 400
     assert "not an OAuth server" in resp.json()["detail"]
 
 
 def test_oauth_callback_reports_unknown_state_in_html(tmp_path: Path) -> None:
-    client = TestClient(_enabled_app(tmp_path))
+    client = TestClient(_enabled_app(tmp_path), base_url=LOOPBACK)
     resp = client.get("/admin/api/mcp/oauth/callback?code=x&state=stale")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/html")
     assert "failed" in resp.text.lower()
+
+
+# --- the OAuth flow does not leak tasks or registry entries (finding #4) -------
+# `callback_handler` awaits the redirect with a timeout, and every error/return path
+# in `start` cancels the connect task and evicts the state, so an abandoned flow, a
+# stateless authorize URL, and a burst of starts all clean up after themselves.
+
+
+class _StatelessBridge(FakeBridge):
+    """Drives the OAuth handlers with an authorize URL that carries no `state`, the
+    one the callback could never be matched to - so `start` must treat it as dead."""
+
+    async def connect_server(
+        self, config: ServerConfig, *, secret: str | None = None, auth: Any = None
+    ) -> int:
+        self.connected.append((config, secret, auth))
+        if auth is not None:
+            await auth.redirect_handler("https://auth.example/authorize?client_id=abc")
+            await auth.callback_handler()  # suspends until start cancels the task
+        return 3
+
+
+class _CountingBridge(FakeBridge):
+    """A distinct `state` per flow, so several pending flows coexist in `_FLOWS`
+    rather than colliding on one key."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._n = 0
+
+    async def connect_server(
+        self, config: ServerConfig, *, secret: str | None = None, auth: Any = None
+    ) -> int:
+        self.connected.append((config, secret, auth))
+        if auth is not None:
+            self._n += 1
+            await auth.redirect_handler(f"https://auth.example/authorize?state=S{self._n}")
+            await auth.callback_handler()
+        return 3
+
+
+async def test_an_abandoned_oauth_flow_is_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner opens the authorize URL, then closes the tab and never returns. The
+    suspended connect must give up rather than hold its task and `_FLOWS` entry."""
+    monkeypatch.setattr(mcp_oauth, "CALLBACK_TIMEOUT", 0.05)
+    bridge = FakeBridge()
+
+    await mcp_oauth.start_oauth_flow(
+        bridge, tmp_path, lookup("notion"),
+        redirect_uri=OAUTH_REDIRECT, build_provider=_fake_build_provider,
+    )
+    flow = mcp_oauth._FLOWS["STATE-XYZ"]
+    task = flow.task
+    assert task is not None
+
+    await asyncio.sleep(0.2)  # past CALLBACK_TIMEOUT
+
+    assert "STATE-XYZ" not in mcp_oauth._FLOWS, "an abandoned flow leaked its registry entry"
+    assert task.done(), "an abandoned flow leaked its connect task"
+
+
+async def test_a_stateless_authorize_url_cancels_the_connect_task(tmp_path: Path) -> None:
+    """An authorize URL with no `state` is a flow whose callback can never be matched.
+    `start` raises, and it must first cancel the task it left parked in the callback."""
+    bridge = _StatelessBridge()
+    with pytest.raises(mcp_oauth.OAuthError):
+        await mcp_oauth.start_oauth_flow(
+            bridge, tmp_path, lookup("notion"),
+            redirect_uri=OAUTH_REDIRECT, build_provider=_fake_build_provider,
+        )
+
+    await asyncio.sleep(0.05)  # let the cancellation propagate
+    lingering = [
+        t for t in asyncio.all_tasks()
+        if t.get_name() == "mcp-oauth-notion" and not t.done()
+    ]
+    assert not lingering, "the no-state error stranded the connect task"
+    assert mcp_oauth._FLOWS == {}, "a dead flow was left in the registry"
+
+
+async def test_pending_flows_do_not_grow_without_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run of abandoned flows must not pile up in `_FLOWS` forever - the timeout
+    reaps every one of them."""
+    monkeypatch.setattr(mcp_oauth, "CALLBACK_TIMEOUT", 0.05)
+    bridge = _CountingBridge()
+
+    for _ in range(5):
+        await mcp_oauth.start_oauth_flow(
+            bridge, tmp_path, lookup("notion"),
+            redirect_uri=OAUTH_REDIRECT, build_provider=_fake_build_provider,
+        )
+    assert len(mcp_oauth._FLOWS) == 5, "each pending flow should be registered while live"
+
+    await asyncio.sleep(0.2)  # past CALLBACK_TIMEOUT for all of them
+    assert mcp_oauth._FLOWS == {}, "abandoned flows were never reaped"
+
+
+# --- the connect/disconnect lock serialises mcp.json writers (finding #6) ------
+
+
+class _OrderBridge(FakeBridge):
+    """Records the interleaving of its connect bodies. With the route-level lock the
+    two persist+connect regions run one after the other; without it they overlap at
+    the await and the `mcp.json` read-modify-write can lose an update."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.order: list[str] = []
+
+    async def connect_server(
+        self, config: ServerConfig, *, secret: str | None = None, auth: Any = None
+    ) -> int:
+        self.order.append(f"start:{config.name}")
+        await asyncio.sleep(0.02)
+        self.order.append(f"end:{config.name}")
+        self.connected.append((config, secret, auth))
+        return 3
+
+
+async def test_concurrent_connects_are_serialized(tmp_path: Path) -> None:
+    bridge = _OrderBridge()
+    app = _enabled_app(tmp_path, bridge)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url=LOOPBACK) as client:
+        await asyncio.gather(
+            client.post("/admin/api/mcp/connect", json={"name": "fetch"}),
+            client.post("/admin/api/mcp/connect", json={"name": "time"}),
+        )
+
+    assert bridge.order == ["start:fetch", "end:fetch", "start:time", "end:time"], (
+        "the two persist+connect regions interleaved"
+    )
+    # Both landed in mcp.json - the serialised read-modify-write lost neither.
+    assert {c.name for c in load_config(tmp_path).servers} == {"fetch", "time"}

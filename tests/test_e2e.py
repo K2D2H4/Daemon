@@ -1096,6 +1096,42 @@ async def test_boot_catch_up_that_raises_does_not_take_the_daemon_down(
         assert not app.state.loop_task.done()
 
 
+async def test_build_io_closes_the_store_when_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Store.open` succeeds, then `reindex` (or anything before the `_IO` is
+    returned) raises. The sqlite handle must be closed, not leaked - the process now
+    keeps running degraded, so a leak here would accumulate across restarts
+    (finding #7). Regression: the open store must be closed before the error escapes.
+    """
+    import sqlite3
+
+    from daemon import app as app_module
+    from daemon.memory.store import Store
+
+    opened: list[Store] = []
+    real_open = Store.open
+
+    def spy_open(path: Any) -> Store:
+        store = real_open(path)
+        opened.append(store)
+        return store
+
+    monkeypatch.setattr("daemon.memory.store.Store.open", staticmethod(spy_open))
+    monkeypatch.setattr(
+        "daemon.memory.reindex.reindex",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("mirror is corrupt")),
+    )
+
+    with pytest.raises(RuntimeError):
+        app_module._build_io(settings_for(tmp_path))
+
+    assert opened, "the store was never opened"
+    # A closed connection raises on use; a leaked one would answer instead.
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].conn.execute("SELECT 1")
+
+
 async def test_a_missing_channel_still_brings_up_memory_tools_and_mcp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -14,6 +14,7 @@ and dropping them.
 
 from __future__ import annotations
 
+import asyncio
 import stat
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,7 @@ from daemon.tools.mcp import (
     save_server,
     server_config_from_catalog,
 )
-from tests.test_mcp import RemoteTool, Session, write_config
+from tests.test_mcp import Listing, RemoteTool, Session, write_config
 
 
 class _Dummy:
@@ -186,28 +187,114 @@ class _FakeStack:
         self._closed.append(self._name)
 
 
-async def test_disconnect_closes_only_that_servers_stack() -> None:
+def _stack_recording_connect(
+    bridge: McpBridge, closed: list[str]
+) -> Any:
+    """A fake `_connect` that puts a recording stack in `bridge._stacks`, the way the
+    real `_connect` leaves one there - so the connection's own task has a stack to
+    close and the test can watch it be closed."""
+
+    async def connect(config: ServerConfig, *, secret: Any = None, auth: Any = None) -> Any:
+        bridge._stacks[config.name] = _FakeStack(config.name, closed)  # type: ignore[assignment]
+        return Session([])
+
+    return connect
+
+
+async def test_disconnect_closes_only_that_servers_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bridge = McpBridge([])
     await bridge.start(Registry())
     closed: list[str] = []
-    bridge._stacks["a"] = _FakeStack("a", closed)  # type: ignore[assignment]
-    bridge._stacks["b"] = _FakeStack("b", closed)  # type: ignore[assignment]
-    bridge._sessions["a"] = object()
-    bridge._sessions["b"] = object()
+    monkeypatch.setattr(bridge, "_connect", _stack_recording_connect(bridge, closed))
+    await bridge.connect_server(ServerConfig(name="a", command="x"))
+    await bridge.connect_server(ServerConfig(name="b", command="y"))
 
     await bridge.disconnect_server("a")
     assert closed == ["a"]
     assert "b" in bridge._stacks and "a" not in bridge._stacks
 
 
-async def test_aclose_closes_every_server_stack() -> None:
+async def test_aclose_closes_every_server_stack(monkeypatch: pytest.MonkeyPatch) -> None:
     bridge = McpBridge([])
+    await bridge.start(Registry())
     closed: list[str] = []
-    bridge._stacks["a"] = _FakeStack("a", closed)  # type: ignore[assignment]
-    bridge._stacks["b"] = _FakeStack("b", closed)  # type: ignore[assignment]
+    monkeypatch.setattr(bridge, "_connect", _stack_recording_connect(bridge, closed))
+    await bridge.connect_server(ServerConfig(name="a", command="x"))
+    await bridge.connect_server(ServerConfig(name="b", command="y"))
+
     await bridge.aclose()
     assert sorted(closed) == ["a", "b"]
     assert not bridge._stacks
+
+
+async def test_a_server_is_torn_down_in_the_task_that_opened_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fix, proven rather than assumed: anyio requires the stdio/session context
+    to be exited in the task it was entered in. A connect from one request task and a
+    disconnect from a *different* request task - the split that raised 'exit cancel
+    scope in a different task' and orphaned the child - must still tear down in the
+    single owning task, and a connect-then-aclose must too."""
+    import mcp
+    import mcp.client.stdio as stdio
+
+    class _AffinityStdioCM:
+        """Records the task its enter and exit run in, so the test can assert they
+        match. A plain object() stands in for each of the (read, write) streams."""
+
+        def __init__(self, record: dict[str, Any]) -> None:
+            self._record = record
+
+        async def __aenter__(self) -> tuple[Any, Any]:
+            self._record["enter"] = asyncio.current_task()
+            return (object(), object())
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            self._record["exit"] = asyncio.current_task()
+            return False
+
+    class _AffinitySessionCM:
+        async def __aenter__(self) -> _AffinitySessionCM:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        async def initialize(self) -> None:
+            return None
+
+        async def list_tools(self) -> Any:
+            return Listing([])
+
+    def wire(record: dict[str, Any]) -> None:
+        monkeypatch.setattr(mcp, "StdioServerParameters", lambda **_: object())
+        monkeypatch.setattr(stdio, "stdio_client", lambda _p: _AffinityStdioCM(record))
+        monkeypatch.setattr(mcp, "ClientSession", lambda r, w: _AffinitySessionCM())
+
+    # connect-then-disconnect, deliberately from two different request tasks.
+    record: dict[str, Any] = {}
+    wire(record)
+    bridge = McpBridge([])
+    await bridge.start(Registry())
+    config = ServerConfig(name="t", command="uvx")
+    await asyncio.create_task(bridge.connect_server(config))
+    enter_task = record["enter"]
+    assert enter_task is not None
+    assert enter_task is not asyncio.current_task()  # a dedicated task, not the caller
+    assert "exit" not in record  # still open
+    await asyncio.create_task(bridge.disconnect_server("t"))
+    assert record["exit"] is enter_task  # exited where it was entered, not in the caller
+
+    # connect-then-aclose closes it in the entering task too.
+    record = {}
+    wire(record)
+    bridge = McpBridge([])
+    await bridge.start(Registry())
+    await asyncio.create_task(bridge.connect_server(config))
+    await bridge.aclose()
+    assert record["exit"] is record["enter"]
 
 
 # --- secret indirection: stdio env ------------------------------------------
@@ -348,6 +435,44 @@ async def test_remove_server_drops_only_that_block(data_dir: Path) -> None:
 async def test_remove_absent_server_reports_false(data_dir: Path) -> None:
     save_server(data_dir, ServerConfig(name="a", command="uvx"))
     assert remove_server(data_dir, "never-there") is False
+
+
+# --- an unparseable mcp.json is never silently overwritten -------------------
+
+
+async def test_save_server_refuses_to_clobber_an_unparseable_config(data_dir: Path) -> None:
+    """A trailing comma - the exact case `load_config`'s docstring calls out - must
+    not cost the owner every hand-edited block: `save_server` raises rather than
+    rewriting the file with only the new server."""
+    bad = '{"servers": {"fs": {"command": "uvx"},}}'  # trailing comma
+    (data_dir / "mcp.json").write_text(bad, encoding="utf-8")
+    with pytest.raises(ToolError):
+        save_server(data_dir, ServerConfig(name="new", url="https://x/mcp"))
+    # The file is untouched - nothing was discarded.
+    assert (data_dir / "mcp.json").read_text(encoding="utf-8") == bad
+
+
+async def test_remove_server_refuses_to_clobber_an_unparseable_config(data_dir: Path) -> None:
+    bad = '{"servers": {"fs": {"command": "uvx"},}}'
+    (data_dir / "mcp.json").write_text(bad, encoding="utf-8")
+    with pytest.raises(ToolError):
+        remove_server(data_dir, "fs")
+    assert (data_dir / "mcp.json").read_text(encoding="utf-8") == bad
+
+
+async def test_save_server_refuses_a_config_that_is_not_an_object(data_dir: Path) -> None:
+    """A file that parses but is a list, not an object, is just as unsafe to
+    overwrite - it is still something the owner wrote."""
+    (data_dir / "mcp.json").write_text("[1, 2, 3]", encoding="utf-8")
+    with pytest.raises(ToolError):
+        save_server(data_dir, ServerConfig(name="new", command="uvx"))
+
+
+async def test_save_server_starts_fresh_when_the_file_is_absent(data_dir: Path) -> None:
+    """Absence is not corruption: the first save creates the file."""
+    assert not (data_dir / "mcp.json").exists()
+    save_server(data_dir, ServerConfig(name="a", command="uvx"))
+    assert {s.name for s in load_config(data_dir).servers} == {"a"}
 
 
 # --- catalog -> ServerConfig -------------------------------------------------

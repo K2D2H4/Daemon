@@ -55,7 +55,7 @@ def schedule_exit() -> None:
     a half-closed one. Scheduled on the loop so the endpoint's response is sent
     first; only reached when `is_supervised` said something will bring us back.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     loop.call_later(EXIT_DELAY_SECONDS, _raise_sigterm)
     logger.info("admin: graceful restart requested; exiting in %.2fs", EXIT_DELAY_SECONDS)
 

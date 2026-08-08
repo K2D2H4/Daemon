@@ -55,6 +55,14 @@ START_TIMEOUT = 30.0
 plus dynamic registration is a couple of round-trips; past this the server is not
 answering and returning is better than a request that hangs open."""
 
+CALLBACK_TIMEOUT = 300.0
+"""How long the suspended connect waits for its redirect to come back before it gives
+up (finding #4). Without a ceiling, an owner who closes the OAuth tab strands the
+connect task, its open connection and its `_FLOWS` entry forever. Five minutes is
+long enough for a human to authorise in another tab and short enough that an
+abandoned flow does not linger; when it fires, the connect fails and its `finally`
+evicts the `_FLOWS` entry."""
+
 
 class OAuthError(RuntimeError):
     """A flow that could not start or complete. Its message is safe to return to
@@ -213,7 +221,16 @@ async def start_oauth_flow(
         flow.ready.set()
 
     async def callback_handler() -> tuple[str, str | None]:
-        return await flow.future
+        # Bounded (finding #4): an abandoned flow - the owner closed the OAuth tab -
+        # would otherwise suspend this connect on `flow.future` forever, holding its
+        # connection and its `_FLOWS` entry. On timeout the connect below fails and its
+        # `finally` evicts the registry entry, so the flow cleans itself up.
+        try:
+            return await asyncio.wait_for(flow.future, timeout=CALLBACK_TIMEOUT)
+        except TimeoutError as exc:
+            raise OAuthError(
+                f"{entry.name}: timed out waiting for the authorization callback"
+            ) from exc
 
     provider = build(config.url, redirect_uri, storage, redirect_handler, callback_handler)
 
@@ -234,17 +251,29 @@ async def start_oauth_flow(
 
     flow.task = asyncio.create_task(connect(), name=f"mcp-oauth-{entry.name}")
 
+    def _abandon() -> None:
+        """Tear down a flow that will never complete (finding #4): cancel the
+        suspended connect task and drop any registry entry it left. Without this the
+        error returns below strand the task - the no-state case in particular leaves
+        it parked in `callback_handler` on a future nothing will ever resolve."""
+        if flow.task is not None:
+            flow.task.cancel()
+        if registered_state is not None:
+            _FLOWS.pop(registered_state, None)
+
     try:
         await asyncio.wait_for(flow.ready.wait(), timeout=START_TIMEOUT)
     except TimeoutError:
-        flow.task.cancel()
+        _abandon()
         raise OAuthError(
             f"{entry.name}: timed out waiting for the authorization URL"
         ) from None
 
     if flow.error is not None:
+        _abandon()
         raise OAuthError(str(flow.error)) from flow.error
     if not flow.authorize_url:
+        _abandon()
         raise OAuthError(f"{entry.name}: no authorization URL was produced")
     return flow.authorize_url
 

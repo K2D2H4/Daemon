@@ -109,6 +109,12 @@ def create_app(
     app.state.tools = None
     app.state.tools_status = "not started"
     app.state.mcp = None
+    # Serialises the admin's persist-then-(dis)connect MCP routes so two of them
+    # cannot interleave the `mcp.json` read-modify-write and lose an update
+    # (daemon/admin/routes.py, finding #6). Constructed here, not in the lifespan,
+    # because the routes run under `TestClient` without one; it binds to the running
+    # loop on first use.
+    app.state.mcp_persist_lock = asyncio.Lock()
     # Where a settings patch is written and where `.env` is read from - the same
     # file Settings loaded (config.ENV_FILE, cwd-relative), so the admin edits the
     # one source of truth rather than a second copy. A test overrides it.
@@ -490,42 +496,50 @@ def _build_io(settings: Settings) -> _IO:
     # Built before the channel: the channel takes the cursor from it, so a
     # restart does not re-receive and re-answer what it already handled.
     store = Store.open(settings.data_dir / DB_FILENAME)
-    # Repairs a mirror that fell behind its markdown - a failed mirror write, a
-    # crash between the two writes, or a deleted database. Without this the
-    # markdown being the source of truth is a claim nothing acts on.
-    reindex(settings.data_dir, store)
-    # Pairing by default: on a first run the env allowlist is empty, and in
-    # `allowlist` mode that refuses to start - correct as a policy, useless as an
-    # onboarding step. The owner's id is captured from their first message
-    # instead of transcribed by hand.
-    # A missing bot token must not cost the daemon its memory, tools and admin
-    # surface: those are channel-independent, and the admin web (M5) is explicitly
-    # a local-only, tokenless-deployment surface. So a channel that will not build
-    # degrades to "no inbound conversation path" rather than taking the whole
-    # process down - the same tolerance `build_proactive_tick` already applies to
-    # its own `_build_channel`. `_lifespan` starts the conversation loop only when
-    # the channel is present, so None here simply means no Telegram loop.
+    # Everything after the open is guarded so a failure between here and the return
+    # closes the sqlite handle rather than leaking it (finding #7): `reindex` can
+    # raise on a corrupt mirror, and the process now keeps running degraded rather
+    # than crashing, so a leaked handle would accumulate across restarts.
     try:
-        channel: Channel | None = _build_channel(settings, store)
-    except Exception as exc:
-        logger.error(
-            "channel not started; continuing with memory, tools and admin "
-            "(no inbound conversation path): %s",
-            exc,
+        # Repairs a mirror that fell behind its markdown - a failed mirror write, a
+        # crash between the two writes, or a deleted database. Without this the
+        # markdown being the source of truth is a claim nothing acts on.
+        reindex(settings.data_dir, store)
+        # Pairing by default: on a first run the env allowlist is empty, and in
+        # `allowlist` mode that refuses to start - correct as a policy, useless as an
+        # onboarding step. The owner's id is captured from their first message
+        # instead of transcribed by hand.
+        # A missing bot token must not cost the daemon its memory, tools and admin
+        # surface: those are channel-independent, and the admin web (M5) is explicitly
+        # a local-only, tokenless-deployment surface. So a channel that will not build
+        # degrades to "no inbound conversation path" rather than taking the whole
+        # process down - the same tolerance `build_proactive_tick` already applies to
+        # its own `_build_channel`. `_lifespan` starts the conversation loop only when
+        # the channel is present, so None here simply means no Telegram loop.
+        try:
+            channel: Channel | None = _build_channel(settings, store)
+        except Exception as exc:
+            logger.error(
+                "channel not started; continuing with memory, tools and admin "
+                "(no inbound conversation path): %s",
+                exc,
+            )
+            channel = None
+        recall, recall_status, embedder = _build_recall(settings, store)
+        writer = FileMemoryWriter(settings.data_dir, store)
+        return _IO(
+            channel=channel,
+            memory=writer,
+            recall=recall,
+            recall_status=recall_status,
+            resolve_id=_id_resolver(writer),
+            close=store.close,
+            embedder=embedder,
+            store=store,
         )
-        channel = None
-    recall, recall_status, embedder = _build_recall(settings, store)
-    writer = FileMemoryWriter(settings.data_dir, store)
-    return _IO(
-        channel=channel,
-        memory=writer,
-        recall=recall,
-        recall_status=recall_status,
-        resolve_id=_id_resolver(writer),
-        close=store.close,
-        embedder=embedder,
-        store=store,
-    )
+    except Exception:
+        store.close()
+        raise
 
 
 BACKFILL_CHUNK = 500

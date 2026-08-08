@@ -230,11 +230,32 @@ def _block_of(config: ServerConfig) -> dict[str, Any]:
 
 
 def _read_raw(path: Path) -> dict[str, Any]:
+    """The current `mcp.json` as a dict, `{}` only when the file is genuinely absent.
+
+    Absence is fine - the first `save_server` starts the file. But a file that
+    *exists* and does not parse (the trailing comma `load_config`'s docstring calls
+    out) must not be treated as empty: the next `save_server`/`remove_server` would
+    then rewrite the file with only its one change, silently discarding every block
+    the owner hand-edited. So a parse or shape error raises, for the route to
+    surface, rather than the connect flow quietly clobbering the file.
+    """
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
-    return raw if isinstance(raw, dict) else {}
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        raise ToolError(
+            f"{path} exists but is not valid JSON ({exc}); fix or remove it before "
+            "adding or removing a server, so its other blocks are not lost"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ToolError(
+            f"{path} exists but is not a JSON object; fix or remove it before "
+            "adding or removing a server, so its other blocks are not lost"
+        )
+    return raw
 
 
 def save_server(data_dir: Path, config: ServerConfig) -> None:
@@ -298,6 +319,70 @@ class McpTool:
         return await self._bridge.call(self._server, self._remote_name, arguments)
 
 
+class _ServerLink:
+    """One server's transport + session, opened and closed in a single task.
+
+    The SDK's stdio/http transports and `ClientSession` are anyio cancel scopes, and
+    anyio raises `RuntimeError: Attempted to exit cancel scope in a different task
+    than it was entered in` if they are `__aexit__`'d anywhere but the task that
+    `__aenter__`'d them. A hot connect runs in one request task and its disconnect in
+    another, so splitting enter and exit across them orphaned the stdio child every
+    time (the RuntimeError was swallowed as "closing failed"). `_run` keeps both ends
+    together: it opens the contexts, hands the session back over `_ready`, waits for
+    `_close`, and only then exits them - all in the one task. The request tasks
+    (`connect_server`, `disconnect_server`, `aclose`) only ever signal across.
+    """
+
+    def __init__(
+        self, bridge: McpBridge, config: ServerConfig, *, secret: str | None, auth: Any
+    ) -> None:
+        self._bridge = bridge
+        self._config = config
+        self._secret = secret
+        self._auth = auth
+        self._session: Any = None
+        self._error: BaseException | None = None
+        self._ready = asyncio.Event()
+        self._close = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    async def open(self) -> Any:
+        """Start the owning task and block until the session is up, or the connect
+        failed. Returns the session; on failure raises exactly what the connect
+        raised - the task has already torn its own partial stack down in that task,
+        so nothing is orphaned."""
+        self._task = asyncio.create_task(self._run())
+        await self._ready.wait()
+        if self._error is not None:
+            await self._task
+            raise self._error
+        return self._session
+
+    async def close(self) -> None:
+        """Signal the owning task to exit the contexts, and wait for it. Idempotent:
+        a second call just re-sets an already-set event and awaits a done task."""
+        self._close.set()
+        if self._task is not None:
+            await self._task
+
+    async def _run(self) -> None:
+        try:
+            self._session = await self._bridge._connect(
+                self._config, secret=self._secret, auth=self._auth
+            )
+        except BaseException as exc:  # noqa: BLE001 - relayed to `open`, task ends clean
+            # `_connect` has already closed its own partial stack, in this same task.
+            self._error = exc
+            self._ready.set()
+            return
+        self._ready.set()
+        try:
+            await self._close.wait()
+        finally:
+            # Same task that entered the stack, so anyio permits the exit.
+            await self._bridge._close_stack(self._config.name)
+
+
 class McpBridge:
     """Owns the sessions and their teardown, one exit stack *per server*.
 
@@ -306,6 +391,14 @@ class McpBridge:
     others stay up, which the admin "add a server" flow needs and a single shared
     stack could not give. Leaking a stack per restart is how a machine ends up with
     forty orphaned children, so `disconnect_server` and `aclose` both close them.
+
+    That stack is entered *and exited in a single dedicated task per server* (see
+    `_ServerLink`). The SDK's stdio/http transports and `ClientSession` are anyio
+    cancel scopes, and anyio refuses to exit one in a different task than opened it -
+    so a hot connect (a request task) followed by a disconnect (another request task)
+    used to raise `Attempted to exit cancel scope in a different task`, which the
+    teardown's `except` swallowed while the stdio child was left running. The task
+    keeps enter and exit together; the request tasks only ever *signal* it.
 
     `register`, `unregister` and `specs` are synchronous and need no lock, but a rare
     cross-turn install (the admin route connecting while a turn is mid-flight) could
@@ -319,6 +412,9 @@ class McpBridge:
         resolved = McpConfig(config, {}) if isinstance(config, list) else config
         self._configs = resolved.servers
         self._stacks: dict[str, AsyncExitStack] = {}
+        self._connections: dict[str, _ServerLink] = {}
+        """Server name -> the task that owns its transport, so the same task that
+        opened the stack is the one that closes it (see `_ServerLink`)."""
         self._sessions: dict[str, Any] = {}
         self._registered: dict[str, tuple[str, ...]] = {}
         """Server name -> the local tool names it put in the registry, so a
@@ -400,28 +496,51 @@ class McpBridge:
         secret: str | None = None,
         auth: Any = None,
     ) -> int:
-        session = await self._connect(config, secret=secret, auth=auth)
+        # The transport is opened in a dedicated task that will also close it, so
+        # anyio's "exit the cancel scope in the task that entered it" rule holds even
+        # when the later disconnect comes from a different request task. See
+        # `_ServerLink`.
+        link = _ServerLink(self, config, secret=secret, auth=auth)
+        session = await link.open()
+        self._connections[config.name] = link
         self._sessions[config.name] = session
         # Registration is inside the same call as the connect, deliberately. It used
         # to sit after it in `start`, so a server that connected and then hung on
         # `list_tools` raised out and cost every *remaining* server its tools as well
         # - one slow server disabling the others.
-        return await self._register(config, session, registry)
+        try:
+            return await self._register(config, session, registry)
+        except BaseException:
+            # The session came up but its tools would not list; tear the whole
+            # connection down (in its own task) so its child process is not orphaned.
+            await self._teardown(config.name)
+            raise
 
     async def _teardown(self, name: str) -> None:
         """Undo one server: unregister its tools, drop its session, close its stack.
-        Runs under `self._lock` (its callers hold it)."""
+        Runs under `self._lock` (its callers hold it). The stack is closed by the
+        server's own task (`_ServerLink.close`), never inline here, so a disconnect
+        can run from any request task without tripping anyio's same-task exit rule."""
         if self._registry is not None:
             for tool_name in self._registered.get(name, ()):
                 self._registry.unregister(tool_name)
         self._registered.pop(name, None)
         self._sessions.pop(name, None)
+        link = self._connections.pop(name, None)
+        if link is not None:
+            await link.close()
+
+    async def _close_stack(self, name: str) -> None:
+        """Close and drop one server's exit stack. Called only from that server's own
+        task (`_ServerLink._run`), which is the task that entered the stack - so
+        anyio's same-task exit rule is satisfied and the stdio child is terminated."""
         stack = self._stacks.pop(name, None)
-        if stack is not None:
-            try:
-                await stack.aclose()
-            except Exception:
-                logger.exception("closing MCP session %r failed", name)
+        if stack is None:
+            return
+        try:
+            await stack.aclose()
+        except Exception:
+            logger.exception("closing MCP session %r failed", name)
 
     async def _connect(
         self, config: ServerConfig, *, secret: str | None = None, auth: Any = None
@@ -528,14 +647,14 @@ class McpBridge:
     async def aclose(self) -> None:
         self._sessions.clear()
         self._registered.clear()
-        for name, stack in list(self._stacks.items()):
-            try:
-                await stack.aclose()
-            except Exception:
-                # Shutdown: a server that dies while being closed has nothing left to
-                # break, and raising here would mask whatever else the lifespan is
-                # unwinding.
-                logger.exception("closing MCP session %r failed", name)
+        # Each link closes its own stack in the task that opened it (`_close_stack`
+        # swallows a stack that dies mid-close - shutdown has nothing left to break,
+        # and raising would mask whatever else the lifespan is unwinding). Awaiting
+        # them from the lifespan task is safe precisely because the exit happens over
+        # in each server's task, not here.
+        for link in list(self._connections.values()):
+            await link.close()
+        self._connections.clear()
         self._stacks.clear()
 
 

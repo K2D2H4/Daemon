@@ -101,6 +101,16 @@ def current_settings_payload(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _reject_newlines(value: str) -> None:
+    """`.env` is line-oriented, so a value with a newline injects extra `KEY=value`
+    lines - bypassing the EDITABLE allowlist and the validate-before-write check
+    entirely (finding #2). `{"anthropic_api_key": "x\\nDAEMON_HOST=0.0.0.0"}` would
+    bind the admin to every interface on the next boot. Refuse it at the source, for
+    every editable value and every indirectly-written secret."""
+    if "\n" in value or "\r" in value:
+        raise PatchError("a value may not contain a newline")
+
+
 def _env_value(field: str, value: Any) -> str:
     """One editable value serialised the way `.env` stores it."""
     if field in BOOL_FIELDS:
@@ -116,9 +126,16 @@ def _env_value(field: str, value: Any) -> str:
                 Task(str(task))
             except ValueError as exc:
                 raise PatchError(f"route_overrides names unknown task {task!r}") from exc
+            # json.dumps would *escape* a newline rather than emit one, so this line
+            # never injects - but a newline in a routing value is malformed input, and
+            # rejecting it keeps the rule uniform across every field.
+            _reject_newlines(str(task))
+            _reject_newlines(str(provider))
             out[str(task)] = str(provider)
         return json.dumps(out)
-    return str(value)
+    text = str(value)
+    _reject_newlines(text)
+    return text
 
 
 def write_env_secret(env_path: Path, key: str, value: str) -> None:
@@ -130,6 +147,9 @@ def write_env_secret(env_path: Path, key: str, value: str) -> None:
     quoting rule and same durability as the settings patch above - `merge_env`
     preserves comments and unknown keys because the file is the owner's only copy
     of their credentials."""
+    # Same newline guard as the settings patch (finding #2): a secret with a newline
+    # would inject an extra `.env` line under the writer's nose.
+    _reject_newlines(value)
     existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
     write_private_replace(env_path, merge_env(existing, {key: value}))
 

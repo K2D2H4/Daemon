@@ -32,10 +32,13 @@ adds here can run on a turn that is not the owner's (CONTRACTS 10, 12).
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from daemon.admin.mcp_oauth import OAuthError, complete_oauth_flow, start_oauth_flow
@@ -47,7 +50,7 @@ from daemon.admin.settings_io import (
     write_env_secret,
 )
 from daemon.app import health_payload
-from daemon.llm.base import Message
+from daemon.llm.base import Message, ProviderError
 from daemon.mcp_catalog import CATALOG, lookup
 from daemon.tasks import Task
 from daemon.tools.mcp import (
@@ -57,9 +60,78 @@ from daemon.tools.mcp import (
     server_config_from_catalog,
 )
 
-router = APIRouter(prefix="/admin")
-
 SHELL = Path(__file__).parent / "static" / "index.html"
+
+CHAT_TEST_TIMEOUT = 60.0
+"""Ceiling on the chat-test round-trip. A hung provider must not hold the admin
+request open forever - past this the answer is a 504 that says so, not a socket that
+never closes (finding #7)."""
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+"""The only Host/Origin hostnames the admin serves. Anything else is either a
+DNS-rebinding attempt or a genuinely remote caller, and the admin is loopback-only
+by design (docs/design decision 1)."""
+
+_UNSAFE_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE"})
+_SAFE_FETCH_SITES = frozenset({"same-origin", "same-site", "none"})
+
+
+def _hostname(authority: str) -> str:
+    """The bare host of a `Host`/`Origin` authority, port and IPv6 brackets removed.
+
+    `127.0.0.1:8787` -> `127.0.0.1`; `[::1]:8787` -> `::1`; `localhost` -> `localhost`.
+    """
+    authority = authority.strip()
+    if not authority:
+        return ""
+    if authority.startswith("["):  # `[::1]` or `[::1]:8787`
+        return authority[1:].split("]", 1)[0]
+    return authority.rsplit(":", 1)[0] if ":" in authority else authority
+
+
+async def _loopback_only(request: Request) -> None:
+    """Reject CSRF and DNS-rebinding on the no-auth loopback admin (finding #1).
+
+    The admin deliberately has no auth: local is owner (docs/design decision 1). That
+    makes two browser attacks reachable, and this router-level guard closes both:
+
+      * DNS-rebinding - a page whose domain the attacker has re-pointed at 127.0.0.1
+        can talk to us same-origin. The defence is the `Host` header: the browser
+        still sends the attacker's name, and we serve only loopback hostnames.
+      * cross-site CSRF - a *simple* request (text/plain body, no custom header) skips
+        the CORS preflight, so its side effect lands unseen. For unsafe methods we
+        refuse a request the browser labels cross-site (`Sec-Fetch-Site`) or whose
+        `Origin` is not loopback. The admin's own same-origin fetches carry neither
+        signal against them, so the served page keeps working.
+    """
+    if _hostname(request.headers.get("host", "")) not in LOOPBACK_HOSTS:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "the admin is loopback-only; this request's Host is not a loopback "
+                "address (a DNS-rebinding attempt looks exactly like this)."
+            ),
+        )
+    if request.method not in _UNSAFE_METHODS:
+        return
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site is not None and fetch_site not in _SAFE_FETCH_SITES:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"cross-site request refused (Sec-Fetch-Site: {fetch_site}); the "
+                "admin accepts writes only from its own page."
+            ),
+        )
+    origin = request.headers.get("origin")
+    if origin and _hostname(urlsplit(origin).netloc) not in LOOPBACK_HOSTS:
+        raise HTTPException(
+            status_code=403,
+            detail="cross-origin request refused; the Origin is not a loopback address.",
+        )
+
+
+router = APIRouter(prefix="/admin", dependencies=[Depends(_loopback_only)])
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -83,13 +155,31 @@ async def chat_test(request: Request) -> JSONResponse:
     preset routes `chat_text` to reachable, and what does it say back? Everything
     that would make it a conversation is deliberately absent (see module docstring).
     """
-    body = await request.json()
-    text = str(body.get("text", "")).strip()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
+    text = str(body.get("text", "")).strip() if isinstance(body, dict) else ""
     if not text:
         return JSONResponse({"detail": "text is required"}, status_code=400)
 
     gateway = request.app.state.gateway
-    completion = await gateway.complete(Task.CHAT_TEXT, [Message(role="user", content=text)])
+    try:
+        completion = await asyncio.wait_for(
+            gateway.complete(Task.CHAT_TEXT, [Message(role="user", content=text)]),
+            timeout=CHAT_TEST_TIMEOUT,
+        )
+    except TimeoutError:
+        # A hung provider would otherwise hold this request open forever (finding #7).
+        return JSONResponse(
+            {"detail": "the model did not respond in time"}, status_code=504
+        )
+    except ProviderError as exc:
+        # An unreachable or misconfigured provider is exactly what this endpoint
+        # exists to surface (a missing model, a bad key, ollama down). Return the
+        # message as a 502 so the UI shows "model not found" rather than a 500
+        # traceback - the diagnostic is the whole point of a chat health check.
+        return JSONResponse({"detail": str(exc)}, status_code=502)
     return JSONResponse({"reply": completion.text})
 
 
@@ -107,7 +197,10 @@ async def patch_settings(request: Request) -> JSONResponse:
     A rejected patch is a 400 whose body names the problem and whose side effect is
     nothing at all - the write is downstream of a successful `Settings`
     construction (daemon/admin/settings_io.py)."""
-    patch = await request.json()
+    try:
+        patch = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
     if not isinstance(patch, dict):
         return JSONResponse({"detail": "body must be an object"}, status_code=400)
 
@@ -233,7 +326,10 @@ async def mcp_connect(request: Request) -> JSONResponse:
     """
     if not request.app.state.settings.mcp_enabled:
         return _mcp_off()
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"detail": "body must be an object"}, status_code=400)
     name = str(body.get("name", "")).strip()
@@ -264,18 +360,29 @@ async def mcp_connect(request: Request) -> JSONResponse:
                 {"detail": f"{name} needs an API key"}, status_code=400
             )
         assert entry.key_env  # a key server always names its env var (catalog invariant)
-        write_env_secret(request.app.state.env_path, entry.key_env, secret)
+        try:
+            write_env_secret(request.app.state.env_path, entry.key_env, secret)
+        except PatchError as exc:
+            # A key carrying a newline would inject an `.env` line (finding #2).
+            return JSONResponse({"detail": str(exc)}, status_code=400)
 
     config = server_config_from_catalog(entry)
-    # Persist before connecting (see docstring). The entry survives a failed connect.
-    save_server(settings.data_dir, config)
-    try:
-        landed = await bridge.connect_server(config, secret=secret)
-    except Exception as exc:  # noqa: BLE001 - the server, not us; reported to the client
-        return JSONResponse(
-            {"detail": f"{name} was saved but did not connect: {exc}", "connected": False},
-            status_code=502,
-        )
+    # Persist-then-connect, serialised against a concurrent disconnect (finding #6):
+    # two tabs, or a double-click, would otherwise interleave the `mcp.json`
+    # read-modify-write with `remove_server` and lose one update.
+    async with request.app.state.mcp_persist_lock:
+        # Persist before connecting (see docstring). The entry survives a failed connect.
+        save_server(settings.data_dir, config)
+        try:
+            landed = await bridge.connect_server(config, secret=secret)
+        except Exception as exc:  # noqa: BLE001 - the server, not us; reported to the client
+            return JSONResponse(
+                {
+                    "detail": f"{name} was saved but did not connect: {exc}",
+                    "connected": False,
+                },
+                status_code=502,
+            )
     return JSONResponse({"name": name, "connected": True, "tools": landed})
 
 
@@ -286,10 +393,13 @@ async def mcp_disconnect(request: Request, name: str) -> JSONResponse:
     so a half-happened removal is safe to retry."""
     if not request.app.state.settings.mcp_enabled:
         return _mcp_off()
-    removed = remove_server(request.app.state.settings.data_dir, name)
-    bridge = request.app.state.mcp
-    if bridge is not None:
-        await bridge.disconnect_server(name)
+    # The same lock the connect route takes (finding #6), so persist+disconnect cannot
+    # interleave with a concurrent persist+connect and lose an `mcp.json` update.
+    async with request.app.state.mcp_persist_lock:
+        removed = remove_server(request.app.state.settings.data_dir, name)
+        bridge = request.app.state.mcp
+        if bridge is not None:
+            await bridge.disconnect_server(name)
     return JSONResponse({"removed": removed})
 
 
@@ -303,7 +413,10 @@ async def mcp_oauth_start(request: Request) -> JSONResponse:
     authorize URL exists."""
     if not request.app.state.settings.mcp_enabled:
         return _mcp_off()
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"detail": "body must be an object"}, status_code=400)
     name = str(body.get("name", "")).strip()

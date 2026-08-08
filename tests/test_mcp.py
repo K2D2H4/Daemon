@@ -472,13 +472,19 @@ async def test_closing_reports_a_failure_without_raising(
     """Shutdown: a server that dies while being closed has nothing left to break, and
     raising here would mask whatever else the lifespan is unwinding."""
     bridge = McpBridge([])
+    await bridge.start(Registry())
 
     class BoomStack:
         async def aclose(self) -> None:
             raise RuntimeError("the pipe was already gone")
 
-    # Per-server stacks now: one whose close raises must not stop the rest.
-    bridge._stacks["notes"] = BoomStack()  # type: ignore[assignment]
+    async def connect(config: ServerConfig, *, secret: Any = None, auth: Any = None) -> Any:
+        # Leave a stack whose close raises, as the real `_connect` leaves one.
+        bridge._stacks[config.name] = BoomStack()  # type: ignore[assignment]
+        return Session([])
+
+    monkeypatch.setattr(bridge, "_connect", connect)
+    await bridge.connect_server(ServerConfig(name="notes", command="x"))
     with caplog.at_level("ERROR"):
         await bridge.aclose()
     assert any("closing MCP session" in r.message for r in caplog.records)
