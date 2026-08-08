@@ -30,6 +30,7 @@ from daemon.tools.mcp import (
     McpBridge,
     ServerConfig,
     _bearer_headers,
+    _leaf_message,
     _resolve_command,
     _stdio_env,
     load_config,
@@ -377,6 +378,16 @@ def test_resolve_command_leaves_an_unknown_command_to_fail_by_name() -> None:
 
 def test_resolve_command_passes_an_absolute_path_through() -> None:
     assert _resolve_command("/usr/bin/env") == "/usr/bin/env"
+
+
+def test_leaf_message_unwraps_a_taskgroup_exception_group() -> None:
+    """A url connect failure arrives wrapped in an anyio ExceptionGroup whose own
+    message is the useless 'unhandled errors in a taskgroup'; the real 401/closed
+    stream is a leaf. `_leaf_message` reports the leaf."""
+    inner = RuntimeError("401 Unauthorized")
+    group = BaseExceptionGroup("unhandled errors in a task group", [inner])
+    assert _leaf_message(group) == "401 Unauthorized"
+    assert _leaf_message(RuntimeError("plain")) == "plain"
 
 
 # --- secret indirection: bearer header --------------------------------------

@@ -424,6 +424,36 @@ def test_update_reports_a_failed_install(monkeypatch: pytest.MonkeyPatch) -> Non
     assert cli.main(["update"]) == 1
 
 
+# --- .env secrets reach os.environ so MCP keys survive a restart -------------
+
+
+def test_load_env_secrets_puts_dotenv_values_into_the_environ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An MCP key lives in .env under its variable name; the engine reads it back
+    from os.environ at connect time, so a restart must load .env into the environ or
+    a url server loses its bearer and fails with a taskgroup error."""
+    (tmp_path / ".env").write_text("TAVILY_API_KEY=tvly-secret\n", encoding="utf-8")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    cli._load_env_secrets()  # the _sandbox fixture already chdir'd into tmp_path
+
+    assert os.environ["TAVILY_API_KEY"] == "tvly-secret"
+
+
+def test_load_env_secrets_does_not_override_the_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """setdefault, not overwrite: a value the shell already exported wins, matching
+    how Settings resolves precedence (env over file)."""
+    (tmp_path / ".env").write_text("TAVILY_API_KEY=from-file\n", encoding="utf-8")
+    monkeypatch.setenv("TAVILY_API_KEY", "from-shell")
+
+    cli._load_env_secrets()
+
+    assert os.environ["TAVILY_API_KEY"] == "from-shell"
+
+
 def test_latest_ref_falls_back_to_main_when_there_is_no_release(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
