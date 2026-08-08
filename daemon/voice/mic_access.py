@@ -70,10 +70,12 @@ def request_microphone_access(
         fw = _load(frameworks)
         av = fw.av
         current = _STATUS.get(
-            int(av.AVCaptureDevice.authorizationStatusForMediaType_(av.AVMediaTypeAudio))
+            int(av.AVCaptureDevice.authorizationStatusForMediaType_(av.AVMediaTypeAudio)),
+            "unavailable",
         )
-        # Already decided (authorized/denied/restricted): don't pump for nothing.
-        if current in ("authorized", "denied", "restricted"):
+        # Only a genuinely-undecided state should pump for a prompt; anything else
+        # (already decided, or an unmapped/unknown code) is returned as-is.
+        if current != "not_determined":
             return current
 
         done: dict[str, bool] = {}

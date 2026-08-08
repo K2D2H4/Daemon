@@ -106,3 +106,106 @@ def test_request_prompts_when_not_determined_and_grant_is_refused() -> None:
     fw, device = _fw(0, granted=False)
     assert request_microphone_access(frameworks=fw) == "denied"
     assert device.requested is True
+
+
+# Coverage tests for pump loop and timeout paths (Task 4 review finding 2)
+
+
+class DeferredCaptureDevice(FakeCaptureDevice):
+    """Stores the handler instead of firing it synchronously."""
+
+    def requestAccessForMediaType_completionHandler_(self, _media, handler) -> None:
+        self.requested = True
+        self._handler = handler  # do NOT call yet
+
+
+class PumpingLoop:
+    """Fires the stored handler on the first runMode_beforeDate_ call."""
+
+    def __init__(self, device: DeferredCaptureDevice) -> None:
+        self._device = device
+
+    def runMode_beforeDate_(self, _mode, _date) -> None:
+        self._device._handler(True)  # callback arrives during the pump
+
+
+class PumpingFoundation:
+    """Foundation mock that returns a PumpingLoop."""
+
+    def __init__(self, loop: PumpingLoop) -> None:
+        self._loop = loop
+        self.NSDate = FakeDate
+
+    @property
+    def NSRunLoop(self) -> type:
+        class RunLoop:
+            @staticmethod
+            def currentRunLoop():
+                return self._loop
+
+        return RunLoop
+
+
+def test_request_pumps_and_returns_result_when_handler_fires_during_pump() -> None:
+    """Exercises the pump loop body. Handler is deferred until pump calls it."""
+    device = DeferredCaptureDevice(0)  # not_determined
+    pumping_loop = PumpingLoop(device)
+    fw = Frameworks(
+        av=FakeAV(device),
+        foundation=PumpingFoundation(pumping_loop),
+    )
+    assert request_microphone_access(frameworks=fw) == "authorized"
+    assert device.requested is True
+
+
+class NoopLoop:
+    """Runloop that never needs to pump (handler never fires, just passes)."""
+
+    def runMode_beforeDate_(self, _mode, _date) -> None:
+        pass  # harmless no-op
+
+
+class NoopFoundation:
+    """Foundation mock that returns a NoopLoop."""
+
+    NSDate = FakeDate
+
+    class NSRunLoop:
+        @staticmethod
+        def currentRunLoop() -> NoopLoop:
+            return NoopLoop()
+
+
+def test_request_times_out_and_returns_not_determined() -> None:
+    """Handler never fires, tiny timeout. Guarantees the pump loop cannot block."""
+    device = DeferredCaptureDevice(0)  # not_determined
+    fw = Frameworks(
+        av=FakeAV(device),
+        foundation=NoopFoundation(),
+    )
+    assert request_microphone_access(frameworks=fw, timeout=0.05) == "not_determined"
+    assert device.requested is True
+
+
+def test_request_unmapped_status_returns_unavailable_without_prompting() -> None:
+    """Unknown/unmapped status code 4 must return unavailable, not prompt."""
+    fw, device = _fw(4)  # status code 4 is unmapped (no such AVAuthorizationStatus)
+    assert request_microphone_access(frameworks=fw) == "unavailable"
+    assert device.requested is False, "must not prompt for unmapped status"
+
+
+def test_request_broken_frameworks_never_raises() -> None:
+    """request_microphone_access with missing/broken frameworks → unavailable."""
+
+    class Broken:
+        pass
+
+    fw = Frameworks(av=Broken(), foundation=Broken())
+    assert request_microphone_access(frameworks=fw) == "unavailable"
+
+
+def test_request_restricted_returns_restricted_without_prompting() -> None:
+    """Status 1 (restricted) is already decided; must not prompt."""
+    fw, device = _fw(1)  # restricted
+    assert request_microphone_access(frameworks=fw) == "restricted"
+    assert device.requested is False
