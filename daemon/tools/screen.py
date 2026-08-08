@@ -244,21 +244,28 @@ async def _capture_one_display(
         return await _downscale_and_read(path, sips, long_edge=long_edge, timeout_secs=timeout_secs)
 
 
+MAX_DISPLAYS = 32
+"""Hard cap on `capture_all_displays`'s enumeration. Nothing on real hardware
+gets close to this - it exists so a hypothetical `screencapture` quirk (exiting
+0 with content past the real display count) can't turn the loop into a hang;
+"nothing may hang" (tests/CLAUDE.md)."""
+
+
 async def capture_all_displays(
     *, long_edge: int, timeout_secs: float = 20.0
 ) -> list[tuple[bytes, int, int]]:
     """Capture every display as a JPEG each, downscaled to `long_edge`.
 
     Enumerates displays starting at 1 (`screencapture -D`'s numbering; 1 is
-    main) until `_capture_one_display` reports one doesn't exist. Always
-    returns at least one shot on success - display 1 failing raises instead of
-    returning an empty list, the same `TCC_HINT` `capture_display` raises.
+    main) until `_capture_one_display` reports one doesn't exist, or
+    `MAX_DISPLAYS` is reached. Always returns at least one shot on success -
+    display 1 failing raises instead of returning an empty list, the same
+    `TCC_HINT` `capture_display` raises.
     """
     screencapture, sips = _require_capture_tools()
 
     shots: list[tuple[bytes, int, int]] = []
-    index = 1
-    while True:
+    for index in range(1, MAX_DISPLAYS + 1):
         shot = await _capture_one_display(
             index,
             screencapture=screencapture,
@@ -269,7 +276,6 @@ async def capture_all_displays(
         if shot is None:
             break
         shots.append(shot)
-        index += 1
 
     return shots
 

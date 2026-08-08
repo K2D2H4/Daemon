@@ -1,4 +1,6 @@
+import asyncio
 import platform
+from pathlib import Path
 
 import pytest
 
@@ -133,6 +135,93 @@ async def test_capture_all_displays_raises_when_main_display_fails(monkeypatch):
 
     with pytest.raises(ToolError, match=screen.TCC_HINT):
         await screen.capture_all_displays(long_edge=1536)
+
+
+# --- _capture_one_display index asymmetry --------------------------------------
+#
+# The tests above mock `_capture_one_display` itself, so they never exercise the
+# index==1-raises / index>=2-stops branching *inside* it - the crux of the
+# feature. These mock one level lower, `_run`, so the same failure/zero-byte
+# signal is fed to both a display-1 and a display-2 call and the asymmetric
+# response is what gets asserted.
+
+
+async def test_capture_one_display_index_one_raises_on_screencapture_failure(monkeypatch):
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        if name == "screencapture":
+            raise ToolError(on_failure or "screencapture failed")
+        raise AssertionError("sips should not run after a screencapture failure")
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    with pytest.raises(ToolError, match=screen.TCC_HINT):
+        await screen._capture_one_display(
+            1, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+        )
+
+
+async def test_capture_one_display_index_two_returns_none_on_identical_failure(monkeypatch):
+    """The IDENTICAL screencapture failure signal, on display 2, means "no such
+    display" - the normal loop terminator, not an error."""
+
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        if name == "screencapture":
+            raise ToolError(on_failure or "screencapture failed")
+        raise AssertionError("sips should not run after a screencapture failure")
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    result = await screen._capture_one_display(
+        2, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+    )
+    assert result is None
+
+
+async def test_capture_one_display_index_one_raises_on_zero_byte_file(monkeypatch):
+    """A TCC denial can also show up as screencapture exiting 0 having written
+    nothing - display 1 must still raise."""
+
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        return ""  # screencapture "succeeds" but writes no file
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    with pytest.raises(ToolError, match=screen.TCC_HINT):
+        await screen._capture_one_display(
+            1, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+        )
+
+
+async def test_capture_one_display_index_two_returns_none_on_zero_byte_file(monkeypatch):
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        return ""  # screencapture "succeeds" but writes no file
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    result = await screen._capture_one_display(
+        2, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+    )
+    assert result is None
+
+
+async def test_capture_one_display_returns_bytes_and_dims_on_success(monkeypatch):
+    """A real capture (any index) downscales and reads the file back, exactly
+    like `capture_display` does."""
+
+    async def fake_run(name, argv, *, timeout_secs, on_failure=None):
+        if name == "screencapture":
+            await asyncio.to_thread(Path(argv[-1]).write_bytes, b"\xff\xd8fake")
+            return ""
+        if "-Z" in argv:  # sips resize - the file already has the right bytes
+            return ""
+        return "  pixelWidth: 1536\n  pixelHeight: 864\n"  # sips -g dims
+
+    monkeypatch.setattr(screen, "_run", fake_run)
+
+    result = await screen._capture_one_display(
+        3, screencapture="screencapture", sips="sips", long_edge=1536, timeout_secs=5
+    )
+    assert result == (b"\xff\xd8fake", 1536, 864)
 
 
 # --- SeeScreen ----------------------------------------------------------------
