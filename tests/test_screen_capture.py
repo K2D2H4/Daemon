@@ -164,7 +164,7 @@ class _FakeControl:
         self.start_calls = 0
         self.stop_calls = 0
 
-    def start(self) -> str:
+    async def start(self) -> str:
         self.start_calls += 1
         return "started-message"
 

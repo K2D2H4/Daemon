@@ -254,7 +254,9 @@ def _input_items(messages: list[Message]) -> list[dict[str, Any]]:
             )
             continue
         if message.role == "user" and message.images:
-            content: list[dict[str, Any]] = [{"type": "text", "text": message.content}]
+            content: list[dict[str, Any]] = []
+            if message.content:
+                content.append({"type": "text", "text": message.content})
             content.extend(
                 {
                     "type": "image_url",

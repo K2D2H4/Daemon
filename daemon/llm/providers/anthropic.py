@@ -198,10 +198,10 @@ def _turns(messages: list[Message]) -> list[dict[str, Any]]:
             turns.append({"role": "assistant", "content": content})
             continue
         if message.role == "user" and message.images:
-            content = []
+            blocks: list[dict[str, Any]] = []
             if message.content:
-                content.append({"type": "text", "text": message.content})
-            content.extend(
+                blocks.append({"type": "text", "text": message.content})
+            blocks.extend(
                 {
                     "type": "image",
                     "source": {
@@ -212,7 +212,19 @@ def _turns(messages: list[Message]) -> list[dict[str, Any]]:
                 }
                 for img in message.images
             )
-            turns.append({"role": "user", "content": content})
+            # A see_screen round is assistant(tool_calls) -> tool -> user(images):
+            # the `tool` branch above already opened a user turn for the
+            # tool_result. Appending a second user turn here would put two user
+            # turns back to back, which this function's docstring says the API
+            # rejects - so merge into the preceding one instead, same as the
+            # tool-result merge above.
+            previous = turns[-1] if turns else None
+            if previous is not None and previous.get("role") == "user" and isinstance(
+                previous.get("content"), list
+            ):
+                previous["content"].extend(blocks)
+            else:
+                turns.append({"role": "user", "content": blocks})
             continue
         turns.append({"role": message.role, "content": message.content})
     return turns

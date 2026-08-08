@@ -1828,10 +1828,22 @@ async def test_run_voice_offers_the_owners_tools_pinned_to_allowlist(
 # for `ScreenSharePump` so nothing here touches a real screen or socket.
 
 
+class _FakeContextSession:
+    """Records `send_context` calls, standing in for the live session the
+    pump would otherwise hold (Finding 3: the framing seed on share start)."""
+
+    def __init__(self) -> None:
+        self.context_sent: list[str] = []
+
+    async def send_context(self, text: str) -> None:
+        self.context_sent.append(text)
+
+
 class _FakePump:
     def __init__(self) -> None:
         self.started = False
         self.stopped = False
+        self.session = _FakeContextSession()
 
     def start(self) -> None:
         self.started = True
@@ -1907,7 +1919,7 @@ async def test_screen_share_is_stopped_and_unbound_when_the_conversation_ends() 
     controller = ScreenShareController()
     pump = _FakePump()
     controller.bind(pump)
-    controller.start()
+    await controller.start()
     assert controller.active is True
 
     session = FakeSession(Turn())
@@ -1938,7 +1950,7 @@ async def test_screen_share_unbinds_even_when_run_is_cancelled() -> None:
         await asyncio.sleep(0)
     # The share is on when the cancellation lands - the case that actually risks
     # a leak, since `stop_and_unbind` only calls `pump.stop()` while active.
-    controller.start()
+    await controller.start()
     assert created[0].started is True
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

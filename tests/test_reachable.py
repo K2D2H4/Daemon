@@ -363,7 +363,7 @@ class _DummyScreenShareControl:
     file's job is to check they are *returned by their factory*, not to drive a
     real pump."""
 
-    def start(self) -> str:
+    async def start(self) -> str:
         return "started"
 
     async def stop(self) -> str:

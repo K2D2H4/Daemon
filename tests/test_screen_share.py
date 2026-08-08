@@ -220,12 +220,27 @@ async def test_send_frame_failure_is_logged_and_the_loop_continues(monkeypatch, 
 # --- ScreenShareController -----------------------------------------------------
 
 
+class _FakeContextSession:
+    """Records `send_context` calls - stands in for the live `VoiceSession`
+    the pump would otherwise hold, so Finding 3's framing-seed can be checked
+    without a real socket."""
+
+    def __init__(self) -> None:
+        self.context_sent: list[str] = []
+
+    async def send_context(self, text: str) -> None:
+        self.context_sent.append(text)
+
+
 class _FakePump:
-    """Records start/stop rather than driving a real capture loop."""
+    """Records start/stop rather than driving a real capture loop. Carries a
+    `session` so `ScreenShareController.start` has something to seed the
+    untrusted-data framing on before starting the pump."""
 
     def __init__(self) -> None:
         self.started = False
         self.stopped = False
+        self.session = _FakeContextSession()
 
     def start(self) -> None:
         self.started = True
@@ -234,11 +249,11 @@ class _FakePump:
         self.stopped = True
 
 
-def test_controller_start_with_no_pump_bound_apologises_and_does_not_crash():
+async def test_controller_start_with_no_pump_bound_apologises_and_does_not_crash():
     from daemon.voice.screen_share import ScreenShareController
 
     controller = ScreenShareController()
-    message = controller.start()
+    message = await controller.start()
     assert "voice conversation" in message
     assert controller.active is False
 
@@ -252,27 +267,53 @@ async def test_controller_stop_with_no_pump_bound_says_not_sharing():
     assert controller.active is False
 
 
-def test_controller_bind_then_start_flips_the_pump_and_acknowledges():
+async def test_controller_bind_then_start_flips_the_pump_and_acknowledges():
     from daemon.voice.screen_share import ScreenShareController
 
     controller = ScreenShareController()
     pump = _FakePump()
     controller.bind(pump)
-    message = controller.start()
+    message = await controller.start()
     assert pump.started is True
     assert controller.active is True
     assert "watching your screen" in message.lower()
 
 
-def test_controller_start_twice_says_already_watching():
+async def test_controller_start_seeds_the_screen_note_before_starting_the_pump():
+    """Finding 3: live frames carry no per-frame framing, so the untrusted-data
+    note (security stance A) has to be seeded into history once, silently,
+    before the pump - and thus any frame - starts. The spoken acknowledgement
+    must stay short and must not carry that framing paragraph itself."""
     from daemon.voice.screen_share import ScreenShareController
 
     controller = ScreenShareController()
     pump = _FakePump()
     controller.bind(pump)
-    controller.start()
-    message = controller.start()
+    message = await controller.start()
+
+    assert pump.session.context_sent, "the framing must be seeded via send_context"
+    note = pump.session.context_sent[0]
+    assert "screenshot" in note.lower()
+    assert "not instruction" in note.lower() or "not an instruction" in note.lower()
+    assert pump.started is True
+
+    # The spoken acknowledgement is a short, separate sentence - it must not
+    # contain the framing paragraph the model would otherwise read aloud.
+    assert note not in message
+    assert "data" not in message.lower()
+
+
+async def test_controller_start_twice_says_already_watching():
+    from daemon.voice.screen_share import ScreenShareController
+
+    controller = ScreenShareController()
+    pump = _FakePump()
+    controller.bind(pump)
+    await controller.start()
+    message = await controller.start()
     assert "already" in message.lower()
+    # Only the first start seeds the framing; the second call is a no-op.
+    assert len(pump.session.context_sent) == 1
 
 
 async def test_controller_stop_stops_the_pump_and_deactivates():
@@ -281,7 +322,7 @@ async def test_controller_stop_stops_the_pump_and_deactivates():
     controller = ScreenShareController()
     pump = _FakePump()
     controller.bind(pump)
-    controller.start()
+    await controller.start()
     message = await controller.stop()
     assert pump.stopped is True
     assert controller.active is False
@@ -294,18 +335,21 @@ async def test_stop_and_unbind_stops_an_active_pump_and_clears_it():
     controller = ScreenShareController()
     pump = _FakePump()
     controller.bind(pump)
-    controller.start()
+    await controller.start()
     await controller.stop_and_unbind()
     assert pump.stopped is True
     assert controller.active is False
     # A second start with nothing bound must not crash and must not report success.
-    assert "voice conversation" in controller.start()
+    assert "voice conversation" in await controller.start()
 
 
 async def test_stop_and_unbind_never_raises_even_if_the_pump_stop_fails():
     from daemon.voice.screen_share import ScreenShareController
 
     class _BrokenPump:
+        def __init__(self) -> None:
+            self.session = _FakeContextSession()
+
         def start(self) -> None:
             pass
 
@@ -314,7 +358,7 @@ async def test_stop_and_unbind_never_raises_even_if_the_pump_stop_fails():
 
     controller = ScreenShareController()
     controller.bind(_BrokenPump())
-    controller.start()
+    await controller.start()
     await controller.stop_and_unbind()  # must not raise
     assert controller.active is False
 

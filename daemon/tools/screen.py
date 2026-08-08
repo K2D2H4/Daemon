@@ -269,7 +269,7 @@ class ScreenShareControl(Protocol):
     implementation is `daemon.voice.screen_share.ScreenShareController`, but
     nothing here names it."""
 
-    def start(self) -> str: ...
+    async def start(self) -> str: ...
     async def stop(self) -> str: ...
 
 
@@ -301,7 +301,7 @@ class StartScreenShare:
         return "start sharing the screen"
 
     async def run(self, arguments: Mapping[str, Any]) -> str:
-        return self._control.start()
+        return await self._control.start()
 
 
 class StopScreenShare:

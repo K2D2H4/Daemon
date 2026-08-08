@@ -22,6 +22,8 @@ from typing import Any, Protocol
 
 from PIL import Image
 
+from daemon.tools.screen import screen_note
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,6 +85,14 @@ class ScreenSharePump:
         self._dedup_threshold = dedup_threshold
         self._keepalive_secs = keepalive_secs
         self._task: asyncio.Task[None] | None = None
+
+    @property
+    def session(self) -> _FrameSink:
+        """Read-only: `ScreenShareController.start` seeds the untrusted-data
+        framing on this session before starting the pump (Finding 3, the
+        screen-sharing final review) - frames must never reach the model with
+        no framing at all."""
+        return self._session
 
     def start(self) -> None:
         """Idempotent: does nothing if already running."""
@@ -160,10 +170,18 @@ class ScreenShareController:
     def active(self) -> bool:
         return self._active
 
-    def start(self) -> str:
-        """Turn the share on. `pump.start()` is sync; this returns the spoken
-        acknowledgement the model relays - the explicit signal is carried in the
-        tool result, not left to the model to invent."""
+    async def start(self) -> str:
+        """Turn the share on. Returns the spoken acknowledgement the model
+        relays - the explicit signal is carried in the tool result, not left
+        to the model to invent.
+
+        Async because the untrusted-data framing (`screen_note`, security
+        stance A - a Global Constraint) has to be seeded into the model's
+        history *before* any frame is sent, via `send_context` so it lands
+        silently rather than as a paragraph the model would read aloud. Order
+        matters: framing first, then `pump.start()`, so the first frame that
+        ever flows already has it in history.
+        """
         if self._pump is None:
             return (
                 "I can only share your screen during a voice conversation. Ask me "
@@ -171,6 +189,7 @@ class ScreenShareController:
             )
         if self._active:
             return "I'm already watching your screen."
+        await self._pump.session.send_context(screen_note("the owner's screen"))
         self._pump.start()
         self._active = True
         logger.info("screen share on")
