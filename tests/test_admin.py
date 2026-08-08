@@ -232,7 +232,10 @@ def test_restart_refuses_when_not_supervised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = create_app(_settings(tmp_path))
-    # No launchd/systemd markers -> not supervised. Assert we never try to exit.
+    # Force not-supervised rather than trusting the ambient environment: a CI
+    # runner under systemd sets INVOCATION_ID, so `is_supervised()` is True there
+    # and this test would see a 200 (it did). Pin it, like the supervised sibling.
+    monkeypatch.setattr("daemon.admin.routes.is_supervised", lambda *a, **k: False)
     called = {"exit": False}
     monkeypatch.setattr(
         "daemon.admin.routes.schedule_exit", lambda *a, **k: called.__setitem__("exit", True)
