@@ -37,6 +37,8 @@ USAGE = 2
 
 GITHUB_REPO = "K2D2H4/Daemon"
 PACKAGE_NAME = "daemon-ai"
+"""The repo and the distributable. `daemon update` and install.sh must agree on
+both, because update re-installs exactly what the one-liner does."""
 INSTALL_SPEC = f"{PACKAGE_NAME}[mcp]"
 """What `uv tool install` requests, extra included. MCP defaults on (config.py),
 so a plain `daemon-ai` install shows the admin's MCP tab and then fails every
@@ -45,8 +47,6 @@ docstring on `_update` promises the two do not drift, and a bare-name reinstall
 here would silently drop the extra on the next `daemon update`. The version cap
 lives in the extra (pyproject `mcp>=1.9,<2`), so `[mcp]` also keeps `daemon update`
 off the incompatible mcp 2.0."""
-"""The repo and the distributable. `daemon update` and install.sh must agree on
-both, because update re-installs exactly what the one-liner does."""
 
 
 def build_parser() -> argparse.ArgumentParser:
