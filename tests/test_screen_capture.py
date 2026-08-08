@@ -1,5 +1,6 @@
 import asyncio
 import platform
+import re
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,10 @@ async def test_capture_all_displays_stops_at_first_missing_display(monkeypatch):
     async def fake_capture_one(index, *, screencapture, sips, long_edge, timeout_secs):
         return shots.get(index)
 
+    # Skip the macOS/tool guard so the enumeration logic is exercised on any
+    # platform (CI is Linux); the guard itself is covered by
+    # test_capture_refuses_off_darwin.
+    monkeypatch.setattr(screen, "_require_capture_tools", lambda: ("screencapture", "sips"))
     monkeypatch.setattr(screen, "_capture_one_display", fake_capture_one)
 
     result = await screen.capture_all_displays(long_edge=1536)
@@ -131,9 +136,10 @@ async def test_capture_all_displays_raises_when_main_display_fails(monkeypatch):
     async def fake_capture_one(index, *, screencapture, sips, long_edge, timeout_secs):
         raise ToolError(screen.TCC_HINT)
 
+    monkeypatch.setattr(screen, "_require_capture_tools", lambda: ("screencapture", "sips"))
     monkeypatch.setattr(screen, "_capture_one_display", fake_capture_one)
 
-    with pytest.raises(ToolError, match=screen.TCC_HINT):
+    with pytest.raises(ToolError, match=re.escape(screen.TCC_HINT)):
         await screen.capture_all_displays(long_edge=1536)
 
 
