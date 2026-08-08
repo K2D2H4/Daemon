@@ -27,6 +27,15 @@ def test_sips_resize_caps_long_edge():
     assert "jpeg" in argv             # force jpeg output
 
 
+def test_screencapture_display_argv_uses_d_flag():
+    argv = screen.SCREENCAPTURE_DISPLAY_ARGS("/tmp/x.jpg", 2)
+    assert argv[0] == "screencapture"
+    assert "-D" in argv and "2" in argv
+    assert "-x" in argv               # silent, no shutter sound
+    assert "-C" not in argv          # cursor never captured
+    assert argv[-1] == "/tmp/x.jpg"
+
+
 @pytest.mark.skipif(platform.system() == "Darwin", reason="guard is for non-mac")
 async def test_capture_refuses_off_darwin():
     with pytest.raises(ToolError, match="macOS"):
@@ -91,6 +100,41 @@ def test_screen_note_marks_content_as_data():
     assert "main display" in note
 
 
+# --- capture_all_displays ------------------------------------------------------
+
+
+async def test_capture_all_displays_stops_at_first_missing_display(monkeypatch):
+    """Enumeration starts at 1 and stops as soon as a display doesn't exist -
+    display 3 here doesn't exist, so exactly 2 shots come back."""
+
+    shots = {
+        1: (b"\xff\xd8one", 1536, 864),
+        2: (b"\xff\xd8two", 1536, 993),
+    }
+
+    async def fake_capture_one(index, *, screencapture, sips, long_edge, timeout_secs):
+        return shots.get(index)
+
+    monkeypatch.setattr(screen, "_capture_one_display", fake_capture_one)
+
+    result = await screen.capture_all_displays(long_edge=1536)
+
+    assert result == [shots[1], shots[2]]
+
+
+async def test_capture_all_displays_raises_when_main_display_fails(monkeypatch):
+    """Display 1 failing is a genuine problem (permission/real failure), not the
+    normal loop terminator - it must raise the TCC hint, not be swallowed."""
+
+    async def fake_capture_one(index, *, screencapture, sips, long_edge, timeout_secs):
+        raise ToolError(screen.TCC_HINT)
+
+    monkeypatch.setattr(screen, "_capture_one_display", fake_capture_one)
+
+    with pytest.raises(ToolError, match=screen.TCC_HINT):
+        await screen.capture_all_displays(long_edge=1536)
+
+
 # --- SeeScreen ----------------------------------------------------------------
 
 
@@ -152,6 +196,27 @@ async def test_see_screen_run_rejects_non_integer_window():
 async def test_see_screen_run_rejects_negative_window():
     with pytest.raises(ToolError):
         await _tool().run({"window": -1})
+
+
+async def test_see_screen_preview_all_displays():
+    assert "all displays" in _tool().preview({"all_displays": True})
+
+
+async def test_see_screen_run_all_displays_returns_one_image_per_display(monkeypatch):
+    async def fake_capture_all_displays(*, long_edge, timeout_secs=20.0):
+        return [(b"\xff\xd8a", 100, 80), (b"\xff\xd8b", 120, 90)]
+
+    monkeypatch.setattr(screen, "capture_all_displays", fake_capture_all_displays)
+
+    result = await _tool().run({"all_displays": True})
+
+    assert isinstance(result, ToolOutput)
+    assert len(result.images) == 2
+    assert result.images[0].data == b"\xff\xd8a"
+    assert result.images[1].data == b"\xff\xd8b"
+    assert "2" in result.content
+    assert "100x80" in result.content
+    assert "120x90" in result.content
 
 
 # --- StartScreenShare / StopScreenShare ----------------------------------------

@@ -45,6 +45,13 @@ SCREENCAPTURE_ARGS = lambda path, window_id: (  # noqa: E731
 button. `-l <id>` captures one window instead of the whole display. `-C`, which
 would draw the cursor into the frame, must never appear here."""
 
+SCREENCAPTURE_DISPLAY_ARGS = lambda path, display_num: (  # noqa: E731
+    ["screencapture", "-x", "-D", str(display_num), "-t", "jpg", path]
+)
+"""Capture display `display_num` (1 = main) instead of whatever the owner's
+mouse currently sits on. Same invariants as `SCREENCAPTURE_ARGS`: `-x` silent,
+`-C` (cursor) never present."""
+
 SIPS_RESIZE_ARGS = lambda path, long_edge: (  # noqa: E731
     ["sips", "-Z", str(long_edge), "-s", "format", "jpeg", path]
 )
@@ -128,6 +135,39 @@ def _parse_dimensions(raw: str) -> tuple[int, int]:
     return width, height
 
 
+def _require_capture_tools() -> tuple[str, str]:
+    """The platform/tool guards shared by `capture_display` and
+    `capture_all_displays`. Returns the resolved `(screencapture, sips)` paths."""
+    if platform.system() != "Darwin":
+        raise ToolError("I can only capture the screen on macOS")
+    screencapture = shutil.which("screencapture")
+    sips = shutil.which("sips")
+    if screencapture is None or sips is None:
+        raise ToolError("screencapture or sips is not available, so I cannot capture the screen")
+    return screencapture, sips
+
+
+async def _downscale_and_read(
+    path: str, sips: str, *, long_edge: int, timeout_secs: float
+) -> tuple[bytes, int, int]:
+    """Downscale the file `screencapture` just wrote and read it back.
+
+    Shared tail of `capture_display` and `_capture_one_display`: `sips -Z` to cap
+    the long edge, `sips -g` to read the resulting dimensions back (there is no
+    `--json` to ask for instead), then the bytes themselves.
+    """
+    resize_argv = SIPS_RESIZE_ARGS(path, long_edge)
+    resize_argv[0] = sips
+    await _run("sips", resize_argv, timeout_secs=timeout_secs)
+
+    dims_argv = [sips, "-g", "pixelWidth", "-g", "pixelHeight", path]
+    dims_raw = await _run("sips", dims_argv, timeout_secs=timeout_secs)
+    width, height = _parse_dimensions(dims_raw)
+
+    jpeg_bytes = await asyncio.to_thread(Path(path).read_bytes)
+    return jpeg_bytes, width, height
+
+
 async def capture_display(
     *, long_edge: int, window_id: int | None = None, timeout_secs: float = 20.0
 ) -> tuple[bytes, int, int]:
@@ -136,12 +176,7 @@ async def capture_display(
     Returns `(jpeg_bytes, width, height)`. Raises `ToolError` on non-Darwin,
     missing tools, a Screen Recording permission denial, or a timeout.
     """
-    if platform.system() != "Darwin":
-        raise ToolError("I can only capture the screen on macOS")
-    screencapture = shutil.which("screencapture")
-    sips = shutil.which("sips")
-    if screencapture is None or sips is None:
-        raise ToolError("screencapture or sips is not available, so I cannot capture the screen")
+    screencapture, sips = _require_capture_tools()
 
     with tempfile.TemporaryDirectory() as scratch:
         path = str(Path(scratch) / "capture.jpg")
@@ -159,17 +194,84 @@ async def capture_display(
         if size == 0:
             raise ToolError(TCC_HINT)
 
-        resize_argv = SIPS_RESIZE_ARGS(path, long_edge)
-        resize_argv[0] = sips
-        await _run("sips", resize_argv, timeout_secs=timeout_secs)
-
-        dims_argv = [sips, "-g", "pixelWidth", "-g", "pixelHeight", path]
-        dims_raw = await _run("sips", dims_argv, timeout_secs=timeout_secs)
-        width, height = _parse_dimensions(dims_raw)
-
-        jpeg_bytes = await asyncio.to_thread(output.read_bytes)
+        jpeg_bytes, width, height = await _downscale_and_read(
+            path, sips, long_edge=long_edge, timeout_secs=timeout_secs
+        )
 
     return jpeg_bytes, width, height
+
+
+async def _capture_one_display(
+    index: int, *, screencapture: str, sips: str, long_edge: int, timeout_secs: float
+) -> tuple[bytes, int, int] | None:
+    """Capture display `index` (1 = main), the seam `capture_all_displays` loops
+    over and the seam unit tests monkeypatch.
+
+    Display 1 is strict: a non-zero exit or a zero-byte file is a genuine
+    failure (most likely a Screen Recording/TCC denial) and raises `ToolError`
+    with `TCC_HINT`, same as `capture_display`. For display 2 and beyond, the
+    same two signals mean "there is no display `index`" - the normal way this
+    loop ends - so they return `None` instead of raising.
+
+    Owns its own scratch directory rather than sharing one across displays: each
+    capture is a handful of independent subprocess calls, so per-call cleanup
+    costs nothing and keeps this function callable on its own.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        path = str(Path(scratch) / f"display{index}.jpg")
+
+        capture_argv = SCREENCAPTURE_DISPLAY_ARGS(path, index)
+        capture_argv[0] = screencapture
+        try:
+            await _run(
+                "screencapture",
+                capture_argv,
+                timeout_secs=timeout_secs,
+                on_failure=TCC_HINT if index == 1 else None,
+            )
+        except ToolError:
+            if index == 1:
+                raise
+            return None
+
+        output = Path(path)
+        size = await asyncio.to_thread(lambda: output.stat().st_size if output.exists() else 0)
+        if size == 0:
+            if index == 1:
+                raise ToolError(TCC_HINT)
+            return None
+
+        return await _downscale_and_read(path, sips, long_edge=long_edge, timeout_secs=timeout_secs)
+
+
+async def capture_all_displays(
+    *, long_edge: int, timeout_secs: float = 20.0
+) -> list[tuple[bytes, int, int]]:
+    """Capture every display as a JPEG each, downscaled to `long_edge`.
+
+    Enumerates displays starting at 1 (`screencapture -D`'s numbering; 1 is
+    main) until `_capture_one_display` reports one doesn't exist. Always
+    returns at least one shot on success - display 1 failing raises instead of
+    returning an empty list, the same `TCC_HINT` `capture_display` raises.
+    """
+    screencapture, sips = _require_capture_tools()
+
+    shots: list[tuple[bytes, int, int]] = []
+    index = 1
+    while True:
+        shot = await _capture_one_display(
+            index,
+            screencapture=screencapture,
+            sips=sips,
+            long_edge=long_edge,
+            timeout_secs=timeout_secs,
+        )
+        if shot is None:
+            break
+        shots.append(shot)
+        index += 1
+
+    return shots
 
 
 def screen_note(source: str) -> str:
@@ -210,7 +312,8 @@ class SeeScreen:
         description=(
             "Look at the owner's screen right now - a screenshot of what is on "
             "their display - so you can talk about what they are looking at. "
-            "Read-only: it takes no action."
+            "Pass all_displays to see every monitor at once. Read-only: it "
+            "takes no action."
         ),
         parameters={
             "type": "object",
@@ -219,9 +322,19 @@ class SeeScreen:
                     "type": "integer",
                     "description": (
                         "Optional window id to capture instead of the whole main "
-                        "display; omit for the whole display."
+                        "display; omit for the whole display. Ignored when "
+                        "all_displays is true."
                     ),
-                }
+                },
+                "all_displays": {
+                    "type": "boolean",
+                    "description": (
+                        "Capture EVERY display (one image per monitor) instead "
+                        "of just the main one. Use when the owner has multiple "
+                        "monitors and asks about another screen, or says 'all "
+                        "my screens'. Defaults to false (main display only)."
+                    ),
+                },
             },
         },
     )
@@ -231,10 +344,20 @@ class SeeScreen:
         self._timeout = timeout_secs
 
     def preview(self, arguments: Mapping[str, Any]) -> str:
+        if arguments.get("all_displays"):
+            return "look at all displays"
         window = arguments.get("window")
         return "look at the main display" if window is None else f"look at window {window}"
 
     async def run(self, arguments: Mapping[str, Any]) -> ToolOutput:
+        if arguments.get("all_displays"):
+            shots = await capture_all_displays(long_edge=self._max_px, timeout_secs=self._timeout)
+            images = tuple(ImageBlock(jpeg, "image/jpeg") for jpeg, _w, _h in shots)
+            content = f"captured {len(shots)} display(s): " + ", ".join(
+                f"{w}x{h}" for _b, w, h in shots
+            )
+            return ToolOutput(content=content, images=images)
+
         window = arguments.get("window")
         if window is not None:
             try:
