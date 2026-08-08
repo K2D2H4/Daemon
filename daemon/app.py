@@ -1569,9 +1569,27 @@ async def _build_tools(
 
     bridge: Any = None
     if settings.mcp_enabled:
-        from daemon.tools.mcp import McpBridge, load_config
+        # The oauth-provider factory lives here because this is the one file allowed
+        # to import `daemon/admin` (CONTRACTS 4); `tools/mcp.py` must not. It builds a
+        # non-interactive provider (redirect/callback handlers raise, never block) so
+        # a persisted oauth server reconnects with its stored token at startup and
+        # fails gracefully - not a browser hang - when the token is gone.
+        from daemon.admin.mcp_oauth import build_reconnect_provider
+        from daemon.tools.mcp import McpBridge, ServerConfig, load_config
 
-        bridge = McpBridge(load_config(settings.data_dir))
+        redirect_uri = (
+            f"http://{settings.host}:{settings.port}/admin/api/mcp/oauth/callback"
+        )
+
+        def oauth_provider_factory(config: ServerConfig) -> Any:
+            return build_reconnect_provider(
+                settings.data_dir, config, redirect_uri=redirect_uri
+            )
+
+        bridge = McpBridge(
+            load_config(settings.data_dir),
+            oauth_provider_factory=oauth_provider_factory,
+        )
         try:
             landed = await bridge.start(registry)
         except Exception:

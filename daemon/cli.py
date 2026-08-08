@@ -444,8 +444,14 @@ def _restart_after_update() -> None:
     try:
         service.restart()
     except ServiceError as exc:
-        print(f"the code is updated, but restarting the service failed ({exc}) - "
-              "restart it yourself to pick it up.")
+        # `installed` only means the unit file exists; launchd may not have it
+        # loaded (a common state when the daemon is actually being run by hand with
+        # `daemon run`). Name both remedies rather than echoing a bare launchctl code.
+        print(f"the code is updated, but I could not restart it automatically ({exc}).")
+        print(
+            "  If you run it with `daemon run`, restart that. If it should be a "
+            "background service, `daemon install` loads it (then update restarts it)."
+        )
         return
     print("restarted the resident service on the new version.")
 

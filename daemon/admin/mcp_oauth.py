@@ -41,7 +41,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from daemon.fs import write_private_replace
 from daemon.mcp_catalog import CatalogEntry
-from daemon.tools.mcp import server_config_from_catalog
+from daemon.tools.mcp import ServerConfig, save_server, server_config_from_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,21 @@ evicts the `_FLOWS` entry."""
 class OAuthError(RuntimeError):
     """A flow that could not start or complete. Its message is safe to return to
     the client - it names the failure, never a token."""
+
+
+@dataclass
+class OAuthStart:
+    """The outcome of `start_oauth_flow`, distinguishing the two success shapes.
+
+    `authorize_url` set means the browser must visit it and the connect is suspended
+    at the callback (the first-auth path). `authorize_url is None` with
+    `connected` True means the provider connected straight away with a stored token -
+    no redirect was ever produced, so there is nothing for the browser to do and the
+    frontend just refreshes. A failure is an `OAuthError` raised, never an instance of
+    this."""
+
+    authorize_url: str | None
+    connected: bool
 
 
 class FileTokenStorage:
@@ -180,6 +195,44 @@ def _build_provider(
     )
 
 
+def build_reconnect_provider(
+    data_dir: Path,
+    config: ServerConfig,
+    *,
+    redirect_uri: str,
+    build_provider: Any = None,
+) -> Any:
+    """A non-interactive OAuth provider for reconnecting a server at startup.
+
+    Unlike `start_oauth_flow`'s provider, this one has no browser behind it: there is
+    no owner watching a boot. Its `redirect_handler` and `callback_handler` therefore
+    *raise* rather than block - a valid stored token connects silently (the handlers
+    are never reached), and a missing or expired-unrefreshable one fails fast with a
+    clean "reauthorize in the admin" message that `McpBridge.start` records against
+    the server. The alternative - a handler that waits - would hang startup on a
+    redirect nobody can follow.
+
+    `app.py:_build_tools` wires this into `McpBridge(oauth_provider_factory=...)`; the
+    bridge itself never imports this module (CONTRACTS 4). `build_provider` is the
+    same test seam `start_oauth_flow` exposes."""
+    build = build_provider or _build_provider
+    storage = FileTokenStorage(data_dir, config.name)
+
+    async def redirect_handler(_url: str) -> None:
+        raise OAuthError(
+            f"{config.name}: its stored authorization is missing or expired - "
+            "reauthorize it in the admin"
+        )
+
+    async def callback_handler() -> tuple[str, str | None]:
+        raise OAuthError(
+            f"{config.name}: its stored authorization is missing or expired - "
+            "reauthorize it in the admin"
+        )
+
+    return build(config.url, redirect_uri, storage, redirect_handler, callback_handler)
+
+
 async def start_oauth_flow(
     bridge: Any,
     data_dir: Path,
@@ -187,14 +240,23 @@ async def start_oauth_flow(
     *,
     redirect_uri: str,
     build_provider: Any = None,
-) -> str:
-    """Begin an OAuth connect and return the URL the browser must visit.
+) -> OAuthStart:
+    """Begin an OAuth connect and report how it resolved.
 
-    Kicks `bridge.connect_server(config, auth=provider)` off as a background task;
-    it suspends inside the provider's `callback_handler` until `complete_oauth_flow`
-    resolves the future. Returns as soon as the `redirect_handler` has produced the
-    authorize URL, or raises `OAuthError` if the connect fails before it does (a
-    server that is unreachable, or refuses dynamic registration).
+    Kicks `bridge.connect_server(config, auth=provider)` off as a background task and
+    persists the server to `mcp.json` first (mirroring the key path in
+    `save_server`), so a flow the owner never finishes still shows as
+    configured-but-not-connected rather than vanishing on restart.
+
+    Three outcomes, all after the connect has either produced an authorize URL or
+    finished:
+
+      * the connect failed before redirecting -> raise `OAuthError`;
+      * a `redirect_handler` produced an authorize URL -> return it, connect suspended
+        at the callback (the first-auth path, unchanged);
+      * the connect completed with no error and no authorize URL -> the provider used
+        a stored token and connected directly. This is success, not the old false
+        "no authorization URL was produced" error: return `connected=True`.
 
     `build_provider` defaults to the module's real one; the parameter, and the
     `or _build_provider` fallthrough (a live global lookup, so a monkeypatch on the
@@ -202,6 +264,10 @@ async def start_oauth_flow(
     """
     build = build_provider or _build_provider
     config = server_config_from_catalog(entry)
+    # Persist before connecting, exactly as the key path does (routes.py
+    # `mcp_connect`): the entry survives a failed or abandoned flow, so it reads as
+    # configured-but-not-connected and reconnects on the next start.
+    save_server(data_dir, config)
     loop = asyncio.get_running_loop()
     flow = PendingFlow(name=entry.name, ready=asyncio.Event(), future=loop.create_future())
     storage = FileTokenStorage(data_dir, entry.name)
@@ -272,10 +338,14 @@ async def start_oauth_flow(
     if flow.error is not None:
         _abandon()
         raise OAuthError(str(flow.error)) from flow.error
-    if not flow.authorize_url:
-        _abandon()
-        raise OAuthError(f"{entry.name}: no authorization URL was produced")
-    return flow.authorize_url
+    if flow.authorize_url:
+        return OAuthStart(authorize_url=flow.authorize_url, connected=False)
+    # No error and no authorize URL: `redirect_handler` never fired because the
+    # provider connected with a stored token. `ready` was set by connect()'s finally,
+    # so the connect is already done - this is a completed connection, not a dead
+    # flow. (The old code raised "no authorization URL was produced" here, turning a
+    # successful second connect into a false error.)
+    return OAuthStart(authorize_url=None, connected=True)
 
 
 async def complete_oauth_flow(code: str, state: str) -> str:
