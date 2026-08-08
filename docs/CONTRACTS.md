@@ -114,8 +114,9 @@ FROZEN means: do not edit without flagging it first.
     `allowlist` remain for anyone who wants a prompt before the machine changes. So
     `daemon doctor` has to say which way it is set - a capability nobody was asked
     about and which is reported nowhere is the silent state this project keeps being
-    bitten by. The two groups that read more than the owner's own files, the browser
-    and MCP, stay off and keep their own switches.
+    bitten by. The browser group - the one that reads an authenticated session the
+    owner never named - stays off behind its own switch; MCP keeps its own switch
+    too but defaults on, since it launches nothing until a server is configured.
 
 13. **Code is never built from data.** Three places would be natural to get this
     wrong and all three are done the same way — the script is a constant and the

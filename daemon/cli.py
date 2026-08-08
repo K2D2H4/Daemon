@@ -22,19 +22,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from daemon import __version__
 from daemon.config import OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
-from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus
+from daemon.service import ServiceAction, ServiceError, ServiceStatus, service_for
 
 OK = 0
 PROBLEM = 1
 USAGE = 2
+
+GITHUB_REPO = "K2D2H4/Daemon"
+PACKAGE_NAME = "daemon-ai"
+"""The repo and the distributable. `daemon update` and install.sh must agree on
+both, because update re-installs exactly what the one-liner does."""
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="daemon",
         description="Self-hosted AI companion. `daemon run` with no arguments is the default.",
+    )
+    # Handled in `main` rather than argparse's `action="version"`, which raises
+    # SystemExit - every other command here returns an int, and a bug report's
+    # first line should not depend on catching an exception.
+    parser.add_argument(
+        "--version", action="store_true", help="print the installed version and exit"
     )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="run the daemon in the foreground (what the service supervises)")
@@ -56,6 +68,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="is the service installed and running")
     sub.add_parser("doctor", help="check configuration, Ollama, data dir and schema")
     sub.add_parser("reindex", help="rebuild the sqlite mirror from the markdown log")
+    sub.add_parser(
+        "update",
+        help="reinstall the latest release in place (needs uv; source installs use git pull)",
+    )
     reflect = sub.add_parser(
         "reflect", help="consolidate a day of conversation into memory and observations"
     )
@@ -152,6 +168,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args_list = ["run"]
 
     args = build_parser().parse_args(args_list)
+
+    if args.version:
+        print(f"daemon {__version__}")
+        return OK
+
     command: str = args.command
 
     if command == "doctor":
@@ -170,6 +191,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from daemon.wake_cli import calibrate
 
         return calibrate(takes=args.takes)
+    if command == "update":
+        # Before Settings, and for setup's reason: you may be updating precisely
+        # because a version is broken, and the new code should land regardless of
+        # whether this one's configuration loads.
+        return _update()
 
     try:
         settings = Settings()
@@ -248,20 +274,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 # --- seams the tests replace -------------------------------------------------
 
 
-def service_for(settings: Settings) -> Service:
-    """Build the service definition from settings.
-
-    The working directory is where `.env` lives - the current directory, which is
-    the directory the user is standing in when they install. The unit file carries
-    that path and nothing else, so the secrets stay in one file.
-    """
-    return Service(
-        label=settings.service_label,
-        working_dir=Path.cwd(),
-        log_dir=settings.data_dir / "logs",
-    )
-
-
 def _setup(*, check_only: bool) -> int:
     from daemon.setup import run
 
@@ -274,6 +286,68 @@ def _serve(settings: Settings) -> int:
     from daemon.app import create_app
 
     uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
+    return OK
+
+
+def _uv_present() -> bool:
+    """A seam so tests do not probe the real PATH."""
+    import shutil
+
+    return shutil.which("uv") is not None
+
+
+def _latest_ref() -> str:
+    """The tag of the latest published GitHub release, or `main` if there is none
+    (or the lookup fails). Mirrors install.sh, so `daemon update` and the one-liner
+    resolve the same thing."""
+    import httpx
+
+    try:
+        response = httpx.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            timeout=15.0,
+            follow_redirects=True,
+        )
+    except httpx.HTTPError:
+        return "main"
+    if response.status_code != 200:
+        return "main"
+    return response.json().get("tag_name") or "main"
+
+
+def _run(cmd: list[str]) -> int:
+    """Run an external command, letting its output through. A seam so tests never
+    shell out."""
+    import subprocess
+
+    return subprocess.run(cmd, check=False).returncode
+
+
+def _update() -> int:
+    """Reinstall the latest release through uv - the same tarball the one-liner
+    installs, so the two cannot drift. Not available to a source/pip install, which
+    has no uv and updates with `git pull` instead.
+
+    A source tarball, not a git ref: a bare machine (a fresh Mac before the Command
+    Line Tools) has no git, which is the same reason install.sh stopped using git+.
+    """
+    if not _uv_present():
+        print(
+            "daemon update needs uv, which this install does not have - you are "
+            "probably running from source. Update with `git pull`, or reinstall "
+            "with the one-liner in the README."
+        )
+        return PROBLEM
+    ref = os.environ.get("DAEMON_VERSION") or _latest_ref()
+    source = f"https://github.com/{GITHUB_REPO}/archive/{ref}.tar.gz"
+    print(f"updating to {ref} ...")
+    install = [
+        "uv", "tool", "install", "--force", "--python", "3.13", "--from", source, PACKAGE_NAME
+    ]
+    if _run(install) != 0:
+        print("update failed - the install output above says why.")
+        return PROBLEM
+    print(f"updated to {ref}. Restart `daemon run` or the service to pick it up.")
     return OK
 
 

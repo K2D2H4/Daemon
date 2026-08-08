@@ -41,8 +41,15 @@ that overturned some of them: **[docs/adr/](docs/adr/)**.
 ## Try it
 
 ```bash
-git clone https://github.com/K2D2H4/Daemon.git && cd Daemon
-pip install -e ".[dev]"     # Python 3.13
+curl -fsSL https://raw.githubusercontent.com/K2D2H4/Daemon/main/install.sh | bash
+```
+
+One command, on a Mac with nothing set up. It bootstraps
+[uv](https://docs.astral.sh/uv/), which provisions Python 3.13 and installs the
+`daemon` command into an isolated environment — it does not touch your system
+Python. Then run onboarding in your own terminal:
+
+```bash
 daemon setup
 ```
 
@@ -50,6 +57,20 @@ daemon setup
 bot token from [@BotFather](https://t.me/BotFather). Then it waits for you to
 message the bot and asks whether that was you — nobody types a numeric user id.
 Pick `offline` and you need no API key at all, just [Ollama](https://ollama.com).
+
+Voice is an opt-in extra (needs PortAudio, macOS only): install with
+`uv tool install --force --from "git+https://github.com/K2D2H4/Daemon" "daemon-ai[voice]"`.
+
+<details>
+<summary>From source (development)</summary>
+
+```bash
+git clone https://github.com/K2D2H4/Daemon.git && cd Daemon
+pip install -e ".[dev]"     # Python 3.13; add ".[dev,voice]" for the voice extra
+daemon setup
+```
+
+</details>
 
 ```bash
 daemon run       # here, in this terminal
@@ -62,23 +83,12 @@ daemon proactive # one round of "is there a reason to speak?", and what it decid
 daemon tools list  # what it may do to this machine, and what needs your say-so
 daemon tools log   # every tool call it has made, refusals included
 daemon doctor    # what is configured, reachable, indexed and remembered
+daemon update    # reinstall the latest release in place (re-runs what the one-liner did)
 ```
 
 `daemon setup` asks whether it may act on this machine (`DAEMON_TOOLS_ENABLED=true`
 by default); set it to false in `.env` to answer no later, and `daemon doctor` always
 says which way it is set.
-
-## Five faces
-
-<div align="center">
-<img src="docs/assets/states.png" alt="The five sprite states: running, responding, working, suspended, error" width="900">
-</div>
-
-One 28×28 sprite per state. Which face shows is decided by what the process is
-doing rather than by which one looks best — a mascot free to pick its own mood is
-a mascot that will eventually lie about the state of your machine. They drive the
-**[landing page](https://k2d2h4.github.io/Daemon/)**; there is no graphical status
-surface in the terminal, where `daemon doctor` reports plain text instead.
 
 ## Deciding whether to speak
 
@@ -158,12 +168,13 @@ is finished.
 | **M1c** ✅ | PC control — ten tools it can reach your machine with, and a gate in front of them |
 | **M2** ✅ | Reflection pass, entity graph, observations, and recall reads the curated tier |
 | **M3** ◐ | Proactivity — it speaks first, on a five-minute loop that mostly decides not to. Off until you switch it on; the speaker is a second switch. Tuning waits on labels |
-| M4 | Persona evolution |
+| **M4** ◐ | Persona evolution — a seed you own plus rules it learns about you, with an anchor that stops the personality collapsing. Code complete; the gate, like M3's, waits on ~2 weeks of real observations |
 
-Recall scores **93.3% on the golden set** — 28 of 30, top-5, `bge-m3`, with every
+Recall scores **94.0% on the golden set** — 47 of 50, top-5, `bge-m3`, with every
 embedding indexed. Those conditions are part of the number: the same suite reads
-50.0% keyword-only, and 83.3% on a smaller embedder. `evals/agent-results.json`
-holds the last run as data, and `python3 -m evals.golden_set --json` reproduces it.
+56.0% keyword-only, and 60.0% on the deterministic offline embedder it ships as a
+floor. `evals/agent-results.json` holds the last run as data, and
+`python3 -m evals.golden_set --embedder ollama --json` reproduces it.
 
 ## Contributing
 

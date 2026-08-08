@@ -132,7 +132,7 @@ def _enabled_app(tmp_path: Path, bridge: FakeBridge | None = None) -> Any:
 
 
 def test_mcp_routes_are_409_when_disabled(tmp_path: Path) -> None:
-    app = create_app(_settings(tmp_path))  # mcp_enabled defaults False
+    app = create_app(_settings(tmp_path, mcp_enabled=False))  # MCP defaults on; turn it off
     app.state.env_path = tmp_path / ".env"
     client = TestClient(app, base_url=LOOPBACK)
 

@@ -950,8 +950,8 @@ def test_the_tool_layer_can_be_switched_off_entirely(tmp_path: Path) -> None:
 
 def test_the_default_install_has_tools_in_full_mode(tmp_path: Path) -> None:
     """The default a person actually gets: tools assembled, `full` in force (a
-    guarded tool runs without asking - the origin gate is what stays), and the
-    browser and MCP still off."""
+    guarded tool runs without asking - the origin gate is what stays), the browser
+    still off, and MCP on but contributing nothing until a server is configured."""
     settings = Settings(
         _env_file=None,
         DAEMON_PRESET="offline",
@@ -967,14 +967,17 @@ def test_the_default_install_has_tools_in_full_mode(tmp_path: Path) -> None:
 
         runner, bridge, status = asyncio.run(_build_tools(settings, store))
         assert runner is not None and len(runner) == 7, "the built-ins, and not the browser"
-        assert bridge is None, "mcp is off by default"
+        # MCP is on by default, so the bridge exists - but with no mcp.json it started
+        # no server, added no tool (the count is still 7) and recorded no failure.
+        assert bridge is not None and not bridge.failures, "mcp on, but empty"
         assert "mode=full" in status and "browser" not in status
     finally:
         store.close()
 
 
 def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
-    """The other direction, so "reachable from settings" is a claim with a test."""
+    """The other direction, so "reachable from settings" is a claim with a test.
+    MCP is turned off here, which also covers the disabled path: no bridge at all."""
     settings = Settings(
         _env_file=None,
         DAEMON_PRESET="offline",
@@ -983,6 +986,7 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
         TELEGRAM_BOT_TOKEN=TOKEN,
         DAEMON_TOOLS_ENABLED=True,
         DAEMON_TOOLS_ROOTS=str(tmp_path),
+        DAEMON_MCP_ENABLED=False,
     )
     store = Store.open(tmp_path / "daemon.sqlite3")
     try:
@@ -990,7 +994,7 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
 
         runner, bridge, status = asyncio.run(_build_tools(settings, store))
         assert runner is not None and len(runner) == 7
-        assert bridge is None, "mcp is off, so no server should have been started"
+        assert bridge is None, "mcp is off, so no bridge should have been built"
         assert "mode=full" in status
     finally:
         store.close()

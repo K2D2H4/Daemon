@@ -253,6 +253,103 @@ def test_run_serves(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cli.main(["run"]) == 0
 
 
+def test_version_flag_prints_the_package_version(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`daemon --version` is the first line of any bug report, so it must work on a
+    machine where the install is broken. It reads the one place the version is
+    declared - `daemon.__version__` - which is the same number a source checkout and
+    an installed wheel both carry, so it needs no network and no metadata lookup."""
+    from daemon import __version__
+
+    assert cli.main(["--version"]) == 0
+    assert __version__ in capsys.readouterr().out
+
+
+def test_version_is_a_release_number() -> None:
+    """Guards the bump: an empty or malformed `__version__` would make `--version`
+    print nothing useful and would tag a release nobody can pin."""
+    import re
+
+    from daemon import __version__
+
+    assert re.fullmatch(r"\d+\.\d+\.\d+", __version__), __version__
+
+
+def test_update_installs_the_latest_release(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`daemon update` re-installs through uv exactly what the one-liner installs,
+    so the two cannot drift. The network and the subprocess are seams; what this
+    pins is that the resolved ref reaches the install command as a tarball (not a
+    git ref - a bare machine has no git)."""
+    ran: list[list[str]] = []
+    monkeypatch.setattr(cli, "_uv_present", lambda: True)
+    monkeypatch.setattr(cli, "_latest_ref", lambda: "v9.9.9")
+    monkeypatch.setattr(cli, "_run", lambda cmd: ran.append(cmd) or 0)
+    monkeypatch.delenv("DAEMON_VERSION", raising=False)
+
+    assert cli.main(["update"]) == 0
+    assert ran, "the install command never ran"
+    cmd = " ".join(ran[0])
+    assert "uv" in ran[0] and "tool" in ran[0] and "install" in ran[0]
+    assert "--force" in ran[0]
+    assert "archive/v9.9.9.tar.gz" in cmd and "git+" not in cmd
+    assert "daemon-ai" in ran[0]
+
+
+def test_update_honours_the_version_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`DAEMON_VERSION=<ref>` pins the update, and skips the latest-release lookup -
+    the same override install.sh honours."""
+    ran: list[list[str]] = []
+    monkeypatch.setattr(cli, "_uv_present", lambda: True)
+    monkeypatch.setattr(
+        cli, "_latest_ref", lambda: pytest.fail("must not resolve latest when pinned")
+    )
+    monkeypatch.setattr(cli, "_run", lambda cmd: ran.append(cmd) or 0)
+    monkeypatch.setenv("DAEMON_VERSION", "v0.1.0")
+
+    assert cli.main(["update"]) == 0
+    assert "archive/v0.1.0.tar.gz" in " ".join(ran[0])
+
+
+def test_update_without_uv_explains_and_does_not_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A source/pip install has no uv; update must say so and point elsewhere, not
+    shell out to a binary that is not there."""
+    ran: list[list[str]] = []
+    monkeypatch.setattr(cli, "_uv_present", lambda: False)
+    monkeypatch.setattr(cli, "_run", lambda cmd: ran.append(cmd) or 0)
+
+    assert cli.main(["update"]) == 1
+    assert not ran, "update shelled out despite uv being absent"
+    assert "uv" in capsys.readouterr().out.lower()
+
+
+def test_update_reports_a_failed_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_uv_present", lambda: True)
+    monkeypatch.setattr(cli, "_latest_ref", lambda: "main")
+    monkeypatch.setattr(cli, "_run", lambda cmd: 1)
+    monkeypatch.delenv("DAEMON_VERSION", raising=False)
+
+    assert cli.main(["update"]) == 1
+
+
+def test_latest_ref_falls_back_to_main_when_there_is_no_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before the first release is cut, GitHub's releases/latest 404s (or the
+    network is down). The installer treats that as 'install main'; so does update."""
+    import httpx
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise httpx.HTTPError("no network")
+
+    monkeypatch.setattr(httpx, "get", boom)
+    assert cli._latest_ref() == "main"
+
+
 def test_run_warns_when_the_shell_overrides_the_env_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
