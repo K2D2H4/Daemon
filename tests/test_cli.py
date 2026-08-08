@@ -355,7 +355,9 @@ def test_an_unknown_command_is_a_usage_error() -> None:
     assert exit_info.value.code == 2
 
 
-def test_request_mic_reports_status_and_exit_code(monkeypatch, capsys) -> None:
+def test_request_mic_reports_status_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     import daemon.cli as cli
 
     monkeypatch.setattr(
