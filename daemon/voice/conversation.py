@@ -281,6 +281,12 @@ class VoiceConversation:
                 # that, and only if the owner asks.
                 if self._screen_share is not None and self._screen_pump_factory is not None:
                     self._screen_share.bind(self._screen_pump_factory(session))
+                # Before the opening audio: the tail of the conversation this wake
+                # word interrupted, so a fresh session does not greet an amnesiac's
+                # greeting. Safe to send here and only here - nothing is generating
+                # yet, and `send_context` mid-generation kills the answer (measured,
+                # module docstring).
+                await self._send_continuity(session)
                 # Before the microphone, so the utterance that opened the session is
                 # the first thing the model hears rather than racing live audio for
                 # its place in the turn.
@@ -328,6 +334,28 @@ class VoiceConversation:
             await session.send_audio(self._opening_audio)
         except Exception:
             logger.exception("voice: could not hand over the utterance that opened the session")
+
+    async def _send_continuity(self, session: VoiceSession) -> None:
+        """Hand over the conversation this wake word is continuing, if it is fresh.
+
+        Every session used to start empty - the server holds voice history, and a
+        new socket has none - so calling the daemon twice in three minutes met a
+        stranger the second time, while the same two messages over Telegram were one
+        thread (the text loop carries `recent()` in every request). Same never-fails
+        contract as `_send_opening`: continuity lost costs one "what were we
+        saying?", raising would cost the turn.
+        """
+        try:
+            block = await self._companion.continuity_block()
+        except Exception:
+            logger.exception("voice: could not assemble the recent conversation")
+            return
+        if not block:
+            return
+        try:
+            await session.send_context(block)
+        except Exception:
+            logger.exception("voice: could not hand over the recent conversation")
 
     # --- the two streams ----------------------------------------------------
 

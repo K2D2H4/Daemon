@@ -50,6 +50,8 @@ apart.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import time
 import unicodedata
@@ -275,8 +277,27 @@ class WakeGate:
         dead_run = 0
         in_segment = False
 
+        stream = self._audio.record()
         try:
-            async for block in self._audio.record():
+            while True:
+                # A watchdog on every wait, because a dead capture has two faces and
+                # only one raises: a stream can deliver all-zero blocks (caught per
+                # frame below) or deliver *nothing at all* - the callback never fires,
+                # the queue stays empty, and this generator would park here forever
+                # while /health said `running` (measured live: a launchd resident went
+                # deaf with zero frames, so the zero-frame detector never ran).
+                try:
+                    async with asyncio.timeout(self._dead_stream_seconds):
+                        block = await anext(stream)
+                except TimeoutError:
+                    logger.warning(
+                        "wake: the microphone has delivered nothing at all for %.0fs; "
+                        "the capture stream is dead - ending the gate so it is rebuilt",
+                        self._dead_stream_seconds,
+                    )
+                    return
+                except StopAsyncIteration:
+                    break
                 pending += block
                 while len(pending) >= self._frame_bytes:
                     frame = bytes(pending[: self._frame_bytes])
@@ -365,6 +386,12 @@ class WakeGate:
             # that is not there would report itself healthy while hearing nothing.
             logger.exception("wake: the gate has stopped listening")
             raise
+        finally:
+            # Manual iteration does not finalise the generator the way `async for`
+            # leaving scope does; without this, a watchdog return would leave the
+            # microphone stream open - the light left on.
+            with contextlib.suppress(Exception):
+                await stream.aclose()
 
     async def _decide(self, pcm: bytes, confidence: float) -> WakeEvent | None:
         """Transcribe one segment and decide, or explain itself to a counter."""

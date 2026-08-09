@@ -123,6 +123,8 @@ def create_app(
     app.state.wake_status = "off"
     app.state.tools = None
     app.state.tools_status = "not started"
+    app.state.voice_runtime = None
+    app.state.wake_gate = None
     app.state.mcp = None
     # Serialises the admin's persist-then-(dis)connect MCP routes so two of them
     # cannot interleave the `mcp.json` read-modify-write and lose an update
@@ -284,6 +286,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 settings, io.store
             )
             app.state.tools = tools
+            if settings.voice_enabled and settings.wake_enabled:
+                # The wake path's boot-once services (VoiceRuntime): without this,
+                # every wake word rebuilt the tool layer and reconnected every MCP
+                # server before the daemon could speak - ~4s of the owner's "why
+                # does it take six seconds to answer", paid per call.
+                try:
+                    app.state.voice_runtime = await _build_voice_runtime(
+                        settings, io.store, memory, recall
+                    )
+                except Exception as exc:
+                    # The wake round falls back to building its own per call -
+                    # slower, never deaf.
+                    logger.error(
+                        "voice runtime not prebuilt (wake rounds build their own): %s", exc
+                    )
 
     # Set regardless of the channel: memory, recall and the tool layer are
     # channel-independent capabilities, and tying their `app.state` handles to a
@@ -370,7 +387,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.wake_status = "unavailable"
         else:
             app.state.wake_task = asyncio.create_task(
-                _wake_forever(settings), name="wake-gate"
+                _wake_forever(
+                    settings,
+                    shared=getattr(app.state, "voice_runtime", None),
+                    state=app.state,
+                ),
+                name="wake-gate",
             )
 
     try:
@@ -398,6 +420,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             # per restart.
             with suppress(Exception):
                 await mcp.aclose()
+        voice_runtime = getattr(app.state, "voice_runtime", None)
+        if voice_runtime is not None and voice_runtime.mcp is not None:
+            # The voice half's bridge, for the same orphan reason as the text one.
+            with suppress(Exception):
+                await voice_runtime.mcp.aclose()
         if close_io is not None:
             with suppress(Exception):
                 close_io()
@@ -406,6 +433,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if tools is not None:
             # `fetch_page` owns an HTTP client; the runner walks the registry for it.
             closeables.append(tools)
+        if voice_runtime is not None and voice_runtime.tools is not None:
+            closeables.append(voice_runtime.tools)
         if embedder is not None:
             # The embedder holds its own HTTP client, and it is not in `providers`
             # because embeddings are routed separately (llm/base.py).
@@ -931,7 +960,63 @@ async def _boot_catchup(settings: Settings, lock: asyncio.Lock) -> None:
         logger.exception("boot catch-up failed")
 
 
-async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
+@dataclass
+class VoiceRuntime:
+    """What a wake-opened conversation reuses instead of rebuilding.
+
+    Built once at resident startup and handed to every wake round. Before this
+    existed each wake word rebuilt the lot - reopened sqlite, reindexed, and
+    reconnected every MCP server - which put ~4s of setup between "벨라" and the
+    daemon being able to say anything, on top of the session handshake. Boot-once
+    services are how every voice stack does it (LiveKit/Pipecat keep pipelines warm
+    for the process lifetime); the billed Gemini session stays per-conversation.
+
+    Ownership stays with the lifespan: `run_voice` treats everything here as
+    borrowed and closes none of it, and the lifespan's shutdown closes the MCP
+    bridge and the runner exactly as it does the text path's.
+    """
+
+    store: Any
+    writer: Any
+    recall: Any
+    tools: Any
+    mcp: Any
+    screen_share: Any
+
+
+async def _build_voice_runtime(
+    settings: Settings, store: Any, writer: Any, recall: Any
+) -> VoiceRuntime:
+    """The voice half of the tool layer, built once at startup.
+
+    A separate runner from the text path's on purpose: voice degrades `ask` to
+    `allowlist` (a spoken turn has nowhere to surface an approval) and carries the
+    live-share start/stop tools bound to a `ScreenShareController`, neither of which
+    the text registry has. The price is a second set of MCP connections held open -
+    paid once at boot instead of on every single wake word.
+    """
+    screen_share = None
+    if settings.screen_enabled:
+        # Guarded like run_voice's own block: a missing Pillow must cost the
+        # feature, not the resident.
+        try:
+            from daemon.voice.screen_share import ScreenShareController
+
+            screen_share = ScreenShareController()
+        except ImportError as exc:
+            logger.warning("voice screen sharing off (missing dependency): %s", exc)
+    voice_mode = "allowlist" if settings.tools_mode == "ask" else settings.tools_mode
+    tools, mcp, _status = await _build_tools(
+        settings, store, mode=voice_mode, screen_share=screen_share
+    )
+    return VoiceRuntime(
+        store=store, writer=writer, recall=recall, tools=tools, mcp=mcp, screen_share=screen_share
+    )
+
+
+async def run_voice(
+    settings: Settings, *, opening_audio: bytes = b"", shared: VoiceRuntime | None = None
+) -> int:
     """One spoken conversation at this machine, then exit.
 
     Assembled here rather than inside the daemon's own loop because voice is a
@@ -957,45 +1042,62 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
     route = settings.route_for(Task.CHAT_VOICE)
 
     harden_existing(settings.data_dir)
-    store = Store.open(settings.data_dir / DB_FILENAME)
+    # `shared` is the resident's boot-once voice runtime (VoiceRuntime): store,
+    # recall, tool layer and MCP connections built at startup and reused across
+    # wake rounds. Rebuilding them here cost every single wake word ~4s of MCP
+    # reconnect plus a reindex before the daemon could say anything - the owner's
+    # "why does it take six seconds to answer". `daemon voice` (the CLI, one
+    # conversation per process) passes nothing and keeps building - and closing -
+    # its own, which is what `owns` guards.
+    owns = shared is None
+    store = Store.open(settings.data_dir / DB_FILENAME) if owns else shared.store
     try:
-        reindex(settings.data_dir, store)
-        writer = FileMemoryWriter(settings.data_dir, store)
-        recall, _status, embedder = _build_recall(settings, store)
-        # The controller for the live-share start/stop tools (Task 2.3). Built
-        # only when screen sharing is on at all - `None` otherwise, which is what
-        # keeps those two tools off `_build_tools`'s registry entirely. Built here
-        # rather than inside `_voice_attempts` because the same instance has to
-        # survive a reconnect: the tools registered below hold a reference to it,
-        # and a fresh controller per attempt would leave them pointing at a stale
-        # one.
-        screen_share = None
-        if settings.screen_enabled:
-            # Guarded like the screen-tool block in `_build_tools`: screen sharing
-            # needs Pillow (daemon/voice/screen_share.py imports it at module scope).
-            # A missing Pillow must lose only the feature, not crash the whole voice
-            # session on the wake word - the failure this caught on the owner's Mac.
-            try:
-                from daemon.voice.screen_share import ScreenShareController
+        if owns:
+            reindex(settings.data_dir, store)
+            writer = FileMemoryWriter(settings.data_dir, store)
+            recall, _status, embedder = _build_recall(settings, store)
+        else:
+            writer, recall, embedder = shared.writer, shared.recall, None
+        if owns:
+            # The controller for the live-share start/stop tools (Task 2.3). Built
+            # only when screen sharing is on at all - `None` otherwise, which is what
+            # keeps those two tools off `_build_tools`'s registry entirely. Built here
+            # rather than inside `_voice_attempts` because the same instance has to
+            # survive a reconnect: the tools registered below hold a reference to it,
+            # and a fresh controller per attempt would leave them pointing at a stale
+            # one.
+            screen_share = None
+            if settings.screen_enabled:
+                # Guarded like the screen-tool block in `_build_tools`: screen sharing
+                # needs Pillow (daemon/voice/screen_share.py imports it at module
+                # scope). A missing Pillow must lose only the feature, not crash the
+                # whole voice session on the wake word - the failure this caught on
+                # the owner's Mac.
+                try:
+                    from daemon.voice.screen_share import ScreenShareController
 
-                screen_share = ScreenShareController()
-            except ImportError as exc:
-                logger.warning("voice screen sharing off (missing dependency): %s", exc)
-        # Tools follow the owner's configured mode - `full` for this install, so a
-        # spoken turn runs guarded tools the same as the text path does. A microphone
-        # has no relay path, so a spoken turn is the owner's own words and the origin
-        # gate is the real boundary; pinning `allowlist` here silently refused every
-        # guarded call the owner made by voice, `open_path` among them. The one mode a
-        # spoken turn cannot honour is `ask`: it has nowhere to surface an approval, so
-        # `ask` would pile up rows that lapse unanswered - the silent degradation this
-        # repo calls the dangerous failure - and so degrades to `allowlist` here.
-        # The allowlist and standing grants are the same table the text path edits,
-        # so voice reads the surface text writes to; it just never adds to it. Off
-        # entirely when `DAEMON_TOOLS_ENABLED` is false, exactly like text.
-        voice_mode = "allowlist" if settings.tools_mode == "ask" else settings.tools_mode
-        tools, mcp_bridge, _tools_status = await _build_tools(
-            settings, store, mode=voice_mode, screen_share=screen_share
-        )
+                    screen_share = ScreenShareController()
+                except ImportError as exc:
+                    logger.warning("voice screen sharing off (missing dependency): %s", exc)
+            # Tools follow the owner's configured mode - `full` for this install, so a
+            # spoken turn runs guarded tools the same as the text path does. A
+            # microphone has no relay path, so a spoken turn is the owner's own words
+            # and the origin gate is the real boundary; pinning `allowlist` here
+            # silently refused every guarded call the owner made by voice, `open_path`
+            # among them. The one mode a spoken turn cannot honour is `ask`: it has
+            # nowhere to surface an approval, so `ask` would pile up rows that lapse
+            # unanswered - the silent degradation this repo calls the dangerous
+            # failure - and so degrades to `allowlist` here. The allowlist and
+            # standing grants are the same table the text path edits, so voice reads
+            # the surface text writes to; it just never adds to it. Off entirely when
+            # `DAEMON_TOOLS_ENABLED` is false, exactly like text.
+            voice_mode = "allowlist" if settings.tools_mode == "ask" else settings.tools_mode
+            tools, mcp_bridge, _tools_status = await _build_tools(
+                settings, store, mode=voice_mode, screen_share=screen_share
+            )
+        else:
+            screen_share = shared.screen_share
+            tools, mcp_bridge = shared.tools, None
         companion = Companion(
             writer,
             data_dir=settings.data_dir,
@@ -1096,13 +1198,17 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
         finally:
             with suppress(Exception):
                 await audio.close()
+            # Everything below is owned teardown: a shared runtime's store, tools
+            # and MCP connections belong to the resident's lifespan and must
+            # outlive this one conversation - closing them here would take the
+            # next wake round's tools with it.
             # Before the sqlite close below, because an MCP server is a child process:
             # one left running is an orphan per `daemon voice` run, the same reason the
             # lifespan closes the bridge ahead of the store.
             if mcp_bridge is not None:
                 with suppress(Exception):
                     await mcp_bridge.aclose()
-            if tools is not None:
+            if owns and tools is not None:
                 # The runner walks its registry for anything holding a client -
                 # `fetch_page`'s, if the browser group is on - the same as the lifespan.
                 with suppress(Exception):
@@ -1113,7 +1219,8 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
                     with suppress(Exception):
                         await closer()
     finally:
-        store.close()
+        if owns:
+            store.close()
 
 
 READY_CUE_HZ = (784.0, 1046.5)
@@ -1295,7 +1402,16 @@ def _wake_health(state: Any) -> str:
     if task is None:
         return getattr(state, "wake_status", "off")
     if not task.done():
-        return "running"
+        gate = getattr(state, "wake_gate", None)
+        if gate is None:
+            # Between rounds - usually because a conversation holds the microphone.
+            return "running"
+        # The live counters, so "is it actually hearing?" is answerable from
+        # outside: frames at zero with the gate up is a dead capture stream, not a
+        # quiet room (the failure that used to be invisible until someone spoke to
+        # a deaf machine).
+        c = gate.counters
+        return f"running, {c.frames_seen} frames, {c.transcribed} transcribed, {c.fired} fired"
     return "stopped"
 
 
@@ -1309,7 +1425,9 @@ def _mic_health() -> str:
     return microphone_authorization_status()
 
 
-async def _wake_round(settings: Settings) -> None:
+async def _wake_round(
+    settings: Settings, shared: VoiceRuntime | None = None, state: Any = None
+) -> None:
     """Listen until called, hold one spoken conversation, release the microphone.
 
     One round, because the caller loops: keeping this a single round is what makes
@@ -1325,27 +1443,36 @@ async def _wake_round(settings: Settings) -> None:
     per-minute session (docs/PLAN.md 6.5).
     """
     gate, close_gate = await build_wake_gate(settings)
+    if state is not None:
+        # The live gate's counters, for /health: `frames_seen` is what separates "a
+        # quiet room" from "a dead capture stream" from outside the process - the
+        # question nobody could answer the night the resident went deaf while
+        # `running` (see WakeGate's dead-stream handling).
+        state.wake_gate = gate
     fired = None
     try:
         async for event in gate.listen():
             fired = event
             break
     finally:
+        if state is not None:
+            state.wake_gate = None
         # Before the conversation, not after: this is what hands the microphone over
         # and stops the gate hearing what happens next.
         with suppress(Exception):
             await close_gate()
     if fired is None:
-        # The stream ended without a wake word - a closed device, or a test's
-        # scripted audio running out. Not an error, but not a reason to spin either;
-        # the caller's own guard handles the pacing.
+        # The stream ended without a wake word - a closed device, a test's scripted
+        # audio running out, or the gate's own dead-stream watchdog asking to be
+        # rebuilt. Not an error, but not a reason to spin either; the caller's own
+        # guard handles the pacing.
         return
     logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
     # The segment that fired the gate goes with it. Without this the session opens
     # deaf to the question it was opened for: the gate consumed "루시 뭐 해", matched
     # on the alias, and the owner had to say "뭐 해" again into a microphone that had
     # just changed hands.
-    await run_voice(settings, opening_audio=fired.pcm)
+    await run_voice(settings, opening_audio=fired.pcm, shared=shared)
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
     await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
@@ -1376,7 +1503,9 @@ async def _rounds(round_: WakeRound) -> None:
             await asyncio.sleep(0)
 
 
-async def _wake_forever(settings: Settings) -> None:
+async def _wake_forever(
+    settings: Settings, shared: VoiceRuntime | None = None, state: Any = None
+) -> None:
     """Rounds, until cancelled.
 
     Every failure is caught and the loop continues. A wake gate that dies is the
@@ -1391,7 +1520,7 @@ async def _wake_forever(settings: Settings) -> None:
     """
     while True:
         try:
-            await _wake_round(settings)
+            await _wake_round(settings, shared, state)
         except asyncio.CancelledError:
             raise  # BaseException, so the clause below would not have caught it
         except Exception:
