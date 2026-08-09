@@ -51,6 +51,15 @@ def test_installer_forces_a_managed_python_on_macos() -> None:
     Daemon.app, so the headless wake gate is denied the mic (measured live). install.sh
     must force a uv-managed (non-.app) python on macOS - and `daemon update` matches it
     (tested in test_cli.py::test_update_install_command_forces_managed_python_on_macos)."""
-    text = INSTALL_SH.read_text(encoding="utf-8")
-    assert "only-managed" in text, "install.sh must force a uv-managed python on macOS"
-    assert "Darwin" in text, "the managed-python forcing must be gated to macOS"
+    lines = INSTALL_SH.read_text(encoding="utf-8").splitlines()
+    guard = next(
+        (i for i, ln in enumerate(lines) if "uname -s" in ln and "Darwin" in ln), None
+    )
+    assert guard is not None, "the managed-python forcing must be gated on macOS (uname Darwin)"
+    end = next((j for j in range(guard + 1, len(lines)) if lines[j].strip() == "fi"), None)
+    assert end is not None, "the Darwin guard must be a closed if/fi block"
+    # Inside the guard, not global: forcing only-managed on Linux would download a
+    # managed python needlessly and is not the fix.
+    assert "only-managed" in "\n".join(lines[guard : end + 1]), (
+        "--python-preference only-managed must live inside the `uname = Darwin` guard"
+    )
