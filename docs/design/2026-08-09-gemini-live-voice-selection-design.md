@@ -137,9 +137,10 @@ GET /admin/api/voice-sample/{voice}  ->  audio/mpeg bytes, or 404
   `evals/` because it imports product code (`GeminiLiveSession`) and hits the live
   API — `scripts/` may do neither (scripts import no product code).
 - For each voice in `GEMINI_LIVE_VOICES`: open a `GeminiLiveSession` with that
-  `voice_name`, prompt one short Korean greeting (default:
-  "안녕하세요, 저는 데몬이에요"), collect the audio bytes from `receive()` until the
-  turn boundary, and write `daemon/admin/static/voice-samples/{voice}.mp3`.
+  `voice_name`, prompt one short English greeting (default:
+  "Hi, I'm Daemon. This is what I sound like."), collect the audio bytes from
+  `receive()` until the turn boundary, and write
+  `daemon/admin/static/voice-samples/{voice}.mp3`.
 - Encoding: the session returns 24 kHz mono 16-bit PCM. Encode to MP3 (~64 kbps,
   ~2 s) with `ffmpeg` invoked as a subprocess — an offline, one-time dependency on
   the generator's machine, not a runtime dependency of the daemon. Target ≈ 15–20 KB
