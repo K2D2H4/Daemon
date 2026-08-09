@@ -957,9 +957,16 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
         # one.
         screen_share = None
         if settings.screen_enabled:
-            from daemon.voice.screen_share import ScreenShareController
+            # Guarded like the screen-tool block in `_build_tools`: screen sharing
+            # needs Pillow (daemon/voice/screen_share.py imports it at module scope).
+            # A missing Pillow must lose only the feature, not crash the whole voice
+            # session on the wake word - the failure this caught on the owner's Mac.
+            try:
+                from daemon.voice.screen_share import ScreenShareController
 
-            screen_share = ScreenShareController()
+                screen_share = ScreenShareController()
+            except ImportError as exc:
+                logger.warning("voice screen sharing off (missing dependency): %s", exc)
         # Tools follow the owner's configured mode - `full` for this install, so a
         # spoken turn runs guarded tools the same as the text path does. A microphone
         # has no relay path, so a spoken turn is the owner's own words and the origin

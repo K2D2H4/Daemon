@@ -35,6 +35,12 @@ dependencies = [
     "onnxruntime>=1.20; sys_platform == 'darwin'",
     "pyobjc-framework-Speech>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-AVFoundation>=10.0; sys_platform == 'darwin'",
+    # Screen sharing (on by default) hard-imports Pillow from run_voice's
+    # ScreenShareController - a missing Pillow crashed the voice session on the first
+    # wake word (measured on the owner's Mac). Voice is core on macOS, so Pillow is
+    # too; it stays in the [voice] extra below for Linux. run_voice also guards the
+    # import now, so a bare install degrades to "no screen sharing" rather than crash.
+    "Pillow>=10.0; sys_platform == 'darwin'",
     # read_file's PDF path (daemon/tools/extract.py). Pure Python, no system
     # libraries - deliberately not PyMuPDF, whose compiled wheels a self-hoster on
     # an odd platform can't always get. The Office formats (.docx/.xlsx/.pptx)

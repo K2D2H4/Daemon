@@ -20,7 +20,9 @@ VOICE_PACKAGES = (
     "pyobjc-framework-AVFoundation",
 )
 
-PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PYPROJECT = REPO_ROOT / "pyproject.toml"
+INSTALL_SH = REPO_ROOT / "install.sh"
 
 
 def _core_deps() -> list[str]:
@@ -41,3 +43,36 @@ def test_voice_stack_is_a_default_macos_dependency() -> None:
 def test_voice_extra_still_exists_for_linux() -> None:
     data = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
     assert "voice" in data["project"]["optional-dependencies"]
+
+
+def test_pillow_is_a_default_macos_dependency() -> None:
+    """Screen sharing is on by default and run_voice hard-imports Pillow through its
+    ScreenShareController; a missing Pillow crashed the voice session on the first wake
+    word (measured live). On macOS - where voice is core - Pillow must be core too, not
+    stranded in the [voice] extra where a `[mcp]` install never picks it up."""
+    core = _core_deps()
+    matches = [d for d in core if d.split(">=")[0].split(";")[0].strip() == "Pillow"]
+    assert matches, "Pillow must be a core dependency on macOS (screen sharing needs it)"
+    assert all("sys_platform == 'darwin'" in d for d in matches), (
+        f"Pillow must be gated to darwin so Linux core installs stay lean: {matches}"
+    )
+
+
+def test_installer_forces_a_managed_python_on_macos() -> None:
+    """The python.org framework build is a `Python.app` bundle; the .app launcher
+    exec'ing into it makes macOS attribute the mic grant to Python.app, not
+    Daemon.app, so the headless wake gate is denied the mic (measured live). install.sh
+    must force a uv-managed (non-.app) python on macOS - and `daemon update` matches it
+    (tested in test_cli.py::test_update_install_command_forces_managed_python_on_macos)."""
+    lines = INSTALL_SH.read_text(encoding="utf-8").splitlines()
+    guard = next(
+        (i for i, ln in enumerate(lines) if "uname -s" in ln and "Darwin" in ln), None
+    )
+    assert guard is not None, "the managed-python forcing must be gated on macOS (uname Darwin)"
+    end = next((j for j in range(guard + 1, len(lines)) if lines[j].strip() == "fi"), None)
+    assert end is not None, "the Darwin guard must be a closed if/fi block"
+    # Inside the guard, not global: forcing only-managed on Linux would download a
+    # managed python needlessly and is not the fix.
+    assert "only-managed" in "\n".join(lines[guard : end + 1]), (
+        "--python-preference only-managed must live inside the `uname = Darwin` guard"
+    )
