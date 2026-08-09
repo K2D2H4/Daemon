@@ -56,6 +56,20 @@ Same reason the Telegram poll has one (daemon/channels/telegram.py): a round
 that fails instantly - no microphone, a revoked permission - would otherwise
 retry as fast as the process can manage."""
 
+WAKE_REARM_SETTLE_SECONDS = 1.0
+"""Pause after a spoken conversation before the next wake round opens a fresh
+microphone stream.
+
+The conversation ran through the macOS Voice-Processing I/O unit
+(daemon/voice/apple_audio.py), which releases the shared input device
+*asynchronously* when the engine stops. A fresh PortAudio capture opened inside that
+window has come up dead - all-zero blocks, no error - leaving the gate `running` and
+permanently deaf until a restart (measured live: a session worked, the next wake word
+was never heard). Letting CoreAudio finish the teardown first is the cheap half of the
+fix; the wake gate's own dead-stream detection (daemon/voice/wake.py) is the half that
+recovers if this is ever not enough. Pure wait - it can cost a second of not-yet-
+listening, never the listening itself."""
+
 OK = 0
 PROBLEM = 1
 """Shell exit codes, matching cli.py - `daemon voice` is a command."""
@@ -1332,6 +1346,9 @@ async def _wake_round(settings: Settings) -> None:
     # on the alias, and the owner had to say "뭐 해" again into a microphone that had
     # just changed hands.
     await run_voice(settings, opening_audio=fired.pcm)
+    # Let the conversation's Voice-Processing unit finish releasing the microphone
+    # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
+    await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
 
 
 async def _rounds(round_: WakeRound) -> None:

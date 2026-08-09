@@ -540,6 +540,36 @@ async def test_a_recognizer_that_cannot_say_whether_it_is_available_is_survived(
     assert rig.gate.counters.errors == 1
 
 
+async def test_an_all_zero_stream_is_treated_as_dead_and_ends_the_gate() -> None:
+    """A capture opened right after a voice session has come up dead: all-zero blocks,
+    no exception, so the `except` that catches a vanished device never fires and the
+    gate stays `running` and permanently deaf (measured live). It is caught here
+    instead, as impossibly perfect silence, and the gate ends so daemon/app.py rebuilds
+    the stream rather than the owner having to restart the process."""
+    # 15 frames of pure zero; the threshold below is 10 (320 ms / 32 ms).
+    dead = b"\x00" * (FRAME_BYTES * 15)
+    rig = build([dead], [], FakeRecognizer(), dead_stream_ms=320)
+
+    events = await rig.collect()
+
+    assert events == []
+    # Ended at the threshold rather than draining all 15 frames: it bailed early.
+    assert rig.gate.counters.frames_seen == 10
+
+
+async def test_a_quiet_but_live_stream_is_not_mistaken_for_dead() -> None:
+    """A real microphone in a silent room still has a nonzero noise floor, so a single
+    nonzero sample per frame keeps the gate listening. Only *exact* zero across the
+    whole window is a dead stream; a quiet house must never trip it."""
+    floor = b"\x01\x00" * FRAME_SAMPLES  # every sample == 1: quiet, but never zero
+    rig = build([floor * 15], [], FakeRecognizer(), dead_stream_ms=320)
+
+    events = await rig.collect()
+
+    assert events == []
+    assert rig.gate.counters.frames_seen == 15, "a live-but-quiet stream is read to the end"
+
+
 async def test_a_raising_recognizer_leaves_the_loop_alive() -> None:
     """A dead listener leaves a process that is alive and permanently deaf."""
     blocks, probabilities = script(*ONE_PHRASE, *ONE_PHRASE)

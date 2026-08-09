@@ -97,6 +97,19 @@ sessions. Covers the rest of the utterance that carried the wake word - a sessio
 is up in about 1.3 s (0.56 s handshake + 740 ms to first audio, measured) - without
 swallowing a deliberate second call."""
 
+DEFAULT_DEAD_STREAM_MS = 45_000
+"""How long a run of pure digital silence (every sample exactly zero) means the
+capture stream came up dead rather than the room being quiet.
+
+A fresh PortAudio capture opened right after a macOS Voice-Processing session has
+released the shared microphone can come up delivering all-zero blocks forever - the
+gate reports `running`, `/health` says the mic is authorised, and not one wake word
+is ever heard (measured live: voice worked, the next call was never heard). A real
+microphone in a silent room still has a nonzero noise floor, so 45 s of *exactly*
+zero is a dead stream, not a quiet house - and the gate ends its listen so the
+caller rebuilds it, instead of staying deaf until someone restarts the process. The
+window is deliberately long: the cost of being wrong is one cheap stream reopen."""
+
 ERROR_LOG_EVERY = 20
 """Failures here arrive per frame when they arrive at all, so they are counted and
 logged periodically. The count is what a report needs anyway; the flood is not."""
@@ -207,6 +220,7 @@ class WakeGate:
         min_speech_ms: int = DEFAULT_MIN_SPEECH_MS,
         max_segment_ms: int = DEFAULT_MAX_SEGMENT_MS,
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
+        dead_stream_ms: int = DEFAULT_DEAD_STREAM_MS,
     ) -> None:
         if vad.sample_rate != audio.sample_rate:
             # Loud, because the quiet version of this is the worst bug the gate can
@@ -232,6 +246,8 @@ class WakeGate:
         self._min_speech_frames = max(1, round(min_speech_ms / frame_ms))
         self._max_segment_frames = max(2, round(max_segment_ms / frame_ms))
         self._cooldown_seconds = cooldown_seconds
+        self._dead_stream_frames = max(1, round(dead_stream_ms / frame_ms))
+        self._dead_stream_seconds = dead_stream_ms / 1000.0
         self._last_fire: float | None = None
         self.counters = WakeCounters()
 
@@ -254,6 +270,9 @@ class WakeGate:
         segment: list[bytes] = []
         speech: list[float] = []
         silence_run = 0
+        # Consecutive frames of pure digital silence. A dead capture stream (see
+        # DEFAULT_DEAD_STREAM_MS) is all zeros forever; a live mic never is.
+        dead_run = 0
         in_segment = False
 
         try:
@@ -264,6 +283,23 @@ class WakeGate:
                     del pending[: self._frame_bytes]
 
                     self.counters.frames_seen += 1
+                    # A dead stream delivers all-zero blocks and no exception, so it
+                    # is not caught by the `except` below - it is caught here, by the
+                    # audio being impossibly silent. Ending the generator hands the
+                    # caller a chance to rebuild the stream (daemon/app.py), which is
+                    # the difference between a 45 s deaf spell and a permanent one.
+                    if any(frame):
+                        dead_run = 0
+                    else:
+                        dead_run += 1
+                        if dead_run >= self._dead_stream_frames:
+                            logger.warning(
+                                "wake: the microphone has delivered only silence for "
+                                "%.0fs; the capture stream is dead, not the room quiet "
+                                "- ending the gate so it is rebuilt",
+                                self._dead_stream_seconds,
+                            )
+                            return
                     probability = self._probability(frame)
                     is_speech = probability >= self._threshold
                     # Fed on every frame, speech or not, so the buffer always holds
