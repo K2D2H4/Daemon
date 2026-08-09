@@ -8,6 +8,7 @@ Endpoints (docs/design/2026-08-07-m5-admin-web-design.md, "JSON API"):
     GET   /admin/api/settings     editable settings, secrets masked
     PATCH /admin/api/settings     validate -> write .env -> {restart_required, supervised}
     POST  /admin/api/restart      graceful exit, only when supervised
+    GET   /admin/api/voice-sample/{voice}  a voice preview clip (audio/mpeg), allowlist-gated
 
     --- Phase 2, all behind DAEMON_MCP_ENABLED (409 with guidance when off) ---
     GET    /admin/api/mcp/catalog          the trusted catalog (no commands/urls)
@@ -39,7 +40,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from daemon.admin.mcp_oauth import OAuthError, complete_oauth_flow, start_oauth_flow
 from daemon.admin.restart import is_supervised, schedule_exit
@@ -50,6 +51,7 @@ from daemon.admin.settings_io import (
     write_env_secret,
 )
 from daemon.app import health_payload
+from daemon.config import GEMINI_LIVE_VOICES
 from daemon.llm.base import Message, ProviderError
 from daemon.mcp_catalog import CATALOG, lookup
 from daemon.tasks import Task
@@ -61,6 +63,11 @@ from daemon.tools.mcp import (
 )
 
 SHELL = Path(__file__).parent / "static" / "index.html"
+
+VOICE_SAMPLES = Path(__file__).parent / "static" / "voice-samples"
+"""Committed MP3 previews, one per Gemini Live voice, produced offline by
+evals/gen_voice_samples.py. Served locally so preview needs no key and no network -
+the admin stays offline (design decision 4: no CDN, offline operation preserved)."""
 
 CHAT_TEST_TIMEOUT = 60.0
 """Ceiling on the chat-test round-trip. A hung provider must not hold the admin
@@ -233,6 +240,23 @@ async def restart() -> JSONResponse:
         )
     schedule_exit()
     return JSONResponse({"restarted": True, "supervised": True})
+
+
+@router.get("/api/voice-sample/{voice}")
+async def voice_sample(voice: str) -> Response:
+    """A short preview clip for one Gemini Live voice, as audio/mpeg.
+
+    The name is checked against the fixed voice set BEFORE any path is built, so an
+    unknown or traversal name can never resolve a file. A known voice whose clip was
+    not generated is a 404, not a 500 - a missing asset degrades to 'no preview'."""
+    if voice not in GEMINI_LIVE_VOICES:
+        return JSONResponse({"detail": f"no such voice {voice!r}"}, status_code=404)
+    path = VOICE_SAMPLES / f"{voice}.mp3"
+    if not path.is_file():
+        return JSONResponse(
+            {"detail": f"no preview generated for {voice!r}"}, status_code=404
+        )
+    return Response(path.read_bytes(), media_type="audio/mpeg")
 
 
 # --- MCP (Phase 2), all behind DAEMON_MCP_ENABLED ----------------------------

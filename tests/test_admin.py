@@ -384,6 +384,44 @@ def test_a_newline_in_a_secret_is_refused_and_writes_nothing(tmp_path: Path) -> 
     assert "DAEMON_HOST" not in text
 
 
+def test_patch_sets_the_gemini_live_voice(tmp_path: Path) -> None:
+    """PATCH writes `.env` and reports `restart_required` - it does not hot-reload
+    `app.state.settings` (that object is fixed at boot, by design). So the real
+    contract is proven by simulating the restart: build a fresh `Settings` from the
+    written `.env` and confirm *that* process surfaces the value."""
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch("/admin/api/settings", json={"gemini_live_voice": "Kore"})
+    assert resp.status_code == 200
+    assert resp.json()["restart_required"] is True
+    assert "DAEMON_GEMINI_LIVE_VOICE=Kore" in env.read_text(encoding="utf-8")
+
+    restarted = create_app(Settings(_env_file=str(env), preset="offline", data_dir=tmp_path))
+    got = TestClient(restarted, base_url=LOOPBACK).get("/admin/api/settings").json()
+    assert got["editable"]["gemini_live_voice"] == "Kore"
+    assert "Kore" in got["options"]["gemini_live_voices"]
+    assert got["options"]["gemini_live_voices"][0] == "", (
+        "empty (server default) must be offered first"
+    )
+
+
+def test_patch_rejects_an_unknown_gemini_live_voice(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    original = "DAEMON_PRESET=offline\n"
+    env.write_text(original, encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch("/admin/api/settings", json={"gemini_live_voice": "Nope"})
+    assert resp.status_code == 400
+    assert env.read_text(encoding="utf-8") == original, "a rejected voice still wrote"
+
+
 def test_a_newline_in_a_route_override_is_refused(tmp_path: Path) -> None:
     env = tmp_path / ".env"
     original = "DAEMON_PRESET=offline\n"
@@ -402,3 +440,38 @@ def test_a_newline_in_a_route_override_is_refused(tmp_path: Path) -> None:
     # reason and the guard fired before Settings validation ever saw it.
     assert "newline" in resp.json()["detail"].lower()
     assert env.read_text(encoding="utf-8") == original
+
+
+def test_voice_sample_serves_a_present_clip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    samples = tmp_path / "voice-samples"
+    samples.mkdir()
+    (samples / "Kore.mp3").write_bytes(b"ID3-fake-mp3-bytes")
+    monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
+
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+    resp = client.get("/admin/api/voice-sample/Kore")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "audio/mpeg"
+    assert resp.content == b"ID3-fake-mp3-bytes"
+
+
+def test_voice_sample_404_for_missing_or_unknown_and_never_reads_a_bad_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    samples = tmp_path / "voice-samples"
+    samples.mkdir()
+    monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
+
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+
+    # Known voice, but no file generated yet -> 404, not 500.
+    assert client.get("/admin/api/voice-sample/Kore").status_code == 404
+    # A name outside the allowlist -> 404, and the allowlist check runs before any
+    # filesystem touch, so a traversal attempt never resolves a path.
+    assert client.get("/admin/api/voice-sample/Nope").status_code == 404
+    assert client.get("/admin/api/voice-sample/..%2f..%2fetc%2fpasswd").status_code == 404

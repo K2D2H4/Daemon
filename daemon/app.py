@@ -1042,6 +1042,9 @@ async def run_voice(settings: Settings, *, opening_audio: bytes = b"") -> int:
                 end_sensitivity=settings.voice_end_sensitivity,
                 prefix_padding_ms=settings.voice_prefix_padding_ms,
                 silence_duration_ms=settings.voice_silence_duration_ms,
+                # Empty passes straight through as "leave it to the server", exactly
+                # as before this setting existed (daemon/voice/gemini_live.py).
+                voice_name=settings.gemini_live_voice,
             )
 
         screen_pump_factory = None

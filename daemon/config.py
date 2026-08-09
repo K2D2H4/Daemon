@@ -60,6 +60,18 @@ THINKING_LEVELS = ("", "low", "high")
 """What DAEMON_GEMINI_THINKING_LEVEL accepts: `low`, `high`, or empty to leave it
 to the model. A Gemini 3 knob; other providers ignore it."""
 
+GEMINI_LIVE_VOICES = frozenset({
+    "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede",
+    "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+    "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar",
+    "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
+    "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
+})
+"""Prebuilt Gemini Live voices. Native-audio models accept the full TTS voice set
+(ai.google.dev/gemini-api/docs/speech-generation). Kept here rather than imported
+from daemon/voice/*: importing the voice layer into config inverts the layering,
+the same reason SENSITIVITIES is duplicated."""
+
 SENSITIVITIES = ("low", "high")
 """What the two speech-sensitivity settings accept, plus empty for "the server
 decides".
@@ -289,6 +301,12 @@ class Settings(BaseSettings):
     the text and realtime endpoints do not take the same ids. Deliberately has no
     default - a guessed model id fails at the first voice turn, which is exactly
     the kind of late failure this module exists to prevent."""
+
+    gemini_live_voice: str = Field(default="", alias="DAEMON_GEMINI_LIVE_VOICE")
+    """Which prebuilt voice the Gemini Live session speaks in: one of
+    GEMINI_LIVE_VOICES, or empty to leave it to the server. Checked at construction,
+    not on the wire: an unknown name comes back as a 1007 close the session treats as
+    permanent, so a typo would end voice mode rather than fail the setting."""
 
     # --- how the server decides a turn ended (daemon/voice/gemini_live.py) ---
     # All four are empty or None by default, and that is not laziness: an omitted
@@ -755,6 +773,12 @@ class Settings(BaseSettings):
                     f"{env} is {chosen!r}; expected one of {', '.join(SENSITIVITIES)}, "
                     "or empty to leave it to the server"
                 )
+
+        if self.gemini_live_voice and self.gemini_live_voice not in GEMINI_LIVE_VOICES:
+            problems.append(
+                f"DAEMON_GEMINI_LIVE_VOICE is {self.gemini_live_voice!r}; expected one of "
+                "the Gemini Live voices, or empty to leave it to the server"
+            )
 
         if self.wake_enabled and not self.wake_aliases:
             problems.append(
