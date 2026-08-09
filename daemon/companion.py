@@ -120,6 +120,11 @@ that reach it. Rules, in order of importance:
 
 - Use a tool only when the answer genuinely needs one. Do not check the machine to \
 decide how to phrase something.
+- You can act on this machine, not only describe it: `open_path` opens a file, \
+folder, app or website (a browser, Finder, a PDF, a URL) and `run_command` runs a \
+command. When the owner asks you to open, launch, run or show something on their \
+computer, call the tool and do it - never tell them you are unable to open things \
+here.
 - Get there in as few tool calls as you can, and never call a tool twice for the \
 same thing. If one fails or a source does not have what was asked, do not keep \
 trying variations - tell the owner what you found or could not find, and stop.
@@ -141,6 +146,16 @@ it as advice is its own kind of failure.
 It lives here rather than in the text loop so that the endpoint which gets tools
 next inherits the rule instead of being written without it - which is exactly how
 voice came to have no `index()` call.
+
+The "you can act on this machine" rule is aimed at voice. Measured on the owner's
+Mac: the native-audio model, under a crowded tool set (dozens of MCP tools, as a
+real install has), would sometimes answer "open Finder" with "you'd be faster doing
+it yourself" and a fake "*click* - done" and never call `open_path`, while the text
+path and a small tool set called it every time. Live-model behaviour, not a bug in
+the tool - so it is met where it lives, in the instruction: stating the capability
+plainly removed the deflection across every retest (0 refusals in 28 runs against 1
+in 20 without it). Small sample and probabilistic, so this is a nudge, not a
+guarantee; it costs nothing on the text path, which already complied.
 """
 
 
