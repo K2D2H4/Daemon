@@ -161,6 +161,10 @@ def health_payload(state: Any, settings: Settings) -> dict[str, Any]:
         # leaves a daemon that answers Telegram normally and has simply stopped
         # hearing the room, with nothing anywhere saying so.
         "wake_gate": _wake_health(state),
+        # macOS: a wake gate can be "running" while the mic is denied, which
+        # reads as a quiet room. Naming the grant here is the difference between
+        # a diagnosable and an invisible failure (spec §6).
+        "mic": _mic_health(),
         # Same reasoning: an MCP server that failed to start leaves the model
         # with fewer tools and nothing else different, which is exactly the kind
         # of quiet degradation this endpoint exists to name.
@@ -333,6 +337,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.wake_task = asyncio.create_task(_rounds(wake_round), name="wake-gate")
     elif settings.wake_enabled:
         try:
+            await _claim_microphone(settings)
             # Built once here so an unavailable recognizer or a missing model is
             # reported at startup instead of five seconds into a retry loop that
             # looks like a quiet room.
@@ -1270,6 +1275,16 @@ def _wake_health(state: Any) -> str:
     return "stopped"
 
 
+def _mic_health() -> str:
+    """The microphone TCC decision, read (never prompted) at request time. `n/a`
+    off macOS, where there is no TCC gate."""
+    if sys.platform != "darwin":
+        return "n/a"
+    from daemon.voice.mic_access import microphone_authorization_status
+
+    return microphone_authorization_status()
+
+
 async def _wake_round(settings: Settings) -> None:
     """Listen until called, hold one spoken conversation, release the microphone.
 
@@ -1357,6 +1372,26 @@ async def _wake_forever(settings: Settings) -> None:
             await asyncio.sleep(WAKE_RETRY_SECONDS)
         else:
             await asyncio.sleep(0)  # yield, so a stream that ends instantly cannot pin the loop
+
+
+async def _claim_microphone(settings: Settings) -> None:
+    """macOS: claim the mic grant under the .app identity before PortAudio opens a
+    stream that would otherwise return silence (spec D1). Headless-and-granted this
+    is instant; ungranted it is the harmless no-op that only `daemon request-mic`
+    (foreground, under Daemon.app) can turn into a prompt. Off the event loop
+    because the runloop pump is blocking.
+    """
+    if sys.platform != "darwin":
+        return
+    from daemon.voice.mic_access import request_microphone_access
+
+    status = await asyncio.to_thread(request_microphone_access, timeout=2.0)
+    if status != "authorized":
+        logger.warning(
+            "wake gate: microphone not granted (%s); run `daemon install` and click "
+            "Allow so it can hear the wake word",
+            status,
+        )
 
 
 # --- the wake gate ------------------------------------------------------------

@@ -23,7 +23,7 @@ import pytest
 from conftest import FakeProvider
 
 from daemon import app as daemon_app
-from daemon import cli
+from daemon import cli, macapp
 from daemon.config import Route, Settings
 from daemon.fs import DIR_MODE
 from daemon.llm.gateway import LLMGateway
@@ -34,7 +34,7 @@ from daemon.memory.store import Store
 from daemon.memory.writer import FileMemoryWriter
 from daemon.persona.evolve import PersonaEvolution
 from daemon.reflection import Reflection, artifact_path
-from daemon.service import ServiceAction, ServiceStatus
+from daemon.service import RunResult, Service, ServiceAction, ServiceStatus
 from daemon.tasks import Task
 
 DAY = "2026-08-03"
@@ -115,7 +115,16 @@ class FakeService:
 @pytest.fixture
 def service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> FakeService:
     fake = FakeService(tmp_path / "ai.daemon.default.plist")
+    # `_uninstall` builds the service via `cli.service_for`; `_install` goes through
+    # the shared, .app-aware `daemon.macapp.build_resident_service`. Patch both so the
+    # generic dispatch tests never construct a real Service.
     monkeypatch.setattr(cli, "service_for", lambda settings: fake)
+    monkeypatch.setattr("daemon.macapp.build_resident_service", lambda settings: fake)
+    # Pin the platform so the test is deterministic on every dev machine and never
+    # takes the real `.app`/launchctl/mic path - and, for uninstall, never rmtrees a
+    # developer's real ~/Applications/Daemon.app (tests/CLAUDE.md: no test may touch
+    # a microphone, and none may delete real user files).
+    monkeypatch.setattr(cli.sys, "platform", "linux")
     return fake
 
 
@@ -530,6 +539,111 @@ def test_uninstall_calls_uninstall(service: FakeService) -> None:
     assert service.calls == [("uninstall", None)]
 
 
+def test_macos_program_puts_launcher_first_then_daemon_argv() -> None:
+    program = macapp.macos_program(
+        Path("/Users/x/Applications/Daemon.app/Contents/MacOS/launcher"),
+        ("/Users/x/.local/bin/daemon", "run"),
+    )
+    assert program == (
+        "/Users/x/Applications/Daemon.app/Contents/MacOS/launcher",
+        "/Users/x/.local/bin/daemon",
+        "run",
+    )
+
+
+def test_macos_install_writes_launcher_first_in_the_plist(tmp_path: Path) -> None:
+    """The load-bearing wiring: launchd must exec Daemon.app's launcher (argv[0]),
+    which then execs the daemon path with `run` - in that order, or a real machine
+    starts the wrong thing (or nothing). Proven on a real plist on disk, not a mock
+    of launchctl/codesign/open (tests/CLAUDE.md: a test that passes for the wrong
+    reason is worse than none).
+    """
+    launcher = tmp_path / "Applications" / "Daemon.app" / "Contents" / "MacOS" / "launcher"
+    daemon_path = "/x/.local/bin/daemon"
+    program = macapp.macos_program(launcher, (daemon_path, "run"))
+
+    def fake_runner(command: object) -> RunResult:
+        return RunResult(0)
+
+    svc = Service(
+        label="default",
+        working_dir=tmp_path,
+        log_dir=tmp_path,
+        program=program,
+        home=tmp_path,
+        platform="darwin",
+        runner=fake_runner,
+    )
+    svc.install()
+
+    plist_path = tmp_path / "Library" / "LaunchAgents" / f"{svc.label}.plist"
+    written = plist_path.read_text(encoding="utf-8")
+
+    launcher_index = written.index(str(launcher))
+    daemon_index = written.index(daemon_path)
+    run_index = written.index("<string>run</string>")
+    assert launcher_index < daemon_index < run_index
+
+
+def test_grant_open_argv_keeps_only_the_console_script_path() -> None:
+    """default_program()'s console-script shape: (daemon, "run")."""
+    argv = macapp.grant_open_argv(Path("/A/Daemon.app"), ("/x/daemon", "run"))
+
+    assert argv[-3:] == ["--args", "/x/daemon", "request-mic"]
+    assert "run" not in argv
+
+
+def test_grant_open_argv_keeps_the_module_prefix_for_a_checkout() -> None:
+    """default_program()'s checkout-fallback shape: (python, "-m", "daemon.cli",
+    "run") - the bug this covers: the old code took only daemon_argv[0] (the
+    python executable) and dropped `-m daemon.cli`, so the launcher execed
+    `python request-mic`, which fails silently and never pops the prompt.
+    """
+    argv = macapp.grant_open_argv(
+        Path("/A/Daemon.app"), ("/usr/bin/python3", "-m", "daemon.cli", "run")
+    )
+
+    assert argv[-5:] == ["--args", "/usr/bin/python3", "-m", "daemon.cli", "request-mic"]
+    assert "run" not in argv
+
+
+def test_install_reports_a_codesign_failure_instead_of_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """build_bundle raises a bare RuntimeError on a codesign failure. It is a
+    RuntimeError subclass of ServiceError's own base, so `except ServiceError` in
+    main() would NOT catch it - it must be handled inside `_install` itself, before
+    any Service is constructed (no launchctl/codesign/open is reached).
+    """
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+
+    def fail(app_path: Path) -> Path:
+        raise RuntimeError("codesign failed: errSecInternalComponent")
+
+    monkeypatch.setattr("daemon.macapp.build_bundle", fail)
+
+    settings = Settings()
+    assert cli._install(settings, force=False) == 1
+    assert "daemon:" in capsys.readouterr().err
+
+
+def test_install_reports_missing_codesign_instead_of_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FileNotFoundError (an OSError) is what a subprocess call raises when
+    `codesign` is not on PATH at all - an Xcode-less acceptance Mac."""
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+
+    def fail(app_path: Path) -> Path:
+        raise FileNotFoundError("codesign")
+
+    monkeypatch.setattr("daemon.macapp.build_bundle", fail)
+
+    settings = Settings()
+    assert cli._install(settings, force=False) == 1
+    assert "daemon:" in capsys.readouterr().err
+
+
 def test_status_calls_status(service: FakeService, capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["status"]) == 0
     assert service.calls == [("status", None)]
@@ -568,6 +682,23 @@ def test_an_unknown_command_is_a_usage_error() -> None:
         cli.main(["dance"])
 
     assert exit_info.value.code == 2
+
+
+def test_request_mic_reports_status_and_exit_code(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import daemon.cli as cli
+
+    monkeypatch.setattr(
+        "daemon.voice.mic_access.request_microphone_access", lambda **_: "authorized"
+    )
+    assert cli.main(["request-mic"]) == 0
+    assert "authorized" in capsys.readouterr().out
+
+    monkeypatch.setattr(
+        "daemon.voice.mic_access.request_microphone_access", lambda **_: "denied"
+    )
+    assert cli.main(["request-mic"]) == 1
 
 
 def test_a_broken_config_stops_a_command_that_needs_it(

@@ -3533,6 +3533,40 @@ def test_residency_is_offered_and_a_yes_installs_and_reports_awake(tmp_path: Pat
     assert "awake" in out or "running and answering" in out
 
 
+def test_residency_on_macos_pops_the_mic_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unification: `daemon setup`'s residency finish, on macOS, installs the
+    resident AND pops the one-time mic prompt under Daemon.app's identity - the same
+    .app path `daemon install` takes, via the shared macapp.grant_after_install.
+    Proven without a real .app: the injected service carries the launcher program,
+    and grant_microphone_once is stubbed, so no AVFoundation and no `open` run.
+    """
+    from daemon import macapp
+
+    monkeypatch.setattr(macapp.sys, "platform", "darwin")
+    launcher = str(macapp.APP_DIR / "Contents" / "MacOS" / "launcher")
+    granted: list[tuple[Path, tuple[str, ...]]] = []
+    monkeypatch.setattr(
+        macapp, "grant_microphone_once", lambda lp, argv: granted.append((lp, argv))
+    )
+
+    service = residency_service(tmp_path, running=[True])
+    service.program = (launcher, "/x/daemon", "run")  # what build_resident_service makes
+
+    result = drive(
+        tmp_path,
+        [*TOKEN_TO_RESIDENCY, "y"],
+        tty=True,
+        service_factory=lambda settings: service,
+        checks=replace(working_checks(), health=healthy),
+    )
+
+    assert result.code == 0
+    assert service.installs == 1
+    assert granted == [(Path(launcher), ("/x/daemon", "run"))]
+
+
 def test_a_no_at_the_residency_question_installs_nothing_and_leaves_a_hint(
     tmp_path: Path,
 ) -> None:
