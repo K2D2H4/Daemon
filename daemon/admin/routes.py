@@ -462,12 +462,18 @@ async def mcp_oauth_start(request: Request) -> JSONResponse:
 
 
 CALLBACK_PAGE = """<!doctype html><meta charset="utf-8">
-<title>Daemon — {title}</title>
+<title>Daemon — {title}</title>{extra}
 <style>body{{font-family:ui-monospace,Menlo,monospace;background:#120F18;color:#ECE7F5;
 display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}}
 .box{{max-width:32rem;padding:2rem;text-align:center}}
-h1{{color:#A78BFA;font-size:1rem;letter-spacing:.05em}}p{{color:#8E85A3}}</style>
+h1{{color:#A78BFA;font-size:1rem;letter-spacing:.05em}}p{{color:#8E85A3}}
+a{{color:#A78BFA}}</style>
 <div class="box"><h1>{heading}</h1><p>{message}</p></div>"""
+
+# On success the browser is on this page in the tab the OAuth provider redirected;
+# send it straight back to the admin's MCP tab rather than leaving the owner to
+# close the tab by hand. A meta refresh (not JS) so it works with scripts disabled.
+_RETURN_TO_ADMIN = '\n<meta http-equiv="refresh" content="1.5;url=/admin/#mcp">'
 
 
 @router.get("/api/mcp/oauth/callback", response_class=HTMLResponse)
@@ -482,6 +488,7 @@ async def mcp_oauth_callback(
     if not request.app.state.settings.mcp_enabled:
         return HTMLResponse(
             CALLBACK_PAGE.format(
+                extra="",
                 title="MCP off",
                 heading="MCP is off",
                 message="Enable DAEMON_MCP_ENABLED and try again.",
@@ -490,6 +497,7 @@ async def mcp_oauth_callback(
     if not code or not state:
         return HTMLResponse(
             CALLBACK_PAGE.format(
+                extra="",
                 title="authorization failed",
                 heading="Authorization failed",
                 message="The provider returned no code. Nothing was connected.",
@@ -500,6 +508,7 @@ async def mcp_oauth_callback(
     except OAuthError as exc:
         return HTMLResponse(
             CALLBACK_PAGE.format(
+                extra="",
                 title="authorization failed",
                 heading="Authorization failed",
                 message=str(exc),
@@ -507,8 +516,9 @@ async def mcp_oauth_callback(
         )
     return HTMLResponse(
         CALLBACK_PAGE.format(
+            extra=_RETURN_TO_ADMIN,
             title="connected",
             heading=f"{name} connected",
-            message="You can close this tab and return to the Daemon admin.",
+            message='Returning to the admin… <a href="/admin/#mcp">go now</a>.',
         )
     )
