@@ -8,7 +8,7 @@ LaunchAgent on the developer's machine is a test suite nobody runs twice.
 from __future__ import annotations
 
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -53,6 +53,7 @@ def make_service(
     platform: str = "darwin",
     label: str = "default",
     runner: FakeRunner | None = None,
+    sleep: Callable[[float], None] = lambda _seconds: None,
 ) -> Service:
     working = tmp_path / "project"
     working.mkdir(exist_ok=True)
@@ -65,6 +66,7 @@ def make_service(
         platform=platform,
         uid=501,
         runner=runner or FakeRunner(),
+        sleep=sleep,  # never really sleep in tests (the bootout settle-poll)
     )
 
 
@@ -326,7 +328,8 @@ def test_a_changed_definition_is_reported_instead_of_overwritten(tmp_path: Path)
 
 
 def test_force_boots_the_old_job_out_before_replacing_it(tmp_path: Path) -> None:
-    runner = FakeRunner()
+    # `print` answers 113 (gone), so the post-bootout settle-poll returns at once.
+    runner = FakeRunner({"print": RunResult(113, stderr=NO_SUCH_SERVICE)})
     service = make_service(tmp_path, runner=runner)
     service.install()
     service.unit_path.write_text("<plist>hand edited</plist>")
@@ -338,8 +341,63 @@ def test_force_boots_the_old_job_out_before_replacing_it(tmp_path: Path) -> None
     assert service.unit_path.read_text() == service.render()
     assert runner.commands == [
         ("launchctl", "bootout", "gui/501/ai.daemon.default"),
+        # The settle-poll: confirm the label has left the domain before bootstrapping.
+        ("launchctl", "print", "gui/501/ai.daemon.default"),
         ("launchctl", "bootstrap", "gui/501", str(service.unit_path)),
     ]
+
+
+def test_force_waits_for_the_bootout_to_settle_before_bootstrapping(tmp_path: Path) -> None:
+    """The reinstall race, modelled. `bootout` is async, so the old job lingers in
+    the domain for a few `print` polls; a `bootstrap` that lands while it lingers
+    fails with EIO and loads nothing, and `_is_loaded` then sees the dying job and
+    reports success - the exact false-positive measured twice on the owner's Mac
+    (`daemon install --force` printed "installed" and left the service unloaded).
+    install() must wait until the label is gone before bootstrapping.
+    """
+
+    class Racy:
+        """Old job lingers for `linger` print polls after bootout; a bootstrap that
+        lands while it lingers fails and loads nothing."""
+
+        def __init__(self, linger: int) -> None:
+            self.commands: list[tuple[str, ...]] = []
+            self._linger = linger
+            self._old_present = True
+            self.new_loaded = False
+
+        def __call__(self, command: Sequence[str]) -> RunResult:
+            self.commands.append(tuple(command))
+            joined = " ".join(command)
+            if "bootout" in joined:
+                return RunResult(0)  # teardown starts; the old job still lingers
+            if "print" in joined:
+                if self._old_present and self._linger <= 0:
+                    self._old_present = False
+                elif self._old_present:
+                    self._linger -= 1
+                loaded = self._old_present or self.new_loaded
+                return RunResult(0) if loaded else RunResult(113, stderr=NO_SUCH_SERVICE)
+            if "bootstrap" in joined:
+                if self._old_present:
+                    return RunResult(5, stderr=BOOTSTRAP_EIO)  # races the teardown
+                self.new_loaded = True
+                return RunResult(0)
+            return RunResult(0)
+
+    runner = Racy(linger=2)
+    service = make_service(tmp_path, runner=runner)
+    # A differing plist so install(force=True) takes the unload -> load path.
+    service.unit_path.parent.mkdir(parents=True, exist_ok=True)
+    service.unit_path.write_text("<plist>hand edited</plist>", encoding="utf-8")
+
+    action = service.install(force=True)
+
+    assert action.applied
+    # Without the settle-wait the bootstrap races the teardown, hits EIO, and loads
+    # nothing while `_is_loaded` sees the dying job - so `new_loaded` stays False.
+    # The wait is exactly what makes this True.
+    assert runner.new_loaded, "the service must actually end up loaded, not just reported so"
 
 
 # --- uninstall ---------------------------------------------------------------

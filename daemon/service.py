@@ -30,6 +30,7 @@ import difflib
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +48,15 @@ THROTTLE_SECONDS = 30
 """Minimum seconds between restarts. launchd's default of 10 turns a bad API key
 into a crash loop that spins all day; 30 still recovers from a real crash fast
 enough that a proactive tick is not missed."""
+
+BOOTOUT_SETTLE_ATTEMPTS = 25
+BOOTOUT_SETTLE_INTERVAL = 0.2
+"""How long `install --force` waits for a bootout to finish before it bootstraps.
+`launchctl bootout` is asynchronous - the old process gets SIGTERM and lingers in
+the domain for a moment. Bootstrapping into that window fails with EIO and loads
+nothing, while `_is_loaded` sees the dying job and reports success (measured twice
+on the owner's Mac: install printed "installed" and left the service unloaded). Up
+to 5s of polling closes the race - see `_await_unloaded`."""
 
 LINGER_NOTE = (
     "systemd user services stop at logout unless lingering is on. "
@@ -131,6 +141,7 @@ class Service:
         platform: str = sys.platform,
         uid: int | None = None,
         runner: Runner = subprocess_runner,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not SERVICE_LABEL_RE.match(label):
             raise ServiceError(
@@ -150,6 +161,7 @@ class Service:
         self._platform = platform
         self._uid = os.getuid() if uid is None else uid
         self._run = runner
+        self._sleep = sleep
 
     # --- paths --------------------------------------------------------------
 
@@ -307,6 +319,11 @@ WantedBy=default.target
             # A changed definition has to be unloaded first; launchd keeps the old
             # one in memory otherwise and the edit appears to do nothing.
             commands += self._unload()
+            if self._platform == DARWIN:
+                # bootout is async - wait for the job to actually leave the domain
+                # before the bootstrap below, or the two race and the service is left
+                # unloaded while the install reports success (see `_await_unloaded`).
+                self._await_unloaded()
 
         path.parent.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
         self._prepare_logs()
@@ -437,6 +454,26 @@ WantedBy=default.target
         """Does launchd have this job? Exit 0 from `print` is the whole answer; the
         alternative is 113 and `Could not find service ...`."""
         return self._run(self._print_command()).returncode == 0
+
+    def _await_unloaded(self) -> None:
+        """Block until launchd has actually removed the job, after a bootout.
+
+        `bootout` returns before the teardown finishes: the old process is still
+        getting SIGTERM. A `bootstrap` fired into that window fails with EIO (exit 5,
+        byte-for-byte what "already loaded" returns), and `_load`'s fallback then
+        asks `_is_loaded`, which sees the *dying* job and answers True - so the
+        install reports success while nothing ends up running. Measured twice on the
+        owner's Mac: `daemon install --force` printed "installed" and left
+        `launchctl print` returning 113. Waiting for the label to leave the domain
+        before the bootstrap is the fix.
+
+        If the budget runs out with the job still present, this returns anyway rather
+        than raise: `_load`'s own check surfaces the real failure if the bootstrap
+        then does not take."""
+        for _ in range(BOOTOUT_SETTLE_ATTEMPTS):
+            if not self._is_loaded():
+                return
+            self._sleep(BOOTOUT_SETTLE_INTERVAL)
 
     def _check(self, command: Sequence[str], *, allow: str | None = None) -> RunResult:
         result = self._run(command)

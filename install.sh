@@ -57,11 +57,21 @@ fi
 #    `daemon` command in. --python 3.13 pulls a managed CPython if the host has
 #    none; --force makes a re-run an upgrade rather than a no-op.
 say "Installing ${PACKAGE} @ ${ref} ..."
+# macOS: force a uv-managed (non-.app) CPython. The python.org framework build is
+# itself a `Python.app` bundle, and when Daemon.app's launcher execs into it macOS
+# attributes the microphone (TCC) grant to Python.app instead of Daemon.app - so the
+# headless wake gate is silently denied the mic even after the grant is given
+# (measured on the owner's Mac). A managed standalone python is a plain binary and
+# keeps the Daemon.app identity. `daemon update` forces the same, so they do not drift.
+PYPREF=""
+if [ "$(uname -s)" = "Darwin" ]; then
+  PYPREF="--python-preference only-managed"
+fi
 # The `[mcp]` extra is included because MCP defaults on: without it the admin's MCP
 # tab shows but every connect fails "No module named 'mcp'". `daemon update` installs
 # the same spec, so an update does not drop it. (The extra pins mcp<2 - the v2 client
 # surface is incompatible - so this stays on the working 1.x.)
-uv tool install --force --python 3.13 \
+uv tool install --force --python 3.13 ${PYPREF} \
   "${PACKAGE}[mcp] @ https://github.com/${REPO}/archive/${ref}.tar.gz"
 
 # Put uv's tool bin dir on PATH - for the version check below, and, persistently,
