@@ -382,9 +382,15 @@ async function connectServer(name,secret){
 async function oauthConnect(name){
   mcpNote('Starting OAuth for '+name+'…',true);
   try{const r=await api('/admin/api/mcp/oauth/start',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name})});
-    // The provider's page finishes at our own callback route, which tells the user
-    // to return here; a poll picks the new connection up.
-    window.location.href=r.authorize_url;
+    if(r.authorize_url){
+      // The provider's page finishes at our own callback route, which tells the user
+      // to return here; a poll picks the new connection up.
+      window.location.href=r.authorize_url;
+      return;
+    }
+    // No authorize URL: the provider connected straight away with a stored token, so
+    // there is no browser step - just show it connected and refresh the list.
+    mcpNote(name+' connected.',true);await loadMcp();
   }catch(e){mcpNote(e.message,false);}
 }
 async function removeServer(name){

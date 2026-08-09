@@ -179,6 +179,102 @@ async def test_disconnecting_an_unknown_server_is_a_noop() -> None:
     await bridge.disconnect_server("never-connected")  # must not raise
 
 
+async def test_is_connected_tracks_live_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/servers` reads `is_connected`, so it must follow the live session, not
+    `failures`: false before the connect, true after, false again after disconnect."""
+    bridge, _ = await _started_bridge(monkeypatch, {"notes": Session([RemoteTool("read")])})
+    assert not bridge.is_connected("notes")
+    await bridge.connect_server(ServerConfig(name="notes", command="x"))
+    assert bridge.is_connected("notes")
+    assert bridge.connected_names() == ("notes",)
+    await bridge.disconnect_server("notes")
+    assert not bridge.is_connected("notes")
+
+
+# --- oauth servers reconnect at startup through the provider factory ---------
+
+
+async def test_startup_reconnects_an_oauth_server_with_its_stored_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persisted auth="oauth" server must reconnect at startup through its stored
+    token, with no browser step: the factory builds the non-interactive provider, and
+    the bridge hands it to `_connect` as `auth=`. A valid token connects silently."""
+    sentinel = object()
+    seen: dict[str, Any] = {}
+
+    def factory(config: ServerConfig) -> Any:
+        seen["config"] = config
+        return sentinel
+
+    bridge = McpBridge(
+        [ServerConfig(name="notion", url="https://mcp.notion.com/mcp", auth="oauth")],
+        oauth_provider_factory=factory,
+    )
+
+    async def connect(config: ServerConfig, *, secret: Any = None, auth: Any = None) -> Any:
+        seen["auth"] = auth
+        return Session([RemoteTool("search")])
+
+    monkeypatch.setattr(bridge, "_connect", connect)
+    registry = Registry()
+    landed = await bridge.start(registry)
+
+    assert landed == 1
+    assert seen["config"].name == "notion"  # the factory was consulted for the oauth server
+    assert seen["auth"] is sentinel  # its provider reached the transport as auth=
+    assert bridge.is_connected("notion")  # a live session, no browser step
+    assert "notion" not in bridge.failures
+
+
+async def test_startup_oauth_reconnect_without_a_valid_token_fails_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing or expired-unrefreshable token makes the non-interactive provider's
+    redirect handler raise; the connect must degrade to configured-but-not-connected,
+    never a hang or a raise out of `start`."""
+    bridge = McpBridge(
+        [ServerConfig(name="notion", url="https://mcp.notion.com/mcp", auth="oauth")],
+        oauth_provider_factory=lambda config: object(),
+    )
+
+    async def connect(config: ServerConfig, *, secret: Any = None, auth: Any = None) -> Any:
+        raise ToolError("notion: reauthorize it in the admin")
+
+    monkeypatch.setattr(bridge, "_connect", connect)
+    landed = await bridge.start(Registry())  # must not raise
+
+    assert landed == 0
+    assert not bridge.is_connected("notion")
+    assert "notion" in bridge.failures
+    assert "reauthorize" in bridge.failures["notion"]
+
+
+async def test_a_non_oauth_server_never_consults_the_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The factory fires only for auth="oauth"; a plain url or stdio server connects
+    with auth=None exactly as before, so the seam cannot change their behaviour."""
+    calls: list[ServerConfig] = []
+    bridge = McpBridge(
+        [ServerConfig(name="fetch", command="uvx", args=("mcp-server-fetch",))],
+        oauth_provider_factory=lambda config: calls.append(config) or object(),
+    )
+    seen: dict[str, Any] = {}
+
+    async def connect(config: ServerConfig, *, secret: Any = None, auth: Any = None) -> Any:
+        seen["auth"] = auth
+        return Session([RemoteTool("fetch")])
+
+    monkeypatch.setattr(bridge, "_connect", connect)
+    await bridge.start(Registry())
+
+    assert calls == []  # factory untouched for a non-oauth server
+    assert seen["auth"] is None
+
+
 # --- per-server exit stacks close independently -----------------------------
 
 

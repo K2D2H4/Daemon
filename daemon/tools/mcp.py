@@ -75,6 +75,13 @@ class ServerConfig:
     value. The value lives in `.env` (0600); `mcp.json` stores only the name, so the
     config file stays shareable. At connect time it becomes one child env var for a
     stdio server or an `Authorization: Bearer` header for a url one."""
+    auth: str = ""
+    """How the server authenticates: `""` (or `"none"`) is unauthenticated, `"key"`
+    is a bearer/env secret, `"oauth"` means tokens live under `mcp_tokens/`. Only
+    `"oauth"` changes connect behaviour: at startup an oauth server reconnects with
+    its stored token through the `oauth_provider_factory` (no browser). Persisted so a
+    restart knows which servers to reconnect that way rather than treating them as
+    plain url servers with no bearer and getting a 401."""
 
     @property
     def is_remote(self) -> bool:
@@ -146,6 +153,7 @@ def load_config(data_dir: Path) -> McpConfig:
                 url=url,
                 safe=frozenset(str(s) for s in block.get("safe", ()) or ()),
                 key_env=str(block.get("key_env", "") or ""),
+                auth=str(block.get("auth", "") or ""),
             )
         )
     return McpConfig(configs, rejected)
@@ -278,6 +286,7 @@ def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
         args=args,
         url=entry.url,
         key_env=entry.key_env or "",
+        auth=entry.auth,
     )
 
 
@@ -296,6 +305,10 @@ def _block_of(config: ServerConfig) -> dict[str, Any]:
         block["safe"] = sorted(config.safe)
     if config.key_env:
         block["key_env"] = config.key_env
+    if config.auth:
+        # Persisted so a restart reconnects an oauth server through its stored token
+        # rather than treating a bearer-less url server as unauthenticated.
+        block["auth"] = config.auth
     return block
 
 
@@ -476,11 +489,23 @@ class McpBridge:
     `self._lock`.
     """
 
-    def __init__(self, config: McpConfig | list[ServerConfig]) -> None:
+    def __init__(
+        self,
+        config: McpConfig | list[ServerConfig],
+        *,
+        oauth_provider_factory: Any = None,
+    ) -> None:
         # A bare list is accepted so a test can build a bridge from one server
         # without also stating that nothing was rejected.
         resolved = McpConfig(config, {}) if isinstance(config, list) else config
         self._configs = resolved.servers
+        self._oauth_provider_factory = oauth_provider_factory
+        """Builds a non-interactive OAuth provider for an `auth="oauth"` server at
+        connect time. Passed in by `app.py:_build_tools` (the one place allowed to
+        import `daemon/admin`), so this module never imports the admin layer
+        (CONTRACTS 4). None outside the assembled app - a test that needs the seam
+        supplies its own, and a bridge without one simply cannot reconnect oauth
+        servers, which is the honest degradation, not a crash."""
         self._stacks: dict[str, AsyncExitStack] = {}
         self._connections: dict[str, _ServerLink] = {}
         """Server name -> the task that owns its transport, so the same task that
@@ -561,6 +586,17 @@ class McpBridge:
             await self._teardown(name)
             self.failures.pop(name, None)
 
+    def is_connected(self, name: str) -> bool:
+        """Whether this server has a live session right now - the ground truth for
+        `/servers`, which used to infer "connected" from "not in failures" and so
+        showed a persisted-but-never-connected server as green (a server present in
+        `mcp.json` that no connect ever succeeded for is in neither dict)."""
+        return name in self._sessions
+
+    def connected_names(self) -> tuple[str, ...]:
+        """The servers with a live session, for callers that want the whole set."""
+        return tuple(self._sessions)
+
     async def _bring_up(
         self,
         config: ServerConfig,
@@ -569,6 +605,16 @@ class McpBridge:
         secret: str | None = None,
         auth: Any = None,
     ) -> int:
+        # An oauth server reconnects with its stored token: build the non-interactive
+        # provider here (never at import - the factory is app.py's, which is the only
+        # file allowed to reach `daemon/admin`). `auth` is already set on the
+        # interactive admin path (start_oauth_flow passes its own provider), so this
+        # only fires for a startup reconnect. A valid stored token connects silently;
+        # a missing/expired one makes the provider's redirect handler raise, and this
+        # connect then fails gracefully into `failures` rather than blocking on a
+        # browser step that startup has no way to perform.
+        if auth is None and config.auth == "oauth" and self._oauth_provider_factory is not None:
+            auth = self._oauth_provider_factory(config)
         # The transport is opened in a dedicated task that will also close it, so
         # anyio's "exit the cancel scope in the task that entered it" rule holds even
         # when the later disconnect comes from a different request task. See
