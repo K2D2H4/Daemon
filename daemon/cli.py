@@ -432,6 +432,28 @@ def _run(cmd: list[str]) -> int:
     return subprocess.run(cmd, check=False).returncode
 
 
+def _update_install_command(source: str) -> list[str]:
+    """The `uv tool install` argv `daemon update` runs. Kept in step with install.sh.
+
+    On macOS it forces a uv-managed (non-`.app`) CPython. The python.org framework
+    build is itself a `Python.app` bundle, and when Daemon.app's launcher execs into
+    it, macOS attributes the microphone (TCC) grant to Python.app instead of
+    Daemon.app - so the headless wake gate is silently denied the mic even though
+    the grant was given (measured on the owner's Mac). A managed standalone python is
+    a plain binary and keeps the Daemon.app identity. `--python 3.13` alone would let
+    uv pick the framework build if it is present, which is exactly what broke.
+
+    One requirement string, not `--from <url> <name>`: uv rejects extras on the
+    positional when `--from` is also given, so the extra rides a PEP 508 direct
+    reference - `daemon-ai[mcp] @ <url>`.
+    """
+    command = ["uv", "tool", "install", "--force", "--python", "3.13"]
+    if sys.platform == "darwin":
+        command += ["--python-preference", "only-managed"]
+    command.append(f"{INSTALL_SPEC} @ {source}")
+    return command
+
+
 def _update() -> int:
     """Reinstall the latest release through uv - the same tarball the one-liner
     installs, so the two cannot drift. Not available to a source/pip install, which
@@ -450,12 +472,7 @@ def _update() -> int:
     ref = os.environ.get("DAEMON_VERSION") or _latest_ref()
     source = f"https://github.com/{GITHUB_REPO}/archive/{ref}.tar.gz"
     print(f"updating to {ref} ...")
-    # One requirement string, not `--from <url> <name>`: uv rejects extras on the
-    # positional when `--from` is also given ("conflicts with install request"), so
-    # the extra rides a PEP 508 direct reference - `daemon-ai[mcp] @ <url>`.
-    install = [
-        "uv", "tool", "install", "--force", "--python", "3.13", f"{INSTALL_SPEC} @ {source}"
-    ]
+    install = _update_install_command(source)
     if _run(install) != 0:
         print("update failed - the install output above says why.")
         return PROBLEM

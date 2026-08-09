@@ -523,6 +523,27 @@ def test_run_is_quiet_when_the_environment_agrees(
     assert "overrides" not in caplog.text
 
 
+def test_update_install_command_forces_managed_python_on_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """macOS: the framework Python.app breaks the headless mic grant, so `daemon
+    update` must force a uv-managed (non-.app) CPython - see the helper's docstring."""
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    cmd = cli._update_install_command("https://github.com/x/archive/v1.tar.gz")
+    assert "--python-preference" in cmd
+    assert cmd[cmd.index("--python-preference") + 1] == "only-managed"
+    assert cmd[-1] == "daemon-ai[mcp] @ https://github.com/x/archive/v1.tar.gz"
+
+
+def test_update_install_command_leaves_python_selection_alone_off_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    cmd = cli._update_install_command("https://github.com/x/archive/v1.tar.gz")
+    assert "--python-preference" not in cmd and "only-managed" not in cmd
+    assert cmd[-1] == "daemon-ai[mcp] @ https://github.com/x/archive/v1.tar.gz"
+
+
 def test_install_calls_install(service: FakeService) -> None:
     assert cli.main(["install"]) == 0
     assert service.calls == [("install", False)]

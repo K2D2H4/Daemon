@@ -20,7 +20,9 @@ VOICE_PACKAGES = (
     "pyobjc-framework-AVFoundation",
 )
 
-PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PYPROJECT = REPO_ROOT / "pyproject.toml"
+INSTALL_SH = REPO_ROOT / "install.sh"
 
 
 def _core_deps() -> list[str]:
@@ -41,3 +43,14 @@ def test_voice_stack_is_a_default_macos_dependency() -> None:
 def test_voice_extra_still_exists_for_linux() -> None:
     data = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
     assert "voice" in data["project"]["optional-dependencies"]
+
+
+def test_installer_forces_a_managed_python_on_macos() -> None:
+    """The python.org framework build is a `Python.app` bundle; the .app launcher
+    exec'ing into it makes macOS attribute the mic grant to Python.app, not
+    Daemon.app, so the headless wake gate is denied the mic (measured live). install.sh
+    must force a uv-managed (non-.app) python on macOS - and `daemon update` matches it
+    (tested in test_cli.py::test_update_install_command_forces_managed_python_on_macos)."""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "only-managed" in text, "install.sh must force a uv-managed python on macOS"
+    assert "Darwin" in text, "the managed-python forcing must be gated to macOS"
