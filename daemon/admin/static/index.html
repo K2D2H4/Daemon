@@ -86,8 +86,9 @@ section.on>*:nth-child(4){animation-delay:.15s}
 .mini{width:44px;height:44px;flex:none;image-rendering:pixelated}
 .mini svg{width:100%;height:100%;display:block;shape-rendering:crispEdges}
 .mini.go{animation:bob 1s ease-in-out infinite}
-label.field{display:block;margin:0 0 16px}
-label.field .n{display:block;font-family:var(--pix);font-size:10px;letter-spacing:1px;color:var(--tm);margin-bottom:7px}
+.field{display:block;margin:0 0 16px}
+.field .n{display:block;font-family:var(--pix);font-size:10px;letter-spacing:1px;color:var(--tm);margin-bottom:7px}
+.voice-preview{display:flex;align-items:center;gap:10px;margin-top:10px}
 input[type=text],input[type=number],input[type=password],select,textarea{
 width:100%;font:inherit;color:var(--tb);background:var(--well);border:2px solid var(--line);
 padding:11px 12px;box-shadow:inset 2px 2px 0 0 #08060C}
@@ -266,32 +267,35 @@ function fieldStr(name,val,opts){
   return `<label class="field"><span class="n">${name}</span><input type="text" data-f="${name}" value="${esc(val??'')}"></label>`;
 }
 function fieldBool(name,val){return `<label class="field"><span class="n">${name}</span><select data-f="${name}"><option value="true" ${val?'selected':''}>true</option><option value="false" ${!val?'selected':''}>false</option></select></label>`;}
-function fieldVoicePreview(){return `<div class="field"><span class="n">preview</span><button type="button" class="btn" id="voice-play" aria-label="Preview the selected voice">▶</button><span class="muted" id="voice-preview-msg"></span><audio id="voice-sample" hidden></audio></div>`;}
+function fieldGeminiVoice(val,opts){const o=opts.map(x=>`<option ${x===val?'selected':''}>${esc(x)}</option>`).join('');
+  return `<div class="field"><span class="n">gemini_live_voice</span><select data-f="gemini_live_voice">${o}</select><div class="voice-preview"><button type="button" class="btn" id="voice-play" aria-label="Preview the selected voice">▶ preview</button><span class="muted" id="voice-preview-msg"></span></div><audio id="voice-sample" hidden></audio></div>`;}
 function fieldNum(name,val){return `<label class="field"><span class="n">${name}</span><input type="number" step="any" data-f="${name}" value="${esc(val)}"></label>`;}
 function fieldSecret(name,val){const set=val==='set';return `<label class="field"><span class="n">${name} ${set?'· set':'· unset'}</span><input type="password" data-f="${name}" placeholder="${set?'leave blank to keep':'not set'}"></label>`;}
+function renderSettings(){
+  const e=SETTINGS.editable,o=SETTINGS.options,r=SETTINGS.readonly;
+  let h='<div class="grid">';
+  h+=fieldStr('preset',e.preset,o.presets);
+  h+=fieldStr('hosted_provider',e.hosted_provider,['',...o.hosted_providers]);
+  h+=fieldStr('tools_mode',e.tools_mode,o.tool_modes);
+  h+=fieldBool('voice_enabled',e.voice_enabled);
+  h+=fieldGeminiVoice(e.gemini_live_voice,o.gemini_live_voices);
+  h+=fieldBool('mcp_enabled',e.mcp_enabled);
+  h+=fieldBool('browser_enabled',e.browser_enabled);
+  h+=fieldNum('recall_limit',e.recall_limit);
+  h+=fieldNum('recall_half_life_days',e.recall_half_life_days);
+  h+=fieldSecret('anthropic_api_key',e.anthropic_api_key);
+  h+=fieldSecret('openai_api_key',e.openai_api_key);
+  h+=fieldSecret('gemini_api_key',e.gemini_api_key);
+  h+='</div>';
+  h+=`<div style="margin-top:20px"><span class="lab">READ-ONLY</span>
+    <div class="kv"><span class="k">host</span><span class="v">${esc(r.host)}</span></div>
+    <div class="kv"><span class="k">port</span><span class="v">${esc(r.port)}</span></div>
+    <div class="kv"><span class="k">data_dir</span><span class="v">${esc(r.data_dir)}</span></div></div>`;
+  $('#settings-form').innerHTML=h;
+}
 async function loadSettings(){
-  try{SETTINGS=await api('/admin/api/settings');const e=SETTINGS.editable,o=SETTINGS.options,r=SETTINGS.readonly;
-    let h='<div class="grid">';
-    h+=fieldStr('preset',e.preset,o.presets);
-    h+=fieldStr('hosted_provider',e.hosted_provider,['',...o.hosted_providers]);
-    h+=fieldStr('tools_mode',e.tools_mode,o.tool_modes);
-    h+=fieldBool('voice_enabled',e.voice_enabled);
-    h+=fieldStr('gemini_live_voice',e.gemini_live_voice,o.gemini_live_voices);
-    h+=fieldVoicePreview();
-    h+=fieldBool('mcp_enabled',e.mcp_enabled);
-    h+=fieldBool('browser_enabled',e.browser_enabled);
-    h+=fieldNum('recall_limit',e.recall_limit);
-    h+=fieldNum('recall_half_life_days',e.recall_half_life_days);
-    h+=fieldSecret('anthropic_api_key',e.anthropic_api_key);
-    h+=fieldSecret('openai_api_key',e.openai_api_key);
-    h+=fieldSecret('gemini_api_key',e.gemini_api_key);
-    h+='</div>';
-    h+=`<div style="margin-top:20px"><span class="lab">READ-ONLY</span>
-      <div class="kv"><span class="k">host</span><span class="v">${esc(r.host)}</span></div>
-      <div class="kv"><span class="k">port</span><span class="v">${esc(r.port)}</span></div>
-      <div class="kv"><span class="k">data_dir</span><span class="v">${esc(r.data_dir)}</span></div></div>`;
-    $('#settings-form').innerHTML=h;
-  }catch(err){$('#settings-form').innerHTML=`<p class="note err">${esc(err.message)}</p>`;}
+  try{SETTINGS=await api('/admin/api/settings');renderSettings();}
+  catch(err){$('#settings-form').innerHTML=`<p class="note err">${esc(err.message)}</p>`;}
 }
 function collectPatch(){
   const e=SETTINGS.editable,patch={};
@@ -310,10 +314,14 @@ $('#settings-save').onclick=async()=>{
   if(Object.keys(patch).length===0){n.className='note';n.textContent='Nothing changed.';return;}
   $('#settings-save').disabled=true;
   try{const r=await api('/admin/api/settings',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify(patch)});
-    n.className='note ok';n.textContent='Written to .env. '+(r.restart_required?'A restart is needed to apply.':'');
+    // The running daemon does not hot-reload; re-reading /settings would return the
+    // pre-restart values and revert the form, which reads as "the save was lost". So
+    // reflect the saved patch locally (secrets become "set") instead of re-fetching.
+    for(const k in patch){SETTINGS.editable[k]=['anthropic_api_key','openai_api_key','gemini_api_key'].includes(k)?'set':patch[k];}
+    renderSettings();
+    n.className='note ok';n.textContent=r.restart_required?'Saved to .env. The running daemon keeps these until you restart.':'Saved to .env.';
     if(r.restart_required){$('#restart-row').style.display='block';
       $('#restart-btn').dataset.sup=r.supervised;}
-    await loadSettings();
   }catch(e){n.className='note err';n.textContent=e.message;}
   $('#settings-save').disabled=false;
 };
