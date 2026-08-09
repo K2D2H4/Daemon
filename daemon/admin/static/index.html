@@ -266,7 +266,7 @@ function fieldStr(name,val,opts){
   return `<label class="field"><span class="n">${name}</span><input type="text" data-f="${name}" value="${esc(val??'')}"></label>`;
 }
 function fieldBool(name,val){return `<label class="field"><span class="n">${name}</span><select data-f="${name}"><option value="true" ${val?'selected':''}>true</option><option value="false" ${!val?'selected':''}>false</option></select></label>`;}
-function fieldVoicePreview(){return `<div class="field"><span class="n">preview</span><button type="button" class="btn" id="voice-play">▶</button><audio id="voice-sample" hidden></audio></div>`;}
+function fieldVoicePreview(){return `<div class="field"><span class="n">preview</span><button type="button" class="btn" id="voice-play" aria-label="Preview the selected voice">▶</button><span class="muted" id="voice-preview-msg"></span><audio id="voice-sample" hidden></audio></div>`;}
 function fieldNum(name,val){return `<label class="field"><span class="n">${name}</span><input type="number" step="any" data-f="${name}" value="${esc(val)}"></label>`;}
 function fieldSecret(name,val){const set=val==='set';return `<label class="field"><span class="n">${name} ${set?'· set':'· unset'}</span><input type="password" data-f="${name}" placeholder="${set?'leave blank to keep':'not set'}"></label>`;}
 async function loadSettings(){
@@ -320,10 +320,12 @@ $('#settings-save').onclick=async()=>{
 $('#settings-form').addEventListener('click',ev=>{
   if(ev.target.id!=='voice-play')return;
   const sel=document.querySelector('[data-f="gemini_live_voice"]');
-  if(!sel||!sel.value)return; // the empty "(default)" option has no clip
+  const msg=$('#voice-preview-msg');
+  if(!sel||!sel.value){return;} // the empty "(default)" option has no clip
   const a=$('#voice-sample');
+  if(msg)msg.textContent='';
   a.src='/admin/api/voice-sample/'+encodeURIComponent(sel.value);
-  a.play();
+  a.play().catch(()=>{if(msg)msg.textContent='no preview available yet';});
 });
 
 // restart + reconnect
