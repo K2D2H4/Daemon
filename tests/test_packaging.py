@@ -45,6 +45,19 @@ def test_voice_extra_still_exists_for_linux() -> None:
     assert "voice" in data["project"]["optional-dependencies"]
 
 
+def test_pillow_is_a_default_macos_dependency() -> None:
+    """Screen sharing is on by default and run_voice hard-imports Pillow through its
+    ScreenShareController; a missing Pillow crashed the voice session on the first wake
+    word (measured live). On macOS - where voice is core - Pillow must be core too, not
+    stranded in the [voice] extra where a `[mcp]` install never picks it up."""
+    core = _core_deps()
+    matches = [d for d in core if d.split(">=")[0].split(";")[0].strip() == "Pillow"]
+    assert matches, "Pillow must be a core dependency on macOS (screen sharing needs it)"
+    assert all("sys_platform == 'darwin'" in d for d in matches), (
+        f"Pillow must be gated to darwin so Linux core installs stay lean: {matches}"
+    )
+
+
 def test_installer_forces_a_managed_python_on_macos() -> None:
     """The python.org framework build is a `Python.app` bundle; the .app launcher
     exec'ing into it makes macOS attribute the mic grant to Python.app, not
