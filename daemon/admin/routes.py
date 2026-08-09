@@ -8,6 +8,7 @@ Endpoints (docs/design/2026-08-07-m5-admin-web-design.md, "JSON API"):
     GET   /admin/api/settings     editable settings, secrets masked
     PATCH /admin/api/settings     validate -> write .env -> {restart_required, supervised}
     POST  /admin/api/restart      graceful exit, only when supervised
+    GET   /admin/api/voice-sample/{voice}  a Gemini Live voice preview clip (audio/mpeg), allowlist-gated
 
     --- Phase 2, all behind DAEMON_MCP_ENABLED (409 with guidance when off) ---
     GET    /admin/api/mcp/catalog          the trusted catalog (no commands/urls)
@@ -66,7 +67,7 @@ SHELL = Path(__file__).parent / "static" / "index.html"
 VOICE_SAMPLES = Path(__file__).parent / "static" / "voice-samples"
 """Committed MP3 previews, one per Gemini Live voice, produced offline by
 evals/gen_voice_samples.py. Served locally so preview needs no key and no network -
-the admin stays offline (design decision 1)."""
+the admin stays offline (design decision 4: no CDN, offline operation preserved)."""
 
 CHAT_TEST_TIMEOUT = 60.0
 """Ceiling on the chat-test round-trip. A hung provider must not hold the admin

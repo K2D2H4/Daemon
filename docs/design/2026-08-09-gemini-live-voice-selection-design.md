@@ -36,7 +36,7 @@ gone.
    `daemon/voice/*` into `config.py` would invert the layering, the same reason
    `SENSITIVITIES` is duplicated rather than imported (config.py header comment).
 3. **Bundled preview samples**, not live-on-click. The admin is documented as
-   "static, self-contained, offline" (admin routes docstring, design decision 1).
+   "static, self-contained, offline" (admin routes docstring, design decision 4).
    A one-time generator hits the live API and commits a short compressed clip per
    voice; the admin serves those files. Preview then costs nothing, needs no key,
    and keeps the admin offline. The generation run doubles as the real-API check.
