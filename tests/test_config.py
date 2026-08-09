@@ -230,6 +230,16 @@ def test_a_misspelled_speech_sensitivity_fails_at_startup() -> None:
         make_settings(voice_end_sensitivity="medium")
 
 
+def test_an_unknown_gemini_live_voice_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_VOICE"):
+        make_settings(preset="offline", gemini_live_voice="NotAVoice")
+
+
+def test_a_known_gemini_live_voice_and_empty_both_construct() -> None:
+    assert make_settings(preset="offline", gemini_live_voice="Kore").gemini_live_voice == "Kore"
+    assert make_settings(preset="offline", gemini_live_voice="").gemini_live_voice == ""
+
+
 def test_endpointing_is_unset_by_default_so_the_server_decides() -> None:
     """~800 ms of silence is the server's own default. A default of our own here
     would be a number nobody measured, presented as a decision."""
