@@ -411,6 +411,9 @@ document.querySelector('.tab[data-tab="mcp"]').addEventListener('click',loadMcp)
 $('#mark-chip').innerHTML=sprite('running');
 setStage('running');setChatMood('running',false);
 loadHealth();loadSettings();setInterval(loadHealth,15000);
+// Deep link: the OAuth callback returns to /admin/#mcp, so open that tab on load
+// (clicking it also runs loadMcp via the listener above).
+{const want=(location.hash||'').slice(1);const t=want&&document.querySelector(`.tab[data-tab="${want}"]`);if(t)t.click();}
 </script>
 </body>
 </html>
