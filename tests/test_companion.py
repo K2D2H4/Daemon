@@ -352,6 +352,10 @@ async def test_the_continuity_block_carries_the_fresh_tail_under_a_nonce(
     assert "면접 준비 도와줘" in block and "어디부터" in block
     # Continuity framing, not recall framing: it IS the conversation being continued.
     assert "history" in block and "not a new request" in block
+    # And the persona owns the voice: the tail is rough transcripts, and a model
+    # that style-matched them switched register mid-conversation (measured live -
+    # the owner's "왜 갑자기 반말해?"). The block must say whose manner wins.
+    assert "persona alone" in block and "do not imitate" in block
 
 
 async def test_stale_history_yields_no_block(data_dir: Path) -> None:
