@@ -6,4 +6,4 @@ metadata and `daemon --version` always agree, and a source checkout reads the sa
 number without any package metadata present.
 """
 
-__version__ = "0.1.21"
+__version__ = "0.1.22"

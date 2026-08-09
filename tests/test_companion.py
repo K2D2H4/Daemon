@@ -333,3 +333,34 @@ def test_a_marker_inside_a_curated_fact_is_stripped() -> None:
 
 def test_nothing_recalled_renders_nothing() -> None:
     assert render_recall([], "n") == ""
+
+
+# --- the continuity block (voice session starts) -------------------------------
+
+
+async def test_the_continuity_block_carries_the_fresh_tail_under_a_nonce(
+    data_dir: Path,
+) -> None:
+    memory = FakeMemory()
+    memory.records.extend([said("면접 준비 도와줘"), said("좋아요, 어디부터?", role="assistant")])
+    companion = Companion(memory, data_dir=data_dir)
+
+    block = await companion.continuity_block()
+
+    assert block.startswith("[recent-conversation:")
+    assert block.rstrip().endswith("]") and "[end-recent-conversation:" in block
+    assert "면접 준비 도와줘" in block and "어디부터" in block
+    # Continuity framing, not recall framing: it IS the conversation being continued.
+    assert "history" in block and "not a new request" in block
+
+
+async def test_stale_history_yields_no_block(data_dir: Path) -> None:
+    from dataclasses import replace as _replace
+    from datetime import timedelta
+
+    memory = FakeMemory()
+    old = said("지난주 이야기")
+    memory.records.append(_replace(old, ts=old.ts - timedelta(hours=5)))
+    companion = Companion(memory, data_dir=data_dir)
+
+    assert await companion.continuity_block() == ""

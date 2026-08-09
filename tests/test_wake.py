@@ -16,6 +16,7 @@ Korean throughout, because the matching is against measured Korean transcription
 
 from __future__ import annotations
 
+import asyncio
 import unicodedata
 import wave
 from collections.abc import AsyncIterator
@@ -538,6 +539,47 @@ async def test_a_recognizer_that_cannot_say_whether_it_is_available_is_survived(
     assert await rig.collect() == []
     assert rig.gate.counters.skipped_unavailable == 1
     assert rig.gate.counters.errors == 1
+
+
+async def test_a_stream_that_delivers_nothing_at_all_is_dead_too() -> None:
+    """The other face of a dead capture, and the one the zero-frame detector cannot
+    see: the callback never fires, the queue stays empty, and the gate parks on a
+    block that never comes - `/health` said `running` while a launchd resident heard
+    nothing (measured live). The watchdog on the wait is what turns that into a
+    bounded deaf spell."""
+
+    class Mute(FakeAudio):
+        async def record(self) -> AsyncIterator[bytes]:
+            yield b""  # opens fine, then never delivers again
+            await asyncio.Event().wait()
+
+    rig = build([], [], FakeRecognizer(), audio=Mute([]), dead_stream_ms=150)
+
+    events = await rig.collect()
+
+    assert events == []
+    assert rig.gate.counters.frames_seen == 0, "nothing ever arrived - and the gate still ended"
+
+
+async def test_a_stream_that_goes_mute_mid_listen_is_dead_too() -> None:
+    """Same watchdog, after real audio has flowed: a stream that stops delivering is
+    as dead as one that never started."""
+
+    class GoesMute(FakeAudio):
+        async def record(self) -> AsyncIterator[bytes]:
+            for block in self.blocks:
+                yield block
+            await asyncio.Event().wait()
+
+    blocks, probabilities = script(*ONE_PHRASE)
+    audio = GoesMute(blocks)
+    rig = build(blocks, probabilities, FakeRecognizer("루시"), aliases=("루시",), audio=audio,
+                dead_stream_ms=150)
+
+    events = await rig.collect()
+
+    assert [event.matched for event in events] == ["루시"], "the phrase before death still fired"
+    assert rig.gate.counters.frames_seen == len(blocks)
 
 
 async def test_an_all_zero_stream_is_treated_as_dead_and_ends_the_gate() -> None:

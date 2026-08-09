@@ -2002,3 +2002,68 @@ async def test_run_voice_degrades_ask_to_allowlist(
 
     assert code == 0
     assert seen.get("mode") == "allowlist", "voice did not degrade `ask` to `allowlist`"
+
+
+# --- session-start continuity -------------------------------------------------
+# Every session used to start empty - the server holds voice history and a new
+# socket has none - so calling the daemon twice in three minutes met a stranger
+# the second time. The tail of the recent conversation now rides in on
+# `send_context` before the opening audio (daemon/companion.py, continuity_block).
+
+
+def _spoke(text: str, role: str = "user", *, minutes_ago: float = 1.0) -> LoggedMessage:
+    from datetime import timedelta
+
+    from daemon import clock
+
+    return LoggedMessage(
+        ts=clock.now() - timedelta(minutes=minutes_ago),
+        role=role,  # type: ignore[arg-type]
+        content=text,
+        origin="owner" if role == "user" else "agent",
+        session_kind="interactive",
+        modality="voice",
+        channel="voice",
+    )
+
+
+async def test_the_recent_conversation_rides_in_before_the_first_turn() -> None:
+    session = FakeSession(Says("user", "이어서 하자"), b"\x01", Turn())
+    memory = FakeMemory()
+    memory.records.extend(
+        [
+            _spoke("면접 준비 도와줘", minutes_ago=3),
+            _spoke("좋아요, 어디 회사부터?", "assistant", minutes_ago=2),
+        ]
+    )
+
+    await run(conversation(session, FakeAudio(), memory))
+
+    continuity = [text for text in session.contexts if "recent-conversation" in text]
+    assert len(continuity) == 1, "the tail goes over exactly once per session, at the start"
+    assert "면접 준비 도와줘" in continuity[0]
+    assert "어디 회사부터" in continuity[0]
+    assert continuity[0] not in session.sent_while_generating, (
+        "sent before any generation - mid-generation clientContent kills the answer"
+    )
+
+
+async def test_a_quiet_stretch_means_no_continuity_block_at_all() -> None:
+    """Two hours of silence is a finished conversation: greeting afresh is correct,
+    recall is the tool for older context, and an empty block must not become an
+    empty `send_context` frame on the wire."""
+    session = FakeSession(Says("user", "안녕"), b"\x01", Turn())
+    memory = FakeMemory()
+    memory.records.append(_spoke("어제 얘기", minutes_ago=60 * 5))
+
+    await run(conversation(session, FakeAudio(), memory))
+
+    assert [text for text in session.contexts if "recent-conversation" in text] == []
+
+
+async def test_an_empty_history_sends_nothing_either() -> None:
+    session = FakeSession(Says("user", "안녕"), b"\x01", Turn())
+
+    await run(conversation(session, FakeAudio(), FakeMemory()))
+
+    assert [text for text in session.contexts if "recent-conversation" in text] == []
