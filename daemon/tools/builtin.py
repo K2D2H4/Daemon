@@ -483,7 +483,10 @@ class OpenPath:
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "A path, or an http(s) URL.",
+                    "description": (
+                        "A path, an http(s) URL, or an application by name ending in "
+                        ".app - e.g. 'Google Chrome.app', 'Finder.app'."
+                    ),
                 }
             },
             "required": ["target"],
@@ -519,6 +522,21 @@ class OpenPath:
             raise ToolError(
                 f"{scheme.group(1)}: links are not opened, only http(s) and local paths"
             )
+        if opener == "open" and target.lower().endswith(".app"):
+            # An application, launched by LaunchServices (`open -a`) rather than
+            # resolved against the file scope: the scope guards reading and writing
+            # files, and launching an app is this tool's documented job - approval-
+            # checked like the URL branch above. Without this branch an app could
+            # never be opened at all (measured live): a bare "Google Chrome.app"
+            # resolved relative to the data dir and did not exist, and
+            # "/System/Library/CoreServices/Finder.app" sits outside the home
+            # sandbox - so the model's every phrasing failed.
+            if "/" in target:
+                # `-a` takes a bundle path as well as a name; ~ is expanded here
+                # because exec without a shell leaves it literal.
+                return [opener, "-a", str(Path(target).expanduser())]
+            # "Google Chrome.app" -> the name LaunchServices knows, "Google Chrome".
+            return [opener, "-a", target[: -len(".app")]]
         return [opener, str(self._scope.resolve(target))]
 
     async def run(self, arguments: Mapping[str, Any]) -> str:
