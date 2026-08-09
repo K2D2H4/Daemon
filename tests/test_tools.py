@@ -473,6 +473,40 @@ async def test_open_path_only_opens_http(scope: PathScope, target: str) -> None:
     assert "not opened" in str(caught.value)
 
 
+async def test_open_path_launches_an_app_by_name_on_macos(
+    scope: PathScope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before this branch existed an application could never be opened at all
+    (measured live): "Google Chrome.app" resolved relative to the data dir and did
+    not exist, and Finder's bundle sits outside the home sandbox. `open -a` takes
+    the name LaunchServices knows, so the scope - which guards file reads and
+    writes, not launches - is deliberately not consulted."""
+    monkeypatch.setattr("daemon.tools.builtin.platform.system", lambda: "Darwin")
+    assert OpenPath(scope).argv({"target": "Google Chrome.app"}) == [
+        "open", "-a", "Google Chrome",
+    ]
+
+
+async def test_open_path_launches_an_app_bundle_path_outside_the_scope(
+    scope: PathScope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact live failure: /System/Library/CoreServices/Finder.app was refused
+    as "outside the paths I may touch". `-a` accepts a bundle path too."""
+    monkeypatch.setattr("daemon.tools.builtin.platform.system", lambda: "Darwin")
+    argv = OpenPath(scope).argv({"target": "/System/Library/CoreServices/Finder.app"})
+    assert argv == ["open", "-a", "/System/Library/CoreServices/Finder.app"]
+
+
+async def test_open_path_still_scopes_apps_off_macos(
+    scope: PathScope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """xdg-open has no `-a`; a .app name is an ordinary path on Linux and stays
+    inside the sandbox rather than growing a fake launch branch."""
+    monkeypatch.setattr("daemon.tools.builtin.platform.system", lambda: "Linux")
+    with pytest.raises(ToolError):
+        OpenPath(scope).argv({"target": "/System/Library/CoreServices/Finder.app"})
+
+
 # --- notify -----------------------------------------------------------------
 
 
