@@ -171,12 +171,14 @@ class FakeSession:
             self.sent_while_generating.append(text)
 
     async def send_tool_response(self, results: Sequence[ToolResult]) -> None:
-        # Recorded and unused. Nothing in `VoiceConversation` offers a tool to a
-        # session yet - PR-2b owns that, and `tests/test_reachable.py` says so - but
-        # the method is the protocol's, so a fake without it would fail
-        # `test_the_fakes_satisfy_the_protocols` rather than quietly let the
-        # conversation find some fallback the product does not have.
         self.tool_responses.append(list(results))
+        # The answer is what starts the model's post-tool generation (measured:
+        # a blocking call produces nothing before the response and 13.69s of audio
+        # after it - gemini_live.py's tool notes). From here until the turn
+        # boundary a `send_context` is the documented interrupt, and the live
+        # symptom of sending one was the server cancelling the tool call - so the
+        # fake counts it the same way it counts one sent over audio.
+        self.generating = True
         self.events.append("tool_response")
 
     async def interrupt(self) -> None:
@@ -824,6 +826,39 @@ async def test_the_answer_arrives_after_the_tool_call(
 
     assert audio.played == [b"\x01\x02"], "the answer after the tool call was lost"
     assert [r.content for r in memory.records] == ["메모 뭐라고 돼 있어", "별거 없어"]
+
+
+async def test_recall_waits_out_a_tool_answer_instead_of_killing_it(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """A blocking tool call arrives before any audio, so nothing had set
+    `_generating` when the user's transcript settled recall - and the recall block's
+    `clientContent` landed right after the tool response, which the live server
+    answers by cancelling the call: `tool.ran ok=True` then `the server cancelled
+    tool calls [...]` on every single call, and the daemon opened Finder and said
+    nothing about it (measured on the owner's Mac). Recall now waits for the turn
+    boundary here exactly as it does mid-audio."""
+    (tmp_path / "notes.md").write_text("hi")
+    runner, _store = tool_runner(db, tmp_path)
+    session = FakeSession(
+        Calls(_read_file_call(tmp_path / "notes.md")),
+        # The user's final transcript arrives with the tool call, before any audio -
+        # the exact window the live cancellations came from.
+        Transcript(text="메모 좀 열어봐 줄래", role="user", final=True),
+        b"\x01",
+        Says("assistant", "열었어요"),
+        Turn(),
+    )
+    await run(conversation(session, recall=FakeRecall(_item()), resolve_id=Ids(), tools=runner))
+
+    assert session.tool_responses, "the tool answer still goes back"
+    assert session.sent_while_generating == [], (
+        "recall went out between the tool answer and the spoken result - the exact "
+        "clientContent the server answers with a tool-call cancellation"
+    )
+    assert [c for c in session.contexts if "recalled-memory" in c], (
+        "held, not dropped: the memory still reaches the model at the turn boundary"
+    )
 
 
 async def test_a_spoken_tool_call_is_audited_as_the_owner_over_voice(
