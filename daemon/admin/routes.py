@@ -8,7 +8,7 @@ Endpoints (docs/design/2026-08-07-m5-admin-web-design.md, "JSON API"):
     GET   /admin/api/settings     editable settings, secrets masked
     PATCH /admin/api/settings     validate -> write .env -> {restart_required, supervised}
     POST  /admin/api/restart      graceful exit, only when supervised
-    GET   /admin/api/voice-sample/{voice}  a Gemini Live voice preview clip (audio/mpeg), allowlist-gated
+    GET   /admin/api/voice-sample/{voice}  a voice preview clip (audio/mpeg), allowlist-gated
 
     --- Phase 2, all behind DAEMON_MCP_ENABLED (409 with guidance when off) ---
     GET    /admin/api/mcp/catalog          the trusted catalog (no commands/urls)
