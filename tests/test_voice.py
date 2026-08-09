@@ -1215,6 +1215,45 @@ async def test_a_tool_reaches_setup_as_a_function_declaration() -> None:
     assert declared["parameters"] == READ_FILE.parameters
 
 
+async def test_a_tool_schema_is_narrowed_before_it_reaches_setup() -> None:
+    """An MCP server forwards its own inputSchema untouched, and the Live API closes
+    the socket 1007 on keywords like `additionalProperties`/`title`/`$schema` - which
+    this file treats as permanent, so one connected MCP server killed every voice
+    session (measured live: `Unknown name "additionalProperties"`). They must be
+    stripped, the same narrowing `llm/providers/gemini.py` applies to the REST path."""
+    dirty = ToolSpec(
+        name="tavily__search",
+        description="web search",
+        parameters={
+            "type": "object",
+            "title": "SearchArgs",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": False,
+            "properties": {
+                "query": {"type": "string", "title": "Query", "default": ""},
+                "max": {"type": ["integer", "null"], "additionalProperties": False},
+            },
+            "required": ["query"],
+        },
+    )
+    connection = FakeConnection(SETUP_COMPLETE)
+    async with session(connection, tools=[dirty]):
+        pass
+
+    (setup,) = connection.messages("setup")
+    (group,) = setup["tools"]
+    (declared,) = group["functionDeclarations"]
+    params = declared["parameters"]
+    assert "additionalProperties" not in params
+    assert "title" not in params and "$schema" not in params
+    assert "additionalProperties" not in params["properties"]["max"]
+    assert "title" not in params["properties"]["query"]
+    # The valid shape survives, and a `[integer, null]` union becomes type+nullable.
+    assert params["type"] == "object"
+    assert params["properties"]["query"]["type"] == "string"
+    assert params["properties"]["max"] == {"type": "integer", "nullable": True}
+
+
 async def test_every_tool_goes_in_one_group_not_one_group_each() -> None:
     """The API takes a list of tool *objects* and a function is a declaration
     inside one of them - the same shape `llm/providers/gemini.py` sends."""

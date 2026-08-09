@@ -45,6 +45,7 @@ from websockets.exceptions import (
 )
 
 from daemon.llm.base import ToolCall, ToolSpec, decode_tool_arguments, synthesise_call_id
+from daemon.llm.gemini_schema import gemini_schema
 from daemon.tools.base import ToolResult
 from daemon.voice.base import Interrupted, Transcript
 
@@ -867,17 +868,19 @@ class GeminiLiveSession:
     def _function_declarations(self) -> list[dict[str, Any]]:
         """`ToolSpec` as the wire wants it.
 
-        `parameters` goes through untouched, which is the property that lets an MCP
-        server's own schema be forwarded without this layer understanding it - the
-        same passthrough `ToolSpec` documents and `llm/providers/gemini.py` relies
-        on.
+        `parameters` is narrowed by `gemini_schema` first. An MCP server forwards its
+        own `inputSchema` untouched, and those carry keywords the Live API rejects
+        (`additionalProperties`, `title`, `$schema`) - a single one closes the socket
+        1007 and this file treats that as permanent, so one connected MCP server
+        killed every voice session. `llm/providers/gemini.py` narrows the REST path
+        the same way through the same helper.
         """
         declarations: list[dict[str, Any]] = []
         for spec in self._tools:
             declared: dict[str, Any] = {
                 "name": spec.name,
                 "description": spec.description,
-                "parameters": spec.parameters,
+                "parameters": gemini_schema(spec.parameters),
             }
             if self._tool_behavior:
                 declared["behavior"] = self._tool_behavior
