@@ -169,8 +169,9 @@ def test_catalog_lists_entries_without_leaking_commands(tmp_path: Path) -> None:
     assert by_name["tavily"]["auth"] == "key"
     assert by_name["tavily"]["needs_key"] is True
     assert by_name["notion"]["auth"] == "oauth"
-    # 2b has not confirmed a live flow, so the one-click stays off (reality gate).
-    assert by_name["notion"]["oauth_verified"] is False
+    # notion's live DCR + localhost flow is confirmed (a token persists under
+    # mcp_tokens/), so the one-click is on. Unconfirmed OAuth servers stay off.
+    assert by_name["notion"]["oauth_verified"] is True
     # The command a server runs is a code constant, never sent to the browser.
     for card in body["catalog"]:
         assert "command" not in card and "url" not in card and "args" not in card

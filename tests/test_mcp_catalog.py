@@ -30,6 +30,29 @@ def test_a_uvx_server_is_launched_against_the_daemons_own_mcp() -> None:
     assert "mcp-server-time" in config.args  # the tool itself still runs
 
 
+def test_a_fastmcp_server_opts_out_of_the_mcp_pin() -> None:
+    """A fastmcp-based server (google/slack) resolves a newer `mcp` than the daemon
+    pins; forcing `--with mcp==<daemon version>` would make uvx fail to resolve rather
+    than start. `pin_mcp=False` keeps the pin off so it launches as `uvx <server>`."""
+    entry = lookup("google")
+    assert entry is not None and entry.kind == "uvx" and entry.pin_mcp is False
+    config = server_config_from_catalog(entry)
+    assert "--with" not in config.args
+    assert config.args[0] == "workspace-mcp"
+
+
+def test_google_declares_the_oauth_env_it_reads() -> None:
+    """`google` runs its own Google OAuth and reads GOOGLE_OAUTH_CLIENT_ID/SECRET; the
+    stdio child sees only an allowlist, so the entry must name them in
+    `env_passthrough` or the server can never receive its credentials. The mapping
+    carries the names through to the ServerConfig the bridge starts."""
+    entry = lookup("google")
+    assert entry is not None
+    assert entry.env_passthrough == ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
+    config = server_config_from_catalog(entry)
+    assert config.env_passthrough == ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
+
+
 def test_a_url_server_gets_no_uvx_pin() -> None:
     entry = lookup("tavily")
     assert entry is not None and entry.kind == "url"
@@ -68,14 +91,20 @@ def test_a_key_entry_names_the_env_var_that_holds_its_secret() -> None:
         assert entry.key_env, f"{entry.name} is a key server but names no env var"
 
 
-def test_oauth_entries_stay_unverified_until_actually_confirmed() -> None:
-    """`oauth_verified` is a promise we made about a specific server's dynamic
-    client registration and localhost redirect. Until 2b confirms one, it is False -
-    a True we did not earn would one-click-expose a flow that then fails."""
+def test_oauth_entries_are_verified_only_when_confirmed() -> None:
+    """`oauth_verified` is a promise about a specific server's dynamic client
+    registration and localhost redirect, earned by actually completing the flow.
+    `notion` was confirmed live (the admin button persists a token under
+    mcp_tokens/). Any OAuth server we have NOT confirmed must stay False - a True we
+    did not earn would one-click-expose a flow that then fails."""
+    confirmed = {"notion"}
     oauth_entries = [entry for entry in CATALOG if entry.auth == "oauth"]
     assert oauth_entries, "expected at least one OAuth server"
     for entry in oauth_entries:
-        assert entry.oauth_verified is False
+        expected = entry.name in confirmed
+        assert entry.oauth_verified is expected, (
+            f"{entry.name}: oauth_verified should be {expected}"
+        )
 
 
 def test_a_uvx_entry_carries_a_command_and_a_url_entry_a_url() -> None:

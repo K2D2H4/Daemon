@@ -21,6 +21,18 @@ Each entry is enough to build a `daemon.tools.mcp.ServerConfig` (see
                     dynamic client registration (RFC 7591) and a localhost redirect.
                     False until 2b earns it - a premature True would one-click-expose
                     a flow that then fails.
+  * `pin_mcp`     -> whether to launch a uvx server with the daemon's own `mcp`
+                    pinned in (`--with mcp==<version>`). True for the reference
+                    servers, which under-constrain `mcp` and die on a resolved-too-new
+                    one. False for a server that brings its own resolved stack - a
+                    `fastmcp`-based server (workspace, slack) needs a newer `mcp` than
+                    the daemon pins, and the pin would make it fail to resolve.
+  * `env_passthrough` -> NAMES of environment variables a stdio server may read from
+                    Daemon's own environment. The stdio child sees an allowlist, not
+                    `os.environ` (see `_stdio_env`), so a server that runs its own
+                    OAuth (workspace reads GOOGLE_OAUTH_CLIENT_ID/SECRET) would
+                    otherwise get nothing. Names only - a code constant, never a value;
+                    the secret still lives in the environment, never in `mcp.json`.
 """
 
 from __future__ import annotations
@@ -43,6 +55,8 @@ class CatalogEntry:
     key_env: str | None = None
     auth: Auth = "none"
     oauth_verified: bool = False
+    pin_mcp: bool = True
+    env_passthrough: tuple[str, ...] = ()
 
 
 CATALOG: tuple[CatalogEntry, ...] = (
@@ -88,16 +102,70 @@ CATALOG: tuple[CatalogEntry, ...] = (
         key_env="TAVILY_API_KEY",
         auth="key",
     ),
-    # --- an OAuth server (2b installs it; 2a only lists it) --------------------
+    # --- GitHub's own remote server, authenticated with a PAT -----------------
+    # GitHub's hosted MCP has no dynamic client registration (a DCR attempt 422s),
+    # so the OAuth button cannot serve it; a Personal Access Token presented as a
+    # bearer is the supported path. `key`, not `oauth`, is the honest mapping.
+    CatalogEntry(
+        name="github",
+        kind="url",
+        description="GitHub repos, issues and pull requests, via a Personal Access Token.",
+        url="https://api.githubcopilot.com/mcp/",
+        key_env="GITHUB_MCP_PAT",
+        auth="key",
+    ),
+    # --- a fastmcp stdio server that carries its own Google OAuth --------------
+    # `workspace-mcp` reaches Gmail/Calendar/Drive; it runs the Google OAuth flow
+    # itself (the daemon presents no secret, so `auth="none"`). It reads
+    # GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET from the environment - the
+    # stdio child sees only an allowlist (see `_stdio_env`), so those two names are
+    # declared in `env_passthrough`. The owner exports both, creates a Google Cloud
+    # OAuth client, and completes a one-time browser consent before CONNECT succeeds.
+    # `pin_mcp=False`: it needs a newer `mcp` (via fastmcp) than the daemon pins.
+    # Permissions are pinned to the owner's decision: Gmail up to `send` (read,
+    # organise, draft, send) but NOT `full`, so a compromised turn cannot permanently
+    # delete mail (`--help` confirms the cumulative order ...drafts<send<full, and
+    # the space-separated `SERVICE:LEVEL ...` form); Calendar `full` for creating
+    # events; Drive `readonly`, its stated use.
+    CatalogEntry(
+        name="google",
+        kind="uvx",
+        description=(
+            "Gmail (read/send, no permanent delete), Calendar (read/write) and Drive "
+            "(read). Needs a Google Cloud OAuth client exported as "
+            "GOOGLE_OAUTH_CLIENT_ID/SECRET and a one-time browser consent."
+        ),
+        command="uvx",
+        args=("workspace-mcp", "--permissions", "gmail:send", "calendar:full", "drive:readonly"),
+        auth="none",
+        pin_mcp=False,
+        env_passthrough=("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"),
+    ),
+    # --- a fastmcp stdio server, authenticated with a Slack bot token ----------
+    # Slack's hosted server (mcp.slack.com) has no dynamic client registration
+    # either, so this stdio server takes a bot token (xoxb-...) as an env secret.
+    # `pin_mcp=False` for the same fastmcp reason as `google`.
+    CatalogEntry(
+        name="slack",
+        kind="uvx",
+        description="Slack channels and messages, via a bot token.",
+        command="uvx",
+        args=("--from", "workos-slack-mcp-server", "slack-mcp-server"),
+        key_env="SLACK_BOT_TOKEN",
+        auth="key",
+        pin_mcp=False,
+    ),
+    # --- an OAuth server (verified against the live DCR + localhost flow) ------
     CatalogEntry(
         name="notion",
         kind="url",
         description="Notion workspace access over OAuth.",
         url="https://mcp.notion.com/mcp",
         auth="oauth",
-        # Not yet confirmed against a live dynamic-registration + localhost-redirect
-        # flow. 2b flips this once it has.
-        oauth_verified=False,
+        # Confirmed against a live dynamic-registration + localhost-redirect flow:
+        # the admin OAuth button completes and persists a token under mcp_tokens/.
+        # This is the server that earns the "verified" promise (the rest stay False).
+        oauth_verified=True,
     ),
 )
 

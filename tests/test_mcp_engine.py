@@ -443,6 +443,36 @@ def test_static_env_from_mcp_json_is_still_passed() -> None:
     assert _stdio_env(config)["FOO"] == "bar"
 
 
+def test_stdio_env_passes_declared_passthrough_names_but_not_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that runs its own OAuth (workspace/Google) needs specific env vars the
+    allowlist omits; `env_passthrough` names them. The allowlist still holds: a var it
+    did not name - here Daemon's own provider key - is never forwarded."""
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "gcid")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "gcsecret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-daemons-own-secret")
+    config = ServerConfig(
+        name="google",
+        command="uvx",
+        env_passthrough=("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"),
+    )
+
+    env = _stdio_env(config)
+
+    assert env["GOOGLE_OAUTH_CLIENT_ID"] == "gcid"
+    assert env["GOOGLE_OAUTH_CLIENT_SECRET"] == "gcsecret"
+    assert "ANTHROPIC_API_KEY" not in env  # not named, so still refused
+
+
+def test_stdio_env_omits_an_unset_passthrough_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A declared name that is not set stays absent rather than becoming an empty
+    string - the honest 'not configured' the secret path already makes."""
+    monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_ID", raising=False)
+    config = ServerConfig(name="g", command="uvx", env_passthrough=("GOOGLE_OAUTH_CLIENT_ID",))
+    assert "GOOGLE_OAUTH_CLIENT_ID" not in _stdio_env(config)
+
+
 # --- finding uvx under a service's minimal PATH -----------------------------
 
 
@@ -562,6 +592,29 @@ async def test_save_server_round_trips_through_load_config(data_dir: Path) -> No
     assert config.command == "uvx"
     assert config.args == ("mcp-server-fetch",)
     assert config.safe == frozenset({"fetch"})
+
+
+async def test_env_passthrough_round_trips_through_mcp_json(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart rebuilds servers from mcp.json, so the passthrough names must survive
+    the write/read - otherwise `google` reconnects blind and its OAuth vars vanish.
+    Names are stored (like key_env); no secret value is written."""
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "gcsecret")
+    save_server(
+        data_dir,
+        ServerConfig(
+            name="google",
+            command="uvx",
+            args=("workspace-mcp",),
+            env_passthrough=("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"),
+        ),
+    )
+    text = (data_dir / "mcp.json").read_text(encoding="utf-8")
+    assert "GOOGLE_OAUTH_CLIENT_SECRET" in text  # the name persists
+    assert "gcsecret" not in text  # the value never does
+    (config,) = load_config(data_dir).servers
+    assert config.env_passthrough == ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
 
 
 async def test_save_server_writes_owner_only(data_dir: Path) -> None:
