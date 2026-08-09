@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from daemon.config import (
+    GEMINI_LIVE_VOICES,
     HOSTED_PROVIDERS,
     PRESETS,
     Settings,
@@ -42,6 +43,7 @@ STR_FIELDS: dict[str, str] = {
     "preset": "DAEMON_PRESET",
     "hosted_provider": "DAEMON_HOSTED_PROVIDER",
     "tools_mode": "DAEMON_TOOLS_MODE",
+    "gemini_live_voice": "DAEMON_GEMINI_LIVE_VOICE",
 }
 BOOL_FIELDS: dict[str, str] = {
     "voice_enabled": "DAEMON_VOICE_ENABLED",
@@ -97,6 +99,7 @@ def current_settings_payload(settings: Settings) -> dict[str, Any]:
             "presets": sorted(PRESETS),
             "hosted_providers": list(HOSTED_PROVIDERS),
             "tool_modes": list(TOOL_MODES),
+            "gemini_live_voices": ["", *sorted(GEMINI_LIVE_VOICES)],
         },
     }
 
