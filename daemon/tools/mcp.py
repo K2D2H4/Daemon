@@ -82,6 +82,12 @@ class ServerConfig:
     its stored token through the `oauth_provider_factory` (no browser). Persisted so a
     restart knows which servers to reconnect that way rather than treating them as
     plain url servers with no bearer and getting a 401."""
+    env_passthrough: tuple[str, ...] = ()
+    """NAMES of environment variables a stdio child may read from Daemon's own
+    environment, on top of the `_SAFE_STDIO_ENV` allowlist. For a server that runs its
+    own OAuth (workspace reads GOOGLE_OAUTH_CLIENT_ID/SECRET): the allowlist would
+    otherwise hand it nothing. Names, never values - a code constant that rides in
+    `mcp.json` like `key_env` does; the secret itself stays in the environment."""
 
     @property
     def is_remote(self) -> bool:
@@ -154,6 +160,7 @@ def load_config(data_dir: Path) -> McpConfig:
                 safe=frozenset(str(s) for s in block.get("safe", ()) or ()),
                 key_env=str(block.get("key_env", "") or ""),
                 auth=str(block.get("auth", "") or ""),
+                env_passthrough=tuple(str(n) for n in block.get("env_passthrough", ()) or ()),
             )
         )
     return McpConfig(configs, rejected)
@@ -218,6 +225,12 @@ def _stdio_env(config: ServerConfig, secret: str | None = None) -> dict[str, str
     then at most the one named secret."""
     env = {name: os.environ[name] for name in _SAFE_STDIO_ENV if name in os.environ}
     env["PATH"] = _augmented_path()
+    # The named passthrough: a server that runs its own auth (workspace's Google
+    # OAuth) needs specific vars the allowlist omits. Only names the catalog declared,
+    # only when actually set - a missing one stays absent rather than becoming "".
+    for name in config.env_passthrough:
+        if name in os.environ:
+            env[name] = os.environ[name]
     env.update({str(k): str(v) for k, v in dict(config.env).items()})
     value = _secret_value(config, secret)
     if config.key_env and value is not None:
@@ -276,9 +289,11 @@ def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
     A `uvx` server is launched with the daemon's own `mcp` pinned in (see
     `_mcp_pin`), so a curated catalog server actually starts rather than failing on a
     resolved-too-new `mcp`. The pin is a plain argv prefix - structured, no secret,
-    and persisted transparently into `mcp.json`."""
+    and persisted transparently into `mcp.json`. An entry sets `pin_mcp=False` to
+    opt out: a `fastmcp`-based server brings a newer `mcp` than the daemon pins, and
+    the pin would make it fail to resolve rather than start."""
     args = tuple(entry.args)
-    if entry.kind == "uvx":
+    if entry.kind == "uvx" and entry.pin_mcp:
         args = (*_mcp_pin(), *args)
     return ServerConfig(
         name=entry.name,
@@ -287,6 +302,7 @@ def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
         url=entry.url,
         key_env=entry.key_env or "",
         auth=entry.auth,
+        env_passthrough=tuple(entry.env_passthrough),
     )
 
 
@@ -305,6 +321,10 @@ def _block_of(config: ServerConfig) -> dict[str, Any]:
         block["safe"] = sorted(config.safe)
     if config.key_env:
         block["key_env"] = config.key_env
+    if config.env_passthrough:
+        # Names only (no secret), so it persists like `key_env`: a restart rebuilds
+        # this server from mcp.json and must still know which env vars it may read.
+        block["env_passthrough"] = list(config.env_passthrough)
     if config.auth:
         # Persisted so a restart reconnects an oauth server through its stored token
         # rather than treating a bearer-less url server as unauthenticated.
