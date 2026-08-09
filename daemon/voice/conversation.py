@@ -236,6 +236,18 @@ class VoiceConversation:
         called `_playing` and used to decide barge-ins, and neither survived contact
         with the provider - see `_offer` and `_watch_partials`."""
 
+        self._answering_tool = False
+        """Whether a tool call is between "the model asked" and "the model spoke".
+
+        The blind spot `_generating` alone had: a blocking tool call arrives before
+        any audio (measured - the provider module's tool-calling notes),
+        so nothing had set `_generating` when the user's transcript settled recall
+        - and the recall block's `clientContent` interrupted the answer the model
+        was about to give for the tool result. Live symptom: `tool.ran ok=True`
+        followed milliseconds later by `gemini-live: the server cancelled tool
+        calls [...]` on every single tool call, and the daemon opened Finder and
+        said nothing about it."""
+
         self._deferred: list[RecalledItem] | None = None
         """Recall that arrived mid-answer and is waiting for the turn to end."""
 
@@ -422,6 +434,7 @@ class VoiceConversation:
         # recall forever after a turn that ended without a final transcript, and
         # never flushing would mean a memory searched for and then silently dropped.
         self._generating = False
+        self._answering_tool = False
         await self._flush_deferred(session)
         self.ended = getattr(session, "ended", None)
         if produced:
@@ -604,7 +617,7 @@ class VoiceConversation:
         identity = self._companion.recall_key(items)
         if not identity or identity == self._offered:
             return
-        if self._generating:
+        if self._generating or self._answering_tool:
             # Held, not dropped, and `_offered` is deliberately left alone so the
             # flush does not mistake this for something already sent. A later
             # prefetch landing in the same turn simply replaces it - the newest
@@ -703,6 +716,12 @@ class VoiceConversation:
         `send_tool_response`). The runner returns one result per call it was given,
         so there is always something to send.
         """
+        # From this moment until the model has spoken (or the turn ends), a
+        # `send_context` would land in the middle of the tool exchange and the
+        # server cancels the call - see `_answering_tool`. Set before running the
+        # tool, because the user's own transcript settles recall in this same
+        # window.
+        self._answering_tool = True
         outcome = await self._companion.run_tools(
             [call], origin="owner", channel=self._channel, sender_id=None
         )
