@@ -104,6 +104,12 @@ the first third of an utterance is a different query and gets thrown away;
 covering most of it embeds to nearly the same vector and is worth the whole 117 ms
 it saves."""
 
+OPENING_ANSWER_HOLD_SECONDS = 6.0
+"""How long the microphone is held while the model owes an answer to the wake
+word. Long enough to cover a slow first turn (measured: 1.1 s with no microphone
+attached, 11.77 s with one), short enough that a model which never answers hands
+the room back well inside the idle budget."""
+
 PLAYBACK_BYTES_PER_FRAME = 2
 """16-bit mono, which is what every `AudioIO` here plays (daemon/voice/audio.py).
 Only used to turn a byte count into seconds for the session report."""
@@ -256,6 +262,23 @@ class VoiceConversation:
         called `_playing` and used to decide barge-ins, and neither survived contact
         with the provider - see `_offer` and `_watch_partials`."""
 
+        self._opening_answer_until = 0.0
+        """Loop-clock deadline for holding the microphone after an opening the model
+        still owes an answer to.
+
+        Measured, and the measurement is the whole justification: the same opening
+        text answered in **1.1 s** against a session with no microphone attached, and
+        took **11.77 s** in the resident, where the mic starts streaming the room the
+        instant the session is up. Incoming audio at the moment a turn begins reads
+        as the user starting to speak, so the server cancels the answer it was about
+        to give and waits for an utterance that never comes - and it does that
+        without emitting `interrupted`, which is why the session reported zero
+        barge-ins while the owner sat through eleven seconds of nothing and concluded
+        the daemon was deaf. The owner has just said the wake word and is waiting;
+        holding the room out of the socket until the answer starts costs nothing they
+        were going to say. Bounded, because a model that never answers must not take
+        the microphone with it."""
+
         self._answering_tool = False
         """Whether a tool call is between "the model asked" and "the model spoke".
 
@@ -367,6 +390,8 @@ class VoiceConversation:
                 # A prompt, so the model answers it - which is the point: being
                 # called by name deserves an answer, not silence.
                 await session.send_text(self._opening_text)
+                loop = asyncio.get_running_loop()
+                self._opening_answer_until = loop.time() + OPENING_ANSWER_HOLD_SECONDS
         except Exception:
             logger.exception("voice: could not hand over the utterance that opened the session")
 
@@ -490,6 +515,15 @@ class VoiceConversation:
                     # microphone resumes - barge-in over the spoken result works
                     # exactly as before.
                     continue
+                if self._opening_answer_until and not self._generating:
+                    if asyncio.get_running_loop().time() < self._opening_answer_until:
+                        # The answer to the wake word has not started yet; see
+                        # `_opening_answer_until`. Dropped, not queued - stale room
+                        # audio helps nobody once the answer is under way.
+                        continue
+                    # Bound reached: the model is not answering, so the microphone
+                    # goes back to the owner rather than staying held.
+                    self._opening_answer_until = 0.0
                 if not self._barge_in_enabled and (self._generating or self._answering_tool):
                     # Half-duplex, by the owner's choice (DAEMON_VOICE_BARGE_IN=false):
                     # while the daemon is speaking, the microphone yields entirely, so
@@ -519,6 +553,8 @@ class VoiceConversation:
         30s" about a stretch it had spent speaking.
         """
         self._played_bytes += size
+        # The answer has started, so the microphone goes back to the room.
+        self._opening_answer_until = 0.0
         if self._first_audio_at is None:
             self._first_audio_at = at
         seconds = size / (self._audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME)
