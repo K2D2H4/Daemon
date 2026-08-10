@@ -88,17 +88,34 @@ def test_upsample_16k_to_24k_grows_length_by_3_over_2():
     assert len(out) % 2 == 0
 
 
-async def test_session_update_sets_voice_instructions_and_pcm16():
+async def test_session_update_uses_the_ga_shape():
+    # The GA gpt-realtime shape, confirmed against the live socket: audio config nested
+    # under audio.{input,output}, output_modalities, format objects, voice under output.
+    # The old flat beta shape (input_audio_format="pcm16", top-level voice) is rejected
+    # 4000 by gpt-realtime.
     conn = FakeConnection(SESSION_UPDATED)
     async with make(conn, system_instruction="be brief", voice_name="alloy"):
         pass
     (upd,) = conn.sent_of_type("session.update")
     s = upd["session"]
-    assert s["voice"] == "alloy"
+    assert s["type"] == "realtime"
+    assert s["output_modalities"] == ["audio"]
     assert s["instructions"] == "be brief"
-    assert s["input_audio_format"] == "pcm16" and s["output_audio_format"] == "pcm16"
-    assert s["turn_detection"]["type"] == "server_vad"
-    assert "input_audio_transcription" in s
+    assert s["audio"]["output"]["voice"] == "alloy"
+    assert s["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    assert s["audio"]["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    assert s["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+    assert s["audio"]["input"]["transcription"]["model"] == "whisper-1"
+    # No beta-shape leftovers at the top level.
+    assert "voice" not in s and "input_audio_format" not in s and "modalities" not in s
+
+
+async def test_no_voice_omits_the_voice_field():
+    conn = FakeConnection(SESSION_UPDATED)
+    async with make(conn):  # no voice_name -> server default
+        pass
+    (upd,) = conn.sent_of_type("session.update")
+    assert "voice" not in upd["session"]["audio"]["output"]
 
 
 async def test_send_audio_appends_upsampled_base64():
@@ -264,10 +281,13 @@ async def test_setup_error_fails_fast_instead_of_hanging_for_20s():
     assert "unknown parameter" in str(exc_info.value)
 
 
-def test_1007_is_permanent_1008_is_retried():
+def test_close_code_classification():
     # gemini_live.py's sibling measured 1008 as an idle timeout wearing a
     # policy-violation code; classifying it permanent by code alone defeats
     # reconnect for something that was just weather. OpenAI's 1008 semantics are
-    # unconfirmed against a live socket, so this port keeps only 1007 permanent.
+    # unconfirmed against a live socket, so only 1007 and 4000 are permanent.
     assert _permanent_close(1007, "") is True
+    # 4000 invalid_request (measured: a beta-shaped session.update closes 4000) is a
+    # malformed request - retrying dials into the same close.
+    assert _permanent_close(4000, "invalid_request_error.beta_api_shape_disabled") is True
     assert _permanent_close(1008, "anything") is False

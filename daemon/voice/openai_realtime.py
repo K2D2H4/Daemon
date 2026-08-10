@@ -73,7 +73,12 @@ _PERMANENT_STATUS = frozenset({400, 401, 403, 404})
 """Handshake statuses that retrying cannot fix: a bad, revoked or unauthorised
 key, or a wrong endpoint."""
 
-_PERMANENT_CLOSE_CODES = frozenset({1007})  # invalid payload; confirm in spike
+_PERMANENT_CLOSE_CODES = frozenset({1007, 4000})
+"""Close codes retrying cannot fix. 1007 is an invalid payload; 4000 is OpenAI's
+application-level invalid_request (measured: a beta-shaped session.update on gpt-realtime
+closes 4000 invalid_request_error.beta_api_shape_disabled) - a malformed request retries
+into the same close. 1008 is deliberately NOT here: like Gemini's, an idle/normal close
+can wear it and must be retried; OpenAI's exact 1008 semantics are still unconfirmed."""
 """1008 is deliberately excluded. gemini_live.py measured its own 1008 as an idle
 timeout wearing a policy-violation code, and classifying it permanent there ended
 a voice turn with no retry for something that was just weather. OpenAI's 1008
@@ -536,10 +541,11 @@ class OpenAIRealtimeSession:
             # carries no secret and is the query param OpenAI's endpoint wants.
             return await self._connect(
                 f"{self._url}?model={self._model}",
-                additional_headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "OpenAI-Beta": "realtime=v1",
-                },
+                # GA drops the `OpenAI-Beta: realtime=v1` header; sending it (plus the
+                # old flat session shape) makes gpt-realtime close 4000
+                # invalid_request_error.beta_api_shape_disabled. Measured on the live
+                # socket, 2026-08-09.
+                additional_headers={"Authorization": f"Bearer {self._api_key}"},
                 # Explicit, never the library default - see `_ssl_context`.
                 ssl=self._ssl_context or _ssl_context(bundle),
             )
@@ -589,15 +595,28 @@ class OpenAIRealtimeSession:
             logger.debug("openai-realtime: closing a failed connection did not go cleanly")
 
     def _setup_message(self) -> dict[str, Any]:
-        session: dict[str, Any] = {
-            "modalities": ["audio", "text"],
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
-            "turn_detection": {"type": "server_vad"},
-            "input_audio_transcription": {"model": "whisper-1"},
+        # The GA (gpt-realtime) session shape, confirmed against the live socket's own
+        # `session.created` (2026-08-09): audio config nested under audio.{input,output},
+        # `output_modalities` not `modalities`, each format an object {type,rate} not the
+        # beta "pcm16" string, and `voice` under audio.output. The old flat beta shape is
+        # rejected with a 4000 invalid_request_error.beta_api_shape_disabled close.
+        # `rate` is OUTPUT_SAMPLE_RATE (24 kHz) both ways: GA input is 24 kHz, which is
+        # exactly what send_audio upsamples the 16 kHz mic capture to.
+        audio: dict[str, Any] = {
+            "input": {
+                "format": {"type": "audio/pcm", "rate": OUTPUT_SAMPLE_RATE},
+                "turn_detection": {"type": "server_vad"},
+                "transcription": {"model": "whisper-1"},
+            },
+            "output": {"format": {"type": "audio/pcm", "rate": OUTPUT_SAMPLE_RATE}},
         }
         if self._voice_name:
-            session["voice"] = self._voice_name
+            audio["output"]["voice"] = self._voice_name
+        session: dict[str, Any] = {
+            "type": "realtime",
+            "output_modalities": ["audio"],
+            "audio": audio,
+        }
         if self._system_instruction:
             session["instructions"] = self._system_instruction
         if self._tools:
