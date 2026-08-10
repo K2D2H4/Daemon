@@ -233,6 +233,9 @@ class VoiceConversation:
         self._started_at: float | None = None
         self._first_audio_at: float | None = None
         self._played_bytes = 0
+        self._playback_until = 0.0
+        """Loop-clock instant the speaker runs dry, so the idle budget can start
+        counting silence when the room actually falls silent (see `_on_audio`)."""
 
         self._generating = False
         """Whether the model is mid-turn.
@@ -422,7 +425,6 @@ class VoiceConversation:
         try:
             async for item in stream:
                 produced = True
-                budget.reschedule(loop.time() + self._idle_timeout)
                 if isinstance(item, bytes):
                     self._generating = True
                     self._on_audio(loop.time(), len(item))
@@ -433,6 +435,15 @@ class VoiceConversation:
                     await self._run_tool_call(session, item)
                 else:
                     await self._on_transcript(session, item)
+                # After the item is handled, not before: a chunk has to be able to
+                # extend the budget by *its own* playing time, and `_on_audio` is
+                # what knows that. Rescheduling first counted every answer as if it
+                # were heard the instant it arrived - the ten seconds `_on_audio`
+                # describes. From when the room falls silent, not when the packet
+                # landed.
+                budget.reschedule(
+                    max(loop.time(), self._playback_until) + self._idle_timeout
+                )
         finally:
             await _aclose(stream)
         # The turn is over, whatever ended it, so nothing is generating and anything
@@ -483,10 +494,23 @@ class VoiceConversation:
             logger.exception("voice: stopped feeding the session")
 
     def _on_audio(self, at: float, size: int) -> None:
-        """Note one chunk on its way to the speaker."""
+        """Note one chunk on its way to the speaker, and when it will finish playing.
+
+        The second half is what keeps the idle budget honest. The model generates
+        faster than real time, so a whole answer *arrives* long before it is *heard*:
+        measured on the owner's Mac, 28.4 s of audio landed in about 19 s, and the
+        30 s silence budget - rescheduled on arrival - had already been running for
+        ten of them while the daemon was still talking. The owner got 20.7 s of turn
+        instead of 30, was cut off mid-reply, and the log said "nothing heard for
+        30s" about a stretch it had spent speaking.
+        """
         self._played_bytes += size
         if self._first_audio_at is None:
             self._first_audio_at = at
+        seconds = size / (self._audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME)
+        # Chunks queue behind each other, so playback ends after whatever is already
+        # queued - not `at + seconds`, which would forget the backlog.
+        self._playback_until = max(self._playback_until, at) + seconds
 
     # --- transcripts --------------------------------------------------------
 

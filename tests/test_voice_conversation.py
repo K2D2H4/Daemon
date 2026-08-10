@@ -2234,3 +2234,43 @@ async def test_an_undeliverable_image_is_admitted_rather_than_described() -> Non
 
     assert "could not be delivered" in framed.content
     assert "DATA to look at" not in framed.content, "do not frame an image nobody got"
+
+
+# --- the silence budget counts silence, not speech ----------------------------
+
+
+def test_queued_audio_marks_when_the_room_actually_falls_silent() -> None:
+    """Chunks queue behind each other, so playback ends after the backlog - not at
+    "arrival + this chunk". Forgetting the backlog is what let a 28.4 s answer that
+    landed in 19 s spend ten of the owner's thirty silent seconds talking."""
+    from daemon.voice.conversation import PLAYBACK_BYTES_PER_FRAME
+
+    conv = conversation(FakeSession())
+    one_second = 24_000 * PLAYBACK_BYTES_PER_FRAME  # FakeAudio plays at 24 kHz
+
+    conv._on_audio(100.0, one_second)  # arrives at 100, plays 100 -> 101
+    conv._on_audio(100.1, one_second)  # arrives while the first is still playing
+
+    assert conv._playback_until == pytest.approx(102.0), "the backlog was forgotten"
+
+
+async def test_a_session_is_not_closed_while_the_daemon_is_still_speaking() -> None:
+    """The measured complaint: "데몬이 말하고 있는 시간도 nothing heard에 포함되나?" It
+    was. The model generates faster than real time, so the whole answer arrived, the
+    budget started running on arrival, and the owner was cut off mid-reply while the
+    log claimed nothing had been heard for 30 s."""
+    from daemon.voice.conversation import PLAYBACK_BYTES_PER_FRAME
+
+    quarter_second = 24_000 // 4 * PLAYBACK_BYTES_PER_FRAME
+    session = FakeSession(b"\x00" * quarter_second, Hang())
+    conv = conversation(session, idle_timeout=0.05)
+
+    started = asyncio.get_running_loop().time()
+    async with asyncio.timeout(5):
+        await conv.run()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed > 0.25, (
+        "the session closed while the speaker still had audio queued - the budget "
+        "counted the daemon's own voice as silence"
+    )
