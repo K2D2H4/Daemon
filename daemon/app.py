@@ -1015,7 +1015,11 @@ async def _build_voice_runtime(
 
 
 async def run_voice(
-    settings: Settings, *, opening_audio: bytes = b"", shared: VoiceRuntime | None = None
+    settings: Settings,
+    *,
+    opening_audio: bytes = b"",
+    opening_text: str = "",
+    shared: VoiceRuntime | None = None,
 ) -> int:
     """One spoken conversation at this machine, then exit.
 
@@ -1192,6 +1196,7 @@ async def run_voice(
                 companion,
                 GeminiLiveError,
                 opening_audio=opening_audio,
+                opening_text=opening_text,
                 screen_share=screen_share,
                 screen_pump_factory=screen_pump_factory,
                 barge_in=settings.voice_barge_in,
@@ -1308,6 +1313,7 @@ async def _voice_attempts(
     companion: Companion,
     session_error: type[Exception],
     opening_audio: bytes = b"",
+    opening_text: str = "",
     screen_share: Any = None,
     screen_pump_factory: Callable[[Any], Any] | None = None,
     barge_in: bool = True,
@@ -1346,6 +1352,7 @@ async def _voice_attempts(
             audio,
             companion,
             opening_audio=pending_opening,
+            opening_text=opening_text,
             screen_share=screen_share,
             screen_pump_factory=screen_pump_factory,
             barge_in=barge_in,
@@ -1500,16 +1507,24 @@ async def _wake_round(
     # for: the gate consumed "루시 뭐 해", matched on the alias, and the owner had to
     # say "뭐 해" again into a microphone that had just changed hands.
     #
-    # When the owner *only* called the name, though, the segment is the name alone,
-    # and handing it over gives the session's own transcriber a syllable to
-    # misread as a first utterance. Measured: "벨라" arrived at the model as
-    # "별로" - an ordinary Korean word meaning "not really" - so the daemon opened
-    # by answering something the owner had not said. The local recognizer already
-    # decided this segment is the wake word and nothing else; sending it buys a
-    # second, worse opinion. Silence is the honest handover: the owner is about to
-    # speak into a live microphone.
-    opening = b"" if _only_the_wake_word(fired) else fired.pcm
-    await run_voice(settings, opening_audio=opening, shared=shared)
+    # When the owner *only* called the name, the segment is the name alone, and
+    # handing over its audio gives the session's own transcriber a syllable to
+    # misread as a first utterance. Measured: "벨라" arrived at the model as "별로"
+    # - an ordinary Korean word meaning "not really" - so the daemon opened by
+    # answering something the owner had not said. The local recognizer has already
+    # decided what this segment is, so the *words* are settled and only the audio
+    # is ambiguous: the name goes over as text instead, where there is nothing left
+    # to mishear. Sending nothing at all was tried in between and is worse - the
+    # owner called, got silence, waited ten seconds and called again.
+    name_only = _only_the_wake_word(fired)
+    await run_voice(
+        settings,
+        opening_audio=b"" if name_only else fired.pcm,
+        # The name as the recognizer heard it, so the model answers being called
+        # instead of waiting on a microphone the owner thinks is dead.
+        opening_text=fired.heard if name_only else "",
+        shared=shared,
+    )
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
     await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)

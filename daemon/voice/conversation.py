@@ -176,6 +176,7 @@ class VoiceConversation:
         channel: str = VOICE_CHANNEL,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
         opening_audio: bytes = b"",
+        opening_text: str = "",
         screen_share: ScreenShareController | None = None,
         screen_pump_factory: Callable[[VoiceSession], ScreenSharePump] | None = None,
         barge_in: bool = True,
@@ -190,6 +191,16 @@ class VoiceConversation:
         DAEMON_VOICE_BARGE_IN). False is half-duplex: answers always play to the
         end, and speaking over one changes nothing until it finishes."""
         self._opening_audio = opening_audio
+        self._opening_text = opening_text
+        """What the owner said, as text, when the audio is not worth sending.
+
+        The wake-word-only case: the local recognizer has already decided the
+        segment is the name and nothing else, so the *words* are settled and only
+        the audio is ambiguous - sent as audio, "벨라" reached the model as "별로"
+        and it answered a sentence nobody said. Sent as text there is nothing left
+        to mishear, and the model answers being called by name the way a person
+        does. Skipping it entirely is not the third option: that leaves the owner
+        calling into silence, waiting, and calling again."""
         """Audio to hand the session before the microphone is even open.
 
         The wake gate's own segment, normally: it heard the owner say "루시 뭐 해",
@@ -349,10 +360,13 @@ class VoiceConversation:
         Never fails the conversation: an opening that cannot be delivered costs the
         user one repeated sentence, and raising here would cost them the whole turn.
         """
-        if not self._opening_audio:
-            return
         try:
-            await session.send_audio(self._opening_audio)
+            if self._opening_audio:
+                await session.send_audio(self._opening_audio)
+            elif self._opening_text:
+                # A prompt, so the model answers it - which is the point: being
+                # called by name deserves an answer, not silence.
+                await session.send_text(self._opening_text)
         except Exception:
             logger.exception("voice: could not hand over the utterance that opened the session")
 
