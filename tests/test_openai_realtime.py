@@ -13,10 +13,18 @@ import json
 
 import pytest
 
+from daemon.llm.base import ToolCall, ToolSpec
+from daemon.voice.base import Interrupted, Transcript
 from daemon.voice.openai_realtime import OpenAIRealtimeSession, _upsample_16k_to_24k
 
 KEY, MODEL = "sk-test", "gpt-realtime"
 SESSION_UPDATED = {"type": "session.updated"}
+
+
+def _a_tool_spec_named(name: str) -> ToolSpec:
+    return ToolSpec(
+        name=name, description="A tool.", parameters={"type": "object", "properties": {}}
+    )
 
 
 class FakeConnection:
@@ -104,3 +112,57 @@ async def test_bearer_auth_header_is_sent():
         pass
     _, headers = connect.calls[0]
     assert headers["Authorization"] == f"Bearer {KEY}"
+
+
+async def collect(live):
+    return [item async for item in live.receive()]
+
+
+def audio_delta(b):
+    return {"type": "response.output_audio.delta", "delta": base64.b64encode(b).decode()}
+
+
+async def test_receive_yields_audio_then_transcripts_then_ends_on_response_done():
+    conn = FakeConnection(
+        SESSION_UPDATED,
+        audio_delta(b"\x01\x02"),
+        {"type": "response.output_audio_transcript.done", "transcript": "안녕하세요"},
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "뭐 해"},
+        {"type": "response.done"},
+    )
+    async with make(conn) as live:
+        items = await collect(live)
+    assert b"\x01\x02" in [i for i in items if isinstance(i, bytes)]
+    texts = {(t.role, t.text, t.final) for t in items if isinstance(t, Transcript)}
+    assert ("assistant", "안녕하세요", True) in texts
+    assert ("user", "뭐 해", True) in texts
+
+
+async def test_speech_started_is_a_barge_in():
+    conn = FakeConnection(
+        SESSION_UPDATED,
+        audio_delta(b"\x01\x02"),
+        {"type": "input_audio_buffer.speech_started"},
+        {"type": "response.done"},
+    )
+    async with make(conn) as live:
+        items = await collect(live)
+    assert any(isinstance(i, Interrupted) for i in items)
+
+
+async def test_function_call_becomes_a_toolcall():
+    conn = FakeConnection(
+        SESSION_UPDATED,
+        {"type": "response.output_item.added",
+         "item": {"type": "function_call", "name": "open_path", "call_id": "c1"}},
+        {
+            "type": "response.function_call_arguments.done",
+            "call_id": "c1",
+            "arguments": '{"path": "/tmp"}',
+        },
+        {"type": "response.done"},
+    )
+    async with make(conn, tools=(_a_tool_spec_named("open_path"),)) as live:
+        items = await collect(live)
+    calls = [i for i in items if isinstance(i, ToolCall)]
+    assert calls and calls[0].name == "open_path" and calls[0].arguments == {"path": "/tmp"}

@@ -17,20 +17,24 @@ import json
 import logging
 import os
 import ssl
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from typing import Any
 
 import certifi
 import websockets
-from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
+from websockets.exceptions import (
+    ConnectionClosed,
+    ConnectionClosedOK,
+    InvalidHandshake,
+    InvalidStatus,
+)
 
-from daemon.llm.base import ToolSpec
-from daemon.voice.base import Transcript
+from daemon.llm.base import ToolCall, ToolSpec, decode_tool_arguments, synthesise_call_id
+from daemon.voice.base import Interrupted, Transcript
 
-# `ToolCall`/`ToolResult`/`Interrupted`, `decode_tool_arguments`/`synthesise_call_id`,
-# `ConnectionClosedOK`, and `AsyncIterator`/`Iterator` are not imported here - nothing
-# in this task's slice (`__aenter__`/`_handshake`/`send_audio`) uses them yet. They
-# come back with `receive()`/`send_tool_response()` in Tasks 3-4.
+# `ToolResult` is not imported here - nothing in this task's slice (`receive()`'s
+# decoder) sends a tool result back yet. That comes with `send_tool_response()` in
+# Task 4.
 
 logger = logging.getLogger(__name__)
 
@@ -203,8 +207,7 @@ def _backoff_delay(failures: int) -> float:
 class OpenAIRealtimeSession:
     """Implements the `VoiceSession` protocol in daemon/voice/base.py.
 
-    Task 2 builds connect/configure/send_audio only; `receive`/`send_*`/`interrupt`
-    land in later tasks (docs/PLAN.md Phase B1).
+    `send_tool_response`/`interrupt` land in a later task (docs/PLAN.md Phase B1).
     """
 
     name = "openai-realtime"
@@ -245,7 +248,7 @@ class OpenAIRealtimeSession:
         self._said: dict[str, list[str]] = {"user": [], "assistant": []}
         # In-progress user speech, pushed as it arrives for `partial_transcripts`.
         self._partials: asyncio.Queue[Transcript | None] = asyncio.Queue(PARTIAL_BACKLOG)
-        # Set at a turn boundary and cleared by `receive()`. Later task.
+        # Set at a turn boundary and cleared by `receive()`.
         self._turn_over = False
         self._dropping = False
         # Whether the model is mid-generation. `interrupt()` is only allowed to
@@ -257,7 +260,7 @@ class OpenAIRealtimeSession:
         a socket that is gone."""
         self._funcs: dict[str, dict[str, Any]] = {}
         """Function-call items accumulated by id, across `response.output_item.added`
-        and `response.function_call_arguments.done` events. Later task."""
+        and `response.function_call_arguments.done` events - see `_decode`."""
         self._log_filter = _KeyFilter(api_key)
         self._filtered: list[logging.Logger | logging.Handler] = [logging.getLogger("websockets")]
         # Handler-level too: logging runs the originating logger's filters, never
@@ -324,6 +327,53 @@ class OpenAIRealtimeSession:
                 "audio": base64.b64encode(pcm24).decode("ascii"),
             }
         )
+
+    async def receive(self) -> AsyncIterator[bytes | Transcript | Interrupted | ToolCall]:
+        """One turn: audio chunks to play, interleaved with completed transcripts.
+
+        Only `final=True` transcripts are ever yielded - see gemini_live.py's
+        `receive()` for why deltas are accumulated rather than handed out as they
+        arrive. **Ends at the turn boundary** (`response.done`), and `ended` stays
+        None when it does: the turn is over, the session is not.
+        """
+        ws = self._require_open()
+        self._turn_over = False
+        closed: OpenAIRealtimeError | None = None
+        try:
+            async for raw in ws:
+                for item in self._decode(raw):
+                    yield item
+                if self._turn_over:
+                    return
+        except ConnectionClosedOK:
+            pass
+        except ConnectionClosed as exc:
+            closed = self._closed_error(exc)
+        # A dropped connection must not swallow the last thing that was said:
+        # flush before surfacing the failure.
+        for item in self._flush():
+            yield item
+        self.ended = str(closed) if closed is not None else "the server closed the stream"
+        self._end_partials()
+        if closed is not None:
+            raise closed
+
+    def pending_transcripts(self) -> list[Transcript]:
+        """Take what has been transcribed but not yet released - see
+        gemini_live.py's version for why this exists."""
+        return list(self._flush())
+
+    async def partial_transcripts(self) -> AsyncIterator[Transcript]:
+        """The user's utterance as it grows, one item per delta that arrives.
+
+        See gemini_live.py's version - identical reasoning, `final=False` always,
+        user only, ends when the session does.
+        """
+        while True:
+            partial = await self._partials.get()
+            if partial is None:
+                return
+            yield partial
 
     def _require_open(self) -> Any:
         if self._ws is None:
@@ -470,6 +520,92 @@ class OpenAIRealtimeSession:
             logger.warning("openai-realtime: dropping a message that is not JSON")
             return None
         return message if isinstance(message, dict) else None
+
+    def _decode(self, raw: str | bytes) -> Iterator[bytes | Transcript | Interrupted | ToolCall]:
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            logger.warning("openai-realtime: dropping a non-JSON message")
+            return
+        if not isinstance(msg, dict):
+            return
+        t = msg.get("type")
+        if t in _AUDIO_DELTA:
+            self._generating = True
+            if not self._dropping:
+                try:
+                    yield base64.b64decode(msg.get("delta") or "", validate=True)
+                except Exception:
+                    logger.warning("openai-realtime: undecodable audio delta")
+            return
+        if t == _SPEECH_STARTED:
+            if self._generating:
+                self._dropping = True
+                yield Interrupted()
+            return
+        if t in _ASSISTANT_TR_DELTA:
+            self._said["assistant"].append(msg.get("delta") or "")
+            return
+        if t in _ASSISTANT_TR_DONE:
+            # `transcript` carries the full text; prefer it over accumulated deltas.
+            text = msg.get("transcript")
+            if isinstance(text, str) and text:
+                self._said["assistant"] = [text]
+            return
+        if t in _USER_TR_DELTA:
+            self._said["user"].append(msg.get("delta") or "")
+            self._push_partial()
+            return
+        if t in _USER_TR_DONE:
+            text = msg.get("transcript")
+            if isinstance(text, str) and text:
+                self._said["user"] = [text]
+                self._push_partial()
+            return
+        if t == _OUTPUT_ITEM_ADDED:
+            item = msg.get("item") or {}
+            if item.get("type") == "function_call":
+                cid = item.get("call_id") or item.get("id") or ""
+                self._funcs[cid] = {"name": item.get("name"), "args": ""}
+            return
+        if t == _FUNC_ARGS_DONE:
+            cid = msg.get("call_id") or ""
+            rec = self._funcs.pop(cid, {"name": None})
+            name = rec.get("name")
+            if isinstance(name, str) and name and self._tools:
+                yield ToolCall(
+                    id=cid or synthesise_call_id(name, 0),
+                    name=name,
+                    arguments=decode_tool_arguments(msg.get("arguments")),
+                )
+            return
+        if t == "error":
+            logger.warning("openai-realtime: server error %s", msg.get("error"))
+            return
+        if t == _RESPONSE_DONE:
+            self._dropping = False
+            self._generating = False
+            yield from self._flush()
+            self._turn_over = True
+            return
+
+    def _flush(self) -> Iterator[Transcript]:
+        """Release the accumulated turn, user first - see gemini_live.py's version
+        for why one role at a time, cleared as it is handed over."""
+        for role in ("user", "assistant"):
+            fragments = self._said[role]
+            self._said[role] = []
+            text = "".join(fragments).strip()
+            if text:
+                yield Transcript(text=text, role=role, final=True)
+
+    def _push_partial(self) -> None:
+        """Offer the utterance so far to whoever is listening for it. Never
+        blocks and never raises - see gemini_live.py's version."""
+        text = "".join(self._said["user"]).strip()
+        if not text:
+            return
+        self._offer_partial(Transcript(text=text, role="user", final=False))
 
     def _end_partials(self) -> None:
         """Close the partial stream so `async for` over it finishes rather than
