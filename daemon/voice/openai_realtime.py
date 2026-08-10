@@ -79,13 +79,6 @@ application-level invalid_request (measured: a beta-shaped session.update on gpt
 closes 4000 invalid_request_error.beta_api_shape_disabled) - a malformed request retries
 into the same close. 1008 is deliberately NOT here: like Gemini's, an idle/normal close
 can wear it and must be retried; OpenAI's exact 1008 semantics are still unconfirmed."""
-"""1008 is deliberately excluded. gemini_live.py measured its own 1008 as an idle
-timeout wearing a policy-violation code, and classifying it permanent there ended
-a voice turn with no retry for something that was just weather. OpenAI's 1008
-semantics are unconfirmed against a live socket - the spike/`daemon voice` run
-pins them - and until they are, retrying is the safer default: a genuinely
-permanent 1008 costs a few retries and some backoff before failing with the same
-message, while a wrongly-permanent one would silently stop reconnecting."""
 
 
 def _permanent_close(code: int, reason: str) -> bool:

@@ -134,6 +134,8 @@ async def test_bearer_auth_header_is_sent():
         pass
     _, headers = connect.calls[0]
     assert headers["Authorization"] == f"Bearer {KEY}"
+    # GA drops the beta header; re-adding it makes gpt-realtime close 4000.
+    assert "OpenAI-Beta" not in headers
 
 
 async def collect(live):
