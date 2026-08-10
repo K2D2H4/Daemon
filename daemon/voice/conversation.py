@@ -53,7 +53,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 
 from daemon import clock
@@ -68,6 +68,7 @@ from daemon import clock
 from daemon.companion import Companion
 from daemon.llm.base import ToolCall
 from daemon.memory.base import LoggedMessage, RecalledItem
+from daemon.tools.base import ToolResult
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 from daemon.voice.screen_share import ScreenShareController, ScreenSharePump
 
@@ -757,7 +758,68 @@ class VoiceConversation:
         # (`daemon tools log`); the runner also logs each run at INFO. A spoken turn
         # has no reply line to fold a notice into, and reading raw commands aloud is
         # exactly the clutter this removal is about.
-        await session.send_tool_response(outcome.results)
+        results = await self._deliver_images(session, outcome.results)
+        await session.send_tool_response(results)
+
+    async def _deliver_images(
+        self, session: VoiceSession, results: Sequence[ToolResult]
+    ) -> Sequence[ToolResult]:
+        """Put what a tool captured in front of the model, not just its caption.
+
+        `see_screen` returns a caption *and* pixels (`ToolResult.images`). The text
+        loop attaches the pixels as their own user turn (daemon/loop.py); voice
+        dropped them on the floor and sent only the caption - "captured 1
+        display(s)" - so the model was asked what is on screen while being shown
+        nothing, and did what a model does with a question it cannot answer: it
+        invented one. The owner's screen held a photo of food and the daemon called
+        it a picture of a dog, confidently, while the text path described the same
+        screen correctly.
+
+        Frames go over `realtime_input.video`, the channel the live share already
+        uses, and they go *before* the tool response so the image is in history when
+        the model composes its answer. Verified against the live socket rather than
+        inferred: a probe image carrying the digits 7392 came back read aloud
+        correctly, which is also what retires the "pending confirmation" note this
+        transport used to carry.
+
+        Never fails the turn: an image that cannot be delivered downgrades the
+        caption to say so, which is the one honest thing to tell a model that is
+        about to be asked what it can see.
+        """
+        from dataclasses import replace
+
+        from daemon.tools.screen import screen_note
+
+        delivered: list[ToolResult] = []
+        for result in results:
+            if not result.images:
+                delivered.append(result)
+                continue
+            sent = 0
+            for image in result.images:
+                try:
+                    await session.send_frame(image.data)
+                    sent += 1
+                except Exception:
+                    logger.exception("voice: could not hand over a captured image")
+            if not sent:
+                delivered.append(
+                    replace(
+                        result,
+                        content=(
+                            f"{result.content}\n\nThe image could not be delivered, so "
+                            "you cannot see it. Say that rather than describing it."
+                        ),
+                    )
+                )
+                continue
+            # The untrusted-data framing rides in the caption, because a frame
+            # carries no text of its own - same stance as the text path, which puts
+            # `screen_note` on the turn holding the image (security stance A).
+            delivered.append(
+                replace(result, content=f"{result.content}\n\n{screen_note('the screen')}")
+            )
+        return delivered
 
 
 def _covers(prepared: str, said: str) -> bool:
