@@ -310,6 +310,7 @@ def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
         url=entry.url,
         key_env=entry.key_env or "",
         auth=entry.auth,
+        env=dict(entry.env),
         env_passthrough=tuple(entry.env_passthrough),
     )
 
