@@ -30,7 +30,7 @@ from daemon.memory.log import from_iso, utc_iso
 logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _INSERT_MESSAGE = """
 INSERT INTO messages
@@ -128,7 +128,7 @@ class Store:
                     self.conn.execute(ddl)
             # The index over external_id is left to schema.sql, which runs next
             # now that the column exists.
-        # v3 to v6 add only new tables, which schema.sql creates on its own.
+        # v3 to v7 add only new tables, which schema.sql creates on its own.
         self.conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),
@@ -1285,6 +1285,88 @@ class Store:
         ).fetchone()
         counts["responded"] = int(responded["n"])
         return counts
+
+    # --- M5: telemetry the admin reads back ----------------------------------
+
+    def record_proactive_round(
+        self,
+        *,
+        generated: int,
+        expired: int,
+        considered: int,
+        spoke: int,
+        declined: int,
+        blocked_by: str,
+        now: datetime,
+    ) -> int:
+        """Append one round to the audit, returning its id.
+
+        Written for the rounds that did nothing too. Those are the majority and
+        they are the point: "288 rounds, none of them spoke" and "the loop stopped
+        running" are the same picture without them.
+        """
+        cursor = self.conn.execute(
+            "INSERT INTO proactive_rounds "
+            "(ts, generated, expired, considered, spoke, declined, blocked_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (utc_iso(now), generated, expired, considered, spoke, declined, blocked_by),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def proactive_rounds_since(self, *, since: datetime) -> list[sqlite3.Row]:
+        """Every round since `since`, oldest first - the timeline's reading order."""
+        return self.conn.execute(
+            "SELECT * FROM proactive_rounds WHERE ts >= ? ORDER BY ts",
+            (utc_iso(since),),
+        ).fetchall()
+
+    def record_reflection_run(
+        self,
+        *,
+        date: str,
+        status: str,
+        messages_read: int,
+        facts: int,
+        entities: int,
+        observations: int,
+        detail: str,
+        now: datetime,
+    ) -> int:
+        """Append one pass to the audit, returning its id.
+
+        Includes the passes that failed, which the artifact file cannot: it is not
+        written when the model is unreachable, so a broken night and a night with
+        nothing to say look identical on disk.
+        """
+        cursor = self.conn.execute(
+            "INSERT INTO reflection_runs "
+            "(ts, date, status, messages_read, facts, entities, observations, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                utc_iso(now),
+                date,
+                status,
+                messages_read,
+                facts,
+                entities,
+                observations,
+                detail,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def reflection_runs_since(self, *, since: datetime) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM reflection_runs WHERE ts >= ? ORDER BY ts",
+            (utc_iso(since),),
+        ).fetchall()
+
+    def recent_reflection_runs(self, limit: int = 20) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM reflection_runs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
 
     # --- M2: what reflection reads ------------------------------------------
 

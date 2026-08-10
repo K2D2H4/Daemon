@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,9 +68,16 @@ class FakeBridge:
         """Names with a live session, the way the real bridge tracks `_sessions`.
         `/servers` reads `is_connected`, so a test states liveness here rather than
         inferring it from `failures`."""
+        self.tools: dict[str, tuple[str, ...]] = {}
+        """What each server registered, the way the real bridge tracks `_registered`.
+        `/servers` reports it so the admin can show that a connected server actually
+        gave the model something."""
 
     def is_connected(self, name: str) -> bool:
         return name in self.live
+
+    def registered_tools(self, name: str) -> tuple[str, ...]:
+        return self.tools.get(name, ())
 
     def connected_names(self) -> tuple[str, ...]:
         return tuple(self.live)
@@ -632,3 +640,70 @@ async def test_concurrent_connects_are_serialized(tmp_path: Path) -> None:
     )
     # Both landed in mcp.json - the serialised read-modify-write lost neither.
     assert {c.name for c in load_config(tmp_path).servers} == {"fetch", "time"}
+
+
+# --- g. a server's own credentials live on its card --------------------------
+#
+# `GOOGLE_OAUTH_CLIENT_ID`/`SECRET` are a property of one catalog entry, not of the
+# daemon, so they belong here rather than in Settings' KEYS card - and a card only
+# rendered when MCP is on answers "only when MCP is enabled" for free.
+
+
+def test_catalog_reports_passthrough_names_and_whether_they_are_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "id-value")
+    monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_SECRET", raising=False)
+    client = TestClient(_enabled_app(tmp_path), base_url=LOOPBACK)
+
+    entries = {e["name"]: e for e in client.get("/admin/api/mcp/catalog").json()["catalog"]}
+    google = entries["google"]
+    states = {p["name"]: p["set"] for p in google["passthrough"]}
+
+    assert states == {"GOOGLE_OAUTH_CLIENT_ID": True, "GOOGLE_OAUTH_CLIENT_SECRET": False}
+    assert "id-value" not in json.dumps(google), "a credential value left the machine"
+
+
+def test_connect_writes_passthrough_credentials_and_makes_them_effective_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`.env` is only read into `os.environ` at boot (daemon/cli.py) and the stdio
+    child gets these from `os.environ` - so writing the file alone would leave the
+    value the owner just typed unusable until a restart."""
+    monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_ID", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    app = _enabled_app(tmp_path)
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.post(
+        "/admin/api/mcp/connect",
+        json={"name": "google", "passthrough": {"GOOGLE_OAUTH_CLIENT_ID": "written-id"}},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert "GOOGLE_OAUTH_CLIENT_ID=written-id" in env.read_text(encoding="utf-8")
+    assert os.environ["GOOGLE_OAUTH_CLIENT_ID"] == "written-id", (
+        "the child reads this from os.environ; a file-only write is invisible until reboot"
+    )
+
+
+def test_connect_refuses_a_variable_the_entry_does_not_declare(tmp_path: Path) -> None:
+    """The allowlist is the catalog's, not the client's (CONTRACTS 13). Otherwise a
+    page could write arbitrary environment into the owner's `.env`."""
+    env = tmp_path / ".env"
+    original = "DAEMON_PRESET=offline\n"
+    env.write_text(original, encoding="utf-8")
+    app = _enabled_app(tmp_path)
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.post(
+        "/admin/api/mcp/connect",
+        json={"name": "google", "passthrough": {"DAEMON_HOST": "0.0.0.0"}},
+    )
+
+    assert resp.status_code == 400
+    assert env.read_text(encoding="utf-8") == original
+    assert "DAEMON_HOST" not in env.read_text(encoding="utf-8")
