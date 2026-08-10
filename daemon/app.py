@@ -685,8 +685,12 @@ def open_store(settings: Settings) -> Iterator[Any]:
     opens the store the same way.
 
     One connection per request rather than a shared one: sqlite3 connections are
-    not safe to share across threads, the admin's callers are a poll every fifteen
-    seconds from one browser, and opening the file is measured in microseconds.
+    not safe to share across threads, and the admin's callers are one browser
+    polling every fifteen seconds. `Store.open` is not free - it replays the whole
+    of `schema.sql` and hardens three files - so this is a real cost, just a small
+    one against that traffic: measured end to end, the endpoints that use it answer
+    in 1.3-2.6ms against a 753-message database, under what `/health` takes. Reach
+    for a cached handle if something noisier than the admin ever wants one.
     """
     from daemon.memory.store import Store
 

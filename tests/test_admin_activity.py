@@ -195,8 +195,51 @@ def test_d_a_refused_call_is_its_own_kind(tmp_path: Path, store: Store) -> None:
     assert refused[0]["rule"] == "not on the allowlist", (
         "a refusal that does not say what stopped it cannot be acted on"
     )
+    # `tool` admits refusals too: "what did it try to run" includes the call a rule
+    # stopped, and that is the most interesting one on the page.
     tools = activity_payload(store, kind="tool")["items"]
-    assert [row["text"] for row in tools] == ["read_file /etc/hosts"]
+    assert {row["text"] for row in tools} == {
+        "read_file /etc/hosts",
+        "run_command rm -rf /",
+    }
+
+
+def test_d_a_filter_reaches_past_the_page_limit(tmp_path: Path, store: Store) -> None:
+    """The `kind` filter is applied before `limit` truncates. Applied after, a page
+    of sixty allowed calls hid the refusal underneath them and `?kind=refused` came
+    back empty while the row was in the table."""
+    now = clock_now()
+    store.record_tool_call(
+        tool="write_file",
+        arguments="{}",
+        preview="write_file /etc/hosts",
+        verdict="deny",
+        mode="full",
+        reason="outside the allowed roots",
+        origin="owner",
+        channel="cli",
+        sender_id=None,
+        now=now - timedelta(hours=2),
+    )
+    for i in range(60):
+        store.record_tool_call(
+            tool="read_file",
+            arguments="{}",
+            preview=f"read_file {i}",
+            verdict="allow",
+            mode="full",
+            reason="",
+            origin="owner",
+            channel="cli",
+            sender_id=None,
+            ran=True,
+            ok=True,
+            now=now,
+        )
+
+    refused = activity_payload(store, kind="refused", limit=60)["items"]
+
+    assert [row["text"] for row in refused] == ["write_file /etc/hosts"]
 
 
 # --- the endpoints themselves ------------------------------------------------

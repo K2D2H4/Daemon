@@ -276,6 +276,15 @@ section.on{animation:rise .3s ease both}
 .lrow .t{font-size:12px;color:var(--td)}
 .lrow .x{font-size:12.5px;color:var(--tb);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lrow .d{font-size:11.5px;text-align:right;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trow{display:grid;grid-template-columns:78px 110px minmax(0,1fr) 150px 110px auto;gap:12px;
+ align-items:center;padding:11px 16px;border-bottom:1px solid var(--hair)}
+.trow:last-child{border-bottom:none}
+.trow .t{font-size:12px;color:var(--td)}
+.trow .x{font-size:12.5px;color:var(--tb);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trow .o,.trow .m{font-size:11.5px;color:var(--tf);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trow .d{font-size:11.5px;text-align:right;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:900px){.trow{grid-template-columns:70px 96px minmax(0,1fr);row-gap:4px}
+ .trow .o,.trow .m,.trow .d{grid-column:1/-1;text-align:left}}
 
 /* --- mcp ------------------------------------------------------------------ */
 .srow{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--hair);flex-wrap:wrap}
@@ -453,6 +462,12 @@ input:focus,select:focus{border-color:var(--accent);outline:none}
     <div class="card" id="log"><p class="empty">Loading…</p></div>
   </section>
 
+  <section id="view-tools">
+    <div><span class="lab">TOOL CALLS</span>
+      <p class="cap" id="tool-summary" style="margin:8px 0 0">—</p></div>
+    <div class="card" id="tool-log"><p class="empty">Loading…</p></div>
+  </section>
+
   <section id="view-mcp">
     <div><span class="lab">MCP SERVERS</span>
       <p class="cap" style="margin:8px 0 0;max-width:640px">Install a server from the trusted catalog. Its tools still pass the origin gate — nothing here runs on a turn that is not yours.</p></div>
@@ -533,7 +548,10 @@ function sprite(state){const d=$(`#sprite-defs [data-s="${state}"]`);return d?d.
 // to say" and "what is it allowed to run" are separate questions, and neither is
 // findable under a generic Activity tab.
 const NAV={overview:{view:'overview'},activity:{view:'activity',filter:'all'},
-  proactive:{view:'activity',filter:'proact'},tools:{view:'activity',filter:'tool'},
+  proactive:{view:'activity',filter:'proact'},
+  // Its own view, not the merged log filtered: `origin` is the column the whole
+  // tool policy turns on, and the merged log has no room for it.
+  tools:{view:'tools'},
   mcp:{view:'mcp'},chat:{view:'chat'},settings:{view:'settings'}};
 const LOG_TITLE={all:'ACTIVITY',proact:'PROACTIVE',tool:'TOOL CALLS',reflect:'REFLECTION',refused:'REFUSED'};
 let NAV_KEY='overview', FILTER='all';
@@ -545,6 +563,7 @@ function go(key,{push=true}={}){
   $$('.nav-item').forEach(b=>b.setAttribute('aria-current',String(b.dataset.nav===key)));
   $$('main section').forEach(s=>s.classList.toggle('on',s.id==='view-'+spec.view));
   if(spec.view==='activity'){syncFilterChips();renderLog();loadActivity();}
+  if(spec.view==='tools')loadToolLog();
   if(spec.view==='mcp')loadMcp();
   if(push&&location.hash.slice(1)!==key)location.hash=key;
 }
@@ -601,8 +620,10 @@ function renderHealth(h){
   $('#routing').innerHTML=Object.entries(h.routing||{}).map(([k,v])=>
     `<span class="k">${esc(k)}</span><span class="v">${esc(v)}</span>`).join('');
   $('#chat-route').textContent='chat_text → '+((h.routing&&h.routing.chat_text)||'—');
-  const m=String(h.tools||'').match(/(\d+)\s+tools/);
-  $('#c-tools').textContent=m?m[1]:'';
+  // Deliberately not the "N tools" from /health: that is how many tools are
+  // *registered*, and it sat beside a nav item that opens a *call log*. The counter
+  // is filled from the log itself in loadActivity().
+
 }
 function renderAttention(tiles,state){
   // The creature says the state; the list underneath says which subsystem is unhappy
@@ -920,11 +941,38 @@ function renderLog(){
 async function loadActivity(){
   try{const r=await api('/admin/api/activity?limit=200');LOG=r.items||[];
     $('#c-activity').textContent=LOG.length>=200?'200+':String(LOG.length);
+    const calls=LOG.filter(r=>r.kind==='tool'||r.kind==='refused').length;
+    $('#c-tools').textContent=calls>=200?'200+':String(calls);
     renderRecent();renderLog();}
   catch(e){$('#recent').innerHTML=`<p class="empty">${esc(e.message)}</p>`;
     $('#log').innerHTML=`<p class="empty">${esc(e.message)}</p>`;}
 }
 $$('.fchip').forEach(c=>c.addEventListener('click',()=>{FILTER=c.dataset.filter;syncFilterChips();renderLog();}));
+
+// --- tool calls -------------------------------------------------------------
+// The one view that shows *why* a call was allowed: the policy mode in force and
+// the origin of the turn that asked for it. A turn that is not the owner's own
+// words never reaches a tool (CONTRACTS 10), and this column is the evidence.
+function toolRow(r){
+  const cls=r.verdict==='deny'?'v-refused':(r.ok===false?'v-err':(r.ran?'v-ok':'v-blocked'));
+  const outcome=r.verdict==='deny'?('refused · '+(r.reason||'policy'))
+    :(!r.ran?'waiting':(r.ok?('ok'+(r.duration_ms!=null?` · ${r.duration_ms}ms`:'')):'failed'));
+  return `<div class="trow"><span class="t">${stamp(r.ts)}</span>
+    <span class="chip k-${r.verdict==='deny'?'refused':'tool'}">${esc(r.tool.split('__').pop())}</span>
+    <span class="x" title="${esc(r.arguments||r.preview)}">${esc(r.preview||r.tool)}</span>
+    <span class="o" title="origin of the turn that asked">${esc(r.origin)} · ${esc(r.channel)}</span>
+    <span class="m">mode=${esc(r.mode)}</span>
+    <span class="d ${cls}" title="${esc(outcome)}">${esc(outcome)}</span></div>`;
+}
+async function loadToolLog(){
+  try{const {items}=await api('/admin/api/tools/log?limit=200');
+    const denied=items.filter(r=>r.verdict==='deny').length;
+    $('#tool-summary').textContent=
+      `${items.length} call(s) · ${denied} refused · newest first · refreshes when you open this view`;
+    $('#tool-log').innerHTML=items.length?items.map(toolRow).join('')
+      :'<p class="empty">No tool call has been recorded yet.</p>';
+  }catch(e){$('#tool-log').innerHTML=`<p class="empty">${esc(e.message)}</p>`;}
+}
 
 // --- chat -------------------------------------------------------------------
 let chatRevert=null;
@@ -1041,8 +1089,15 @@ function collectPatch(){
     const f=el.dataset.f;
     if(BOOLS.includes(f)){const v=el.dataset.v==='true';if(v!==base(f))patch[f]=v;return;}
     let v=el.value;
-    if(f==='recall_limit'){v=parseInt(v,10);if(v!==base(f))patch[f]=v;return;}
-    if(f==='recall_half_life_days'){v=parseFloat(v);if(v!==base(f))patch[f]=v;return;}
+    // A cleared number input parses to NaN, which JSON.stringify sends as null and
+    // the server stores as the string "None" - so one emptied field 400'd the whole
+    // patch, taking every other edit with it, and (NaN !== NaN) left a permanent
+    // "1 unsaved" that only a re-render cleared.
+    if(f==='recall_limit'||f==='recall_half_life_days'){
+      v=f==='recall_limit'?parseInt(v,10):parseFloat(v);
+      if(Number.isFinite(v)&&v!==base(f))patch[f]=v;
+      return;
+    }
     if(SECRETS.includes(f)){if(v.trim())patch[f]=v;return;}
     if(v!==(base(f)??''))patch[f]=v;
   });
@@ -1088,8 +1143,14 @@ $('#settings-save').onclick=async()=>{
     // pre-restart values and revert the form, which reads as "the save was lost". So
     // reflect the saved patch locally (secrets become "set") instead of re-fetching.
     // Not written into `editable`: that is what the process is *running*, and a save
-    // does not change it. The patch becomes pending, which is what the fields show.
-    for(const k of Object.keys(patch)){if(!SECRETS.includes(k))PENDING[k]=patch[k];}
+    // does not change it. The patch becomes pending, which is what the fields show -
+    // unless it saved the value back to what the daemon is already running, which is
+    // nothing to restart for and must drop the badge rather than keep it forever.
+    for(const k of Object.keys(patch)){
+      if(SECRETS.includes(k))continue;
+      if(patch[k]===SETTINGS.editable[k])delete PENDING[k];
+      else PENDING[k]=patch[k];
+    }
     renderSettings();
     if(r.restart_required){
       n.className='note ok';n.textContent='Saved to .env. Restarting…';

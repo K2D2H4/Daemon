@@ -43,6 +43,17 @@ KINDS = ("proact", "tool", "reflect", "refused")
 its own kind rather than a `tool` with a bad verdict because "what was it stopped
 from doing" is the question that gets asked on its own."""
 
+_MATCHES: dict[str, frozenset[str]] = {
+    "proact": frozenset({"proact"}),
+    "reflect": frozenset({"reflect"}),
+    "refused": frozenset({"refused"}),
+    # Asking for tool calls means asking what it tried to run, and the calls it was
+    # stopped from running are the most interesting of those. `refused` narrows to
+    # them; `tool` must not hide them.
+    "tool": frozenset({"tool", "refused"}),
+}
+"""Which row kinds each filter admits. Not an identity map: see `tool`."""
+
 DEFAULT_LIMIT = 60
 MAX_LIMIT = 500
 """A ceiling, so a hand-typed `?limit=100000` cannot make the admin read the whole
@@ -211,17 +222,22 @@ def activity_payload(
     wanted = kind if kind in KINDS else "all"
     since = clock_now() - timedelta(days=7)
 
+    # Each source is read to its own ceiling and the `kind` filter is applied to the
+    # merged result *before* `limit` truncates it. Reading only `limit` rows per
+    # source and filtering afterwards returned an empty page for a filter whose rows
+    # exist: sixty allowed tool calls since the last denial pushed every refusal out
+    # of the window that `?kind=refused&limit=60` ever looked at (reproduced).
     rows: list[dict[str, Any]] = []
     if wanted in ("all", "proact"):
         rows += _round_rows(store, since)
         rows += _utterance_rows(store, since)
     if wanted in ("all", "tool", "refused"):
-        rows += _tool_rows(store, limit if wanted != "all" else MAX_LIMIT)
+        rows += _tool_rows(store, MAX_LIMIT)
     if wanted in ("all", "reflect"):
-        rows += _reflection_rows(store, limit)
+        rows += _reflection_rows(store, MAX_LIMIT)
 
     if wanted in KINDS:
-        rows = [row for row in rows if row["kind"] == wanted]
+        rows = [row for row in rows if row["kind"] in _MATCHES[wanted]]
     rows.sort(key=lambda row: row["ts"], reverse=True)
     return {"items": rows[:limit], "kind": wanted}
 
@@ -249,7 +265,12 @@ def _quiet_window(settings: Settings) -> dict[str, Any] | None:
     }
 
 
-def _marks(store: Store, since: datetime) -> list[dict[str, str]]:
+def _marks(
+    store: Store,
+    since: datetime,
+    rounds: list[Any] | None = None,
+    tool_calls: list[Any] | None = None,
+) -> list[dict[str, str]]:
     """Every mark on the local day's timeline as `{ts, kind}`.
 
     Two different things, deliberately given two different shapes by the browser:
@@ -268,7 +289,13 @@ def _marks(store: Store, since: datetime) -> list[dict[str, str]]:
     timezone are allowed to disagree, and the axis is a local day.
     """
     marks: list[dict[str, str]] = []
-    for row in store.proactive_rounds_since(since=since):
+    # The caller has usually just read these for its own counts; re-reading them here
+    # doubled the two heaviest queries on a payload polled every fifteen seconds.
+    if rounds is None:
+        rounds = store.proactive_rounds_since(since=since)
+    if tool_calls is None:
+        tool_calls = store.recent_tool_calls(MAX_LIMIT)
+    for row in rounds:
         marks.append({"ts": row["ts"], "kind": "round"})
         # A round the gate refused is an event, not just a heartbeat - it is the
         # one place "it wanted to speak and a rule stopped it" is visible at a
@@ -277,7 +304,7 @@ def _marks(store: Store, since: datetime) -> list[dict[str, str]]:
             marks.append({"ts": row["ts"], "kind": "blocked"})
     for row in store.utterances_since(since=since):
         marks.append({"ts": row["spoken_at"], "kind": "spoke"})
-    for row in store.recent_tool_calls(MAX_LIMIT):
+    for row in tool_calls:
         if row["ts"] < utc_iso(since):
             continue
         marks.append({"ts": row["ts"], "kind": "refused" if row["verdict"] == "deny" else "tool"})
@@ -292,17 +319,14 @@ def today_payload(store: Store, settings: Settings) -> dict[str, Any]:
     day_start = local_day_start(now)
 
     rounds = store.proactive_rounds_since(since=day_start)
+    all_tool_calls = store.recent_tool_calls(MAX_LIMIT)
     blocked: dict[str, int] = {}
     for row in rounds:
         for rule, count in _blocked_by(row["blocked_by"]).items():
             blocked[rule] = blocked.get(rule, 0) + count
 
     spoken = store.utterances_since(since=day_start)
-    tool_calls = [
-        row
-        for row in store.recent_tool_calls(MAX_LIMIT)
-        if row["ts"] >= utc_iso(day_start)
-    ]
+    tool_calls = [row for row in all_tool_calls if row["ts"] >= utc_iso(day_start)]
     reflections = [
         {"ts": row["ts"], "date": row["date"], "status": row["status"]}
         for row in store.reflection_runs_since(since=day_start)
@@ -330,7 +354,7 @@ def today_payload(store: Store, settings: Settings) -> dict[str, Any]:
         "quiet_hours": _quiet_window(settings),
         "cooldown_minutes": cooldown,
         "enabled": settings.proactive_enabled,
-        "marks": _marks(store, day_start),
+        "marks": _marks(store, day_start, rounds=rounds, tool_calls=all_tool_calls),
         "now": utc_iso(now),
     }
 

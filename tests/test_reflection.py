@@ -598,3 +598,26 @@ async def test_the_artifact_shows_the_triggers(data_dir: Path, store: Store) -> 
     await pass_for(data_dir, store, reply).run(DAY)
 
     assert "triggers: 이사" in artifact_path(data_dir, DAY).read_text(encoding="utf-8")
+
+
+async def test_a_pass_that_raises_records_why_before_it_propagates(
+    data_dir: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`unavailable` is a returned Result; anything else the pass hits is an
+    exception, and it used to travel straight past the audit write. That left the
+    one outcome the table exists for - a pass that *broke* - as the only one with no
+    row, which is the same blindness the table was added to end."""
+    record(store, "연희동으로 이사했어")
+    reflection = pass_for(data_dir, store)
+
+    def explode(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("daemon.reflection._write_artifact", explode)
+
+    with pytest.raises(OSError):
+        await reflection.run(DAY)
+
+    rows = store.recent_reflection_runs()
+    assert [(row["date"], row["status"]) for row in rows] == [(DAY, "failed")]
+    assert "disk full" in rows[0]["detail"], "a failure that does not say why is not a readout"
