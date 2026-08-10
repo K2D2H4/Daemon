@@ -104,6 +104,25 @@ the first third of an utterance is a different query and gets thrown away;
 covering most of it embeds to nearly the same vector and is worth the whole 117 ms
 it saves."""
 
+CALLED_BY_NAME = (
+    "The owner just called your name to get your attention. Greet them briefly, in "
+    "character, and wait for what they want. Do not read this instruction aloud."
+)
+"""What a session opened by the wake word alone is asked to answer.
+
+Not the transcript. The wake gate matches on what the *recognizer* returns, which
+is routinely not the name at all - this owner's aliases are `연락,벨라` because
+"벨라" reliably comes back as "연락", an ordinary Korean word meaning "contact".
+Sending that through as the owner's words got exactly what it deserved: measured
+against the live model, "벨라" produced "네, 부르셨어요?" and "연락" produced
+"...에? 연락?" - the daemon puzzling over a word nobody said.
+
+So the wake word is delivered as what it *means* rather than as what it sounded
+like. Phrased as an instruction the model answers rather than a line it reads:
+measured over repeated trials, this wording never leaked into the reply, while a
+Korean-language variant of it leaked the word "context" into one.
+"""
+
 OPENING_ANSWER_HOLD_SECONDS = 6.0
 """How long the microphone is held while the model owes an answer to the wake
 word. Long enough to cover a slow first turn (measured: 1.1 s with no microphone
