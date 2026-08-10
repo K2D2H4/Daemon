@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import sys
+import threading
 from typing import Any
 
 import numpy as np
@@ -760,3 +761,35 @@ async def test_playing_after_close_is_silently_ignored(
 async def test_closing_twice_is_harmless(audio: VoiceProcessingAudio) -> None:
     await audio.close()
     await audio.close()
+
+
+# --- a wedged device must not take the daemon with it -------------------------
+
+
+async def test_a_stalled_engine_stop_does_not_block_the_event_loop(
+    audio: VoiceProcessingAudio, framework: FakeAVFoundation
+) -> None:
+    """Measured on the owner's Mac: `AudioOutputUnitStop` parked on `HALB_Mutex` and
+    never returned. It was awaited straight on the event loop, so it took the whole
+    daemon with it - Telegram stopped polling, /health stopped answering, and the
+    resident sat alive and mute until it was killed. A wedged audio device must cost
+    the conversation, not the process."""
+    await audio.play(b"\x00\x00" * 240)
+    stalled = threading.Event()
+
+    def wedge() -> None:
+        stalled.wait(timeout=5)  # the CoreAudio mutex that never unlocks
+
+    framework.engines[-1].stop = wedge
+
+    closing = asyncio.create_task(audio.close())
+    # The loop is still ours while the engine hangs: this only returns if `close`
+    # left the event loop free, which is the whole property under test.
+    ticks = 0
+    for _ in range(20):
+        await asyncio.sleep(0)
+        ticks += 1
+    assert ticks == 20 and not closing.done(), "the stop is blocking, not stalled off-loop"
+
+    stalled.set()
+    await asyncio.wait_for(closing, timeout=5)
