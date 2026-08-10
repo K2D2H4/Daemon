@@ -30,11 +30,8 @@ from websockets.exceptions import (
 )
 
 from daemon.llm.base import ToolCall, ToolSpec, decode_tool_arguments, synthesise_call_id
+from daemon.tools.base import ToolResult
 from daemon.voice.base import Interrupted, Transcript
-
-# `ToolResult` is not imported here - nothing in this task's slice (`receive()`'s
-# decoder) sends a tool result back yet. That comes with `send_tool_response()` in
-# Task 4.
 
 logger = logging.getLogger(__name__)
 
@@ -205,10 +202,7 @@ def _backoff_delay(failures: int) -> float:
 
 
 class OpenAIRealtimeSession:
-    """Implements the `VoiceSession` protocol in daemon/voice/base.py.
-
-    `send_tool_response`/`interrupt` land in a later task (docs/PLAN.md Phase B1).
-    """
+    """Implements the `VoiceSession` protocol in daemon/voice/base.py."""
 
     name = "openai-realtime"
 
@@ -258,6 +252,8 @@ class OpenAIRealtimeSession:
         """Why `receive()` finished, set as it finishes. Without it a session
         ending looks exactly like a turn ending, and the caller keeps talking into
         a socket that is gone."""
+        self._warned_no_video = False
+        """`send_frame` logs once, not per frame - see its docstring."""
         self._funcs: dict[str, dict[str, Any]] = {}
         """Function-call items accumulated by id, across `response.output_item.added`
         and `response.function_call_arguments.done` events - see `_decode`."""
@@ -327,6 +323,100 @@ class OpenAIRealtimeSession:
                 "audio": base64.b64encode(pcm24).decode("ascii"),
             }
         )
+
+    async def send_frame(self, jpeg: bytes) -> None:
+        """No-op: OpenAI Realtime has no realtime video input channel.
+
+        Screen share is Gemini-only (ADR 0009's `realtimeInput.video`); calling
+        this on this provider would otherwise fail silently every frame, so it
+        warns once instead - loud enough to notice, quiet enough not to spam a
+        log at frame rate.
+        """
+        if not self._warned_no_video:
+            logger.warning(
+                "openai-realtime: screen share is unsupported on OpenAI; frames are dropped"
+            )
+            self._warned_no_video = True
+
+    async def send_context(self, text: str) -> None:
+        """Put text in the model's history without asking it to answer.
+
+        A `conversation.item.create` message item, and deliberately no
+        `response.create` after it: that second message is what asks the model to
+        answer, and this is the only way recall reaches a voice turn without the
+        daemon narrating old memories nobody asked about (see `send_text`).
+        """
+        if not text.strip():
+            logger.debug("openai-realtime: nothing to seed; skipping send_context")
+            return
+        await self._send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+        )
+
+    async def send_text(self, text: str) -> None:
+        """Give the model something to say without any user audio.
+
+        Unlike `send_context`, this follows the item with `response.create`: the
+        model answers this text rather than reading it back verbatim.
+        """
+        if not text.strip():
+            logger.warning("openai-realtime: refusing to send empty text")
+            return
+        await self._send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+        )
+        await self._send({"type": "response.create"})
+
+    async def send_tool_response(self, results: Sequence[ToolResult]) -> None:
+        """Answer this turn's tool calls, one `function_call_output` item per
+        result, then one `response.create` to let the model continue.
+
+        Sends nothing when there is nothing to answer - the same reasoning as
+        gemini_live.py's version: a needless message on a per-minute-billed
+        socket buys nothing.
+        """
+        if not results:
+            logger.debug("openai-realtime: no tool results to send")
+            return
+        for result in results:
+            await self._send(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": result.call_id,
+                        "output": result.content,
+                    },
+                }
+            )
+        await self._send({"type": "response.create"})
+
+    async def interrupt(self) -> None:
+        """The user started talking over us.
+
+        Local only, like gemini_live.py's version: under server VAD the user's own
+        audio already stopped generation server-side, so this just refuses to hand
+        the caller any more of the abandoned turn's audio. A no-op when nothing is
+        being generated - same reasoning as the Gemini sibling.
+        """
+        if not self._generating:
+            logger.debug("openai-realtime: nothing is being generated; interrupt does nothing")
+            return
+        self._dropping = True
 
     async def receive(self) -> AsyncIterator[bytes | Transcript | Interrupted | ToolCall]:
         """One turn: audio chunks to play, interleaved with completed transcripts.

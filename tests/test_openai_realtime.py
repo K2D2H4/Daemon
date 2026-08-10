@@ -177,3 +177,41 @@ async def test_function_call_becomes_a_toolcall():
         items = await collect(live)
     calls = [i for i in items if isinstance(i, ToolCall)]
     assert calls and calls[0].name == "open_path" and calls[0].arguments == {"path": "/tmp"}
+
+
+async def test_send_context_adds_history_without_a_response():
+    conn = FakeConnection(SESSION_UPDATED)
+    async with make(conn) as live:
+        await live.send_context("recall: the user likes tea")
+    assert conn.sent_of_type("conversation.item.create")
+    assert not conn.sent_of_type("response.create")  # context must not make the model answer
+
+
+async def test_send_text_prompts_a_response():
+    conn = FakeConnection(SESSION_UPDATED)
+    async with make(conn) as live:
+        await live.send_text("say hello")
+    assert conn.sent_of_type("conversation.item.create")
+    assert conn.sent_of_type("response.create")
+
+
+async def test_send_tool_response_emits_function_output_then_response():
+    from daemon.tools.base import ToolResult
+    conn = FakeConnection(SESSION_UPDATED)
+    result = ToolResult(call_id="c1", name="open_path", ok=True, content="done")
+    async with make(conn) as live:
+        await live.send_tool_response([result])
+    outs = conn.sent_of_type("conversation.item.create")
+    assert any(
+        m["item"]["type"] == "function_call_output" and m["item"]["call_id"] == "c1"
+        for m in outs
+    )
+    assert conn.sent_of_type("response.create")
+
+
+async def test_send_frame_is_a_noop():
+    conn = FakeConnection(SESSION_UPDATED)
+    async with make(conn) as live:
+        await live.send_frame(b"\xff\xd8jpeg")
+    assert conn.sent == [conn.sent[0]] if conn.sent else True  # nothing beyond session.update
+    assert not conn.sent_of_type("input_audio_buffer.append")
