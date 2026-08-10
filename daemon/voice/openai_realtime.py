@@ -566,18 +566,29 @@ class OpenAIRealtimeSession:
             item = msg.get("item") or {}
             if item.get("type") == "function_call":
                 cid = item.get("call_id") or item.get("id") or ""
-                self._funcs[cid] = {"name": item.get("name"), "args": ""}
+                self._funcs[cid] = {"name": item.get("name")}
             return
         if t == _FUNC_ARGS_DONE:
             cid = msg.get("call_id") or ""
             rec = self._funcs.pop(cid, {"name": None})
             name = rec.get("name")
-            if isinstance(name, str) and name and self._tools:
-                yield ToolCall(
-                    id=cid or synthesise_call_id(name, 0),
-                    name=name,
-                    arguments=decode_tool_arguments(msg.get("arguments")),
-                )
+            if isinstance(name, str) and name:
+                if self._tools:
+                    yield ToolCall(
+                        id=cid or synthesise_call_id(name, 0),
+                        name=name,
+                        arguments=decode_tool_arguments(msg.get("arguments")),
+                    )
+                else:
+                    # A session that declared nothing cannot legitimately be asked
+                    # for anything - see gemini_live.py's `_decode_tool_calls` for
+                    # the same drop, logged there for the same reason: silence
+                    # here reads as a config mismatch nobody was told about.
+                    logger.warning(
+                        "openai-realtime: dropping a call to %r - no tool was "
+                        "offered in setup",
+                        name,
+                    )
             return
         if t == "error":
             logger.warning("openai-realtime: server error %s", msg.get("error"))

@@ -150,6 +150,17 @@ async def test_speech_started_is_a_barge_in():
     assert any(isinstance(i, Interrupted) for i in items)
 
 
+async def test_speech_started_with_nothing_generating_is_not_a_barge_in():
+    conn = FakeConnection(
+        SESSION_UPDATED,
+        {"type": "input_audio_buffer.speech_started"},
+        {"type": "response.done"},
+    )
+    async with make(conn) as live:
+        items = await collect(live)
+    assert not any(isinstance(i, Interrupted) for i in items)
+
+
 async def test_function_call_becomes_a_toolcall():
     conn = FakeConnection(
         SESSION_UPDATED,
