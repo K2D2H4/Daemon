@@ -177,12 +177,17 @@ class VoiceConversation:
         opening_audio: bytes = b"",
         screen_share: ScreenShareController | None = None,
         screen_pump_factory: Callable[[VoiceSession], ScreenSharePump] | None = None,
+        barge_in: bool = True,
     ) -> None:
         self._session = session
         self._audio = audio
         self._companion = companion
         self._channel = channel
         self._idle_timeout = idle_timeout
+        self._barge_in_enabled = barge_in
+        """Whether the microphone streams while the daemon talks (config.py,
+        DAEMON_VOICE_BARGE_IN). False is half-duplex: answers always play to the
+        end, and speaking over one changes nothing until it finishes."""
         self._opening_audio = opening_audio
         """Audio to hand the session before the microphone is even open.
 
@@ -458,6 +463,14 @@ class VoiceConversation:
                     # queued. The moment audio flows, `_generating` is set and the
                     # microphone resumes - barge-in over the spoken result works
                     # exactly as before.
+                    continue
+                if not self._barge_in_enabled and (self._generating or self._answering_tool):
+                    # Half-duplex, by the owner's choice (DAEMON_VOICE_BARGE_IN=false):
+                    # while the daemon is speaking, the microphone yields entirely, so
+                    # an answer always plays to the end - no echo leak, no "응" of
+                    # agreement, no room noise can kill it mid-sentence. The price is
+                    # stated in config.py: interrupting by voice does nothing until
+                    # the answer finishes.
                     continue
                 await session.send_audio(chunk)
         except asyncio.CancelledError:
