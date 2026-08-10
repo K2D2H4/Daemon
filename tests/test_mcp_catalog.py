@@ -53,6 +53,15 @@ def test_google_declares_the_oauth_env_it_reads() -> None:
     assert config.env_passthrough == ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
 
 
+def test_google_runs_single_user_so_a_spawned_launch_reuses_the_cached_token() -> None:
+    """The owner is the only account: `--single-user` makes the server load the one
+    cached credential without session mapping, so a stdio launch the daemon spawns
+    reuses a prior consent instead of trying (and failing) to authenticate headless."""
+    entry = lookup("google")
+    assert entry is not None
+    assert "--single-user" in entry.args
+
+
 def test_a_url_server_gets_no_uvx_pin() -> None:
     entry = lookup("tavily")
     assert entry is not None and entry.kind == "url"

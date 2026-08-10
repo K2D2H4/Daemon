@@ -136,7 +136,17 @@ CATALOG: tuple[CatalogEntry, ...] = (
             "GOOGLE_OAUTH_CLIENT_ID/SECRET and a one-time browser consent."
         ),
         command="uvx",
-        args=("workspace-mcp", "--permissions", "gmail:send", "calendar:full", "drive:readonly"),
+        # `--single-user`: the owner is the only account, so the server loads the one
+        # cached credential without session mapping - a stdio launch the daemon spawns
+        # reuses the token from a prior consent instead of trying to authenticate again.
+        args=(
+            "workspace-mcp",
+            "--single-user",
+            "--permissions",
+            "gmail:send",
+            "calendar:full",
+            "drive:readonly",
+        ),
         auth="none",
         pin_mcp=False,
         env_passthrough=("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"),

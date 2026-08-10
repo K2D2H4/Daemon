@@ -34,6 +34,7 @@ from daemon.tools.mcp import (
     _resolve_command,
     _stdio_env,
     load_config,
+    missing_passthrough_env,
     remove_server,
     save_server,
     server_config_from_catalog,
@@ -471,6 +472,24 @@ def test_stdio_env_omits_an_unset_passthrough_name(monkeypatch: pytest.MonkeyPat
     monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_ID", raising=False)
     config = ServerConfig(name="g", command="uvx", env_passthrough=("GOOGLE_OAUTH_CLIENT_ID",))
     assert "GOOGLE_OAUTH_CLIENT_ID" not in _stdio_env(config)
+
+
+def test_missing_passthrough_env_lists_only_the_unset_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stdio server that self-authenticates starts even with its OAuth env unset, so
+    the admin needs to know which names are missing to explain the coming failure."""
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "gcid")
+    monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_SECRET", raising=False)
+    config = ServerConfig(
+        name="google",
+        command="uvx",
+        env_passthrough=("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"),
+    )
+    assert missing_passthrough_env(config) == ["GOOGLE_OAUTH_CLIENT_SECRET"]
+
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "gcsecret")
+    assert missing_passthrough_env(config) == []
 
 
 # --- finding uvx under a service's minimal PATH -----------------------------
