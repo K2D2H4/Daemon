@@ -1441,6 +1441,17 @@ def _mic_health() -> str:
     return microphone_authorization_status()
 
 
+def _only_the_wake_word(fired: Any) -> bool:
+    """Did the owner call the name and stop, with no question attached?
+
+    Compared in the wake gate's own normalised form, so spacing, punctuation and
+    Unicode form cannot make "벨라" look different from the alias it matched.
+    """
+    from daemon.voice.wake import normalise
+
+    return normalise(fired.heard) == normalise(fired.matched)
+
+
 async def _wake_round(
     settings: Settings, shared: VoiceRuntime | None = None, state: Any = None
 ) -> None:
@@ -1484,11 +1495,21 @@ async def _wake_round(
         # guard handles the pacing.
         return
     logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
-    # The segment that fired the gate goes with it. Without this the session opens
-    # deaf to the question it was opened for: the gate consumed "루시 뭐 해", matched
-    # on the alias, and the owner had to say "뭐 해" again into a microphone that had
-    # just changed hands.
-    await run_voice(settings, opening_audio=fired.pcm, shared=shared)
+    # The segment that fired the gate goes with it - but only when it carries more
+    # than the name. Without it the session opens deaf to the question it was opened
+    # for: the gate consumed "루시 뭐 해", matched on the alias, and the owner had to
+    # say "뭐 해" again into a microphone that had just changed hands.
+    #
+    # When the owner *only* called the name, though, the segment is the name alone,
+    # and handing it over gives the session's own transcriber a syllable to
+    # misread as a first utterance. Measured: "벨라" arrived at the model as
+    # "별로" - an ordinary Korean word meaning "not really" - so the daemon opened
+    # by answering something the owner had not said. The local recognizer already
+    # decided this segment is the wake word and nothing else; sending it buys a
+    # second, worse opinion. Silence is the honest handover: the owner is about to
+    # speak into a live microphone.
+    opening = b"" if _only_the_wake_word(fired) else fired.pcm
+    await run_voice(settings, opening_audio=opening, shared=shared)
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
     await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
