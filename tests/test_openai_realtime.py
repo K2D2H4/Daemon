@@ -15,7 +15,12 @@ import pytest
 
 from daemon.llm.base import ToolCall, ToolSpec
 from daemon.voice.base import Interrupted, Transcript
-from daemon.voice.openai_realtime import OpenAIRealtimeSession, _upsample_16k_to_24k
+from daemon.voice.openai_realtime import (
+    OpenAIRealtimeError,
+    OpenAIRealtimeSession,
+    _permanent_close,
+    _upsample_16k_to_24k,
+)
 
 KEY, MODEL = "sk-test", "gpt-realtime"
 SESSION_UPDATED = {"type": "session.updated"}
@@ -136,6 +141,34 @@ async def test_receive_yields_audio_then_transcripts_then_ends_on_response_done(
     texts = {(t.role, t.text, t.final) for t in items if isinstance(t, Transcript)}
     assert ("assistant", "안녕하세요", True) in texts
     assert ("user", "뭐 해", True) in texts
+    # No double-emit: the user transcript arrived before `response.done` here,
+    # and it must be released exactly once, not once from the immediate path
+    # and again from `_flush`.
+    assert sum(1 for t in texts if t[0] == "user") == 1
+
+
+async def test_user_transcript_arriving_after_response_done_lands_in_the_next_turn():
+    # whisper-1 emits only `input_audio_transcription.completed` - a full
+    # transcript, no delta stream - and it commonly arrives *after*
+    # `response.done`. Here it is scripted as the very next server message,
+    # which `receive()` only sees once it is called again for the next turn.
+    # Dropping it - or misfiling it as belonging to the next turn's own speech -
+    # would lose the only thing memory gets from a voice turn.
+    conn = FakeConnection(
+        SESSION_UPDATED,
+        audio_delta(b"\x01\x02"),
+        {"type": "response.output_audio_transcript.done", "transcript": "hello"},
+        {"type": "response.done"},
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "뭐 해"},
+    )
+    async with make(conn) as live:
+        first_turn = await collect(live)
+        second_turn = await collect(live)
+    first_texts = {(t.role, t.text, t.final) for t in first_turn if isinstance(t, Transcript)}
+    assert ("assistant", "hello", True) in first_texts
+    assert not any(role == "user" for role, _, _ in first_texts)
+    second_texts = {(t.role, t.text, t.final) for t in second_turn if isinstance(t, Transcript)}
+    assert ("user", "뭐 해", True) in second_texts
 
 
 async def test_speech_started_is_a_barge_in():
@@ -215,3 +248,26 @@ async def test_send_frame_is_a_noop():
         await live.send_frame(b"\xff\xd8jpeg")
     assert conn.sent == [conn.sent[0]] if conn.sent else True  # nothing beyond session.update
     assert not conn.sent_of_type("input_audio_buffer.append")
+
+
+async def test_setup_error_fails_fast_instead_of_hanging_for_20s():
+    # OpenAI reports an invalid session.update via a top-level {"type": "error"}
+    # event and leaves the socket open - it never sends session.updated. Before
+    # the fix this fell through to the SETUP_TIMEOUT_SECONDS (20s) wait and then
+    # raised a misleading "no session.updated" message. The fake socket returns
+    # this as the very first message, so a passing test here is proof the error
+    # is caught immediately rather than proof of a fast clock.
+    conn = FakeConnection({"type": "error", "error": {"message": "unknown parameter"}})
+    with pytest.raises(OpenAIRealtimeError) as exc_info:
+        async with make(conn):
+            pass
+    assert "unknown parameter" in str(exc_info.value)
+
+
+def test_1007_is_permanent_1008_is_retried():
+    # gemini_live.py's sibling measured 1008 as an idle timeout wearing a
+    # policy-violation code; classifying it permanent by code alone defeats
+    # reconnect for something that was just weather. OpenAI's 1008 semantics are
+    # unconfirmed against a live socket, so this port keeps only 1007 permanent.
+    assert _permanent_close(1007, "") is True
+    assert _permanent_close(1008, "anything") is False

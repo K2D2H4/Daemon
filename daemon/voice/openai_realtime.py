@@ -73,10 +73,14 @@ _PERMANENT_STATUS = frozenset({400, 401, 403, 404})
 """Handshake statuses that retrying cannot fix: a bad, revoked or unauthorised
 key, or a wrong endpoint."""
 
-_PERMANENT_CLOSE_CODES = frozenset({1007, 1008})  # invalid payload / policy; confirm in spike
-"""Confirm in evals/openai_realtime_spike.py once a real key is available - ported
-as the closest analogue of gemini_live.py's classification, not yet measured
-against OpenAI's own socket."""
+_PERMANENT_CLOSE_CODES = frozenset({1007})  # invalid payload; confirm in spike
+"""1008 is deliberately excluded. gemini_live.py measured its own 1008 as an idle
+timeout wearing a policy-violation code, and classifying it permanent there ended
+a voice turn with no retry for something that was just weather. OpenAI's 1008
+semantics are unconfirmed against a live socket - the spike/`daemon voice` run
+pins them - and until they are, retrying is the safer default: a genuinely
+permanent 1008 costs a few retries and some backoff before failing with the same
+message, while a wrongly-permanent one would silently stop reconnecting."""
 
 
 def _permanent_close(code: int, reason: str) -> bool:
@@ -499,6 +503,18 @@ class OpenAIRealtimeSession:
                         continue
                     if message.get("type") == "session.updated":
                         return ws
+                    if message.get("type") == "error":
+                        # The socket stays open on a rejected `session.update` -
+                        # OpenAI reports it as a top-level error event rather than
+                        # closing. Left undetected, this loop would wait out the
+                        # full SETUP_TIMEOUT_SECONDS and then raise a misleading
+                        # "no session.updated" message for what is actually a bad
+                        # setup payload - a bug, not weather, so it is permanent.
+                        error = OpenAIRealtimeError(
+                            self._redact(f"session.update rejected: {self._error_detail(message)}"),
+                            permanent=True,
+                        )
+                        break
                     # Nothing else is required before setup completes.
                     logger.debug("openai-realtime: ignoring pre-setup message %s", sorted(message))
         except ConnectionClosed as exc:
@@ -647,10 +663,20 @@ class OpenAIRealtimeSession:
             self._push_partial()
             return
         if t in _USER_TR_DONE:
+            # whisper-1 (the model `_setup_message` requests) emits only this
+            # `completed` event - a full transcript, no delta stream - and it
+            # commonly arrives *after* `response.done`. Waiting for the turn
+            # boundary to release it, the way `_flush` does for the assistant
+            # side, would misfile a late arrival into the next turn or drop it
+            # if the session ends first - and in voice mode the transcript is
+            # the only thing memory ever gets. So the user side is yielded
+            # immediately, here, decoupled from `_flush`/`_turn_over` entirely.
+            self._said["user"] = []
             text = msg.get("transcript")
-            if isinstance(text, str) and text:
-                self._said["user"] = [text]
-                self._push_partial()
+            if isinstance(text, str) and text.strip():
+                clean = text.strip()
+                yield Transcript(text=clean, role="user", final=True)
+                self._offer_partial(Transcript(text=clean, role="user", final=False))
             return
         if t == _OUTPUT_ITEM_ADDED:
             item = msg.get("item") or {}
@@ -679,6 +705,15 @@ class OpenAIRealtimeSession:
                         "offered in setup",
                         name,
                     )
+            else:
+                # `output_item.added` was missing, or its `call_id` did not line
+                # up with this event's - either way there is no name to run and
+                # no way to answer this call, so it is dropped rather than
+                # silently ignored.
+                logger.warning(
+                    "openai-realtime: dropping a function-call-args event with "
+                    "no matching name/id"
+                )
             return
         if t == "error":
             logger.warning("openai-realtime: server error %s", msg.get("error"))
@@ -691,14 +726,16 @@ class OpenAIRealtimeSession:
             return
 
     def _flush(self) -> Iterator[Transcript]:
-        """Release the accumulated turn, user first - see gemini_live.py's version
-        for why one role at a time, cleared as it is handed over."""
-        for role in ("user", "assistant"):
-            fragments = self._said[role]
-            self._said[role] = []
-            text = "".join(fragments).strip()
-            if text:
-                yield Transcript(text=text, role=role, final=True)
+        """Release the accumulated assistant turn, cleared as it is handed over.
+
+        Assistant only: the user side is yielded straight from `_decode` when
+        `conversation.item.input_audio_transcription.completed` arrives, not
+        accumulated here - see that branch for why."""
+        fragments = self._said["assistant"]
+        self._said["assistant"] = []
+        text = "".join(fragments).strip()
+        if text:
+            yield Transcript(text=text, role="assistant", final=True)
 
     def _push_partial(self) -> None:
         """Offer the utterance so far to whoever is listening for it. Never
@@ -732,3 +769,15 @@ class OpenAIRealtimeSession:
 
     def _redact(self, text: str) -> str:
         return text.replace(self._api_key, "<key>")
+
+    def _error_detail(self, message: dict[str, Any]) -> str:
+        """The human-readable part of a top-level `error` event, whatever shape
+        it arrives in - OpenAI's documented shape is `{"error": {"message": ...}}`,
+        but a detail worth surfacing should not depend on that holding exactly."""
+        error = message.get("error")
+        if isinstance(error, dict):
+            text = error.get("message")
+            if isinstance(text, str) and text:
+                return text
+            return str(error)
+        return str(error)
