@@ -2274,3 +2274,27 @@ async def test_a_session_is_not_closed_while_the_daemon_is_still_speaking() -> N
         "the session closed while the speaker still had audio queued - the budget "
         "counted the daemon's own voice as silence"
     )
+
+
+async def test_being_called_by_name_is_answered_rather_than_met_with_silence() -> None:
+    """The wake-word-only handover. Audio was tried and misheard ("벨라" -> "별로",
+    answered as a sentence nobody said); sending nothing was tried next and left the
+    owner calling into silence, waiting ten seconds, and calling again. The name goes
+    over as text - settled words, nothing left to mishear - and `send_text` is a
+    prompt, so the model answers being called the way a person does."""
+    session = FakeSession(Says("assistant", "네?"), Turn())
+
+    await run(conversation(session, opening_text="벨라"))
+
+    assert session.texts == ["벨라"], "the model was never told it had been called"
+    assert session.sent == [], "no audio was sent - that is the misheard path"
+
+
+async def test_a_question_in_the_same_breath_still_goes_over_as_audio() -> None:
+    """When the segment carries more than the name, the audio is what has the
+    question in it - text would throw the question away."""
+    session = FakeSession(Turn())
+
+    await run(conversation(session, opening_audio=b"pcm"))
+
+    assert session.sent == [b"pcm"] and session.texts == []
