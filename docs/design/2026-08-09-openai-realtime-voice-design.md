@@ -55,10 +55,22 @@ a startup error rather than a first-turn failure.
 ## OpenAI Realtime facts (grounded, 2026-08-09)
 
 Sources: OpenAI Realtime guide + Realtime-conversations reference
-(`developers.openai.com/api/docs/guides/realtime`). **Event names drift between the beta
-(`realtime=v1`) and GA (`gpt-realtime`) surfaces**, so the concrete strings are pinned
-against the live socket during implementation (the repo's "socket wins over docs" rule;
-`gemini_live.py` documents its measured findings the same way). Best-known GA names below.
+(`developers.openai.com/api/docs/guides/realtime`). **Event names AND the request shape
+drift between the beta (`realtime=v1`) and GA (`gpt-realtime`) surfaces.**
+
+**Confirmed live against gpt-realtime, 2026-08-09** (the repo's "socket wins over docs"
+rule): the beta request shape is *rejected* — a beta-header + flat `session.update`
+(`input_audio_format:"pcm16"`, top-level `voice`, `modalities`) closes **4000
+`invalid_request_error.beta_api_shape_disabled`**. The GA shape (from the socket's own
+`session.created`) is: **drop** the `OpenAI-Beta` header; `session` = `{type:"realtime",
+output_modalities:["audio"], instructions, audio:{input:{format:{type:"audio/pcm",rate:24000},
+turn_detection:{type:"server_vad"}, transcription:{model:"whisper-1"}}, output:{format:{...},
+voice}}, tools}`. Server event names (measured): `response.output_audio.delta`,
+`response.output_audio_transcript.delta|done`, `conversation.item.input_audio_transcription.delta|completed`,
+`input_audio_buffer.speech_started`, `response.done` — all in the decoder's constants. And
+the load-bearing timing (measured with fed audio): the user's `...input_audio_transcription.completed`
+arrives **~200 ms AFTER `response.done`** — which is exactly why the user transcript is
+yielded immediately on `completed`, decoupled from the turn boundary. Names table below.
 
 - **Transport:** `wss://api.openai.com/v1/realtime?model=<model>`; headers
   `Authorization: Bearer <OPENAI_API_KEY>` and (beta models) `OpenAI-Beta: realtime=v1`.
