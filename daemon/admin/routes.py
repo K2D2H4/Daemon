@@ -9,6 +9,9 @@ Endpoints (docs/design/2026-08-07-m5-admin-web-design.md, "JSON API"):
     PATCH /admin/api/settings     validate -> write .env -> {restart_required, supervised}
     POST  /admin/api/restart      graceful exit, only when supervised
     GET   /admin/api/voice-sample/{voice}  a voice preview clip (audio/mpeg), allowlist-gated
+    GET   /admin/api/activity     the merged decision log (proactivity, tools, reflection)
+    GET   /admin/api/proactive/today   today's rounds, budget and timeline marks
+    GET   /admin/api/tools/log    tool calls and refusals with their policy decision
 
     --- Phase 2, all behind DAEMON_MCP_ENABLED (409 with guidance when off) ---
     GET    /admin/api/mcp/catalog          the trusted catalog (no commands/urls)
@@ -35,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -42,6 +46,12 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from daemon.admin.activity import (
+    activity_payload,
+    clamp_limit,
+    today_payload,
+    tool_log_payload,
+)
 from daemon.admin.mcp_oauth import OAuthError, complete_oauth_flow, start_oauth_flow
 from daemon.admin.restart import is_supervised, schedule_exit
 from daemon.admin.settings_io import (
@@ -50,7 +60,7 @@ from daemon.admin.settings_io import (
     current_settings_payload,
     write_env_secret,
 )
-from daemon.app import health_payload
+from daemon.app import health_payload, open_store
 from daemon.config import GEMINI_LIVE_VOICES
 from daemon.llm.base import Message, ProviderError
 from daemon.mcp_catalog import CATALOG, lookup
@@ -193,7 +203,9 @@ async def chat_test(request: Request) -> JSONResponse:
 
 @router.get("/api/settings")
 async def get_settings(request: Request) -> dict[str, Any]:
-    payload = current_settings_payload(request.app.state.settings)
+    payload = current_settings_payload(
+        request.app.state.settings, request.app.state.env_path
+    )
     payload["supervised"] = is_supervised()
     return payload
 
@@ -260,6 +272,42 @@ async def voice_sample(voice: str) -> Response:
     return Response(path.read_bytes(), media_type="audio/mpeg")
 
 
+# --- what the daemon decided, read back --------------------------------------
+#
+# Read-only, and deliberately so: these three exist because the process already
+# writes down every gate verdict, tool call and reflection pass and then showed
+# none of them. Nothing here writes, and the store handle is opened and closed per
+# request (daemon/app.py `open_store`) rather than held, so a page left open
+# overnight does not sit on a connection.
+
+
+@router.get("/api/activity")
+async def activity(request: Request, kind: str = "all", limit: int = 60) -> JSONResponse:
+    """The merged log: proactivity rounds, tool calls, reflection passes."""
+    settings = request.app.state.settings
+    with open_store(settings) as store:
+        payload = activity_payload(store, kind=kind, limit=clamp_limit(limit))
+    return JSONResponse(payload)
+
+
+@router.get("/api/proactive/today")
+async def proactive_today(request: Request) -> JSONResponse:
+    """Today's rounds, the budget still left, and the 24-hour timeline's marks."""
+    settings = request.app.state.settings
+    with open_store(settings) as store:
+        payload = today_payload(store, settings)
+    return JSONResponse(payload)
+
+
+@router.get("/api/tools/log")
+async def tools_log(request: Request, limit: int = 60) -> JSONResponse:
+    """Tool calls with the policy decision that let them run, refusals included."""
+    settings = request.app.state.settings
+    with open_store(settings) as store:
+        payload = tool_log_payload(store, limit=clamp_limit(limit))
+    return JSONResponse(payload)
+
+
 # --- MCP (Phase 2), all behind DAEMON_MCP_ENABLED ----------------------------
 
 MCP_OFF = (
@@ -297,6 +345,15 @@ async def mcp_catalog(request: Request) -> JSONResponse:
                     "auth": entry.auth,
                     "oauth_verified": entry.oauth_verified,
                     "needs_key": entry.key_env is not None,
+                    # The credentials this server runs its *own* auth with (google's
+                    # Google OAuth client). Names and set/unset only, never values -
+                    # the same rule the settings page follows for its secrets. They
+                    # belong on this card rather than in Settings because they are a
+                    # property of one catalog entry, not of the daemon.
+                    "passthrough": [
+                        {"name": name, "set": bool(os.environ.get(name))}
+                        for name in entry.env_passthrough
+                    ],
                 }
                 for entry in CATALOG
             ]
@@ -326,6 +383,9 @@ async def mcp_servers(request: Request) -> JSONResponse:
                 "name": config.name,
                 "remote": config.is_remote,
                 "connected": connected,
+                # What the model actually gained. A server that comes up and
+                # registers nothing reads as green without this.
+                "tools": list(bridge.registered_tools(config.name)) if connected else [],
                 "reason": (
                     None
                     if connected
@@ -394,6 +454,36 @@ async def mcp_connect(request: Request) -> JSONResponse:
         except PatchError as exc:
             # A key carrying a newline would inject an `.env` line (finding #2).
             return JSONResponse({"detail": str(exc)}, status_code=400)
+
+    # Credentials the entry declares it reads from the environment. The allowlist is
+    # the *catalog's*, never the client's (CONTRACTS 13): a body naming any other
+    # variable would otherwise let a page write arbitrary environment into `.env`.
+    supplied = body.get("passthrough")
+    if supplied is not None:
+        if not isinstance(supplied, dict):
+            return JSONResponse(
+                {"detail": "passthrough must be an object of name -> value"},
+                status_code=400,
+            )
+        unknown = set(supplied) - set(entry.env_passthrough)
+        if unknown:
+            return JSONResponse(
+                {"detail": f"{name} does not read: {', '.join(sorted(unknown))}"},
+                status_code=400,
+            )
+        for var, raw in supplied.items():
+            value = str(raw).strip()
+            if not value:
+                continue  # empty means "leave the working value alone", as for secrets
+            try:
+                write_env_secret(request.app.state.env_path, var, value)
+            except PatchError as exc:
+                return JSONResponse({"detail": str(exc)}, status_code=400)
+            # `.env` is read into `os.environ` at boot (daemon/cli.py), and
+            # `_stdio_env` passes these through from `os.environ` - so without this
+            # the value the owner just typed would not reach the child until a
+            # restart, and the connect below would warn that it is still missing.
+            os.environ[var] = value
 
     config = server_config_from_catalog(entry)
     # Persist-then-connect, serialised against a concurrent disconnect (finding #6):

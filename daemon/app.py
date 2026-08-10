@@ -14,8 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, nullcontext, suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -25,6 +25,7 @@ from fastapi import FastAPI
 
 from daemon import __version__
 from daemon.channels.base import Channel
+from daemon.clock import now_iso
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
 from daemon.config import ANTHROPIC, ENV_FILE, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
 from daemon.llm.base import Provider
@@ -164,6 +165,11 @@ def health_payload(state: Any, settings: Settings) -> dict[str, Any]:
         "status": "ok",
         "preset": settings.preset,
         "voice_enabled": settings.voice_enabled,
+        # When this process came up, so a reader can tell "quiet for a week" from
+        # "restarted a minute ago and has not had time to do anything yet". Absent
+        # rather than faked when the lifespan never ran (tests build the app
+        # directly), because a zero uptime would be a lie the admin would print.
+        "started_at": getattr(state, "started_at", None),
         "routing": {
             task_key.value: route.provider
             for task_key, route in settings.routing_table().items()
@@ -191,6 +197,7 @@ def health_payload(state: Any, settings: Settings) -> dict[str, Any]:
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
+    app.state.started_at = now_iso()
     providers = _build_providers(settings)
     gateway = LLMGateway(
         providers, settings.routing_table(), fallback=settings.fallback_route()
@@ -666,6 +673,28 @@ def _build_recall(settings: Settings, store: Any) -> tuple[Recall | None, str, A
     except Exception as exc:
         logger.warning("recall could not be built, continuing without it: %s", exc)
         return None, f"unavailable: {exc}", None
+
+
+@contextmanager
+def open_store(settings: Settings) -> Iterator[Any]:
+    """A short-lived `Store` handle, closed on the way out.
+
+    Exists so the admin's read-only endpoints can query the mirror without
+    importing an implementation themselves - this module is the only one allowed
+    to (docs/CONTRACTS.md, the layering rule), and every other assembly point here
+    opens the store the same way.
+
+    One connection per request rather than a shared one: sqlite3 connections are
+    not safe to share across threads, the admin's callers are a poll every fifteen
+    seconds from one browser, and opening the file is measured in microseconds.
+    """
+    from daemon.memory.store import Store
+
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    try:
+        yield store
+    finally:
+        store.close()
 
 
 async def build_proactive_tick(

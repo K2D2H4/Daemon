@@ -663,6 +663,15 @@ class McpBridge:
         """The servers with a live session, for callers that want the whole set."""
         return tuple(self._sessions)
 
+    def registered_tools(self, name: str) -> tuple[str, ...]:
+        """The tool names this server contributed to the registry.
+
+        For the admin, which shows them under each configured server: "connected"
+        answers whether the process is up, and this answers what the model actually
+        gained by it - a server that connects and registers nothing is a different
+        problem from one that will not start."""
+        return tuple(self._registered.get(name, ()))
+
     async def _bring_up(
         self,
         config: ServerConfig,

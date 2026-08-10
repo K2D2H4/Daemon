@@ -239,6 +239,13 @@ async def test_an_unreachable_model_leaves_the_day_for_tomorrow(
     assert result.status == "unavailable"
     assert not artifact_path(data_dir, DAY).exists()  # so it is retried
 
+    # No artifact means the file cannot say the night broke - a failed pass and a
+    # night with nothing to say look identical on disk. The audit row is the only
+    # place the difference survives, which is what the admin reads.
+    runs = store.recent_reflection_runs()
+    assert [(row["date"], row["status"]) for row in runs] == [(DAY, "unavailable")]
+    assert "" != runs[0]["detail"], "a failure that does not say why is not a readout"
+
 
 async def test_an_out_of_range_importance_is_clamped_not_rejected(
     data_dir: Path, store: Store

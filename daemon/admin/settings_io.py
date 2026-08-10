@@ -29,6 +29,7 @@ from daemon.config import (
     GEMINI_LIVE_VOICES,
     HOSTED_PROVIDERS,
     PRESETS,
+    SENSITIVITIES,
     Settings,
 )
 from daemon.fs import write_private_replace
@@ -44,18 +45,46 @@ STR_FIELDS: dict[str, str] = {
     "hosted_provider": "DAEMON_HOSTED_PROVIDER",
     "tools_mode": "DAEMON_TOOLS_MODE",
     "gemini_live_voice": "DAEMON_GEMINI_LIVE_VOICE",
+    # Model ids, one per provider the `hosted_provider` list offers. All three, not
+    # just the one in use: `DAEMON_OPENAI_MODEL` has no default, so a page that let
+    # you pick `openai` without letting you name its model could only ever answer
+    # the choice with a 400 the page itself could not fix.
+    "anthropic_model": "DAEMON_ANTHROPIC_MODEL",
+    "openai_model": "DAEMON_OPENAI_MODEL",
+    "gemini_model": "DAEMON_GEMINI_MODEL",
+    # The realtime endpoint does not take the text endpoint's id (config.py), which
+    # is why voice has its own.
+    "gemini_live_model": "DAEMON_GEMINI_LIVE_MODEL",
+    # Both halves of the pair: `Settings` validates each against SENSITIVITIES, and
+    # offering only the start one would leave the end one hand-edit-only for no
+    # reason a reader could infer.
+    "voice_start_sensitivity": "DAEMON_VOICE_START_SENSITIVITY",
+    "voice_end_sensitivity": "DAEMON_VOICE_END_SENSITIVITY",
 }
 BOOL_FIELDS: dict[str, str] = {
     "voice_enabled": "DAEMON_VOICE_ENABLED",
     "mcp_enabled": "DAEMON_MCP_ENABLED",
     "browser_enabled": "DAEMON_BROWSER_ENABLED",
+    # The switches the Overview already reports on. Showing a proactivity budget,
+    # a wake gate and a screen capability while leaving their on/off in a text
+    # editor is the same gap this milestone opened to close.
+    "tools_enabled": "DAEMON_TOOLS_ENABLED",
+    "screen_enabled": "DAEMON_SCREEN_ENABLED",
+    "wake_enabled": "DAEMON_WAKE_ENABLED",
+    "voice_barge_in": "DAEMON_VOICE_BARGE_IN",
+    "proactive_enabled": "DAEMON_PROACTIVE_ENABLED",
 }
+LIST_FIELDS: dict[str, str] = {"wake_aliases": "DAEMON_WAKE_ALIASES"}
+"""Comma-separated in `.env` and tuple-valued on `Settings`. Reported and accepted
+as the comma-separated form, which is what `daemon wake calibrate` writes and what a
+person types - the JSON array a naive round-trip would produce is neither."""
 INT_FIELDS: dict[str, str] = {"recall_limit": "DAEMON_RECALL_LIMIT"}
 FLOAT_FIELDS: dict[str, str] = {"recall_half_life_days": "DAEMON_RECALL_HALF_LIFE_DAYS"}
 SECRET_FIELDS: dict[str, str] = {
     "anthropic_api_key": "ANTHROPIC_API_KEY",
     "openai_api_key": "OPENAI_API_KEY",
     "gemini_api_key": "GEMINI_API_KEY",
+    "telegram_bot_token": "TELEGRAM_BOT_TOKEN",
 }
 ROUTE_OVERRIDES = "route_overrides"
 ROUTE_OVERRIDES_ENV = "DAEMON_ROUTE_OVERRIDES"
@@ -63,6 +92,7 @@ ROUTE_OVERRIDES_ENV = "DAEMON_ROUTE_OVERRIDES"
 EDITABLE = {
     *STR_FIELDS,
     *BOOL_FIELDS,
+    *LIST_FIELDS,
     *INT_FIELDS,
     *FLOAT_FIELDS,
     *SECRET_FIELDS,
@@ -75,13 +105,43 @@ class PatchError(ValueError):
     client - it names the field or the validation failure, never a secret."""
 
 
-def current_settings_payload(settings: Settings) -> dict[str, Any]:
+def pending_values(settings: Settings, env_path: Path) -> dict[str, Any]:
+    """Editable values `.env` holds that differ from the ones this process is running.
+
+    The running daemon does not hot-reload, so a saved patch is invisible to
+    `app.state.settings` until a restart. Without this the page reloads showing the
+    pre-save values with nothing to say why, and a save that worked perfectly reads
+    as a save that was lost - measured by doing exactly that.
+
+    Reported *beside* the running values, never instead of them: the admin's one job
+    is not to lie about what the daemon is currently doing.
+    """
+    if not env_path.exists():
+        return {}
+    try:
+        saved = Settings(_env_file=None, **parse_env(env_path.read_text(encoding="utf-8")))
+    except Exception:  # noqa: BLE001 - a file we cannot build from has nothing to report
+        return {}
+    pending: dict[str, Any] = {}
+    for name in (*STR_FIELDS, *BOOL_FIELDS, *INT_FIELDS, *FLOAT_FIELDS):
+        if getattr(saved, name) != getattr(settings, name):
+            pending[name] = getattr(saved, name)
+    for name in LIST_FIELDS:
+        if getattr(saved, name) != getattr(settings, name):
+            pending[name] = ",".join(getattr(saved, name))
+    return pending
+
+
+def current_settings_payload(settings: Settings, env_path: Path | None = None) -> dict[str, Any]:
     """The GET /settings body: editable values (secrets masked), read-only
-    display, and the option lists the front-end offers choices from."""
+    display, the option lists the front-end offers choices from, and anything
+    `.env` holds that this process has not restarted into."""
     editable: dict[str, Any] = {
         name: getattr(settings, name) for name in (*STR_FIELDS, *BOOL_FIELDS, *INT_FIELDS)
     }
     editable["recall_half_life_days"] = settings.recall_half_life_days
+    for name in LIST_FIELDS:
+        editable[name] = ",".join(getattr(settings, name))
     editable[ROUTE_OVERRIDES] = {
         task.value: provider for task, provider in settings.route_overrides.items()
     }
@@ -90,6 +150,7 @@ def current_settings_payload(settings: Settings) -> dict[str, Any]:
         editable[name] = "set" if getattr(settings, name) else None
     return {
         "editable": editable,
+        "pending": pending_values(settings, env_path) if env_path is not None else {},
         "readonly": {
             "host": settings.host,
             "port": settings.port,
@@ -100,6 +161,8 @@ def current_settings_payload(settings: Settings) -> dict[str, Any]:
             "hosted_providers": list(HOSTED_PROVIDERS),
             "tool_modes": list(TOOL_MODES),
             "gemini_live_voices": ["", *sorted(GEMINI_LIVE_VOICES)],
+            # Empty is a real choice - "leave it to the server" (config.py).
+            "sensitivities": ["", *SENSITIVITIES],
         },
     }
 
@@ -184,9 +247,14 @@ def apply_patch(patch: Mapping[str, Any], env_path: Path) -> PatchResult:
         env_key = (
             ROUTE_OVERRIDES_ENV
             if field == ROUTE_OVERRIDES
-            else {**STR_FIELDS, **BOOL_FIELDS, **INT_FIELDS, **FLOAT_FIELDS, **SECRET_FIELDS}[
-                field
-            ]
+            else {
+                **STR_FIELDS,
+                **BOOL_FIELDS,
+                **LIST_FIELDS,
+                **INT_FIELDS,
+                **FLOAT_FIELDS,
+                **SECRET_FIELDS,
+            }[field]
         )
         if field in SECRET_FIELDS and (value is None or str(value).strip() == ""):
             # An empty secret means "leave the working key alone", not "clear it".

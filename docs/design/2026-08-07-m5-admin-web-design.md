@@ -87,7 +87,17 @@ DELETE /admin/api/mcp/servers/{n} unregister + disconnect.
 --- Phase 2b (OAuth) ---
 POST  /admin/api/mcp/oauth/start  {name} -> {authorize_url}
 GET   /admin/api/mcp/oauth/callback  code 수신 -> 토큰 저장(0600) -> 연결
+--- Phase 3 (레일 개편: 데몬이 이미 기록하지만 보여주지 않던 것) ---
+GET   /admin/api/activity         병합 로그. proactivity 라운드 + 툴 호출 + 성찰 패스.
+GET   /admin/api/proactive/today  오늘의 라운드/예산/차단 규칙 + 24시간 타임라인 마크.
+GET   /admin/api/tools/log        툴 호출과 거부, 각각을 결정한 정책 판정과 함께.
 ```
+
+세 개 모두 읽기 전용이고, 나머지 `/admin`과 같은 loopback + origin 게이트를 지난다.
+이들이 읽는 두 테이블(`proactive_rounds`, `reflection_runs`)은 이번에 `memory/schema.sql`에
+추가됐다 — 조용한 데몬과 고장난 데몬을 구별하려면 "아무 일도 없었던 라운드"가 행으로
+남아야 하고, 모델에 닿지 못한 성찰은 아티팩트 파일을 쓰지 않아 파일만으로는 실패가
+보이지 않기 때문이다.
 
 편집 대상(3의 검증을 통과해야 커밋): `preset`, `hosted_provider`, `route_overrides`,
 `voice_enabled`, `recall_limit`, `recall_half_life_days`, 도구 `mode`,

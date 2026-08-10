@@ -427,8 +427,29 @@ class Reflection:
         self._notes = notes or EntityNotes(data_dir, store)
 
     async def run(self, date: str, *, force: bool = False) -> Result:
-        """Reflect on one local day. Safe to call twice - the second call is a
-        no-op unless `force`, because the artifact is the marker."""
+        """Reflect on one local day, and record that it ran.
+
+        Safe to call twice - the second call is a no-op unless `force`, because the
+        artifact is the marker. The audit row is not that marker and must not be
+        read as one: it is written for every outcome, including `unavailable`,
+        which writes no artifact at all. A night the model could not be reached
+        and a night with nothing to say are indistinguishable on disk, and the
+        difference is exactly what someone asking "did last night run?" means.
+        """
+        result = await self._reflect(date, force=force)
+        self._store.record_reflection_run(
+            date=result.date,
+            status=result.status,
+            messages_read=result.messages_read,
+            facts=result.facts,
+            entities=result.entities,
+            observations=result.observations,
+            detail=result.detail,
+            now=clock_now(),
+        )
+        return result
+
+    async def _reflect(self, date: str, *, force: bool = False) -> Result:
         path = artifact_path(self._data_dir, date)
         if path.exists() and not force:
             return Result(date=date, status="skipped", detail=f"{path.name} already exists")
