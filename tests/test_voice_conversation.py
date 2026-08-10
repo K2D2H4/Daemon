@@ -1686,19 +1686,28 @@ async def test_a_session_that_refuses_the_opening_still_holds_the_conversation()
 # --- the ready cue -------------------------------------------------------------
 
 
-def test_the_ready_cue_is_short_quiet_and_starts_at_silence() -> None:
+def test_the_ready_cue_is_audible_brief_and_starts_at_silence() -> None:
     """A bare sine starts on a discontinuity, which is an audible click and exactly
-    the kind of noise a VAD notices."""
+    the kind of noise a VAD notices.
+
+    The lower bound is the one that earns its keep: an acknowledgement too quiet to
+    notice is why the owner said the wake word again, and on this provider each repeat
+    interrupts the answer being generated, which the server discards and restarts -
+    the measured "same sentence three times" loop. Loud enough to be heard the first
+    time, short enough not to delay the turn, quiet enough not to startle."""
     import numpy as np
 
     from daemon.app import READY_CUE_MS, ready_cue
 
     pcm = ready_cue(24_000)
     samples = np.frombuffer(pcm, dtype="<i2")
+    peak = int(np.abs(samples).max())
 
     assert len(samples) == pytest.approx(24_000 * READY_CUE_MS / 1000, rel=0.02)
     assert samples[0] == 0 and samples[-1] == 0, "the cue clicks"
-    assert 0 < int(np.abs(samples).max()) < 8000, "the cue is loud enough to startle"
+    assert peak > 8000, "an acknowledgement nobody hears is one the owner talks over"
+    assert peak < 16000, "the cue is loud enough to startle"
+    assert READY_CUE_MS <= 250, "an ack that delays the conversation is not an ack"
 
 
 def test_the_ready_cue_follows_the_devices_rate() -> None:
@@ -2128,3 +2137,41 @@ async def test_the_microphone_holds_while_a_tool_answer_is_pending() -> None:
         "a chunk crossed while the tool answer was pending - the exact audio the "
         "server answers with a tool-call cancellation"
     )
+
+
+async def test_half_duplex_holds_the_microphone_while_the_daemon_speaks() -> None:
+    """DAEMON_VOICE_BARGE_IN=false: while the daemon is speaking (or a tool answer is
+    pending), the microphone yields entirely, so an echo leak or an "응" of agreement
+    cannot kill the answer mid-sentence - the shape the owner's own prototype used.
+    The default (barge_in=True) keeps today's behaviour: mid-speech chunks cross."""
+    session = FakeSession()
+    conv = conversation(session, barge_in=False)
+
+    async def mic() -> Any:
+        yield b"m1"  # idle listening: forwarded
+        conv._generating = True
+        yield b"m2"  # the daemon is speaking: held - speaking over it does nothing
+        conv._generating = False
+        conv._answering_tool = True
+        yield b"m3"  # tool answer pending: held here too
+        conv._answering_tool = False
+        yield b"m4"  # back to listening: forwarded
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"m1", b"m4"]
+
+
+async def test_barge_in_stays_the_default() -> None:
+    """Nobody configured anything: a mid-speech chunk still crosses, because being
+    able to cut the daemon off is the default contract."""
+    session = FakeSession()
+    conv = conversation(session)
+
+    async def mic() -> Any:
+        conv._generating = True
+        yield b"over-speech"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"over-speech"]

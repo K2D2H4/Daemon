@@ -368,3 +368,22 @@ async def test_stale_history_yields_no_block(data_dir: Path) -> None:
     companion = Companion(memory, data_dir=data_dir)
 
     assert await companion.continuity_block() == ""
+
+
+async def test_the_continuity_block_says_the_owner_outranks_the_transcript(
+    data_dir: Path,
+) -> None:
+    """These lines are speech recognition output, and it mishears: a bad moment of
+    audio attributed words to the owner that they never said, this block replayed it
+    into every later session, and the daemon quoted its own record back as proof when
+    told otherwise (measured - the owner could not talk their way out of a mishearing).
+    The header has to state that a denial ends the topic."""
+    memory = FakeMemory()
+    memory.records.append(said("면접 준비 도와줘"))
+    companion = Companion(memory, data_dir=data_dir)
+
+    block = await companion.continuity_block()
+
+    assert "mishears" in block, "the block must admit the transcript can be wrong"
+    assert "they are right and this record is wrong" in block
+    assert "never insist they said it" in block

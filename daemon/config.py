@@ -340,6 +340,19 @@ class Settings(BaseSettings):
     `interruptions` is what says whether a lower value cost anything - fewer seconds
     to the first answer is only a win if the count of interruptions did not move."""
 
+    voice_barge_in: bool = Field(default=True, alias="DAEMON_VOICE_BARGE_IN")
+    """Whether the owner can cut the daemon off mid-answer by speaking.
+
+    On (the default), the microphone streams while the daemon talks - which is the
+    only way a barge-in can be noticed at all, and also why a leaked syllable of
+    the daemon's own speaker audio, or an "응" of agreement, kills the answer
+    mid-sentence when the echo path is imperfect. Off is half-duplex: the
+    microphone yields while the daemon is speaking or a tool answer is pending, so
+    an answer always plays to the end and the owner talks in the gaps - the shape
+    the owner's own prototype used, at the cost of not being able to interrupt by
+    voice. A room where answers keep dying mid-sentence wants this off; sensitivity
+    tuning (`DAEMON_VOICE_START_SENSITIVITY`) is the gentler lever to try first."""
+
     # --- the wake gate (daemon/voice/wake.py) -----------------------------
     # A voice session bills per minute, so an always-open one costs about 48x what
     # 30 minutes a day costs (docs/PLAN.md 6.5). These knobs describe the free

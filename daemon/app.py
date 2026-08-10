@@ -1194,6 +1194,7 @@ async def run_voice(
                 opening_audio=opening_audio,
                 screen_share=screen_share,
                 screen_pump_factory=screen_pump_factory,
+                barge_in=settings.voice_barge_in,
             )
         finally:
             with suppress(Exception):
@@ -1228,12 +1229,25 @@ READY_CUE_HZ = (784.0, 1046.5)
 falling one reads as "finished", and neither is a word - so it cannot be mistaken for
 the daemon speaking or transcribed as one."""
 
-READY_CUE_MS = 90
-READY_CUE_GAIN = 0.18
-"""Short and quiet on purpose. The cue answers "may I speak now?", and the honest
-answer is that until it existed there was none: the wake gate released the microphone
-and about a second passed with nothing to say the session was live, so the owner
-guessed - and guessing early is how an utterance lands in the handover and is lost."""
+READY_CUE_MS = 180
+READY_CUE_GAIN = 0.35
+"""Short, and loud enough to be unmistakable. The cue answers "may I speak now?",
+and the honest answer is that until it existed there was none: the wake gate released
+the microphone and about a second passed with nothing to say the session was live, so
+the owner guessed - and guessing early is how an utterance lands in the handover and
+is lost.
+
+Raised from 90 ms / 0.18 after the owner reported the failure this was supposed to
+prevent, in its worst form. Below about a second of silence a person assumes the wake
+word did not register and **says it again, louder** - and on this provider each repeat
+lands in the already-open session as a fresh turn that *interrupts the answer being
+generated*, which the server then discards and regenerates from the top (documented:
+Live API cancels and discards an interrupted generation; google-gemini/cookbook#1197
+reproduces the resulting restart loop on this exact model). The observed symptom was
+the daemon restarting the same sentence three times. So the acknowledgement has to be
+heard the first time: an ack nobody notices is the root of a cascade, not a nicety.
+Still well under the "startle" bound, still not a word, and still played through the
+echo-cancelled engine so it cannot be heard as speech by the far end."""
 
 
 def ready_cue(sample_rate: int) -> bytes:
@@ -1296,6 +1310,7 @@ async def _voice_attempts(
     opening_audio: bytes = b"",
     screen_share: Any = None,
     screen_pump_factory: Callable[[Any], Any] | None = None,
+    barge_in: bool = True,
 ) -> int:
     """Hold a conversation, and pick it back up if the session is cut.
 
@@ -1333,6 +1348,7 @@ async def _voice_attempts(
             opening_audio=pending_opening,
             screen_share=screen_share,
             screen_pump_factory=screen_pump_factory,
+            barge_in=barge_in,
         )
         failure: Exception | None = None
         try:
