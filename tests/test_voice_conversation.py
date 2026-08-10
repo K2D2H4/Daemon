@@ -2298,3 +2298,60 @@ async def test_a_question_in_the_same_breath_still_goes_over_as_audio() -> None:
     await run(conversation(session, opening_audio=b"pcm"))
 
     assert session.sent == [b"pcm"] and session.texts == []
+
+
+# --- the room stays out of the socket until the wake word is answered ---------
+
+
+async def test_the_microphone_is_held_until_the_answer_to_the_wake_word_starts() -> None:
+    """The same opening text is answered in 1.1 s against a session with no
+    microphone and took 11.77 s in the resident, where the mic streams the room the
+    moment the session is up: audio arriving as a turn begins reads as the user
+    speaking, so the server cancels the answer and waits for an utterance that never
+    comes - without emitting `interrupted`, which is why the session reported zero
+    barge-ins while the owner sat through eleven seconds of silence."""
+    session = FakeSession()
+    conv = conversation(session, opening_text="벨라")
+    await conv._send_opening(session)
+
+    async def mic() -> Any:
+        yield b"room"          # the answer has not started: held
+        conv._on_audio(asyncio.get_running_loop().time(), 480)  # first audio arrives
+        yield b"after"         # the room is the owner's again
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"after"], "the room was streamed into the opening turn"
+
+
+async def test_a_model_that_never_answers_gives_the_microphone_back() -> None:
+    """Bounded, because holding the microphone for a model that is not coming back
+    would turn a slow turn into a deaf one."""
+    session = FakeSession()
+    conv = conversation(session, opening_text="벨라")
+    await conv._send_opening(session)
+    # The hold has expired without any audio ever arriving.
+    conv._opening_answer_until = asyncio.get_running_loop().time() - 0.01
+
+    async def mic() -> Any:
+        yield b"speak"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"speak"]
+
+
+async def test_an_audio_opening_does_not_hold_the_microphone() -> None:
+    """The hold is for the text opening, where the owner has demonstrably finished
+    speaking - the gate captured the whole phrase. An audio opening carries their
+    question and the turn is already under way."""
+    session = FakeSession()
+    conv = conversation(session, opening_audio=b"pcm")
+    await conv._send_opening(session)
+
+    async def mic() -> Any:
+        yield b"more"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"pcm", b"more"]
