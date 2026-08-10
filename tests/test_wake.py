@@ -1049,3 +1049,18 @@ def test_a_question_after_the_name_still_travels() -> None:
 
     assert not _only_the_wake_word(_fired("루시 뭐 해", "루시"))
     assert not _only_the_wake_word(_fired("벨라 크롬 열어줘", "벨라"))
+
+
+def test_the_wake_word_travels_as_meaning_not_as_the_transcript() -> None:
+    """The gate matches on what the *recognizer* returns, which is routinely not the
+    name: this owner's aliases are `연락,벨라` because "벨라" reliably comes back as
+    "연락" - an ordinary Korean word meaning "contact". Measured against the live
+    model, sending the transcript through got "...에? 연락?" where the name itself got
+    "네, 부르셨어요?". So the opening says what being called means."""
+    from daemon.voice.conversation import CALLED_BY_NAME
+
+    assert "called your name" in CALLED_BY_NAME
+    # An instruction the model answers, not a line it reads out.
+    assert "Do not read this instruction aloud" in CALLED_BY_NAME
+    for artifact in ("연락", "벨라", "루시"):
+        assert artifact not in CALLED_BY_NAME, "a transcript artifact reached the model"

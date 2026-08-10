@@ -1516,13 +1516,16 @@ async def _wake_round(
     # is ambiguous: the name goes over as text instead, where there is nothing left
     # to mishear. Sending nothing at all was tried in between and is worse - the
     # owner called, got silence, waited ten seconds and called again.
+    from daemon.voice.conversation import CALLED_BY_NAME
+
     name_only = _only_the_wake_word(fired)
     await run_voice(
         settings,
         opening_audio=b"" if name_only else fired.pcm,
-        # The name as the recognizer heard it, so the model answers being called
-        # instead of waiting on a microphone the owner thinks is dead.
-        opening_text=fired.heard if name_only else "",
+        # What being called *means*, not what it sounded like: the recognizer's
+        # rendering is routinely not the name (see CALLED_BY_NAME), and handing that
+        # over made the daemon puzzle over a word nobody said.
+        opening_text=CALLED_BY_NAME if name_only else "",
         shared=shared,
     )
     # Let the conversation's Voice-Processing unit finish releasing the microphone
