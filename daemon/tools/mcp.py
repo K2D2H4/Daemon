@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
@@ -285,6 +286,42 @@ def missing_passthrough_env(config: ServerConfig) -> list[str]:
     and lists its tools without them, so it reads "connected" - then fails the moment a
     tool runs. Naming the gap lets the admin say so instead of showing a bare green."""
     return [name for name in config.env_passthrough if not os.environ.get(name)]
+
+
+_EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+")
+"""An email as a credential filename would carry it: a local part, one `@`, a domain,
+and no whitespace. Deliberately loose on the domain, strict on the shape - it exists
+to reject bookkeeping files and injection-y names, not to validate deliverability."""
+
+
+def google_authenticated_email() -> str | None:
+    """The single Google account the `workspace` server holds a cached credential for,
+    or None when there are zero or several.
+
+    workspace-mcp names each credential file `{email}.json` under its credentials dir
+    (WORKSPACE_MCP_CREDENTIALS_DIR, default `~/.google_workspace_mcp/credentials`). Its
+    tools take a `user_google_email` the model cannot otherwise know, so it invents one
+    from the OS username - which never matches the stored credential, and every Google
+    call re-prompts auth. Surfacing the real one lets the model pass it. Only when
+    exactly one account is present: zero means not connected yet, several is ambiguous
+    and guessing would reintroduce the mismatch this exists to fix."""
+    base = os.environ.get("WORKSPACE_MCP_CREDENTIALS_DIR") or os.path.expanduser(
+        "~/.google_workspace_mcp/credentials"
+    )
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return None
+    # Credential files are named `{email}.json`; the dir also holds bookkeeping like
+    # `oauth_states.json`. Require the stem to be email-shaped (one `@`, no
+    # whitespace) - that skips the bookkeeping AND refuses to launder an oddly-named
+    # file into the prompt, since this value goes into the model's context (CONTRACTS).
+    emails = [
+        stem
+        for name in names
+        if name.endswith(".json") and _EMAIL_SHAPE.fullmatch(stem := name[:-5])
+    ]
+    return emails[0] if len(emails) == 1 else None
 
 
 def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
