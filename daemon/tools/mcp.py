@@ -279,6 +279,14 @@ def _mcp_pin() -> tuple[str, ...]:
         return ()
 
 
+def missing_passthrough_env(config: ServerConfig) -> list[str]:
+    """The `env_passthrough` names this server declares but that are not set in the
+    environment. A stdio server that runs its own auth (google's Google OAuth) starts
+    and lists its tools without them, so it reads "connected" - then fails the moment a
+    tool runs. Naming the gap lets the admin say so instead of showing a bare green."""
+    return [name for name in config.env_passthrough if not os.environ.get(name)]
+
+
 def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
     """Turn a trusted catalog entry into a `ServerConfig` the bridge can connect.
 

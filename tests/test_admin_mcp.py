@@ -194,6 +194,39 @@ def test_connect_keyless_saves_then_connects(tmp_path: Path) -> None:
     assert config.name == "fetch" and secret is None and auth is None
 
 
+def test_connect_warns_when_passthrough_env_is_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """google starts and lists its tools without its Google OAuth client, so the
+    process reads 'connected' - but the tools fail on first use until the env is set.
+    The connect response says so rather than showing a bare green (the false-green
+    finding: a card looked connected while nothing could actually reach Google)."""
+    monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_SECRET", raising=False)
+    bridge = FakeBridge()
+    client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
+
+    body = client.post("/admin/api/mcp/connect", json={"name": "google"}).json()
+
+    assert body["connected"] is True
+    assert "GOOGLE_OAUTH_CLIENT_ID" in body["warning"]
+    assert "GOOGLE_OAUTH_CLIENT_SECRET" in body["warning"]
+
+
+def test_connect_does_not_warn_when_passthrough_env_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "gcid")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "gcsecret")
+    bridge = FakeBridge()
+    client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
+
+    body = client.post("/admin/api/mcp/connect", json={"name": "google"}).json()
+
+    assert body["connected"] is True
+    assert "warning" not in body
+
+
 def test_connect_key_server_writes_env_then_passes_secret(tmp_path: Path) -> None:
     bridge = FakeBridge()
     client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)

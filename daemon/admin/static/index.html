@@ -396,8 +396,10 @@ async function loadMcpServers(){
 async function connectServer(name,secret){
   mcpNote('Connecting '+name+'…',true);
   try{const body={name};if(secret)body.secret=secret;
-    await api('/admin/api/mcp/connect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-    mcpNote(name+' connected.',true);await loadMcp();
+    const r=await api('/admin/api/mcp/connect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    // A server can start (and read "connected") yet still need env/consent before its
+    // tools work; show that as a warning rather than a plain success (finding: google).
+    mcpNote(r&&r.warning?r.warning:name+' connected.',!(r&&r.warning));await loadMcp();
   }catch(e){mcpNote(e.message,false);await loadMcpServers().catch(()=>{});}
 }
 async function oauthConnect(name){
@@ -415,6 +417,9 @@ async function oauthConnect(name){
   }catch(e){mcpNote(e.message,false);}
 }
 async function removeServer(name){
+  // A destructive one-click that used to fire with no guard: a stray click dropped a
+  // configured server (and orphaned its OAuth token) with nothing to undo it.
+  if(!confirm('Remove '+name+'? It stops until you reconnect. Any stored OAuth token is kept.'))return;
   try{await api('/admin/api/mcp/servers/'+encodeURIComponent(name),{method:'DELETE'});
     mcpNote(name+' removed.',true);await loadMcp();
   }catch(e){mcpNote(e.message,false);}

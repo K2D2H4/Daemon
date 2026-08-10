@@ -57,6 +57,7 @@ from daemon.mcp_catalog import CATALOG, lookup
 from daemon.tasks import Task
 from daemon.tools.mcp import (
     load_config,
+    missing_passthrough_env,
     remove_server,
     save_server,
     server_config_from_catalog,
@@ -411,7 +412,18 @@ async def mcp_connect(request: Request) -> JSONResponse:
                 },
                 status_code=502,
             )
-    return JSONResponse({"name": name, "connected": True, "tools": landed})
+    payload: dict[str, Any] = {"name": name, "connected": True, "tools": landed}
+    # The process started and offered its tools, but a server that runs its own auth
+    # from passed-through env (google) will fail on first real use if those are unset -
+    # a green badge would be lying. Say what is missing rather than show a bare success.
+    missing = missing_passthrough_env(config)
+    if missing:
+        payload["warning"] = (
+            f"{name} started, but these environment variables are not set: "
+            f"{', '.join(missing)}. Its tools will fail until they are set and you "
+            "complete the one-time authorization."
+        )
+    return JSONResponse(payload)
 
 
 @router.delete("/api/mcp/servers/{name}")
