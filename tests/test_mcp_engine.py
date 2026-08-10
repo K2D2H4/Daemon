@@ -33,6 +33,7 @@ from daemon.tools.mcp import (
     _leaf_message,
     _resolve_command,
     _stdio_env,
+    google_authenticated_email,
     load_config,
     missing_passthrough_env,
     remove_server,
@@ -634,6 +635,30 @@ async def test_env_passthrough_round_trips_through_mcp_json(
     assert "gcsecret" not in text  # the value never does
     (config,) = load_config(data_dir).servers
     assert config.env_passthrough == ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
+
+
+def test_google_authenticated_email_returns_only_an_unambiguous_single_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """workspace-mcp names each credential `{email}.json`. Surface the account only
+    when there is exactly one: none means not connected, several is ambiguous and
+    guessing would reintroduce the user_google_email mismatch this exists to fix."""
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    monkeypatch.setenv("WORKSPACE_MCP_CREDENTIALS_DIR", str(creds))
+    assert google_authenticated_email() is None  # none cached yet
+
+    (creds / "owner@gmail.com.json").write_text("{}", encoding="utf-8")
+    # workspace-mcp also drops bookkeeping here; only an email-shaped stem counts, or a
+    # real single account would read as ambiguous and get suppressed. `oauth_states`
+    # has no `@`; a whitespace-bearing name is not email-shaped (and would be prompt
+    # injection if it reached the model), so both are ignored.
+    (creds / "oauth_states.json").write_text("{}", encoding="utf-8")
+    (creds / "bad name@evil.com.json").write_text("{}", encoding="utf-8")
+    assert google_authenticated_email() == "owner@gmail.com"
+
+    (creds / "second@gmail.com.json").write_text("{}", encoding="utf-8")
+    assert google_authenticated_email() is None  # ambiguous -> never guess
 
 
 async def test_static_env_round_trips_through_mcp_json(data_dir: Path) -> None:
