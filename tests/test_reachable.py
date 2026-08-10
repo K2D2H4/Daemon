@@ -63,11 +63,6 @@ PENDING_CLASSES: dict[str, str] = {
     # routes a spoken tool call through `Companion.run_tools` and answers it with
     # `send_tool_response`, and `daemon/app.py`'s `run_voice` offers the session the
     # owner's tool specs, pinned to `allowlist`.
-    "OpenAIRealtimeSession": (
-        "M1b+ (voice Phase B1) - the OpenAI Realtime VoiceSession, built by "
-        "app.run_voice when DAEMON_VOICE_PROVIDER=openai. Wired in the app-branch "
-        "task; this entry is removed then."
-    ),
 }
 
 PENDING_WIRING = {
@@ -133,6 +128,7 @@ WIRED_CLASSES = (
     # voice layer was complete, tested and unreachable - which is the whole
     # reason this file exists, and this line is what that gap closing looks like.
     "GeminiLiveSession",
+    "OpenAIRealtimeSession",
     "SoundDeviceAudio",
     "VoiceConversation",
     # The echo-cancelling AudioIO, built by `app.build_voice_audio` on macOS.

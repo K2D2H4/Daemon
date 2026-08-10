@@ -1069,6 +1069,7 @@ async def run_voice(
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
     from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
+    from daemon.voice.openai_realtime import OpenAIRealtimeError, OpenAIRealtimeSession
 
     if not settings.voice_enabled:
         logger.error("voice is off; set DAEMON_VOICE_ENABLED=true (see `daemon setup`)")
@@ -1177,6 +1178,14 @@ async def run_voice(
             """A fresh session per attempt. Reconnecting means starting clean: the
             old one carries a half-flushed transcript, a partial-transcript queue
             nobody will read again, and a log filter holding the API key."""
+            if route.provider == "openai":
+                return OpenAIRealtimeSession(
+                    api_key=settings.openai_api_key,
+                    model=route.model,
+                    system_instruction=system_instruction,
+                    tools=tool_specs,
+                    voice_name=settings.openai_realtime_voice,
+                )
             return GeminiLiveSession(
                 api_key=settings.gemini_api_key,
                 model=route.model,
@@ -1227,7 +1236,7 @@ async def run_voice(
                 new_session,
                 audio,
                 companion,
-                GeminiLiveError,
+                (GeminiLiveError, OpenAIRealtimeError),
                 opening_audio=opening_audio,
                 opening_text=opening_text,
                 screen_share=screen_share,
@@ -1344,7 +1353,7 @@ async def _voice_attempts(
     new_session: Callable[[], Any],
     audio: AudioIO,
     companion: Companion,
-    session_error: type[Exception],
+    session_error: type[Exception] | tuple[type[Exception], ...],
     opening_audio: bytes = b"",
     opening_text: str = "",
     screen_share: Any = None,
