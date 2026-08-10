@@ -446,6 +446,19 @@ class VoiceConversation:
     ) -> None:
         try:
             async for chunk in microphone:
+                if self._answering_tool and not self._generating:
+                    # The floor belongs to the tool. Between "the model asked" and
+                    # its first audio back, the server's activity detection reads
+                    # any mic sound - a breath, a mumble, the room - as the user
+                    # interrupting and cancels the pending call, so the daemon ran
+                    # the tool and never spoke the result (measured live: `tool.ran
+                    # ok=True` then `the server cancelled tool calls`, with zero
+                    # real interruptions in the session). Nothing is playing yet,
+                    # so there is nothing to barge into; the chunk is dropped, not
+                    # queued. The moment audio flows, `_generating` is set and the
+                    # microphone resumes - barge-in over the spoken result works
+                    # exactly as before.
+                    continue
                 await session.send_audio(chunk)
         except asyncio.CancelledError:
             raise

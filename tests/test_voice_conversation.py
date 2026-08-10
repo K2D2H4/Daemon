@@ -2102,3 +2102,29 @@ async def test_an_empty_history_sends_nothing_either() -> None:
     await run(conversation(session, FakeAudio(), FakeMemory()))
 
     assert [text for text in session.contexts if "recent-conversation" in text] == []
+
+
+async def test_the_microphone_holds_while_a_tool_answer_is_pending() -> None:
+    """Between "the model asked for a tool" and its first audio back, mic sound is
+    read by the server's activity detection as the user interrupting, and it cancels
+    the pending call - the daemon ran the tool and never spoke the result (measured
+    live: `tool.ran ok=True` then `the server cancelled tool calls`, zero real
+    interruptions in the session). Driven directly rather than through a scripted
+    session because the property is about interleaving: which chunks cross while the
+    flags are in each state."""
+    session = FakeSession()
+    conv = conversation(session)
+
+    async def mic() -> Any:
+        yield b"m1"  # ordinary conversation: forwarded
+        conv._answering_tool = True
+        yield b"m2"  # tool pending, nothing playing: held - this is the fix
+        conv._generating = True
+        yield b"m3"  # the answer is playing: forwarded, so barge-in still works
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"m1", b"m3"], (
+        "a chunk crossed while the tool answer was pending - the exact audio the "
+        "server answers with a tool-call cancellation"
+    )
