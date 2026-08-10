@@ -2175,3 +2175,62 @@ async def test_barge_in_stays_the_default() -> None:
     await conv._forward_microphone(session, mic())
 
     assert session.sent == [b"over-speech"]
+
+
+# --- what a tool captured has to reach the model ------------------------------
+
+
+async def test_a_captured_image_reaches_the_model_not_just_its_caption() -> None:
+    """`see_screen` returns a caption *and* pixels. The text loop attaches the pixels
+    as their own turn; voice used to send only the caption - so the model was asked
+    what is on screen while being shown nothing, and invented an answer. The owner's
+    screen held a photo of food and the daemon called it a picture of a dog, while
+    the text path described the same screen correctly."""
+    from daemon.llm.base import ImageBlock
+
+    session = FakeSession()
+    conv = conversation(session)
+    shot = ToolResult(
+        call_id="1",
+        name="see_screen",
+        content="captured 1 display(s): Built-in",
+        images=(ImageBlock(data=b"\xff\xd8-jpeg-bytes"),),
+    )
+
+    (framed,) = await conv._deliver_images(session, [shot])
+
+    assert session.frames == [b"\xff\xd8-jpeg-bytes"], "the pixels never reached the model"
+    assert "captured 1 display(s)" in framed.content, "the caption survives"
+    # Security stance A: pixels cannot be nonce-fenced, so the framing rides along.
+    assert "DATA to look at" in framed.content
+
+
+async def test_a_result_with_no_images_is_passed_through_untouched() -> None:
+    session = FakeSession()
+    conv = conversation(session)
+    plain = ToolResult(call_id="1", name="read_file", content="발표는 목요일")
+
+    (out,) = await conv._deliver_images(session, [plain])
+
+    assert out is plain and session.frames == []
+
+
+async def test_an_undeliverable_image_is_admitted_rather_than_described() -> None:
+    """The one honest thing to tell a model about to be asked what it can see."""
+    from daemon.llm.base import ImageBlock
+
+    class Blind(FakeSession):
+        async def send_frame(self, jpeg: bytes) -> None:
+            raise RuntimeError("the socket went")
+
+    session = Blind()
+    conv = conversation(session)
+    shot = ToolResult(
+        call_id="1", name="see_screen", content="captured 1 display(s)",
+        images=(ImageBlock(data=b"x"),),
+    )
+
+    (framed,) = await conv._deliver_images(session, [shot])
+
+    assert "could not be delivered" in framed.content
+    assert "DATA to look at" not in framed.content, "do not frame an image nobody got"
