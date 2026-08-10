@@ -636,6 +636,19 @@ async def test_env_passthrough_round_trips_through_mcp_json(
     assert config.env_passthrough == ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
 
 
+async def test_static_env_round_trips_through_mcp_json(data_dir: Path) -> None:
+    """A restart rebuilds servers from mcp.json, so a catalog-set flag like
+    OAUTHLIB_INSECURE_TRANSPORT must survive the write/read - otherwise google's
+    localhost consent callback would be refused again after a restart. Not a secret,
+    so the value (not just the name) is stored."""
+    save_server(
+        data_dir,
+        ServerConfig(name="google", command="uvx", env={"OAUTHLIB_INSECURE_TRANSPORT": "1"}),
+    )
+    (config,) = load_config(data_dir).servers
+    assert config.env == {"OAUTHLIB_INSECURE_TRANSPORT": "1"}
+
+
 async def test_save_server_writes_owner_only(data_dir: Path) -> None:
     save_server(data_dir, ServerConfig(name="a", command="uvx"))
     mode = (data_dir / "mcp.json").stat().st_mode & 0o777
