@@ -338,61 +338,59 @@ git commit -m "proactivity: split the merged audio signal in Reading (frozen fil
 
 - [ ] **Step 1: Write the failing test**
 
+`tests/test_presence.py`에 이미 `build(**kwargs) -> (MachinePresence, FakeRunner)`(:112)가 있다.
+**새 헬퍼를 만들지 말고 그것을 쓴다.** 다만 `build`는 `rest.setdefault("audio", lambda: False)`로
+**인자 없는** 오디오 콜러블을 기본값으로 넣는데, `audio_running`이 셀렉터를 받게 되므로 그
+기본값도 같이 고쳐야 한다 — 이 태스크에 포함된다.
+
 ```python
 # tests/test_presence.py 에 추가
-import pytest
-
-from daemon.proactivity.presence import DEFAULT_INPUT, DEFAULT_OUTPUT, MachinePresence
+from daemon.proactivity.presence import DEFAULT_INPUT
 
 
-def _audio(*, mic: bool, out: bool):
+def audio_probe(*, mic: bool, out: bool):
     """A stand-in for the CoreAudio probe, answering per device selector."""
     def probe(selector: int) -> bool:
         return mic if selector == DEFAULT_INPUT else out
     return probe
 
 
-@pytest.mark.asyncio
 async def test_our_own_microphone_hold_is_not_a_call() -> None:
     """The whole point. With the wake listener running, the raw probe says the
     input device is busy; the gate must not read that as somebody on a call."""
-    presence = MachinePresence(
-        platform="darwin",
-        run=_stub_run(),
-        audio=_audio(mic=True, out=False),
-        mic_held=lambda: True,
-    )
-    reading = await presence.read()
+    reader, _ = build(audio=audio_probe(mic=True, out=False), mic_held=lambda: True)
+    reading = await reader.read()
     assert reading.mic_busy is False
 
 
-@pytest.mark.asyncio
 async def test_somebody_elses_microphone_hold_is_a_call() -> None:
-    presence = MachinePresence(
-        platform="darwin",
-        run=_stub_run(),
-        audio=_audio(mic=True, out=False),
-        mic_held=lambda: False,
-    )
-    reading = await presence.read()
+    reader, _ = build(audio=audio_probe(mic=True, out=False), mic_held=lambda: False)
+    reading = await reader.read()
     assert reading.mic_busy is True
 
 
-@pytest.mark.asyncio
 async def test_output_is_read_independently_of_the_microphone() -> None:
-    presence = MachinePresence(
-        platform="darwin",
-        run=_stub_run(),
-        audio=_audio(mic=False, out=True),
-        mic_held=lambda: False,
-    )
-    reading = await presence.read()
+    reader, _ = build(audio=audio_probe(mic=False, out=True), mic_held=lambda: False)
+    reading = await reader.read()
     assert reading.mic_busy is False
     assert reading.output_busy is True
+
+
+async def test_we_do_not_probe_a_device_we_already_hold() -> None:
+    """Not an optimisation. If we hold it the device is busy by definition, so
+    the probe can only return the answer we must not act on."""
+    def must_not_run(selector: int) -> bool:
+        raise AssertionError("the microphone probe ran while we held the device")
+
+    reader, _ = build(audio=must_not_run, mic_held=lambda: True)
+    reading = await reader.read()
+    assert reading.mic_busy is False
 ```
 
-`_stub_run()`은 기존 테스트가 이미 쓰는 헬퍼다. 없으면 파일 내 기존 패턴을 따라 만든다 —
-`ioreg`·`lsappinfo` 출력을 흉내내는 async 콜러블.
+> **기존 테스트 두 개가 깨진다. 고치는 것이 이 태스크의 일부다.**
+> `test_a_complete_reading_answers_all_three_probes`(:134)가 `reading.audio_busy is True`를
+> 단언한다. 이름과 단언을 새 필드로 갱신한다 — 프로브가 이제 셋이 아니므로 이름의 "three"도
+> 사실이 아니다. `build`의 `audio` 기본값도 `lambda selector: False`로.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -524,62 +522,87 @@ git commit -m "presence: read the microphone and the output device apart"
 
 - [ ] **Step 1: Write the failing test**
 
+> **먼저 `FakeRunner`를 고쳐야 한다 — 이것이 이 태스크의 첫 작업이다.** 지금
+> `FakeRunner.__call__`(:91)은 `argv[0] == OSASCRIPT`인 모든 호출에 **같은** `osascript`
+> 답을 돌려준다. 포그라운드 프로브가 유일한 osascript 사용자였기 때문이다. 음소거 프로브가
+> 세 번째·네 번째 osascript 사용자가 되므로, 그대로 두면 음소거 프로브가 `"Google Chrome"`을
+> 받고 `ProbeError`를 던진다 — 그리고 그 실패는 조용하다. `unknown`에 한 줄이 늘 뿐이다.
+>
+> `argv[2]`(`-e` 뒤의 스크립트)로 갈라지게 하고 `RUNNER_KEYS`에 `muted`·`volume`·
+> `sp_audio`를 더한다. 알 수 없는 명령에 `AssertionError`를 던지는 기존 동작은 유지한다 —
+> 새 명령이 조용히 통과하지 않게 막는 장치다.
+
 ```python
 # tests/test_presence.py 에 추가
-@pytest.mark.asyncio
 async def test_muted_output_is_read_as_muted() -> None:
-    presence = MachinePresence(
-        platform="darwin",
-        run=_stub_run(volume="true"),   # osascript answers `true`
-        audio=_audio(mic=False, out=False),
-        mic_held=lambda: False,
-    )
-    reading = await presence.read()
+    reader, _ = build(muted="true\n")
+    reading = await reader.read()
     assert reading.output_muted is True
 
 
-@pytest.mark.asyncio
 async def test_zero_volume_counts_as_muted() -> None:
     """Nobody hears 0% either, and `say` still exits 0. The two states differ in
     the Settings pane and not in the room."""
-    presence = MachinePresence(
-        platform="darwin",
-        run=_stub_run(volume="false", volume_level="0"),
-        audio=_audio(mic=False, out=False),
-        mic_held=lambda: False,
-    )
-    reading = await presence.read()
+    reader, _ = build(muted="false\n", volume="0\n")
+    reading = await reader.read()
     assert reading.output_muted is True
 
 
-@pytest.mark.asyncio
+async def test_an_audible_machine_is_not_muted() -> None:
+    reader, _ = build(muted="false\n", volume="50\n")
+    reading = await reader.read()
+    assert reading.output_muted is False
+
+
+async def test_an_unreadable_mute_state_is_unknown_not_audible(reading_reason) -> None:
+    """`None` and not `False`: False is what lets a line be spoken aloud, and an
+    osascript that answered nonsense is not evidence anybody would hear it."""
+    reader, _ = build(muted="Google Chrome\n")
+    reading = await reader.read()
+    assert reading.output_muted is None
+    assert reason_for(reading, "output_muted") != ""
+
+
 async def test_a_locked_screen_is_recorded() -> None:
-    presence = MachinePresence(
-        platform="darwin",
-        run=_stub_run(),
-        audio=_audio(mic=False, out=False),
-        mic_held=lambda: False,
-        session=lambda: {"CGSSessionScreenIsLocked": 1},
-    )
-    reading = await presence.read()
+    reader, _ = build(session=lambda: {"CGSSessionScreenIsLocked": 1})
+    reading = await reader.read()
     assert reading.screen_locked is True
 
 
-@pytest.mark.asyncio
 async def test_an_absent_lock_key_means_unlocked_not_unknown() -> None:
-    """macOS omits the key entirely when unlocked - it does not set it to 0. A
-    probe that read the absence as "could not answer" would route every
-    utterance to Telegram forever."""
-    presence = MachinePresence(
-        platform="darwin",
-        run=_stub_run(),
-        audio=_audio(mic=False, out=False),
-        mic_held=lambda: False,
-        session=lambda: {"kCGSSessionOnConsoleKey": True},
-    )
-    reading = await presence.read()
+    """macOS omits the key entirely when unlocked - it does not set it to 0
+    (verified 2026-08-11). A probe that read the absence as "could not answer"
+    would route every utterance to Telegram for the life of the process."""
+    reader, _ = build(session=lambda: {"kCGSSessionOnConsoleKey": True})
+    reading = await reader.read()
     assert reading.screen_locked is False
+
+
+async def test_no_quartz_is_unknown_rather_than_unlocked() -> None:
+    reader, _ = build(session=lambda: None)
+    reading = await reader.read()
+    assert reading.screen_locked is None
+
+
+async def test_headphones_are_read_from_the_default_output_transport() -> None:
+    reader, _ = build(sp_audio=SP_AUDIO_HEADPHONES)
+    reading = await reader.read()
+    assert reading.headphones is True
+
+
+async def test_built_in_speakers_are_not_headphones() -> None:
+    """The default output on the development machine is
+    `MacBook Pro Speakers (eqMac)` - a virtual device in front of the built-in
+    speakers. The name describes the proxy; the transport is what is read."""
+    reader, _ = build(sp_audio=SP_AUDIO_BUILTIN)
+    reading = await reader.read()
+    assert reading.headphones is False
 ```
+
+`SP_AUDIO_HEADPHONES`·`SP_AUDIO_BUILTIN`은 `system_profiler SPAudioDataType` 출력을 흉내낸
+모듈 상수로, 파일 상단의 `IOREG_DUMP`·`LS_FRONT`와 같은 자리에 둔다. `Default Output Device: Yes`가
+붙은 블록과 그 블록의 `Transport:` 줄을 포함해야 한다. `reading_reason` 픽스처는 만들지 말고
+기존 `reason_for(reading, field)` 헬퍼(:123)를 쓴다.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -730,36 +753,49 @@ git commit -m "presence: mute, screen lock, and headphone transport"
 
 - [ ] **Step 1: Write the failing test**
 
+`tests/test_audio.py`에 `FakeSoundDevice`(`RawInputStream`/`RawOutputStream`)와 `backend()`
+픽스처가 이미 있고, `SoundDeviceAudio(backend=backend)`가 주입 경로다. **새 시임을 만들지
+말고 그것을 쓴다.** 마이크를 여는 곳은 `daemon/voice/audio.py:119`의 `async def record()`다.
+
 ```python
 # tests/test_audio.py 에 추가
 from daemon import mic_hold
 
 
-def test_an_open_input_stream_marks_the_microphone_held(monkeypatch) -> None:
-    """Without this the presence probe cannot tell the wake listener's hold from
-    somebody else's call, and the speaker route dies whenever voice is on."""
-    seen: list[bool] = []
+async def test_recording_marks_the_microphone_held(backend: FakeSoundDevice) -> None:
+    """Without this the presence probe cannot tell the wake listener's own hold
+    from somebody else's call, and the local speaker route dies for as long as
+    voice is switched on. See daemon/mic_hold.py."""
+    assert mic_hold.held() is False
+    io = SoundDeviceAudio(backend=backend)
 
-    class _FakeStream:
-        def __enter__(self):
-            seen.append(mic_hold.held())
-            return self
+    stream = io.record()
+    await anext(stream)
+    assert mic_hold.held() is True, "the hold must be visible while recording"
 
-        def __exit__(self, *exc):
-            return False
+    await stream.aclose()
+    assert mic_hold.held() is False
 
-        def read(self, frames):
-            return (b"\x00" * frames * 2, False)
 
-    # Substitute the backend so no PortAudio device is touched, per the testing
-    # rule in docs/CONTRACTS.md.
-    ...  # wire _FakeStream in via the module's existing injection seam
-    assert seen == [True]
+async def test_the_hold_is_released_when_recording_raises(
+    backend: FakeSoundDevice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stream that dies mid-read must not leave the daemon convinced it is on
+    a call for the rest of the process's life - that is the failure this whole
+    milestone exists to remove, reintroduced by an unbalanced counter."""
+    def explode(**kwargs: Any) -> FakeStream:
+        raise RuntimeError("PortAudio went away")
+
+    monkeypatch.setattr(backend, "RawInputStream", explode)
+    io = SoundDeviceAudio(backend=backend)
+
+    with pytest.raises(RuntimeError):
+        await anext(io.record())
     assert mic_hold.held() is False
 ```
 
-구현자 주의: `tests/test_audio.py`가 이미 백엔드를 대체하는 방식을 그대로 따른다. 새 주입
-경로를 만들지 말 것 — 기존 것이 있다.
+구현자 주의: `record()`가 async generator이므로 위 테스트가 `anext`/`aclose`로 구동한다.
+기존 녹음 테스트가 이미 그 패턴을 쓰고 있으면 그 스타일에 맞춘다.
 
 - [ ] **Step 2: Run test to verify it fails**
 
