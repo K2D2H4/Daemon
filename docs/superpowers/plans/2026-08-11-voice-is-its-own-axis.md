@@ -600,7 +600,7 @@ table and the sentence under it:
 - [ ] **Step 4: Check nothing else still promises the coupling**
 
 ```bash
-grep -rn "routes no voice task\|Voice unavailable\|음성 | 불가\|voice is not available" --include="*.py" --include="*.md" . | grep -v node_modules
+grep -rnE "routes no voice task|Voice unavailable|voice is not available|음성.*불가" --include="*.py" --include="*.md" --include="*.example" . | grep -v node_modules
 ```
 
 Expected: no hits outside this plan file and `docs/adr/0012`. Any hit in `.env.example`,
