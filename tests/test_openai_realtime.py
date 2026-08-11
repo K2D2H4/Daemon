@@ -18,7 +18,6 @@ import pytest
 from daemon.llm.base import ToolCall, ToolSpec
 from daemon.voice.base import Interrupted, Transcript, VoiceSession
 from daemon.voice.openai_realtime import (
-    USER_TRANSCRIPT_GRACE_SECONDS,
     OpenAIRealtimeError,
     OpenAIRealtimeSession,
     _permanent_close,
@@ -185,21 +184,28 @@ async def test_receive_yields_audio_then_transcripts_then_ends_on_response_done(
 
 
 async def test_user_transcript_arriving_after_response_done_lands_before_the_reply():
-    # whisper-1 emits only `input_audio_transcription.completed` - a full
-    # transcript, no delta stream - and it commonly arrives *after*
-    # `response.done` (~200ms, measured). Losing it to the next turn - or
-    # misfiling it as belonging to the next turn's own speech - would record the
-    # assistant's reply BEFORE the user's question that prompted it: the exact
-    # ordering bug gemini_live.py's `_flush` docstring calls out ("user first:
-    # that is the order it happened in"). `receive()`'s grace wait
-    # (USER_TRANSCRIPT_GRACE_SECONDS) is what keeps this in the same turn, user
+    # The reproduced live defect. `input_audio_buffer.committed` tells `_decode`
+    # a user transcript is OWED for this turn; whisper-1 then emits only
+    # `input_audio_transcription.completed` - a full transcript, no delta stream
+    # - and it commonly arrives *after* `response.done` (~200ms, measured).
+    # Losing it to the next turn - or misfiling it as belonging to the next
+    # turn's own speech - would record the assistant's reply BEFORE the user's
+    # question that prompted it: the exact ordering bug gemini_live.py's
+    # `_flush` docstring calls out ("user first: that is the order it happened
+    # in"). `receive()`'s grace wait (USER_TRANSCRIPT_GRACE_SECONDS) - paid only
+    # because a transcript is owed - is what keeps this in the same turn, user
     # transcript yielded before the assistant's.
     conn = FakeConnection(
         SESSION_UPDATED,
+        {"type": "input_audio_buffer.committed", "item_id": "item_1"},
         audio_delta(b"\x01\x02"),
         {"type": "response.output_audio_transcript.done", "transcript": "hello"},
         {"type": "response.done"},
-        {"type": "conversation.item.input_audio_transcription.completed", "transcript": "뭐 해"},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "item_1",
+            "transcript": "뭐 해",
+        },
     )
     async with make(conn) as live:
         items = await collect(live)
@@ -210,12 +216,37 @@ async def test_user_transcript_arriving_after_response_done_lands_before_the_rep
     assert sum(1 for role, _, _ in texts if role == "user") == 1
 
 
+async def test_user_transcript_arriving_before_response_done_is_not_double_emitted():
+    # The early-arrival counterpart of the test above: `…completed` lands
+    # before `response.done` this time. It must still be one turn, user before
+    # assistant, with no double-emit - the accumulate-then-flush structure
+    # should not care which order the two events happened to arrive in.
+    conn = FakeConnection(
+        SESSION_UPDATED,
+        {"type": "input_audio_buffer.committed", "item_id": "item_1"},
+        audio_delta(b"\x01\x02"),
+        {"type": "response.output_audio_transcript.done", "transcript": "hello"},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "item_1",
+            "transcript": "뭐 해",
+        },
+        {"type": "response.done"},
+    )
+    async with make(conn) as live:
+        items = await collect(live)
+    texts = [(t.role, t.text, t.final) for t in items if isinstance(t, Transcript)]
+    assert texts == [("user", "뭐 해", True), ("assistant", "hello", True)]
+    assert sum(1 for role, _, _ in texts if role == "user") == 1
+
+
 async def test_turn_with_no_user_transcription_completes_within_the_grace_window():
-    # A turn where the user never spoke (e.g. a send_text-only turn, or one
-    # where whisper-1 simply never reports anything) has no `…completed` event
-    # to wait for. `HANG` makes the fake socket never deliver another message,
-    # so a passing test here is proof the internal wait is bounded by
-    # USER_TRANSCRIPT_GRACE_SECONDS, not proof that the fake socket ran dry.
+    # A turn where the user never spoke (e.g. a send_text-only turn) never gets
+    # `input_audio_buffer.committed`, so nothing is OWED and `receive()` must not
+    # wait at all. `HANG` makes the fake socket never deliver another message; a
+    # bound well under USER_TRANSCRIPT_GRACE_SECONDS (0.5s) is what proves the
+    # wait was skipped entirely - a regression that waits unconditionally would
+    # blow through this timeout instead of finishing.
     conn = FakeConnection(
         SESSION_UPDATED,
         {"type": "response.output_audio_transcript.done", "transcript": "hi"},
@@ -223,10 +254,49 @@ async def test_turn_with_no_user_transcription_completes_within_the_grace_window
         HANG,
     )
     async with make(conn) as live:
-        async with asyncio.timeout(USER_TRANSCRIPT_GRACE_SECONDS + 2.0):
+        async with asyncio.timeout(0.2):
             items = await collect(live)
     texts = [t for t in items if isinstance(t, Transcript)]
     assert texts == [Transcript(text="hi", role="assistant", final=True)]
+
+
+async def test_consecutive_turns_do_not_bleed_user_transcripts():
+    # Two full turns on one connection, each with its own `committed` +
+    # `completed`. Turn 1's user transcript must not appear in turn 2's result,
+    # and turn 2 must not inherit any state - `owed`, `committed_item_id` -
+    # left over from turn 1.
+    conn = FakeConnection(
+        SESSION_UPDATED,
+        # Turn 1
+        {"type": "input_audio_buffer.committed", "item_id": "item_1"},
+        audio_delta(b"\x01\x02"),
+        {"type": "response.output_audio_transcript.done", "transcript": "first reply"},
+        {"type": "response.done"},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "item_1",
+            "transcript": "첫 turn",
+        },
+        # Turn 2
+        {"type": "input_audio_buffer.committed", "item_id": "item_2"},
+        audio_delta(b"\x03\x04"),
+        {"type": "response.output_audio_transcript.done", "transcript": "second reply"},
+        {"type": "response.done"},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "item_2",
+            "transcript": "두번째 turn",
+        },
+    )
+    async with make(conn) as live:
+        turn1 = [
+            (t.role, t.text, t.final) for t in await collect(live) if isinstance(t, Transcript)
+        ]
+        turn2 = [
+            (t.role, t.text, t.final) for t in await collect(live) if isinstance(t, Transcript)
+        ]
+    assert turn1 == [("user", "첫 turn", True), ("assistant", "first reply", True)]
+    assert turn2 == [("user", "두번째 turn", True), ("assistant", "second reply", True)]
 
 
 async def test_speech_started_is_a_barge_in():
