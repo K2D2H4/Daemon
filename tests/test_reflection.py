@@ -621,3 +621,192 @@ async def test_a_pass_that_raises_records_why_before_it_propagates(
     rows = store.recent_reflection_runs()
     assert [(row["date"], row["status"]) for row in rows] == [(DAY, "failed")]
     assert "disk full" in rows[0]["detail"], "a failure that does not say why is not a readout"
+
+
+# --- updating what is already known (ADR 0010) ------------------------------
+#
+# The pass used to be write-only with respect to memory: it read the day and
+# nothing else, so the only way a new fact could retire an old one was for the
+# model to independently reinvent the same `supersession_key` string. Five nights
+# of real reflection produced three overlapping facts about the owner under three
+# different keys. These cover the id that replaced that hope.
+
+
+async def seed(data_dir: Path, store: Store, *facts: tuple[str, str | None]) -> list[int]:
+    """Facts already in the curated tier, the way a previous night left them."""
+    memory = curated.CuratedMemory(data_dir, store)
+    return [await memory.add(body, importance=8, supersession_key=key) for body, key in facts]
+
+
+def update_reply(target: object, body: str, *, key: str | None = None) -> str:
+    return json.dumps(
+        {"facts": [{"body": body, "importance": 9, "updates": target, "key": key}]},
+        ensure_ascii=False,
+    )
+
+
+def entry(store: Store, entry_id: int) -> Any:
+    return store.conn.execute(
+        "SELECT status, superseded_by FROM memory_entries WHERE id = ?", (entry_id,)
+    ).fetchone()
+
+
+async def test_the_prompt_carries_what_is_already_known(data_dir: Path, store: Store) -> None:
+    """The whole defect in one assertion: the model cannot supersede a fact it
+    cannot see, and it could not see any of them."""
+    [known] = await seed(data_dir, store, ("사용자의 이름은 김대현이다", "user_name"))
+    record(store, "무슨 말")
+    provider = FakeProvider(FULL_REPLY)
+
+    await Reflection(data_dir, store, gateway_for(provider)).run(DAY)
+
+    prompt = "\n".join(m.content for m in provider.calls[0] if m.role == "user")
+    assert f"{known}: 사용자의 이름은 김대현이다" in prompt
+
+
+async def test_a_fact_that_updates_another_retires_it(data_dir: Path, store: Store) -> None:
+    [old] = await seed(data_dir, store, ("사용자의 이름은 김대현이다", None))
+    record(store, "나 9년차 엔지니어야")
+    reply = update_reply(old, "이름은 김대현이며, 9년차 엔지니어다")
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    assert result.facts == 1
+    assert curated.read(data_dir) == ["이름은 김대현이며, 9년차 엔지니어다"]
+    replaced = entry(store, old)
+    assert replaced["status"] == "retired"
+    assert replaced["superseded_by"] is not None, "a retired fact must point at what replaced it"
+
+
+async def test_an_update_and_a_key_retire_both_rows(data_dir: Path, store: Store) -> None:
+    """The unique index (`schema.sql:199`) allows one active row per key, so a
+    fact that both updates an id and carries a key held by a *different* row would
+    hit `UNIQUE constraint failed` if only the id were retired."""
+    old, keyed = await seed(
+        data_dir,
+        store,
+        ("사용자의 이름은 김대현이다", None),
+        ("사용자는 개발자다", "job"),
+    )
+    record(store, "나 9년차 엔지니어야")
+    reply = update_reply(old, "이름은 김대현이며, 9년차 엔지니어다", key="job")
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    assert result.problems == []
+    assert result.facts == 1
+    assert curated.read(data_dir) == ["이름은 김대현이며, 9년차 엔지니어다"]
+    assert entry(store, old)["status"] == "retired"
+    assert entry(store, keyed)["status"] == "retired"
+
+
+async def test_an_update_pointing_nowhere_keeps_the_fact_and_says_so(
+    data_dir: Path, store: Store
+) -> None:
+    """`updates` is the model naming a row to retire, so it is hostile input like
+    everything else here. Dropping the fact too would let one bad number cost a
+    night's work; retiring row 9999 is not an option at all."""
+    record(store, "나 9년차 엔지니어야")
+    reply = update_reply(9999, "이름은 김대현이며, 9년차 엔지니어다")
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    assert result.facts == 1
+    assert curated.read(data_dir) == ["이름은 김대현이며, 9년차 엔지니어다"]
+    assert any("9999" in problem for problem in result.problems)
+
+
+async def test_an_update_cannot_retire_an_already_retired_fact(
+    data_dir: Path, store: Store
+) -> None:
+    """Superseding a fact that is already superseded would move the pointer of a
+    row that has been settled, rewriting history rather than extending it."""
+    [old] = await seed(data_dir, store, ("사용자의 이름은 김대현이다", "user_name"))
+    await seed(data_dir, store, ("이름은 김대현이며, 9년차 엔지니어다", "user_name"))
+    assert entry(store, old)["status"] == "retired"
+    settled = entry(store, old)["superseded_by"]
+    record(store, "무슨 말")
+
+    result = await Reflection(
+        data_dir, store, gateway_for(FakeProvider(update_reply(old, "완전히 다른 사실")))
+    ).run(DAY)
+
+    assert result.facts == 1
+    assert entry(store, old)["superseded_by"] == settled, "a settled pointer must not move"
+    assert result.problems != []
+
+
+async def test_a_non_integer_update_is_ignored(data_dir: Path, store: Store) -> None:
+    record(store, "무슨 말")
+    reply = update_reply("첫 번째 사실", "이름은 김대현이며, 9년차 엔지니어다")
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    assert result.facts == 1
+    assert curated.read(data_dir) == ["이름은 김대현이며, 9년차 엔지니어다"]
+    assert result.problems != []
+
+
+async def test_a_fact_with_no_update_still_just_adds(data_dir: Path, store: Store) -> None:
+    """The regression guard: most facts are new, and this is the path five nights
+    of production already ran."""
+    [known] = await seed(data_dir, store, ("사용자의 이름은 김대현이다", "user_name"))
+    record(store, "연희동으로 이사했어")
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(FULL_REPLY))).run(DAY)
+
+    assert result.problems == []
+    assert entry(store, known)["status"] == "active"
+    # A set, because the order is the injection ranking (importance first) and
+    # what this test is about is that nothing was retired.
+    assert set(curated.read(data_dir)) == {
+        "사용자의 이름은 김대현이다",
+        "연희동에 산다",
+        "김치찌개를 좋아한다",
+    }
+
+
+async def test_the_first_ever_pass_has_nothing_to_carry(data_dir: Path, store: Store) -> None:
+    """No curated tier yet - the prompt must still be well-formed rather than
+    carrying an empty section the model has to interpret."""
+    record(store, "연희동으로 이사했어")
+    provider = FakeProvider(FULL_REPLY)
+
+    result = await Reflection(data_dir, store, gateway_for(provider)).run(DAY)
+
+    assert result.status == "written"
+    assert result.facts == 2
+    prompt = "\n".join(m.content for m in provider.calls[0] if m.role == "user")
+    assert "이미 기억하고 있는 것" not in prompt
+
+
+async def test_the_artifact_records_what_an_update_replaced(
+    data_dir: Path, store: Store
+) -> None:
+    """The artifact is what a human reads to check the other three, so a night
+    that retired a fact has to say which one."""
+    [old] = await seed(data_dir, store, ("사용자의 이름은 김대현이다", None))
+    record(store, "나 9년차 엔지니어야")
+    reply = update_reply(old, "이름은 김대현이며, 9년차 엔지니어다")
+
+    await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    text = artifact_path(data_dir, DAY).read_text(encoding="utf-8")
+    assert f"updates: {old}" in text
+
+
+async def test_the_artifact_does_not_claim_an_update_that_was_refused(
+    data_dir: Path, store: Store
+) -> None:
+    """The artifact is rendered before the mirror is touched, so a rejected id
+    would be printed as though it had retired something. `_one_per_key` already
+    settles its collisions before rendering for exactly this reason: the file a
+    human reads to check the pass has to describe what the pass did."""
+    record(store, "무슨 말")
+    reply = update_reply(9999, "이름은 김대현이며, 9년차 엔지니어다")
+
+    await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    text = artifact_path(data_dir, DAY).read_text(encoding="utf-8")
+    assert "이름은 김대현이며, 9년차 엔지니어다" in text
+    assert "updates" not in text, "the artifact must not claim a retirement that did not happen"

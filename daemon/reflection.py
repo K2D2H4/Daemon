@@ -36,7 +36,7 @@ import logging
 import os
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -46,7 +46,7 @@ from daemon.llm.base import Message, ProviderError
 from daemon.llm.gateway import LLMGateway
 from daemon.memory import entities as entity_notes
 from daemon.memory import log
-from daemon.memory.curated import CuratedMemory
+from daemon.memory.curated import MAX_INJECTED, CuratedMemory
 from daemon.memory.entities import EntityNotes, UnsafeName
 from daemon.memory.store import Store
 from daemon.tasks import Task
@@ -68,6 +68,10 @@ SYSTEM = """너는 하루치 대화를 정리하는 역할이다. 아래 규칙�
 - facts: 앞으로 계속 기억할 가치가 있는 사실. 그날의 잡담은 넣지 않는다.
   importance 는 1~10. key 는 나중에 바뀔 수 있는 사실에만 넣는다
   (예: 사는 곳, 직장, 관계). 같은 key 는 이전 사실을 대체한다.
+  updates 는 이미 기억하고 있는 사실을 고쳐 쓰는 경우에만, 그 번호를 적는다.
+  겹치는 내용을 새로 추가하지 말고 updates 로 대체한다. 새로운 사실이면 null.
+  단, 기존 사실에만 있는 내용이 새 문장에서 빠지면 안 된다 - 그럴 때는
+  둘을 합친 문장을 쓰거나, 대체하지 말고 새 사실로 추가한다.
   triggers 는 이 사실을 떠올려야 할 때 대화에 나올 만한 단어 2~4개.
   조사 없이 짧게 (예: "이사", "연희동").
 - entities: 사람 / 장소 / 프로젝트 / 주제. note 는 그 대상에 대해 알게 된 것
@@ -77,9 +81,12 @@ SYSTEM = """너는 하루치 대화를 정리하는 역할이다. 아래 규칙�
 
 확실하지 않으면 넣지 않는다. 빈 배열도 정답이다. 설명이나 인사말 없이 JSON만.
 
-{"facts": [{"body": "...", "importance": 5, "key": null, "triggers": ["..."]}],
+{"facts": [{"body": "...", "importance": 5, "key": null, "updates": null,
+            "triggers": ["..."]}],
  "entities": [{"name": "...", "kind": "person", "note": "...", "links": []}],
  "observations": [{"body": "...", "confidence": 0.5}]}"""
+
+KNOWN_HEADER = "[이미 기억하고 있는 것 - 고쳐 쓸 사실은 이 번호를 updates 에 적는다]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +94,10 @@ class Fact:
     body: str
     importance: int = 5
     key: str | None = None
+    updates: int | None = None
+    """The id of a curated fact this one replaces (ADR 0010). Unverified here -
+    `Reflection._apply` checks it against the store, because a number the model
+    chose is a claim about a row, not a row."""
     triggers: tuple[str, ...] = ()
     """Words that should pull this fact forward even when the importance budget
     would have dropped it. Recall matches them as substrings against the query -
@@ -191,6 +202,7 @@ def _clean(raw: dict[str, object]) -> tuple[Conclusion, list[str]]:
                 body=body,
                 importance=_int(item, "importance", 5, 1, 10),
                 key=_key(item),
+                updates=_updates(item, problems),
                 triggers=_triggers(item, problems),
             )
         )
@@ -313,6 +325,29 @@ def _key(item: dict[str, object]) -> str | None:
     return narrowed[:40] or None
 
 
+def _updates(item: dict[str, object], problems: list[str]) -> int | None:
+    """The id of the fact being replaced, or None.
+
+    Only the shape is checked here; whether the row exists and is still active is
+    `_apply`'s job, which is the half that needs the store. A value that is present
+    but not a positive integer is reported rather than dropped silently: it means
+    the model tried to retire something and the pass declined, which is exactly the
+    kind of near-miss that should be visible before it becomes a habit.
+    """
+    value = item.get("updates")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        target = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        problems.append(f"updates was not an id: {value!r}")
+        return None
+    if target <= 0:
+        problems.append(f"updates was not an id: {value!r}")
+        return None
+    return target
+
+
 MAX_TRIGGERS = 4
 MAX_TRIGGER_CHARS = 24
 
@@ -376,6 +411,8 @@ def render_artifact(date: str, conclusion: Conclusion, *, messages_read: int) ->
         lines += ["## 기억할 사실", ""]
         for fact in conclusion.facts:
             suffix = f" (key: {fact.key})" if fact.key else ""
+            if fact.updates is not None:
+                suffix += f" · updates: {fact.updates}"
             if fact.triggers:
                 suffix += f" · triggers: {', '.join(fact.triggers)}"
             lines.append(f"- [{fact.importance}] {fact.body}{suffix}")
@@ -482,7 +519,7 @@ class Reflection:
                 Task.REFLECTION,
                 [
                     Message(role="system", content=SYSTEM),
-                    Message(role="user", content=_transcript(rows)),
+                    Message(role="user", content=self._known_facts() + _transcript(rows)),
                 ],
             )
         except ProviderError as exc:
@@ -502,6 +539,7 @@ class Reflection:
             )
 
         conclusion, problems = _clean(raw)
+        conclusion = self._resolve_updates(conclusion, problems)
         # The artifact goes down first: it is the markdown record of what this pass
         # concluded, and everything below it is a mirror of that.
         _write_artifact(path, render_artifact(date, conclusion, messages_read=len(rows)))
@@ -514,6 +552,52 @@ class Reflection:
             problems=problems,
             **applied,
         )
+
+    def _resolve_updates(self, conclusion: Conclusion, problems: list[str]) -> Conclusion:
+        """Strip every `updates` that does not name a fact this pass can retire.
+
+        Before the artifact is rendered, not during `_apply`, for the reason
+        `_one_per_key` gives: the artifact is rendered from the conclusion, so a
+        claim settled afterwards is a claim the file gets wrong. An id the model
+        invented would otherwise be written down as a retirement that never
+        happened.
+
+        The active set shrinks as it goes, so two facts in one night claiming the
+        same row cannot both be honoured - the second is left as an addition rather
+        than silently retiring nothing, which is the same shape as two facts
+        colliding on one key.
+        """
+        active = {int(row["id"]) for row in self._store.active_entries(MAX_INJECTED)}
+        facts = []
+        for fact in conclusion.facts:
+            if fact.updates is None:
+                facts.append(fact)
+                continue
+            if fact.updates not in active:
+                problems.append(f"updates named {fact.updates}, which is not an active fact")
+                facts.append(replace(fact, updates=None))
+                continue
+            active.discard(fact.updates)
+            facts.append(fact)
+        return replace(conclusion, facts=tuple(facts))
+
+    def _known_facts(self) -> str:
+        """The curated tier, numbered, ahead of the transcript.
+
+        Without this the pass was write-only with respect to memory: supersession
+        fired only when the model independently reinvented the same `key` string on
+        two different nights, which is not a mechanism (ADR 0010). Bounded by the
+        injection budget for the same reason that tier is - it is the set the
+        daemon actually carries, so it is the set worth reconciling against.
+
+        Empty when nothing is known yet, header included, rather than an empty
+        section the model has to interpret.
+        """
+        known = self._store.active_entries(MAX_INJECTED)
+        if not known:
+            return ""
+        lines = [KNOWN_HEADER, *(f"{row['id']}: {row['body']}" for row in known), "", ""]
+        return "\n".join(lines)
 
     def _nothing_to_read(self, date: str, path: Path) -> Result:
         """A day with no eligible messages: either not mirrored yet, or genuinely
@@ -553,6 +637,7 @@ class Reflection:
                     fact.body,
                     importance=fact.importance,
                     supersession_key=fact.key,
+                    supersedes=fact.updates,
                     trigger_phrases=fact.triggers,
                     session_kind="reflection",
                 )

@@ -730,6 +730,7 @@ class Store:
         modality: str,
         now: datetime,
         supersession_key: str | None = None,
+        supersedes: int | None = None,
         source_file: str | None = None,
         source_anchor: str | None = None,
         commit: bool = True,
@@ -753,22 +754,29 @@ class Store:
         caller can render the file from the post-insert state without
         reimplementing the ordering. The caller owns the commit and the rollback -
         see `memory.curated.CuratedMemory.add`.
+
+        `supersedes` names a row directly, which is how reflection retires a fact
+        the model chose to update (ADR 0010). It is *additional* to the key match,
+        not an alternative: a fact can both replace row 4 and carry a key row 7
+        holds, and retiring only one of them would hit the unique index. Both
+        retire into the new row. Already-retired ids are the caller's to reject -
+        this only ever retires what is active, so a settled `superseded_by`
+        pointer cannot be moved.
         """
         stamp = utc_iso(now)
         try:
-            previous = (
-                self.conn.execute(
-                    "SELECT id FROM memory_entries "
-                    "WHERE supersession_key = ? AND status = 'active'",
-                    (supersession_key,),
-                ).fetchone()
-                if supersession_key
-                else None
-            )
-            if previous is not None:
+            previous = [
+                int(row["id"])
+                for row in self.conn.execute(
+                    "SELECT id FROM memory_entries WHERE status = 'active' "
+                    "AND (id = ? OR (supersession_key IS NOT NULL AND supersession_key = ?))",
+                    (supersedes, supersession_key),
+                ).fetchall()
+            ]
+            for entry_id in previous:
                 self.conn.execute(
                     "UPDATE memory_entries SET status = 'retired', updated_at = ? WHERE id = ?",
-                    (stamp, int(previous["id"])),
+                    (stamp, entry_id),
                 )
 
             cursor = self.conn.execute(
@@ -791,10 +799,10 @@ class Store:
                 ),
             )
             new_id = int(cursor.lastrowid or 0)
-            if previous is not None:
+            for entry_id in previous:
                 self.conn.execute(
                     "UPDATE memory_entries SET superseded_by = ? WHERE id = ?",
-                    (new_id, int(previous["id"])),
+                    (new_id, entry_id),
                 )
         except Exception:
             # Discards the retire too. Without this a failed insert would leave

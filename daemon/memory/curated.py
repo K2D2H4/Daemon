@@ -124,6 +124,7 @@ class CuratedMemory:
         importance: int = 5,
         trigger_phrases: tuple[str, ...] = (),
         supersession_key: str | None = None,
+        supersedes: int | None = None,
         origin: str = "agent",
         session_kind: str = "reflection",
         modality: str = "text",
@@ -161,6 +162,7 @@ class CuratedMemory:
             modality=modality,
             now=now or clock_now(),
             supersession_key=supersession_key,
+            supersedes=supersedes,
             commit=False,
         )
         # Rendered on this thread because a sqlite connection belongs to the
