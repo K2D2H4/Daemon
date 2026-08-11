@@ -60,13 +60,11 @@ that told users the coupling was deliberate.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add `providers_for` to the existing top-level import so Task 2's tests can use it:
+Leave `tests/test_config.py`'s import line alone — Task 2 extends it when it has a caller.
+Adding `providers_for` here would be an unused import, and suppressing the resulting ruff
+`F401` with a `noqa` is worse than either alternative.
 
-```python
-from daemon.config import PRESETS, ConfigError, Route, Settings, providers_for
-```
-
-Then replace the whole section marked `# --- voice under the offline preset -----`
+Replace the whole section marked `# --- voice under the offline preset -----`
 (lines 127-146). Three tests go, and each for its own reason:
 `test_offline_preset_refuses_voice` and `test_enabling_voice_on_the_offline_preset_fails_at_startup`
 assert the contract this task deliberately changes;
@@ -279,7 +277,13 @@ git commit -m "config: voice is turned on, not routed by the preset"
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `tests/test_config.py`, after the tests from Task 1:
+Extend `tests/test_config.py`'s existing top-level import — now that there is a caller:
+
+```python
+from daemon.config import PRESETS, ConfigError, Route, Settings, providers_for
+```
+
+Then add these, after the tests from Task 1:
 
 ```python
 def test_providers_for_asks_for_the_voice_key_under_the_offline_preset() -> None:
