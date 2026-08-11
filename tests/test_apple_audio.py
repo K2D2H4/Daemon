@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from daemon import mic_hold
 from daemon.voice import apple_audio
 from daemon.voice.apple_audio import AudioFrameworks, VoiceProcessingAudio
 from daemon.voice.audio import AudioUnavailable
@@ -517,6 +518,58 @@ async def test_an_engine_that_will_not_start_says_so(
 
     with pytest.raises(AudioUnavailable, match="refused to start"):
         await anext(audio.record())  # type: ignore[arg-type]
+
+
+async def test_recording_marks_the_microphone_held(
+    audio: VoiceProcessingAudio, framework: FakeAVFoundation
+) -> None:
+    """The second of the two holders `daemon/mic_hold.py`'s counter exists for -
+    see `daemon/voice/audio.py`'s equivalent test for the first. Without this the
+    presence probe cannot tell this session's own hold from somebody else's call."""
+    assert mic_hold.held() is False
+    stream = audio.record()
+    task = asyncio.create_task(anext(stream))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    assert mic_hold.held() is True, "the hold must be visible while recording"
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await stream.aclose()
+    assert mic_hold.held() is False
+
+
+async def test_the_hold_is_released_when_installing_the_tap_raises(
+    audio: VoiceProcessingAudio, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors daemon/voice/audio.py: the hold must cover the tap install, not
+    start after it. The assertion inside `explode` is the point of this test -
+    without it, the test would pass whether or not the hold actually covers the
+    install, since the failure happens either way."""
+
+    def explode(self: FakeNode, bus: int, size: int, fmt: Any, block: Any) -> None:
+        assert mic_hold.held() is True, "the hold must already cover the tap install"
+        raise RuntimeError("AVAudioEngine went away")
+
+    monkeypatch.setattr(FakeNode, "installTapOnBus_bufferSize_format_block_", explode)
+
+    assert mic_hold.held() is False
+    with pytest.raises(RuntimeError):
+        await anext(audio.record())  # type: ignore[arg-type]
+    assert mic_hold.held() is False
+
+
+async def test_the_hold_is_released_when_the_engine_fails_to_start(
+    framework: FakeAVFoundation,
+) -> None:
+    """Same failure, one call earlier: `_start()` can also fail before the tap is
+    ever reached, and it happens inside the hold too."""
+    framework.refuse_start = True
+    audio = VoiceProcessingAudio(frameworks=AudioFrameworks(avfoundation=framework))
+
+    assert mic_hold.held() is False
+    with pytest.raises(AudioUnavailable, match="refused to start"):
+        await anext(audio.record())  # type: ignore[arg-type]
+    assert mic_hold.held() is False
 
 
 async def test_a_missing_converter_is_reported_not_ignored(

@@ -71,6 +71,7 @@ from typing import Any
 
 import numpy as np
 
+from daemon import mic_hold
 from daemon.voice.audio import (
     CHANNELS,
     INPUT_SAMPLE_RATE,
@@ -302,22 +303,30 @@ class VoiceProcessingAudio:
             if pcm:
                 loop.call_soon_threadsafe(enqueue, pcm)
 
-        with self._guard:
-            self._start()
-            self._input.installTapOnBus_bufferSize_format_block_(
-                0, TAP_BUFFER_FRAMES, self._source_format, on_buffer
-            )
-            self._tapped = True
-        try:
-            while True:
-                yield await blocks.get()
-        finally:
-            # Reached on cancellation and on the consumer breaking out. A tap
-            # nobody reads is a microphone light left on.
+        # The second of the two holders `daemon/mic_hold.py`'s counter exists
+        # for - `SoundDeviceAudio.record()` in daemon/voice/audio.py is the
+        # first, and its own hold covers construction for the same reason this
+        # one starts here rather than after `installTapOnBus_...`: the engine
+        # can fail to start or the tap can fail to install, and a hold taken
+        # after that point would never be entered, never be released, and never
+        # be wrong in a way a green suite could see.
+        with mic_hold.hold():
             with self._guard:
-                if self._tapped and self._input is not None:
-                    self._input.removeTapOnBus_(0)
-                    self._tapped = False
+                self._start()
+                self._input.installTapOnBus_bufferSize_format_block_(
+                    0, TAP_BUFFER_FRAMES, self._source_format, on_buffer
+                )
+                self._tapped = True
+            try:
+                while True:
+                    yield await blocks.get()
+            finally:
+                # Reached on cancellation and on the consumer breaking out. A tap
+                # nobody reads is a microphone light left on.
+                with self._guard:
+                    if self._tapped and self._input is not None:
+                        self._input.removeTapOnBus_(0)
+                        self._tapped = False
 
     def _convert(self, buffer: Any) -> bytes:
         """One tap buffer to 16 kHz mono 16-bit PCM.

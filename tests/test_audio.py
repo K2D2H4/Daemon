@@ -292,6 +292,13 @@ async def test_the_hold_is_released_when_recording_raises(
     milestone exists to remove, reintroduced by an unbalanced counter."""
 
     def explode(**kwargs: Any) -> FakeStream:
+        # The assertion is the point of this test. Without it the test passes
+        # whether or not the hold covers the construction call - and covering it
+        # is the whole reason the hold sits where it does: PortAudio can fail
+        # while opening the device, and a hold taken after that point would
+        # never be entered, never be released, and never be wrong in a way a
+        # green suite could see.
+        assert mic_hold.held() is True, "the hold must already cover stream construction"
         raise RuntimeError("PortAudio went away")
 
     monkeypatch.setattr(backend, "RawInputStream", explode)
