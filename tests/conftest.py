@@ -37,27 +37,40 @@ def pytest_unconfigure(config: pytest.Config) -> None:
 
 
 @pytest.fixture(autouse=True)
-def no_real_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hide the developer's own environment from every test.
+def no_real_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Hide the developer's own configuration from every test - both halves of it.
 
-    `Settings(_env_file=None, ...)` stops pydantic-settings reading `.env` from
-    disk but *not* from the process environment, so a shell that had sourced
-    `.env` - which is how you run the product - leaked real values into tests that
-    had explicitly chosen their own.
+    **The process environment.** `Settings(_env_file=None, ...)` stops
+    pydantic-settings reading `.env` from disk but *not* from the process
+    environment, so a shell that had sourced `.env` - which is how you run the
+    product - leaked real values into tests that had explicitly chosen their own.
 
     Found by sourcing `.env` and running the suite: `DAEMON_VOICE_ENABLED=true`
     made `test_the_allowlist_accepts_what_a_person_would_type` raise ConfigError,
     because voice is on and the preset that test picks is `offline`. Three
     allowlist cases failed for a reason that had nothing to do with allowlists.
 
-    Autouse and suite-wide rather than a fix to that one test: a green suite that
-    depends on a clean shell is not a gate, and the same leak was available to
-    every test that builds `Settings`. It also makes CONTRACTS' "a test that needs
-    an API key is a broken test" enforceable rather than aspirational - a test
-    cannot now accidentally *see* a real key either.
+    **The file on disk.** The mirror image, and it survived the fix above: a test
+    that does *not* pass `_env_file=None` - `daemon.cli.main`, building `Settings()`
+    the way the product does - reads `ENV_FILE = ".env"` relative to the *current
+    directory*, and pytest runs in the repo root. So the developer's real `.env`
+    decided the result: the same `DAEMON_VOICE_ENABLED=true` plus a monkeypatched
+    `DAEMON_PRESET=offline` made `test_the_audit_trail_is_readable_from_the_cli`
+    exit 2 instead of 0. It passed in CI only because CI has no `.env`. Chdir'ing
+    into `tmp_path` puts every test somewhere with no `.env` in it; a test that
+    wants one writes it there itself, which is what test_cli.py and test_setup.py
+    were already doing per-file.
+
+    Autouse and suite-wide rather than a fix to those tests: a green suite that
+    depends on a clean shell - or on the developer not having run `daemon setup` -
+    is not a gate, and both leaks were available to every test that builds
+    `Settings`. It also makes CONTRACTS' "a test that needs an API key is a broken
+    test" enforceable rather than aspirational - a test cannot now accidentally
+    *see* a real key either.
     """
     for name in [k for k in os.environ if k.startswith(CONFIG_PREFIXES)]:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 @pytest.fixture(autouse=True)
