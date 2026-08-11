@@ -25,6 +25,7 @@ OLLAMA = "ollama"
 ANTHROPIC = "anthropic"
 OPENAI = "openai"
 GEMINI = "gemini"
+OPENAI_COMPATIBLE = "openai_compatible"
 
 # Env var carrying the API key, or None for a provider that needs no key.
 # Every name here is buildable: tests/test_reachable.py fails if one is nameable
@@ -34,6 +35,7 @@ PROVIDER_KEY_ENV: dict[str, str | None] = {
     ANTHROPIC: "ANTHROPIC_API_KEY",
     OPENAI: "OPENAI_API_KEY",
     GEMINI: "GEMINI_API_KEY",
+    OPENAI_COMPATIBLE: "OPENAI_COMPATIBLE_API_KEY",
 }
 
 HOSTED = "hosted"
@@ -49,9 +51,13 @@ CHAT_VOICE is deliberately not HOSTED: it names GEMINI because Gemini Live is th
 only native-audio session implemented, and pointing it at a provider with no voice
 session would fail at the first voice turn instead of at startup."""
 
-HOSTED_PROVIDERS = ("anthropic", "openai", "gemini")
+HOSTED_PROVIDERS = ("anthropic", "openai", "gemini", "openai_compatible")
 """What DAEMON_HOSTED_PROVIDER accepts. Ollama is not here - "hosted" is the
-opposite of local, and the offline preset never resolves HOSTED at all."""
+opposite of local, and the offline preset never resolves HOSTED at all.
+
+`openai_compatible` is one name for many vendors on purpose: Qwen, Kimi,
+DeepSeek, OpenRouter and a self-hosted server differ by endpoint, not by
+protocol, so the endpoint is configuration and the protocol is the provider."""
 
 VOICE_TASKS = frozenset({Task.CHAT_VOICE})
 """Tasks that need a hosted native-audio model. The offline preset has none."""
@@ -270,6 +276,17 @@ class Settings(BaseSettings):
     anthropic_model: str = Field(default="claude-sonnet-5", alias="DAEMON_ANTHROPIC_MODEL")
     openai_model: str = Field(default="", alias="DAEMON_OPENAI_MODEL")
     gemini_model: str = Field(default="", alias="DAEMON_GEMINI_MODEL")
+    openai_compatible_model: str = Field(
+        default="", alias="DAEMON_OPENAI_COMPATIBLE_MODEL"
+    )
+    openai_compatible_base_url: str = Field(
+        default="", alias="DAEMON_OPENAI_COMPATIBLE_BASE_URL"
+    )
+    """Which OpenAI-compatible endpoint answers, up to and including the version
+    segment - `https://api.deepseek.com/v1`, not the `/chat/completions` below it.
+
+    No default, deliberately, for the reason `DAEMON_GEMINI_LIVE_MODEL` has none:
+    a guessed endpoint fails at the first conversation instead of at startup."""
 
     gemini_thinking_level: str = Field(default="low", alias="DAEMON_GEMINI_THINKING_LEVEL")
     """How hard a Gemini 3 model thinks before answering: `low`, `high`, or empty
@@ -469,6 +486,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    openai_compatible_api_key: str = Field(default="", alias="OPENAI_COMPATIBLE_API_KEY")
 
     telegram_dm_policy: str = Field(default="pairing", alias="DAEMON_TELEGRAM_DM_POLICY")
     """How an unknown sender is handled. `pairing` is the default because the
@@ -730,6 +748,34 @@ class Settings(BaseSettings):
             return tuple(part.strip() for part in text.split(",") if part.strip())
         return value
 
+    @field_validator("openai_compatible_base_url", mode="before")
+    @classmethod
+    def _clean_base_url(cls, value: object) -> object:
+        """Strip the trailing slash, and refuse the whole endpoint URL.
+
+        Vendor docs print `.../v1/chat/completions`, and pasting that whole line
+        is the predictable mistake. Left alone the provider appends the path a
+        second time and the resulting 404 explains nothing. Rejected rather than
+        quietly repaired, and the message carries the value to use instead - the
+        same choice QUIET_HOURS_RE makes: loud beats degraded.
+        """
+        if not isinstance(value, str):
+            return value
+        text = value.strip().rstrip("/")
+        if not text:
+            return ""
+        if not text.startswith(("http://", "https://")):
+            raise ValueError(
+                f"DAEMON_OPENAI_COMPATIBLE_BASE_URL must start with http:// or https:// - "
+                f"got {text!r}"
+            )
+        if text.endswith("/chat/completions"):
+            raise ValueError(
+                "DAEMON_OPENAI_COMPATIBLE_BASE_URL must not include /chat/completions - "
+                f"use {text.removesuffix('/chat/completions')}"
+            )
+        return text
+
     @model_validator(mode="after")
     def _check(self) -> Settings:
         if self.preset not in PRESETS:
@@ -974,6 +1020,11 @@ class Settings(BaseSettings):
             found.append(
                 f"{context} routes to {provider!r} but no model is set "
                 f"(DAEMON_{provider.upper()}_MODEL)"
+            )
+        if provider == OPENAI_COMPATIBLE and not self.openai_compatible_base_url:
+            found.append(
+                f"{context} routes to {provider!r} but no endpoint is set "
+                "(DAEMON_OPENAI_COMPATIBLE_BASE_URL)"
             )
         return found
 
