@@ -753,17 +753,6 @@ class Settings(BaseSettings):
                     f"(known: {', '.join(sorted(PROVIDER_KEY_ENV))})"
                 )
 
-        if self.voice_enabled and not VOICE_TASKS <= self.routing.keys():
-            problems.append(
-                f"DAEMON_VOICE_ENABLED is on but preset {self.preset!r} routes no voice task; "
-                "voice needs a hosted native-audio provider (docs/PLAN.md 3.2)"
-            )
-        if self.voice_enabled and not self.gemini_live_model:
-            problems.append(
-                "DAEMON_VOICE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
-                "the native-audio endpoint needs its own model id"
-            )
-
         # Caught here rather than on the wire. The server answers a bad enum by
         # closing with 1007, which the session classifies as permanent - so a typo
         # in one of these would not be a bad setting, it would be voice mode gone
@@ -796,6 +785,29 @@ class Settings(BaseSettings):
                 "DAEMON_WAKE_ENABLED is on but DAEMON_VOICE_ENABLED is off; the gate exists "
                 "only to open a voice session, so set DAEMON_VOICE_ENABLED=true or switch "
                 "the gate off"
+            )
+        # These two used to fire on `voice_enabled` alone. That was correct while
+        # the switch meant only "a hosted voice session may run", and became wrong
+        # when it also came to mean "a proactive line may come out of the local
+        # speaker" - because `/usr/bin/say` needs neither a route nor a model, and
+        # the `offline` preset can satisfy the second meaning while never
+        # satisfying the first. Requiring both at load time did not degrade an
+        # offline install, it stopped `Settings` from loading at all, which stops
+        # the daemon. And it made docs/PLAN.md 7's stated promise - proactive
+        # speech out the local speaker crossing no route - unreachable on the one
+        # preset that promise is about.
+        #
+        # The wake gate is different and keeps its check: it exists only to open a
+        # hosted session, so under a preset routing none it can never do anything.
+        if self.wake_enabled and not VOICE_TASKS <= self.routing.keys():
+            problems.append(
+                f"DAEMON_WAKE_ENABLED is on but preset {self.preset!r} routes no voice task; "
+                "the wake gate exists only to open a voice session (docs/PLAN.md 3.2)"
+            )
+        if self.wake_enabled and not self.gemini_live_model:
+            problems.append(
+                "DAEMON_WAKE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
+                "the native-audio endpoint needs its own model id"
             )
         if not 0.0 < self.wake_vad_threshold <= 1.0:
             problems.append(

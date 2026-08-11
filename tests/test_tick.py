@@ -61,21 +61,19 @@ class FakeChannel:
 
 
 def settings(**overrides: Any) -> Settings:
-    voice_enabled = overrides.pop("voice_enabled", None)
     base: dict[str, Any] = {
         "preset": "offline",
         "proactive_enabled": True,
         "proactive_quiet_hours": "",
     }
-    built = Settings(_env_file=None, **{**base, **overrides})
-    if voice_enabled is None:
-        return built
-    # Settings itself refuses voice_enabled=True under the offline preset (no
-    # hosted native-audio provider to route chat_voice to) - correctly, for the
-    # real conversation path. This file only needs the flag as a bool for the
-    # gate's speaker check, so patch it in past that unrelated check, the same
-    # escape hatch tests/test_gate.py uses.
-    return Settings.model_construct(**{**built.model_dump(), "voice_enabled": voice_enabled})
+    # `voice_enabled=True` under the offline preset used to need a
+    # `model_construct` escape hatch here, because `Settings` refused it outright
+    # (the switch was overloaded to also mean "the hosted conversation route
+    # exists," which offline never satisfies). That routed-session check now
+    # lives at session start instead, so the offline preset legitimately allows
+    # `voice_enabled=True` - it is what lets `/usr/bin/say` run without a route -
+    # and this builds like any other `Settings` call.
+    return Settings(_env_file=None, **{**base, **overrides})
 
 
 @pytest.fixture

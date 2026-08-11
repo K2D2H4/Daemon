@@ -134,9 +134,26 @@ def test_offline_preset_refuses_voice() -> None:
         settings.route_for(Task.CHAT_VOICE)
 
 
-def test_enabling_voice_on_the_offline_preset_fails_at_startup() -> None:
+def test_an_offline_install_may_speak_out_of_its_own_speaker() -> None:
+    """PLAN 7's promise: on the fully-offline preset nothing leaves the device,
+    and proactive speech goes out the local speaker precisely because
+    `/usr/bin/say` crosses no route. Rejecting this combination at load time
+    took that promise away - and took the daemon with it, since Settings failing
+    to load is not a degraded feature, it is a process that does not start."""
+    settings = make_settings(preset="offline", voice_enabled=True)  # must not raise
+
+    assert settings.voice_enabled is True
+
+
+def test_a_wake_gate_still_needs_a_voice_route() -> None:
+    """The load-time check that survives, and why: the wake gate exists only to
+    open a hosted voice session (config.py's own words), so under a preset that
+    routes none it can never do anything. That is a misconfiguration worth
+    refusing early - unlike the speaker, which works fine there."""
     with pytest.raises(ConfigError, match="routes no voice task"):
-        make_settings(preset="offline", voice_enabled=True)
+        make_settings(
+            preset="offline", voice_enabled=True, wake_enabled=True, wake_aliases="벨라"
+        )
 
 
 def test_voice_is_refused_while_disabled_even_when_routed() -> None:
@@ -346,17 +363,6 @@ def test_a_non_positive_half_life_fails_at_startup() -> None:
     # Zero or negative makes the recency term undefined rather than aggressive.
     with pytest.raises(ConfigError, match="DAEMON_RECALL_HALF_LIFE_DAYS"):
         make_settings(preset="offline", recall_half_life_days=0)
-
-
-def test_enabling_voice_without_a_live_model_fails_at_startup() -> None:
-    with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_MODEL is empty"):
-        make_settings(
-            preset="balanced",
-            anthropic_api_key="k",
-            gemini_model="g",
-            gemini_api_key="k",
-            voice_enabled=True,
-        )
 
 
 def test_a_service_label_that_is_really_a_path_is_rejected() -> None:

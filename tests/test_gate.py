@@ -146,22 +146,22 @@ def settings(**overrides: Any) -> Settings:
     brakes released by default a test that expects a block has to be testing the
     one rule it names. The defaults themselves are asserted in their own tests.
 
-    `voice_enabled` is applied through `model_construct` after the rest of the
-    fields build normally - the same escape hatch the unparsable-quiet-hours
-    test below uses. `Settings` itself refuses `voice_enabled=True` under the
-    offline preset - correctly, since the real conversation path needs a
-    hosted native-audio provider offline never has - but `_route` only ever
-    reads the flag, never the routing table behind it, so that check has
-    nothing to do with what this file tests.
+    `voice_enabled=True` under the offline preset used to need a `model_construct`
+    escape hatch here: `Settings` refused the combination outright, because the
+    switch was overloaded to also mean "the hosted conversation route exists,"
+    which the offline preset never satisfies. Now that the switch's two meanings
+    are checked where each is actually needed - the routed-session check moved to
+    session start - the offline preset legitimately allows `voice_enabled=True`
+    (it is what lets `/usr/bin/say` run without a route), so this builds like any
+    other `Settings` call.
     """
-    voice_enabled = overrides.pop("voice_enabled", True)
     base: dict[str, Any] = {
         "preset": "offline",
         "proactive_enabled": True,
         "proactive_quiet_hours": "",
+        "voice_enabled": True,
     }
-    built = Settings(_env_file=None, **{**base, **overrides})
-    return Settings.model_construct(**{**built.model_dump(), "voice_enabled": voice_enabled})
+    return Settings(_env_file=None, **{**base, **overrides})
 
 
 def gate_for(history: UtteranceHistory | None = None, **overrides: Any) -> Gate:

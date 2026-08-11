@@ -1873,6 +1873,32 @@ async def test_run_voice_follows_the_owners_tool_mode(
     )
 
 
+async def test_starting_a_voice_session_refuses_without_a_voice_route() -> None:
+    """Moved here from load time. The check did not disappear - it now fires
+    where the thing it guards actually happens."""
+    from daemon import app as app_module
+    from daemon.config import ConfigError, Settings
+
+    settings = Settings(_env_file=None, preset="offline", voice_enabled=True)
+    with pytest.raises(ConfigError, match="routes no voice task"):
+        await app_module.run_voice(settings)
+
+
+async def test_run_voice_refuses_without_a_live_model(tmp_path: pathlib.Path) -> None:
+    """Moved from load time (`Settings._check`, config.py): this preset has a real
+    voice route (Gemini) so the routing half of the check above is satisfied, but
+    no native-audio model id is still nothing `run_voice` can open a session with.
+    Used to fail `Settings()` itself under `voice_enabled` alone; now it fails
+    here, at session start, with the same message."""
+    from daemon import app as app_module
+    from daemon.config import ConfigError
+
+    settings = _voice_settings(tmp_path, DAEMON_GEMINI_LIVE_MODEL="")
+
+    with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_MODEL is empty"):
+        await app_module.run_voice(settings)
+
+
 # --- screen-share lifecycle (Task 2.3) ----------------------------------------
 #
 # The pump needs a live VoiceSession, so the conversation binds it once the

@@ -26,7 +26,16 @@ from fastapi import FastAPI
 from daemon import __version__
 from daemon.channels.base import Channel
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
-from daemon.config import ANTHROPIC, ENV_FILE, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
+from daemon.config import (
+    ANTHROPIC,
+    ENV_FILE,
+    GEMINI,
+    OLLAMA,
+    OPENAI,
+    VOICE_TASKS,
+    ConfigError,
+    Settings,
+)
 from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
@@ -1036,9 +1045,28 @@ async def run_voice(
     if not settings.voice_enabled:
         logger.error("voice is off; set DAEMON_VOICE_ENABLED=true (see `daemon setup`)")
         return PROBLEM
-    # route_for raises with the specific reason - no voice route in this preset,
-    # voice disabled, no live model id - which is more use than anything this
-    # function could say about it.
+    # Moved here from `Settings._check` (config.py), not deleted: these two used to
+    # fire on `voice_enabled` alone, at load time. That was correct while the
+    # switch meant only "a hosted voice session may run", and became wrong once it
+    # also came to mean "a proactive line may come out of the local speaker" -
+    # `/usr/bin/say` needs neither a route nor a model, so refusing to *load*
+    # `Settings` over them took the `offline` install's only voice feature away
+    # along with the daemon itself. A hosted session is the only thing these two
+    # guard, and opening one is the only thing this function does - so they run
+    # right here, where that actually happens, with the same messages as before.
+    problems: list[str] = []
+    if not VOICE_TASKS <= settings.routing.keys():
+        problems.append(
+            f"DAEMON_VOICE_ENABLED is on but preset {settings.preset!r} routes no voice task; "
+            "voice needs a hosted native-audio provider (docs/PLAN.md 3.2)"
+        )
+    if not settings.gemini_live_model:
+        problems.append(
+            "DAEMON_VOICE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
+            "the native-audio endpoint needs its own model id"
+        )
+    if problems:
+        raise ConfigError("; ".join(problems))
     route = settings.route_for(Task.CHAT_VOICE)
 
     harden_existing(settings.data_dir)
