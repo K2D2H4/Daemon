@@ -17,7 +17,7 @@ reflection and the proactive judge on this machine; use Gemini or OpenAI for spo
 turns) and no way to ask for it.
 
 The absence was defended as what made the privacy promise true. It is not what makes
-it true. `docs/PLAN.md:551` states the promise as "**text mode** + local models —
+it true. `docs/PLAN.md` §7 states the promise as "**text mode** + local models —
 nothing leaves the device", and one line above it: "turn voice on and audio goes to
 the provider you chose (BYOK); leave it off and it does not". The promise was already
 conditioned on the switch. Only the table disagreed.
