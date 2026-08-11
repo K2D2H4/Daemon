@@ -165,13 +165,23 @@ class CuratedMemory:
             supersedes=supersedes,
             commit=False,
         )
-        # Rendered on this thread because a sqlite connection belongs to the
-        # thread that made it (see store.Store); only the write, which fsyncs
-        # twice, is worth handing to the executor.
-        text = render(self.entries(MAX_INJECTED))
         try:
+            # Rendered on this thread because a sqlite connection belongs to the
+            # thread that made it (see store.Store); only the write, which fsyncs
+            # twice, is worth handing to the executor.
+            #
+            # Inside the guard, not before it: this read runs on the connection
+            # that is already mid-transaction, so a failure here leaves the
+            # retire-and-insert open. `reflection.Reflection.run` commits this same
+            # connection to record the run, which would make that durable with no
+            # markdown behind it - the unrecoverable direction.
+            text = render(self.entries(MAX_INJECTED))
             await asyncio.to_thread(write_private_replace, core_path(self._data_dir), text)
-        except Exception:
+        except BaseException:
+            # BaseException because the await above is a cancellation point, and a
+            # daemon shutting down mid-pass must not leave the transaction open
+            # either - `app.py` cancels the reflection catch-up task on every
+            # lifespan exit.
             self._store.conn.rollback()
             raise
         self._store.conn.commit()

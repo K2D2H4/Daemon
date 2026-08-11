@@ -95,9 +95,10 @@ class Fact:
     importance: int = 5
     key: str | None = None
     updates: int | None = None
-    """The id of a curated fact this one replaces (ADR 0010). Unverified here -
-    `Reflection._apply` checks it against the store, because a number the model
-    chose is a claim about a row, not a row."""
+    """The id of a curated fact this one replaces (ADR 0010). Only the shape is
+    checked here; `Reflection._resolve_updates` checks it against the store, before
+    the artifact is rendered, because a number the model chose is a claim about a
+    row rather than a row."""
     triggers: tuple[str, ...] = ()
     """Words that should pull this fact forward even when the importance budget
     would have dropped it. Recall matches them as substrings against the query -
@@ -335,14 +336,25 @@ def _updates(item: dict[str, object], problems: list[str]) -> int | None:
     kind of near-miss that should be visible before it becomes a habit.
     """
     value = item.get("updates")
-    if value is None or isinstance(value, bool):
+    if value is None:
         return None
-    try:
-        target = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        problems.append(f"updates was not an id: {value!r}")
-        return None
-    if target <= 0:
+    # Deliberately narrow rather than `int(value)`. That coerces three things this
+    # must refuse: `True` (which is 1, a real row), `3.9` (which truncates to 3 -
+    # also a real row, and not the one named), and `"1_0"` (Python reads numeric
+    # separators in strings, so it is 10). Each would retire a genuine fact the
+    # model did not point at, which is the silent wrong-retirement the whole
+    # no-DELETE shape exists to prevent.
+    if isinstance(value, bool):
+        target = None
+    elif isinstance(value, int):
+        target = value
+    elif isinstance(value, float):
+        target = int(value) if value.is_integer() else None
+    elif isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+        target = int(value.strip())
+    else:
+        target = None
+    if target is None or target <= 0:
         problems.append(f"updates was not an id: {value!r}")
         return None
     return target
@@ -566,18 +578,36 @@ class Reflection:
         same row cannot both be honoured - the second is left as an addition rather
         than silently retiring nothing, which is the same shape as two facts
         colliding on one key.
+
+        It shrinks by `key` as well as by id, and that half was missing until
+        review caught it. `_apply` retires by both, so a fact carrying `key: job`
+        takes the row holding that key *before* a later fact's `updates` can name
+        it. Validated against one snapshot, the later claim passed here, degraded
+        to a plain insert in the store, and left the artifact asserting a
+        retirement a different fact had performed - the accumulation this file
+        exists to prevent, arriving through the audit record that was supposed to
+        show it.
         """
-        active = {int(row["id"]) for row in self._store.active_entries(MAX_INJECTED)}
+        rows = self._store.active_entries(MAX_INJECTED)
+        active = {int(row["id"]) for row in rows}
+        was_active = set(active)
+        # Which row each key currently belongs to, so a fact carrying that key can
+        # be seen taking it - `insert_entry` will retire it either way.
+        held = {row["supersession_key"]: int(row["id"]) for row in rows if row["supersession_key"]}
         facts = []
         for fact in conclusion.facts:
-            if fact.updates is None:
-                facts.append(fact)
-                continue
-            if fact.updates not in active:
-                problems.append(f"updates named {fact.updates}, which is not an active fact")
-                facts.append(replace(fact, updates=None))
-                continue
+            if fact.updates is not None and fact.updates not in active:
+                problems.append(
+                    f"updates named {fact.updates}, which another fact in this pass "
+                    "already replaced"
+                    if fact.updates in was_active
+                    else f"updates named {fact.updates}, which is not an active fact"
+                )
+                fact = replace(fact, updates=None)
             active.discard(fact.updates)
+            # `held.get(None)` is None and `discard(None)` is a no-op, so a fact
+            # with no key costs nothing here.
+            active.discard(held.get(fact.key))
             facts.append(fact)
         return replace(conclusion, facts=tuple(facts))
 

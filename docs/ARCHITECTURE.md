@@ -160,6 +160,14 @@ a self-amplifying loop; and rows recall already put in front of the model are
 excluded, because context injected once must not be counted again as new
 evidence.
 
+It also reads **what it already knows**: the active curated tier goes into the
+prompt numbered by row id, so a fact can name the one it replaces
+(`updates: <id>`). Without that the pass was write-only with respect to memory and
+supersession fired only when the model happened to reinvent the same key string on
+two different nights — [ADR 0010](adr/0010-supersession-needs-an-id-not-a-name.md)
+has the measurement. The model is never given a delete: retirement is only ever a
+side effect of a successor being written.
+
 **What it writes** is three things, plus the artifact a human reads to check them:
 
 | | markdown | mirror |
@@ -178,7 +186,10 @@ Everything the model produced is treated as hostile input on the way in — name
 are checked twice before becoming filenames (a blocklist, then a boundary on the
 resolved path), `importance` and `confidence` are clamped rather than rejected,
 supersession keys are narrowed to `[a-z0-9_]`, and a reply with no parseable JSON
-writes nothing at all. A half-applied reflection is worse than a skipped one,
+writes nothing at all. `updates` is the sharpest of these, because it retires a
+fact: it is accepted only as a positive integer naming a row that is still active
+after everything earlier in the same pass has been applied, and a refused one is
+reported and downgraded to a plain addition rather than dropping the fact. A half-applied reflection is worse than a skipped one,
 because the day gets marked done either way.
 
 ## The weekly persona pass

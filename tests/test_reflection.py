@@ -810,3 +810,120 @@ async def test_the_artifact_does_not_claim_an_update_that_was_refused(
     text = artifact_path(data_dir, DAY).read_text(encoding="utf-8")
     assert "이름은 김대현이며, 9년차 엔지니어다" in text
     assert "updates" not in text, "the artifact must not claim a retirement that did not happen"
+
+
+async def test_a_key_in_the_same_night_can_take_the_row_an_update_named(
+    data_dir: Path, store: Store
+) -> None:
+    """A fact's `key` retires a row too, so validating every `updates` against one
+    snapshot taken before any of them are applied is a check-then-act: the earlier
+    fact retires row 2 by key, and the later fact's `updates: 2` then quietly
+    degrades to a plain insert while the artifact still claims the retirement.
+
+    Found by review, reproduced: the pass reported no problems, the artifact said
+    `updates: 2`, and the tier ended with the overlapping pair ADR 0010 exists to
+    prevent - one arriving because the model asked for a replacement and got an
+    addition."""
+    await seed(data_dir, store, ("사용자는 개발자다", "job"))
+    [keyed] = [row["id"] for row in store.active_entries(50)]
+    record(store, "나 CTO 됐어")
+    reply = json.dumps(
+        {
+            "facts": [
+                {"body": "사용자는 CTO다", "importance": 9, "key": "job"},
+                {"body": "이름은 김대현이며 9년차다", "importance": 9, "updates": keyed},
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    assert result.problems != [], "a refused update must not be silent"
+    text = artifact_path(data_dir, DAY).read_text(encoding="utf-8")
+    assert f"updates: {keyed}" not in text
+    # The key still retired it - by the fact that actually claimed it.
+    row = entry(store, keyed)
+    assert row["status"] == "retired"
+    assert row["superseded_by"] is not None
+
+
+async def test_two_facts_cannot_both_claim_one_row(data_dir: Path, store: Store) -> None:
+    """`_resolve_updates` shrinks its set as it walks, so the second claim on a row
+    is refused rather than silently retiring nothing."""
+    [old] = await seed(data_dir, store, ("사용자는 개발자다", None))
+    record(store, "무슨 말")
+    reply = json.dumps(
+        {
+            "facts": [
+                {"body": "사용자는 CTO다", "importance": 9, "updates": old},
+                {"body": "사용자는 창업자다", "importance": 9, "updates": old},
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    assert result.facts == 2, "the second fact is still worth keeping"
+    assert result.problems != []
+    text = artifact_path(data_dir, DAY).read_text(encoding="utf-8")
+    assert text.count(f"updates: {old}") == 1, "only one fact may claim the row"
+
+
+async def test_one_fact_updating_the_row_its_own_key_holds_retires_it_once(
+    data_dir: Path, store: Store
+) -> None:
+    """The id match and the key match can name the *same* row. It must be retired
+    once, with one `superseded_by` - the case that would regress into a double
+    update if the retire query were rewritten."""
+    [old] = await seed(data_dir, store, ("사용자는 개발자다", "job"))
+    record(store, "나 CTO 됐어")
+    reply = update_reply(old, "사용자는 CTO다", key="job")
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    assert result.problems == []
+    assert curated.read(data_dir) == ["사용자는 CTO다"]
+    row = entry(store, old)
+    assert row["status"] == "retired"
+    assert row["superseded_by"] is not None
+
+
+async def test_a_fractional_update_is_refused_rather_than_truncated(
+    data_dir: Path, store: Store
+) -> None:
+    """`int(3.9)` is 3, which is a real row and the wrong one. Truncating a number
+    the model chose into a *different valid* id is the silent wrong-retirement the
+    DELETE ban exists to prevent."""
+    ids = await seed(
+        data_dir,
+        store,
+        ("첫 번째 사실", None),
+        ("두 번째 사실", None),
+        ("세 번째 사실", None),
+    )
+    record(store, "무슨 말")
+    reply = update_reply(len(ids) + 0.9, "네 번째 사실")
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    assert result.problems != []
+    for entry_id in ids:
+        assert entry(store, entry_id)["status"] == "active", "no row may be retired"
+
+
+async def test_a_boolean_update_is_reported_not_swallowed(
+    data_dir: Path, store: Store
+) -> None:
+    """`true` is not an id. JSON has no separate integer type for it, and Python
+    would coerce it to 1 - a real row - so it is refused; refusing silently is what
+    hides a model that has started answering the wrong shape."""
+    [old] = await seed(data_dir, store, ("사용자는 개발자다", None))
+    record(store, "무슨 말")
+    reply = update_reply(True, "사용자는 CTO다")
+
+    result = await Reflection(data_dir, store, gateway_for(FakeProvider(reply))).run(DAY)
+
+    assert result.problems != []
+    assert entry(store, old)["status"] == "active"

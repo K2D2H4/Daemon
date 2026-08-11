@@ -121,6 +121,41 @@ async def test_the_markdown_is_written_before_the_mirror_commits(
     assert tier.entries() == ["아직 커밋 안 된 사실"]
 
 
+async def test_a_failure_before_the_file_write_leaves_nothing_pending(
+    tier: curated.CuratedMemory, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mirror write is already open when the file is rendered, so a failure
+    *there* has to roll back too.
+
+    Found by review. Rendering sat outside the guard, so the retire-and-insert
+    stayed open and uncommitted - and the next commit on this connection, which
+    `reflection.Reflection.run` always makes to record the run, turned it durable
+    with no markdown behind it. That is the one direction non-negotiable 1 calls
+    unrecoverable, and the pass reported the fact as not recorded.
+    """
+    await tier.add("먼저 있던 사실", supersession_key="k", now=NOW)
+
+    def boom(*_: object, **__: object) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(curated, "render", boom)
+
+    with pytest.raises(sqlite3.OperationalError):
+        await tier.add("대체하려던 사실", supersession_key="k", now=NOW)
+
+    assert not tier._store.conn.in_transaction, "the transaction must not be left open"
+    # A fresh connection: the retire must not be waiting for someone else's commit.
+    other = sqlite3.connect(data_dir / "daemon.sqlite3")
+    try:
+        rows = other.execute(
+            "SELECT body FROM memory_entries WHERE status = 'active'"
+        ).fetchall()
+    finally:
+        other.close()
+    assert [row[0] for row in rows] == ["먼저 있던 사실"]
+    assert curated.read(data_dir) == ["먼저 있던 사실"]
+
+
 # --- rebuild ----------------------------------------------------------------
 
 
