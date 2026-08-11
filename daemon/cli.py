@@ -1091,7 +1091,7 @@ def _proactivity_check(settings: Settings) -> Check:
             "persona seed.",
         )
 
-    speaker = "speaker on" if settings.proactive_speaker_enabled else "telegram only"
+    speaker = "speaker on" if settings.voice_enabled else "telegram only"
     quiet = settings.proactive_quiet_hours or "no quiet window"
     detail = (
         f"on, {speaker} · budget {settings.proactive_daily_budget}/day "

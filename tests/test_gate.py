@@ -145,14 +145,23 @@ def settings(**overrides: Any) -> Settings:
     All three are the opposite of the product defaults, deliberately: with the
     brakes released by default a test that expects a block has to be testing the
     one rule it names. The defaults themselves are asserted in their own tests.
+
+    `voice_enabled` is applied through `model_construct` after the rest of the
+    fields build normally - the same escape hatch the unparsable-quiet-hours
+    test below uses. `Settings` itself refuses `voice_enabled=True` under the
+    offline preset - correctly, since the real conversation path needs a
+    hosted native-audio provider offline never has - but `_route` only ever
+    reads the flag, never the routing table behind it, so that check has
+    nothing to do with what this file tests.
     """
+    voice_enabled = overrides.pop("voice_enabled", True)
     base: dict[str, Any] = {
         "preset": "offline",
         "proactive_enabled": True,
         "proactive_quiet_hours": "",
-        "proactive_speaker_enabled": True,
     }
-    return Settings(_env_file=None, **{**base, **overrides})
+    built = Settings(_env_file=None, **{**base, **overrides})
+    return Settings.model_construct(**{**built.model_dump(), "voice_enabled": voice_enabled})
 
 
 def gate_for(history: UtteranceHistory | None = None, **overrides: Any) -> Gate:
@@ -178,13 +187,16 @@ def test_an_unobstructed_candidate_passes() -> None:
 
 
 def test_the_speaker_switch_is_separate_from_the_proactivity_switch() -> None:
-    """Telegram-only proactivity is a complete product; the speaker is the addition
-    that needs the gate to be trustworthy first (PLAN 6.4)."""
-    verdict = gate_for(proactive_speaker_enabled=False).judge(EMOTIONAL, PRESENT, now=NOW)
+    """Telegram-only proactivity is a complete product; voice is the addition
+    that needs the gate to be trustworthy first (PLAN 6.4). One switch now
+    governs both the conversation path and the speaker, but it is still a
+    different switch from `proactive_enabled` - turning proactivity on does not
+    imply a voice out of the laptop."""
+    verdict = gate_for(voice_enabled=False).judge(EMOTIONAL, PRESENT, now=NOW)
 
     assert verdict.allowed
     assert verdict.delivery == "telegram"
-    assert "DAEMON_PROACTIVE_SPEAKER_ENABLED" in verdict.why
+    assert "DAEMON_VOICE_ENABLED" in verdict.why
 
 
 # --- quiet hours -------------------------------------------------------------

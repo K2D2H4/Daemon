@@ -597,13 +597,36 @@ def test_a_zero_silence_threshold_fails_at_startup() -> None:
         make_settings(preset="offline", proactive_silence_hours=0)
 
 
-def test_proactivity_and_the_speaker_are_off_by_default() -> None:
-    """Two separate switches, both off. An ignored notification costs nothing and a
-    voice in a meeting is an accident, so the speaker is not implied by turning
-    proactivity on (docs/PLAN.md 6.4)."""
+def test_proactivity_and_voice_are_off_by_default() -> None:
+    """Both off. `voice_enabled` now doubles as the proactive-speaker switch
+    (DAEMON_PROACTIVE_SPEAKER_ENABLED is gone), so a fresh install that never
+    turns on proactivity, or never turns on voice, gets no sound from either
+    path - not just no Telegram message."""
     settings = make_settings(preset="offline")
     assert settings.proactive_enabled is False
-    assert settings.proactive_speaker_enabled is False
+    assert settings.voice_enabled is False
+
+
+def test_the_speaker_switch_is_gone() -> None:
+    """One switch, not two. They were split because a voice in a meeting is an
+    accident and a Telegram message is not - but the gate now carries seven rules
+    for exactly that, and a second switch only made "voice on" mean two things.
+
+    `preset="offline"` rather than a bare `Settings()`: the default preset needs
+    a hosted provider and this test has nothing to do with that - it is here to
+    fail on a stray `hasattr`, not on an unrelated startup check."""
+    assert not hasattr(make_settings(preset="offline"), "proactive_speaker_enabled")
+
+
+def test_an_unset_legacy_speaker_switch_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pydantic must not reject an .env that still carries the old key: the user
+    upgrading is the whole point, and a settings file that refuses to load takes
+    the conversation loop down with it."""
+    monkeypatch.setenv("DAEMON_PROACTIVE_SPEAKER_ENABLED", "true")
+    settings = make_settings(preset="offline")  # must not raise
+    assert settings.voice_enabled in (True, False)
 
 
 def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:

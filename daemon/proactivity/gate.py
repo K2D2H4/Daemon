@@ -245,8 +245,11 @@ class Gate:
         heard - and it is what puts the label buttons on every utterance, which
         the 👎 brake depends on.
         """
-        if not self.settings.proactive_speaker_enabled:
-            return "telegram", "DAEMON_PROACTIVE_SPEAKER_ENABLED is off"
+        if not self.settings.voice_enabled:
+            # DAEMON_PROACTIVE_SPEAKER_ENABLED used to be the switch checked here;
+            # it is gone, and DAEMON_VOICE_ENABLED now governs the speaker path
+            # too - one switch, so "voice on" cannot mean two different things.
+            return "telegram", "DAEMON_VOICE_ENABLED is off"
 
         at_keyboard = reading.at_keyboard
         if at_keyboard is None:

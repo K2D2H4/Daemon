@@ -712,7 +712,7 @@ async def build_proactive_tick(
             logger.error("proactive: no channel, so nothing can be delivered there: %s", exc)
 
         speaker = None
-        if settings.proactive_speaker_enabled:
+        if settings.voice_enabled:
             from daemon.proactivity.speaker import LocalSpeaker
 
             speaker = LocalSpeaker()

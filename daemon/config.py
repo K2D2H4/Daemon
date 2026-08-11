@@ -263,7 +263,17 @@ class Settings(BaseSettings):
 
     voice_enabled: bool = Field(default=False, alias="DAEMON_VOICE_ENABLED")
     """docs/PLAN.md 6.5: voice is the user's choice and text mode is a complete
-    product, so voice keys are only required once this is on."""
+    product, so voice keys are only required once this is on.
+
+    Also the only switch for whether a proactive utterance may leave the laptop
+    speaker - `DAEMON_PROACTIVE_SPEAKER_ENABLED` used to be a second one. It was
+    split off in the first place because the two failure costs are not
+    comparable (PLAN 6.4): an ignored Telegram message costs nothing, a voice in
+    a meeting is an accident. But `Gate._route` already carries that asymmetry
+    on its own - seven rules that downgrade to Telegram rather than block - so a
+    second top-level switch only bought "voice on" meaning two different things
+    depending which file you read. One switch; the gate still refuses to speak
+    into a meeting."""
 
     ollama_base_url: str = Field(default="http://127.0.0.1:11434", alias="DAEMON_OLLAMA_BASE_URL")
     ollama_model: str = Field(default="qwen3:14b", alias="DAEMON_OLLAMA_MODEL")
@@ -420,16 +430,10 @@ class Settings(BaseSettings):
     proactive_silence_hours: float = Field(default=20.0, alias="DAEMON_PROACTIVE_SILENCE_HOURS")
     """Hours without conversation before the `silence` kind becomes a candidate."""
 
-    proactive_speaker_enabled: bool = Field(
-        default=False, alias="DAEMON_PROACTIVE_SPEAKER_ENABLED"
-    )
-    """Whether it may talk out of the machine's speaker when the user is present.
-
-    Off by default and gated separately from `proactive_enabled`, because the two
-    failure costs are not comparable: an ignored Telegram message costs nothing and
-    a voice in a meeting is an accident (PLAN 6.4). Telegram-only proactivity is a
-    complete product; this is the addition that needs the gate to be trustworthy
-    first."""
+    # `DAEMON_PROACTIVE_SPEAKER_ENABLED` used to live here as a second switch.
+    # Removed: `voice_enabled` above now governs the speaker path too, and
+    # `model_config`'s `extra="ignore"` means an old .env that still sets it
+    # loads fine - the key is just inert, not honoured and not an error.
 
     # --- persona evolution (M4, docs/PLAN.md 5.5) -------------------------
     # No on/off switch, deliberately: the failure cost is the same shape as

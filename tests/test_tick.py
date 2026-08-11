@@ -61,12 +61,21 @@ class FakeChannel:
 
 
 def settings(**overrides: Any) -> Settings:
+    voice_enabled = overrides.pop("voice_enabled", None)
     base: dict[str, Any] = {
         "preset": "offline",
         "proactive_enabled": True,
         "proactive_quiet_hours": "",
     }
-    return Settings(_env_file=None, **{**base, **overrides})
+    built = Settings(_env_file=None, **{**base, **overrides})
+    if voice_enabled is None:
+        return built
+    # Settings itself refuses voice_enabled=True under the offline preset (no
+    # hosted native-audio provider to route chat_voice to) - correctly, for the
+    # real conversation path. This file only needs the flag as a bool for the
+    # gate's speaker check, so patch it in past that unrelated check, the same
+    # escape hatch tests/test_gate.py uses.
+    return Settings.model_construct(**{**built.model_dump(), "voice_enabled": voice_enabled})
 
 
 @pytest.fixture
@@ -318,7 +327,7 @@ async def test_the_recorded_route_is_telegram_when_no_speaker_is_wired(
     store: Store, data_dir: Path
 ) -> None:
     add_candidate(store)
-    tick, _, _ = tick_for(store, data_dir, proactive_speaker_enabled=True)
+    tick, _, _ = tick_for(store, data_dir, voice_enabled=True)
 
     await tick.run(now=NOW)
 
