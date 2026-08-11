@@ -19,7 +19,7 @@ Host that is not loopback, which is what defeats DNS-rebinding.
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -118,9 +118,14 @@ def test_b_a_failed_pass_is_recorded_where_the_artifact_cannot_say_so(
 
 
 def test_c_empty_rounds_stay_out_of_the_log_and_in_the_timeline(
-    tmp_path: Path, store: Store
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    now = clock_now()
+    # Pin "now" to midday, not the live clock: the rounds span 55 minutes back and
+    # `today_payload` counts only those on the current *local* day (`local_day_start`),
+    # so a live clock within an hour of local midnight drops the older rounds into
+    # yesterday and the count comes up short. CI caught this at 00:16 UTC (5 != 13).
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("daemon.admin.activity.clock_now", lambda: now)
     for minutes in range(0, 60, 5):
         store.record_proactive_round(
             generated=0,
