@@ -156,6 +156,7 @@ logger = logging.getLogger(__name__)
 IOREG = "/usr/sbin/ioreg"
 LSAPPINFO = "/usr/bin/lsappinfo"
 OSASCRIPT = "/usr/bin/osascript"
+SYSTEM_PROFILER = "/usr/sbin/system_profiler"
 CORE_AUDIO = "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
 
 PROBE_TIMEOUT_SECONDS = 2.0
@@ -218,6 +219,29 @@ _HID_IDLE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
 node sits in the tree. So the value is found by pattern rather than by position,
 and a dump that does not contain it at all is a failed probe (below) rather than
 a zero."""
+
+MUTED = 'output muted of (get volume settings)'
+VOLUME = 'output volume of (get volume settings)'
+"""Two calls rather than one AppleScript returning a record: parsing
+`{output volume:50, output muted:true}` means owning a record parser, and the
+second call costs ~120 ms on a five-minute tick.
+
+`get volume settings` is Standard Additions, not System Events, so it needs no
+Automation grant - unlike the `osascript` foreground fallback this file already
+warns about. Verified answering on this machine (2026-08-11).
+"""
+
+HEADPHONE_TRANSPORTS = ("headphone", "usb", "bluetooth", "displayport", "thunderbolt")
+"""Output transports where a spoken line reaches nobody but the user.
+
+Not exhaustive and it cannot be, same as `gate.FOCUS_APPS`. It does not have to
+be: a miss only costs the speaker in a case where Telegram still delivers, and a
+false positive costs a line spoken aloud next to somebody - so the list holds
+only transports that are point-to-point by construction. Built-in speakers are
+absent on purpose, and so is anything routed through a virtual device: the
+default output on the development machine is `MacBook Pro Speakers (eqMac)`,
+where the name describes the proxy rather than the hardware behind it.
+"""
 
 
 class ProbeError(Exception):
@@ -329,6 +353,43 @@ def audio_running(selector: int) -> bool:
     return bool(_uint32_property(device, IS_RUNNING_SOMEWHERE))
 
 
+# --- the default output's transport, through system_profiler ---------------
+
+
+def _default_output_transport(dump: str) -> str | None:
+    """The `Transport:` value of whichever block has `Default Output Device: Yes`.
+
+    `system_profiler SPAudioDataType` prints one indented block per device, in
+    no guaranteed order, so the default has to be found by its own marker line
+    rather than assumed to be first. `None` if no block claims it, or the block
+    that does names no transport.
+    """
+    blocks = re.split(r"\n(?=\s{8}\S)", dump)
+    for block in blocks:
+        if "Default Output Device: Yes" not in block:
+            continue
+        found = re.search(r"Transport:\s*(.+)", block)
+        return found.group(1).strip() if found else None
+    return None
+
+
+# --- the session dictionary, through Quartz ---------------------------------
+
+
+def _window_server_session() -> dict[str, object] | None:
+    """The window server's session dictionary, or None if Quartz is unavailable.
+
+    Imported lazily: pyobjc is present in this install, but presence must keep
+    answering on a machine where it is not, and a module-scope import would make
+    that a crash at import time rather than one `None` field.
+    """
+    try:
+        import Quartz
+    except ImportError:
+        return None
+    return Quartz.CGSessionCopyCurrentDictionary()
+
+
 # --- the reading ------------------------------------------------------------
 
 
@@ -348,6 +409,7 @@ class MachinePresence:
         run: Callable[[Sequence[str]], Awaitable[str]] | None = None,
         audio: Callable[[int], bool] | None = None,
         mic_held: Callable[[], bool] | None = None,
+        session: Callable[[], dict[str, object] | None] | None = None,
         now: datetime | None = None,
     ) -> None:
         # sys.platform, not platform.system(): it is a constant fixed at compile
@@ -365,6 +427,7 @@ class MachinePresence:
         self._run = run if run is not None else self._spawn
         self._audio = audio if audio is not None else audio_running
         self._mic_held = mic_held if mic_held is not None else mic_hold.held
+        self._session = session if session is not None else _window_server_session
         self._now = now
 
     async def read(self) -> Reading:
@@ -387,12 +450,18 @@ class MachinePresence:
         app = await self._probe("foreground_app", self._foreground_app, unknown)
         mic = await self._probe("mic_busy", self._mic_busy, unknown)
         output = await self._probe("output_busy", self._output_busy, unknown)
+        muted = await self._probe("output_muted", self._output_muted, unknown)
+        locked = await self._probe("screen_locked", self._screen_locked, unknown)
+        cans = await self._probe("headphones", self._headphones, unknown)
         return Reading(
             at=at,
             idle_seconds=idle,
             foreground_app=app,
             mic_busy=mic,
             output_busy=output,
+            output_muted=muted,
+            screen_locked=locked,
+            headphones=cans,
             unknown=tuple(unknown),
         )
 
@@ -516,6 +585,52 @@ class MachinePresence:
             raise ProbeError(f"CoreAudio did not answer in {self._timeout:g}s") from None
         except OSError as exc:
             raise ProbeError(f"CoreAudio unavailable: {exc}") from exc
+
+    async def _output_muted(self) -> bool:
+        """Muted, or turned all the way down.
+
+        Both are the same fact for this file's purpose - `say` exits 0 and the
+        room stays quiet either way (`daemon/proactivity/speaker.py` measured
+        that a misconfigured voice is silent with a clean exit). Treating only
+        the mute switch as mute would leave the zero-volume case recorded as a
+        line spoken aloud.
+        """
+        muted = (await self._run([OSASCRIPT, "-e", MUTED])).strip().casefold()
+        if muted == "true":
+            return True
+        if muted != "false":
+            raise ProbeError(f"osascript gave no mute state ({_excerpt(muted)})")
+        level = (await self._run([OSASCRIPT, "-e", VOLUME])).strip()
+        try:
+            return int(level) == 0
+        except ValueError:
+            raise ProbeError(f"osascript gave no volume ({_excerpt(level)})") from None
+
+    async def _screen_locked(self) -> bool:
+        """Whether the session is locked.
+
+        macOS *omits* `CGSSessionScreenIsLocked` when unlocked rather than
+        setting it to 0 (verified 2026-08-11), so an absent key is the answer
+        "unlocked" and not the answer "unknown". Reading it as unknown would send
+        every utterance to Telegram for the rest of the process's life, which is
+        this project's signature defect wearing a probe's clothes.
+        """
+        session = await asyncio.to_thread(self._session)
+        if session is None:
+            raise ProbeError("no window-server session dictionary")
+        return bool(session.get("CGSSessionScreenIsLocked", False))
+
+    async def _headphones(self) -> bool:
+        """Whether the default output is point-to-point.
+
+        Only ever *widens* what the gate allows, so an unreadable transport
+        resolves to False and the ordinary rules apply.
+        """
+        dump = await self._run([SYSTEM_PROFILER, "SPAudioDataType"])
+        transport = _default_output_transport(dump)
+        if transport is None:
+            raise ProbeError("system_profiler named no default output transport")
+        return any(marker in transport.casefold() for marker in HEADPHONE_TRANSPORTS)
 
     async def _spawn(self, argv: Sequence[str]) -> str:
         """Run a probe command and return its stdout. Bounded, and never a shell.

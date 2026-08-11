@@ -38,9 +38,12 @@ from daemon.proactivity.presence import (
     IOREG,
     IS_RUNNING_SOMEWHERE,
     LSAPPINFO,
+    MUTED,
     OSASCRIPT,
     SYSTEM_OBJECT,
+    SYSTEM_PROFILER,
     UNKNOWN_OBJECT,
+    VOLUME,
     MachinePresence,
     ProbeError,
     audio_running,
@@ -66,13 +69,78 @@ LS_FRONT = "ASN:0x0-0x761761:\n"
 LS_INFO = '"LSDisplayName"="Google Chrome"\n'
 LS_NULL_INFO = '"LSDisplayName"=[ NULL ]\n'
 
+# Two `system_profiler SPAudioDataType` dumps, trimmed to the shape that matters:
+# one block per device, and the `Default Output Device: Yes` marker on the block
+# `_default_output_transport` has to find - it is not always the first block, and
+# real output never guarantees an order.
+#
+# NOTE for whoever verifies this against the real machine (2026-08-11, this
+# machine): a live `system_profiler SPAudioDataType` capture here shows the
+# default output device - `MacBook Pro Speakers (eqMac)` - answering
+# `Transport: USB`, not `Transport: Virtual`. That is *inside*
+# `HEADPHONE_TRANSPORTS` as written, so `_headphones()` on this real machine
+# currently reads True for built-in speakers behind eqMac's proxy - the opposite
+# of what `HEADPHONE_TRANSPORTS`'s own docstring claims a virtual device does.
+# `SP_AUDIO_BUILTIN` below uses `Transport: Virtual` instead, to isolate the
+# claim this test suite is actually pinning (a transport outside the list is not
+# headphones) from that unresolved real-machine discrepancy. See the task report.
+SP_AUDIO_HEADPHONES = """Audio:
+
+    Devices:
+
+        MacBook Pro Microphone:
+
+          Input Channels: 1
+          Manufacturer: Apple Inc.
+          Current SampleRate: 48000
+          Transport: Built-in
+          Input Source: MacBook Pro Microphone
+
+        AirPods Pro:
+
+          Default Output Device: Yes
+          Default System Output Device: Yes
+          Manufacturer: Apple Inc.
+          Output Channels: 2
+          Current SampleRate: 48000
+          Transport: Bluetooth
+          Output Source: AirPods Pro
+"""
+
+SP_AUDIO_BUILTIN = """Audio:
+
+    Devices:
+
+        MacBook Pro Microphone:
+
+          Default Input Device: Yes
+          Input Channels: 1
+          Manufacturer: Apple Inc.
+          Current SampleRate: 48000
+          Transport: Built-in
+          Input Source: MacBook Pro Microphone
+
+        MacBook Pro Speakers (eqMac):
+
+          Default Output Device: Yes
+          Default System Output Device: Yes
+          Manufacturer: Bitgapp Ltd
+          Output Channels: 2
+          Current SampleRate: 44100
+          Transport: Virtual
+          Output Source: MacBook Pro Speakers (eqMac)
+"""
+
 
 class FakeRunner:
     """Stands in for the command runner.
 
     Keyed by command, and `lsappinfo`'s two calls are separate keys, because the
     chain fails in two different places and each one has to be reachable from a
-    test.
+    test. `osascript` is keyed by *script* (`argv[2]`, the text after `-e`), not
+    just by command: the foreground probe, the mute probe and the volume probe
+    are all `osascript`, and one canned answer for all three is how a mute-state
+    call would silently receive the foreground app's name instead.
     """
 
     def __init__(
@@ -82,11 +150,17 @@ class FakeRunner:
         ls_front: str | Exception = LS_FRONT,
         ls_info: str | Exception = LS_INFO,
         osascript: str | Exception = "Google Chrome\n",
+        muted: str | Exception = "false\n",
+        volume: str | Exception = "50\n",
+        sp_audio: str | Exception = SP_AUDIO_BUILTIN,
     ) -> None:
         self.ioreg = ioreg
         self.ls_front = ls_front
         self.ls_info = ls_info
         self.osascript = osascript
+        self.muted = muted
+        self.volume = volume
+        self.sp_audio = sp_audio
         self.calls: list[list[str]] = []
 
     async def __call__(self, argv: Sequence[str]) -> str:
@@ -96,7 +170,17 @@ class FakeRunner:
         elif argv[0] == LSAPPINFO:
             reply = self.ls_front if argv[1] == "front" else self.ls_info
         elif argv[0] == OSASCRIPT:
-            reply = self.osascript
+            script = argv[2]
+            if script == MUTED:
+                reply = self.muted
+            elif script == VOLUME:
+                reply = self.volume
+            elif script == FRONTMOST:
+                reply = self.osascript
+            else:  # pragma: no cover - a new script must be added deliberately
+                raise AssertionError(f"unexpected osascript {script!r}")
+        elif argv[0] == SYSTEM_PROFILER:
+            reply = self.sp_audio
         else:  # pragma: no cover - a new command must be added deliberately
             raise AssertionError(f"unexpected command {argv[0]!r}")
         if isinstance(reply, Exception):
@@ -107,7 +191,7 @@ class FakeRunner:
         return [argv for argv in self.calls if argv[0] == command]
 
 
-RUNNER_KEYS = ("ioreg", "ls_front", "ls_info", "osascript")
+RUNNER_KEYS = ("ioreg", "ls_front", "ls_info", "osascript", "muted", "volume", "sp_audio")
 
 
 def build(**kwargs: object) -> tuple[MachinePresence, FakeRunner]:
@@ -115,6 +199,10 @@ def build(**kwargs: object) -> tuple[MachinePresence, FakeRunner]:
     runner = FakeRunner(**{k: v for k, v in kwargs.items() if k in RUNNER_KEYS})  # type: ignore[arg-type]
     rest = {k: v for k, v in kwargs.items() if k not in RUNNER_KEYS}
     rest.setdefault("audio", lambda selector: False)
+    # An unlocked session with no lock key, same as the real machine unlocked
+    # (verified 2026-08-11) - so a test that does not care about screen_locked
+    # does not have to fake one, and none of them touches the real Quartz call.
+    rest.setdefault("session", lambda: {})
     return (
         MachinePresence(platform="darwin", run=runner, now=PINNED, **rest),  # type: ignore[arg-type]
         runner,
@@ -184,13 +272,19 @@ async def test_the_smallest_idle_time_wins_when_several_nodes_report_one() -> No
 async def test_lsappinfo_answers_and_osascript_is_never_asked() -> None:
     """The reason `lsappinfo` is primary: 8 ms against 233 ms, and no Automation
     grant. If this ever regresses, every reading silently costs 30x more and
-    acquires a permission dependency nobody asked for."""
+    acquires a permission dependency nobody asked for.
+
+    `osascript` is not asserted absent outright: the mute and headphone probes
+    are unconditional `osascript`/`system_profiler` users with nothing to do with
+    the foreground-app fallback this test pins. What must never happen is that
+    fallback - the `FRONTMOST` script - running while `lsappinfo` still answers.
+    """
     reader, runner = build()
 
     reading = await reader.read()
 
     assert reading.foreground_app == "Google Chrome"
-    assert runner.ran(OSASCRIPT) == []
+    assert all(argv[2] != FRONTMOST for argv in runner.ran(OSASCRIPT))
     assert [argv[1] for argv in runner.ran(LSAPPINFO)] == ["front", "info"]
 
 
@@ -758,3 +852,71 @@ async def test_we_do_not_probe_a_device_we_already_hold() -> None:
     reader, _ = build(audio=must_not_run, mic_held=lambda: True)
     reading = await reader.read()
     assert reading.mic_busy is False
+
+
+# --- mute, screen lock, headphones -------------------------------------------
+
+
+async def test_muted_output_is_read_as_muted() -> None:
+    reader, _ = build(muted="true\n")
+    reading = await reader.read()
+    assert reading.output_muted is True
+
+
+async def test_zero_volume_counts_as_muted() -> None:
+    """Nobody hears 0% either, and `say` still exits 0. The two states differ in
+    the Settings pane and not in the room."""
+    reader, _ = build(muted="false\n", volume="0\n")
+    reading = await reader.read()
+    assert reading.output_muted is True
+
+
+async def test_an_audible_machine_is_not_muted() -> None:
+    reader, _ = build(muted="false\n", volume="50\n")
+    reading = await reader.read()
+    assert reading.output_muted is False
+
+
+async def test_an_unreadable_mute_state_is_unknown_not_audible() -> None:
+    """`None` and not `False`: False is what lets a line be spoken aloud, and an
+    osascript that answered nonsense is not evidence anybody would hear it."""
+    reader, _ = build(muted="Google Chrome\n")
+    reading = await reader.read()
+    assert reading.output_muted is None
+    assert reason_for(reading, "output_muted") != ""
+
+
+async def test_a_locked_screen_is_recorded() -> None:
+    reader, _ = build(session=lambda: {"CGSSessionScreenIsLocked": 1})
+    reading = await reader.read()
+    assert reading.screen_locked is True
+
+
+async def test_an_absent_lock_key_means_unlocked_not_unknown() -> None:
+    """macOS omits the key entirely when unlocked - it does not set it to 0
+    (verified 2026-08-11). A probe that read the absence as "could not answer"
+    would route every utterance to Telegram for the life of the process."""
+    reader, _ = build(session=lambda: {"kCGSSessionOnConsoleKey": True})
+    reading = await reader.read()
+    assert reading.screen_locked is False
+
+
+async def test_no_quartz_is_unknown_rather_than_unlocked() -> None:
+    reader, _ = build(session=lambda: None)
+    reading = await reader.read()
+    assert reading.screen_locked is None
+
+
+async def test_headphones_are_read_from_the_default_output_transport() -> None:
+    reader, _ = build(sp_audio=SP_AUDIO_HEADPHONES)
+    reading = await reader.read()
+    assert reading.headphones is True
+
+
+async def test_built_in_speakers_are_not_headphones() -> None:
+    """The default output on the development machine is
+    `MacBook Pro Speakers (eqMac)` - a virtual device in front of the built-in
+    speakers. The name describes the proxy; the transport is what is read."""
+    reader, _ = build(sp_audio=SP_AUDIO_BUILTIN)
+    reading = await reader.read()
+    assert reading.headphones is False
