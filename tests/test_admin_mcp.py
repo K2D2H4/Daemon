@@ -440,6 +440,107 @@ async def test_reconnect_provider_handlers_raise_rather_than_block(tmp_path: Pat
         await captured["callback"]()
 
 
+# --- token expiry survives the restart the SDK forgets it across ---
+
+
+class _ContextProvider(SimpleNamespace):
+    """A provider shaped like the SDK's: it carries the `context` whose
+    `token_expiry_time` the SDK consults, and which it only ever fills in when a
+    token arrives over the wire."""
+
+
+def _context_build_provider(
+    url: str, redirect_uri: str, storage: Any, redirect_handler: Any, callback_handler: Any
+) -> _ContextProvider:
+    return _ContextProvider(context=SimpleNamespace(token_expiry_time=None), storage=storage)
+
+
+async def _store_token(tmp_path: Path, *, expires_in: int | None = 28800) -> None:
+    from mcp.shared.auth import OAuthToken
+
+    storage = mcp_oauth.FileTokenStorage(tmp_path, "notion")
+    await storage.set_tokens(
+        OAuthToken(access_token="at", refresh_token="rt", expires_in=expires_in)
+    )
+
+
+async def test_stored_token_records_when_it_was_obtained(tmp_path: Path) -> None:
+    """`expires_in` is a duration, so on its own it says nothing after a restart.
+    Persist the moment the token arrived, or its age is unknowable."""
+    await _store_token(tmp_path)
+    saved = json.loads((tmp_path / mcp_oauth.TOKENS_DIRNAME / "notion.json").read_text())
+    assert isinstance(saved["obtained_at"], (int, float))
+    assert saved["tokens"]["expires_in"] == 28800
+
+
+async def test_reconnect_refreshes_an_expired_token_instead_of_demanding_reauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defect: the SDK keeps `token_expiry_time` in memory only, so after a
+    restart a *stale* token reads as valid (`not None` is "no expiry declared"), the
+    refresh branch is skipped, the dead token 401s and the owner is told to
+    reauthorize - with a good refresh token sitting on disk. The provider must boot
+    knowing the token is expired so the SDK refreshes it."""
+    await _store_token(tmp_path)
+    # 9 hours later: past the 8-hour lifetime, so this token is dead.
+    monkeypatch.setattr(mcp_oauth.time, "time", lambda: _obtained_at(tmp_path) + 9 * 3600)
+
+    config = server_config_from_catalog(lookup("notion"))
+    provider = mcp_oauth.build_reconnect_provider(
+        tmp_path, config, redirect_uri=OAUTH_REDIRECT, build_provider=_context_build_provider
+    )
+    expiry = provider.context.token_expiry_time
+    assert expiry is not None, "the SDK would treat the stale token as valid and never refresh"
+    assert expiry < mcp_oauth.time.time()
+
+
+async def test_a_live_token_is_not_forced_through_a_refresh(tmp_path: Path) -> None:
+    """The other direction: a token still inside its lifetime keeps a future expiry,
+    so a restart reconnects on it silently rather than burning a refresh."""
+    await _store_token(tmp_path)
+    config = server_config_from_catalog(lookup("notion"))
+    provider = mcp_oauth.build_reconnect_provider(
+        tmp_path, config, redirect_uri=OAUTH_REDIRECT, build_provider=_context_build_provider
+    )
+    assert provider.context.token_expiry_time > mcp_oauth.time.time()
+
+
+async def test_a_token_of_unknown_age_is_treated_as_expired(tmp_path: Path) -> None:
+    """A file written before `obtained_at` existed - every already-authorized
+    install. Its age is unknowable, so assume the worst and let the refresh decide;
+    the expiry must be *truthy*, since the SDK reads a falsy one as 'never expires'
+    and would be back to sending the dead token."""
+    await _store_token(tmp_path)
+    path = tmp_path / mcp_oauth.TOKENS_DIRNAME / "notion.json"
+    saved = json.loads(path.read_text())
+    del saved["obtained_at"]
+    path.write_text(json.dumps(saved))
+
+    config = server_config_from_catalog(lookup("notion"))
+    provider = mcp_oauth.build_reconnect_provider(
+        tmp_path, config, redirect_uri=OAUTH_REDIRECT, build_provider=_context_build_provider
+    )
+    expiry = provider.context.token_expiry_time
+    assert expiry, "a falsy expiry means 'no expiry declared' to the SDK"
+    assert expiry < mcp_oauth.time.time()
+
+
+async def test_a_token_with_no_declared_lifetime_keeps_no_expiry(tmp_path: Path) -> None:
+    """A server that declares no `expires_in` is saying the token does not expire.
+    Inventing an expiry for it would refresh a token that never needed it."""
+    await _store_token(tmp_path, expires_in=None)
+    config = server_config_from_catalog(lookup("notion"))
+    provider = mcp_oauth.build_reconnect_provider(
+        tmp_path, config, redirect_uri=OAUTH_REDIRECT, build_provider=_context_build_provider
+    )
+    assert provider.context.token_expiry_time is None
+
+
+def _obtained_at(tmp_path: Path) -> float:
+    saved = json.loads((tmp_path / mcp_oauth.TOKENS_DIRNAME / "notion.json").read_text())
+    return float(saved["obtained_at"])
+
+
 async def test_complete_oauth_flow_rejects_unknown_state() -> None:
     with pytest.raises(mcp_oauth.OAuthError):
         await mcp_oauth.complete_oauth_flow("code", "not-a-real-state")
