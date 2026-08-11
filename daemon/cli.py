@@ -529,14 +529,19 @@ def _err_log_path() -> Path:
     and reading those defaults off the model rather than repeating them here is
     what keeps this from drifting away from `config.py`.
 
-    Nothing here may raise. This runs precisely when the configuration is already
-    broken, and the module docstring's promise - print what you found rather than a
-    traceback - is worth least when it only holds for configurations that parse.
-    Three attempts, each catching everything, because listing the failures instead
-    of catching them all has now let a traceback through twice: ConfigError from the
-    model validator, then pydantic's ValidationError from a field that will not
-    coerce, then UnicodeDecodeError from a `.env` an editor saved as CP949 - which
-    `Settings` raises while reading the file, before any of the rest can apply.
+    No configuration can make this raise. That is the promise, and it is narrower
+    than "nothing can": the last line still calls `Path.cwd()`, which fails if the
+    working directory has been deleted out from under the process - a broken machine
+    rather than a broken `.env`, and not something a fallback path can paper over.
+
+    Within that, three attempts, each catching everything, because listing the
+    failures instead of catching them all has now let a traceback through twice:
+    ConfigError from the model validator, then pydantic's ValidationError from a
+    field that will not coerce, then UnicodeDecodeError from a `.env` an editor saved
+    as CP949 - which `Settings` raises while reading the file, before any of the rest
+    can apply. This runs precisely when the configuration is already broken, and the
+    module docstring's promise - print what you found rather than a traceback - is
+    worth least when it only holds for configurations that parse.
     """
     try:
         return service_for(Settings()).err_log
@@ -865,7 +870,13 @@ def _restart_after_update() -> None:
     """
     try:
         settings = Settings()
-    except ConfigError:
+    except Exception:  # noqa: BLE001 - any unusable configuration, see _err_log_path
+        # Not just ConfigError. `daemon update` runs before the Settings gate on
+        # purpose - you may be updating because a version is broken - so this is
+        # reached with any `.env` at all, including the ones that raise pydantic's
+        # ValidationError or UnicodeDecodeError. Narrower, it turned a reinstall
+        # that had already succeeded into a traceback on its last line, which is
+        # the one outcome the docstring above rules out.
         print(
             "the code is updated; restart the service yourself to pick it up "
             "(config did not load here, so I could not do it automatically)."

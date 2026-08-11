@@ -1666,3 +1666,30 @@ def test_doctor_reports_a_field_that_will_not_coerce(
     printed = capsys.readouterr().out
     assert "[FAIL] config:" in printed
     assert "DAEMON_PORT" in printed
+
+
+def test_doctor_survives_an_env_file_the_encoding_of_which_is_wrong(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The third of the three reasons `_doctor`'s catch is wide, and the one the
+    commit that widened it named while leaving it untested: `Settings` raises
+    UnicodeDecodeError while *reading* a `.env` that an editor saved as CP949, so
+    neither ConfigError nor ValidationError describes it."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_bytes("DAEMON_PERSONA_SEED=연희동에 산다\n".encode("cp949"))
+
+    assert cli.main(["doctor"]) == cli.PROBLEM
+    assert "[FAIL] config:" in capsys.readouterr().out
+
+
+def test_update_that_cannot_load_the_config_still_reports_success(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`daemon update` runs before the Settings gate on purpose, so its restart step
+    meets every `.env` there is. A traceback on the last line of a reinstall that
+    already succeeded is the one outcome its docstring rules out."""
+    monkeypatch.setenv("DAEMON_PORT", "not-a-number")
+
+    cli._restart_after_update()
+
+    assert "the code is updated" in capsys.readouterr().out
