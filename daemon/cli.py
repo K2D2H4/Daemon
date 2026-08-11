@@ -32,7 +32,7 @@ from typing import Any
 from daemon import __version__
 from daemon.config import ENV_FILE, OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
-from daemon.service import ServiceAction, ServiceError, ServiceStatus, service_for
+from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus, service_for
 
 OK = 0
 PROBLEM = 1
@@ -73,11 +73,17 @@ _LOG_POLL_SECONDS = 0.25
 feel live, long enough that watching an idle daemon is not a spin loop."""
 
 _LOG_NOISE = re.compile(
-    # The admin console health-polls itself and Telegram is long-polled once a
-    # second: together 56% of a measured 22,790-line log. Both patterns end in the
-    # success status on purpose - a 409 from getUpdates is the exact line that
-    # explains a bot token clash, and a 500 from the admin is never noise.
-    r'uvicorn\.access\b.*"\s+[23]\d\d\s*$'
+    # The admin console re-reads several endpoints on a timer and Telegram is
+    # long-polled once a second: together 56% of a measured 22,790-line log.
+    #
+    # Two things are deliberately narrow. Both patterns anchor on a success status,
+    # because a 409 from getUpdates is the exact line that explains a bot token
+    # clash and a 500 from the admin is never noise. And the admin pattern matches
+    # GET only: the first version dropped every successful admin request, which
+    # silently swallowed the `PATCH /api/settings` that had just rewritten `.env`
+    # and the `POST /api/mcp/connect` the owner was waiting on. Reads can repeat
+    # unprompted; a write is always something that happened.
+    r'uvicorn\.access\b.*"GET .*"\s+[23]\d\d\s*$'
     r"|getUpdates\s+\"HTTP/[\d.]+\s+2\d\d[^\"]*\"\s*$"
 )
 
@@ -304,8 +310,10 @@ def build_parser() -> argparse.ArgumentParser:
 def _grouped_commands(groups: dict[str, list[tuple[str, str]]]) -> str:
     """The command list, grouped by when you would reach for them.
 
-    This is the *only* rendering of the list - the subparsers are registered with
-    `help=SUPPRESS` - so there is no second copy to keep in step.
+    This is the *only* rendering of the list - the subparsers are registered
+    without a `help=` at all, which is what stops argparse listing them a second
+    time - so there is no second copy to keep in step. See `add` for why
+    withholding the argument is not the same as passing SUPPRESS.
     """
     width = max(len(name) for entries in groups.values() for name, _ in entries)
     columns = min(shutil.get_terminal_size(fallback=(80, 24)).columns, 100)
@@ -347,6 +355,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Before Settings, like doctor and setup: the moment you most need to be
         # told what the commands are is the moment the configuration is broken.
         return _help(args.topic)
+    if command == "log":
+        # Also before Settings, and for a sharper version of the same reason: a
+        # configuration the process cannot load is one of the ways the resident
+        # fails, and the log is where that failure is written down. Refusing to
+        # open it until the configuration parses withholds the evidence about the
+        # very thing that is broken.
+        return _log(follow=args.follow, lines=args.lines, raw=args.raw)
     if command == "doctor":
         # Doctor is the one command that must survive a configuration it cannot
         # load - explaining the breakage is its whole job.
@@ -433,8 +448,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_persona(settings, args))
     if command == "tools":
         return _tools(settings, args)
-    if command == "log":
-        return _log(settings, follow=args.follow, lines=args.lines, raw=args.raw)
 
     try:
         if command == "install":
@@ -470,13 +483,13 @@ def _help(topic: str | None) -> int:
     return OK
 
 
-def _log(settings: Settings, *, follow: bool, lines: int, raw: bool) -> int:
+def _log(*, follow: bool, lines: int, raw: bool) -> int:
     """`daemon log`: what the resident has been writing.
 
     The resident's own stderr, which is where every logger in the process ends up.
     Not the tool audit trail - that is `daemon tools log`, a different question.
     """
-    path = service_for(settings).err_log
+    path = _err_log_path()
     if not path.exists():
         print(f"daemon: no log at {path}", file=sys.stderr)
         print(
@@ -500,6 +513,41 @@ def _log(settings: Settings, *, follow: bool, lines: int, raw: bool) -> int:
         # here would be the last thing printed after a good session.
         print()
     return OK
+
+
+def _err_log_path() -> Path:
+    """Where the resident writes its stderr, even when `Settings` will not build.
+
+    The happy path is `service_for`, so a working install and `daemon status` agree
+    on one path. The fallback exists because `daemon log` is dispatched before the
+    Settings gate on purpose: only two values decide the path, both have defaults,
+    and reading those defaults off the model rather than repeating them here is
+    what keeps this from drifting away from `config.py`.
+    """
+    try:
+        return service_for(Settings()).err_log
+    except ConfigError:
+        pass
+
+    filed: dict[str, str] = {}
+    env_file = Path(ENV_FILE)
+    if env_file.exists():
+        from daemon.setup import parse_env
+
+        try:
+            filed = parse_env(env_file.read_text(encoding="utf-8"))
+        except OSError:
+            filed = {}
+
+    def configured(alias: str, field: str) -> str:
+        raw = os.environ.get(alias) or filed.get(alias)
+        return raw if raw else str(Settings.model_fields[field].default)
+
+    return Service(
+        label=configured("DAEMON_SERVICE_LABEL", "service_label"),
+        working_dir=Path.cwd(),
+        log_dir=Path(configured("DAEMON_DATA_DIR", "data_dir")).expanduser() / "logs",
+    ).err_log
 
 
 def _keeper(raw: bool) -> Callable[[str], bool]:

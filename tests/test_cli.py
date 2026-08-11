@@ -24,7 +24,7 @@ from conftest import FakeProvider
 
 from daemon import app as daemon_app
 from daemon import cli, macapp
-from daemon.config import Route, Settings
+from daemon.config import ConfigError, Route, Settings
 from daemon.fs import DIR_MODE
 from daemon.llm.gateway import LLMGateway
 from daemon.memory.base import LoggedMessage
@@ -1367,6 +1367,12 @@ POLL = (
     'https://api.telegram.org/bot<token>/getUpdates "HTTP/1.1 200 OK"'
 )
 SIGNAL = "2026-08-11 11:01:27,688 INFO daemon.app proactive: silent - 0 generated"
+WRITE = (
+    "2026-08-11 11:03:49,371 INFO uvicorn.access 127.0.0.1:54813 - "
+    '"PATCH /admin/api/settings HTTP/1.1" 200'
+)
+"""A successful admin *write*. The first filter dropped every successful admin
+request, which swallowed the settings change that had just rewritten `.env`."""
 
 
 @pytest.fixture
@@ -1460,3 +1466,66 @@ def test_follow_yields_lines_as_they_are_appended(tmp_path: Path) -> None:
         assert next(stream) == "second"
     finally:
         stream.close()
+
+
+def _unusable(reason: str) -> type[Settings]:
+    """A `Settings` that refuses to build, but is still the class.
+
+    Replacing the name with a bare function would also remove `model_fields`,
+    which the fallback path reads to find the defaults - the test would then fail
+    for a reason the product never hits.
+    """
+
+    class Unusable(Settings):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise ConfigError(reason)
+
+    return Unusable
+
+
+def test_log_keeps_what_the_admin_console_changed(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reads repeat unprompted; a write is always something that happened. Only
+    the polling GETs are noise, and only when they succeeded."""
+    log_file.write_text("\n".join([NOISE, WRITE, NOISE]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [WRITE]
+
+
+def test_log_reads_the_default_path_when_the_configuration_will_not_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A configuration the process cannot load is one of the ways the resident
+    fails, and the log is where that failure is written down - so `daemon log` must
+    not be gated on the same validation that is refusing to pass."""
+    monkeypatch.chdir(tmp_path)
+    # Cleared so this really exercises the model's own default (`./data`) rather
+    # than the value the sandbox fixture exports.
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "Settings", _unusable("preset 'offline' routes no voice"))
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_honours_a_configured_data_dir_without_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fallback still reads DAEMON_DATA_DIR - it falls back to the model's own
+    defaults, not to a second copy of them."""
+    monkeypatch.chdir(tmp_path)
+    logs = tmp_path / "elsewhere" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "elsewhere"))
+
+    monkeypatch.setattr(cli, "Settings", _unusable("nope"))
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
