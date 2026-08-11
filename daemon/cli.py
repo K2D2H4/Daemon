@@ -32,7 +32,7 @@ from typing import Any
 from daemon import __version__
 from daemon.config import ENV_FILE, OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
-from daemon.service import ServiceAction, ServiceError, ServiceStatus, service_for
+from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus, service_for
 
 OK = 0
 PROBLEM = 1
@@ -73,11 +73,22 @@ _LOG_POLL_SECONDS = 0.25
 feel live, long enough that watching an idle daemon is not a spin loop."""
 
 _LOG_NOISE = re.compile(
-    # The admin console health-polls itself and Telegram is long-polled once a
-    # second: together 56% of a measured 22,790-line log. Both patterns end in the
-    # success status on purpose - a 409 from getUpdates is the exact line that
-    # explains a bot token clash, and a 500 from the admin is never noise.
-    r'uvicorn\.access\b.*"\s+[23]\d\d\s*$'
+    # The admin console re-reads several endpoints on a timer and Telegram is
+    # long-polled once a second: together 56% of a measured 22,790-line log.
+    #
+    # Two things are deliberately narrow. Both patterns anchor on a success status,
+    # because a 409 from getUpdates is the exact line that explains a bot token
+    # clash and a 500 from the admin is never noise. And the admin pattern matches
+    # GET only: the first version dropped every successful admin request, which
+    # silently swallowed the `PATCH /api/settings` that had just rewritten `.env`
+    # and the `POST /api/mcp/connect` the owner was waiting on. Reads can repeat
+    # unprompted; a write is always something that happened.
+    #
+    # `oauth/callback` is the exception that proves the method is a proxy and not
+    # the thing itself: it is a GET because an OAuth redirect has to be, and it
+    # lands tokens on disk. A successful one is the only line saying a connection
+    # finished, so it survives.
+    r'uvicorn\.access\b.*"GET (?!\S*oauth/callback).*"\s+[23]\d\d\s*$'
     r"|getUpdates\s+\"HTTP/[\d.]+\s+2\d\d[^\"]*\"\s*$"
 )
 
@@ -304,8 +315,10 @@ def build_parser() -> argparse.ArgumentParser:
 def _grouped_commands(groups: dict[str, list[tuple[str, str]]]) -> str:
     """The command list, grouped by when you would reach for them.
 
-    This is the *only* rendering of the list - the subparsers are registered with
-    `help=SUPPRESS` - so there is no second copy to keep in step.
+    This is the *only* rendering of the list - the subparsers are registered
+    without a `help=` at all, which is what stops argparse listing them a second
+    time - so there is no second copy to keep in step. See `add` for why
+    withholding the argument is not the same as passing SUPPRESS.
     """
     width = max(len(name) for entries in groups.values() for name, _ in entries)
     columns = min(shutil.get_terminal_size(fallback=(80, 24)).columns, 100)
@@ -347,6 +360,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Before Settings, like doctor and setup: the moment you most need to be
         # told what the commands are is the moment the configuration is broken.
         return _help(args.topic)
+    if command == "log":
+        # Also before Settings, and for a sharper version of the same reason: a
+        # configuration the process cannot load is one of the ways the resident
+        # fails, and the log is where that failure is written down. Refusing to
+        # open it until the configuration parses withholds the evidence about the
+        # very thing that is broken.
+        return _log(follow=args.follow, lines=args.lines, raw=args.raw)
     if command == "doctor":
         # Doctor is the one command that must survive a configuration it cannot
         # load - explaining the breakage is its whole job.
@@ -433,8 +453,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_persona(settings, args))
     if command == "tools":
         return _tools(settings, args)
-    if command == "log":
-        return _log(settings, follow=args.follow, lines=args.lines, raw=args.raw)
 
     try:
         if command == "install":
@@ -470,13 +488,13 @@ def _help(topic: str | None) -> int:
     return OK
 
 
-def _log(settings: Settings, *, follow: bool, lines: int, raw: bool) -> int:
+def _log(*, follow: bool, lines: int, raw: bool) -> int:
     """`daemon log`: what the resident has been writing.
 
     The resident's own stderr, which is where every logger in the process ends up.
     Not the tool audit trail - that is `daemon tools log`, a different question.
     """
-    path = service_for(settings).err_log
+    path = _err_log_path()
     if not path.exists():
         print(f"daemon: no log at {path}", file=sys.stderr)
         print(
@@ -500,6 +518,82 @@ def _log(settings: Settings, *, follow: bool, lines: int, raw: bool) -> int:
         # here would be the last thing printed after a good session.
         print()
     return OK
+
+
+def _err_log_path() -> Path:
+    """Where the resident writes its stderr, even when `Settings` will not build.
+
+    The happy path is `service_for`, so a working install and `daemon status` agree
+    on one path. The fallback exists because `daemon log` is dispatched before the
+    Settings gate on purpose: only two values decide the path, both have defaults,
+    and reading those defaults off the model rather than repeating them here is
+    what keeps this from drifting away from `config.py`.
+
+    No configuration can make this raise. That is the promise, and it is narrower
+    than "nothing can": the last line still calls `Path.cwd()`, which fails if the
+    working directory has been deleted out from under the process - a broken machine
+    rather than a broken `.env`, and not something a fallback path can paper over.
+
+    Within that, three attempts, each catching everything, because listing the
+    failures instead of catching them all has now let a traceback through twice:
+    ConfigError from the model validator, then pydantic's ValidationError from a
+    field that will not coerce, then UnicodeDecodeError from a `.env` an editor saved
+    as CP949 - which `Settings` raises while reading the file, before any of the rest
+    can apply. This runs precisely when the configuration is already broken, and the
+    module docstring's promise - print what you found rather than a traceback - is
+    worth least when it only holds for configurations that parse.
+    """
+    try:
+        return service_for(Settings()).err_log
+    except Exception:  # noqa: BLE001 - every way a configuration can be unusable
+        pass
+    try:
+        return _log_path(_env_setting("DAEMON_SERVICE_LABEL", "service_label"))
+    except Exception:  # noqa: BLE001 - and every way the values in it can be
+        pass
+    # Defaults only, and they are the model's own, so this last line cannot fail
+    # for a reason the configuration caused. If no resident ever ran here, `_log`
+    # says so and prints the path it looked at.
+    return _log_path(_default("service_label"), data_dir=Path(_default("data_dir")))
+
+
+def _log_path(label: str, *, data_dir: Path | None = None) -> Path:
+    """The err-log path `Service` would compute for this label and data dir."""
+    if data_dir is None:
+        data_dir = Path(_env_setting("DAEMON_DATA_DIR", "data_dir")).expanduser()
+    return Service(label=label, working_dir=Path.cwd(), log_dir=data_dir / "logs").err_log
+
+
+def _default(field: str) -> str:
+    """A field's default, read off the model so it cannot drift from `config.py`."""
+    return str(Settings.model_fields[field].default)
+
+
+def _env_setting(alias: str, field: str) -> str:
+    """What `Settings` would read for one alias, without building `Settings`.
+
+    Case-insensitive, and last-match-wins within a source, because that is what
+    `case_sensitive=False` actually does: pydantic-settings case-folds the names
+    into a dict, so with both `DAEMON_DATA_DIR` and `daemon_data_dir` set the second
+    one is the one that counts. Returning the first match instead pointed this at a
+    different directory than the resident would use.
+    """
+    filed: dict[str, str] = {}
+    env_file = Path(ENV_FILE)
+    try:
+        if env_file.exists():
+            from daemon.setup import parse_env
+
+            filed = parse_env(env_file.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - an unreadable .env is one we cannot consult
+        filed = {}
+
+    # Environment before file, matching pydantic-settings' source precedence.
+    for source in (os.environ, filed):
+        matches = [value for key, value in source.items() if key.upper() == alias and value]
+        if matches:
+            return matches[-1]
+    return _default(field)
 
 
 def _keeper(raw: bool) -> Callable[[str], bool]:
@@ -776,7 +870,13 @@ def _restart_after_update() -> None:
     """
     try:
         settings = Settings()
-    except ConfigError:
+    except Exception:  # noqa: BLE001 - any unusable configuration, see _err_log_path
+        # Not just ConfigError. `daemon update` runs before the Settings gate on
+        # purpose - you may be updating because a version is broken - so this is
+        # reached with any `.env` at all, including the ones that raise pydantic's
+        # ValidationError or UnicodeDecodeError. Narrower, it turned a reinstall
+        # that had already succeeded into a traceback on its last line, which is
+        # the one outcome the docstring above rules out.
         print(
             "the code is updated; restart the service yourself to pick it up "
             "(config did not load here, so I could not do it automatically)."
@@ -1166,7 +1266,14 @@ class Check:
 def _doctor() -> int:
     try:
         settings = Settings()
-    except ConfigError as exc:
+    except Exception as exc:  # noqa: BLE001 - see below
+        # Everything, for the reason `_err_log_path` says at length: ConfigError is
+        # only the failure the model validator produces. `DAEMON_PORT=abc` raises
+        # pydantic's ValidationError from field parsing and a `.env` saved as CP949
+        # raises UnicodeDecodeError from reading the file, and catching only
+        # ConfigError made the command whose whole job is explaining the breakage
+        # print a traceback instead - the exact trap config.py records. Reporting a
+        # failure this command cannot classify still beats a stack trace.
         checks = [Check("config", False, str(exc))]
         admin = None
     else:
