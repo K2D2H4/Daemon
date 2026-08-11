@@ -20,8 +20,13 @@ OAuth `state` - the one value that survives the round-trip through the provider 
 comes back on the redirect - so the callback can find the flow it belongs to.
 
 Tokens are at-rest 0600 under the data dir, never in a service unit file - the same
-rule `daemon/service.py` and the bearer-key path follow. The SDK handles refresh on
-its own once the storage exists.
+rule `daemon/service.py` and the bearer-key path follow. The SDK refreshes them on
+its own *while the process lives*, but not across a restart: it derives the deadline
+from `expires_in` the moment a token arrives and keeps it in memory only, so a
+reloaded token comes back looking like one that never expires. `token_expiry` and
+`_prime_token_expiry` restore that deadline - without them an eight-hour Notion token
+sends a corpse, 401s, and escalates to a full re-authorization the owner has to click
+through on every restart, refresh token in hand.
 
 The `mcp` SDK is imported lazily (inside `_build_provider` and `FileTokenStorage`'s
 methods) so importing this module - which the admin router does at process start -
@@ -34,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -62,6 +68,11 @@ connect task, its open connection and its `_FLOWS` entry forever. Five minutes i
 long enough for a human to authorise in another tab and short enough that an
 abandoned flow does not linger; when it fires, the connect fails and its `finally`
 evicts the `_FLOWS` entry."""
+
+ALREADY_EXPIRED = 1.0
+"""An expiry the wall clock is always past, for a token whose age we cannot know.
+Deliberately not `0.0`: the SDK's `is_token_valid` reads a *falsy* expiry as "the
+server declared no expiry", so zero would mean the exact opposite - never expires."""
 
 
 class OAuthError(RuntimeError):
@@ -121,7 +132,41 @@ class FileTokenStorage:
     async def set_tokens(self, tokens: Any) -> None:
         data = self._read()
         data["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
+        # `expires_in` is a duration, so by itself it says nothing once the process
+        # that received it is gone. Stamp the arrival, which is what `token_expiry`
+        # turns back into an absolute deadline on the next boot.
+        data["obtained_at"] = time.time()
         self._write(data)
+
+    def token_expiry(self) -> float | None:
+        """When the stored access token dies, as a unix timestamp, or None if it
+        never does. `None` and `ALREADY_EXPIRED` are opposites here, not neighbours.
+
+        This exists because the SDK never persists the deadline: `OAuthContext`
+        computes `token_expiry_time` the moment a token arrives over the wire and
+        keeps it in memory, so a reloaded token comes back with the field at `None` -
+        which `is_token_valid` reads as "no expiry declared". The stale token is then
+        sent, 401s, and the SDK escalates to a *full* authorization instead of the
+        refresh it had the token for. Reconstructing the deadline puts it back on the
+        refresh path.
+        """
+        data = self._read()
+        tokens = data.get("tokens")
+        if not isinstance(tokens, dict) or not tokens.get("access_token"):
+            return None
+        expires_in = tokens.get("expires_in")
+        if expires_in is None:
+            return None  # the server declared no expiry; do not invent one
+        obtained_at = data.get("obtained_at")
+        if not isinstance(obtained_at, int | float):
+            # A file written before `obtained_at` existed - every install authorized
+            # before this. Its age is unknowable, so assume the worst and let the
+            # refresh decide; a good refresh token then rewrites the file with a stamp.
+            return ALREADY_EXPIRED
+        try:
+            return float(obtained_at) + float(expires_in)  # some servers send a string
+        except (TypeError, ValueError):
+            return ALREADY_EXPIRED
 
     async def get_client_info(self) -> Any:
         from mcp.shared.auth import OAuthClientInformationFull
@@ -195,6 +240,23 @@ def _build_provider(
     )
 
 
+def _prime_token_expiry(provider: Any, storage: FileTokenStorage) -> None:
+    """Hand the provider the deadline the SDK forgot across the restart.
+
+    `OAuthContext.token_expiry_time` is the one piece of token state that lives only
+    in memory; every other field is reloaded through `TokenStorage`. Setting it here
+    is what makes `is_token_valid()` tell the truth about a reloaded token, so an
+    expired one takes the refresh branch rather than 401ing into a full
+    re-authorization the owner has to click through. Written defensively - a provider
+    without a `context` is a test double, and priming is an optimisation to it, not a
+    requirement.
+    """
+    context = getattr(provider, "context", None)
+    if context is None:
+        return
+    context.token_expiry_time = storage.token_expiry()
+
+
 def build_reconnect_provider(
     data_dir: Path,
     config: ServerConfig,
@@ -230,7 +292,12 @@ def build_reconnect_provider(
             "reauthorize it in the admin"
         )
 
-    return build(config.url, redirect_uri, storage, redirect_handler, callback_handler)
+    provider = build(config.url, redirect_uri, storage, redirect_handler, callback_handler)
+    # Without this a merely *expired* token boots down the same path as a revoked
+    # one - the handlers above raise and the owner is told to reauthorize, with a
+    # perfectly good refresh token on disk.
+    _prime_token_expiry(provider, storage)
+    return provider
 
 
 async def start_oauth_flow(
@@ -299,6 +366,10 @@ async def start_oauth_flow(
             ) from exc
 
     provider = build(config.url, redirect_uri, storage, redirect_handler, callback_handler)
+    # Same restart amnesia as the reconnect path: an owner pressing Connect on a
+    # server whose token merely expired gets a silent refresh instead of another
+    # trip through the provider's consent screen.
+    _prime_token_expiry(provider, storage)
 
     async def connect() -> None:
         try:
