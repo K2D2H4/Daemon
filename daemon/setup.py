@@ -84,6 +84,7 @@ from daemon.config import (
     HOSTED_PROVIDERS,
     OLLAMA,
     OPENAI,
+    OPENAI_COMPATIBLE,
     PRESETS,
     ConfigError,
     Settings,
@@ -260,9 +261,90 @@ HOSTED_CHOICES: tuple[Choice, ...] = (
             "'Standard' keys - the wizard says so if yours is one.",
         ),
     ),
+    Choice(
+        "openai_compatible",
+        "Something else — Qwen, Kimi, DeepSeek, OpenRouter, or your own server.",
+        (
+            "Anything that speaks OpenAI's API works here; the next question asks "
+            "which, and fills in its address for you.",
+            "One name covers them all because they differ by address, not by "
+            "protocol - so `daemon doctor` says openai_compatible and the address "
+            "says who that is.",
+        ),
+    ),
 )
 """What separates them, rather than which model ids they publish - ids change
 every few months and are the wrong thing to choose a vendor by."""
+
+
+@dataclass(frozen=True, slots=True)
+class Vendor:
+    """One known OpenAI-compatible service, and what to prefill for it."""
+
+    name: str
+    label: str
+    base_url: str
+    model: str
+    """Empty when the vendor's catalogue rotates too fast for a default to age
+    well - OpenRouter's free ids carry a `:free` suffix and come and go."""
+    keys_url: str
+
+
+COMPATIBLE_VENDORS: tuple[Vendor, ...] = (
+    Vendor(
+        "qwen",
+        "Qwen (Alibaba Model Studio)",
+        # International (Singapore). The new-account free quota is only granted
+        # on this endpoint, and the China one does not honour it.
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "qwen-plus",
+        "https://bailian.console.alibabacloud.com/",
+    ),
+    Vendor(
+        "kimi",
+        "Kimi (Moonshot)",
+        "https://api.moonshot.ai/v1",
+        "kimi-k2.5",
+        "https://platform.moonshot.ai/console/api-keys",
+    ),
+    Vendor(
+        "deepseek",
+        "DeepSeek",
+        "https://api.deepseek.com/v1",
+        "deepseek-chat",
+        "https://platform.deepseek.com/api_keys",
+    ),
+    Vendor(
+        "openrouter",
+        "OpenRouter",
+        "https://openrouter.ai/api/v1",
+        "",
+        "https://openrouter.ai/keys",
+    ),
+)
+"""The endpoints the wizard can prefill. Not a whitelist - a fifth choice takes
+any URL - and not stored: `.env` holds the URL alone, and `vendor_label` reads
+the name back out of it. Two stored values that can disagree would leave no way
+to tell which is the truth."""
+
+COMPATIBLE_CHOICES: tuple[Choice, ...] = (
+    *(Choice(v.name, v.label) for v in COMPATIBLE_VENDORS),
+    Choice("custom", "Something else — your own server, or a service not listed."),
+)
+
+
+def vendor_label(base_url: str) -> str:
+    """A known endpoint's human name, or the URL unchanged.
+
+    The reverse of the table: `.env` stores only the URL, so this is how
+    `daemon doctor` and the admin page say "Qwen" rather than a hostname.
+    """
+    stripped = base_url.rstrip("/")
+    for vendor in COMPATIBLE_VENDORS:
+        if vendor.base_url == stripped:
+            return vendor.label
+    return base_url
+
 
 DEFAULT_HOSTED_CHOICE = HOSTED_CHOICES[0].name
 """What the provider prompt puts in its brackets for someone who just presses
@@ -573,6 +655,76 @@ def check_openai(key: str, model: str) -> Verdict:
     return Verdict(True, "key works", models=listed)
 
 
+def check_openai_compatible(
+    key: str, base_url: str, model: str, *, client: httpx.Client | None = None
+) -> Verdict:
+    """Prove the key against the endpoint, and list its models when it can.
+
+    Two steps rather than one, because `/models` is optional in the compatible
+    spec while `/chat/completions` is the thing this install will actually call:
+
+    1. `GET /models` costs no tokens, proves the key, and its ids become the menu.
+    2. Anything other than 200 or a definitive 401/403 means the endpoint may
+       simply not implement it, so fall back to a one-token chat call. That
+       proves the exact path the daemon will use - `/models` succeeding does not
+       imply `/chat/completions` will, which is how an unfunded OpenRouter
+       account lists a paid model happily and then answers 402.
+    """
+    root = base_url.rstrip("/")
+    headers = {"authorization": f"Bearer {key}"}
+    owns = client is None
+    http = client or httpx.Client(timeout=HTTP_TIMEOUT)
+    try:
+        try:
+            response = http.get(f"{root}/models", headers=headers)
+        except httpx.HTTPError as exc:
+            return Verdict(False, f"could not reach {root}: {_redact(str(exc), key)}")
+
+        if response.status_code in (401, 403):
+            return Verdict(
+                False,
+                f"the endpoint rejected the key (HTTP {response.status_code}).",
+                hint="Check that the key belongs to the service at that address.",
+            )
+        if response.status_code == 200:
+            ids = _newest_first(response, "created")
+            listed = {"DAEMON_OPENAI_COMPATIBLE_MODEL": ids}
+            if model and ids and model not in ids:
+                return Verdict(
+                    True,
+                    f"key works, but {model!r} is not in that endpoint's model list",
+                    hint="The next question offers the ids that do exist.",
+                    models=listed,
+                )
+            return Verdict(True, "key works", models=listed)
+
+        # No usable list. Prove the key on the path that matters instead.
+        try:
+            chat = http.post(
+                f"{root}/chat/completions",
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                },
+            )
+        except httpx.HTTPError as exc:
+            return Verdict(False, f"could not reach {root}: {_redact(str(exc), key)}")
+
+        if chat.status_code == 200:
+            return Verdict(
+                True,
+                "key works (that endpoint lists no models, so the next question "
+                "takes an id you type)",
+            )
+        said = _redact(chat.text[:BODY_LIMIT], key)
+        return Verdict(False, f"{root} returned HTTP {chat.status_code}: {said}")
+    finally:
+        if owns:
+            http.close()
+
+
 def check_gemini(key: str) -> Verdict:
     """Validate the key, name the Standard-key trap, and keep the model list.
 
@@ -761,6 +913,7 @@ class Checks:
 
     anthropic: Callable[[str, str], Verdict] = check_anthropic
     openai: Callable[[str, str], Verdict] = check_openai
+    openai_compatible: Callable[[str, str, str], Verdict] = check_openai_compatible
     gemini: Callable[[str], Verdict] = check_gemini
     telegram: Callable[[str], Verdict] = check_telegram
     ollama: Callable[[str], OllamaState] = check_ollama
@@ -1081,6 +1234,44 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 # voice brought us here. Asking twice for one capability is noise,
                 # so in that case it is filled in rather than asked.
                 silent=not gemini_chat,
+                listed=True,
+            )
+        )
+    if OPENAI_COMPATIBLE in providers:
+        current_url = env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", "")
+        needs.append(
+            Need(
+                key="DAEMON_OPENAI_COMPATIBLE_BASE_URL",
+                label="endpoint",
+                why="The address of the service, up to the version segment - "
+                "https://api.deepseek.com/v1, not the /chat/completions below it.",
+                default=current_url,
+            )
+        )
+        needs.append(
+            Need(
+                key="OPENAI_COMPATIBLE_API_KEY",
+                label="API key",
+                why="Your key for that service. Your account, your bill - Daemon is "
+                "not a reseller.",
+                url=next(
+                    (
+                        v.keys_url
+                        for v in COMPATIBLE_VENDORS
+                        if v.base_url == current_url.rstrip("/")
+                    ),
+                    "",
+                ),
+                secret=True,
+            )
+        )
+        needs.append(
+            Need(
+                key="DAEMON_OPENAI_COMPATIBLE_MODEL",
+                label="model id",
+                why="Which model answers. Settings has no default here, so an empty "
+                "value would refuse to start.",
+                default=env.get("DAEMON_OPENAI_COMPATIBLE_MODEL", ""),
                 listed=True,
             )
         )
@@ -1494,6 +1685,7 @@ LISTED_BY = {
     "DAEMON_OPENAI_MODEL": "OPENAI_API_KEY",
     "DAEMON_GEMINI_MODEL": "GEMINI_API_KEY",
     "DAEMON_GEMINI_LIVE_MODEL": "GEMINI_API_KEY",
+    "DAEMON_OPENAI_COMPATIBLE_MODEL": "OPENAI_COMPATIBLE_API_KEY",
 }
 """Which credential can list the ids for each model question.
 
@@ -1514,7 +1706,9 @@ answered and had nothing. Both fall back to exactly the old question, because a
 list that could not be fetched must cost the menu and not the wizard."""
 
 
-DATED_LISTS = frozenset({"DAEMON_ANTHROPIC_MODEL", "DAEMON_OPENAI_MODEL"})
+DATED_LISTS = frozenset(
+    {"DAEMON_ANTHROPIC_MODEL", "DAEMON_OPENAI_MODEL", "DAEMON_OPENAI_COMPATIBLE_MODEL"}
+)
 """Which lists arrive already in a real newest-first order (`_newest_first`).
 
 The asymmetry is the provider's, not a preference: Anthropic dates every model with
@@ -1522,7 +1716,17 @@ The asymmetry is the provider's, not a preference: Anthropic dates every model w
 creation date at all. So two of the three menus are ordered by a fact and the third
 falls back to reading a version out of the id (`model_version`). Worth naming here
 because the next reader will otherwise try to unify them and find there is nothing
-to unify them with."""
+to unify them with.
+
+The compatible endpoints join the dated side, not because every one of them dates
+its models - OpenRouter's `created` is real and DeepSeek's may be absent - but
+because `check_openai_compatible` runs every list through the same `_newest_first`
+either way, and that function already puts the undated remainder back in arrival
+order rather than raising or dropping them (see its docstring). `dated=False` here
+would have `model_version` re-guess an order from ids the account chose, not this
+project - `kimi-k2.5` reads as version `(2, 5)` to that regex, which would rank it
+above a model `_newest_first` already knows is newer. Trusting the arrival order
+is right whether or not this particular account's endpoint dated anything."""
 
 
 MODEL_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -1749,6 +1953,9 @@ class Wizard:
             "GEMINI_API_KEY": lambda: self.checks.gemini(key),
             "ANTHROPIC_API_KEY": lambda: self.checks.anthropic(key, need.default),
             "OPENAI_API_KEY": lambda: self.checks.openai(key, need.default),
+            "OPENAI_COMPATIBLE_API_KEY": lambda: self.checks.openai_compatible(
+                key, env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", ""), need.default
+            ),
         }[credential]
         try:
             verdict = probe()
@@ -1939,7 +2146,33 @@ class Wizard:
             "Provider", HOSTED_CHOICES, default=current or DEFAULT_HOSTED_CHOICE
         )
         _record(updates, "DAEMON_HOSTED_PROVIDER", chosen, current)
+        if chosen == OPENAI_COMPATIBLE:
+            self._choose_compatible_endpoint(env, updates)
         return chosen
+
+    def _choose_compatible_endpoint(
+        self, env: Mapping[str, str], updates: dict[str, str]
+    ) -> None:
+        """Which compatible service, and therefore which address to prefill.
+
+        Asked as a second question rather than as four more entries in the
+        provider menu, because the vendor is not a provider: the menu would show
+        `qwen` as a peer of `anthropic` while `.env` and every log line said
+        `openai_compatible`, and a choice that is not the thing stored is the
+        confusion DEFAULT_HOSTED_PROVIDER was emptied to end.
+        """
+        current_url = env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", "")
+        if current_url:
+            self.prompt.say(f"Currently {vendor_label(current_url)}. {KEEP_HINT}")
+        picked = self._pick("Service", COMPATIBLE_CHOICES, default=COMPATIBLE_VENDORS[0].name)
+        vendor = next((v for v in COMPATIBLE_VENDORS if v.name == picked), None)
+        if vendor is None:
+            # "custom" - nothing to prefill, so `needs_for` asks for the address
+            # with no default and the model question has no list behind it.
+            return
+        _record(updates, "DAEMON_OPENAI_COMPATIBLE_BASE_URL", vendor.base_url, current_url)
+        if vendor.model and not env.get("DAEMON_OPENAI_COMPATIBLE_MODEL"):
+            updates["DAEMON_OPENAI_COMPATIBLE_MODEL"] = vendor.model
 
     def _choose_voice(
         self, preset: str, hosted: str, env: Mapping[str, str], updates: dict[str, str]
@@ -2043,6 +2276,14 @@ class Wizard:
             return self.checks.openai(value, env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL)
         if need.key == "GEMINI_API_KEY":
             return self.checks.gemini(value)
+        if need.key == "OPENAI_COMPATIBLE_API_KEY":
+            # The endpoint question comes first in `needs_for`, so by the time the
+            # key is typed its address is already in `updates` and merged into `env`.
+            return self.checks.openai_compatible(
+                value,
+                env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", ""),
+                env.get("DAEMON_OPENAI_COMPATIBLE_MODEL", ""),
+            )
         if need.key == "TELEGRAM_BOT_TOKEN":
             verdict = self.checks.telegram(value)
             # getMe already told us the handle; the pairing step would otherwise

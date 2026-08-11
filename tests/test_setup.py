@@ -10,6 +10,7 @@ us to, not a string a fake made up.
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 from collections.abc import Callable, Sequence
@@ -2082,6 +2083,64 @@ def test_the_env_the_wizard_writes_loads_and_routes_to_that_provider(
     assert routes[Task.REFLECTION].provider == provider
 
 
+def test_choosing_a_known_vendor_fills_the_address_and_never_names_it(
+    tmp_path: Path,
+) -> None:
+    """The fourth provider choice asks a second question - which service - and
+    that answer only ever becomes an address in `.env`, never a vendor name.
+
+    Two stored values that could disagree (a vendor field and a URL) would leave
+    no way to tell which is true, so `.env` holds the URL alone and
+    `vendor_label` reads the name back out of it for display.
+    """
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "qwen", "n", "gemma3:4b", "sk-qwen-x", "",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=checks)
+
+    assert result.code == 0
+    qwen = setup.COMPATIBLE_VENDORS[0]
+    assert qwen.name == "qwen"
+    assert "DAEMON_HOSTED_PROVIDER=openai_compatible" in result.written
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={qwen.base_url}" in result.written
+    assert "OPENAI_COMPATIBLE_API_KEY=sk-qwen-x" in result.written
+    # No key anywhere in the file names the vendor - only the address does.
+    assert "VENDOR" not in result.written.upper()
+
+
+def test_the_env_the_wizard_writes_for_a_compatible_endpoint_loads_and_routes(
+    tmp_path: Path,
+) -> None:
+    """Same acceptance question as the three named providers: does what the
+    wizard wrote actually start and route to it?"""
+    from daemon.config import Settings
+    from daemon.tasks import Task
+
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "deepseek", "n", "gemma3:4b", "sk-ds-x", "",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=checks)
+
+    assert result.code == 0
+    settings = Settings(_env_file=result.env_path)
+    routes = settings.routing_table()
+    assert routes[Task.CHAT_TEXT].provider == "openai_compatible"
+    assert routes[Task.CHAT_TEXT].model  # a provider with no model id cannot start
+    assert settings.openai_compatible_base_url == "https://api.deepseek.com/v1"
+
+
 def test_offline_is_never_asked_whose_model(tmp_path: Path) -> None:
     # It resolves no hosted task, so the question would be about a bill nobody is
     # going to get - and the answer would be written into the file as if it meant
@@ -2212,6 +2271,173 @@ def test_the_openai_key_travels_in_a_header_not_the_url(
 
     assert "sk-SECRET" not in str(seen["url"])
     assert seen["headers"] == {"authorization": "Bearer sk-SECRET"}
+
+
+# --- the openai-compatible endpoint: vendor table and probe --------------------
+# The vendor is never written to `.env` - only the address is, and `vendor_label`
+# reads the name back out of it (setup.COMPATIBLE_VENDORS's docstring). So the
+# probe below is the same shape as `check_openai`'s but takes the address as an
+# argument, and it is injectable (`client=`) rather than patching `httpx.get`,
+# because the wizard-authored `Checks.openai_compatible` slot takes one client per
+# call rather than one global one - see docs/CONTRACTS.md on no test touching the
+# network.
+
+
+def test_vendor_label_names_a_known_endpoint_and_echoes_an_unknown_one() -> None:
+    assert "Qwen" in setup.vendor_label("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+    assert setup.vendor_label("https://llm.internal/v1") == "https://llm.internal/v1"
+
+
+def test_vendor_label_ignores_a_trailing_slash() -> None:
+    # `.env` and Settings both strip it (config._clean_base_url); the reverse
+    # lookup has to agree or a re-run's "Currently ..." line would print the raw
+    # URL for an endpoint the wizard itself wrote.
+    assert (
+        setup.vendor_label("https://api.deepseek.com/v1/")
+        == setup.vendor_label("https://api.deepseek.com/v1")
+    )
+
+
+def test_every_vendor_base_url_is_one_settings_would_accept() -> None:
+    # Settings rejects a base URL ending in /chat/completions or missing a scheme
+    # (config._clean_base_url). A vendor table entry that failed that check would
+    # write a `.env` the wizard itself could not start - so pin it here rather
+    # than discover it against a real account.
+    from daemon.config import Settings
+
+    for vendor in setup.COMPATIBLE_VENDORS:
+        settings = Settings(
+            _env_file=None,
+            DAEMON_HOSTED_PROVIDER="openai_compatible",
+            DAEMON_OPENAI_COMPATIBLE_BASE_URL=vendor.base_url,
+            OPENAI_COMPATIBLE_API_KEY="sk-x",
+            DAEMON_OPENAI_COMPATIBLE_MODEL=vendor.model or "some-model",
+        )
+        assert settings.openai_compatible_base_url == vendor.base_url
+
+
+def test_compatible_probe_lists_models_when_the_endpoint_has_them() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/models")
+        return httpx.Response(200, json={"data": [{"id": "qwen-plus"}, {"id": "qwen-max"}]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "qwen-plus", client=client
+        )
+
+    assert verdict.ok
+    assert verdict.models["DAEMON_OPENAI_COMPATIBLE_MODEL"] == ("qwen-plus", "qwen-max")
+
+
+def test_compatible_probe_falls_back_to_a_one_token_chat_when_models_is_missing() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/models"):
+            return httpx.Response(404, text="not found")
+        body = json.loads(request.content)
+        assert body["max_tokens"] == 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "custom-model", client=client
+        )
+
+    assert verdict.ok
+    assert any(path.endswith("/chat/completions") for path in seen)
+    # No list to offer, so the wizard falls through to NO_LIST_NOTE.
+    assert not verdict.models
+
+
+def test_compatible_probe_does_not_fall_back_on_a_rejected_key() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(401, text="bad key")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-bad", "https://x.test/v1", "qwen-plus", client=client
+        )
+
+    assert not verdict.ok
+    # 401 is a definitive answer about the key; a second call would only cost time.
+    assert not any(path.endswith("/chat/completions") for path in seen)
+
+
+def test_compatible_probe_never_reveals_the_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="bad request for key sk-secret-abc")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-secret-abc", "https://x.test/v1", "m", client=client
+        )
+
+    assert "sk-secret-abc" not in verdict.detail
+
+
+def test_a_korean_error_body_from_a_compatible_endpoint_is_bounded_and_redacted() -> None:
+    """Same rule as `_telegram_said`: untrusted prose on its way to a terminal is
+    bounded by columns, not characters, and Korean is two columns per syllable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, text="키 sk-secret-abc 가 거부되었습니다. " * 20
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-secret-abc", "https://x.test/v1", "m", client=client
+        )
+
+    assert not verdict.ok
+    assert "sk-secret-abc" not in verdict.detail
+    assert "거부되었습니다" in verdict.detail
+    assert tui.display_width(verdict.detail) <= setup.BODY_LIMIT + 60
+
+
+def test_a_model_the_compatible_endpoint_did_not_date_keeps_its_place() -> None:
+    # Not every compatible vendor dates its models (setup.DATED_LISTS's docstring)
+    # - a missing `created` must cost the ordering, not the menu.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "undated-a"},
+                    {"id": "dated-old", "created": 1_600_000_000},
+                    {"id": "dated-new", "created": 1_770_000_000},
+                    {"id": "undated-b"},
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "dated-new", client=client
+        )
+
+    ids = verdict.models["DAEMON_OPENAI_COMPATIBLE_MODEL"]
+    assert ids == ("dated-new", "dated-old", "undated-a", "undated-b")
+
+
+def test_compatible_probe_flags_a_model_id_that_is_not_in_the_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "qwen-plus"}]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "qwen-turbo", client=client
+        )
+
+    assert verdict.ok
+    assert "not in that endpoint's model list" in verdict.detail
+    assert "next question" in verdict.hint
 
 
 # --- the model id, offered from the account's own list -------------------------
@@ -2616,7 +2842,14 @@ def test_a_dated_list_is_not_second_guessed_by_reading_versions_out_of_names() -
 def test_which_lists_are_dated_is_settled_by_the_provider_not_by_taste() -> None:
     # The asymmetry is worth pinning: it is the reason there are two orderings, and
     # a future reader trying to unify them should fail this test first.
-    assert setup.DATED_LISTS == {"DAEMON_ANTHROPIC_MODEL", "DAEMON_OPENAI_MODEL"}
+    # DAEMON_OPENAI_COMPATIBLE_MODEL joins the dated side because its probe runs
+    # every list through the same `_newest_first` as OpenAI's - not because every
+    # compatible vendor publishes a date (see setup.DATED_LISTS's docstring).
+    assert setup.DATED_LISTS == {
+        "DAEMON_ANTHROPIC_MODEL",
+        "DAEMON_OPENAI_MODEL",
+        "DAEMON_OPENAI_COMPATIBLE_MODEL",
+    }
     assert "DAEMON_GEMINI_MODEL" not in setup.DATED_LISTS
     assert "DAEMON_GEMINI_LIVE_MODEL" not in setup.DATED_LISTS
 
@@ -3116,9 +3349,32 @@ def test_the_chosen_provider_decides_which_key_is_asked_for() -> None:
     assert "GEMINI_API_KEY" in keys("gemini")
     assert "ANTHROPIC_API_KEY" not in keys("gemini")
     assert "OPENAI_API_KEY" in keys("openai")
+    assert "OPENAI_COMPATIBLE_API_KEY" in keys("openai_compatible")
+    assert "ANTHROPIC_API_KEY" not in keys("openai_compatible")
     # And answering it removes it from the list of things still to answer.
-    for hosted in ("anthropic", "openai", "gemini"):
+    for hosted in ("anthropic", "openai", "gemini", "openai_compatible"):
         assert "DAEMON_HOSTED_PROVIDER" not in keys(hosted)
+
+
+def test_needs_asks_for_endpoint_key_and_model_when_compatible_is_chosen() -> None:
+    needs = setup.needs_for(
+        {"DAEMON_PRESET": "balanced", "DAEMON_HOSTED_PROVIDER": "openai_compatible"}
+    )
+    keys = [need.key for need in needs]
+
+    assert "DAEMON_OPENAI_COMPATIBLE_BASE_URL" in keys
+    assert "OPENAI_COMPATIBLE_API_KEY" in keys
+    assert "DAEMON_OPENAI_COMPATIBLE_MODEL" in keys
+    # The endpoint is asked before the key, because the probe needs it.
+    assert keys.index("DAEMON_OPENAI_COMPATIBLE_BASE_URL") < keys.index("OPENAI_COMPATIBLE_API_KEY")
+
+
+def test_offline_never_asks_about_a_compatible_endpoint() -> None:
+    needs = setup.needs_for({"DAEMON_PRESET": "offline"})
+    keys = [need.key for need in needs]
+
+    assert not any(key.startswith("DAEMON_OPENAI_COMPATIBLE") for key in keys)
+    assert "OPENAI_COMPATIBLE_API_KEY" not in keys
 
 
 def test_offline_is_never_asked_for_a_provider() -> None:
