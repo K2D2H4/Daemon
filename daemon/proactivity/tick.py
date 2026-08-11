@@ -17,11 +17,17 @@ Probing per candidate costs more and, worse, lets two candidates in the same tic
 disagree about where the user is - so the snapshot recorded against one utterance
 would not describe the moment another was suppressed.
 
-## Nothing here catches its own exceptions
+## Nothing here catches its own exceptions - with one exception
 
 `app.py`'s job wrapper does that, once, and logs it. A tick that swallowed its own
 failures would keep returning "nothing to say" forever and look exactly like a
 quiet week, which is this project's signature defect.
+
+`_association` (type E) is the one deliberate exception, because it is the only
+generator with a network dependency - the embedder - and an unreachable Ollama
+must not cost the four generators that need nothing but sqlite. It is narrow (it
+wraps only the `association_candidates` call) and loud (logged at warning), so it
+cannot decay into the silent failure this section otherwise guards against.
 """
 
 from __future__ import annotations
@@ -45,7 +51,11 @@ from daemon.proactivity.base import (
     Utterance,
     Verdict,
 )
-from daemon.proactivity.candidates import generate_candidates
+from daemon.proactivity.candidates import (
+    AssociativeRecall,
+    association_candidates,
+    generate_candidates,
+)
 from daemon.proactivity.delivery import Delivered, ProactiveDelivery
 from daemon.proactivity.gate import Gate
 
@@ -117,6 +127,7 @@ class ProactiveTick:
         gate: Gate | None = None,
         judge: Judgement | None = None,
         delivery: ProactiveDelivery | None = None,
+        recall: AssociativeRecall | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -126,6 +137,10 @@ class ProactiveTick:
         # is what `daemon proactive` does to show its verdicts without speaking.
         self._judge = judge
         self._delivery = delivery
+        # Optional for the same reason recall is optional everywhere else: a
+        # broken embedder must not cost the four generators that need nothing
+        # but sqlite. `None` here means type E simply produces nothing.
+        self._recall = recall
 
     async def run(self, *, now: datetime | None = None) -> TickResult:
         moment = now or clock_now()
@@ -140,6 +155,7 @@ class ProactiveTick:
         # check sees the table in its settled state.
         expired = self._store.expire_candidates(now=moment)
         fresh = generate_candidates(self._store, self._settings, now=moment)
+        fresh += await self._association(moment)
         for candidate in fresh:
             self._store.insert_candidate(
                 kind=candidate.kind,
@@ -203,6 +219,27 @@ class ProactiveTick:
         )
         return result
 
+    async def _association(self, moment: datetime) -> list[Candidate]:
+        """Type E, or nothing. Never raises.
+
+        The one place in this file that swallows an exception, and it is narrow
+        on purpose: the module docstring says nothing here catches its own
+        failures, because a tick that did would look exactly like a quiet week.
+        This is the exception because type E is the only generator with a network
+        dependency - the embedder - and an unreachable Ollama must not cost the
+        four generators that need nothing but sqlite. Logged at warning so it
+        cannot be silent.
+        """
+        if self._recall is None:
+            return []
+        try:
+            return await association_candidates(self._recall, self._store, now=moment)
+        except Exception:
+            logger.warning(
+                "proactive: type E generator failed; the other four still ran",
+                exc_info=True,
+            )
+            return []
 
 
 def row_candidate(row: sqlite3.Row) -> Candidate:

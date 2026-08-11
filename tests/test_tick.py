@@ -155,6 +155,39 @@ async def test_a_disabled_daemon_generates_nothing_but_still_reads_presence(
     assert result.generated == 0
 
 
+# --- type E, optional ---------------------------------------------------------
+
+
+async def test_a_tick_without_recall_still_runs_the_other_four(
+    store: Store, data_dir: Path
+) -> None:
+    """Recall is optional everywhere else in this codebase - a broken embedder
+    must not cost the conversation loop - and it is optional here for the same
+    reason. Four generators is a worse tick, not a dead one."""
+    add_candidate(store)
+    tick = ProactiveTick(store, settings(), FakePresence(), recall=None)
+
+    result = await tick.run(now=NOW)
+
+    assert result.disabled is False
+
+
+async def test_a_failing_recall_does_not_kill_the_tick(store: Store, data_dir: Path) -> None:
+    """An embedder that cannot be reached is an ordinary Tuesday. The other four
+    generators do not depend on it and must still be considered."""
+
+    class _Broken:
+        async def associate(self, *args: Any, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("ollama is down")
+
+    add_candidate(store)
+    tick = ProactiveTick(store, settings(), FakePresence(), recall=_Broken())
+
+    result = await tick.run(now=NOW)  # must not raise
+
+    assert result.disabled is False
+
+
 # --- the one model call ------------------------------------------------------
 
 
