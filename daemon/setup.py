@@ -337,7 +337,7 @@ def vendor_label(base_url: str) -> str:
     """A known endpoint's human name, or the URL unchanged.
 
     The reverse of the table: `.env` stores only the URL, so this is how
-    `daemon doctor` and the admin page say "Qwen" rather than a hostname.
+    `daemon doctor` says "Qwen" rather than a hostname.
     """
     stripped = base_url.rstrip("/")
     for vendor in COMPATIBLE_VENDORS:

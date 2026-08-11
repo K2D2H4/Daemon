@@ -203,6 +203,70 @@ def test_get_settings_masks_secrets(tmp_path: Path) -> None:
     assert editable["openai_api_key"] is None
 
 
+# --- e. the openai_compatible endpoint is editable like its sibling models ---
+
+
+def test_patch_sets_the_compatible_endpoint_and_model(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch(
+        "/admin/api/settings",
+        json={
+            "hosted_provider": "openai_compatible",
+            "openai_compatible_base_url": "https://api.deepseek.com/v1",
+            "openai_compatible_model": "deepseek-chat",
+        },
+    )
+
+    assert resp.status_code == 200
+    written = env.read_text(encoding="utf-8")
+    assert "DAEMON_OPENAI_COMPATIBLE_BASE_URL=https://api.deepseek.com/v1" in written
+    assert "DAEMON_OPENAI_COMPATIBLE_MODEL=deepseek-chat" in written
+
+
+def test_patch_rejects_an_endpoint_carrying_the_full_path(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    original = "DAEMON_PRESET=offline\n"
+    env.write_text(original, encoding="utf-8")
+
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch(
+        "/admin/api/settings",
+        json={"openai_compatible_base_url": "https://api.deepseek.com/v1/chat/completions"},
+    )
+
+    assert resp.status_code == 400
+    assert env.read_text(encoding="utf-8") == original, "a rejected patch still wrote"
+
+
+def test_get_settings_masks_the_compatible_key(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path, openai_compatible_api_key="sk-compat-SUPERSECRET"))
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.get("/admin/api/settings")
+    assert resp.status_code == 200
+    assert "SUPERSECRET" not in resp.text
+
+    assert resp.json()["editable"]["openai_compatible_api_key"] == "set"
+
+
+def test_settings_offer_openai_compatible_as_a_provider(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+
+    payload = client.get("/admin/api/settings").json()
+
+    assert "openai_compatible" in payload["options"]["hosted_providers"]
+
+
 # --- health, shell, restart --------------------------------------------------
 
 

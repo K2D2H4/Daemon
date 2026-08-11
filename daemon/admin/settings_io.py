@@ -55,6 +55,11 @@ STR_FIELDS: dict[str, str] = {
     # The realtime endpoint does not take the text endpoint's id (config.py), which
     # is why voice has its own.
     "gemini_live_model": "DAEMON_GEMINI_LIVE_MODEL",
+    "openai_compatible_model": "DAEMON_OPENAI_COMPATIBLE_MODEL",
+    # The endpoint belongs beside the model for the same reason the model ids do:
+    # a page that lets you choose `openai_compatible` without letting you name its
+    # address could only ever answer the choice with an error it cannot fix.
+    "openai_compatible_base_url": "DAEMON_OPENAI_COMPATIBLE_BASE_URL",
     # Both halves of the pair: `Settings` validates each against SENSITIVITIES, and
     # offering only the start one would leave the end one hand-edit-only for no
     # reason a reader could infer.
@@ -85,6 +90,7 @@ SECRET_FIELDS: dict[str, str] = {
     "openai_api_key": "OPENAI_API_KEY",
     "gemini_api_key": "GEMINI_API_KEY",
     "telegram_bot_token": "TELEGRAM_BOT_TOKEN",
+    "openai_compatible_api_key": "OPENAI_COMPATIBLE_API_KEY",
 }
 ROUTE_OVERRIDES = "route_overrides"
 ROUTE_OVERRIDES_ENV = "DAEMON_ROUTE_OVERRIDES"
