@@ -12,8 +12,8 @@ You own the resident process. Read `docs/CONTRACTS.md` first; it is binding.
 
 - **`daemon/loop.py`** — the text turn: record → recall → complete → record → send.
 - **`daemon/llm/`** — `LLMGateway.complete(task, ...)` routes a `Task` to a provider.
-  Four providers behind `Provider` in `llm/base.py` (frozen): ollama, anthropic,
-  openai, gemini. One fallback hop at most, and only if configured.
+  Five providers behind `Provider` in `llm/base.py` (frozen): ollama, anthropic,
+  openai, gemini, openai_compatible. One fallback hop at most, and only if configured.
 - **`daemon/config.py`** — two axes that are deliberately not multiplied: a *preset*
   (`offline` / `balanced` / `quality`) answers where work runs,
   `DAEMON_HOSTED_PROVIDER` answers whose model. Three presets, not nine. No default

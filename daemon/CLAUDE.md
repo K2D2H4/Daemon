@@ -21,7 +21,7 @@ in `app.py`, which owns every concrete-implementation import here.
 | `tui.py` · `service.py` | terminal presentation, CJK-aware widths, plain text when not a tty · the LaunchAgent / systemd user unit, which holds no secrets |
 | `fs.py` · `clock.py` | 0700 dirs, 0600 files, and the two durable writes — append, and atomic replace · the one timestamp helper, so nobody scatters `datetime.now()` |
 | `channels/` | `channels/base.py` (frozen) · `channels/telegram.py` · `channels/pairing.py` |
-| `llm/` | `llm/base.py` (frozen) · `llm/gateway.py` · `llm/providers/` (4) · `llm/embedders/` |
+| `llm/` | `llm/base.py` (frozen) · `llm/gateway.py` · `llm/providers/` (5) · `llm/embedders/` |
 | `memory/` | `memory/schema.sql` (frozen) · `store` · `log` · `writer` · `recall` · `curated` · `entities` · `reindex` |
 | `voice/` | `voice/base.py` (frozen) · `voice/gemini_live.py` · `voice/audio.py` (PortAudio) · `voice/apple_audio.py` (macOS echo cancellation) · `voice/conversation.py` · `voice/vad.py` · `voice/apple_speech.py` · `voice/wake.py` · `voice/mic_access.py` (mic TCC request + status, Apple-guarded) |
 | `macapp/` | the thin native-launcher `Daemon.app` (macOS): `build_bundle` assembles and ad-hoc-signs the bundle whose code identity is the microphone grant; `launcher.c`/`launcher` is the committed universal2 Mach-O it copies in |
