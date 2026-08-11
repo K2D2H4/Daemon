@@ -99,6 +99,40 @@ def test_a_failed_supersession_leaves_the_old_fact_active(store: Store) -> None:
     assert store.count_entries() == 1
 
 
+def test_the_retire_decision_is_read_inside_the_write_transaction(store: Store) -> None:
+    """Which rows to retire is decided by a SELECT, so that SELECT has to be under
+    the write lock. It was not: sqlite's legacy transaction handling opens the
+    implicit BEGIN on the first *write*, so the read ran in autocommit.
+
+    That is a check-then-act across connections. Replaying the statements with a
+    second writer committing in the window: A reads row 1 as active, B supersedes it
+    and commits, A retires row 1 again and repoints it - `superseded_by` moves off
+    the successor that earned it, and both successors stay active claiming the same
+    fact. `daemon reflect` run by hand during the 04:00 pass is two writers, and
+    `daemon/app.py` opens a second `Store` for it.
+
+    The window between the two statements is too small to hold open from outside, so
+    this asserts the ordering that closes it rather than racing it: the transaction
+    is open before the read happens.
+    """
+    entry(store, "원래 사실")
+    statements: list[str] = []
+    store.conn.set_trace_callback(lambda sql: statements.append(" ".join(sql.split())))
+    try:
+        entry(store, "새로운 사실", supersedes=1)
+    finally:
+        store.conn.set_trace_callback(None)
+
+    read_at = next(
+        index
+        for index, sql in enumerate(statements)
+        if sql.startswith("SELECT id FROM memory_entries")
+    )
+    began = [index for index, sql in enumerate(statements) if sql.startswith("BEGIN IMMEDIATE")]
+    assert began, "the write transaction must be opened explicitly, not by the first write"
+    assert began[0] < read_at, "the retire set was read before the write lock was taken"
+
+
 def test_the_budget_drops_the_least_important_not_the_oldest(store: Store) -> None:
     """This tier is always injected under a budget, so the order it comes back in
     decides what survives truncation."""
