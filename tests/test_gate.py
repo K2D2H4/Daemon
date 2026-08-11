@@ -432,13 +432,32 @@ def test_the_budget_rule_works_against_the_real_store(db: sqlite3.Connection) ->
         ("somebody else's mic", {"mic_busy": True}, "telegram"),
         ("output device in use", {"output_busy": True}, "telegram"),
         ("a meeting app in front", {"foreground_app": "zoom.us"}, "telegram"),
+        # Every tri-valued field again, unmeasured rather than busy. `is not
+        # False` is what makes these route to telegram instead of `both` - a
+        # "simplification" to `is True` would flip every one of these from safe
+        # to speaking, and nothing above would notice.
+        ("microphone state unmeasured", {"mic_busy": None}, "telegram"),
+        ("output device state unmeasured", {"output_busy": None}, "telegram"),
+        ("output mute state unmeasured", {"output_muted": None}, "telegram"),
+        ("screen lock state unmeasured", {"screen_locked": None}, "telegram"),
     ],
 )
 def test_routing_table(name: str, override: dict[str, Any], expected: str) -> None:
     """One row per rule in `_route`, so a missing rule shows up as a missing row
-    rather than as a gap nobody wrote a test for."""
+    rather than as a gap nobody wrote a test for.
+
+    Every row also asserts `allowed`: none of these signals may block the
+    utterance outright, only downgrade where it goes (PLAN 6.4's asymmetry -
+    the reason `audio_busy=True` was demoted from a block to a route in the
+    first place, per this file's own docstring). Confirmed against `judge()`
+    rather than assumed: with `gate_for()`'s defaults (quiet hours off, no
+    prior utterance, budget unspent) none of the rules that *can* block -
+    quiet hours, cooldown, budget - depend on the `Reading` at all, so every
+    row here is allowed regardless of which routing rule it exercises.
+    """
     reading = Reading(at=NOW, **{**ROUTING_BASE, **override})
     verdict = gate_for().judge(EMOTIONAL, reading, now=NOW)
+    assert verdict.allowed, name
     assert verdict.delivery == expected, name
 
 
