@@ -12,6 +12,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `m0_voice_spike.py` | the six things about Gemini Live only a live key could settle |
 | `m1c_voice_tools_spike.py` | whether answering a voice tool call costs the answer — it does not |
 | `m1c_text_tools_spike.py` | whether our provider survives a real Gemini 3 tool round-trip — the `thoughtSignature` contract |
+| `openai_compatible_spike.py` | whether a real OpenAI-compatible endpoint answers `/models`, a Korean turn, and a tool round-trip |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py
@@ -131,6 +132,48 @@ The contract is Gemini-3-only. On a 2.5 id the spike says so and treats its own
 green as vacuous — the `evals/` rule that a run proving nothing is worse than a red
 one. It is why this is a spike and not a `tests/` case: only a live key can settle
 whether the field we emit is the field the API wants.
+
+## openai_compatible_spike.py
+
+```bash
+python3 -m evals.openai_compatible_spike
+python3 -m evals.openai_compatible_spike --base-url https://openrouter.ai/api/v1
+```
+
+Needs `OPENAI_COMPATIBLE_API_KEY`, `DAEMON_OPENAI_COMPATIBLE_BASE_URL` and a model
+id. Drives the real `OpenAICompatibleProvider`, not a hand-built request, over
+three checks in order: `GET /models`, a plain Korean turn, and a forced tool call
+whose result is fed back on a second turn. Also lists the endpoint's models that
+are both free and tool-capable, since the free catalogue rotates and a hardcoded
+id goes stale.
+
+Measured 2026-08-11 on OpenRouter, model `openai/gpt-oss-20b:free`: all three
+checks passed. That model is a reasoning one, and at `max_tokens: 40` it spent its
+entire budget on reasoning tokens (37 of 40) and returned `content: None` with
+`finish_reason: "length"` — our provider correctly raised `ProviderError("no text
+content")` rather than treating that as an empty answer. At `max_tokens: 600` the
+same prompt answered normally with room to spare, which is the budget the spike
+uses for its three real checks; a bonus, informational check reproduces the tiny
+budget on purpose so the shape is visible rather than assumed. This is a real
+model behaviour, not a provider defect — a small output budget on a reasoning
+model is genuinely insufficient for it to reason and answer, and raising rather
+than returning empty text is the correct call for `daemon/loop.py`, which cannot
+distinguish "the model refused" from "the model was cut off empty" any other way.
+
+One more thing worth knowing before reading a raw response body: OpenRouter's
+non-streaming responses can be prefixed with blank-line padding (anti-timeout
+keep-alive), which shows up in the raw dump this spike prints. `httpx`'s and the
+standard library's JSON parsing both skip it without complaint, so it is cosmetic
+here, not a defect.
+
+**Not exercised**: Qwen's DashScope endpoint (`--base-url
+https://dashscope-intl.aliyuncs.com/compatible-mode/v1 --model qwen-plus`).
+Nothing in `daemon/llm/providers/openai_compatible.py` is Qwen-specific, so this is expected to work
+once a Singapore-region key exists — the China-region key available when this was
+last run gets `403 AccessDenied.Unpurchased` from `/chat/completions` and `401`
+from the International endpoint. Code-supported, unverified; do not call it
+working until a run against it is recorded here. Kimi, DeepSeek and a custom
+self-hosted URL are unverified for the same reason: no key, no run, no claim.
 
 ## Common changes
 
