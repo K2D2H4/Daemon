@@ -18,10 +18,15 @@ machine docs/PLAN.md 6.3 recorded the probes working on:
 | `foreground_app` | `lsappinfo`, two calls | 6.9-12 ms, median 7.7 ms |
 | `foreground_app` fallback | `osascript` + System Events | 168-233 ms warm, 464 ms cold |
 | `mic_busy` / `output_busy` | CoreAudio, via ctypes | 0.08-0.14 ms warm, 77 ms first call |
+| `screen_locked` | Quartz, in-process | 0.09-0.15 ms warm, ~18 ms cold |
+| `output_muted` | `osascript`: `MUTED`, `VOLUME` if not muted | 134-178 ms, +145-247 ms if not |
 
-A reading costs ~20 ms when `lsappinfo` answers and ~200 ms when it falls through
-to `osascript`. Either is fine on a five-minute tick and neither belongs on the
-voice latency path; nothing calls this from there.
+A reading costs ~20 ms when `lsappinfo` answers, plus `output_muted`'s cost:
+**~155-200 ms when the machine is muted** (one `osascript` call) and **~300-445 ms
+when it is not** (two). Add ~200 ms more on top of either if `foreground_app`
+falls through to its own `osascript` call. All of this is fine on a five-minute
+tick and none of it belongs on the voice latency path; nothing calls this from
+there.
 
 ## Why `foreground_app` has two probes and `lsappinfo` goes first
 
@@ -156,7 +161,6 @@ logger = logging.getLogger(__name__)
 IOREG = "/usr/sbin/ioreg"
 LSAPPINFO = "/usr/bin/lsappinfo"
 OSASCRIPT = "/usr/bin/osascript"
-SYSTEM_PROFILER = "/usr/sbin/system_profiler"
 CORE_AUDIO = "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
 
 PROBE_TIMEOUT_SECONDS = 2.0
@@ -229,18 +233,6 @@ second call costs ~120 ms on a five-minute tick.
 `get volume settings` is Standard Additions, not System Events, so it needs no
 Automation grant - unlike the `osascript` foreground fallback this file already
 warns about. Verified answering on this machine (2026-08-11).
-"""
-
-HEADPHONE_TRANSPORTS = ("headphone", "usb", "bluetooth", "displayport", "thunderbolt")
-"""Output transports where a spoken line reaches nobody but the user.
-
-Not exhaustive and it cannot be, same as `gate.FOCUS_APPS`. It does not have to
-be: a miss only costs the speaker in a case where Telegram still delivers, and a
-false positive costs a line spoken aloud next to somebody - so the list holds
-only transports that are point-to-point by construction. Built-in speakers are
-absent on purpose, and so is anything routed through a virtual device: the
-default output on the development machine is `MacBook Pro Speakers (eqMac)`,
-where the name describes the proxy rather than the hardware behind it.
 """
 
 
@@ -353,26 +345,6 @@ def audio_running(selector: int) -> bool:
     return bool(_uint32_property(device, IS_RUNNING_SOMEWHERE))
 
 
-# --- the default output's transport, through system_profiler ---------------
-
-
-def _default_output_transport(dump: str) -> str | None:
-    """The `Transport:` value of whichever block has `Default Output Device: Yes`.
-
-    `system_profiler SPAudioDataType` prints one indented block per device, in
-    no guaranteed order, so the default has to be found by its own marker line
-    rather than assumed to be first. `None` if no block claims it, or the block
-    that does names no transport.
-    """
-    blocks = re.split(r"\n(?=\s{8}\S)", dump)
-    for block in blocks:
-        if "Default Output Device: Yes" not in block:
-            continue
-        found = re.search(r"Transport:\s*(.+)", block)
-        return found.group(1).strip() if found else None
-    return None
-
-
 # --- the session dictionary, through Quartz ---------------------------------
 
 
@@ -443,25 +415,26 @@ class MachinePresence:
             )
 
         unknown: list[str] = []
-        # Sequential, cheapest first. Gathering them would save ~15 ms of the
-        # ~200 ms total - osascript dominates either way - and cost the property
-        # that a failure is attributed to exactly one probe.
+        # Sequential, cheapest first: `screen_locked` is an in-process Quartz
+        # call that costs a fraction of a millisecond warm, so it goes ahead of
+        # `output_muted`, which spawns one or two `osascript` processes (~155-445
+        # ms - see the module docstring). Gathering them would save little of that
+        # - `osascript` dominates either way - and cost the property that a
+        # failure is attributed to exactly one probe.
         idle = await self._probe("idle_seconds", self._idle_seconds, unknown)
         app = await self._probe("foreground_app", self._foreground_app, unknown)
         mic = await self._probe("mic_busy", self._mic_busy, unknown)
         output = await self._probe("output_busy", self._output_busy, unknown)
-        muted = await self._probe("output_muted", self._output_muted, unknown)
         locked = await self._probe("screen_locked", self._screen_locked, unknown)
-        cans = await self._probe("headphones", self._headphones, unknown)
+        muted = await self._probe("output_muted", self._output_muted, unknown)
         return Reading(
             at=at,
             idle_seconds=idle,
             foreground_app=app,
             mic_busy=mic,
             output_busy=output,
-            output_muted=muted,
             screen_locked=locked,
-            headphones=cans,
+            output_muted=muted,
             unknown=tuple(unknown),
         )
 
@@ -586,6 +559,20 @@ class MachinePresence:
         except OSError as exc:
             raise ProbeError(f"CoreAudio unavailable: {exc}") from exc
 
+    async def _screen_locked(self) -> bool:
+        """Whether the session is locked.
+
+        macOS *omits* `CGSSessionScreenIsLocked` when unlocked rather than
+        setting it to 0 (verified 2026-08-11), so an absent key is the answer
+        "unlocked" and not the answer "unknown". Reading it as unknown would send
+        every utterance to Telegram for the rest of the process's life, which is
+        this project's signature defect wearing a probe's clothes.
+        """
+        session = await asyncio.to_thread(self._session)
+        if session is None:
+            raise ProbeError("no window-server session dictionary")
+        return bool(session.get("CGSSessionScreenIsLocked", False))
+
     async def _output_muted(self) -> bool:
         """Muted, or turned all the way down.
 
@@ -606,31 +593,31 @@ class MachinePresence:
         except ValueError:
             raise ProbeError(f"osascript gave no volume ({_excerpt(level)})") from None
 
-    async def _screen_locked(self) -> bool:
-        """Whether the session is locked.
-
-        macOS *omits* `CGSSessionScreenIsLocked` when unlocked rather than
-        setting it to 0 (verified 2026-08-11), so an absent key is the answer
-        "unlocked" and not the answer "unknown". Reading it as unknown would send
-        every utterance to Telegram for the rest of the process's life, which is
-        this project's signature defect wearing a probe's clothes.
-        """
-        session = await asyncio.to_thread(self._session)
-        if session is None:
-            raise ProbeError("no window-server session dictionary")
-        return bool(session.get("CGSSessionScreenIsLocked", False))
-
-    async def _headphones(self) -> bool:
-        """Whether the default output is point-to-point.
-
-        Only ever *widens* what the gate allows, so an unreadable transport
-        resolves to False and the ordinary rules apply.
-        """
-        dump = await self._run([SYSTEM_PROFILER, "SPAudioDataType"])
-        transport = _default_output_transport(dump)
-        if transport is None:
-            raise ProbeError("system_profiler named no default output transport")
-        return any(marker in transport.casefold() for marker in HEADPHONE_TRANSPORTS)
+    # `Reading.headphones` has no probe and stays `None` forever. There was one:
+    # `system_profiler SPAudioDataType`, reading the `Transport:` line of whichever
+    # device claims `Default Output Device: Yes`. It measured wrong on the machine
+    # this file is developed on, and not by a small margin. That machine's default
+    # output is always `MacBook Pro Speakers (eqMac)` - a virtual driver in front
+    # of the real hardware - and it answers `Transport: USB`, same as real USB
+    # headphones would. The other devices on that machine, for reference:
+    #
+    #   MacBook Pro Speakers (eqMac)  -> USB       (the default output, always)
+    #   MacBook Pro Speakers          -> Built-in
+    #   LG FULL HD                    -> HDMI
+    #   Microsoft Teams Audio         -> Virtual
+    #   eqMac Export                  -> USB
+    #
+    # So the probe read "headphones" for the laptop's own built-in speakers, every
+    # time, regardless of what was actually plugged in - not a miscalibration to
+    # tune, a signal this mechanism cannot see past the virtual device to obtain.
+    # And `headphones` is the one field that only ever *widens* what the gate
+    # allows (PLAN 6.4's asymmetry: an ignored notification costs nothing, a voice
+    # in a meeting is an accident) - so a signal this file cannot verify must stay
+    # unmeasured rather than measured wrong in the direction that costs more.
+    # `system_profiler` was also the single most expensive probe in this file
+    # (0.21-0.30 s) for a signal it could not actually deliver. Removed entirely
+    # rather than left disabled, so a later reader does not find dead code that
+    # looks load-bearing.
 
     async def _spawn(self, argv: Sequence[str]) -> str:
         """Run a probe command and return its stdout. Bounded, and never a shell.

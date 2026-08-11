@@ -41,7 +41,6 @@ from daemon.proactivity.presence import (
     MUTED,
     OSASCRIPT,
     SYSTEM_OBJECT,
-    SYSTEM_PROFILER,
     UNKNOWN_OBJECT,
     VOLUME,
     MachinePresence,
@@ -69,68 +68,6 @@ LS_FRONT = "ASN:0x0-0x761761:\n"
 LS_INFO = '"LSDisplayName"="Google Chrome"\n'
 LS_NULL_INFO = '"LSDisplayName"=[ NULL ]\n'
 
-# Two `system_profiler SPAudioDataType` dumps, trimmed to the shape that matters:
-# one block per device, and the `Default Output Device: Yes` marker on the block
-# `_default_output_transport` has to find - it is not always the first block, and
-# real output never guarantees an order.
-#
-# NOTE for whoever verifies this against the real machine (2026-08-11, this
-# machine): a live `system_profiler SPAudioDataType` capture here shows the
-# default output device - `MacBook Pro Speakers (eqMac)` - answering
-# `Transport: USB`, not `Transport: Virtual`. That is *inside*
-# `HEADPHONE_TRANSPORTS` as written, so `_headphones()` on this real machine
-# currently reads True for built-in speakers behind eqMac's proxy - the opposite
-# of what `HEADPHONE_TRANSPORTS`'s own docstring claims a virtual device does.
-# `SP_AUDIO_BUILTIN` below uses `Transport: Virtual` instead, to isolate the
-# claim this test suite is actually pinning (a transport outside the list is not
-# headphones) from that unresolved real-machine discrepancy. See the task report.
-SP_AUDIO_HEADPHONES = """Audio:
-
-    Devices:
-
-        MacBook Pro Microphone:
-
-          Input Channels: 1
-          Manufacturer: Apple Inc.
-          Current SampleRate: 48000
-          Transport: Built-in
-          Input Source: MacBook Pro Microphone
-
-        AirPods Pro:
-
-          Default Output Device: Yes
-          Default System Output Device: Yes
-          Manufacturer: Apple Inc.
-          Output Channels: 2
-          Current SampleRate: 48000
-          Transport: Bluetooth
-          Output Source: AirPods Pro
-"""
-
-SP_AUDIO_BUILTIN = """Audio:
-
-    Devices:
-
-        MacBook Pro Microphone:
-
-          Default Input Device: Yes
-          Input Channels: 1
-          Manufacturer: Apple Inc.
-          Current SampleRate: 48000
-          Transport: Built-in
-          Input Source: MacBook Pro Microphone
-
-        MacBook Pro Speakers (eqMac):
-
-          Default Output Device: Yes
-          Default System Output Device: Yes
-          Manufacturer: Bitgapp Ltd
-          Output Channels: 2
-          Current SampleRate: 44100
-          Transport: Virtual
-          Output Source: MacBook Pro Speakers (eqMac)
-"""
-
 
 class FakeRunner:
     """Stands in for the command runner.
@@ -152,7 +89,6 @@ class FakeRunner:
         osascript: str | Exception = "Google Chrome\n",
         muted: str | Exception = "false\n",
         volume: str | Exception = "50\n",
-        sp_audio: str | Exception = SP_AUDIO_BUILTIN,
     ) -> None:
         self.ioreg = ioreg
         self.ls_front = ls_front
@@ -160,7 +96,6 @@ class FakeRunner:
         self.osascript = osascript
         self.muted = muted
         self.volume = volume
-        self.sp_audio = sp_audio
         self.calls: list[list[str]] = []
 
     async def __call__(self, argv: Sequence[str]) -> str:
@@ -179,8 +114,6 @@ class FakeRunner:
                 reply = self.osascript
             else:  # pragma: no cover - a new script must be added deliberately
                 raise AssertionError(f"unexpected osascript {script!r}")
-        elif argv[0] == SYSTEM_PROFILER:
-            reply = self.sp_audio
         else:  # pragma: no cover - a new command must be added deliberately
             raise AssertionError(f"unexpected command {argv[0]!r}")
         if isinstance(reply, Exception):
@@ -191,7 +124,7 @@ class FakeRunner:
         return [argv for argv in self.calls if argv[0] == command]
 
 
-RUNNER_KEYS = ("ioreg", "ls_front", "ls_info", "osascript", "muted", "volume", "sp_audio")
+RUNNER_KEYS = ("ioreg", "ls_front", "ls_info", "osascript", "muted", "volume")
 
 
 def build(**kwargs: object) -> tuple[MachinePresence, FakeRunner]:
@@ -854,7 +787,7 @@ async def test_we_do_not_probe_a_device_we_already_hold() -> None:
     assert reading.mic_busy is False
 
 
-# --- mute, screen lock, headphones -------------------------------------------
+# --- mute and screen lock -----------------------------------------------------
 
 
 async def test_muted_output_is_read_as_muted() -> None:
@@ -886,6 +819,17 @@ async def test_an_unreadable_mute_state_is_unknown_not_audible() -> None:
     assert reason_for(reading, "output_muted") != ""
 
 
+async def test_an_unreadable_volume_when_not_muted_is_unknown_not_audible() -> None:
+    """The second half of the same rule. Muted answers `false` honestly, but the
+    volume call that decides the zero-volume case can *also* fail to parse - and
+    that failure must land as `None`, not fall back to "well, at least not
+    muted"."""
+    reader, _ = build(muted="false\n", volume="Google Chrome\n")
+    reading = await reader.read()
+    assert reading.output_muted is None
+    assert reason_for(reading, "output_muted") != ""
+
+
 async def test_a_locked_screen_is_recorded() -> None:
     reader, _ = build(session=lambda: {"CGSSessionScreenIsLocked": 1})
     reading = await reader.read()
@@ -907,16 +851,14 @@ async def test_no_quartz_is_unknown_rather_than_unlocked() -> None:
     assert reading.screen_locked is None
 
 
-async def test_headphones_are_read_from_the_default_output_transport() -> None:
-    reader, _ = build(sp_audio=SP_AUDIO_HEADPHONES)
+async def test_headphones_has_no_probe_and_stays_unknown() -> None:
+    """There was a probe (`system_profiler`, reading the default output's
+    `Transport:`); it is gone. On the machine this file is developed on, the
+    default output is always the virtual `MacBook Pro Speakers (eqMac)`, which
+    answers `Transport: USB` - indistinguishable from real USB headphones - for
+    the laptop's own built-in speakers. `headphones` only ever *widens* what the
+    gate allows, so a signal this mechanism cannot verify stays unmeasured."""
+    reader, _ = build()
     reading = await reader.read()
-    assert reading.headphones is True
-
-
-async def test_built_in_speakers_are_not_headphones() -> None:
-    """The default output on the development machine is
-    `MacBook Pro Speakers (eqMac)` - a virtual device in front of the built-in
-    speakers. The name describes the proxy; the transport is what is read."""
-    reader, _ = build(sp_audio=SP_AUDIO_BUILTIN)
-    reading = await reader.read()
-    assert reading.headphones is False
+    assert reading.headphones is None
+    assert reason_for(reading, "headphones") == ""  # not a failed probe - no probe

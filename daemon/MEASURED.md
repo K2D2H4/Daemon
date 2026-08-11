@@ -100,3 +100,33 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   safe, so `allowlist` refused every remote tool an owner added. `tool_grants` is
   that second axis, and it is read only for tools that are *not* `Executable` —
   a tool-level grant on `run_command` would be `mode=full` wearing one table row.
+- **A headphone probe was designed, approved, and implemented, then killed by
+  one `system_profiler` call.** The plan: read the default output device's
+  `Transport:` from `system_profiler SPAudioDataType` and treat `usb` /
+  `bluetooth` / `headphone` / `displayport` / `thunderbolt` as point-to-point.
+  Running it for real on the development machine found the default output is
+  *always* the virtual `MacBook Pro Speakers (eqMac)`, and it reports
+  `Transport: USB` — indistinguishable from real USB headphones — for the
+  laptop's own built-in speakers, whatever is actually plugged in:
+  ```
+  MacBook Pro Speakers (eqMac)  -> USB       (the default output, always)
+  MacBook Pro Speakers          -> Built-in
+  LG FULL HD                    -> HDMI
+  Microsoft Teams Audio         -> Virtual
+  eqMac Export                  -> USB
+  ```
+  Not a miscalibration to tune — the transport field cannot see past the virtual
+  device to the real hardware behind it, on this machine, ever. `headphones` is
+  the one presence signal that only *widens* what the speaker may do, so under
+  PLAN 6.4's asymmetry a probe that answers wrong in that direction is worse than
+  one that never answers. Removed rather than fixed; `Reading.headphones` stays
+  `None` (`daemon/proactivity/presence.py`, `daemon/proactivity/base.py`
+  unchanged). It was also the most expensive probe in the file at 0.21-0.30 s,
+  more than the `osascript` foreground fallback (168-233 ms) — so removing the
+  wrong signal also removed the biggest cost.
+- **`output_muted`'s two `osascript` calls, measured on this machine:** `MUTED`
+  134-178 ms, `VOLUME` (asked only when not muted) 145-247 ms. A reading now
+  costs ~155-200 ms muted and ~300-445 ms not muted, on top of the ~20 ms
+  `idle_seconds`/`foreground_app` already cost when `lsappinfo` answers.
+  `screen_locked`'s Quartz call is 0.09-0.15 ms warm (~18 ms the first time in a
+  process) — cheap enough that it now runs before `output_muted` in `read()`.
