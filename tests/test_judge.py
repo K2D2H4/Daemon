@@ -22,7 +22,7 @@ from conftest import FakeProvider
 from daemon.config import Route
 from daemon.llm.gateway import LLMGateway
 from daemon.proactivity.base import Candidate
-from daemon.proactivity.judge import MAX_CHARS, Judge
+from daemon.proactivity.judge import MAX_CHARS, SYSTEM, Judge
 from daemon.tasks import Task
 
 SEED = "너는 반말을 쓰고, 말수가 적다. 걱정을 길게 늘어놓지 않는다."
@@ -41,6 +41,31 @@ VAGUE = Candidate(
 )
 """A candidate that passes the gate and gives the model nothing concrete: the case
 declining exists for. Type D knows only that an hour usually has a conversation."""
+
+
+def test_the_two_conditions_name_the_same_three_kinds() -> None:
+    """SYSTEM's two conditions are AND'ed (`둘 다`): a candidate that satisfies 1
+    but not 2 is declined forever. Condition 1 admits 사건/감정/기억 (event, feeling,
+    memory - the last added for type E); condition 2 has to ask about the same
+    three or a reason that only ever names a memory - never an event or a feeling -
+    can pass 1 and always fail 2, which is exactly what shipped in review round 1:
+    every type E candidate declined regardless of content, making that generator's
+    output permanently inert.
+
+    Also checks the fix did not widen 2 the other way: the exclusion in 1's second
+    sentence (time/interval/frequency alone is not content) is 1's job, and 2 must
+    not independently start admitting it.
+    """
+    _, numbered = SYSTEM.split("\n\n1. ", 1)
+    condition_1, rest = numbered.split("\n2. ", 1)
+    condition_2, _ = rest.split("\n\n", 1)
+
+    for noun in ("사건", "감정", "기억"):
+        assert noun in condition_1, f"condition 1 no longer names {noun}"
+        assert noun in condition_2, f"condition 2 does not ask about {noun}"
+
+    for excluded in ("시간", "간격", "빈도"):
+        assert excluded not in condition_2
 
 
 def judge_for(
