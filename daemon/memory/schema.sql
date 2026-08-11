@@ -436,3 +436,56 @@ CREATE TABLE IF NOT EXISTS tool_grants (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_grants_entry
     ON tool_grants (tool, channel);
+
+-- ---------------------------------------------------------------------------
+-- M5: telemetry the admin reads back
+-- ---------------------------------------------------------------------------
+-- Two tables that exist so a *quiet* daemon can be told apart from a broken one
+-- (docs/PLAN.md 6.1's tuning readout, and the same worry reflection.py's Result
+-- docstring names). Everything else here records what happened; these record what
+-- was decided, including the rounds and passes where the decision was "nothing".
+--
+-- Not rebuildable from the markdown, and not meant to be: like tool_calls, this
+-- is what the machine did, not what the user said. Losing them costs a graph.
+
+-- One row per proactivity tick. `daemon proactive` writes one too - an audit that
+-- skipped the rounds a human triggered would mis-state the day.
+--
+-- Rounds where proactivity is switched off write nothing: the job is not even
+-- registered then (daemon/app.py), so a row would be the CLI's alone and would
+-- read as a round the daemon ran.
+CREATE TABLE IF NOT EXISTS proactive_rounds (
+    id         INTEGER PRIMARY KEY,
+    ts         TEXT    NOT NULL,
+    generated  INTEGER NOT NULL DEFAULT 0,
+    expired    INTEGER NOT NULL DEFAULT 0,
+    considered INTEGER NOT NULL DEFAULT 0,
+    spoke      INTEGER NOT NULL DEFAULT 0,
+    declined   INTEGER NOT NULL DEFAULT 0,
+
+    -- {rule: count} for the candidates the gate refused this round. The rule name
+    -- is the part of `Verdict.why` before the colon, which is what TickResult
+    -- already aggregates for `daemon proactive`.
+    blocked_by TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(blocked_by))
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_proactive_rounds_ts ON proactive_rounds (ts);
+
+-- One row per reflection pass, including the ones that failed. The artifact file
+-- is still the idempotence marker (reflection.py) - this is not that. A pass that
+-- could not reach the model writes no artifact, so a file-based reading of "did
+-- last night run?" answers "no" identically for a night that was skipped and a
+-- night that broke.
+CREATE TABLE IF NOT EXISTS reflection_runs (
+    id            INTEGER PRIMARY KEY,
+    ts            TEXT    NOT NULL,   -- when the pass ran
+    date          TEXT    NOT NULL,   -- the local day it read
+    status        TEXT    NOT NULL,   -- Result.status, verbatim
+    messages_read INTEGER NOT NULL DEFAULT 0,
+    facts         INTEGER NOT NULL DEFAULT 0,
+    entities      INTEGER NOT NULL DEFAULT 0,
+    observations  INTEGER NOT NULL DEFAULT 0,
+    detail        TEXT    NOT NULL DEFAULT ''
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_reflection_runs_ts ON reflection_runs (ts);

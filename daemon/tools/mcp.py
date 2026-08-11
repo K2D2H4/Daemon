@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
@@ -287,6 +288,42 @@ def missing_passthrough_env(config: ServerConfig) -> list[str]:
     return [name for name in config.env_passthrough if not os.environ.get(name)]
 
 
+_EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+")
+"""An email as a credential filename would carry it: a local part, one `@`, a domain,
+and no whitespace. Deliberately loose on the domain, strict on the shape - it exists
+to reject bookkeeping files and injection-y names, not to validate deliverability."""
+
+
+def google_authenticated_email() -> str | None:
+    """The single Google account the `workspace` server holds a cached credential for,
+    or None when there are zero or several.
+
+    workspace-mcp names each credential file `{email}.json` under its credentials dir
+    (WORKSPACE_MCP_CREDENTIALS_DIR, default `~/.google_workspace_mcp/credentials`). Its
+    tools take a `user_google_email` the model cannot otherwise know, so it invents one
+    from the OS username - which never matches the stored credential, and every Google
+    call re-prompts auth. Surfacing the real one lets the model pass it. Only when
+    exactly one account is present: zero means not connected yet, several is ambiguous
+    and guessing would reintroduce the mismatch this exists to fix."""
+    base = os.environ.get("WORKSPACE_MCP_CREDENTIALS_DIR") or os.path.expanduser(
+        "~/.google_workspace_mcp/credentials"
+    )
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return None
+    # Credential files are named `{email}.json`; the dir also holds bookkeeping like
+    # `oauth_states.json`. Require the stem to be email-shaped (one `@`, no
+    # whitespace) - that skips the bookkeeping AND refuses to launder an oddly-named
+    # file into the prompt, since this value goes into the model's context (CONTRACTS).
+    emails = [
+        stem
+        for name in names
+        if name.endswith(".json") and _EMAIL_SHAPE.fullmatch(stem := name[:-5])
+    ]
+    return emails[0] if len(emails) == 1 else None
+
+
 def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
     """Turn a trusted catalog entry into a `ServerConfig` the bridge can connect.
 
@@ -310,6 +347,7 @@ def server_config_from_catalog(entry: CatalogEntry) -> ServerConfig:
         url=entry.url,
         key_env=entry.key_env or "",
         auth=entry.auth,
+        env=dict(entry.env),
         env_passthrough=tuple(entry.env_passthrough),
     )
 
@@ -624,6 +662,15 @@ class McpBridge:
     def connected_names(self) -> tuple[str, ...]:
         """The servers with a live session, for callers that want the whole set."""
         return tuple(self._sessions)
+
+    def registered_tools(self, name: str) -> tuple[str, ...]:
+        """The tool names this server contributed to the registry.
+
+        For the admin, which shows them under each configured server: "connected"
+        answers whether the process is up, and this answers what the model actually
+        gained by it - a server that connects and registers nothing is a different
+        problem from one that will not start."""
+        return tuple(self._registered.get(name, ()))
 
     async def _bring_up(
         self,

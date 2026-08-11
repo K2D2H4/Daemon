@@ -32,6 +32,37 @@ async def test_a_fact_lands_in_the_markdown_and_the_mirror(
     assert tier.entries() == ["김치찌개를 좋아한다"]
 
 
+async def test_the_file_holds_every_active_fact_not_only_the_injected_ones(
+    tier: curated.CuratedMemory, data_dir: Path
+) -> None:
+    """The file is the source of truth; the budget is an injection limit.
+
+    Rendering the whole file from the top `MAX_INJECTED` rows conflated the two, so
+    the 51st active fact was dropped from `core.md` on the next write while staying
+    active in the mirror. `rebuild` only adds what it finds in the markdown, so
+    `daemon reindex` could not notice, recall still served the row, and deleting the
+    database - the documented recovery - lost it for good.
+    """
+    for index in range(curated.MAX_INJECTED + 2):
+        tier._store.insert_entry(
+            body=f"사실 {index:02d}",
+            importance=5,
+            trigger_phrases=(),
+            origin="agent",
+            session_kind="reflection",
+            modality="text",
+            now=NOW,
+        )
+
+    await tier.add("마지막 사실", importance=5, now=NOW)
+
+    bodies = curated.read(data_dir)
+    assert len(bodies) == curated.MAX_INJECTED + 3
+    # The lowest-ranked row is the one truncation used to eat.
+    assert "사실 00" in bodies
+    assert len(tier.entries()) == curated.MAX_INJECTED, "the injection budget still holds"
+
+
 async def test_the_file_is_owner_only(tier: curated.CuratedMemory, data_dir: Path) -> None:
     """It is a description of a person. 0644 hands it to every local account."""
     await tier.add("연희동에 산다", now=NOW)
@@ -119,6 +150,41 @@ async def test_the_markdown_is_written_before_the_mirror_commits(
 
     assert seen_by_other_connection == [0]
     assert tier.entries() == ["아직 커밋 안 된 사실"]
+
+
+async def test_a_failure_before_the_file_write_leaves_nothing_pending(
+    tier: curated.CuratedMemory, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mirror write is already open when the file is rendered, so a failure
+    *there* has to roll back too.
+
+    Found by review. Rendering sat outside the guard, so the retire-and-insert
+    stayed open and uncommitted - and the next commit on this connection, which
+    `reflection.Reflection.run` always makes to record the run, turned it durable
+    with no markdown behind it. That is the one direction non-negotiable 1 calls
+    unrecoverable, and the pass reported the fact as not recorded.
+    """
+    await tier.add("먼저 있던 사실", supersession_key="k", now=NOW)
+
+    def boom(*_: object, **__: object) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(curated, "render", boom)
+
+    with pytest.raises(sqlite3.OperationalError):
+        await tier.add("대체하려던 사실", supersession_key="k", now=NOW)
+
+    assert not tier._store.conn.in_transaction, "the transaction must not be left open"
+    # A fresh connection: the retire must not be waiting for someone else's commit.
+    other = sqlite3.connect(data_dir / "daemon.sqlite3")
+    try:
+        rows = other.execute(
+            "SELECT body FROM memory_entries WHERE status = 'active'"
+        ).fetchall()
+    finally:
+        other.close()
+    assert [row[0] for row in rows] == ["먼저 있던 사실"]
+    assert curated.read(data_dir) == ["먼저 있던 사실"]
 
 
 # --- rebuild ----------------------------------------------------------------

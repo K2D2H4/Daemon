@@ -23,8 +23,11 @@ Four things here are load-bearing rather than incidental:
    at the turn boundary, in the same server event as the first audio chunk of the
    answer. Measured, twice. So the prefetch fires when the answer has already
    started and what it finds is context for the *next* turn. The machinery stays -
-   it is right for a provider that streams partials, which OpenAI Realtime does -
-   and the claim that it makes recall free is retracted.
+   it would be right for a provider that streams partials, which as it turns out
+   neither hosted provider does today: OpenAI Realtime's `partial_transcripts()`
+   also yields one item per turn, the completed utterance, not a growing
+   fragment (daemon/voice/openai_realtime.py, whisper-1 sends no deltas) - and
+   the claim that this machinery makes recall free is retracted.
 3. **A barge-in is the provider's call, not ours, and it does two things or it does
    nothing.** `session.interrupt()` stops the abandoned turn's audio from arriving,
    `audio.stop_playback()` drops what is already queued; either alone leaves the
@@ -53,7 +56,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 
 from daemon import clock
@@ -68,6 +71,7 @@ from daemon import clock
 from daemon.companion import Companion
 from daemon.llm.base import ToolCall
 from daemon.memory.base import LoggedMessage, RecalledItem
+from daemon.tools.base import ToolResult
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 from daemon.voice.screen_share import ScreenShareController, ScreenSharePump
 
@@ -102,6 +106,31 @@ The tail of a sentence is where Korean puts the question, so a prefetch made fro
 the first third of an utterance is a different query and gets thrown away;
 covering most of it embeds to nearly the same vector and is worth the whole 117 ms
 it saves."""
+
+CALLED_BY_NAME = (
+    "The owner just called your name to get your attention. Greet them briefly, in "
+    "character, and wait for what they want. Do not read this instruction aloud."
+)
+"""What a session opened by the wake word alone is asked to answer.
+
+Not the transcript. The wake gate matches on what the *recognizer* returns, which
+is routinely not the name at all - this owner's aliases are `연락,벨라` because
+"벨라" reliably comes back as "연락", an ordinary Korean word meaning "contact".
+Sending that through as the owner's words got exactly what it deserved: measured
+against the live model, "벨라" produced "네, 부르셨어요?" and "연락" produced
+"...에? 연락?" - the daemon puzzling over a word nobody said.
+
+So the wake word is delivered as what it *means* rather than as what it sounded
+like. Phrased as an instruction the model answers rather than a line it reads:
+measured over repeated trials, this wording never leaked into the reply, while a
+Korean-language variant of it leaked the word "context" into one.
+"""
+
+OPENING_ANSWER_HOLD_SECONDS = 6.0
+"""How long the microphone is held while the model owes an answer to the wake
+word. Long enough to cover a slow first turn (measured: 1.1 s with no microphone
+attached, 11.77 s with one), short enough that a model which never answers hands
+the room back well inside the idle budget."""
 
 PLAYBACK_BYTES_PER_FRAME = 2
 """16-bit mono, which is what every `AudioIO` here plays (daemon/voice/audio.py).
@@ -175,15 +204,31 @@ class VoiceConversation:
         channel: str = VOICE_CHANNEL,
         idle_timeout: float = IDLE_TIMEOUT_SECONDS,
         opening_audio: bytes = b"",
+        opening_text: str = "",
         screen_share: ScreenShareController | None = None,
         screen_pump_factory: Callable[[VoiceSession], ScreenSharePump] | None = None,
+        barge_in: bool = True,
     ) -> None:
         self._session = session
         self._audio = audio
         self._companion = companion
         self._channel = channel
         self._idle_timeout = idle_timeout
+        self._barge_in_enabled = barge_in
+        """Whether the microphone streams while the daemon talks (config.py,
+        DAEMON_VOICE_BARGE_IN). False is half-duplex: answers always play to the
+        end, and speaking over one changes nothing until it finishes."""
         self._opening_audio = opening_audio
+        self._opening_text = opening_text
+        """What the owner said, as text, when the audio is not worth sending.
+
+        The wake-word-only case: the local recognizer has already decided the
+        segment is the name and nothing else, so the *words* are settled and only
+        the audio is ambiguous - sent as audio, "벨라" reached the model as "별로"
+        and it answered a sentence nobody said. Sent as text there is nothing left
+        to mishear, and the model answers being called by name the way a person
+        does. Skipping it entirely is not the third option: that leaves the owner
+        calling into silence, waiting, and calling again."""
         """Audio to hand the session before the microphone is even open.
 
         The wake gate's own segment, normally: it heard the owner say "루시 뭐 해",
@@ -227,6 +272,9 @@ class VoiceConversation:
         self._started_at: float | None = None
         self._first_audio_at: float | None = None
         self._played_bytes = 0
+        self._playback_until = 0.0
+        """Loop-clock instant the speaker runs dry, so the idle budget can start
+        counting silence when the room actually falls silent (see `_on_audio`)."""
 
         self._generating = False
         """Whether the model is mid-turn.
@@ -235,6 +283,23 @@ class VoiceConversation:
         what keeps recall off the wire until the answer is finished. It used to be
         called `_playing` and used to decide barge-ins, and neither survived contact
         with the provider - see `_offer` and `_watch_partials`."""
+
+        self._opening_answer_until = 0.0
+        """Loop-clock deadline for holding the microphone after an opening the model
+        still owes an answer to.
+
+        Measured, and the measurement is the whole justification: the same opening
+        text answered in **1.1 s** against a session with no microphone attached, and
+        took **11.77 s** in the resident, where the mic starts streaming the room the
+        instant the session is up. Incoming audio at the moment a turn begins reads
+        as the user starting to speak, so the server cancels the answer it was about
+        to give and waits for an utterance that never comes - and it does that
+        without emitting `interrupted`, which is why the session reported zero
+        barge-ins while the owner sat through eleven seconds of nothing and concluded
+        the daemon was deaf. The owner has just said the wake word and is waiting;
+        holding the room out of the socket until the answer starts costs nothing they
+        were going to say. Bounded, because a model that never answers must not take
+        the microphone with it."""
 
         self._answering_tool = False
         """Whether a tool call is between "the model asked" and "the model spoke".
@@ -340,10 +405,15 @@ class VoiceConversation:
         Never fails the conversation: an opening that cannot be delivered costs the
         user one repeated sentence, and raising here would cost them the whole turn.
         """
-        if not self._opening_audio:
-            return
         try:
-            await session.send_audio(self._opening_audio)
+            if self._opening_audio:
+                await session.send_audio(self._opening_audio)
+            elif self._opening_text:
+                # A prompt, so the model answers it - which is the point: being
+                # called by name deserves an answer, not silence.
+                await session.send_text(self._opening_text)
+                loop = asyncio.get_running_loop()
+                self._opening_answer_until = loop.time() + OPENING_ANSWER_HOLD_SECONDS
         except Exception:
             logger.exception("voice: could not hand over the utterance that opened the session")
 
@@ -416,7 +486,6 @@ class VoiceConversation:
         try:
             async for item in stream:
                 produced = True
-                budget.reschedule(loop.time() + self._idle_timeout)
                 if isinstance(item, bytes):
                     self._generating = True
                     self._on_audio(loop.time(), len(item))
@@ -427,6 +496,15 @@ class VoiceConversation:
                     await self._run_tool_call(session, item)
                 else:
                     await self._on_transcript(session, item)
+                # After the item is handled, not before: a chunk has to be able to
+                # extend the budget by *its own* playing time, and `_on_audio` is
+                # what knows that. Rescheduling first counted every answer as if it
+                # were heard the instant it arrived - the ten seconds `_on_audio`
+                # describes. From when the room falls silent, not when the packet
+                # landed.
+                budget.reschedule(
+                    max(loop.time(), self._playback_until) + self._idle_timeout
+                )
         finally:
             await _aclose(stream)
         # The turn is over, whatever ended it, so nothing is generating and anything
@@ -459,6 +537,23 @@ class VoiceConversation:
                     # microphone resumes - barge-in over the spoken result works
                     # exactly as before.
                     continue
+                if self._opening_answer_until and not self._generating:
+                    if asyncio.get_running_loop().time() < self._opening_answer_until:
+                        # The answer to the wake word has not started yet; see
+                        # `_opening_answer_until`. Dropped, not queued - stale room
+                        # audio helps nobody once the answer is under way.
+                        continue
+                    # Bound reached: the model is not answering, so the microphone
+                    # goes back to the owner rather than staying held.
+                    self._opening_answer_until = 0.0
+                if not self._barge_in_enabled and (self._generating or self._answering_tool):
+                    # Half-duplex, by the owner's choice (DAEMON_VOICE_BARGE_IN=false):
+                    # while the daemon is speaking, the microphone yields entirely, so
+                    # an answer always plays to the end - no echo leak, no "응" of
+                    # agreement, no room noise can kill it mid-sentence. The price is
+                    # stated in config.py: interrupting by voice does nothing until
+                    # the answer finishes.
+                    continue
                 await session.send_audio(chunk)
         except asyncio.CancelledError:
             raise
@@ -469,10 +564,25 @@ class VoiceConversation:
             logger.exception("voice: stopped feeding the session")
 
     def _on_audio(self, at: float, size: int) -> None:
-        """Note one chunk on its way to the speaker."""
+        """Note one chunk on its way to the speaker, and when it will finish playing.
+
+        The second half is what keeps the idle budget honest. The model generates
+        faster than real time, so a whole answer *arrives* long before it is *heard*:
+        measured on the owner's Mac, 28.4 s of audio landed in about 19 s, and the
+        30 s silence budget - rescheduled on arrival - had already been running for
+        ten of them while the daemon was still talking. The owner got 20.7 s of turn
+        instead of 30, was cut off mid-reply, and the log said "nothing heard for
+        30s" about a stretch it had spent speaking.
+        """
         self._played_bytes += size
+        # The answer has started, so the microphone goes back to the room.
+        self._opening_answer_until = 0.0
         if self._first_audio_at is None:
             self._first_audio_at = at
+        seconds = size / (self._audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME)
+        # Chunks queue behind each other, so playback ends after whatever is already
+        # queued - not `at + seconds`, which would forget the backlog.
+        self._playback_until = max(self._playback_until, at) + seconds
 
     # --- transcripts --------------------------------------------------------
 
@@ -744,7 +854,68 @@ class VoiceConversation:
         # (`daemon tools log`); the runner also logs each run at INFO. A spoken turn
         # has no reply line to fold a notice into, and reading raw commands aloud is
         # exactly the clutter this removal is about.
-        await session.send_tool_response(outcome.results)
+        results = await self._deliver_images(session, outcome.results)
+        await session.send_tool_response(results)
+
+    async def _deliver_images(
+        self, session: VoiceSession, results: Sequence[ToolResult]
+    ) -> Sequence[ToolResult]:
+        """Put what a tool captured in front of the model, not just its caption.
+
+        `see_screen` returns a caption *and* pixels (`ToolResult.images`). The text
+        loop attaches the pixels as their own user turn (daemon/loop.py); voice
+        dropped them on the floor and sent only the caption - "captured 1
+        display(s)" - so the model was asked what is on screen while being shown
+        nothing, and did what a model does with a question it cannot answer: it
+        invented one. The owner's screen held a photo of food and the daemon called
+        it a picture of a dog, confidently, while the text path described the same
+        screen correctly.
+
+        Frames go over `realtime_input.video`, the channel the live share already
+        uses, and they go *before* the tool response so the image is in history when
+        the model composes its answer. Verified against the live socket rather than
+        inferred: a probe image carrying the digits 7392 came back read aloud
+        correctly, which is also what retires the "pending confirmation" note this
+        transport used to carry.
+
+        Never fails the turn: an image that cannot be delivered downgrades the
+        caption to say so, which is the one honest thing to tell a model that is
+        about to be asked what it can see.
+        """
+        from dataclasses import replace
+
+        from daemon.tools.screen import screen_note
+
+        delivered: list[ToolResult] = []
+        for result in results:
+            if not result.images:
+                delivered.append(result)
+                continue
+            sent = 0
+            for image in result.images:
+                try:
+                    await session.send_frame(image.data)
+                    sent += 1
+                except Exception:
+                    logger.exception("voice: could not hand over a captured image")
+            if not sent:
+                delivered.append(
+                    replace(
+                        result,
+                        content=(
+                            f"{result.content}\n\nThe image could not be delivered, so "
+                            "you cannot see it. Say that rather than describing it."
+                        ),
+                    )
+                )
+                continue
+            # The untrusted-data framing rides in the caption, because a frame
+            # carries no text of its own - same stance as the text path, which puts
+            # `screen_note` on the turn holding the image (security stance A).
+            delivered.append(
+                replace(result, content=f"{result.content}\n\n{screen_note('the screen')}")
+            )
+        return delivered
 
 
 def _covers(prepared: str, said: str) -> bool:

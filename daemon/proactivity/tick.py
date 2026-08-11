@@ -179,7 +179,7 @@ class ProactiveTick:
                 # leans on. Anything still due is reconsidered five minutes later.
                 break
 
-        return TickResult(
+        result = TickResult(
             at=moment,
             reading=reading,
             generated=len(fresh),
@@ -188,6 +188,20 @@ class ProactiveTick:
             spoke=spoke,
             declined=declined,
         )
+        # The round goes into the audit whether or not anything came of it. A tick
+        # that decided against speaking leaves no other trace - no utterance row, no
+        # log line - so without this the admin cannot tell a loop that considered
+        # 288 candidates and refused them all from one that stopped running.
+        self._store.record_proactive_round(
+            generated=result.generated,
+            expired=result.expired,
+            considered=len(result.considered),
+            spoke=result.spoke,
+            declined=result.declined,
+            blocked_by=json.dumps(result.blocked_by, ensure_ascii=False),
+            now=moment,
+        )
+        return result
 
 
 

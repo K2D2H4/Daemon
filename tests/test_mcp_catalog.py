@@ -53,6 +53,17 @@ def test_google_declares_the_oauth_env_it_reads() -> None:
     assert config.env_passthrough == ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
 
 
+def test_google_sets_the_localhost_callback_flag() -> None:
+    """The one-time consent redirects to http://localhost:8000/oauth2callback; oauthlib
+    refuses a non-https callback without OAUTHLIB_INSECURE_TRANSPORT. It is a fixed flag,
+    not a secret, so the catalog sets it as static env (carried to the stdio child)
+    rather than making the owner discover it."""
+    entry = lookup("google")
+    assert entry is not None
+    config = server_config_from_catalog(entry)
+    assert config.env.get("OAUTHLIB_INSECURE_TRANSPORT") == "1"
+
+
 def test_google_runs_single_user_so_a_spawned_launch_reuses_the_cached_token() -> None:
     """The owner is the only account: `--single-user` makes the server load the one
     cached credential without session mapping, so a stdio launch the daemon spawns

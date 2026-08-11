@@ -130,3 +130,13 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   `idle_seconds`/`foreground_app` already cost when `lsappinfo` answers.
   `screen_locked`'s Quartz call is 0.09-0.15 ms warm (~18 ms the first time in a
   process) — cheap enough that it now runs before `output_muted` in `read()`.
+- **"The SDK handles refresh on its own" was true only until the process restarted.**
+  `OAuthContext` derives `token_expiry_time` from `expires_in` at the moment a token
+  arrives and keeps it *in memory*; `TokenStorage` persists neither it nor the arrival
+  time, and `is_token_valid()` reads a falsy expiry as "no expiry declared". So every
+  boot loaded Notion's eight-hour token, judged it valid, sent it, took a 401, and
+  escalated to a **full** re-authorization — never once trying the refresh token sitting
+  beside it (the failing log has no `POST /token` at all). Any restart more than eight
+  hours after the last auth made the owner click through Notion's consent screen again.
+  Stamping `obtained_at` at write and priming the context at build puts it back on the
+  refresh branch: `POST /token 200`, no 401, 28 tools, verified live.

@@ -1019,3 +1019,48 @@ def test_the_settings_defaults_are_the_ones_the_gate_uses() -> None:
     assert settings.wake_min_speech_ms == wake.DEFAULT_MIN_SPEECH_MS
     assert settings.wake_max_segment_ms == wake.DEFAULT_MAX_SEGMENT_MS
     assert settings.wake_cooldown_seconds == wake.DEFAULT_COOLDOWN_SECONDS
+
+
+# --- the handover: what audio the session opens with --------------------------
+
+
+def _fired(heard: str, matched: str) -> WakeEvent:
+    return WakeEvent(heard=heard, matched=matched, confidence=0.9, pcm=b"\x01\x02")
+
+
+def test_calling_the_name_alone_hands_the_session_no_audio() -> None:
+    """The segment is the name and nothing else, so handing it over gives the
+    session's own transcriber a syllable to misread as a first utterance. Measured
+    on the owner's Mac: "벨라" reached the model as "별로" - an ordinary Korean word
+    meaning "not really" - and the daemon opened by answering something the owner
+    had never said."""
+    from daemon.app import _only_the_wake_word
+
+    assert _only_the_wake_word(_fired("벨라", "벨라"))
+    # Normalised, so spacing and punctuation cannot fake a question.
+    assert _only_the_wake_word(_fired("벨라,", "벨라"))
+    assert _only_the_wake_word(_fired("헤이 대문", "헤이 대문"))
+
+
+def test_a_question_after_the_name_still_travels() -> None:
+    """The reason the handover exists: the gate consumed "루시 뭐 해" whole, so
+    without the segment the owner has to say the question again."""
+    from daemon.app import _only_the_wake_word
+
+    assert not _only_the_wake_word(_fired("루시 뭐 해", "루시"))
+    assert not _only_the_wake_word(_fired("벨라 크롬 열어줘", "벨라"))
+
+
+def test_the_wake_word_travels_as_meaning_not_as_the_transcript() -> None:
+    """The gate matches on what the *recognizer* returns, which is routinely not the
+    name: this owner's aliases are `연락,벨라` because "벨라" reliably comes back as
+    "연락" - an ordinary Korean word meaning "contact". Measured against the live
+    model, sending the transcript through got "...에? 연락?" where the name itself got
+    "네, 부르셨어요?". So the opening says what being called means."""
+    from daemon.voice.conversation import CALLED_BY_NAME
+
+    assert "called your name" in CALLED_BY_NAME
+    # An instruction the model answers, not a line it reads out.
+    assert "Do not read this instruction aloud" in CALLED_BY_NAME
+    for artifact in ("연락", "벨라", "루시"):
+        assert artifact not in CALLED_BY_NAME, "a transcript artifact reached the model"

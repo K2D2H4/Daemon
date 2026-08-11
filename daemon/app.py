@@ -14,8 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, nullcontext, suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -25,6 +25,7 @@ from fastapi import FastAPI
 
 from daemon import __version__
 from daemon.channels.base import Channel
+from daemon.clock import now_iso
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
 from daemon.config import (
     ANTHROPIC,
@@ -32,7 +33,6 @@ from daemon.config import (
     GEMINI,
     OLLAMA,
     OPENAI,
-    VOICE_TASKS,
     ConfigError,
     Settings,
 )
@@ -86,6 +86,19 @@ PROBLEM = 1
 DB_FILENAME = "daemon.sqlite3"
 """Lives inside the data dir. Deleting it must never lose user data - the
 markdown log is the original (CONTRACTS.md non-negotiable 1)."""
+
+VIDEO_CAPABLE_VOICE_PROVIDERS = frozenset({"gemini"})
+"""Voice providers whose session actually accepts video frames via `send_frame`.
+
+`OpenAIRealtimeSession.send_frame` (daemon/voice/openai_realtime.py) is a
+deliberate no-op - OpenAI Realtime has no realtime video input channel - so
+building a `ScreenShareController` and its start/stop tools for it would let the
+model tell the owner "I'm watching your screen now" while every frame is
+silently dropped. ADR 0009 (docs/adr/0009-images-in-the-message-contract.md)
+is explicit that a capability the code cannot deliver must say so, not attach a
+frame and hope. Gated on this set, not on the current session's `route.provider`
+string inline, so the question reads as "can this provider take video" rather
+than a bare provider-name check."""
 
 PROACTIVE_TICK_MINUTES = 5
 """docs/PLAN.md 6.1's tick. Deterministic work only, unless a candidate is due and
@@ -173,6 +186,11 @@ def health_payload(state: Any, settings: Settings) -> dict[str, Any]:
         "status": "ok",
         "preset": settings.preset,
         "voice_enabled": settings.voice_enabled,
+        # When this process came up, so a reader can tell "quiet for a week" from
+        # "restarted a minute ago and has not had time to do anything yet". Absent
+        # rather than faked when the lifespan never ran (tests build the app
+        # directly), because a zero uptime would be a lie the admin would print.
+        "started_at": getattr(state, "started_at", None),
         "routing": {
             task_key.value: route.provider
             for task_key, route in settings.routing_table().items()
@@ -200,6 +218,7 @@ def health_payload(state: Any, settings: Settings) -> dict[str, Any]:
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
+    app.state.started_at = now_iso()
     providers = _build_providers(settings)
     gateway = LLMGateway(
         providers, settings.routing_table(), fallback=settings.fallback_route()
@@ -677,6 +696,32 @@ def _build_recall(settings: Settings, store: Any) -> tuple[Recall | None, str, A
         return None, f"unavailable: {exc}", None
 
 
+@contextmanager
+def open_store(settings: Settings) -> Iterator[Any]:
+    """A short-lived `Store` handle, closed on the way out.
+
+    Exists so the admin's read-only endpoints can query the mirror without
+    importing an implementation themselves - this module is the only one allowed
+    to (docs/CONTRACTS.md, the layering rule), and every other assembly point here
+    opens the store the same way.
+
+    One connection per request rather than a shared one: sqlite3 connections are
+    not safe to share across threads, and the admin's callers are one browser
+    polling every fifteen seconds. `Store.open` is not free - it replays the whole
+    of `schema.sql` and hardens three files - so this is a real cost, just a small
+    one against that traffic: measured end to end, the endpoints that use it answer
+    in 1.3-2.6ms against a 753-message database, under what `/health` takes. Reach
+    for a cached handle if something noisier than the admin ever wants one.
+    """
+    from daemon.memory.store import Store
+
+    store = Store.open(settings.data_dir / DB_FILENAME)
+    try:
+        yield store
+    finally:
+        store.close()
+
+
 async def build_proactive_tick(
     settings: Settings, *, speak: bool = False
 ) -> tuple[ProactiveTick, Callable[[], Awaitable[None]]]:
@@ -1006,14 +1051,25 @@ async def _build_voice_runtime(
     """
     screen_share = None
     if settings.screen_enabled:
-        # Guarded like run_voice's own block: a missing Pillow must cost the
-        # feature, not the resident.
-        try:
-            from daemon.voice.screen_share import ScreenShareController
+        route = settings.route_for(Task.CHAT_VOICE)
+        if route.provider not in VIDEO_CAPABLE_VOICE_PROVIDERS:
+            # See VIDEO_CAPABLE_VOICE_PROVIDERS: this provider's session drops
+            # every frame, so building the controller here would only let the
+            # model promise a screen it will never see.
+            logger.warning(
+                "live screen share unavailable on voice provider %r (send_frame "
+                "is a no-op there); live-share tools will not be offered",
+                route.provider,
+            )
+        else:
+            # Guarded like run_voice's own block: a missing Pillow must cost the
+            # feature, not the resident.
+            try:
+                from daemon.voice.screen_share import ScreenShareController
 
-            screen_share = ScreenShareController()
-        except ImportError as exc:
-            logger.warning("voice screen sharing off (missing dependency): %s", exc)
+                screen_share = ScreenShareController()
+            except ImportError as exc:
+                logger.warning("voice screen sharing off (missing dependency): %s", exc)
     voice_mode = "allowlist" if settings.tools_mode == "ask" else settings.tools_mode
     tools, mcp, _status = await _build_tools(
         settings, store, mode=voice_mode, screen_share=screen_share
@@ -1024,7 +1080,11 @@ async def _build_voice_runtime(
 
 
 async def run_voice(
-    settings: Settings, *, opening_audio: bytes = b"", shared: VoiceRuntime | None = None
+    settings: Settings,
+    *,
+    opening_audio: bytes = b"",
+    opening_text: str = "",
+    shared: VoiceRuntime | None = None,
 ) -> int:
     """One spoken conversation at this machine, then exit.
 
@@ -1041,6 +1101,7 @@ async def run_voice(
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
     from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
+    from daemon.voice.openai_realtime import OpenAIRealtimeError, OpenAIRealtimeSession
 
     if not settings.voice_enabled:
         logger.error("voice is off; set DAEMON_VOICE_ENABLED=true (see `daemon setup`)")
@@ -1054,17 +1115,10 @@ async def run_voice(
     # along with the daemon itself. A hosted session is the only thing these two
     # guard, and opening one is the only thing this function does - so they run
     # right here, where that actually happens, with the same messages as before.
-    problems: list[str] = []
-    if not VOICE_TASKS <= settings.routing.keys():
-        problems.append(
-            f"DAEMON_VOICE_ENABLED is on but preset {settings.preset!r} routes no voice task; "
-            "voice needs a hosted native-audio provider (docs/PLAN.md 3.2)"
-        )
-    if not settings.gemini_live_model:
-        problems.append(
-            "DAEMON_VOICE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
-            "the native-audio endpoint needs its own model id"
-        )
+    problems = [
+        f"DAEMON_VOICE_ENABLED is on but {problem}"
+        for problem in settings.voice_session_problems()
+    ]
     if problems:
         raise ConfigError("; ".join(problems))
     route = settings.route_for(Task.CHAT_VOICE)
@@ -1095,7 +1149,19 @@ async def run_voice(
             # and a fresh controller per attempt would leave them pointing at a stale
             # one.
             screen_share = None
-            if settings.screen_enabled:
+            if settings.screen_enabled and route.provider not in VIDEO_CAPABLE_VOICE_PROVIDERS:
+                # See VIDEO_CAPABLE_VOICE_PROVIDERS: this provider's session drops
+                # every frame it is handed (OpenAIRealtimeSession.send_frame is a
+                # no-op), so building the controller - and registering its
+                # start/stop tools below - would let the model tell the owner
+                # it is watching a screen it will never see. ADR 0009 requires
+                # the code say so instead.
+                logger.warning(
+                    "live screen share unavailable on voice provider %r (send_frame "
+                    "is a no-op there); live-share tools will not be offered",
+                    route.provider,
+                )
+            elif settings.screen_enabled:
                 # Guarded like the screen-tool block in `_build_tools`: screen sharing
                 # needs Pillow (daemon/voice/screen_share.py imports it at module
                 # scope). A missing Pillow must lose only the feature, not crash the
@@ -1168,6 +1234,14 @@ async def run_voice(
             """A fresh session per attempt. Reconnecting means starting clean: the
             old one carries a half-flushed transcript, a partial-transcript queue
             nobody will read again, and a log filter holding the API key."""
+            if route.provider == "openai":
+                return OpenAIRealtimeSession(
+                    api_key=settings.openai_api_key,
+                    model=route.model,
+                    system_instruction=system_instruction,
+                    tools=tool_specs,
+                    voice_name=settings.openai_realtime_voice,
+                )
             return GeminiLiveSession(
                 api_key=settings.gemini_api_key,
                 model=route.model,
@@ -1218,10 +1292,12 @@ async def run_voice(
                 new_session,
                 audio,
                 companion,
-                GeminiLiveError,
+                (GeminiLiveError, OpenAIRealtimeError),
                 opening_audio=opening_audio,
+                opening_text=opening_text,
                 screen_share=screen_share,
                 screen_pump_factory=screen_pump_factory,
+                barge_in=settings.voice_barge_in,
             )
         finally:
             with suppress(Exception):
@@ -1256,12 +1332,25 @@ READY_CUE_HZ = (784.0, 1046.5)
 falling one reads as "finished", and neither is a word - so it cannot be mistaken for
 the daemon speaking or transcribed as one."""
 
-READY_CUE_MS = 90
-READY_CUE_GAIN = 0.18
-"""Short and quiet on purpose. The cue answers "may I speak now?", and the honest
-answer is that until it existed there was none: the wake gate released the microphone
-and about a second passed with nothing to say the session was live, so the owner
-guessed - and guessing early is how an utterance lands in the handover and is lost."""
+READY_CUE_MS = 180
+READY_CUE_GAIN = 0.35
+"""Short, and loud enough to be unmistakable. The cue answers "may I speak now?",
+and the honest answer is that until it existed there was none: the wake gate released
+the microphone and about a second passed with nothing to say the session was live, so
+the owner guessed - and guessing early is how an utterance lands in the handover and
+is lost.
+
+Raised from 90 ms / 0.18 after the owner reported the failure this was supposed to
+prevent, in its worst form. Below about a second of silence a person assumes the wake
+word did not register and **says it again, louder** - and on this provider each repeat
+lands in the already-open session as a fresh turn that *interrupts the answer being
+generated*, which the server then discards and regenerates from the top (documented:
+Live API cancels and discards an interrupted generation; google-gemini/cookbook#1197
+reproduces the resulting restart loop on this exact model). The observed symptom was
+the daemon restarting the same sentence three times. So the acknowledgement has to be
+heard the first time: an ack nobody notices is the root of a cascade, not a nicety.
+Still well under the "startle" bound, still not a word, and still played through the
+echo-cancelled engine so it cannot be heard as speech by the far end."""
 
 
 def ready_cue(sample_rate: int) -> bytes:
@@ -1320,10 +1409,12 @@ async def _voice_attempts(
     new_session: Callable[[], Any],
     audio: AudioIO,
     companion: Companion,
-    session_error: type[Exception],
+    session_error: type[Exception] | tuple[type[Exception], ...],
     opening_audio: bytes = b"",
+    opening_text: str = "",
     screen_share: Any = None,
     screen_pump_factory: Callable[[Any], Any] | None = None,
+    barge_in: bool = True,
 ) -> int:
     """Hold a conversation, and pick it back up if the session is cut.
 
@@ -1359,8 +1450,10 @@ async def _voice_attempts(
             audio,
             companion,
             opening_audio=pending_opening,
+            opening_text=opening_text,
             screen_share=screen_share,
             screen_pump_factory=screen_pump_factory,
+            barge_in=barge_in,
         )
         failure: Exception | None = None
         try:
@@ -1453,6 +1546,17 @@ def _mic_health() -> str:
     return microphone_authorization_status()
 
 
+def _only_the_wake_word(fired: Any) -> bool:
+    """Did the owner call the name and stop, with no question attached?
+
+    Compared in the wake gate's own normalised form, so spacing, punctuation and
+    Unicode form cannot make "벨라" look different from the alias it matched.
+    """
+    from daemon.voice.wake import normalise
+
+    return normalise(fired.heard) == normalise(fired.matched)
+
+
 async def _wake_round(
     settings: Settings, shared: VoiceRuntime | None = None, state: Any = None
 ) -> None:
@@ -1496,11 +1600,32 @@ async def _wake_round(
         # guard handles the pacing.
         return
     logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
-    # The segment that fired the gate goes with it. Without this the session opens
-    # deaf to the question it was opened for: the gate consumed "루시 뭐 해", matched
-    # on the alias, and the owner had to say "뭐 해" again into a microphone that had
-    # just changed hands.
-    await run_voice(settings, opening_audio=fired.pcm, shared=shared)
+    # The segment that fired the gate goes with it - but only when it carries more
+    # than the name. Without it the session opens deaf to the question it was opened
+    # for: the gate consumed "루시 뭐 해", matched on the alias, and the owner had to
+    # say "뭐 해" again into a microphone that had just changed hands.
+    #
+    # When the owner *only* called the name, the segment is the name alone, and
+    # handing over its audio gives the session's own transcriber a syllable to
+    # misread as a first utterance. Measured: "벨라" arrived at the model as "별로"
+    # - an ordinary Korean word meaning "not really" - so the daemon opened by
+    # answering something the owner had not said. The local recognizer has already
+    # decided what this segment is, so the *words* are settled and only the audio
+    # is ambiguous: the name goes over as text instead, where there is nothing left
+    # to mishear. Sending nothing at all was tried in between and is worse - the
+    # owner called, got silence, waited ten seconds and called again.
+    from daemon.voice.conversation import CALLED_BY_NAME
+
+    name_only = _only_the_wake_word(fired)
+    await run_voice(
+        settings,
+        opening_audio=b"" if name_only else fired.pcm,
+        # What being called *means*, not what it sounded like: the recognizer's
+        # rendering is routinely not the name (see CALLED_BY_NAME), and handing that
+        # over made the daemon puzzle over a word nobody said.
+        opening_text=CALLED_BY_NAME if name_only else "",
+        shared=shared,
+    )
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
     await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)

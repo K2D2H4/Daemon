@@ -303,30 +303,53 @@ class VoiceProcessingAudio:
             if pcm:
                 loop.call_soon_threadsafe(enqueue, pcm)
 
-        # The second of the two holders `daemon/mic_hold.py`'s counter exists
-        # for - `SoundDeviceAudio.record()` in daemon/voice/audio.py is the
-        # first, and its own hold covers construction for the same reason this
-        # one starts here rather than after `installTapOnBus_...`: the engine
-        # can fail to start or the tap can fail to install, and a hold taken
-        # after that point would never be entered, never be released, and never
-        # be wrong in a way a green suite could see.
+        # The second of the two holders `daemon/mic_hold.py`'s counter exists for -
+        # `SoundDeviceAudio.record()` in daemon/voice/audio.py is the first. It
+        # wraps the install rather than starting after it for the same reason the
+        # other one wraps stream construction: the engine can fail to start or the
+        # tap can fail to install, and a hold taken after that point would never be
+        # entered, never be released, and never be wrong in a way a green suite
+        # could see. Outermost, so every path out of the generator releases it -
+        # including the cancellation path the `finally` below exists for.
         with mic_hold.hold():
-            with self._guard:
-                self._start()
-                self._input.installTapOnBus_bufferSize_format_block_(
-                    0, TAP_BUFFER_FRAMES, self._source_format, on_buffer
-                )
-                self._tapped = True
+            # Both tap calls block inside CoreAudio - `installTap` waits on the
+            # engine starting, `removeTap` on the render threads draining - so
+            # neither may run on the event loop. See `close` for what that cost
+            # when it wedged.
             try:
+                # Inside the `try`, so a cancellation landing mid-install still
+                # reaches the `finally` that removes the tap. Outside it, the
+                # thread finished installing while the generator never entered its
+                # own cleanup, and the microphone stayed live (proved by
+                # tests/test_apple_audio.py).
+                await asyncio.to_thread(self._install_tap_blocking, on_buffer)
                 while True:
                     yield await blocks.get()
             finally:
                 # Reached on cancellation and on the consumer breaking out. A tap
                 # nobody reads is a microphone light left on.
-                with self._guard:
-                    if self._tapped and self._input is not None:
-                        self._input.removeTapOnBus_(0)
-                        self._tapped = False
+                # Synchronous, unlike every other call here, and not an oversight:
+                # this runs in an async generator's `finally`, which is reached
+                # through `aclose()` on a cancelled task - and a fresh `await`
+                # there is cancelled before it can start, so the tap would leak
+                # (proved by tests/test_apple_audio.py). Removing a tap is also not
+                # where the measured deadlock was; that was `AudioOutputUnitStop`
+                # in `close`, which is on a thread now.
+                self._remove_tap_blocking()
+
+    def _install_tap_blocking(self, on_buffer: Any) -> None:
+        with self._guard:
+            self._start()
+            self._input.installTapOnBus_bufferSize_format_block_(
+                0, TAP_BUFFER_FRAMES, self._source_format, on_buffer
+            )
+            self._tapped = True
+
+    def _remove_tap_blocking(self) -> None:
+        with self._guard:
+            if self._tapped and self._input is not None:
+                self._input.removeTapOnBus_(0)
+                self._tapped = False
 
     def _convert(self, buffer: Any) -> bytes:
         """One tap buffer to 16 kHz mono 16-bit PCM.
@@ -391,23 +414,30 @@ class VoiceProcessingAudio:
         if not chunk or self._closed:
             return
         try:
-            with self._guard:
-                self._start()
-                buffer = self._playback_buffer(chunk)
-                if buffer is None:
-                    return
-                player = self._player
-                if not player.isPlaying():
-                    # `stop_playback` leaves the player stopped, so this is also
-                    # how the next answer starts.
-                    player.play()
-                player.scheduleBuffer_completionHandler_(buffer, None)
+            # Off the event loop, like every other call into this engine - see
+            # `close`. Ordering is preserved because callers await each chunk
+            # before handing over the next.
+            await asyncio.to_thread(self._play_blocking, chunk)
         except AudioUnavailable as exc:
             self._closed = True
             logger.error("apple audio: playback is unavailable, going mute: %s", exc)
         except Exception:
             # One bad chunk must not end playback for the rest of the conversation.
             logger.exception("apple audio: dropping a chunk the speaker refused")
+
+    def _play_blocking(self, chunk: bytes) -> None:
+        """The engine half of `play`, on a worker thread."""
+        with self._guard:
+            self._start()
+            buffer = self._playback_buffer(chunk)
+            if buffer is None:
+                return
+            player = self._player
+            if not player.isPlaying():
+                # `stop_playback` leaves the player stopped, so this is also
+                # how the next answer starts.
+                player.play()
+            player.scheduleBuffer_completionHandler_(buffer, None)
 
     def _playback_buffer(self, chunk: bytes) -> Any:
         avf = self._frameworks.avfoundation  # type: ignore[union-attr]
@@ -430,12 +460,29 @@ class VoiceProcessingAudio:
         - `play` hands each chunk straight to the engine. The player is left
         stopped and `play` starts it again.
         """
+        await asyncio.to_thread(self._stop_playback_blocking)
+
+    def _stop_playback_blocking(self) -> None:
         with self._guard:
             if self._player is not None and self._started:
                 self._player.stop()
 
     async def close(self) -> None:
-        """Stop the engine and release the device."""
+        """Stop the engine and release the device.
+
+        On a worker thread, because every call here can block indefinitely inside
+        CoreAudio and this one is the worst of them. Measured on the owner's Mac:
+        `AudioOutputUnitStop` parked on `HALB_Mutex::Lock` and never returned, and
+        because it was awaited straight on the event loop it took the **whole
+        daemon** with it - Telegram stopped polling, `/health` stopped answering,
+        and the resident sat there alive and mute until it was killed. A wedged
+        audio device must cost the conversation, not the process.
+        `daemon/voice/audio.py` reached this conclusion first, for PortAudio; this
+        engine simply never had it applied.
+        """
+        await asyncio.to_thread(self._close_blocking)
+
+    def _close_blocking(self) -> None:
         with self._guard:
             self._closed = True
             engine, self._engine = self._engine, None

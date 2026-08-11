@@ -23,6 +23,7 @@ real browser on `127.0.0.1` sends exactly that Host, and `TestClient`'s default
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -228,6 +229,32 @@ def test_shell_page_renders_offline(tmp_path: Path) -> None:
     assert "Daemon" in resp.text
 
 
+def test_voice_sensitivities_are_wired_through_the_provider_aware_block(
+    tmp_path: Path,
+) -> None:
+    """voice_start/end_sensitivity are Gemini-only (daemon/voice/openai_realtime.py
+    never reads them, and app.py passes them only in the GeminiLiveSession branch).
+    The shell has no JS harness, so this cannot drive a real provider switch - but it
+    can assert the source is structured so a switch would work: the two sensitivity
+    fields must be emitted from inside `voiceField()`, the function the `voice_provider`
+    `change` listener re-renders, rather than unconditionally in `renderSettings()`.
+    Reverting to the old unconditional emission (both fieldStr calls sitting in
+    renderSettings, outside voiceField) would fail this test.
+    """
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+    html = client.get("/admin/").text
+
+    start = html.index("function voiceField(")
+    end = html.index("\nfunction ", start + 1)
+    voice_field_fn = html[start:end]
+    outside = html[:start] + html[end:]
+
+    for name in ("voice_start_sensitivity", "voice_end_sensitivity"):
+        assert name in voice_field_fn, f"{name} must render from inside voiceField()"
+        assert name not in outside, f"{name} must not also render unconditionally"
+
+
 def test_restart_refuses_when_not_supervised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -409,6 +436,46 @@ def test_patch_sets_the_gemini_live_voice(tmp_path: Path) -> None:
     )
 
 
+def test_patch_sets_the_openai_voice_provider_and_voice(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch("/admin/api/settings", json={
+        "voice_provider": "openai",
+        "openai_realtime_voice": "alloy",
+        "openai_realtime_model": "gpt-realtime",
+    })
+    assert resp.status_code == 200
+    text = env.read_text(encoding="utf-8")
+    assert "DAEMON_VOICE_PROVIDER=openai" in text
+    assert "DAEMON_OPENAI_REALTIME_VOICE=alloy" in text
+    assert "DAEMON_OPENAI_REALTIME_MODEL=gpt-realtime" in text
+
+    got = client.get("/admin/api/settings").json()
+    voice_providers = got["options"]["voice_providers"]
+    assert "openai" in voice_providers and "gemini" in voice_providers
+    assert got["options"]["openai_realtime_voices"][0] == ""  # server-default offered first
+    assert "alloy" in got["options"]["openai_realtime_voices"]
+
+
+def test_patch_rejects_an_unknown_voice_provider_and_openai_voice(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    original = "DAEMON_PRESET=offline\n"
+    env.write_text(original, encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    bad_provider = client.patch("/admin/api/settings", json={"voice_provider": "anthropic"})
+    assert bad_provider.status_code == 400
+    bad_voice = client.patch("/admin/api/settings", json={"openai_realtime_voice": "nope"})
+    assert bad_voice.status_code == 400
+    assert env.read_text(encoding="utf-8") == original, "a rejected patch still wrote"
+
+
 def test_patch_rejects_an_unknown_gemini_live_voice(tmp_path: Path) -> None:
     env = tmp_path / ".env"
     original = "DAEMON_PRESET=offline\n"
@@ -442,36 +509,167 @@ def test_a_newline_in_a_route_override_is_refused(tmp_path: Path) -> None:
     assert env.read_text(encoding="utf-8") == original
 
 
-def test_voice_sample_serves_a_present_clip(
+def test_voice_sample_serves_both_providers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     samples = tmp_path / "voice-samples"
-    samples.mkdir()
-    (samples / "Kore.mp3").write_bytes(b"ID3-fake-mp3-bytes")
+    (samples / "gemini").mkdir(parents=True)
+    (samples / "openai").mkdir(parents=True)
+    (samples / "gemini" / "Kore.mp3").write_bytes(b"ID3-gemini")
+    (samples / "openai" / "alloy.mp3").write_bytes(b"ID3-openai")
     monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
 
     app = create_app(_settings(tmp_path))
     client = TestClient(app, base_url=LOOPBACK)
-    resp = client.get("/admin/api/voice-sample/Kore")
+
+    g = client.get("/admin/api/voice-sample/gemini/Kore")   # Gemini no-regression
+    assert g.status_code == 200 and g.headers["content-type"] == "audio/mpeg"
+    assert g.content == b"ID3-gemini"
+    o = client.get("/admin/api/voice-sample/openai/alloy")
+    assert o.status_code == 200 and o.content == b"ID3-openai"
+
+
+def test_voice_sample_404_for_unknown_provider_voice_or_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    samples = tmp_path / "voice-samples"
+    (samples / "gemini").mkdir(parents=True)
+    monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
+
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+
+    assert client.get("/admin/api/voice-sample/gemini/Kore").status_code == 404   # known, no file
+    assert client.get("/admin/api/voice-sample/gemini/Nope").status_code == 404   # unknown voice
+    assert client.get("/admin/api/voice-sample/openai/Kore").status_code == 404   # wrong provider
+    assert client.get("/admin/api/voice-sample/nope/Kore").status_code == 404     # unknown provider
+    assert client.get("/admin/api/voice-sample/gemini/..%2f..%2fetc%2fpasswd").status_code == 404
+
+
+# --- the switches and ids that used to be hand-edit-only ----------------------
+#
+# The Overview reports a proactivity budget, a wake gate and a screen capability;
+# until this milestone none of their switches were editable here, so the page
+# described a daemon it could not configure. These prove the round-trip for the
+# kinds that are not plain strings.
+
+
+def test_patch_sets_a_switch_the_overview_reports_on(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch(
+        "/admin/api/settings", json={"proactive_enabled": True, "voice_barge_in": False}
+    )
+    assert resp.status_code == 200, resp.text
+    written = env.read_text(encoding="utf-8")
+    assert "DAEMON_PROACTIVE_ENABLED=true" in written
+    assert "DAEMON_VOICE_BARGE_IN=false" in written
+
+    restarted = Settings(_env_file=str(env), preset="offline", data_dir=tmp_path)
+    assert restarted.proactive_enabled is True
+    assert restarted.voice_barge_in is False, (
+        "the switch main added in v0.1.27 must survive the round-trip, or the page "
+        "silently reverts a value the owner set by hand"
+    )
+
+
+def test_wake_aliases_round_trip_as_the_comma_form_a_person_types(tmp_path: Path) -> None:
+    """Korean, because that is what the recognizer returns for this owner and the
+    JSON-array form a naive round-trip produces is not what `.env` holds."""
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch("/admin/api/settings", json={"wake_aliases": "헤이 대문,루씨"})
+    assert resp.status_code == 200, resp.text
+    assert "DAEMON_WAKE_ALIASES=헤이 대문,루씨" in env.read_text(encoding="utf-8")
+
+    restarted = Settings(_env_file=str(env), preset="offline", data_dir=tmp_path)
+    assert restarted.wake_aliases == ("헤이 대문", "루씨")
+
+    shown = TestClient(
+        create_app(restarted), base_url=LOOPBACK
+    ).get("/admin/api/settings").json()
+    assert shown["editable"]["wake_aliases"] == "헤이 대문,루씨", (
+        "reported as the comma form, not as a JSON array - the field is a text input"
+    )
+
+
+def test_the_telegram_token_is_never_reported_back(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\nTELEGRAM_BOT_TOKEN=123:secret\n", encoding="utf-8")
+    settings = Settings(_env_file=str(env), preset="offline", data_dir=tmp_path)
+    client = TestClient(create_app(settings), base_url=LOOPBACK)
+
+    body = client.get("/admin/api/settings").json()
+
+    assert body["editable"]["telegram_bot_token"] == "set"
+    assert "123:secret" not in json.dumps(body), "the token left the machine"
+
+
+def test_an_incoherent_switch_combination_is_refused_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """The wake gate exists only to open a voice session, so `Settings` refuses it
+    without voice. The admin must surface that as a 400 rather than write a config
+    the next boot would die on - the whole reason a patch is validated by
+    constructing a candidate before a byte is written."""
+    env = tmp_path / ".env"
+    original = "DAEMON_PRESET=offline\n"
+    env.write_text(original, encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch("/admin/api/settings", json={"wake_enabled": True})
+
+    assert resp.status_code == 400
+    assert "DAEMON_VOICE_ENABLED" in resp.json()["detail"], (
+        "the error has to name the setting that would fix it"
+    )
+    assert env.read_text(encoding="utf-8") == original, "a refused patch reached .env"
+
+
+def test_a_saved_value_is_reported_as_pending_until_the_restart(tmp_path: Path) -> None:
+    """The running daemon does not hot-reload, so after a save `app.state.settings`
+    still holds the old value. Reporting only that made a reload after a successful
+    save look exactly like a save that was lost (measured by doing it). `pending`
+    says what `.env` holds *beside* what the process is running - never instead of
+    it, because the admin's one job is not to lie about the daemon's actual state."""
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\nDAEMON_RECALL_LIMIT=6\n", encoding="utf-8")
+    app = create_app(Settings(_env_file=str(env), preset="offline", data_dir=tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    assert client.get("/admin/api/settings").json()["pending"] == {}, "nothing saved yet"
+
+    assert client.patch("/admin/api/settings", json={"recall_limit": 17}).status_code == 200
+
+    body = client.get("/admin/api/settings").json()
+    assert body["pending"] == {"recall_limit": 17}, "the saved value has to be visible"
+    assert body["editable"]["recall_limit"] == 6, (
+        "and the running value must still be reported as the running value"
+    )
+
+
+def test_an_unreadable_env_reports_no_pending_rather_than_failing(tmp_path: Path) -> None:
+    """`pending` is a convenience over the settings page's real job. A `.env` that
+    cannot be built into a candidate must cost the reader that convenience, never
+    the page."""
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=nonsense-preset\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.get("/admin/api/settings")
 
     assert resp.status_code == 200
-    assert resp.headers["content-type"] == "audio/mpeg"
-    assert resp.content == b"ID3-fake-mp3-bytes"
-
-
-def test_voice_sample_404_for_missing_or_unknown_and_never_reads_a_bad_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    samples = tmp_path / "voice-samples"
-    samples.mkdir()
-    monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
-
-    app = create_app(_settings(tmp_path))
-    client = TestClient(app, base_url=LOOPBACK)
-
-    # Known voice, but no file generated yet -> 404, not 500.
-    assert client.get("/admin/api/voice-sample/Kore").status_code == 404
-    # A name outside the allowlist -> 404, and the allowlist check runs before any
-    # filesystem touch, so a traversal attempt never resolves a path.
-    assert client.get("/admin/api/voice-sample/Nope").status_code == 404
-    assert client.get("/admin/api/voice-sample/..%2f..%2fetc%2fpasswd").status_code == 404
+    assert resp.json()["pending"] == {}

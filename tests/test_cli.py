@@ -1287,3 +1287,176 @@ def test_reindex_restores_persona_rules_from_learned_md(
         assert len(store.active_persona_rules()) == 5, "a second reindex must not duplicate rows"
     finally:
         store.close()
+
+
+# --- `daemon help` -----------------------------------------------------------
+
+
+def test_help_prints_exactly_what_dash_dash_help_prints(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The whole point of the subcommand: one document, reachable two ways. If
+    these ever differ, someone has written a second command list by hand."""
+    assert cli.main(["help"]) == 0
+    printed = capsys.readouterr().out
+    assert printed == cli.build_parser().format_help()
+
+
+def test_every_command_is_filed_under_a_group() -> None:
+    """The grouped epilog is the only listing there is, so a command missing from
+    it is a command nobody can discover."""
+    parser = cli.build_parser()
+    grouped = {name for entries in parser.command_groups.values() for name, _ in entries}
+    assert grouped == set(parser.command_parsers)
+
+
+def test_groups_are_the_declared_ones() -> None:
+    parser = cli.build_parser()
+    assert set(parser.command_groups) <= set(cli._GROUP_ORDER)
+
+
+def test_help_lists_each_command_once(capsys: pytest.CaptureFixture[str]) -> None:
+    cli.main(["help"])
+    printed = capsys.readouterr().out
+    for name in cli.build_parser().command_parsers:
+        listed = [
+            line for line in printed.splitlines() if line.startswith(f"  {name} ")
+        ]
+        assert len(listed) == 1, f"{name} appears {len(listed)} times"
+
+
+def test_help_for_one_command_prints_that_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["help", "log"]) == 0
+    printed = capsys.readouterr().out
+    assert "usage: daemon log" in printed
+    assert "--raw" in printed
+
+
+def test_help_for_an_unknown_command_names_the_real_ones(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["help", "lgo"]) == cli.USAGE
+    err = capsys.readouterr().err
+    assert "no such command: lgo" in err
+    assert "doctor" in err
+
+
+def test_help_works_without_a_usable_configuration(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Being told what the commands are is most needed when nothing else works."""
+
+    def broken() -> Settings:
+        raise AssertionError("help must not construct Settings")
+
+    monkeypatch.setattr(cli, "Settings", broken)
+    assert cli.main(["help"]) == 0
+    assert "every day:" in capsys.readouterr().out
+
+
+# --- `daemon log` ------------------------------------------------------------
+
+NOISE = (
+    '2026-08-11 11:03:49,334 INFO uvicorn.access 127.0.0.1:54813 - '
+    '"GET /admin/api/health HTTP/1.1" 200'
+)
+POLL = (
+    "2026-08-11 11:03:01,433 INFO httpx HTTP Request: POST "
+    'https://api.telegram.org/bot<token>/getUpdates "HTTP/1.1 200 OK"'
+)
+SIGNAL = "2026-08-11 11:01:27,688 INFO daemon.app proactive: silent - 0 generated"
+
+
+@pytest.fixture
+def log_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point `daemon log` at a log this test owns, never a developer's real one."""
+    path = tmp_path / "ai.daemon.default.err.log"
+    monkeypatch.setattr(
+        cli, "service_for", lambda settings: SimpleNamespace(err_log=path)
+    )
+    return path
+
+
+def test_log_drops_the_polling_and_keeps_the_rest(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_file.write_text("\n".join([NOISE, SIGNAL, POLL, NOISE]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_raw_keeps_the_polling(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_file.write_text("\n".join([NOISE, SIGNAL, POLL]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log", "--raw"]) == 0
+    assert capsys.readouterr().out.splitlines() == [NOISE, SIGNAL, POLL]
+
+
+def test_log_counts_the_lines_it_shows_not_the_lines_it_reads(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Over half a real log is polling. Filtering *after* taking the last N made
+    `daemon log` print an empty screen on an idle daemon, which reads as broken."""
+    log_file.write_text(
+        "\n".join([SIGNAL, *([NOISE] * 200), SIGNAL]) + "\n", encoding="utf-8"
+    )
+
+    assert cli.main(["log", "-n", "2"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL, SIGNAL]
+
+
+def test_log_keeps_a_failed_poll(log_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A 409 from getUpdates is the line that explains two bots sharing a token -
+    exactly the failure this filter must never hide."""
+    conflict = POLL.replace("200 OK", "409 Conflict")
+    server_error = NOISE.replace("HTTP/1.1\" 200", "HTTP/1.1\" 500")
+    log_file.write_text("\n".join([conflict, server_error]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [conflict, server_error]
+
+
+def test_log_without_a_file_says_so(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["log"]) == cli.PROBLEM
+    assert "no log at" in capsys.readouterr().err
+
+
+def test_tail_reads_back_across_block_boundaries(tmp_path: Path) -> None:
+    """The backward reader stitches blocks together; a line split across two of
+    them must not come back mangled or doubled."""
+    path = tmp_path / "big.log"
+    lines = [f"{n:05d} " + "x" * 200 for n in range(400)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert cli._tail_lines(path, 3, cli._keeper(raw=True)) == lines[-3:]
+    assert cli._tail_lines(path, 400, cli._keeper(raw=True)) == lines
+    assert cli._tail_lines(path, 900, cli._keeper(raw=True)) == lines
+
+
+def test_tail_of_an_empty_log_is_empty(tmp_path: Path) -> None:
+    path = tmp_path / "empty.log"
+    path.write_text("", encoding="utf-8")
+    assert cli._tail_lines(path, 10, cli._keeper(raw=True)) == []
+
+
+def test_follow_yields_lines_as_they_are_appended(tmp_path: Path) -> None:
+    """The follow path is a generator precisely so it can be tested without a
+    thread and without waiting on a loop that never ends."""
+    path = tmp_path / "live.log"
+    path.write_text("already here\n", encoding="utf-8")
+
+    stream = cli._stream_lines(path)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("first\nsecond\n")
+    try:
+        assert next(stream) == "first"
+        assert next(stream) == "second"
+    finally:
+        stream.close()

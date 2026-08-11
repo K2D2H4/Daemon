@@ -15,10 +15,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import pytest
 from test_loop import FakeMemory, FakeRecall, Ids, recalled
 
 from daemon import clock
-from daemon.companion import TOOL_CONTRACT, Companion, render_recall
+from daemon.companion import TOOL_CONTRACT, Companion, google_account_hint, render_recall
 from daemon.llm.base import ToolSpec
 from daemon.memory.base import LoggedMessage
 
@@ -96,6 +97,61 @@ async def test_an_empty_registry_is_not_a_tool_layer(data_dir: Path) -> None:
 
     assert companion.specs(origin="owner") == ()
     assert await companion.context("hello") == ()
+
+
+def test_google_account_hint_names_the_account_when_a_google_tool_is_offered() -> None:
+    specs = [ToolSpec("google__list_calendars", "d", {}), ToolSpec("read_file", "d", {})]
+    hint = google_account_hint(specs, "owner@gmail.com")
+    assert "owner@gmail.com" in hint and "user_google_email" in hint
+
+
+def test_google_account_hint_is_silent_without_a_google_tool() -> None:
+    """The workspace tools are the only ones that need it; the rules stay lean
+    otherwise (the same reason the whole tool block is skipped when unused)."""
+    assert google_account_hint([ToolSpec("read_file", "d", {})], "owner@gmail.com") == ""
+
+
+def test_google_account_hint_is_silent_without_an_authenticated_email() -> None:
+    """Zero or ambiguous accounts -> None -> no line, rather than a guessed address
+    that would reintroduce the exact mismatch this fixes."""
+    assert google_account_hint([ToolSpec("google__list_calendars", "d", {})], None) == ""
+
+
+async def test_tool_rules_carry_the_google_account_when_one_is_authenticated(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring, end to end: a turn offered a google tool, with exactly one cached
+    credential, gets the account named in its tool rules so the model stops guessing
+    a user_google_email from the OS username."""
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    (creds / "owner@gmail.com.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("WORKSPACE_MCP_CREDENTIALS_DIR", str(creds))
+    companion = Companion(
+        FakeMemory(), data_dir=data_dir, tools=FakeTools("google__list_calendars")
+    )
+
+    (rules,) = await companion.context("오늘 일정 뭐야?", origin="owner")
+
+    assert rules.startswith(TOOL_CONTRACT)
+    assert "owner@gmail.com" in rules
+
+
+async def test_a_non_owner_turn_never_carries_the_google_account(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The account is the owner's PII and rides in the system context. A relayed turn
+    is offered no tools (the origin gate), so it must get no tool block at all - and
+    certainly not the email - even with a google tool wired and a credential present."""
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    (creds / "owner@gmail.com.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("WORKSPACE_MCP_CREDENTIALS_DIR", str(creds))
+    companion = Companion(
+        FakeMemory(), data_dir=data_dir, tools=FakeTools("google__list_calendars")
+    )
+
+    assert await companion.context("이거 봐봐", origin="untrusted") == ()
 
 
 async def test_recall_the_window_already_carries_is_not_repeated(data_dir: Path) -> None:
@@ -368,3 +424,22 @@ async def test_stale_history_yields_no_block(data_dir: Path) -> None:
     companion = Companion(memory, data_dir=data_dir)
 
     assert await companion.continuity_block() == ""
+
+
+async def test_the_continuity_block_says_the_owner_outranks_the_transcript(
+    data_dir: Path,
+) -> None:
+    """These lines are speech recognition output, and it mishears: a bad moment of
+    audio attributed words to the owner that they never said, this block replayed it
+    into every later session, and the daemon quoted its own record back as proof when
+    told otherwise (measured - the owner could not talk their way out of a mishearing).
+    The header has to state that a denial ends the topic."""
+    memory = FakeMemory()
+    memory.records.append(said("면접 준비 도와줘"))
+    companion = Companion(memory, data_dir=data_dir)
+
+    block = await companion.continuity_block()
+
+    assert "mishears" in block, "the block must admit the transcript can be wrong"
+    assert "they are right and this record is wrong" in block
+    assert "never insist they said it" in block

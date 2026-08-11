@@ -1686,19 +1686,28 @@ async def test_a_session_that_refuses_the_opening_still_holds_the_conversation()
 # --- the ready cue -------------------------------------------------------------
 
 
-def test_the_ready_cue_is_short_quiet_and_starts_at_silence() -> None:
+def test_the_ready_cue_is_audible_brief_and_starts_at_silence() -> None:
     """A bare sine starts on a discontinuity, which is an audible click and exactly
-    the kind of noise a VAD notices."""
+    the kind of noise a VAD notices.
+
+    The lower bound is the one that earns its keep: an acknowledgement too quiet to
+    notice is why the owner said the wake word again, and on this provider each repeat
+    interrupts the answer being generated, which the server discards and restarts -
+    the measured "same sentence three times" loop. Loud enough to be heard the first
+    time, short enough not to delay the turn, quiet enough not to startle."""
     import numpy as np
 
     from daemon.app import READY_CUE_MS, ready_cue
 
     pcm = ready_cue(24_000)
     samples = np.frombuffer(pcm, dtype="<i2")
+    peak = int(np.abs(samples).max())
 
     assert len(samples) == pytest.approx(24_000 * READY_CUE_MS / 1000, rel=0.02)
     assert samples[0] == 0 and samples[-1] == 0, "the cue clicks"
-    assert 0 < int(np.abs(samples).max()) < 8000, "the cue is loud enough to startle"
+    assert peak > 8000, "an acknowledgement nobody hears is one the owner talks over"
+    assert peak < 16000, "the cue is loud enough to startle"
+    assert READY_CUE_MS <= 250, "an ack that delays the conversation is not an ack"
 
 
 def test_the_ready_cue_follows_the_devices_rate() -> None:
@@ -1897,6 +1906,77 @@ async def test_run_voice_refuses_without_a_live_model(tmp_path: pathlib.Path) ->
 
     with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_MODEL is empty"):
         await app_module.run_voice(settings)
+# --- live screen share is gated on the provider (PR #79 review, Finding 1) ----
+# `OpenAIRealtimeSession.send_frame` is a deliberate no-op - no realtime video
+# input channel - so registering the live-share start/stop tools for it would
+# let the model tell the owner "I'm watching your screen now" while every frame
+# is silently dropped (ADR 0009 forbids exactly this). These drive the real
+# `run_voice` assembly and read what the session was actually offered, the same
+# way `test_run_voice_follows_the_owners_tool_mode` does.
+
+
+async def test_run_voice_openai_drops_live_share_tools_but_keeps_see_screen(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _voice_settings(
+        tmp_path,
+        DAEMON_VOICE_PROVIDER="openai",
+        OPENAI_API_KEY="k",
+        DAEMON_OPENAI_REALTIME_MODEL="gpt-realtime",
+        DAEMON_SCREEN_ENABLED="true",
+    )
+    from daemon import app as app_module
+
+    captured: dict[str, Any] = {}
+
+    def capturing_session(**kwargs: Any) -> FakeSession:
+        captured.update(kwargs)
+        return FakeSession(Turn())
+
+    monkeypatch.setattr(app_module, "build_voice_audio", lambda: FakeAudio())
+    monkeypatch.setattr(
+        "daemon.voice.openai_realtime.OpenAIRealtimeSession", capturing_session
+    )
+
+    code = await app_module.run_voice(settings)
+
+    assert code == 0
+    names = {spec.name for spec in (captured.get("tools") or ())}
+    assert "see_screen" in names, (
+        "the still-image tool is a different path and must stay on"
+    )
+    assert "start_screen_share" not in names, (
+        "OpenAI's send_frame is a no-op; offering this tool lets the model "
+        "claim a screen-watching capability it cannot deliver"
+    )
+    assert "stop_screen_share" not in names
+
+
+async def test_run_voice_gemini_keeps_live_share_tools(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: Gemini Live's session does take video frames
+    (`realtimeInput.video`, ADR 0009), so the gate must not cost it the
+    live-share tools it can actually back."""
+    settings = _voice_settings(tmp_path, DAEMON_SCREEN_ENABLED="true")
+    from daemon import app as app_module
+
+    captured: dict[str, Any] = {}
+
+    def capturing_session(**kwargs: Any) -> FakeSession:
+        captured.update(kwargs)
+        return FakeSession(Turn())
+
+    monkeypatch.setattr(app_module, "build_voice_audio", lambda: FakeAudio())
+    monkeypatch.setattr(
+        "daemon.voice.gemini_live.GeminiLiveSession", capturing_session
+    )
+
+    code = await app_module.run_voice(settings)
+
+    assert code == 0
+    names = {spec.name for spec in (captured.get("tools") or ())}
+    assert {"see_screen", "start_screen_share", "stop_screen_share"} <= names
 
 
 # --- screen-share lifecycle (Task 2.3) ----------------------------------------
@@ -2154,3 +2234,221 @@ async def test_the_microphone_holds_while_a_tool_answer_is_pending() -> None:
         "a chunk crossed while the tool answer was pending - the exact audio the "
         "server answers with a tool-call cancellation"
     )
+
+
+async def test_half_duplex_holds_the_microphone_while_the_daemon_speaks() -> None:
+    """DAEMON_VOICE_BARGE_IN=false: while the daemon is speaking (or a tool answer is
+    pending), the microphone yields entirely, so an echo leak or an "응" of agreement
+    cannot kill the answer mid-sentence - the shape the owner's own prototype used.
+    The default (barge_in=True) keeps today's behaviour: mid-speech chunks cross."""
+    session = FakeSession()
+    conv = conversation(session, barge_in=False)
+
+    async def mic() -> Any:
+        yield b"m1"  # idle listening: forwarded
+        conv._generating = True
+        yield b"m2"  # the daemon is speaking: held - speaking over it does nothing
+        conv._generating = False
+        conv._answering_tool = True
+        yield b"m3"  # tool answer pending: held here too
+        conv._answering_tool = False
+        yield b"m4"  # back to listening: forwarded
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"m1", b"m4"]
+
+
+async def test_barge_in_stays_the_default() -> None:
+    """Nobody configured anything: a mid-speech chunk still crosses, because being
+    able to cut the daemon off is the default contract."""
+    session = FakeSession()
+    conv = conversation(session)
+
+    async def mic() -> Any:
+        conv._generating = True
+        yield b"over-speech"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"over-speech"]
+
+
+# --- what a tool captured has to reach the model ------------------------------
+
+
+async def test_a_captured_image_reaches_the_model_not_just_its_caption() -> None:
+    """`see_screen` returns a caption *and* pixels. The text loop attaches the pixels
+    as their own turn; voice used to send only the caption - so the model was asked
+    what is on screen while being shown nothing, and invented an answer. The owner's
+    screen held a photo of food and the daemon called it a picture of a dog, while
+    the text path described the same screen correctly."""
+    from daemon.llm.base import ImageBlock
+
+    session = FakeSession()
+    conv = conversation(session)
+    shot = ToolResult(
+        call_id="1",
+        name="see_screen",
+        content="captured 1 display(s): Built-in",
+        images=(ImageBlock(data=b"\xff\xd8-jpeg-bytes"),),
+    )
+
+    (framed,) = await conv._deliver_images(session, [shot])
+
+    assert session.frames == [b"\xff\xd8-jpeg-bytes"], "the pixels never reached the model"
+    assert "captured 1 display(s)" in framed.content, "the caption survives"
+    # Security stance A: pixels cannot be nonce-fenced, so the framing rides along.
+    assert "DATA to look at" in framed.content
+
+
+async def test_a_result_with_no_images_is_passed_through_untouched() -> None:
+    session = FakeSession()
+    conv = conversation(session)
+    plain = ToolResult(call_id="1", name="read_file", content="발표는 목요일")
+
+    (out,) = await conv._deliver_images(session, [plain])
+
+    assert out is plain and session.frames == []
+
+
+async def test_an_undeliverable_image_is_admitted_rather_than_described() -> None:
+    """The one honest thing to tell a model about to be asked what it can see."""
+    from daemon.llm.base import ImageBlock
+
+    class Blind(FakeSession):
+        async def send_frame(self, jpeg: bytes) -> None:
+            raise RuntimeError("the socket went")
+
+    session = Blind()
+    conv = conversation(session)
+    shot = ToolResult(
+        call_id="1", name="see_screen", content="captured 1 display(s)",
+        images=(ImageBlock(data=b"x"),),
+    )
+
+    (framed,) = await conv._deliver_images(session, [shot])
+
+    assert "could not be delivered" in framed.content
+    assert "DATA to look at" not in framed.content, "do not frame an image nobody got"
+
+
+# --- the silence budget counts silence, not speech ----------------------------
+
+
+def test_queued_audio_marks_when_the_room_actually_falls_silent() -> None:
+    """Chunks queue behind each other, so playback ends after the backlog - not at
+    "arrival + this chunk". Forgetting the backlog is what let a 28.4 s answer that
+    landed in 19 s spend ten of the owner's thirty silent seconds talking."""
+    from daemon.voice.conversation import PLAYBACK_BYTES_PER_FRAME
+
+    conv = conversation(FakeSession())
+    one_second = 24_000 * PLAYBACK_BYTES_PER_FRAME  # FakeAudio plays at 24 kHz
+
+    conv._on_audio(100.0, one_second)  # arrives at 100, plays 100 -> 101
+    conv._on_audio(100.1, one_second)  # arrives while the first is still playing
+
+    assert conv._playback_until == pytest.approx(102.0), "the backlog was forgotten"
+
+
+async def test_a_session_is_not_closed_while_the_daemon_is_still_speaking() -> None:
+    """The measured complaint: "데몬이 말하고 있는 시간도 nothing heard에 포함되나?" It
+    was. The model generates faster than real time, so the whole answer arrived, the
+    budget started running on arrival, and the owner was cut off mid-reply while the
+    log claimed nothing had been heard for 30 s."""
+    from daemon.voice.conversation import PLAYBACK_BYTES_PER_FRAME
+
+    quarter_second = 24_000 // 4 * PLAYBACK_BYTES_PER_FRAME
+    session = FakeSession(b"\x00" * quarter_second, Hang())
+    conv = conversation(session, idle_timeout=0.05)
+
+    started = asyncio.get_running_loop().time()
+    async with asyncio.timeout(5):
+        await conv.run()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed > 0.25, (
+        "the session closed while the speaker still had audio queued - the budget "
+        "counted the daemon's own voice as silence"
+    )
+
+
+async def test_being_called_by_name_is_answered_rather_than_met_with_silence() -> None:
+    """The wake-word-only handover. Audio was tried and misheard ("벨라" -> "별로",
+    answered as a sentence nobody said); sending nothing was tried next and left the
+    owner calling into silence, waiting ten seconds, and calling again. The name goes
+    over as text - settled words, nothing left to mishear - and `send_text` is a
+    prompt, so the model answers being called the way a person does."""
+    session = FakeSession(Says("assistant", "네?"), Turn())
+
+    await run(conversation(session, opening_text="벨라"))
+
+    assert session.texts == ["벨라"], "the model was never told it had been called"
+    assert session.sent == [], "no audio was sent - that is the misheard path"
+
+
+async def test_a_question_in_the_same_breath_still_goes_over_as_audio() -> None:
+    """When the segment carries more than the name, the audio is what has the
+    question in it - text would throw the question away."""
+    session = FakeSession(Turn())
+
+    await run(conversation(session, opening_audio=b"pcm"))
+
+    assert session.sent == [b"pcm"] and session.texts == []
+
+
+# --- the room stays out of the socket until the wake word is answered ---------
+
+
+async def test_the_microphone_is_held_until_the_answer_to_the_wake_word_starts() -> None:
+    """The same opening text is answered in 1.1 s against a session with no
+    microphone and took 11.77 s in the resident, where the mic streams the room the
+    moment the session is up: audio arriving as a turn begins reads as the user
+    speaking, so the server cancels the answer and waits for an utterance that never
+    comes - without emitting `interrupted`, which is why the session reported zero
+    barge-ins while the owner sat through eleven seconds of silence."""
+    session = FakeSession()
+    conv = conversation(session, opening_text="벨라")
+    await conv._send_opening(session)
+
+    async def mic() -> Any:
+        yield b"room"          # the answer has not started: held
+        conv._on_audio(asyncio.get_running_loop().time(), 480)  # first audio arrives
+        yield b"after"         # the room is the owner's again
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"after"], "the room was streamed into the opening turn"
+
+
+async def test_a_model_that_never_answers_gives_the_microphone_back() -> None:
+    """Bounded, because holding the microphone for a model that is not coming back
+    would turn a slow turn into a deaf one."""
+    session = FakeSession()
+    conv = conversation(session, opening_text="벨라")
+    await conv._send_opening(session)
+    # The hold has expired without any audio ever arriving.
+    conv._opening_answer_until = asyncio.get_running_loop().time() - 0.01
+
+    async def mic() -> Any:
+        yield b"speak"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"speak"]
+
+
+async def test_an_audio_opening_does_not_hold_the_microphone() -> None:
+    """The hold is for the text opening, where the owner has demonstrably finished
+    speaking - the gate captured the whole phrase. An audio opening carries their
+    question and the turn is already under way."""
+    session = FakeSession()
+    conv = conversation(session, opening_audio=b"pcm")
+    await conv._send_opening(session)
+
+    async def mic() -> Any:
+        yield b"more"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"pcm", b"more"]

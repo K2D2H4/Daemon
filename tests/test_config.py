@@ -365,6 +365,70 @@ def test_a_non_positive_half_life_fails_at_startup() -> None:
         make_settings(preset="offline", recall_half_life_days=0)
 
 
+def test_a_wake_gate_without_a_live_model_fails_at_startup() -> None:
+    """Keyed on the wake gate rather than on `voice_enabled`, since the merge that
+    made one switch govern the local speaker too: `/usr/bin/say` needs no model, so
+    refusing to load over a missing one took the `offline` install's only voice
+    feature away along with the daemon. The wake gate keeps the check because
+    opening a hosted session is the only thing it does."""
+    with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_MODEL is empty"):
+        make_settings(
+            preset="balanced",
+            anthropic_api_key="k",
+            gemini_model="g",
+            gemini_api_key="k",
+            voice_enabled=True,
+            wake_enabled=True,
+            wake_aliases="벨라",
+        )
+
+
+def test_voice_provider_defaults_to_gemini() -> None:
+    assert make_settings(preset="offline").voice_provider == "gemini"
+
+
+def test_unknown_voice_provider_fails_at_startup() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_VOICE_PROVIDER"):
+        make_settings(preset="offline", voice_provider="anthropic")
+
+
+def test_openai_voice_route_uses_the_realtime_model_and_provider() -> None:
+    s = make_settings(
+        preset="quality", voice_enabled=True, voice_provider="openai",
+        openai_realtime_model="gpt-realtime", openai_api_key="sk-o", gemini_api_key="g",
+        anthropic_api_key="a",
+    )
+    route = s.route_for(Task.CHAT_VOICE)
+    assert route.provider == "openai"
+    assert route.model == "gpt-realtime"
+
+
+def test_openai_voice_requires_its_own_model_and_key() -> None:
+    """Same move as the gemini one above: these guard a hosted session, so at load
+    time they fire for the wake gate. `run_voice` applies the identical list when a
+    session actually opens - see tests/test_voice_conversation.py."""
+    wake = {"wake_enabled": True, "wake_aliases": "벨라"}
+    with pytest.raises(ConfigError, match="DAEMON_OPENAI_REALTIME_MODEL"):
+        make_settings(preset="quality", voice_enabled=True, voice_provider="openai",
+                      openai_api_key="sk-o", gemini_api_key="g", anthropic_api_key="a", **wake)
+    with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
+        make_settings(
+            preset="quality", voice_enabled=True, voice_provider="openai",
+            openai_realtime_model="gpt-realtime", gemini_api_key="g", anthropic_api_key="a",
+            **wake,
+        )
+
+
+def test_unknown_openai_realtime_voice_fails() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_OPENAI_REALTIME_VOICE"):
+        make_settings(preset="offline", openai_realtime_voice="not-a-voice")
+    assert (
+        make_settings(preset="offline", openai_realtime_voice="alloy").openai_realtime_voice
+        == "alloy"
+    )
+    assert make_settings(preset="offline", openai_realtime_voice="").openai_realtime_voice == ""
+
+
 def test_a_service_label_that_is_really_a_path_is_rejected() -> None:
     # The label becomes a filename under ~/Library/LaunchAgents.
     with pytest.raises(ConfigError, match="not a usable label"):

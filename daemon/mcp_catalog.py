@@ -57,6 +57,12 @@ class CatalogEntry:
     oauth_verified: bool = False
     pin_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    env: tuple[tuple[str, str], ...] = ()
+    """Fixed, non-secret env vars the server needs, set by the daemon rather than the
+    owner - a known-required flag, not a credential. `OAUTHLIB_INSECURE_TRANSPORT=1`
+    lets a stdio server accept its own `http://localhost` OAuth callback; it is not a
+    secret, so it rides in `mcp.json` (unlike `env_passthrough`, whose values stay in
+    the environment)."""
 
 
 CATALOG: tuple[CatalogEntry, ...] = (
@@ -150,6 +156,10 @@ CATALOG: tuple[CatalogEntry, ...] = (
         auth="none",
         pin_mcp=False,
         env_passthrough=("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"),
+        # The one-time consent redirects to http://localhost:8000/oauth2callback;
+        # oauthlib refuses a non-https callback unless this is set. A fixed flag, not a
+        # secret, so the daemon sets it rather than making the owner discover it.
+        env=(("OAUTHLIB_INSECURE_TRANSPORT", "1"),),
     ),
     # --- a fastmcp stdio server, authenticated with a Slack bot token ----------
     # Slack's hosted server (mcp.slack.com) has no dynamic client registration
