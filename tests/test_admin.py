@@ -483,39 +483,47 @@ def test_a_newline_in_a_route_override_is_refused(tmp_path: Path) -> None:
     assert env.read_text(encoding="utf-8") == original
 
 
-def test_voice_sample_serves_a_present_clip(
+def _voice_allowlists():
+    from daemon.config import GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES
+
+    return GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES
+
+
+def test_voice_sample_serves_both_providers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     samples = tmp_path / "voice-samples"
-    samples.mkdir()
-    (samples / "Kore.mp3").write_bytes(b"ID3-fake-mp3-bytes")
-    monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
-
-    app = create_app(_settings(tmp_path))
-    client = TestClient(app, base_url=LOOPBACK)
-    resp = client.get("/admin/api/voice-sample/Kore")
-
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] == "audio/mpeg"
-    assert resp.content == b"ID3-fake-mp3-bytes"
-
-
-def test_voice_sample_404_for_missing_or_unknown_and_never_reads_a_bad_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    samples = tmp_path / "voice-samples"
-    samples.mkdir()
+    (samples / "gemini").mkdir(parents=True)
+    (samples / "openai").mkdir(parents=True)
+    (samples / "gemini" / "Kore.mp3").write_bytes(b"ID3-gemini")
+    (samples / "openai" / "alloy.mp3").write_bytes(b"ID3-openai")
     monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
 
     app = create_app(_settings(tmp_path))
     client = TestClient(app, base_url=LOOPBACK)
 
-    # Known voice, but no file generated yet -> 404, not 500.
-    assert client.get("/admin/api/voice-sample/Kore").status_code == 404
-    # A name outside the allowlist -> 404, and the allowlist check runs before any
-    # filesystem touch, so a traversal attempt never resolves a path.
-    assert client.get("/admin/api/voice-sample/Nope").status_code == 404
-    assert client.get("/admin/api/voice-sample/..%2f..%2fetc%2fpasswd").status_code == 404
+    g = client.get("/admin/api/voice-sample/gemini/Kore")   # Gemini no-regression
+    assert g.status_code == 200 and g.headers["content-type"] == "audio/mpeg"
+    assert g.content == b"ID3-gemini"
+    o = client.get("/admin/api/voice-sample/openai/alloy")
+    assert o.status_code == 200 and o.content == b"ID3-openai"
+
+
+def test_voice_sample_404_for_unknown_provider_voice_or_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    samples = tmp_path / "voice-samples"
+    (samples / "gemini").mkdir(parents=True)
+    monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
+
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+
+    assert client.get("/admin/api/voice-sample/gemini/Kore").status_code == 404   # known, no file
+    assert client.get("/admin/api/voice-sample/gemini/Nope").status_code == 404   # unknown voice
+    assert client.get("/admin/api/voice-sample/openai/Kore").status_code == 404   # wrong provider
+    assert client.get("/admin/api/voice-sample/nope/Kore").status_code == 404     # unknown provider
+    assert client.get("/admin/api/voice-sample/gemini/..%2f..%2fetc%2fpasswd").status_code == 404
 
 
 # --- the switches and ids that used to be hand-edit-only ----------------------
