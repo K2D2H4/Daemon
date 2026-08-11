@@ -1036,17 +1036,23 @@ function fieldToggle(name,running){
     <span class="td">${esc(EXPLAIN[name]||'')}</span></span>
     <span class="sw" role="switch" tabindex="0" data-f="${name}" data-v="${v?'true':'false'}" aria-checked="${v?'true':'false'}"><i></i></span></div>`;
 }
-// Provider-aware voice picker. Renders the SELECTED provider's voice select + preview
-// inside a replaceable #voice-field, so changing the provider re-renders only this.
+// Provider-aware voice block. Renders the SELECTED provider's voice select + preview,
+// plus (gemini only) the two sensitivity knobs - openai_realtime.py never reads them,
+// so showing them under DAEMON_VOICE_PROVIDER=openai promised a control the backend
+// ignores. All of it lives inside the replaceable #voice-field, so changing the
+// provider re-renders the whole block at once (display:contents keeps its children
+// as direct .grid2 items, same as before this wrapper existed).
 function voiceField(provider,e,o){
   const isO=provider==='openai';
   const name=isO?'openai_realtime_voice':'gemini_live_voice';
   const opts=(isO?o.openai_realtime_voices:o.gemini_live_voices)||[''];
   const v=val(name,e[name]);
   const os=opts.map(x=>`<option ${x===v?'selected':''}>${esc(x)}</option>`).join('');
-  return `<div class="field" id="voice-field">${nameCell(name)}<select data-f="${name}">${os}</select>
+  const sens=isO?'':fieldStr('voice_start_sensitivity',e.voice_start_sensitivity,o.sensitivities)
+    +fieldStr('voice_end_sensitivity',e.voice_end_sensitivity,o.sensitivities);
+  return `<div id="voice-field" style="display:contents"><div class="field">${nameCell(name)}<select data-f="${name}">${os}</select>
     <div class="voice-preview"><button type="button" class="btn" id="voice-play">▶ preview</button>
-    <span class="cap" id="voice-preview-msg"></span><audio id="voice-sample" preload="none"></audio></div></div>`;
+    <span class="cap" id="voice-preview-msg"></span><audio id="voice-sample" preload="none"></audio></div></div>${sens}</div>`;
 }
 function card(title,inner){return `<div class="card pad"><span class="card-title">${title}</span>
   <div style="margin-top:14px">${inner}</div></div>`;}
@@ -1071,10 +1077,8 @@ function renderSettings(){
     +'<div class="grid2" style="margin-top:16px">'
     +fieldStr('voice_provider',e.voice_provider,o.voice_providers)
     +voiceField(val('voice_provider',e.voice_provider),e,o)
-    +fieldStr('wake_aliases',e.wake_aliases)
-    +fieldStr('voice_start_sensitivity',e.voice_start_sensitivity,o.sensitivities)
-    +fieldStr('voice_end_sensitivity',e.voice_end_sensitivity,o.sensitivities)+'</div>'
-    +'<p class="cap" style="margin:12px 0 0">Aliases are what the recognizer actually hears, comma-separated — `daemon wake calibrate` measures them. Empty sensitivity leaves it to the server.</p>');
+    +fieldStr('wake_aliases',e.wake_aliases)+'</div>'
+    +'<p class="cap" style="margin:12px 0 0">Aliases are what the recognizer actually hears, comma-separated — `daemon wake calibrate` measures them. Empty sensitivity leaves it to the server (Gemini only - OpenAI Realtime has no equivalent knob).</p>');
   h+=card('MEMORY','<div class="grid2">'+fieldNum('recall_limit',e.recall_limit)
     +fieldNum('recall_half_life_days',e.recall_half_life_days)+'</div>');
   h+=card('KEYS','<div class="grid2">'+SECRETS.map(s=>fieldSecret(s,e[s])).join('')+'</div>'

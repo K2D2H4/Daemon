@@ -229,6 +229,32 @@ def test_shell_page_renders_offline(tmp_path: Path) -> None:
     assert "Daemon" in resp.text
 
 
+def test_voice_sensitivities_are_wired_through_the_provider_aware_block(
+    tmp_path: Path,
+) -> None:
+    """voice_start/end_sensitivity are Gemini-only (daemon/voice/openai_realtime.py
+    never reads them, and app.py passes them only in the GeminiLiveSession branch).
+    The shell has no JS harness, so this cannot drive a real provider switch - but it
+    can assert the source is structured so a switch would work: the two sensitivity
+    fields must be emitted from inside `voiceField()`, the function the `voice_provider`
+    `change` listener re-renders, rather than unconditionally in `renderSettings()`.
+    Reverting to the old unconditional emission (both fieldStr calls sitting in
+    renderSettings, outside voiceField) would fail this test.
+    """
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+    html = client.get("/admin/").text
+
+    start = html.index("function voiceField(")
+    end = html.index("\nfunction ", start + 1)
+    voice_field_fn = html[start:end]
+    outside = html[:start] + html[end:]
+
+    for name in ("voice_start_sensitivity", "voice_end_sensitivity"):
+        assert name in voice_field_fn, f"{name} must render from inside voiceField()"
+        assert name not in outside, f"{name} must not also render unconditionally"
+
+
 def test_restart_refuses_when_not_supervised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
