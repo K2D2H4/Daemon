@@ -909,10 +909,9 @@ def wake_settings(**kwargs: Any) -> Settings:
 def voice_settings(**kwargs: Any) -> Settings:
     """A configuration where voice is genuinely available.
 
-    `offline` deliberately routes no voice task - that absence is what makes the
-    privacy claim in docs/PLAN.md 7 true - so turning voice on there fails for a
-    reason that has nothing to do with the wake gate, and a test asserting a wake
-    message would pass on somebody else's error."""
+    `balanced` rather than `offline` only because these tests predate voice being its
+    own axis (docs/adr/0012) and there is no reason to churn them: both presets can
+    carry voice now, and this one already has the keys the wake path expects."""
     return Settings(
         _env_file=None,
         DAEMON_PRESET="balanced",
