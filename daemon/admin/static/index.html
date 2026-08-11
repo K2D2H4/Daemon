@@ -1000,7 +1000,7 @@ $('#chat-in').addEventListener('keydown',e=>{if(e.key==='Enter')sendChat();});
 let SETTINGS=null, PENDING=null;
 const BOOLS=['voice_enabled','mcp_enabled','browser_enabled','tools_enabled',
   'screen_enabled','wake_enabled','voice_barge_in','proactive_enabled'];
-const SECRETS=['anthropic_api_key','openai_api_key','gemini_api_key','telegram_bot_token'];
+const SECRETS=['anthropic_api_key','openai_api_key','gemini_api_key','telegram_bot_token','openai_compatible_api_key'];
 const EXPLAIN={
   tools_enabled:'The master switch for PC control. Off means no tool runs, whatever the mode says.',
   browser_enabled:'Give the model fetch_page, list_tabs and read_page.',
@@ -1056,8 +1056,10 @@ function renderSettings(){
     +fieldStr('anthropic_model',e.anthropic_model)
     +fieldStr('openai_model',e.openai_model)
     +fieldStr('gemini_model',e.gemini_model)
-    +fieldStr('gemini_live_model',e.gemini_live_model)+'</div>'
-    +'<p class="cap" style="margin:12px 0 0">Each provider takes its own model id. Switching the hosted provider without naming its model is refused, so fill the one you are switching to.</p>');
+    +fieldStr('gemini_live_model',e.gemini_live_model)
+    +fieldStr('openai_compatible_base_url',e.openai_compatible_base_url)
+    +fieldStr('openai_compatible_model',e.openai_compatible_model)+'</div>'
+    +'<p class="cap" style="margin:12px 0 0">Each provider takes its own model id. Switching the hosted provider without naming its model is refused, so fill the one you are switching to. The compatible endpoint stops at the version segment (…/v1) — not the …/chat/completions path below it, which is refused.</p>');
   h+=card('CAPABILITIES',toggles(['tools_enabled','browser_enabled','screen_enabled','mcp_enabled','proactive_enabled'])
     +'<div class="grid2" style="margin-top:16px">'+fieldStr('tools_mode',e.tools_mode,o.tool_modes)+'</div>');
   h+=card('VOICE',toggles(['voice_enabled','wake_enabled','voice_barge_in'])
