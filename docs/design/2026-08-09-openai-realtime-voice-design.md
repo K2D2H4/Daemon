@@ -69,8 +69,12 @@ voice}}, tools}`. Server event names (measured): `response.output_audio.delta`,
 `response.output_audio_transcript.delta|done`, `conversation.item.input_audio_transcription.delta|completed`,
 `input_audio_buffer.speech_started`, `response.done` — all in the decoder's constants. And
 the load-bearing timing (measured with fed audio): the user's `...input_audio_transcription.completed`
-arrives **~200 ms AFTER `response.done`** — which is exactly why the user transcript is
-yielded immediately on `completed`, decoupled from the turn boundary. Names table below.
+arrives **~200 ms AFTER `response.done`**. The user transcript is still yielded the moment
+`completed` decodes, whenever that is — but `receive()` also waits a bounded grace window
+(`USER_TRANSCRIPT_GRACE_SECONDS`, 500ms) at the turn boundary for it when it has not arrived
+yet, so a late arrival still lands in the same turn, before the assistant's reply, rather
+than being misfiled into the next turn as an answer that preceded its own question. Names
+table below.
 
 - **Transport:** `wss://api.openai.com/v1/realtime?model=<model>`; headers
   `Authorization: Bearer <OPENAI_API_KEY>` and (beta models) `OpenAI-Beta: realtime=v1`.
@@ -89,8 +93,8 @@ yielded immediately on `completed`, decoupled from the turn boundary. Names tabl
 | `interrupt()` | local (stop yielding); optional `response.cancel` |
 | receive → `bytes` | `response.output_audio.delta` (b64 pcm16 24k) |
 | receive → `Transcript(assistant, final)` | accumulate `response.output_audio_transcript.delta`, emit at `…transcript.done` |
-| receive → `Transcript(user, final)` | `conversation.item.input_audio_transcription.completed` |
-| `partial_transcripts()` | `conversation.item.input_audio_transcription.delta` (OpenAI DOES stream partials — this is the provider `conversation.py` notes makes the recall prefetch pay off) |
+| receive → `Transcript(user, final)` | `conversation.item.input_audio_transcription.completed`, ~200ms after `response.done` (see above) — `receive()` waits a bounded grace window for it so it is always yielded before the assistant's |
+| `partial_transcripts()` | `conversation.item.input_audio_transcription.delta` — **not delivered in practice**: `_setup_message` requests `transcription.model: "whisper-1"`, and whisper-1 emits only `…completed`, no delta stream. Measured: partials are unavailable today, so the recall-prefetch payoff `conversation.py` notes does **not** apply to this provider as configured — it would need a delta-emitting transcription model. The decoder's `_USER_TR_DELTA` branch is kept, unreachable, for that future model. |
 | receive → `Interrupted` | `input_audio_buffer.speech_started` (barge-in) |
 | receive → `ToolCall` | function-call item / `response.function_call_arguments.done` (accumulate args, decode JSON) |
 | turn boundary (end `receive()`) | `response.done` |

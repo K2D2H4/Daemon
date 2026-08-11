@@ -90,10 +90,10 @@ async def _run_pass(
     capture: Callable[[str, str, str], Awaitable[bytes]],
     key: str,
     model: str,
-) -> int:
+) -> int | None:
     if not key or not model:
         print(f"skip {provider}: set its API key + realtime model", file=sys.stderr)
-        return 0
+        return None  # skipped, not zero failures - see `main`
     dest_dir = OUT / provider
     dest_dir.mkdir(parents=True, exist_ok=True)
     failures = 0
@@ -128,7 +128,14 @@ async def main() -> int:
         os.environ.get("OPENAI_API_KEY", ""),
         os.environ.get("DAEMON_OPENAI_REALTIME_MODEL", ""),
     )
-    return gemini_failures + openai_failures
+    if gemini_failures is None and openai_failures is None:
+        # Neither provider had its key + model set, so both passes skipped and
+        # nothing was written - that is not success.
+        print("nothing generated: no provider had both its key and model set", file=sys.stderr)
+        return 2
+    # Clamped rather than summed: the exit code is a pass/fail boolean, not a
+    # failure count.
+    return 1 if (gemini_failures or 0) + (openai_failures or 0) else 0
 
 
 if __name__ == "__main__":

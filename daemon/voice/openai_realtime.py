@@ -58,6 +58,24 @@ PARTIAL_BACKLOG = 32
 """How many unread in-progress transcripts to keep. See gemini_live.py's constant
 of the same name - the reasoning is unchanged."""
 
+USER_TRANSCRIPT_GRACE_SECONDS = 0.5
+"""How long `receive()` waits at the turn boundary for the user's own transcript.
+
+whisper-1 - the only model `_setup_message` requests - delivers
+`conversation.item.input_audio_transcription.completed` (the user's own words)
+measured **~200ms AFTER `response.done`**, live against gpt-realtime
+(docs/design/2026-08-09-openai-realtime-voice-design.md). Releasing the turn the
+moment `response.done` arrived, without waiting, recorded the assistant's reply
+BEFORE the user's question that prompted it - the exact ordering
+gemini_live.py's `_flush` docstring calls out: "user first: that is the order it
+happened in, and the order memory should record it in." 500ms is the measured
+~200ms plus headroom.
+
+Paid once per turn, unconditionally: the socket gives no clean signal for "a user
+transcript is coming" versus "there is none this turn" (e.g. a `send_text`-only
+turn never produces one), so a turn with nothing to wait for still pays this
+wait - bounded, and cheaper than misfiling the reply into the wrong turn."""
+
 # Server event types (accept GA and beta spellings).
 _AUDIO_DELTA = ("response.output_audio.delta", "response.audio.delta")
 _ASSISTANT_TR_DELTA = ("response.output_audio_transcript.delta", "response.audio_transcript.delta")
@@ -246,6 +264,9 @@ class OpenAIRealtimeSession:
         self._partials: asyncio.Queue[Transcript | None] = asyncio.Queue(PARTIAL_BACKLOG)
         # Set at a turn boundary and cleared by `receive()`.
         self._turn_over = False
+        # Whether this turn's user transcript has arrived - see
+        # USER_TRANSCRIPT_GRACE_SECONDS. Cleared by `receive()`, same as `_turn_over`.
+        self._user_transcript_seen = False
         self._dropping = False
         # Whether the model is mid-generation. `interrupt()` is only allowed to
         # abandon a turn that exists.
@@ -427,15 +448,36 @@ class OpenAIRealtimeSession:
         `receive()` for why deltas are accumulated rather than handed out as they
         arrive. **Ends at the turn boundary** (`response.done`), and `ended` stays
         None when it does: the turn is over, the session is not.
+
+        User transcript before assistant, always. Reaching the boundary without
+        the user's transcript yet, this waits up to `USER_TRANSCRIPT_GRACE_SECONDS`
+        for it - see that constant for why - before flushing and yielding the
+        assistant's. Only the assistant flush moves for this: the user side is
+        still yielded the moment its own event decodes, whenever that is.
         """
         ws = self._require_open()
         self._turn_over = False
+        self._user_transcript_seen = False
         closed: OpenAIRealtimeError | None = None
         try:
             async for raw in ws:
                 for item in self._decode(raw):
                     yield item
                 if self._turn_over:
+                    if not self._user_transcript_seen:
+                        try:
+                            async with asyncio.timeout(USER_TRANSCRIPT_GRACE_SECONDS):
+                                async for late_raw in ws:
+                                    for item in self._decode(late_raw):
+                                        yield item
+                                    if self._user_transcript_seen:
+                                        break
+                        except TimeoutError:
+                            # Measured ~200ms; nothing arrived within the grace
+                            # window, so there is nothing left to wait for.
+                            pass
+                    for item in self._flush():
+                        yield item
                     return
         except ConnectionClosedOK:
             pass
@@ -671,18 +713,23 @@ class OpenAIRealtimeSession:
                 self._said["assistant"] = [text]
             return
         if t in _USER_TR_DELTA:
+            # Kept for a future delta-emitting transcription model. whisper-1 -
+            # the only model `_setup_message` requests - never sends this event;
+            # it emits only the `completed` event below, so this branch does not
+            # fire in production today (measured; see the design doc's
+            # wire-mapping table). Left in, not deleted, so `partial_transcripts()`
+            # starts working the day the configured model does, with no code
+            # change here.
             self._said["user"].append(msg.get("delta") or "")
             self._push_partial()
             return
         if t in _USER_TR_DONE:
-            # whisper-1 (the model `_setup_message` requests) emits only this
-            # `completed` event - a full transcript, no delta stream - and it
-            # commonly arrives *after* `response.done`. Waiting for the turn
-            # boundary to release it, the way `_flush` does for the assistant
-            # side, would misfile a late arrival into the next turn or drop it
-            # if the session ends first - and in voice mode the transcript is
-            # the only thing memory ever gets. So the user side is yielded
-            # immediately, here, decoupled from `_flush`/`_turn_over` entirely.
+            # whisper-1 emits only this `completed` event - a full transcript, no
+            # delta stream - and it commonly arrives *after* `response.done`
+            # (~200ms, measured). Yielded the moment it decodes, whenever that is:
+            # `receive()`'s grace wait (`USER_TRANSCRIPT_GRACE_SECONDS`) is what
+            # keeps a late arrival in this turn rather than the next one.
+            self._user_transcript_seen = True
             self._said["user"] = []
             text = msg.get("transcript")
             if isinstance(text, str) and text.strip():
@@ -733,7 +780,11 @@ class OpenAIRealtimeSession:
         if t == _RESPONSE_DONE:
             self._dropping = False
             self._generating = False
-            yield from self._flush()
+            # No flush here - see `receive()`. The assistant side has to wait for
+            # the grace window too, so that a late user transcript still lands
+            # before it; flushing here would hand the assistant's words over
+            # first, unconditionally, which is the ordering bug this exists to
+            # avoid.
             self._turn_over = True
             return
 
@@ -742,7 +793,9 @@ class OpenAIRealtimeSession:
 
         Assistant only: the user side is yielded straight from `_decode` when
         `conversation.item.input_audio_transcription.completed` arrives, not
-        accumulated here - see that branch for why."""
+        accumulated here - see that branch for why. Called from `receive()`
+        after its grace wait, not from the `response.done` branch above - so the
+        user side, if it arrives late, is always yielded first."""
         fragments = self._said["assistant"]
         self._said["assistant"] = []
         text = "".join(fragments).strip()

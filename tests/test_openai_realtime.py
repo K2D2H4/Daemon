@@ -8,14 +8,17 @@ Mirrors tests/test_voice.py's fake-socket harness for the sibling provider
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 
 import pytest
 
 from daemon.llm.base import ToolCall, ToolSpec
-from daemon.voice.base import Interrupted, Transcript
+from daemon.voice.base import Interrupted, Transcript, VoiceSession
 from daemon.voice.openai_realtime import (
+    USER_TRANSCRIPT_GRACE_SECONDS,
     OpenAIRealtimeError,
     OpenAIRealtimeSession,
     _permanent_close,
@@ -24,6 +27,9 @@ from daemon.voice.openai_realtime import (
 
 KEY, MODEL = "sk-test", "gpt-realtime"
 SESSION_UPDATED = {"type": "session.updated"}
+HANG = object()
+"""A scripted item meaning "never deliver another message" - for proving a wait
+is actually bounded, rather than the fake socket just running out of script."""
 
 
 def _a_tool_spec_named(name: str) -> ToolSpec:
@@ -50,6 +56,9 @@ class FakeConnection:
         if not self.scripted:
             raise StopAsyncIteration
         item = self.scripted.pop(0)
+        if item is HANG:
+            # Never resolves; the caller's own bounded wait is what ends the test.
+            await asyncio.Event().wait()
         if isinstance(item, Exception):
             raise item
         return json.dumps(item)
@@ -63,7 +72,12 @@ def connector(*conns):
 
     async def connect(url, additional_headers=None, ssl=None):
         connect.calls.append((url, additional_headers))
-        return q.pop(0)
+        # Reuse the last item once the queue would otherwise run dry, so a
+        # scripted exception can stand for every retry attempt, not just one.
+        item = q.pop(0) if len(q) > 1 else q[0]
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     connect.calls = []
     return connect
@@ -71,6 +85,10 @@ def connector(*conns):
 
 def make(*conns, **kw):
     return OpenAIRealtimeSession(KEY, MODEL, connect=connector(*conns), **kw)
+
+
+def test_satisfies_voice_session_protocol():
+    assert isinstance(OpenAIRealtimeSession(KEY, MODEL), VoiceSession)
 
 
 def test_missing_credentials_are_rejected_before_any_connection():
@@ -166,13 +184,16 @@ async def test_receive_yields_audio_then_transcripts_then_ends_on_response_done(
     assert sum(1 for t in texts if t[0] == "user") == 1
 
 
-async def test_user_transcript_arriving_after_response_done_lands_in_the_next_turn():
+async def test_user_transcript_arriving_after_response_done_lands_before_the_reply():
     # whisper-1 emits only `input_audio_transcription.completed` - a full
     # transcript, no delta stream - and it commonly arrives *after*
-    # `response.done`. Here it is scripted as the very next server message,
-    # which `receive()` only sees once it is called again for the next turn.
-    # Dropping it - or misfiling it as belonging to the next turn's own speech -
-    # would lose the only thing memory gets from a voice turn.
+    # `response.done` (~200ms, measured). Losing it to the next turn - or
+    # misfiling it as belonging to the next turn's own speech - would record the
+    # assistant's reply BEFORE the user's question that prompted it: the exact
+    # ordering bug gemini_live.py's `_flush` docstring calls out ("user first:
+    # that is the order it happened in"). `receive()`'s grace wait
+    # (USER_TRANSCRIPT_GRACE_SECONDS) is what keeps this in the same turn, user
+    # transcript yielded before the assistant's.
     conn = FakeConnection(
         SESSION_UPDATED,
         audio_delta(b"\x01\x02"),
@@ -181,13 +202,31 @@ async def test_user_transcript_arriving_after_response_done_lands_in_the_next_tu
         {"type": "conversation.item.input_audio_transcription.completed", "transcript": "뭐 해"},
     )
     async with make(conn) as live:
-        first_turn = await collect(live)
-        second_turn = await collect(live)
-    first_texts = {(t.role, t.text, t.final) for t in first_turn if isinstance(t, Transcript)}
-    assert ("assistant", "hello", True) in first_texts
-    assert not any(role == "user" for role, _, _ in first_texts)
-    second_texts = {(t.role, t.text, t.final) for t in second_turn if isinstance(t, Transcript)}
-    assert ("user", "뭐 해", True) in second_texts
+        items = await collect(live)
+    texts = [(t.role, t.text, t.final) for t in items if isinstance(t, Transcript)]
+    assert texts == [("user", "뭐 해", True), ("assistant", "hello", True)]
+    # No double-emit: the late arrival is released exactly once, from the grace
+    # wait, not again from the assistant `_flush`.
+    assert sum(1 for role, _, _ in texts if role == "user") == 1
+
+
+async def test_turn_with_no_user_transcription_completes_within_the_grace_window():
+    # A turn where the user never spoke (e.g. a send_text-only turn, or one
+    # where whisper-1 simply never reports anything) has no `…completed` event
+    # to wait for. `HANG` makes the fake socket never deliver another message,
+    # so a passing test here is proof the internal wait is bounded by
+    # USER_TRANSCRIPT_GRACE_SECONDS, not proof that the fake socket ran dry.
+    conn = FakeConnection(
+        SESSION_UPDATED,
+        {"type": "response.output_audio_transcript.done", "transcript": "hi"},
+        {"type": "response.done"},
+        HANG,
+    )
+    async with make(conn) as live:
+        async with asyncio.timeout(USER_TRANSCRIPT_GRACE_SECONDS + 2.0):
+            items = await collect(live)
+    texts = [t for t in items if isinstance(t, Transcript)]
+    assert texts == [Transcript(text="hi", role="assistant", final=True)]
 
 
 async def test_speech_started_is_a_barge_in():
@@ -281,6 +320,29 @@ async def test_setup_error_fails_fast_instead_of_hanging_for_20s():
         async with make(conn):
             pass
     assert "unknown parameter" in str(exc_info.value)
+
+
+async def test_closing_removes_the_log_filter_it_installed():
+    """A filter left on the root handlers would outlive the session and keep a
+    reference to the key."""
+    root = logging.getLogger()
+    before = [len(h.filters) for h in root.handlers]
+    conn = FakeConnection(SESSION_UPDATED)
+    async with make(conn):
+        pass
+    assert [len(h.filters) for h in root.handlers] == before
+
+
+async def test_a_session_that_never_opens_still_removes_its_log_filter():
+    """__aexit__ does not run when __aenter__ raises, so this is the path where a
+    filter holding the key would be left behind - the failed-handshake path that
+    historically leaked one log filter per retry attempt."""
+    root = logging.getLogger()
+    before = [len(h.filters) for h in root.handlers]
+    with pytest.raises(OpenAIRealtimeError):
+        async with make(OSError("down"), max_attempts=1):
+            pass  # pragma: no cover
+    assert [len(h.filters) for h in root.handlers] == before
 
 
 def test_close_code_classification():
