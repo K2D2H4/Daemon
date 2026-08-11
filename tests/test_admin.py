@@ -483,12 +483,6 @@ def test_a_newline_in_a_route_override_is_refused(tmp_path: Path) -> None:
     assert env.read_text(encoding="utf-8") == original
 
 
-def _voice_allowlists():
-    from daemon.config import GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES
-
-    return GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES
-
-
 def test_voice_sample_serves_both_providers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

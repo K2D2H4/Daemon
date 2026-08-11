@@ -255,9 +255,16 @@ async def restart() -> JSONResponse:
     return JSONResponse({"restarted": True, "supervised": True})
 
 
-_VOICE_ALLOWLISTS: dict[str, frozenset[str]] = dict(
-    zip(VOICE_PROVIDERS, (GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES), strict=True)
-)
+_VOICE_ALLOWLISTS = {"gemini": GEMINI_LIVE_VOICES, "openai": OPENAI_REALTIME_VOICES}
+"""Which voice names each provider serves. A literal map, not zip(VOICE_PROVIDERS, ...):
+zip couples this to the tuple's declaration order, so a reorder there would silently swap
+the two allowlists (same length, no error). The check below is the loud version of that
+coupling - it fails at import if a provider is added to config without an allowlist here."""
+if set(_VOICE_ALLOWLISTS) != set(VOICE_PROVIDERS):
+    raise RuntimeError(
+        f"_VOICE_ALLOWLISTS {sorted(_VOICE_ALLOWLISTS)} out of sync with "
+        f"VOICE_PROVIDERS {sorted(VOICE_PROVIDERS)}"
+    )
 
 
 @router.get("/api/voice-sample/{provider}/{voice}")
