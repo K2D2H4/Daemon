@@ -52,12 +52,13 @@ it was written against what this project's local 4B model actually does - fences
 
 ## What reaches the prompt
 
-The persona seed, and `Candidate.reason`. Nothing else, and in particular not the
-user's own words: `candidates.py` builds every reason out of its own lexicons,
-clock times and dates, so an unsolicited utterance cannot be steered by something
-that was forwarded into the log three weeks ago. That is an assumption about
-another module, so it is not relied on alone - the reason is length-bounded and
-framed as a record rather than as an instruction.
+The persona system message (seed plus M4's learned rules), and `Candidate.reason`.
+Nothing else, and in particular not the user's own words: `candidates.py` builds
+every reason out of its own lexicons, clock times and dates, so an unsolicited
+utterance cannot be steered by something that was forwarded into the log three
+weeks ago. That is an assumption about another module, so it is not relied on
+alone - the reason is length-bounded and framed as a record rather than as an
+instruction.
 
 The seed is required, not optional. The text loop degrades to no persona because
 somebody asked it a question and deserves an answer; nobody asked for this, and
@@ -68,12 +69,12 @@ silent degradation is this project's signature defect.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 
 from daemon.llm.base import Message, ProviderError
 from daemon.llm.gateway import LLMGateway
+from daemon.persona.loader import load_persona, read_file, seed_path
 from daemon.proactivity.base import Candidate, Utterance
 from daemon.reflection import extract_json
 from daemon.tasks import Task
@@ -108,8 +109,8 @@ SYSTEM = """유저가 말을 걸지 않았는데 네가 먼저 한 마디 건네
 **기본값은 침묵이다.** say 를 빈 문자열로 두는 것이 대부분의 정답이고, 문장을 넣는
 것은 예외다. 아래를 **둘 다** 만족할 때만 문장을 넣는다.
 
-1. 이유 안에 구체적인 사건이나 감정이 이름으로 적혀 있다 (발표, 면접, 병원, 힘들다,
-   불안하다 같은 것). 시간·간격·빈도만 적혀 있으면 그건 사건이 아니다.
+1. 이유 안에 구체적인 사건·감정·기억이 내용으로 적혀 있다 (발표, 면접, 힘들다,
+   또는 유저가 예전에 한 말 자체). 시간·간격·빈도만 적혀 있으면 그건 내용이 아니다.
 2. 그 사건이나 감정에 대해 유저에게 물을 것이 실제로 있다.
 
 "오랜만이야", "요즘 어때", "별일 없어", "시간이 많이 흘렀네", "오늘도 변함없네" 는
@@ -131,7 +132,10 @@ JSON만 출력한다.
 예) 이유 (pattern_time): 최근 30일 중 12일은 이 시간에 대화를 했는데, 오늘은 아직
     한 마디도 없다. -> {"say": ""}
 예) 이유 (open_loop): 08월 01일에 '내일 시험' 이야기를 했고, 그 시각이 지났다.
-    어떻게 됐는지 아직 듣지 못했다. -> {"say": "시험 어땠어?"}"""
+    어떻게 됐는지 아직 듣지 못했다. -> {"say": "시험 어땠어?"}
+예) 이유 (association): 2026년 05월 12일에 유저가 이런 얘기를 했다: '교토 골목
+    국수집이 진짜 좋았어'. 지금 대화가 그 기억과 닿아 있다.
+    -> {"say": "예전에 교토 국수집 얘기했던 거 생각나네. 또 가고 싶어?"}"""
 
 
 class Judge:
@@ -139,20 +143,20 @@ class Judge:
 
     def __init__(self, gateway: LLMGateway, data_dir: Path) -> None:
         self._gateway = gateway
-        # The same file `daemon/loop.py` reads, read the same way: seed.md is
-        # human-owned and an edit takes effect without a restart (PLAN 5.1).
+        # M4's learned rules are included as of 2026-08-11. This block used to
+        # say the call was left "for whoever makes it on purpose"; this is that.
         #
-        # Deliberately seed-only, not `persona.loader.load_persona` - unlike the
-        # text loop and voice, both of which now carry M4's learned rules too
-        # (daemon/app.py, daemon/loop.py). This prompt is already the minimum the
-        # module docstring above describes: the seed, one system instruction, and
-        # `Candidate.reason`, nothing else, so an unsolicited utterance cannot be
-        # steered by anything but that reason. Adding accumulated learned rules
-        # here is a real question - what an *unprompted* line should sound like
-        # is not obviously "everything a prompted one gets" - and it wants its
-        # own judgement call, not a side effect of wiring M4 elsewhere. Left
-        # for whoever makes that call on purpose.
-        self._seed_path = Path(data_dir) / "persona" / "seed.md"
+        # The reason to include them: the text loop and voice already do, so
+        # leaving proactivity on the seed alone meant one persona that spoke
+        # differently depending on which path reached the user. The reason the
+        # question was open at all - that an *unprompted* line might not want
+        # everything a prompted one gets - turns out to cut the other way. An
+        # unprompted line is the one with the least context to carry the voice.
+        #
+        # The cost worried about was volume, and that was overestimated: the
+        # judge runs only for candidates that passed the gate (`tick.py`), so it
+        # is bounded by the daily budget - a dozen calls, not 288.
+        self._data_dir = Path(data_dir)
 
     async def decide(self, candidate: Candidate) -> Utterance:
         """What to say about `candidate`, or a falsy `Utterance` and why not.
@@ -161,18 +165,16 @@ class Judge:
         answer to "could not reach the model" is the same as the answer to "nothing
         worth saying", and the tick records nothing either way.
         """
-        seed = await self._read_seed()
-        if not seed:
-            # Reported rather than swallowed: proactivity going permanently quiet
-            # because a file is missing must not look like a quiet week.
+        persona = await self._persona()
+        if not persona:
             logger.warning(
-                "judge: %s is missing or empty; not speaking first without a persona",
-                self._seed_path,
+                "judge: no persona seed under %s; not speaking first without one",
+                self._data_dir,
             )
-            return Utterance(why_not=f"no persona seed at {self._seed_path}")
+            return Utterance(why_not=f"no persona seed under {self._data_dir}")
 
         messages = [
-            Message(role="system", content=seed),
+            Message(role="system", content=persona),
             Message(role="system", content=SYSTEM),
             Message(role="user", content=_reason_block(candidate)),
         ]
@@ -191,14 +193,19 @@ class Judge:
             logger.info("judge: declined %s (%s)", candidate.kind, utterance.why_not)
         return utterance
 
-    async def _read_seed(self) -> str:
-        try:
-            return (await asyncio.to_thread(self._seed_path.read_text, encoding="utf-8")).strip()
-        except FileNotFoundError:
+    async def _persona(self) -> str:
+        """The persona system message, or "" when there is no seed.
+
+        Two reads rather than one, and the seed check is not folded into the
+        emptiness of the result: `load_persona` returns a non-empty string when
+        *either* file has content, so an install with no seed.md and a populated
+        learned.md would pass a single check and speak first in nobody's voice.
+        The seed is the anchor (PLAN 5.1); learned rules are what accumulated on
+        top of it and cannot stand in for it.
+        """
+        if not (await read_file(seed_path(self._data_dir))).strip():
             return ""
-        except OSError:
-            logger.exception("could not read %s", self._seed_path)
-            return ""
+        return await load_persona(self._data_dir)
 
 
 def _reason_block(candidate: Candidate) -> str:

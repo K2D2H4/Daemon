@@ -134,6 +134,49 @@ async def test_an_empty_seed_file_is_the_same_as_none(data_dir: Path) -> None:
     assert provider.calls == []
 
 
+async def test_learned_rules_reach_the_prompt(data_dir: Path) -> None:
+    """The text loop and voice both carry M4's learned rules. Proactivity not
+    carrying them meant the same person spoke differently depending on which
+    path reached them. Decided 2026-08-11; judge.py had left it open on purpose."""
+    (data_dir / "persona" / "learned.md").write_text(
+        "- 아침에는 말을 짧게 한다.", encoding="utf-8"
+    )
+    judge, provider = judge_for(data_dir)
+
+    await judge.decide(OPEN_LOOP)
+
+    assert "아침에는 말을 짧게" in system_text(provider)
+
+
+async def test_a_missing_seed_still_refuses_to_speak(data_dir: Path) -> None:
+    """Unchanged and load-bearing: PLAN 5 says a generic-assistant voice is the
+    one thing this product must not have, and nobody asked for this line."""
+    judge, _ = judge_for(data_dir, seed=None)
+
+    utterance = await judge.decide(OPEN_LOOP)
+
+    assert not utterance
+    assert "seed" in utterance.why_not
+
+
+async def test_learned_rules_alone_are_not_a_persona(data_dir: Path) -> None:
+    """The trap in this task. `load_persona` returns a non-empty string when
+    *either* file has content (loader.py:118), so checking its output instead of
+    the seed would let an install with no seed.md and a populated learned.md
+    speak first in nobody's voice. The seed is the anchor; accumulated rules are
+    not a substitute for it."""
+    (data_dir / "persona" / "learned.md").write_text(
+        "- 아침에는 말을 짧게 한다.", encoding="utf-8"
+    )
+    judge, provider = judge_for(data_dir, seed=None)
+
+    utterance = await judge.decide(OPEN_LOOP)
+
+    assert not utterance
+    assert "seed" in utterance.why_not
+    assert provider.calls == []
+
+
 async def test_the_reason_reaches_the_prompt(data_dir: Path) -> None:
     """It is the whole input: the model is told why this surfaced and asked what to
     say about it. Without it there is nothing to answer but the open question."""
