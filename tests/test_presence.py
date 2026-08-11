@@ -683,3 +683,37 @@ async def test_the_snapshot_carries_the_reasons_a_bad_call_would_need() -> None:
     assert snapshot["idle_seconds"] == pytest.approx(6.654789416)
     assert snapshot["foreground_app"] is None
     assert snapshot["unknown"] == ["foreground_app: timed out; timed out"]
+
+
+# --- Reading: the merged audio signal split in two --------------------------
+
+
+def test_reading_separates_microphone_from_output() -> None:
+    """The merged `audio_busy` is what made enabling voice disable the speaker:
+    the wake listener holds the input device, and the gate could not tell that
+    apart from a call. See the spec, section 1.1 cause 3."""
+    reading = Reading(at=PINNED, mic_busy=False, output_busy=True)
+    assert reading.mic_busy is False
+    assert reading.output_busy is True
+
+
+def test_reading_snapshot_carries_every_new_field() -> None:
+    """gate_snapshot is how a bad call is diagnosed months later. A field the
+    gate reads but the snapshot drops is a decision nobody can reconstruct."""
+    reading = Reading(
+        at=PINNED,
+        idle_seconds=1.0,
+        foreground_app="Warp",
+        mic_busy=False,
+        output_busy=False,
+        output_muted=True,
+        screen_locked=False,
+        headphones=True,
+    )
+    snapshot = reading.as_snapshot()
+    for key in (
+        "idle_seconds", "foreground_app", "mic_busy", "output_busy",
+        "output_muted", "screen_locked", "headphones", "unknown",
+    ):
+        assert key in snapshot, f"{key} is missing from the gate snapshot"
+    assert "audio_busy" not in snapshot, "the merged field must be gone, not kept"
