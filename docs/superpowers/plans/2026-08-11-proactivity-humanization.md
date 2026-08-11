@@ -330,7 +330,25 @@ git commit -m "proactivity: split the merged audio signal in Reading (frozen fil
 
 **Files:**
 - Modify: `daemon/proactivity/presence.py:310-330` (`audio_running`), `:486-500` (`_audio_busy`), `:369-394` (`read`)
-- Test: `tests/test_presence.py`
+- Modify: `daemon/cli.py:718`, `daemon/tools/builtin.py:696-697`, `daemon/proactivity/speaker.py:157` (docstring)
+- Test: `tests/test_presence.py`, `tests/test_delivery.py:54`, `tests/test_tick.py:31`,
+  `tests/test_acceptance.py:616,902`, `tests/test_tools.py:1108,1135,1137`
+
+> **`audio_busy`의 반경은 proactivity/ 밖까지 간다 — Task 2 리뷰에서 드러났다.**
+> `Reading`이 `slots=True`라 지운 필드를 읽으면 `AttributeError`다. 위 목록이 전부이며
+> `grep -rn "audio_busy" daemon/ tests/ --include="*.py"`로 다시 확인할 것.
+>
+> - `daemon/cli.py:718` — `daemon doctor`의 표시. `{True: "busy", False: "free", None: "unknown"}`
+>   매핑을 두 줄로 나눠 mic과 output을 따로 보여준다. 이 화면이 §1.1 결함 ③을 사람이
+>   눈으로 확인하는 곳이므로 합쳐 보이면 안 된다.
+> - `daemon/tools/builtin.py:696-697` — `system_state` 툴. 같은 방식으로 두 줄.
+> - `daemon/proactivity/speaker.py:157` — 문서 문자열 안의 언급. 문장을 `mic_busy`로 고친다.
+> - 테스트들은 `Reading(...)` 생성자 인자 이름만 바뀐다. 의미를 바꾸지 말 것 —
+>   `audio_busy=False`는 `mic_busy=False, output_busy=False`가 된다.
+>
+> **`tests/test_gate.py`는 이 태스크에서 고치지 않는다.** 게이트의 라우팅 규칙 자체가
+> Task 6에서 바뀌므로, 지금 인자 이름만 갈면 Task 6이 같은 줄을 다시 고친다. Task 6까지
+> `tests/test_gate.py`는 red로 둔다 — 예상된 상태다.
 
 **Interfaces:**
 - Consumes: `daemon.mic_hold.held()` (Task 1), `Reading` (Task 2)
@@ -493,13 +511,18 @@ def audio_running(selector: int) -> bool:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/test_presence.py -v`
-Expected: PASS
+```bash
+python3 -m pytest tests/ -v --ignore=tests/test_gate.py
+python3 -m ruff check .
+```
+
+Expected: PASS. `tests/test_gate.py`만 red로 남고, 그것은 Task 6이 닫는다.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add daemon/proactivity/presence.py tests/test_presence.py
+git add daemon/proactivity/presence.py daemon/cli.py daemon/tools/builtin.py \
+       daemon/proactivity/speaker.py tests/
 git commit -m "presence: read the microphone and the output device apart"
 ```
 
