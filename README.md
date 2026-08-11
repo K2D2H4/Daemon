@@ -82,6 +82,8 @@ daemon reflect   # consolidate a day into memory now, instead of waiting for 04:
 daemon proactive # one round of "is there a reason to speak?", and what it decided
 daemon tools list  # what it may do to this machine, and what needs your say-so
 daemon tools log   # every tool call it has made, refusals included
+daemon log       # what the resident is writing (`-f` to follow, `--raw` for the polling too)
+daemon help      # the commands, grouped by how often you reach for them
 daemon doctor    # what is configured, reachable, indexed and remembered
 daemon update    # reinstall the latest release in place (re-runs what the one-liner did)
 ```
