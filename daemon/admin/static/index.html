@@ -1036,9 +1036,15 @@ function fieldToggle(name,running){
     <span class="td">${esc(EXPLAIN[name]||'')}</span></span>
     <span class="sw" role="switch" tabindex="0" data-f="${name}" data-v="${v?'true':'false'}" aria-checked="${v?'true':'false'}"><i></i></span></div>`;
 }
-function fieldVoice(running,opts){const v=val('gemini_live_voice',running);
-  const o=opts.map(x=>`<option ${x===v?'selected':''}>${esc(x)}</option>`).join('');
-  return `<div class="field">${nameCell('gemini_live_voice')}<select data-f="gemini_live_voice">${o}</select>
+// Provider-aware voice picker. Renders the SELECTED provider's voice select + preview
+// inside a replaceable #voice-field, so changing the provider re-renders only this.
+function voiceField(provider,e,o){
+  const isO=provider==='openai';
+  const name=isO?'openai_realtime_voice':'gemini_live_voice';
+  const opts=(isO?o.openai_realtime_voices:o.gemini_live_voices)||[''];
+  const v=val(name,e[name]);
+  const os=opts.map(x=>`<option ${x===v?'selected':''}>${esc(x)}</option>`).join('');
+  return `<div class="field" id="voice-field">${nameCell(name)}<select data-f="${name}">${os}</select>
     <div class="voice-preview"><button type="button" class="btn" id="voice-play">▶ preview</button>
     <span class="cap" id="voice-preview-msg"></span><audio id="voice-sample" preload="none"></audio></div></div>`;
 }
@@ -1056,13 +1062,15 @@ function renderSettings(){
     +fieldStr('anthropic_model',e.anthropic_model)
     +fieldStr('openai_model',e.openai_model)
     +fieldStr('gemini_model',e.gemini_model)
-    +fieldStr('gemini_live_model',e.gemini_live_model)+'</div>'
+    +fieldStr('gemini_live_model',e.gemini_live_model)
+    +fieldStr('openai_realtime_model',e.openai_realtime_model)+'</div>'
     +'<p class="cap" style="margin:12px 0 0">Each provider takes its own model id. Switching the hosted provider without naming its model is refused, so fill the one you are switching to.</p>');
   h+=card('CAPABILITIES',toggles(['tools_enabled','browser_enabled','screen_enabled','mcp_enabled','proactive_enabled'])
     +'<div class="grid2" style="margin-top:16px">'+fieldStr('tools_mode',e.tools_mode,o.tool_modes)+'</div>');
   h+=card('VOICE',toggles(['voice_enabled','wake_enabled','voice_barge_in'])
     +'<div class="grid2" style="margin-top:16px">'
-    +fieldVoice(e.gemini_live_voice,o.gemini_live_voices)
+    +fieldStr('voice_provider',e.voice_provider,o.voice_providers)
+    +voiceField(val('voice_provider',e.voice_provider),e,o)
     +fieldStr('wake_aliases',e.wake_aliases)
     +fieldStr('voice_start_sensitivity',e.voice_start_sensitivity,o.sensitivities)
     +fieldStr('voice_end_sensitivity',e.voice_end_sensitivity,o.sensitivities)+'</div>'
@@ -1117,16 +1125,23 @@ async function loadSettings(){
 }
 $('#settings-form').addEventListener('input',updateDirty);
 $('#settings-form').addEventListener('change',updateDirty);
+$('#settings-form').addEventListener('change',ev=>{
+  if(ev.target.dataset && ev.target.dataset.f==='voice_provider'){
+    const vf=$('#voice-field');
+    if(vf){vf.outerHTML=voiceField(ev.target.value,SETTINGS.editable,SETTINGS.options);updateDirty();}
+  }
+});
 $('#settings-form').addEventListener('click',ev=>{
   const sw=ev.target.closest('.sw');
   if(sw){const on=sw.dataset.v!=='true';sw.dataset.v=String(on);sw.setAttribute('aria-checked',String(on));updateDirty();return;}
   if(ev.target.id!=='voice-play')return;
-  const sel=$('[data-f="gemini_live_voice"]');
+  const prov=$('[data-f="voice_provider"]');
+  const sel=$('#voice-field select');
   const msg=$('#voice-preview-msg');
-  if(!sel||!sel.value)return;   // the empty "(default)" option has no clip
+  if(!prov||!sel||!sel.value)return;   // the empty "(default)" option has no clip
   const a=$('#voice-sample');
   if(msg)msg.textContent='';
-  a.src='/admin/api/voice-sample/'+encodeURIComponent(sel.value);
+  a.src='/admin/api/voice-sample/'+encodeURIComponent(prov.value)+'/'+encodeURIComponent(sel.value);
   a.play().catch(()=>{if(msg)msg.textContent='no preview available yet';});
 });
 $('#settings-form').addEventListener('keydown',ev=>{
