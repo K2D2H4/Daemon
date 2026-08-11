@@ -29,8 +29,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import ValidationError
-
 from daemon import __version__
 from daemon.config import ENV_FILE, OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
@@ -531,50 +529,66 @@ def _err_log_path() -> Path:
     and reading those defaults off the model rather than repeating them here is
     what keeps this from drifting away from `config.py`.
 
-    Nothing below may raise. This runs precisely when the configuration is already
+    Nothing here may raise. This runs precisely when the configuration is already
     broken, and the module docstring's promise - print what you found rather than a
     traceback - is worth least when it only holds for configurations that parse.
+    Three attempts, each catching everything, because listing the failures instead
+    of catching them all has now let a traceback through twice: ConfigError from the
+    model validator, then pydantic's ValidationError from a field that will not
+    coerce, then UnicodeDecodeError from a `.env` an editor saved as CP949 - which
+    `Settings` raises while reading the file, before any of the rest can apply.
     """
     try:
         return service_for(Settings()).err_log
-    except (ConfigError, ValidationError):
-        # Both, because they arrive from different depths: a field that will not
-        # coerce (`DAEMON_PORT=abc`) raises pydantic's ValidationError before the
-        # model validator that raises ConfigError ever runs. config.py already
-        # records this trap costing `daemon doctor` its whole job once.
+    except Exception:  # noqa: BLE001 - every way a configuration can be unusable
         pass
+    try:
+        return _log_path(_env_setting("DAEMON_SERVICE_LABEL", "service_label"))
+    except Exception:  # noqa: BLE001 - and every way the values in it can be
+        pass
+    # Defaults only, and they are the model's own, so this last line cannot fail
+    # for a reason the configuration caused. If no resident ever ran here, `_log`
+    # says so and prints the path it looked at.
+    return _log_path(_default("service_label"), data_dir=Path(_default("data_dir")))
 
+
+def _log_path(label: str, *, data_dir: Path | None = None) -> Path:
+    """The err-log path `Service` would compute for this label and data dir."""
+    if data_dir is None:
+        data_dir = Path(_env_setting("DAEMON_DATA_DIR", "data_dir")).expanduser()
+    return Service(label=label, working_dir=Path.cwd(), log_dir=data_dir / "logs").err_log
+
+
+def _default(field: str) -> str:
+    """A field's default, read off the model so it cannot drift from `config.py`."""
+    return str(Settings.model_fields[field].default)
+
+
+def _env_setting(alias: str, field: str) -> str:
+    """What `Settings` would read for one alias, without building `Settings`.
+
+    Case-insensitive, and last-match-wins within a source, because that is what
+    `case_sensitive=False` actually does: pydantic-settings case-folds the names
+    into a dict, so with both `DAEMON_DATA_DIR` and `daemon_data_dir` set the second
+    one is the one that counts. Returning the first match instead pointed this at a
+    different directory than the resident would use.
+    """
     filed: dict[str, str] = {}
     env_file = Path(ENV_FILE)
-    if env_file.exists():
-        from daemon.setup import parse_env
-
-        try:
-            filed = parse_env(env_file.read_text(encoding="utf-8"))
-        except OSError:
-            filed = {}
-
-    def configured(alias: str, field: str) -> str:
-        # Case-insensitively, because `Settings` is `case_sensitive=False`: a
-        # lowercase `daemon_data_dir` that a working build honours must not resolve
-        # to a different directory here just because this lookup is stricter.
-        for source in (os.environ, filed):
-            for key, value in source.items():
-                if key.upper() == alias and value:
-                    return value
-        return str(Settings.model_fields[field].default)
-
-    log_dir = Path(configured("DAEMON_DATA_DIR", "data_dir")).expanduser() / "logs"
-    label = configured("DAEMON_SERVICE_LABEL", "service_label")
     try:
-        return Service(label=label, working_dir=Path.cwd(), log_dir=log_dir).err_log
-    except ServiceError:
-        # The label becomes the filename, so one `Service` rejects never named a
-        # log. Fall back to the default rather than a traceback: if a resident ever
-        # ran here, that is the name it ran under - and if it did not, `_log` says
-        # so with the path it looked at.
-        default = str(Settings.model_fields["service_label"].default)
-        return Service(label=default, working_dir=Path.cwd(), log_dir=log_dir).err_log
+        if env_file.exists():
+            from daemon.setup import parse_env
+
+            filed = parse_env(env_file.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - an unreadable .env is one we cannot consult
+        filed = {}
+
+    # Environment before file, matching pydantic-settings' source precedence.
+    for source in (os.environ, filed):
+        matches = [value for key, value in source.items() if key.upper() == alias and value]
+        if matches:
+            return matches[-1]
+    return _default(field)
 
 
 def _keeper(raw: bool) -> Callable[[str], bool]:
@@ -1241,7 +1255,14 @@ class Check:
 def _doctor() -> int:
     try:
         settings = Settings()
-    except ConfigError as exc:
+    except Exception as exc:  # noqa: BLE001 - see below
+        # Everything, for the reason `_err_log_path` says at length: ConfigError is
+        # only the failure the model validator produces. `DAEMON_PORT=abc` raises
+        # pydantic's ValidationError from field parsing and a `.env` saved as CP949
+        # raises UnicodeDecodeError from reading the file, and catching only
+        # ConfigError made the command whose whole job is explaining the breakage
+        # print a traceback instead - the exact trap config.py records. Reporting a
+        # failure this command cannot classify still beats a stack trace.
         checks = [Check("config", False, str(exc))]
         admin = None
     else:

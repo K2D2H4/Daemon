@@ -1602,3 +1602,67 @@ def test_log_honours_a_lowercase_env_var(
 
     assert cli.main(["log"]) == 0
     assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_survives_an_env_file_the_encoding_of_which_is_wrong(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `.env` holding Korean, saved once by an editor as CP949, is not valid UTF-8.
+    `Settings` raises UnicodeDecodeError while *reading the file* - a ValueError, so
+    neither the ConfigError nor the OSError guard saw it, and the command that exists
+    to survive a broken configuration printed a traceback for a plausible one."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    (tmp_path / ".env").write_bytes("DAEMON_PERSONA_SEED=연희동에 산다\n".encode("cp949"))
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_survives_a_data_dir_that_is_not_a_usable_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An embedded NUL makes `Path.resolve` raise ValueError, not ServiceError, so the
+    label guard did not cover it and the retry reused the same bad directory. Falls
+    all the way back to the model's defaults."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    (tmp_path / ".env").write_bytes(b"DAEMON_DATA_DIR=/tmp/bad\x00dir\n")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_the_last_of_two_cases_wins_like_settings_does(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`case_sensitive=False` case-folds into a dict, so the later name is the one
+    that counts. Returning the first match sent the fallback to a directory the
+    resident would not have used."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "first"))
+    monkeypatch.setenv("daemon_data_dir", str(tmp_path / "second"))
+
+    assert Settings(preset="offline").data_dir == tmp_path / "second", "premise"
+    assert cli._env_setting("DAEMON_DATA_DIR", "data_dir") == str(tmp_path / "second")
+
+
+def test_doctor_reports_a_field_that_will_not_coerce(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The command whose whole job is explaining a configuration that will not load
+    must not be the one that raises. ConfigError is only what the model validator
+    produces; a field that will not coerce raises pydantic's ValidationError first."""
+    monkeypatch.setenv("DAEMON_PORT", "not-a-number")
+
+    assert cli.main(["doctor"]) == cli.PROBLEM
+    printed = capsys.readouterr().out
+    assert "[FAIL] config:" in printed
+    assert "DAEMON_PORT" in printed
