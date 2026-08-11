@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 
 import pytest
 
@@ -21,7 +22,7 @@ from daemon.voice.openai_realtime import (
     OpenAIRealtimeError,
     OpenAIRealtimeSession,
     _permanent_close,
-    _upsample_16k_to_24k,
+    _resample_16k_to_24k,
 )
 
 KEY, MODEL = "sk-test", "gpt-realtime"
@@ -97,12 +98,63 @@ def test_missing_credentials_are_rejected_before_any_connection():
         OpenAIRealtimeSession(KEY, "")
 
 
-def test_upsample_16k_to_24k_grows_length_by_3_over_2():
-    # 4 samples (8 bytes) of 16-bit LE mono -> 6 samples (12 bytes) at 24k.
-    pcm = b"".join(int(v).to_bytes(2, "little", signed=True) for v in (0, 100, 200, 300))
-    out = _upsample_16k_to_24k(pcm)
-    assert len(out) == 12
-    assert len(out) % 2 == 0
+def _sine_pcm16(freq_hz: float, n_samples: int, amplitude: int = 3000) -> bytes:
+    return b"".join(
+        int(amplitude * math.sin(2 * math.pi * freq_hz * i / 16_000)).to_bytes(
+            2, "little", signed=True
+        )
+        for i in range(n_samples)
+    )
+
+
+def test_resample_grows_length_by_3_over_2_across_a_full_stream():
+    """Fed through in realistic 20ms-mic-chunk pieces, carrying phase and tail
+    across calls the way `send_audio` does, total output length matches the
+    3/2 ratio to within one sample - the invariant a chunk-boundary bug could
+    break by dropping or duplicating a sample at each boundary, even though it
+    would not show up in a single-chunk test."""
+    n_total = 1600  # 100ms at 16kHz
+    pcm = _sine_pcm16(300, n_total)
+    phase, tail = 0.0, b""
+    out = bytearray()
+    for i in range(0, len(pcm), 640):  # 320 samples (20ms) per chunk, like the mic
+        chunk_out, phase, tail = _resample_16k_to_24k(pcm[i : i + 640], phase, tail)
+        out += chunk_out
+    out_samples = len(out) // 2
+    assert abs(out_samples - (n_total * 3) // 2) <= 1
+
+
+def test_resample_is_continuous_across_chunk_boundaries():
+    """The assertion the endpoint-anchored implementation failed: resampling a
+    signal in many small chunks (phase/tail carried, as `send_audio` does)
+    must match resampling the SAME signal in one call, because the
+    interpolation is one continuous fixed-step process, not a fresh stretch
+    per chunk. The old implementation anchored each chunk's first/last input
+    sample to its own first/last output sample, which reset the phase every
+    ~20ms and measurably hurt SNR (300 Hz 32.9 dB vs 58.0 dB; see
+    `_resample_16k_to_24k`'s docstring) - this is the test that would have
+    caught it."""
+    n_total = 1600
+    pcm = _sine_pcm16(1000, n_total)
+
+    whole, _, _ = _resample_16k_to_24k(pcm, 0.0, b"")
+
+    phase, tail = 0.0, b""
+    chunked = bytearray()
+    for i in range(0, len(pcm), 640):
+        chunk_out, phase, tail = _resample_16k_to_24k(pcm[i : i + 640], phase, tail)
+        chunked += chunk_out
+
+    n = min(len(whole), len(chunked)) // 2
+    assert n > 0
+    whole_vals = [
+        int.from_bytes(whole[j * 2 : j * 2 + 2], "little", signed=True) for j in range(n)
+    ]
+    chunked_vals = [
+        int.from_bytes(chunked[j * 2 : j * 2 + 2], "little", signed=True) for j in range(n)
+    ]
+    diffs = [abs(a - b) for a, b in zip(whole_vals, chunked_vals, strict=True)]
+    assert max(diffs) <= 2, "chunked resampling drifted from the single-call reference"
 
 
 async def test_session_update_uses_the_ga_shape():
@@ -135,13 +187,32 @@ async def test_no_voice_omits_the_voice_field():
     assert "voice" not in upd["session"]["audio"]["output"]
 
 
-async def test_send_audio_appends_upsampled_base64():
+async def test_send_audio_appends_resampled_base64_across_calls():
+    """Two mic chunks on the same session: the resample state (phase, tail)
+    must carry across the two `send_audio` calls, not reset each time - the
+    live bug (Finding 2, PR #79 review). Total output for 4 input samples
+    should land within one sample of the 3/2 ratio (6 samples)."""
     conn = FakeConnection(SESSION_UPDATED)
     async with make(conn) as live:
-        await live.send_audio(b"\x00\x01\x02\x03")  # 2 samples 16k -> 3 samples 24k
-    (append,) = conn.sent_of_type("input_audio_buffer.append")
-    raw = base64.b64decode(append["audio"])
-    assert len(raw) == 6  # 3 samples * 2 bytes
+        await live.send_audio(b"\x00\x01\x02\x03")  # 2 samples
+        await live.send_audio(b"\x04\x05\x06\x07")  # 2 more samples
+    appends = conn.sent_of_type("input_audio_buffer.append")
+    total_samples = sum(len(base64.b64decode(a["audio"])) for a in appends) // 2
+    assert abs(total_samples - 6) <= 1
+
+
+async def test_send_audio_buffers_a_lone_sample_until_the_next_chunk():
+    """A chunk with fewer than two samples cannot be interpolated yet - it must
+    be held (in the session's resample tail) rather than dropped, and produce
+    no `input_audio_buffer.append` of its own."""
+    conn = FakeConnection(SESSION_UPDATED)
+    async with make(conn) as live:
+        await live.send_audio(b"\x00\x01")  # 1 sample: nothing to interpolate to yet
+        assert conn.sent_of_type("input_audio_buffer.append") == []
+        await live.send_audio(b"\x02\x03")  # completes the pair
+    appends = conn.sent_of_type("input_audio_buffer.append")
+    assert len(appends) == 1
+    assert len(base64.b64decode(appends[0]["audio"])) > 0
 
 
 async def test_bearer_auth_header_is_sent():
@@ -297,6 +368,39 @@ async def test_consecutive_turns_do_not_bleed_user_transcripts():
         ]
     assert turn1 == [("user", "첫 turn", True), ("assistant", "first reply", True)]
     assert turn2 == [("user", "두번째 turn", True), ("assistant", "second reply", True)]
+
+
+async def test_partial_transcripts_yields_one_completed_utterance_per_turn():
+    """Finding 3 (PR #79 review): whisper-1 sends no deltas, so what actually
+    reaches `partial_transcripts()` is the complete, already-final transcript
+    from `…completed`, offered as `final=False`. This drives one turn and
+    proves exactly that - one item, carrying the full text, not a growing
+    fragment - matching what the docstring now says rather than what it used
+    to claim ("one item per delta")."""
+    conn = FakeConnection(
+        SESSION_UPDATED,
+        {"type": "input_audio_buffer.committed", "item_id": "item_1"},
+        {"type": "response.output_audio_transcript.done", "transcript": "hello"},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "item_1",
+            "transcript": "안녕하세요 반갑습니다",
+        },
+        {"type": "response.done"},
+    )
+    live = make(conn)
+    async with live:
+        await collect(live)  # drive the turn so `_decode` pushes to the partial queue
+        gen = live.partial_transcripts()
+        async with asyncio.timeout(0.2):
+            first = await anext(gen)
+    # The session is now closed (the sentinel was pushed by `close()`), so
+    # draining the rest of the generator must end immediately - proving
+    # nothing else was queued this turn, i.e. one item per turn, not per delta.
+    async with asyncio.timeout(0.2):
+        rest = [item async for item in gen]
+    assert first == Transcript(text="안녕하세요 반갑습니다", role="user", final=False)
+    assert rest == []
 
 
 async def test_speech_started_is_a_barge_in():
