@@ -22,6 +22,7 @@ says "measured" was checked against the real thing, and the number is in the fil
 | [0008](0008-three-stages-one-model-call.md) | Proactivity is three stages, one model call | accepted |
 | [0009](0009-images-in-the-message-contract.md) | Images in the Message contract | accepted |
 | [0010](0010-supersession-needs-an-id-not-a-name.md) | Supersession keys off an id, not a name | accepted, measured |
+| [0011](0011-the-file-holds-more-than-it-injects.md) | core.md holds every active fact, not the injected ones | accepted, measured |
 
 ## Format
 

@@ -32,6 +32,37 @@ async def test_a_fact_lands_in_the_markdown_and_the_mirror(
     assert tier.entries() == ["김치찌개를 좋아한다"]
 
 
+async def test_the_file_holds_every_active_fact_not_only_the_injected_ones(
+    tier: curated.CuratedMemory, data_dir: Path
+) -> None:
+    """The file is the source of truth; the budget is an injection limit.
+
+    Rendering the whole file from the top `MAX_INJECTED` rows conflated the two, so
+    the 51st active fact was dropped from `core.md` on the next write while staying
+    active in the mirror. `rebuild` only adds what it finds in the markdown, so
+    `daemon reindex` could not notice, recall still served the row, and deleting the
+    database - the documented recovery - lost it for good.
+    """
+    for index in range(curated.MAX_INJECTED + 2):
+        tier._store.insert_entry(
+            body=f"사실 {index:02d}",
+            importance=5,
+            trigger_phrases=(),
+            origin="agent",
+            session_kind="reflection",
+            modality="text",
+            now=NOW,
+        )
+
+    await tier.add("마지막 사실", importance=5, now=NOW)
+
+    bodies = curated.read(data_dir)
+    assert len(bodies) == curated.MAX_INJECTED + 3
+    # The lowest-ranked row is the one truncation used to eat.
+    assert "사실 00" in bodies
+    assert len(tier.entries()) == curated.MAX_INJECTED, "the injection budget still holds"
+
+
 async def test_the_file_is_owner_only(tier: curated.CuratedMemory, data_dir: Path) -> None:
     """It is a description of a person. 0644 hands it to every local account."""
     await tier.add("연희동에 산다", now=NOW)

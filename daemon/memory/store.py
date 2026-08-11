@@ -765,6 +765,16 @@ class Store:
         """
         stamp = utc_iso(now)
         try:
+            # The retire set is *read* below and acted on immediately after, so the
+            # read has to be under the write lock. sqlite's legacy transaction
+            # handling opens the implicit BEGIN on the first write, which left that
+            # SELECT in autocommit - a check-then-act across connections, and
+            # `daemon reflect` during the 04:00 pass is two connections. Measured
+            # lock hold for one supersession is 0.5-2.7ms against the 300ms
+            # busy_timeout set in `apply_schema`, so taking it earlier costs
+            # nothing a second writer would notice.
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN IMMEDIATE")
             previous = [
                 int(row["id"])
                 for row in self.conn.execute(

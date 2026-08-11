@@ -61,6 +61,14 @@ MAX_INJECTED = 50
 """Injection budget, in entries. The tier is unconditional, so this is the only
 thing standing between it and the context window."""
 
+ALL_ACTIVE = 10_000
+"""What the *file* holds: every active fact, which is not the same set as what gets
+injected. Rendering `core.md` from `MAX_INJECTED` conflated the two, and since the
+file is written as a whole replace, the 51st fact was dropped from the source of
+truth while staying active in the mirror - unnoticeable to `rebuild`, which only
+adds what the markdown already has. A ceiling rather than no limit, so a runaway
+mirror cannot render an unbounded file; the same number `rebuild` reads with."""
+
 
 def core_path(data_dir: Path) -> Path:
     return data_dir / CORE_FILE
@@ -175,7 +183,7 @@ class CuratedMemory:
             # retire-and-insert open. `reflection.Reflection.run` commits this same
             # connection to record the run, which would make that durable with no
             # markdown behind it - the unrecoverable direction.
-            text = render(self.entries(MAX_INJECTED))
+            text = render(self.entries(ALL_ACTIVE))
             await asyncio.to_thread(write_private_replace, core_path(self._data_dir), text)
         except BaseException:
             # BaseException because the await above is a cancellation point, and a
