@@ -718,7 +718,14 @@ def check_openai_compatible(
                 "key works (that endpoint lists no models, so the next question "
                 "takes an id you type)",
             )
-        said = _redact(chat.text[:BODY_LIMIT], key)
+        # Same order as `_telegram_said`, and for the same reason: redact first,
+        # because slicing before redacting can cut the key in half and leave the
+        # unmatched remainder printed - `_redact`'s `.replace()` only catches the
+        # whole string. Collapse whitespace and drop control characters before
+        # bounding it, so an embedded escape sequence cannot repaint the prompt
+        # printed after it, and words split across lines do not run together.
+        collapsed = " ".join(_redact(chat.text, key).split())
+        said = truncate("".join(char for char in collapsed if char.isprintable()), BODY_LIMIT)
         return Verdict(False, f"{root} returned HTTP {chat.status_code}: {said}")
     finally:
         if owns:
@@ -2164,7 +2171,21 @@ class Wizard:
         current_url = env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", "")
         if current_url:
             self.prompt.say(f"Currently {vendor_label(current_url)}. {KEEP_HINT}")
-        picked = self._pick("Service", COMPATIBLE_CHOICES, default=COMPATIBLE_VENDORS[0].name)
+        # The default has to agree with the line above it, or "Enter keeps it" is
+        # a promise this question breaks: nothing saved defaults to the first
+        # vendor, a saved known vendor defaults to itself, and a saved URL that
+        # matches no vendor defaults to "custom" - never silently renamed to a
+        # vendor it happens to resemble.
+        saved_vendor = next(
+            (v.name for v in COMPATIBLE_VENDORS if v.base_url == current_url.rstrip("/")), None
+        )
+        if saved_vendor is not None:
+            default = saved_vendor
+        elif current_url:
+            default = "custom"
+        else:
+            default = COMPATIBLE_VENDORS[0].name
+        picked = self._pick("Service", COMPATIBLE_CHOICES, default=default)
         vendor = next((v for v in COMPATIBLE_VENDORS if v.name == picked), None)
         if vendor is None:
             # "custom" - nothing to prefill, so `needs_for` asks for the address

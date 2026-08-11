@@ -2141,6 +2141,76 @@ def test_the_env_the_wizard_writes_for_a_compatible_endpoint_loads_and_routes(
     assert settings.openai_compatible_base_url == "https://api.deepseek.com/v1"
 
 
+def test_enter_at_a_saved_vendor_keeps_that_vendor_not_the_first_one(
+    tmp_path: Path,
+) -> None:
+    """`_choose_compatible_endpoint` prints "Currently Kimi (Moonshot). Enter
+    keeps it." on a re-run - so Enter has to actually keep Kimi, not silently
+    fall back to whichever vendor happens to be first in the table.
+
+    The bug this guards against: the default was hardcoded to
+    `COMPATIBLE_VENDORS[0].name` regardless of what was saved, so re-running
+    setup for an unrelated reason (say, turning voice on) and pressing Enter at
+    every already-decided question would quietly swap Kimi's endpoint for
+    Qwen's while leaving `DAEMON_OPENAI_COMPATIBLE_MODEL=kimi-k2.5` in place -
+    Qwen's address paired with Kimi's model, a combination nobody chose.
+    """
+    kimi = next(v for v in setup.COMPATIBLE_VENDORS if v.name == "kimi")
+    assert kimi is not setup.COMPATIBLE_VENDORS[0]  # the bug's default, for contrast
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai_compatible\n"
+        f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={kimi.base_url}\n"
+        f"DAEMON_OPENAI_COMPATIBLE_MODEL={kimi.model}\n"
+        "OPENAI_COMPATIBLE_API_KEY=sk-kimi-x\n"
+    )
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    # Every question already decided is answered with Enter, including the
+    # vendor sub-question - which is the one this test exists to hold honest.
+    answers = [KEEP, KEEP, KEEP, KEEP, "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y", "", "", "", "n"]
+
+    result = drive(tmp_path, answers, existing=existing, checks=checks)
+
+    assert result.code == 0
+    assert "currently kimi" in result.out.lower()
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={kimi.base_url}" in result.written
+    assert f"DAEMON_OPENAI_COMPATIBLE_MODEL={kimi.model}" in result.written
+    # Not Qwen's address under Kimi's model - the broken combination.
+    assert setup.COMPATIBLE_VENDORS[0].base_url not in result.written
+
+
+def test_enter_at_a_saved_custom_endpoint_keeps_it_rather_than_naming_a_vendor(
+    tmp_path: Path,
+) -> None:
+    """A saved URL that matches no known vendor must default to "custom", not to
+    the first vendor in the table - otherwise Enter on a from-scratch server
+    would silently rewrite it to Qwen's address.
+    """
+    custom_url = "https://llm.internal/v1"
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai_compatible\n"
+        f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={custom_url}\n"
+        "DAEMON_OPENAI_COMPATIBLE_MODEL=my-model\n"
+        "OPENAI_COMPATIBLE_API_KEY=sk-custom-x\n"
+    )
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    answers = [KEEP, KEEP, KEEP, KEEP, "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y", "", "", "", "n"]
+
+    result = drive(tmp_path, answers, existing=existing, checks=checks)
+
+    assert result.code == 0
+    assert f"Currently {custom_url}" in result.out
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={custom_url}" in result.written
+    assert "DAEMON_OPENAI_COMPATIBLE_MODEL=my-model" in result.written
+    for vendor in setup.COMPATIBLE_VENDORS:
+        assert vendor.base_url not in result.written
+
+
 def test_offline_is_never_asked_whose_model(tmp_path: Path) -> None:
     # It resolves no hosted task, so the question would be about a bill nobody is
     # going to get - and the answer would be written into the file as if it meant
@@ -2382,8 +2452,18 @@ def test_compatible_probe_never_reveals_the_key() -> None:
 
 
 def test_a_korean_error_body_from_a_compatible_endpoint_is_bounded_and_redacted() -> None:
-    """Same rule as `_telegram_said`: untrusted prose on its way to a terminal is
-    bounded by columns, not characters, and Korean is two columns per syllable."""
+    """Same rule as `_telegram_said`: redact the whole body first, *then* bound it
+    by display columns - not the other way around.
+
+    The repeated key lands exactly on the raw 200-character cut this body was
+    chosen to produce: slicing before redacting truncates the last repetition to
+    `...sk-secret` (missing `-abc`), which does not exact-match the full key
+    string and survives `_redact`'s `.replace()` unredacted. That is a real key
+    fragment on a real terminal, and "the whole key string is absent" does not
+    catch it - which is exactly how this test passed once already while the bug
+    it exists to catch was live. It must fail if the fix is reverted, not just
+    stay green by coincidence.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -2397,6 +2477,14 @@ def test_a_korean_error_body_from_a_compatible_endpoint_is_bounded_and_redacted(
 
     assert not verdict.ok
     assert "sk-secret-abc" not in verdict.detail
+    # Not just the whole key - no recognizable fragment of it either. This is
+    # the assertion that actually fails against the pre-fix code: the old body
+    # slices to `...키 sk-secret`, nine characters of the key with nothing left
+    # to redact it against.
+    assert "sk-secret" not in verdict.detail
+    # And genuinely redacted, not merely cut short before reaching the key -
+    # `<token>` appearing is the evidence that `_redact` ran on the whole body.
+    assert "<token>" in verdict.detail
     assert "거부되었습니다" in verdict.detail
     assert tui.display_width(verdict.detail) <= setup.BODY_LIMIT + 60
 
