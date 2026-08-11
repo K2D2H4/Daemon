@@ -410,6 +410,46 @@ def test_patch_sets_the_gemini_live_voice(tmp_path: Path) -> None:
     )
 
 
+def test_patch_sets_the_openai_voice_provider_and_voice(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch("/admin/api/settings", json={
+        "voice_provider": "openai",
+        "openai_realtime_voice": "alloy",
+        "openai_realtime_model": "gpt-realtime",
+    })
+    assert resp.status_code == 200
+    text = env.read_text(encoding="utf-8")
+    assert "DAEMON_VOICE_PROVIDER=openai" in text
+    assert "DAEMON_OPENAI_REALTIME_VOICE=alloy" in text
+    assert "DAEMON_OPENAI_REALTIME_MODEL=gpt-realtime" in text
+
+    got = client.get("/admin/api/settings").json()
+    voice_providers = got["options"]["voice_providers"]
+    assert "openai" in voice_providers and "gemini" in voice_providers
+    assert got["options"]["openai_realtime_voices"][0] == ""  # server-default offered first
+    assert "alloy" in got["options"]["openai_realtime_voices"]
+
+
+def test_patch_rejects_an_unknown_voice_provider_and_openai_voice(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    original = "DAEMON_PRESET=offline\n"
+    env.write_text(original, encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    bad_provider = client.patch("/admin/api/settings", json={"voice_provider": "anthropic"})
+    assert bad_provider.status_code == 400
+    bad_voice = client.patch("/admin/api/settings", json={"openai_realtime_voice": "nope"})
+    assert bad_voice.status_code == 400
+    assert env.read_text(encoding="utf-8") == original, "a rejected patch still wrote"
+
+
 def test_patch_rejects_an_unknown_gemini_live_voice(tmp_path: Path) -> None:
     env = tmp_path / ".env"
     original = "DAEMON_PRESET=offline\n"
