@@ -744,6 +744,15 @@ async def build_proactive_tick(
     store = Store.open(settings.data_dir / DB_FILENAME)
     closers: list[Callable[[], Awaitable[None]]] = []
 
+    # Built regardless of `speak`: `daemon proactive` (no speaking, structurally)
+    # is how a human sees whether type E produces anything worth saying before it
+    # is ever allowed to say it.
+    recall, _status, embedder = _build_recall(settings, store)
+    if embedder is not None:
+        closer = getattr(embedder, "aclose", None)
+        if closer is not None:
+            closers.append(closer)
+
     judge = None
     delivery = None
     if speak:
@@ -793,7 +802,7 @@ async def build_proactive_tick(
 
     return (
         ProactiveTick(
-            store, settings, MachinePresence(), judge=judge, delivery=delivery
+            store, settings, MachinePresence(), judge=judge, delivery=delivery, recall=recall
         ),
         close,
     )
