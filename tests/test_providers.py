@@ -27,6 +27,7 @@ from daemon.llm.providers.anthropic import AnthropicProvider
 from daemon.llm.providers.gemini import GeminiProvider
 from daemon.llm.providers.ollama import OllamaProvider
 from daemon.llm.providers.openai import OpenAIProvider
+from daemon.llm.providers.openai_compatible import OpenAICompatibleProvider
 
 PROMPT = [Message(role="system", content="seed"), Message(role="user", content="yo")]
 
@@ -1791,3 +1792,256 @@ async def test_call_name_inverts_the_synthesised_id(call_id: object, expected: s
 
     assert call_name(call_id) == expected  # type: ignore[arg-type]
     assert call_name(synthesise_call_id("read_file", 3)) == "read_file"
+
+
+# --- openai-compatible -------------------------------------------------------
+
+COMPAT_OK = {
+    "model": "qwen-plus",
+    "choices": [
+        {"message": {"role": "assistant", "content": KOREAN_REPLY}, "finish_reason": "stop"}
+    ],
+    "usage": {"prompt_tokens": 12, "completion_tokens": 5},
+}
+COMPAT_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+
+async def test_compatible_posts_a_chat_completions_request() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=COMPAT_OK)
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL + "/", client=client)
+        completion = await provider.complete(
+            [Message(role="system", content="seed"), Message(role="user", content=KOREAN)],
+            model="qwen-plus",
+            max_output_tokens=64,
+            temperature=0.4,
+        )
+
+    body = json.loads(seen[0].content)
+    assert seen[0].url.path == "/compatible-mode/v1/chat/completions"
+    assert seen[0].headers["authorization"] == f"Bearer {SECRET}"
+    # The system turn stays a role in the array - unlike Responses, which hoists it.
+    assert body["messages"] == [
+        {"role": "system", "content": "seed"},
+        {"role": "user", "content": KOREAN},
+    ]
+    assert body["max_tokens"] == 64
+    assert body["temperature"] == 0.4
+    assert completion.text == KOREAN_REPLY
+    assert completion.model == "qwen-plus"
+    assert (completion.input_tokens, completion.output_tokens) == (12, 5)
+    assert completion.meta["stop_reason"] == "stop"
+
+
+async def test_compatible_declares_tools_nested_under_function() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=COMPAT_OK)
+
+    spec = ToolSpec(
+        name="read_file",
+        description="Read a file",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+    )
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        await provider.complete(PROMPT, model="qwen-plus", tools=[spec])
+
+    body = json.loads(seen[0].content)
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+        }
+    ]
+
+
+async def test_compatible_reads_tool_calls_with_json_string_arguments() -> None:
+    answer = {
+        "model": "qwen-plus",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path": "메모.txt"}',
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 9, "completion_tokens": 4},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=answer)
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        completion = await provider.complete(PROMPT, model="qwen-plus")
+
+    assert completion.text == ""
+    assert completion.tool_calls == (
+        ToolCall(id="call_abc", name="read_file", arguments={"path": "메모.txt"}),
+    )
+
+
+async def test_compatible_synthesises_an_id_when_the_endpoint_issues_none() -> None:
+    answer = {
+        "model": "local",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"function": {"name": "list_dir", "arguments": {"path": "."}}}
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=answer)
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        completion = await provider.complete(PROMPT, model="local")
+
+    assert completion.tool_calls[0].id == "list_dir-0"
+    assert completion.tool_calls[0].name == "list_dir"
+
+
+def test_compatible_sends_a_tool_result_as_its_own_role() -> None:
+    from daemon.llm.providers.openai_compatible import _messages
+
+    turns = _messages(
+        [
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=(ToolCall(id="call_abc", name="read_file", arguments={"path": "a"}),),
+            ),
+            Message(role="tool", content="파일 내용", tool_call_id="call_abc"),
+        ]
+    )
+    assert turns[0]["tool_calls"][0]["id"] == "call_abc"
+    assert turns[0]["tool_calls"][0]["function"]["arguments"] == '{"path": "a"}'
+    assert turns[1] == {"role": "tool", "tool_call_id": "call_abc", "content": "파일 내용"}
+
+
+def test_compatible_encodes_an_image_as_a_data_uri() -> None:
+    from daemon.llm.providers.openai_compatible import _messages
+
+    turns = _messages(
+        [
+            Message(
+                role="user",
+                content="what is this",
+                images=(ImageBlock(b"\xff\xd8\xff", "image/jpeg"),),
+            )
+        ]
+    )
+    encoded = base64.b64encode(b"\xff\xd8\xff").decode()
+    assert turns[0]["content"][1]["image_url"]["url"] == f"data:image/jpeg;base64,{encoded}"
+
+
+async def test_compatible_retries_a_server_error_exactly_once() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, text="upstream busy")
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError, match="HTTP 503"):
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    assert calls == 2
+
+
+async def test_compatible_does_not_retry_a_client_error() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(402, text="insufficient credits")
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError, match="rejected the request"):
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    assert calls == 1
+
+
+async def test_compatible_never_reveals_the_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text=f"Incorrect API key provided: {SECRET}")
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError) as caught:
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    assert SECRET not in chain_text(caught.value)
+
+
+async def test_compatible_rejects_a_bare_array_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"nope": True}])
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError, match="not an object"):
+            await provider.complete(PROMPT, model="qwen-plus")
+
+
+async def test_compatible_reports_an_empty_answer_instead_of_returning_it() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"model": "qwen-plus", "choices": []})
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError, match="no text content"):
+            await provider.complete(PROMPT, model="qwen-plus")
+
+
+def test_compatible_needs_both_a_key_and_an_endpoint() -> None:
+    with pytest.raises(ProviderError, match="OPENAI_COMPATIBLE_API_KEY"):
+        OpenAICompatibleProvider("", COMPAT_URL)
+    with pytest.raises(ProviderError, match="DAEMON_OPENAI_COMPATIBLE_BASE_URL"):
+        OpenAICompatibleProvider(SECRET, "")
+
+
+async def test_compatible_health_never_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        assert await provider.health() is False
