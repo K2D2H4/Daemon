@@ -5,7 +5,7 @@ probes, and the reason the shape is this careful is docs/PLAN.md 6.4: an ignored
 notification costs nothing, and **a voice coming out of the speaker during a
 meeting is an accident.** The asymmetry runs one way, so every failure here
 resolves towards `None` rather than towards a cheerful `False`, because `False`
-for `audio_busy` is what routes to the speaker.
+for `mic_busy` or `output_busy` is what routes to the speaker.
 
 ## What each probe is, and what it actually cost
 
@@ -17,7 +17,7 @@ machine docs/PLAN.md 6.3 recorded the probes working on:
 | `idle_seconds` | `ioreg -c IOHIDSystem` | 11-16 ms |
 | `foreground_app` | `lsappinfo`, two calls | 6.9-12 ms, median 7.7 ms |
 | `foreground_app` fallback | `osascript` + System Events | 168-233 ms warm, 464 ms cold |
-| `audio_busy` | CoreAudio, via ctypes | 0.08-0.14 ms warm, 77 ms first call |
+| `mic_busy` / `output_busy` | CoreAudio, via ctypes | 0.08-0.14 ms warm, 77 ms first call |
 
 A reading costs ~20 ms when `lsappinfo` answers and ~200 ms when it falls through
 to `osascript`. Either is fine on a five-minute tick and neither belongs on the
@@ -147,6 +147,7 @@ import sys
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 
+from daemon import mic_hold
 from daemon.clock import now as clock_now
 from daemon.proactivity.base import Reading
 
@@ -307,27 +308,25 @@ def _uint32_property(obj: int, selector: int) -> int:
     return value.value
 
 
-def audio_running() -> bool:
-    """Whether the default input or output device is running for anybody.
+def audio_running(selector: int) -> bool:
+    """Whether the default device named by `selector` is running for anybody.
 
-    Blocking, and called through a thread - it is sub-millisecond warm but talks
-    to another process to do it, and `coreaudiod` restarting is a real thing.
+    One device per call, where this used to OR the two together. The merge is
+    what let the wake listener's own hold on the input device present as "the
+    audio hardware is busy", which the gate spent as "on a call" - so voice being
+    on was what kept the speaker route unreachable. The two directions mean
+    different things and the caller needs them apart.
 
-    A machine with no microphone has no default input device, which is not a
-    failure; it is only a failure when *neither* default exists, because then
-    nothing was measured and saying `False` would be a guess.
+    Blocking, and called through a thread: sub-millisecond warm, but it talks to
+    another process to do it and `coreaudiod` restarting is a real thing.
     """
-    measured = False
-    for default in (DEFAULT_OUTPUT, DEFAULT_INPUT):
-        device = _uint32_property(SYSTEM_OBJECT, default)
-        if device == UNKNOWN_OBJECT:
-            continue
-        measured = True
-        if _uint32_property(device, IS_RUNNING_SOMEWHERE):
-            return True
-    if not measured:
-        raise ProbeError("no default audio device")
-    return False
+    device = _uint32_property(SYSTEM_OBJECT, selector)
+    if device == UNKNOWN_OBJECT:
+        # A machine with no microphone has no default input device. Nothing was
+        # measured, so saying False would be a guess - and False on the input
+        # side is what routes to the speaker.
+        raise ProbeError("no such default audio device")
+    return bool(_uint32_property(device, IS_RUNNING_SOMEWHERE))
 
 
 # --- the reading ------------------------------------------------------------
@@ -347,7 +346,8 @@ class MachinePresence:
         platform: str | None = None,
         timeout: float = PROBE_TIMEOUT_SECONDS,
         run: Callable[[Sequence[str]], Awaitable[str]] | None = None,
-        audio: Callable[[], bool] | None = None,
+        audio: Callable[[int], bool] | None = None,
+        mic_held: Callable[[], bool] | None = None,
         now: datetime | None = None,
     ) -> None:
         # sys.platform, not platform.system(): it is a constant fixed at compile
@@ -364,13 +364,14 @@ class MachinePresence:
         # a probe with no failure-path coverage at all.
         self._run = run if run is not None else self._spawn
         self._audio = audio if audio is not None else audio_running
+        self._mic_held = mic_held if mic_held is not None else mic_hold.held
         self._now = now
 
     async def read(self) -> Reading:
-        """The three probes, in one reading. Never raises."""
+        """The four probes, in one reading. Never raises."""
         at = self._now or clock_now()
         if self._platform != "darwin":
-            # One entry, not three: the fact is about the platform, and repeating
+            # One entry, not four: the fact is about the platform, and repeating
             # it per field would pad the gate snapshot without adding anything.
             # The fields are `None`, so the gate already sees nothing is known.
             return Reading(
@@ -384,12 +385,14 @@ class MachinePresence:
         # that a failure is attributed to exactly one probe.
         idle = await self._probe("idle_seconds", self._idle_seconds, unknown)
         app = await self._probe("foreground_app", self._foreground_app, unknown)
-        busy = await self._probe("audio_busy", self._audio_busy, unknown)
+        mic = await self._probe("mic_busy", self._mic_busy, unknown)
+        output = await self._probe("output_busy", self._output_busy, unknown)
         return Reading(
             at=at,
             idle_seconds=idle,
             foreground_app=app,
-            audio_busy=busy,
+            mic_busy=mic,
+            output_busy=output,
             unknown=tuple(unknown),
         )
 
@@ -483,21 +486,35 @@ class MachinePresence:
         has no way to request non-interactively - see the module docstring."""
         return _app_name(await self._run([OSASCRIPT, "-e", FRONTMOST]), "osascript")
 
-    async def _audio_busy(self) -> bool:
-        """Whether something holds the audio device - a call, a recording."""
+    async def _mic_busy(self) -> bool:
+        """Whether somebody *other than us* holds the microphone.
+
+        Our own hold is subtracted rather than probed around, because CoreAudio
+        has no per-process answer: `kAudioDevicePropertyDeviceIsRunningSomewhere`
+        is exactly as wide as its name. The daemon does know its own state, so it
+        asks itself (`daemon/mic_hold.py`) instead of guessing.
+
+        Checked *before* the probe: if we hold it, the device is busy by
+        definition and the answer cannot be anything else.
+        """
+        if self._mic_held():
+            return False
+        return await self._device_running(DEFAULT_INPUT)
+
+    async def _output_busy(self) -> bool:
+        return await self._device_running(DEFAULT_OUTPUT)
+
+    async def _device_running(self, selector: int) -> bool:
         try:
             async with asyncio.timeout(self._timeout):
                 # In a thread because this is a blocking IPC to coreaudiod. A
-                # timeout cannot actually cancel the thread, so a genuinely wedged
-                # coreaudiod leaks one worker per tick - accepted, because the
-                # alternative is blocking the event loop on the same call, and
-                # 0.1 ms warm makes this the improbable branch.
-                return await asyncio.to_thread(self._audio)
+                # timeout cannot cancel the thread, so a wedged coreaudiod leaks
+                # one worker per tick - accepted, because 0.1 ms warm makes this
+                # the improbable branch and the alternative is blocking the loop.
+                return await asyncio.to_thread(self._audio, selector)
         except TimeoutError:
             raise ProbeError(f"CoreAudio did not answer in {self._timeout:g}s") from None
         except OSError as exc:
-            # ctypes.CDLL raising: no CoreAudio framework, which is what a
-            # non-Apple platform reaching this code would look like.
             raise ProbeError(f"CoreAudio unavailable: {exc}") from exc
 
     async def _spawn(self, argv: Sequence[str]) -> str:

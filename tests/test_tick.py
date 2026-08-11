@@ -28,7 +28,7 @@ NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
 class FakePresence:
     def __init__(self, reading: Reading | None = None) -> None:
         self.reading = reading or Reading(
-            at=NOW, idle_seconds=5.0, foreground_app="Warp", audio_busy=False
+            at=NOW, idle_seconds=5.0, foreground_app="Warp", mic_busy=False, output_busy=False
         )
         self.reads = 0
 

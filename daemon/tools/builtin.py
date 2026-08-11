@@ -693,8 +693,10 @@ class SystemState:
             lines.append(f"at the keyboard: {answer}")
         if reading.foreground_app:
             lines.append(f"frontmost app: {reading.foreground_app}")
-        if reading.audio_busy is not None:
-            lines.append(f"audio in use: {'yes' if reading.audio_busy else 'no'}")
+        if reading.mic_busy is not None:
+            lines.append(f"microphone in use: {'yes' if reading.mic_busy else 'no'}")
+        if reading.output_busy is not None:
+            lines.append(f"output device in use: {'yes' if reading.output_busy else 'no'}")
         for note in reading.unknown:
             # Said rather than dropped: a probe that failed is a fact about the
             # answer, and omitting it silently reads as "nothing to report".

@@ -247,7 +247,12 @@ class Gate:
             return "telegram", f"presence unknown ({', '.join(reading.unknown) or 'no reading'})"
         if not at_keyboard:
             return "telegram", f"user away, idle {reading.idle_seconds:.0f}s"
-        if reading.audio_busy is not False:
+        # The merged single-bool reading this rule was written against was split
+        # into `mic_busy` and `output_busy` in Task 3; `_either_busy` recombines
+        # them so this rule keeps its exact pre-split behaviour until Task 6
+        # judges the two separately.
+        device_busy = _either_busy(reading.mic_busy, reading.output_busy)
+        if device_busy is not False:
             # Both `True` and `None` cost the speaker and nothing else - this is
             # the device we would grab, so anything short of "provably free" is a
             # reason not to.
@@ -263,7 +268,7 @@ class Gate:
             # gate is judged on. PLAN 6.4 already says which channel is safe: the
             # text notification is ignorable, the voice is the accident. So this
             # routes, exactly like the foreground app.
-            state = "in use" if reading.audio_busy else "state unknown"
+            state = "in use" if device_busy else "state unknown"
             return "telegram", f"audio device {state}"
         if focus_app(reading.foreground_app) is not None:
             return "telegram", f"{reading.foreground_app} is in the foreground"
@@ -279,3 +284,21 @@ def focus_app(name: str | None) -> str | None:
         return None
     lowered = name.casefold()
     return next((marker for marker in FOCUS_APPS if marker in lowered), None)
+
+
+def _either_busy(mic: bool | None, output: bool | None) -> bool | None:
+    """Three-valued OR, so a rule written against one merged audio-busy bool
+    still has one to read after Task 3 split it into `mic_busy` and
+    `output_busy`.
+
+    Plain `or` is wrong here: `None or False` evaluates to `False` in Python,
+    which would read "the microphone probe failed, but the output was provably
+    free" as "provably free" - inventing the one answer that must never be
+    guessed. True wins outright; both have to be `False` to combine to `False`;
+    anything else is `None`.
+    """
+    if mic is True or output is True:
+        return True
+    if mic is False and output is False:
+        return False
+    return None

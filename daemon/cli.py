@@ -715,10 +715,11 @@ async def _proactive(settings: Settings, *, speak: bool = False) -> int:
 
     reading = result.reading
     idle = "unknown" if reading.idle_seconds is None else f"{reading.idle_seconds:.0f}s"
-    audio = {True: "busy", False: "free", None: "unknown"}[reading.audio_busy]
-    print(
-        f"presence: idle {idle} · app {reading.foreground_app or 'unknown'} · audio {audio}"
-    )
+    tristate = {True: "busy", False: "free", None: "unknown"}
+    mic = tristate[reading.mic_busy]
+    output = tristate[reading.output_busy]
+    print(f"presence: idle {idle} · app {reading.foreground_app or 'unknown'}")
+    print(f"          mic {mic} · output {output}")
     for reason in reading.unknown:
         print(f"  ! {reason}")
 

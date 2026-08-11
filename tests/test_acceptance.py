@@ -613,7 +613,8 @@ async def test_it_speaks_first_and_the_utterance_can_be_labelled(tmp_path: Path)
                     at=datetime.now(UTC),
                     idle_seconds=5.0,
                     foreground_app="Terminal",
-                    audio_busy=False,
+                    mic_busy=False,
+                    output_busy=False,
                 )
 
         provider = Provider(reply='{"say": "발표 어떻게 됐어?"}')
@@ -899,7 +900,9 @@ async def test_it_stays_silent_when_the_gate_says_so(tmp_path: Path) -> None:
 
         class Away:
             async def read(self) -> Reading:
-                return Reading(at=datetime.now(UTC), idle_seconds=9000.0, audio_busy=False)
+                return Reading(
+                    at=datetime.now(UTC), idle_seconds=9000.0, mic_busy=False, output_busy=False
+                )
 
         provider = Provider()
         tick = ProactiveTick(

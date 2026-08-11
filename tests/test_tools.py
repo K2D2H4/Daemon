@@ -1105,12 +1105,13 @@ def reading(**kw: Any) -> Any:
 
 async def test_system_state_reports_what_the_presence_measured() -> None:
     presence = FakePresence(
-        reading(idle_seconds=41.0, foreground_app="Warp", audio_busy=False)
+        reading(idle_seconds=41.0, foreground_app="Warp", mic_busy=False, output_busy=False)
     )
     out = await SystemState(presence).run({})
     assert "input idle: 41s" in out
     assert "frontmost app: Warp" in out
-    assert "audio in use: no" in out
+    assert "microphone in use: no" in out
+    assert "output device in use: no" in out
     assert presence.reads == 1, "it must ask the presence, not probe on its own"
 
 
@@ -1132,9 +1133,9 @@ async def test_a_probe_that_failed_is_said_not_dropped() -> None:
     """Omitting it reads as "nothing to report", which is the silent degradation
     this project keeps being bitten by."""
     out = await SystemState(
-        FakePresence(reading(unknown=("audio_busy: CoreAudio did not answer",)))
+        FakePresence(reading(unknown=("mic_busy: CoreAudio did not answer",)))
     ).run({})
-    assert "could not read: audio_busy: CoreAudio did not answer" in out
+    assert "could not read: mic_busy: CoreAudio did not answer" in out
 
 
 async def test_no_presence_is_admitted_rather_than_guessed() -> None:

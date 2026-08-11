@@ -154,7 +154,7 @@ its own CoreAudio client, and nothing arbitrates between the two. The interlock 
 upstream and already exists. `daemon/proactivity/presence.py` reads
 `kAudioDevicePropertyDeviceIsRunningSomewhere`, and its docstring notes that this
 "cannot distinguish *our own* speaker from someone else's call" - so a live voice
-conversation reads `audio_busy=True`, and the gate declines before routing here.
+conversation reads `mic_busy=True`, and the gate declines before routing here.
 That over-broad reading is load-bearing rather than a wart, and it is why this file
 holds no lock against the voice path: the two cannot both be reached for the same
 tick unless the gate is bypassed.
