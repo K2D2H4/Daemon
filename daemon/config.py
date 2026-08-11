@@ -195,30 +195,37 @@ def providers_for(
     *,
     voice_enabled: bool,
     hosted: str = DEFAULT_HOSTED_PROVIDER,
+    voice_provider: str,
 ) -> list[str]:
     """Providers a preset actually needs, so onboarding asks for those keys only.
 
-    Voice tasks are excluded while voice is off - the same rule as
-    `Settings.active_tasks`. That is what lets a text-only `balanced` install be
-    set up without a hosted voice key (docs/PLAN.md 6.5).
+    Voice contributes only while voice is on - that is what lets a text-only
+    `balanced` install be set up without a hosted voice key (docs/PLAN.md 6.5) - and
+    when it does, it contributes `voice_provider` under *every* preset, `offline`
+    included (docs/adr/0012).
 
     `hosted` resolves the HOSTED placeholder and is required: a caller that guesses
     it asks the user for the wrong key, which is how a person who chose GPT ends up
     being asked for an Anthropic one. Pass "" before the question has been answered
     and hosted tasks simply drop out of the list.
+
+    `voice_provider` is required for the same reason, and is not defaulted here even
+    though the field has a default: reading CHAT_VOICE from the preset table instead
+    asked a user who had chosen OpenAI voice for a Gemini key.
     """
     if preset not in PRESETS:
         raise ConfigError(
             f"unknown preset {preset!r}; expected one of {', '.join(sorted(PRESETS))}"
         )
-    return sorted(
-        {
-            provider
-            for task, provider in preset_providers(preset, hosted).items()
-            # An unanswered question contributes nothing rather than a guess.
-            if (voice_enabled or task not in VOICE_TASKS) and provider != HOSTED
-        }
-    )
+    providers = {
+        provider
+        for task, provider in preset_providers(preset, hosted).items()
+        # An unanswered question contributes nothing rather than a guess.
+        if task not in VOICE_TASKS and provider != HOSTED
+    }
+    if voice_enabled:
+        providers.add(voice_provider)
+    return sorted(providers)
 
 
 @dataclass(frozen=True, slots=True)

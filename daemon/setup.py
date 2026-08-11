@@ -192,15 +192,16 @@ DEFAULT_PRESET = "balanced"
 PRESET_CHOICES: tuple[Choice, ...] = (
     Choice(
         "offline",
-        "Everything on this machine. No keys, no accounts. Voice unavailable.",
+        "Everything on this machine. No keys and no accounts, unless you add voice.",
         (
             "Conversation, the daily reflection and the decision to speak first all "
-            "run here through Ollama. Nothing leaves the machine.",
-            "Voice is not available, and that is the trade rather than a gap: "
-            "native-audio voice means a hosted model is both the brain and the "
-            "voice, and leaving that out is exactly what makes the privacy promise "
+            "run here through Ollama. With voice off, nothing leaves the machine.",
+            "Voice is the one thing you can opt into: native audio needs a hosted "
+            "model, so turning it on sends audio to the provider you choose, with "
+            "your own key. Leaving it off is exactly what makes the privacy promise "
             "true instead of aspirational (docs/PLAN.md 7).",
-            "Needs Ollama and two local models. No API keys and no accounts.",
+            "Needs Ollama and two local models. No API keys and no accounts until "
+            "you turn voice on.",
         ),
     ),
     Choice(
@@ -959,6 +960,11 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
         preset,
         voice_enabled=_truthy(env.get("DAEMON_VOICE_ENABLED", "")),
         hosted=hosted,
+        # The wizard has no voice-provider question yet (it is admin-only), so an
+        # absent value means the field default rather than "nobody chose" - unlike
+        # `hosted`, this field *has* a default, and it is `gemini`.
+        voice_provider=env.get("DAEMON_VOICE_PROVIDER", "")
+        or _settings_default("DAEMON_VOICE_PROVIDER"),
     )
     needs: list[Need] = []
 
@@ -1648,7 +1654,7 @@ class Wizard:
         self._step(2, "How should Daemon think?")
         preset = self._choose_preset(env, updates)
         hosted = self._choose_hosted(preset, env, updates)
-        voice = self._choose_voice(preset, hosted, env, updates)
+        voice = self._choose_voice(env, updates)
 
         merged = {
             **env,
@@ -1941,20 +1947,9 @@ class Wizard:
         _record(updates, "DAEMON_HOSTED_PROVIDER", chosen, current)
         return chosen
 
-    def _choose_voice(
-        self, preset: str, hosted: str, env: Mapping[str, str], updates: dict[str, str]
-    ) -> bool:
-        # `hosted` is passed even though CHAT_VOICE is pinned to Gemini today: the
-        # question is whether this preset has a voice task at all, and answering it
-        # from a table with an unresolved placeholder in it is how the wrong key
-        # gets asked for the moment that pinning changes.
-        if GEMINI not in providers_for(preset, voice_enabled=True, hosted=hosted):
-            self.prompt.say(f"Voice is not part of the {preset} preset: native audio has to")
-            self.prompt.say("run on a hosted model, and leaving it out is what makes 'nothing")
-            self.prompt.say("leaves this machine' literally true. Text mode is the whole product.")
-            self.prompt.say()
-            return False
-
+    def _choose_voice(self, env: Mapping[str, str], updates: dict[str, str]) -> bool:
+        # No preset gate: every preset can carry voice now (docs/adr/0012), and the
+        # trade is stated in the question itself rather than by refusing to ask it.
         raw = env.get("DAEMON_VOICE_ENABLED", "")
         was = _truthy(raw) if raw else False
         self.prompt.say("Turn voice on? Audio then goes to Google's native-audio model,")

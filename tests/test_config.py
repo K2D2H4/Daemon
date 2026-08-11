@@ -16,7 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 from daemon import clock
-from daemon.config import PRESETS, ConfigError, Route, Settings
+from daemon.config import PRESETS, ConfigError, Route, Settings, providers_for
 from daemon.tasks import Task
 
 
@@ -171,6 +171,26 @@ def test_voice_on_needs_its_own_model_under_the_offline_preset_too() -> None:
     # no longer refuses anything.
     with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_MODEL is empty"):
         make_settings(preset="offline", voice_enabled=True, gemini_api_key="k")
+
+
+def test_providers_for_asks_for_the_voice_key_under_the_offline_preset() -> None:
+    assert providers_for(
+        "offline", voice_enabled=True, hosted="", voice_provider="gemini"
+    ) == ["gemini", "ollama"]
+    assert providers_for(
+        "offline", voice_enabled=False, hosted="", voice_provider="gemini"
+    ) == ["ollama"]
+
+
+def test_providers_for_follows_the_voice_provider_not_the_table() -> None:
+    # Reading CHAT_VOICE straight from the preset table asked a user who chose
+    # OpenAI voice for a Gemini key.
+    providers = providers_for(
+        "balanced", voice_enabled=True, hosted="anthropic", voice_provider="openai"
+    )
+
+    assert "openai" in providers
+    assert "gemini" not in providers
 
 
 def test_a_blank_endpointing_value_means_the_server_default(tmp_path: Any) -> None:
