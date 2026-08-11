@@ -28,7 +28,7 @@ import re
 
 import pytest
 
-from daemon.config import PROVIDER_KEY_ENV
+from daemon.config import ENV_FILE, PROVIDER_KEY_ENV
 from daemon.tasks import Task
 
 DAEMON = pathlib.Path(__file__).resolve().parents[1] / "daemon"
@@ -590,3 +590,42 @@ def test_the_environment_is_isolated_from_the_developers_own() -> None:
     leaked = sorted(k for k in os.environ if k.startswith(CONFIG_PREFIXES))
     assert leaked == [], f"real configuration is visible to tests: {leaked}"
     assert CANARY not in os.environ
+
+
+def test_no_test_runs_where_a_developers_env_file_would_be_found() -> None:
+    """The file half of the same defect, and it needs its own assertion.
+
+    `ENV_FILE` is the relative path `.env`, so any test that builds `Settings()`
+    the way the product does - `daemon.cli.main` - reads whatever `.env` sits in
+    the *current directory*, and pytest's is the repo root. A developer who has run
+    `daemon setup` therefore ran a different suite from CI's, which has no `.env`;
+    `test_the_audit_trail_is_readable_from_the_cli` exited 2 for exactly that.
+
+    Three assertions, because one of them alone stops gating without saying so.
+
+    The premise first: all of this matters only while `ENV_FILE` is *relative*. Make
+    it absolute and cwd decides nothing, the chdir guards nothing, and a test that
+    checked only the directory would stay green forever while covering an empty
+    requirement - the "quietly stopped working" failure this file exists to catch.
+
+    Then the directory, which is the half that is falsifiable in CI: delete the chdir
+    from `no_real_configuration` and this fails everywhere, not only on the machines
+    that already had the bug. And then the requirement itself, no `.env` where
+    `Settings()` would look - vacuous in CI, but it is the only one that still holds
+    when the suite is run from somewhere that is not the repo root, which an editable
+    install allows.
+    """
+    assert not pathlib.Path(ENV_FILE).is_absolute(), (
+        f"{ENV_FILE!r} is absolute, so cwd no longer decides what Settings() reads "
+        "and conftest's chdir guards nothing - this test has stopped gating"
+    )
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    assert pathlib.Path.cwd().resolve() != root, (
+        f"tests run in the repo root, where a developer's own {ENV_FILE!r} decides "
+        "what Settings() sees; conftest.no_real_configuration should have chdir'd"
+    )
+    assert not (pathlib.Path.cwd() / ENV_FILE).exists(), (
+        f"a {ENV_FILE!r} sits in the working directory, so Settings() reads it "
+        "instead of what the test chose"
+    )
