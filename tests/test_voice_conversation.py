@@ -1882,6 +1882,79 @@ async def test_run_voice_follows_the_owners_tool_mode(
     )
 
 
+# --- live screen share is gated on the provider (PR #79 review, Finding 1) ----
+# `OpenAIRealtimeSession.send_frame` is a deliberate no-op - no realtime video
+# input channel - so registering the live-share start/stop tools for it would
+# let the model tell the owner "I'm watching your screen now" while every frame
+# is silently dropped (ADR 0009 forbids exactly this). These drive the real
+# `run_voice` assembly and read what the session was actually offered, the same
+# way `test_run_voice_follows_the_owners_tool_mode` does.
+
+
+async def test_run_voice_openai_drops_live_share_tools_but_keeps_see_screen(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _voice_settings(
+        tmp_path,
+        DAEMON_VOICE_PROVIDER="openai",
+        OPENAI_API_KEY="k",
+        DAEMON_OPENAI_REALTIME_MODEL="gpt-realtime",
+        DAEMON_SCREEN_ENABLED="true",
+    )
+    from daemon import app as app_module
+
+    captured: dict[str, Any] = {}
+
+    def capturing_session(**kwargs: Any) -> FakeSession:
+        captured.update(kwargs)
+        return FakeSession(Turn())
+
+    monkeypatch.setattr(app_module, "build_voice_audio", lambda: FakeAudio())
+    monkeypatch.setattr(
+        "daemon.voice.openai_realtime.OpenAIRealtimeSession", capturing_session
+    )
+
+    code = await app_module.run_voice(settings)
+
+    assert code == 0
+    names = {spec.name for spec in (captured.get("tools") or ())}
+    assert "see_screen" in names, (
+        "the still-image tool is a different path and must stay on"
+    )
+    assert "start_screen_share" not in names, (
+        "OpenAI's send_frame is a no-op; offering this tool lets the model "
+        "claim a screen-watching capability it cannot deliver"
+    )
+    assert "stop_screen_share" not in names
+
+
+async def test_run_voice_gemini_keeps_live_share_tools(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: Gemini Live's session does take video frames
+    (`realtimeInput.video`, ADR 0009), so the gate must not cost it the
+    live-share tools it can actually back."""
+    settings = _voice_settings(tmp_path, DAEMON_SCREEN_ENABLED="true")
+    from daemon import app as app_module
+
+    captured: dict[str, Any] = {}
+
+    def capturing_session(**kwargs: Any) -> FakeSession:
+        captured.update(kwargs)
+        return FakeSession(Turn())
+
+    monkeypatch.setattr(app_module, "build_voice_audio", lambda: FakeAudio())
+    monkeypatch.setattr(
+        "daemon.voice.gemini_live.GeminiLiveSession", capturing_session
+    )
+
+    code = await app_module.run_voice(settings)
+
+    assert code == 0
+    names = {spec.name for spec in (captured.get("tools") or ())}
+    assert {"see_screen", "start_screen_share", "stop_screen_share"} <= names
+
+
 # --- screen-share lifecycle (Task 2.3) ----------------------------------------
 #
 # The pump needs a live VoiceSession, so the conversation binds it once the

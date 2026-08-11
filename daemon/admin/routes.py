@@ -8,7 +8,7 @@ Endpoints (docs/design/2026-08-07-m5-admin-web-design.md, "JSON API"):
     GET   /admin/api/settings     editable settings, secrets masked
     PATCH /admin/api/settings     validate -> write .env -> {restart_required, supervised}
     POST  /admin/api/restart      graceful exit, only when supervised
-    GET   /admin/api/voice-sample/{voice}  a voice preview clip (audio/mpeg), allowlist-gated
+    GET   /admin/api/voice-sample/{provider}/{voice}  a preview clip (audio/mpeg), allowlist-gated
     GET   /admin/api/activity     the merged decision log (proactivity, tools, reflection)
     GET   /admin/api/proactive/today   today's rounds, budget and timeline marks
     GET   /admin/api/tools/log    tool calls and refusals with their policy decision
@@ -61,7 +61,7 @@ from daemon.admin.settings_io import (
     write_env_secret,
 )
 from daemon.app import health_payload, open_store
-from daemon.config import GEMINI_LIVE_VOICES
+from daemon.config import GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES, VOICE_PROVIDERS
 from daemon.llm.base import Message, ProviderError
 from daemon.mcp_catalog import CATALOG, lookup
 from daemon.tasks import Task
@@ -76,8 +76,8 @@ from daemon.tools.mcp import (
 SHELL = Path(__file__).parent / "static" / "index.html"
 
 VOICE_SAMPLES = Path(__file__).parent / "static" / "voice-samples"
-"""Committed MP3 previews, one per Gemini Live voice, produced offline by
-evals/gen_voice_samples.py. Served locally so preview needs no key and no network -
+"""Committed MP3 previews, produced offline by evals/gen_voice_samples.py, one per
+voice under <provider>/. Served locally so preview needs no key and no network -
 the admin stays offline (design decision 4: no CDN, offline operation preserved)."""
 
 CHAT_TEST_TIMEOUT = 60.0
@@ -255,19 +255,33 @@ async def restart() -> JSONResponse:
     return JSONResponse({"restarted": True, "supervised": True})
 
 
-@router.get("/api/voice-sample/{voice}")
-async def voice_sample(voice: str) -> Response:
-    """A short preview clip for one Gemini Live voice, as audio/mpeg.
+_VOICE_ALLOWLISTS = {"gemini": GEMINI_LIVE_VOICES, "openai": OPENAI_REALTIME_VOICES}
+"""Which voice names each provider serves. A literal map, not zip(VOICE_PROVIDERS, ...):
+zip couples this to the tuple's declaration order, so a reorder there would silently swap
+the two allowlists (same length, no error). The check below is the loud version of that
+coupling - it fails at import if a provider is added to config without an allowlist here."""
+if set(_VOICE_ALLOWLISTS) != set(VOICE_PROVIDERS):
+    raise RuntimeError(
+        f"_VOICE_ALLOWLISTS {sorted(_VOICE_ALLOWLISTS)} out of sync with "
+        f"VOICE_PROVIDERS {sorted(VOICE_PROVIDERS)}"
+    )
 
-    The name is checked against the fixed voice set BEFORE any path is built, so an
-    unknown or traversal name can never resolve a file. A known voice whose clip was
-    not generated is a 404, not a 500 - a missing asset degrades to 'no preview'."""
-    if voice not in GEMINI_LIVE_VOICES:
-        return JSONResponse({"detail": f"no such voice {voice!r}"}, status_code=404)
-    path = VOICE_SAMPLES / f"{voice}.mp3"
+
+@router.get("/api/voice-sample/{provider}/{voice}")
+async def voice_sample(provider: str, voice: str) -> Response:
+    """A short preview clip for one voice, as audio/mpeg.
+
+    Both `provider` and `voice` are checked against fixed sets BEFORE any path is
+    built, so an unknown provider/voice or a traversal name can never resolve a file.
+    A known voice whose clip was not generated is a 404, not a 500 - a missing asset
+    degrades to 'no preview'. Clips live under voice-samples/<provider>/<voice>.mp3."""
+    allow = _VOICE_ALLOWLISTS.get(provider)
+    if allow is None or voice not in allow:
+        return JSONResponse({"detail": f"no such voice {provider}/{voice}"}, status_code=404)
+    path = VOICE_SAMPLES / provider / f"{voice}.mp3"
     if not path.is_file():
         return JSONResponse(
-            {"detail": f"no preview generated for {voice!r}"}, status_code=404
+            {"detail": f"no preview generated for {provider}/{voice}"}, status_code=404
         )
     return Response(path.read_bytes(), media_type="audio/mpeg")
 
