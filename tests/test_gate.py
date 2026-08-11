@@ -43,9 +43,37 @@ SPEAKER_ROUTES = {"local_speaker", "both"}
 OPEN_LOOP = Candidate(kind="open_loop", reason="어제 발표 어떻게 됐는지 안 물어봤다")
 EMOTIONAL = Candidate(kind="emotional", reason="힘들다고 한 뒤로 이틀 동안 말이 없다")
 
-PRESENT = Reading(at=NOW, idle_seconds=12.0, foreground_app="Terminal", audio_busy=False)
-AWAY = Reading(at=NOW, idle_seconds=3_600.0, foreground_app="Finder", audio_busy=False)
+PRESENT = Reading(
+    at=NOW,
+    idle_seconds=12.0,
+    foreground_app="Terminal",
+    mic_busy=False,
+    output_busy=False,
+    output_muted=False,
+    screen_locked=False,
+)
+AWAY = Reading(
+    at=NOW,
+    idle_seconds=3_600.0,
+    foreground_app="Finder",
+    mic_busy=False,
+    output_busy=False,
+    output_muted=False,
+    screen_locked=False,
+)
 UNREADABLE = Reading(at=NOW, unknown=("idle_seconds: ioreg returned nothing",))
+
+ROUTING_BASE: dict[str, Any] = dict(
+    idle_seconds=1.0,
+    foreground_app="Warp",
+    mic_busy=False,
+    output_busy=False,
+    output_muted=False,
+    screen_locked=False,
+    headphones=False,
+)
+"""Every rule released, for the routing table below - so each row only tests
+the one rule its name says."""
 
 
 @pytest.fixture(autouse=True)
@@ -390,61 +418,76 @@ def test_the_budget_rule_works_against_the_real_store(db: sqlite3.Connection) ->
         assert "open_loop budget" in verdict.why
 
 
-# --- audio, and the foreground app -------------------------------------------
+# --- the six-signal routing table (Task 6) ------------------------------------
 
 
-def test_audio_in_use_costs_the_speaker_not_the_utterance() -> None:
-    """Changed after running it. The original reading was that a busy audio device
-    means a call in progress and waiting is free, so it blocked outright.
+@pytest.mark.parametrize(
+    ("name", "override", "expected"),
+    [
+        ("nothing in the way", {}, "both"),
+        ("away from the keyboard", {"idle_seconds": 600.0}, "telegram"),
+        ("presence unknown", {"idle_seconds": None}, "telegram"),
+        ("screen locked", {"screen_locked": True}, "telegram"),
+        ("muted", {"output_muted": True}, "telegram"),
+        ("somebody else's mic", {"mic_busy": True}, "telegram"),
+        ("output device in use", {"output_busy": True}, "telegram"),
+        ("a meeting app in front", {"foreground_app": "zoom.us"}, "telegram"),
+    ],
+)
+def test_routing_table(name: str, override: dict[str, Any], expected: str) -> None:
+    """One row per rule in `_route`, so a missing rule shows up as a missing row
+    rather than as a gap nobody wrote a test for."""
+    reading = Reading(at=NOW, **{**ROUTING_BASE, **override})
+    verdict = gate_for().judge(EMOTIONAL, reading, now=NOW)
+    assert verdict.delivery == expected, name
 
-    The probe is `kAudioDevicePropertyDeviceIsRunningSomewhere`, which is equally
-    true for a notification chime, an autoplaying video, or a system-wide audio EQ
-    holding the device all day - one was installed on the development machine, and
-    the gate silenced everything. Someone who plays music would never be messaged,
-    which is the dead-bot end of the failure the M3 gate is judged on.
 
-    PLAN 6.4 already names the safe channel: the text notification is ignorable and
-    the voice is the accident. So this routes, exactly like the foreground app.
-    """
-    busy = Reading(at=NOW, idle_seconds=12.0, foreground_app="Terminal", audio_busy=True)
+def test_headphones_excuse_only_the_foreground_app() -> None:
+    """A meeting app in front is a reason not to speak *into the room*. On
+    headphones there is no room. Every other block still applies."""
+    on_cans = {**ROUTING_BASE, "foreground_app": "zoom.us", "headphones": True}
+    assert gate_for().judge(EMOTIONAL, Reading(at=NOW, **on_cans), now=NOW).delivery == "both"
 
-    verdict = gate_for().judge(EMOTIONAL, busy, now=NOW)
-
-    assert verdict.allowed
+    still_blocked = {**on_cans, "mic_busy": True}
+    verdict = gate_for().judge(EMOTIONAL, Reading(at=NOW, **still_blocked), now=NOW)
     assert verdict.delivery == "telegram"
-    assert "audio device in use" in verdict.why
 
 
-def test_an_unknown_audio_state_also_costs_only_the_speaker() -> None:
-    """Anything short of "provably free" keeps us off the device we would grab."""
-    unsure = Reading(at=NOW, idle_seconds=12.0, foreground_app="Terminal", audio_busy=None)
-
-    verdict = gate_for().judge(EMOTIONAL, unsure, now=NOW)
-
-    assert verdict.allowed
+def test_headphones_unknown_does_not_excuse_the_foreground_app() -> None:
+    """`Reading.headphones` has no probe today - presence.py measured that this
+    machine's default output answers `Transport: USB` for its own built-in
+    speakers, and deleted the probe rather than ship a false "headphones" excuse.
+    So every real `Reading` has `headphones is None`, and unlike the other
+    tri-valued fields, `None` here must NOT read as permission: only an explicit
+    `True` may widen what the speaker may do."""
+    meeting = {**ROUTING_BASE, "foreground_app": "zoom.us", "headphones": None}
+    verdict = gate_for().judge(EMOTIONAL, Reading(at=NOW, **meeting), now=NOW)
     assert verdict.delivery == "telegram"
 
 
-def test_a_free_audio_device_does_not_block() -> None:
-    assert gate_for().judge(EMOTIONAL, PRESENT, now=NOW).delivery == "both"
-
-
-def test_an_unreadable_audio_device_costs_the_speaker_not_the_utterance() -> None:
-    """It is the very device we would grab, so "cannot tell" is not permission -
-    but a Telegram message during a call costs nothing, so it still goes."""
-    unsure = Reading(at=NOW, idle_seconds=12.0, foreground_app="Terminal", audio_busy=None)
-    verdict = gate_for().judge(EMOTIONAL, unsure, now=NOW)
-
-    assert verdict.allowed
+def test_our_own_speech_does_not_block_the_next_utterance() -> None:
+    """`output_busy` is the weak signal on purpose: it is True for a chime, an
+    autoplaying video, and the audio EQ installed on the development machine.
+    It costs the speaker and never the utterance."""
+    reading = Reading(at=NOW, **{**ROUTING_BASE, "output_busy": True})
+    verdict = gate_for().judge(EMOTIONAL, reading, now=NOW)
     assert verdict.delivery == "telegram"
-    assert "audio" in verdict.why
+    assert "output device" in verdict.why
 
 
 def test_a_meeting_in_the_foreground_downgrades_to_telegram() -> None:
     """PLAN 6.4's asymmetry as policy: a text notification during a meeting is
     ignorable, a voice out of the laptop is the accident. So the foreground app
     moves the route, and does not cancel the utterance."""
-    meeting = Reading(at=NOW, idle_seconds=5.0, foreground_app="zoom.us", audio_busy=False)
+    meeting = Reading(
+        at=NOW,
+        idle_seconds=5.0,
+        foreground_app="zoom.us",
+        mic_busy=False,
+        output_busy=False,
+        output_muted=False,
+        screen_locked=False,
+    )
     verdict = gate_for().judge(EMOTIONAL, meeting, now=NOW)
 
     assert verdict.allowed
@@ -454,7 +497,15 @@ def test_a_meeting_in_the_foreground_downgrades_to_telegram() -> None:
 
 
 def test_an_ordinary_foreground_app_keeps_the_speaker() -> None:
-    editor = Reading(at=NOW, idle_seconds=5.0, foreground_app="Obsidian", audio_busy=False)
+    editor = Reading(
+        at=NOW,
+        idle_seconds=5.0,
+        foreground_app="Obsidian",
+        mic_busy=False,
+        output_busy=False,
+        output_muted=False,
+        screen_locked=False,
+    )
     assert gate_for().judge(EMOTIONAL, editor, now=NOW).delivery == "both"
 
 

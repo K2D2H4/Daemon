@@ -234,8 +234,16 @@ class Gate:
     def _route(self, reading: Reading) -> tuple[Delivery, str | None]:
         """Where it would go, and why not the speaker if not the speaker.
 
+        Ordered cheapest-certainty first, and every rule here only ever *loses*
+        the speaker. PLAN 6.4's asymmetry is the whole shape of this method: an
+        ignored Telegram message costs nothing, a voice out of the laptop during
+        a meeting is an accident, so anything short of "provably safe to speak"
+        routes to text and the utterance itself survives.
+
         `both` rather than `local_speaker` when the user is here: PLAN 6.3 leaves
-        the same words in Telegram so nothing is lost when the speaker is not heard.
+        the same words in Telegram so nothing is lost when the speaker is not
+        heard - and it is what puts the label buttons on every utterance, which
+        the 👎 brake depends on.
         """
         if not self.settings.proactive_speaker_enabled:
             return "telegram", "DAEMON_PROACTIVE_SPEAKER_ENABLED is off"
@@ -247,30 +255,42 @@ class Gate:
             return "telegram", f"presence unknown ({', '.join(reading.unknown) or 'no reading'})"
         if not at_keyboard:
             return "telegram", f"user away, idle {reading.idle_seconds:.0f}s"
-        # The merged single-bool reading this rule was written against was split
-        # into `mic_busy` and `output_busy` in Task 3; `_either_busy` recombines
-        # them so this rule keeps its exact pre-split behaviour until Task 6
-        # judges the two separately.
-        device_busy = _either_busy(reading.mic_busy, reading.output_busy)
-        if device_busy is not False:
-            # Both `True` and `None` cost the speaker and nothing else - this is
-            # the device we would grab, so anything short of "provably free" is a
-            # reason not to.
-            #
-            # `True` used to block the utterance outright, on the reading that a
-            # busy audio device means a call in progress and waiting is free.
-            # Running it disproved the premise: the probe is
-            # `kAudioDevicePropertyDeviceIsRunningSomewhere`, which is also true
-            # for a notification chime, an autoplaying video, or - observed on the
-            # development machine - a system-wide audio EQ holding the device all
-            # day. Blocking on that means someone who plays music is never
-            # messaged at all, which is the dead-bot end of the failure PLAN 6.1's
-            # gate is judged on. PLAN 6.4 already says which channel is safe: the
-            # text notification is ignorable, the voice is the accident. So this
-            # routes, exactly like the foreground app.
-            state = "in use" if device_busy else "state unknown"
-            return "telegram", f"audio device {state}"
-        if focus_app(reading.foreground_app) is not None:
+        if reading.screen_locked is not False:
+            # Sitting here with the screen locked is still away, and an unreadable
+            # lock state is not proof of presence.
+            state = "locked" if reading.screen_locked else "lock state unknown"
+            return "telegram", f"screen {state}"
+        if reading.output_muted is not False:
+            # `say` exits 0 into a muted device and the row would record a line
+            # spoken aloud that nobody heard (daemon/proactivity/speaker.py).
+            state = "muted" if reading.output_muted else "mute state unknown"
+            return "telegram", f"output {state}"
+        if reading.mic_busy is not False:
+            # Ours is already subtracted (daemon/mic_hold.py), so this is
+            # somebody else holding the microphone - which is what a call is.
+            state = "in use" if reading.mic_busy else "state unknown"
+            return "telegram", f"microphone {state}"
+        if reading.output_busy is not False:
+            # Deliberately the weak signal. It is `True` for a notification
+            # chime, an autoplaying video, and - observed on the development
+            # machine - a system-wide audio EQ holding the device all day, so
+            # blocking outright on it means someone who plays music is never
+            # messaged at all, the dead-bot end of the failure PLAN 6.1's gate is
+            # judged on. It costs the speaker and never the utterance, exactly
+            # like the foreground app below.
+            state = "in use" if reading.output_busy else "state unknown"
+            return "telegram", f"output device {state}"
+        if focus_app(reading.foreground_app) is not None and reading.headphones is not True:
+            # The only rule headphones excuse, and only on an explicit `True` -
+            # `is not True` rather than `not reading.headphones` so that `None`
+            # reads the same as `False` here, deliberately. A meeting app in
+            # front is a reason not to speak *into the room*; on headphones
+            # there is no room. But `headphones` has no probe today
+            # (presence.py measured it wrong - `Transport: USB` for this
+            # machine's own built-in speakers - and deleted it rather than ship
+            # a false excuse), so every real `Reading` has `headphones is None`,
+            # and unmeasured must not read as "on headphones". Every other block
+            # above still applies either way, including the microphone.
             return "telegram", f"{reading.foreground_app} is in the foreground"
         return "both", None
 
@@ -284,21 +304,3 @@ def focus_app(name: str | None) -> str | None:
         return None
     lowered = name.casefold()
     return next((marker for marker in FOCUS_APPS if marker in lowered), None)
-
-
-def _either_busy(mic: bool | None, output: bool | None) -> bool | None:
-    """Three-valued OR, so a rule written against one merged audio-busy bool
-    still has one to read after Task 3 split it into `mic_busy` and
-    `output_busy`.
-
-    Plain `or` is wrong here: `None or False` evaluates to `False` in Python,
-    which would read "the microphone probe failed, but the output was provably
-    free" as "provably free" - inventing the one answer that must never be
-    guessed. True wins outright; both have to be `False` to combine to `False`;
-    anything else is `None`.
-    """
-    if mic is True or output is True:
-        return True
-    if mic is False and output is False:
-        return False
-    return None
