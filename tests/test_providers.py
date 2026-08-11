@@ -1999,6 +1999,22 @@ async def test_compatible_does_not_retry_a_client_error() -> None:
     assert calls == 1
 
 
+async def test_compatible_turns_a_timeout_into_a_provider_error_after_one_retry() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("timed out")
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError, match="unreachable"):
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    assert calls == 2
+
+
 async def test_compatible_never_reveals_the_key() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, text=f"Incorrect API key provided: {SECRET}")
@@ -2009,6 +2025,48 @@ async def test_compatible_never_reveals_the_key() -> None:
             await provider.complete(PROMPT, model="qwen-plus")
 
     assert SECRET not in chain_text(caught.value)
+
+
+async def test_compatible_keeps_the_key_out_of_a_transport_failure_chain(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"failed to connect to {request.url}")
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError) as caught:
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    exc = caught.value
+    # The cause is deliberately kept (never `from None`), so the guarantee has to
+    # come from there being no secret in it.
+    assert isinstance(exc.__cause__, httpx.ConnectError)
+    assert SECRET not in chain_text(exc)
+    assert SECRET not in caplog.text
+
+
+async def test_compatible_sends_the_key_as_a_header_and_never_in_the_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=COMPAT_OK)
+
+    async with mock_client(handler) as client:
+        await OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client).complete(
+            PROMPT, model="qwen-plus"
+        )
+
+    assert SECRET not in str(seen[0].url)
+    assert seen[0].headers["authorization"] == f"Bearer {SECRET}"
+    # httpx logs the request line; a key in the URL would land in the log file.
+    assert SECRET not in caplog.text
 
 
 async def test_compatible_rejects_a_bare_array_body() -> None:
@@ -2029,6 +2087,21 @@ async def test_compatible_reports_an_empty_answer_instead_of_returning_it() -> N
         provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
         with pytest.raises(ProviderError, match="no text content"):
             await provider.complete(PROMPT, model="qwen-plus")
+
+
+async def test_compatible_reports_an_unexpected_shape_without_echoing_the_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Not the documented shape at all, and it quotes the key back at us -
+        # exercising the `except (AttributeError, IndexError, TypeError,
+        # ValueError)` branch in `complete`, which redacts via `repr(data)`.
+        return httpx.Response(200, json={"choices": 42, "sent_key": SECRET})
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError, match="unreadable response") as caught:
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    assert SECRET not in chain_text(caught.value)
 
 
 def test_compatible_needs_both_a_key_and_an_endpoint() -> None:
