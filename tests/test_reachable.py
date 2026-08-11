@@ -128,6 +128,7 @@ WIRED_CLASSES = (
     # voice layer was complete, tested and unreachable - which is the whole
     # reason this file exists, and this line is what that gap closing looks like.
     "GeminiLiveSession",
+    "OpenAIRealtimeSession",
     "SoundDeviceAudio",
     "VoiceConversation",
     # The echo-cancelling AudioIO, built by `app.build_voice_audio` on macOS.
