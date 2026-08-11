@@ -1076,6 +1076,129 @@ starts making sound. Approved 2026-08-11."
 
 ---
 
+### Task 7b: offline 프리셋에 로컬 스피커를 돌려준다
+
+Task 7의 스위치 통합이 `offline` 프리셋에서 로컬 스피커를 빼앗았고, 기능 저하가 아니라
+**로드 실패**다 — `Settings(preset='offline', voice_enabled=True)`가 예외를 던지고, 그건
+데몬이 아예 안 뜬다는 뜻이다. 그리고 PLAN §7이 "정직한 문구"로 못박은 약속을 거짓으로 만든다:
+
+> PC 앞에 있을 때의 선제 발화는 로컬 스피커로 나가므로 어떤 경로도 타지 않는다.
+
+`proactivity/speaker.py`는 `/usr/bin/say`다. 기기 밖으로 아무것도 안 나간다. 즉 통합은
+프라이버시를 택한 사용자에게서 **그 선택과 유일하게 양립하던 음성 기능**을 빼앗았다.
+
+소유자 판단: **(나) 검증을 세션 시작 시점으로 옮긴다.** 스위치는 하나로 유지하고,
+`voice_enabled`가 뜻하는 두 가지를 필요한 시점에서 각각 검사한다.
+
+```
+voice_enabled 가 뜻하는 것 두 가지
+  ① 호스티드 음성 대화 세션이 돌 수 있다   ← CHAT_VOICE 라우팅 + gemini_live_model 필요
+  ② 선제 발화가 로컬 스피커로 나갈 수 있다  ← /usr/bin/say 말고 아무것도 필요 없음
+
+offline 은 ②를 만족할 수 있고 ①은 영원히 못 한다. 로드 시점에 ①을 요구하면
+②까지 같이 죽는다.
+```
+
+**Files:**
+- Modify: `daemon/config.py:756-765` (두 검사), `:794` 부근 (wake 검사)
+- Modify: `daemon/app.py:1036` 부근 (`run_voice`)
+- Test: `tests/test_config.py`, `tests/test_app.py`(또는 voice 세션 시작을 덮는 파일)
+
+**Interfaces:**
+- Consumes: 없음
+- Produces: `Settings`가 `voice_enabled=True` + `preset='offline'`을 받아들인다.
+  음성 세션 시작이 같은 메시지로 거절한다.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_config.py 에 추가
+def test_an_offline_install_may_speak_out_of_its_own_speaker() -> None:
+    """PLAN 7's promise: on the fully-offline preset nothing leaves the device,
+    and proactive speech goes out the local speaker precisely because
+    `/usr/bin/say` crosses no route. Rejecting this combination at load time
+    took that promise away - and took the daemon with it, since Settings failing
+    to load is not a degraded feature, it is a process that does not start."""
+    settings = Settings(preset="offline", voice_enabled=True)   # must not raise
+    assert settings.voice_enabled is True
+
+
+def test_a_wake_gate_still_needs_a_voice_route() -> None:
+    """The load-time check that survives, and why: the wake gate exists only to
+    open a hosted voice session (config.py's own words), so under a preset that
+    routes none it can never do anything. That is a misconfiguration worth
+    refusing early - unlike the speaker, which works fine there."""
+    with pytest.raises(ConfigError, match="routes no voice task"):
+        Settings(preset="offline", voice_enabled=True, wake_enabled=True,
+                 wake_aliases="벨라")
+```
+
+```python
+# 음성 세션 시작을 덮는 테스트 파일에 추가
+async def test_starting_a_voice_session_refuses_without_a_voice_route() -> None:
+    """Moved here from load time. The check did not disappear - it now fires
+    where the thing it guards actually happens."""
+    settings = Settings(preset="offline", voice_enabled=True)
+    with pytest.raises(ConfigError, match="routes no voice task"):
+        await run_voice(settings)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `python3 -m pytest tests/test_config.py -k "offline_install_may_speak" -v`
+Expected: FAIL — `ConfigError: DAEMON_VOICE_ENABLED is on but preset 'offline' routes no voice task`
+
+- [ ] **Step 3: Write minimal implementation**
+
+`config.py`에서 두 검사의 조건을 `voice_enabled`에서 **wake_enabled**로 옮긴다. 지우지 않는다 —
+옮긴다. 그리고 왜 옮겼는지 적는다:
+
+```python
+        # These two used to fire on `voice_enabled` alone. That was correct while
+        # the switch meant only "a hosted voice session may run", and became wrong
+        # when it also came to mean "a proactive line may come out of the local
+        # speaker" - because `/usr/bin/say` needs neither a route nor a model, and
+        # the `offline` preset can satisfy the second meaning while never
+        # satisfying the first. Requiring both at load time did not degrade an
+        # offline install, it stopped `Settings` from loading at all, which stops
+        # the daemon. And it made docs/PLAN.md 7's stated promise - proactive
+        # speech out the local speaker crossing no route - unreachable on the one
+        # preset that promise is about.
+        #
+        # The wake gate is different and keeps its check: it exists only to open a
+        # hosted session, so under a preset routing none it can never do anything.
+        if self.wake_enabled and not VOICE_TASKS <= self.routing.keys():
+            problems.append(
+                f"DAEMON_WAKE_ENABLED is on but preset {self.preset!r} routes no voice task; "
+                "the wake gate exists only to open a voice session (docs/PLAN.md 3.2)"
+            )
+        if self.wake_enabled and not self.gemini_live_model:
+            problems.append(
+                "DAEMON_WAKE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
+                "the native-audio endpoint needs its own model id"
+            )
+```
+
+`app.py`의 음성 세션 진입점(`run_voice`, `:1036` 부근)에서 같은 조건을 검사하고 같은 문구로
+거절한다. 여기가 ①이 실제로 필요해지는 지점이다.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```bash
+python3 -m pytest tests/ -v
+python3 -m ruff check .
+python3 scripts/check_docs.py && python3 scripts/check_landing_claims.py
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add daemon/config.py daemon/app.py tests/
+git commit -m "config: an offline install may still talk out of its own speaker"
+```
+
+---
+
 ### Task 8: Phase 1 실물 검증
 
 단위 테스트는 이 계획이 고치는 결함 두 개(웨이크워드 자기 차단, 음소거 중 거짓 성공)를
