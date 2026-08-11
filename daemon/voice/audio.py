@@ -23,6 +23,8 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+from daemon import mic_hold
+
 logger = logging.getLogger(__name__)
 
 INPUT_SAMPLE_RATE = 16_000
@@ -146,22 +148,32 @@ class SoundDeviceAudio:
                 logger.warning("audio: input stream reported %s", status)
             loop.call_soon_threadsafe(enqueue, bytes(indata))
 
-        stream = sd.RawInputStream(
-            samplerate=self.sample_rate,
-            channels=CHANNELS,
-            dtype=DTYPE,
-            blocksize=self._block_frames,
-            callback=on_block,
-        )
-        stream.start()
-        try:
-            while True:
-                yield await blocks.get()
-        finally:
-            # Reached on cancellation and on the consumer breaking out. An open
-            # input stream that nobody reads is a microphone light left on.
-            stream.stop()
-            stream.close()
+        # Tell the rest of the process the microphone is ours, so
+        # `presence.py` can subtract it from the CoreAudio probe. Without this
+        # the gate reads our own wake listener as somebody on a call and never
+        # routes to the local speaker again - see daemon/mic_hold.py. Entered
+        # before `RawInputStream` so a backend that fails to construct the
+        # stream never leaves the counter incremented, and released in
+        # `hold()`'s own `finally` so a stream that dies mid-read - cancelled,
+        # or the consumer breaking out - cannot leave it stuck either.
+        with mic_hold.hold():
+            stream = sd.RawInputStream(
+                samplerate=self.sample_rate,
+                channels=CHANNELS,
+                dtype=DTYPE,
+                blocksize=self._block_frames,
+                callback=on_block,
+            )
+            stream.start()
+            try:
+                while True:
+                    yield await blocks.get()
+            finally:
+                # Reached on cancellation and on the consumer breaking out. An
+                # open input stream that nobody reads is a microphone light
+                # left on.
+                stream.stop()
+                stream.close()
 
     async def play(self, chunk: bytes) -> None:
         """Queue a chunk. Returns immediately.

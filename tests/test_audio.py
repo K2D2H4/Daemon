@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from daemon import mic_hold
 from daemon.voice import audio
 from daemon.voice.audio import AudioUnavailable, SoundDeviceAudio
 from daemon.voice.base import AudioIO
@@ -259,6 +260,46 @@ async def test_ending_recording_closes_the_stream(backend: FakeSoundDevice) -> N
     (stream,) = backend.inputs
     assert not stream.active
     assert stream.closed
+
+
+async def test_recording_marks_the_microphone_held(backend: FakeSoundDevice) -> None:
+    """Without this the presence probe cannot tell the wake listener's own hold
+    from somebody else's call, and the local speaker route dies for as long as
+    voice is switched on. See daemon/mic_hold.py."""
+    assert mic_hold.held() is False
+    io = SoundDeviceAudio(backend=backend)
+    stream = io.record()
+
+    async def push() -> None:
+        await asyncio.sleep(0)
+        backend.inputs[0].feed(b"\x00\x00")
+
+    task = asyncio.create_task(push())
+    async with asyncio.timeout(5):
+        await anext(stream)
+    await task
+    assert mic_hold.held() is True, "the hold must be visible while recording"
+
+    await stream.aclose()
+    assert mic_hold.held() is False
+
+
+async def test_the_hold_is_released_when_recording_raises(
+    backend: FakeSoundDevice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stream that dies mid-read must not leave the daemon convinced it is on
+    a call for the rest of the process's life - that is the failure this whole
+    milestone exists to remove, reintroduced by an unbalanced counter."""
+
+    def explode(**kwargs: Any) -> FakeStream:
+        raise RuntimeError("PortAudio went away")
+
+    monkeypatch.setattr(backend, "RawInputStream", explode)
+    io = SoundDeviceAudio(backend=backend)
+
+    with pytest.raises(RuntimeError):
+        await anext(io.record())
+    assert mic_hold.held() is False
 
 
 async def test_play_queues_at_the_output_rate(backend: FakeSoundDevice) -> None:
