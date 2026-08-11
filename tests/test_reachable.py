@@ -28,7 +28,7 @@ import re
 
 import pytest
 
-from daemon.config import PROVIDER_KEY_ENV
+from daemon.config import ENV_FILE, PROVIDER_KEY_ENV
 from daemon.tasks import Task
 
 DAEMON = pathlib.Path(__file__).resolve().parents[1] / "daemon"
@@ -589,3 +589,23 @@ def test_the_environment_is_isolated_from_the_developers_own() -> None:
     leaked = sorted(k for k in os.environ if k.startswith(CONFIG_PREFIXES))
     assert leaked == [], f"real configuration is visible to tests: {leaked}"
     assert CANARY not in os.environ
+
+
+def test_no_test_runs_where_a_developers_env_file_would_be_found() -> None:
+    """The file half of the same defect, and it needs its own assertion.
+
+    `ENV_FILE` is the relative path `.env`, so any test that builds `Settings()`
+    the way the product does - `daemon.cli.main` - reads whatever `.env` sits in
+    the *current directory*, and pytest's is the repo root. A developer who has run
+    `daemon setup` therefore ran a different suite from CI's, which has no `.env`;
+    `test_the_audit_trail_is_readable_from_the_cli` exited 2 for exactly that.
+
+    Asserting on the directory rather than on the absence of a file is what makes
+    this falsifiable in CI too: delete the chdir from `no_real_configuration` and
+    this fails everywhere, not only on the machines that already had the bug.
+    """
+    root = pathlib.Path(__file__).resolve().parents[1]
+    assert pathlib.Path.cwd().resolve() != root, (
+        f"tests run in the repo root, where a developer's own {ENV_FILE!r} decides "
+        "what Settings() sees; conftest.no_real_configuration should have chdir'd"
+    )
