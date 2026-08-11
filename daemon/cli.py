@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from daemon import __version__
 from daemon.config import ENV_FILE, OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
@@ -83,7 +85,12 @@ _LOG_NOISE = re.compile(
     # silently swallowed the `PATCH /api/settings` that had just rewritten `.env`
     # and the `POST /api/mcp/connect` the owner was waiting on. Reads can repeat
     # unprompted; a write is always something that happened.
-    r'uvicorn\.access\b.*"GET .*"\s+[23]\d\d\s*$'
+    #
+    # `oauth/callback` is the exception that proves the method is a proxy and not
+    # the thing itself: it is a GET because an OAuth redirect has to be, and it
+    # lands tokens on disk. A successful one is the only line saying a connection
+    # finished, so it survives.
+    r'uvicorn\.access\b.*"GET (?!\S*oauth/callback).*"\s+[23]\d\d\s*$'
     r"|getUpdates\s+\"HTTP/[\d.]+\s+2\d\d[^\"]*\"\s*$"
 )
 
@@ -523,10 +530,18 @@ def _err_log_path() -> Path:
     Settings gate on purpose: only two values decide the path, both have defaults,
     and reading those defaults off the model rather than repeating them here is
     what keeps this from drifting away from `config.py`.
+
+    Nothing below may raise. This runs precisely when the configuration is already
+    broken, and the module docstring's promise - print what you found rather than a
+    traceback - is worth least when it only holds for configurations that parse.
     """
     try:
         return service_for(Settings()).err_log
-    except ConfigError:
+    except (ConfigError, ValidationError):
+        # Both, because they arrive from different depths: a field that will not
+        # coerce (`DAEMON_PORT=abc`) raises pydantic's ValidationError before the
+        # model validator that raises ConfigError ever runs. config.py already
+        # records this trap costing `daemon doctor` its whole job once.
         pass
 
     filed: dict[str, str] = {}
@@ -540,14 +555,26 @@ def _err_log_path() -> Path:
             filed = {}
 
     def configured(alias: str, field: str) -> str:
-        raw = os.environ.get(alias) or filed.get(alias)
-        return raw if raw else str(Settings.model_fields[field].default)
+        # Case-insensitively, because `Settings` is `case_sensitive=False`: a
+        # lowercase `daemon_data_dir` that a working build honours must not resolve
+        # to a different directory here just because this lookup is stricter.
+        for source in (os.environ, filed):
+            for key, value in source.items():
+                if key.upper() == alias and value:
+                    return value
+        return str(Settings.model_fields[field].default)
 
-    return Service(
-        label=configured("DAEMON_SERVICE_LABEL", "service_label"),
-        working_dir=Path.cwd(),
-        log_dir=Path(configured("DAEMON_DATA_DIR", "data_dir")).expanduser() / "logs",
-    ).err_log
+    log_dir = Path(configured("DAEMON_DATA_DIR", "data_dir")).expanduser() / "logs"
+    label = configured("DAEMON_SERVICE_LABEL", "service_label")
+    try:
+        return Service(label=label, working_dir=Path.cwd(), log_dir=log_dir).err_log
+    except ServiceError:
+        # The label becomes the filename, so one `Service` rejects never named a
+        # log. Fall back to the default rather than a traceback: if a resident ever
+        # ran here, that is the name it ran under - and if it did not, `_log` says
+        # so with the path it looked at.
+        default = str(Settings.model_fields["service_label"].default)
+        return Service(label=default, working_dir=Path.cwd(), log_dir=log_dir).err_log
 
 
 def _keeper(raw: bool) -> Callable[[str], bool]:

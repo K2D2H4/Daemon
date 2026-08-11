@@ -1529,3 +1529,76 @@ def test_log_honours_a_configured_data_dir_without_settings(
 
     assert cli.main(["log"]) == 0
     assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+OAUTH = (
+    "2026-08-11 11:03:49,371 INFO uvicorn.access 127.0.0.1:54813 - "
+    '"GET /admin/api/mcp/oauth/callback?code=abc&state=xyz HTTP/1.1" 200'
+)
+"""A GET that is a write: the OAuth redirect has to be a GET, and completing it
+lands MCP tokens on disk. The only line that says a connection finished."""
+
+
+def test_log_keeps_the_oauth_callback(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The method is a proxy for read-vs-write, not the thing itself. Dropping
+    every successful GET would hide the one admin GET that changes state."""
+    log_file.write_text("\n".join([NOISE, OAUTH, NOISE]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [OAUTH]
+
+
+def test_log_survives_a_field_that_will_not_coerce(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A typo'd number in `.env` raises pydantic's ValidationError, not ConfigError -
+    it comes from field parsing, before the model validator that raises ConfigError
+    runs at all. Catching only the latter left the ordinary broken `.env` printing a
+    traceback from the command that exists to survive one."""
+    monkeypatch.chdir(tmp_path)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DAEMON_PORT", "not-a-number")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_survives_a_service_label_that_is_not_usable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`Settings` rejects the label and so does `Service`, from a different
+    exception type - so the fallback re-raised as a traceback the command it was
+    added to protect. The label is the filename, so an unusable one never named a
+    log; the default is the name a resident would have run under."""
+    monkeypatch.chdir(tmp_path)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DAEMON_SERVICE_LABEL", "bad label!")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_honours_a_lowercase_env_var(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`Settings` is `case_sensitive=False`, so a working build honours
+    `daemon_data_dir`. A stricter lookup in the fallback would send the two paths to
+    different directories for the same environment."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    logs = tmp_path / "mydata" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    monkeypatch.setenv("daemon_data_dir", str(tmp_path / "mydata"))
+    monkeypatch.setenv("DAEMON_PORT", "not-a-number")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
