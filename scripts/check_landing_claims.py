@@ -46,7 +46,7 @@ CLAIMS: tuple[tuple[str, str, str], ...] = (
 # ever ships on by default, the page's "ships off by default" copy must change.
 BOOL_CLAIMS: tuple[tuple[str, str, str], ...] = (
     ("DAEMON_PROACTIVE_ENABLED", "False", "Speaking first ships off by default"),
-    ("DAEMON_PROACTIVE_SPEAKER_ENABLED", "False", "the speaker is the second one"),
+    ("DAEMON_VOICE_ENABLED", "False", "the switch that lets it speak out loud ships off too"),
 )
 
 
