@@ -20,10 +20,11 @@ below list surface variants rather than dictionary forms. A morphological
 analyser would do this properly and was declined for the same reason PLAN 4.3
 declined it for recall: too heavy a dependency for a self-hoster.
 
-## Four generators, not five
+## Five generators
 
-Type E (association) is **deliberately not implemented.** `MemoryRecall.search`
-is the recall index's only entry point and it is wrong here twice over:
+Type E (association) was **deliberately not implemented** until now, because
+`MemoryRecall.search` - the recall index's only entry point at the time - was
+wrong here twice over:
 
   * Its score multiplies by recency decay with a 30-day half-life, so a
     three-month-old memory arrives at 0.125x weight. E wants precisely the items
@@ -35,9 +36,18 @@ is the recall index's only entry point and it is wrong here twice over:
     generator that quietly starves the reflection pass is a worse outcome than an
     absent generator.
 
-Both are fixable, neither is fixable from this file, and the fix belongs to
-whoever owns `recall.py`: an entry point that scores without decay and without
-marking. Until then E generates nothing rather than noise.
+Both were fixable, neither was fixable from this file, and the fix belonged to
+whoever owns `recall.py`: `MemoryRecall.associate()` - no decay, `min_age_days` as
+a floor instead, and no `mark_recalled` call. It existed unused until this file
+grew `association_candidates` to call it: PLAN 6.1 names type E as the one that
+gives the *Her*-like feeling, precisely because it has no business to transact,
+and the other four generators only ever produce a reminder.
+
+`association_candidates` is `async` and lives **outside** `generate_candidates`,
+which is synchronous. `associate()` awaits the embedder - a local model, Lane 1's
+existing allowance under non-negotiable 7, not a call that thinks - and a
+synchronous function cannot await it. `tick.run()` is async and awaits the two
+separately, then merges their output.
 
 Type D's guards mean it produces nothing for the first two weeks of history. That
 is correct, not a bug: "the hour this person usually talks" is not a fact yet.
@@ -76,6 +86,18 @@ only words from the lexicons in this file, plus numbers and clock times. A
 follow-up therefore cannot be steered by what a forwarded message said, and A and
 B additionally only read rows with `origin = 'owner'`. The source message id is in
 `payload` for a caller that wants the actual words and can decide to trust them.
+
+**`association_candidates` is the one exception, and it is bounded.** Type E has
+nothing to ask about without the memory's own words - a bare "you said something
+90 days ago" is the same contentless reason `silence` already produces, and the
+judge correctly declines it - so it quotes `RecalledItem.content`, up to
+`ASSOCIATION_QUOTE_CHARS` characters. What keeps this from being a hole in the
+rule above rather than a stated exception to it: it quotes only items where
+`origin == "owner"`. That column is the same unforgeable one CONTRACTS
+non-negotiable 10 relies on to keep a forward from steering a tool call; here it
+is what decides whether text may reach a prompt at all. An item recalled with any
+other origin is dropped before the loop that builds `reason` ever sees its
+content.
 """
 
 from __future__ import annotations
@@ -90,6 +112,7 @@ from typing import Protocol, runtime_checkable
 from daemon.clock import now as clock_now
 from daemon.clock import parse_iso, to_iso
 from daemon.config import Settings
+from daemon.memory.base import RecalledItem
 from daemon.proactivity.base import Candidate, CandidateKind
 
 
@@ -134,6 +157,22 @@ class CandidateReader(Protocol):
         whatever its state. Bounded by what the caller asks about, so it does not
         grow with the table."""
         ...
+
+
+@runtime_checkable
+class AssociativeRecall(Protocol):
+    """The one recall entry point type E may use.
+
+    Declared here rather than imported for the same reason `CandidateReader` is:
+    this module depends on one method, not on `MemoryRecall`. `search` is
+    deliberately *not* in this protocol - it multiplies by recency decay, which
+    buries exactly what type E wants, and it calls `mark_recalled` from a
+    background tick that shows nobody anything.
+    """
+
+    async def associate(
+        self, query: str, *, limit: int = 3, min_age_days: float = 30.0
+    ) -> list[RecalledItem]: ...
 
 
 # --- tuning ------------------------------------------------------------------
@@ -182,6 +221,21 @@ PATTERN_TTL_HOURS = 2
 MAX_PER_KIND = 3
 """Rows one tick may add per kind. The gate owns the daily *utterance* budget; this
 only stops a chatty afternoon from writing forty rows nobody will ever read."""
+
+ASSOCIATION_LOOKBACK = 3
+"""How many recent owner messages become the association query. Enough to carry a
+topic, few enough that a single stray line does not define it."""
+
+ASSOCIATION_MIN_AGE_DAYS = 30.0
+"""Below this it is not an association, it is the conversation."""
+
+ASSOCIATION_QUOTE_CHARS = 200
+"""How much of the remembered message reaches the prompt. The judge needs the
+words to have anything to ask about - a bare "you said something 90 days ago" is
+the contentless reason that makes `silence` produce 빈말 - but the reason is
+still a record being shown to a model, so it is bounded."""
+
+ASSOCIATION_TTL_HOURS = 6
 
 
 # --- Korean surface forms ----------------------------------------------------
@@ -433,6 +487,76 @@ def pattern_time_candidates(reader: CandidateReader, now: datetime) -> list[Cand
             expires_at=now + timedelta(hours=PATTERN_TTL_HOURS),
         )
     ]
+
+
+async def association_candidates(
+    recall: AssociativeRecall,
+    reader: CandidateReader,
+    *,
+    now: datetime | None = None,
+) -> list[Candidate]:
+    """Type E: an old memory the current conversation just brushed against.
+
+    `async` and outside `generate_candidates` because `associate()` awaits the
+    embedder and `generate_candidates` is synchronous - see the module docstring.
+    `tick.run()` is async and merges the two.
+
+    **This generator quotes the user's own words, which the rest of this module
+    does not.** The rule it bends is stated at the top of the file and so is the
+    exception: the source id is in `payload` "for a caller that wants the actual
+    words and can decide to trust them", and `origin = 'owner'` is what deciding
+    looks like. Text that arrived from anywhere else is dropped before it can
+    reach a prompt - the same column CONTRACTS non-negotiable 10 relies on. Type
+    E cannot work without this: with only elapsed days in the reason it produces
+    exactly the 빈말 that `silence` produces.
+    """
+    moment = now or clock_now()
+    recent = [
+        str(row["content"])
+        for row in reader.conversation_between(moment - timedelta(days=1), moment)
+        if _is_owner_utterance(row)
+    ][-ASSOCIATION_LOOKBACK:]
+    if not recent:
+        # Nothing said recently means nothing to associate *from* - a query built
+        # out of an empty string would return whatever ranks highest overall,
+        # which is not an association with anything.
+        return []
+
+    items = await recall.associate(
+        " ".join(recent), limit=MAX_PER_KIND, min_age_days=ASSOCIATION_MIN_AGE_DAYS
+    )
+    found: list[Candidate] = []
+    for item in items:
+        if item.origin != "owner":
+            continue
+        if item.message_id is None:
+            # The curated tier has no `messages.id`, so there is no stable dedup
+            # key for it. Skipping costs a candidate; inventing one would let two
+            # unrelated memories collide on the same key and silence the second.
+            continue
+        quote = " ".join(item.content.split())[:ASSOCIATION_QUOTE_CHARS]
+        if not quote:
+            continue
+        key = f"association:{item.message_id}"
+        found.append(
+            Candidate(
+                kind="association",
+                reason=(
+                    f"{_local(item.ts):%Y년 %m월 %d일}에 유저가 이런 얘기를 했다: "
+                    f"'{quote}'. 지금 대화가 그 기억과 닿아 있다."
+                ),
+                payload={
+                    "dedup": key,
+                    "message_id": item.message_id,
+                    "recalled_at": to_iso(item.ts),
+                    "score": round(item.score, 3),
+                },
+                due_at=moment,
+                expires_at=moment + timedelta(hours=ASSOCIATION_TTL_HOURS),
+            )
+        )
+    spent = reader.existing_dedup_keys([dedup_key(c) for c in found])
+    return [c for c in found if dedup_key(c) not in spent][:MAX_PER_KIND]
 
 
 _KIND_ORDER: tuple[CandidateKind, ...] = ("open_loop", "emotional", "silence", "pattern_time")

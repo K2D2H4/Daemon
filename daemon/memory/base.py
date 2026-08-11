@@ -48,6 +48,13 @@ class RecalledItem:
     the owner said: that is the distinction `messages.origin` exists to protect,
     and rendering it as a plain `user:` line undid it one layer up. Defaults to
     "owner" so existing constructors keep working."""
+    message_id: int | None = None
+    """`messages.id`, for a caller that needs a stable identity for this item -
+    `daemon/proactivity/candidates.py`'s type E dedups on it. `None` for the
+    curated tier (`_curated_item` in recall.py): those rows are `memory_entries`,
+    a different id space from `messages`, and stamping a `memory_entries` id in
+    here would let two unrelated memories collide on the same dedup key. Defaults
+    to `None` so existing constructors keep working."""
 
 
 @runtime_checkable

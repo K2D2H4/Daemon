@@ -254,6 +254,7 @@ class MemoryRecall:
                         # Carried, not dropped: the column is unforgeable so the
                         # renderer can tell relayed text from the owner's own.
                         origin=row["origin"],
+                        message_id=message_id,
                     ),
                 )
             )
@@ -655,6 +656,10 @@ def _curated_item(row: sqlite3.Row, *, triggered: bool) -> RecalledItem:
         # Carried verbatim, like a message's: a fact reflection drew from relayed
         # text is 'untrusted' and must not be rendered as the owner's own words.
         origin=row["origin"],
+        # `memory_entries` has its own id space, disjoint from `messages.id` -
+        # stamping this row's id in here would let a caller that dedups on
+        # `message_id` (type E) collide a curated fact with an unrelated message.
+        message_id=None,
     )
 
 
