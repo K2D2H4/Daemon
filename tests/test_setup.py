@@ -3192,6 +3192,41 @@ def test_the_voice_key_follows_the_voice_provider() -> None:
     assert "DAEMON_OPENAI_MODEL" not in keys
 
 
+def test_the_voice_model_id_follows_the_voice_provider_not_the_switch() -> None:
+    # The hole the four tests above missed and the whole-branch review caught: a
+    # provider can be present for chat while voice is the *other* provider's. Gating
+    # the realtime/Live model on `voice_on` alone then asks for an id Settings never
+    # reads - the mirror of the bug that started this branch, and one `--check` would
+    # report as a complete install still missing something. Both presets here have a
+    # real hosted chat provider that differs from the voice provider, which is the
+    # combination none of the offline-based tests can reach.
+    def keys(**env: str) -> set[str]:
+        return {need.key for need in setup.needs_for(env)}
+
+    # OpenAI answers; voice is Gemini's. The OpenAI *realtime* id is not wanted.
+    openai_chat_gemini_voice = keys(
+        DAEMON_PRESET="quality",
+        DAEMON_HOSTED_PROVIDER="openai",
+        DAEMON_VOICE_ENABLED="true",
+        DAEMON_VOICE_PROVIDER="gemini",
+    )
+    assert "DAEMON_OPENAI_MODEL" in openai_chat_gemini_voice  # chat needs its text id
+    assert "DAEMON_OPENAI_REALTIME_MODEL" not in openai_chat_gemini_voice
+    assert "DAEMON_GEMINI_LIVE_MODEL" in openai_chat_gemini_voice  # voice needs the Live id
+
+    # Gemini answers; voice is OpenAI's. The Gemini *Live* id is not wanted, and
+    # OpenAI - here for voice only - is not asked for its text model id.
+    gemini_chat_openai_voice = keys(
+        DAEMON_PRESET="quality",
+        DAEMON_HOSTED_PROVIDER="gemini",
+        DAEMON_VOICE_ENABLED="true",
+        DAEMON_VOICE_PROVIDER="openai",
+    )
+    assert "DAEMON_OPENAI_REALTIME_MODEL" in gemini_chat_openai_voice
+    assert "DAEMON_GEMINI_LIVE_MODEL" not in gemini_chat_openai_voice
+    assert "DAEMON_OPENAI_MODEL" not in gemini_chat_openai_voice
+
+
 # --- a walkthrough that says yes to voice -------------------------------------
 # Every other voice walkthrough above answers "n" to `_choose_voice`. Task 2
 # exists precisely for the offline + voice-on combination (ADR 0012), so it

@@ -19,7 +19,7 @@ that told users the coupling was deliberate.
 
 - `ruff` line-length **100**, target `py313`, lint rules `E,F,I,UP,B,ASYNC`.
 - `PRESETS` itself is **not** edited. No new preset, no new `.env` key, no migration.
-- The privacy promise stays literally true. `docs/PLAN.md:551` already conditions it on
+- The privacy promise stays literally true. `docs/PLAN.md` §7 already conditions it on
   *text mode* ("텍스트 모드 + 로컬 모델"), so what carries it after this change is
   `voice_enabled=false`, not the missing table row. Every comment that credits the missing
   row must be corrected, not deleted.
@@ -529,7 +529,7 @@ reflection and the proactive judge on this machine; use Gemini or OpenAI for spo
 turns) and no way to ask for it.
 
 The absence was defended as what made the privacy promise true. It is not what makes
-it true. `docs/PLAN.md:551` states the promise as "**text mode** + local models —
+it true. `docs/PLAN.md` §7 states the promise as "**text mode** + local models —
 nothing leaves the device", and one line above it: "turn voice on and audio goes to
 the provider you chose (BYOK); leave it off and it does not". The promise was already
 conditioned on the switch. Only the table disagreed.

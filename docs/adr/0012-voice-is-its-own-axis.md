@@ -30,10 +30,12 @@ explain a limitation that no requirement asked for.
 
 `Settings.routing` adds the `CHAT_VOICE` row whenever `voice_enabled` is on, under
 every preset, mapped to `voice_provider`. The row is still kept when a preset carries
-one and voice is off, so that `routing` stays a faithful rendering of the preset
-table regardless of the switch. `route_for` itself already answers "voice is off
-(DAEMON_VOICE_ENABLED)" before it ever consults the table, independent of whether
-this row is present.
+one and voice is off, so that turning voice on and off does not change which keys
+`routing` holds — only the row's presence would otherwise flicker, and the exact-dict
+tests pin that it does not. (The row's *provider* is `voice_provider`, its own axis, so
+it need not match the preset table's literal entry.) `route_for` answers "voice is off
+(DAEMON_VOICE_ENABLED)" before it ever consults the table, independent of whether this
+row is present.
 
 The validator problem that refused voice under `offline` is deleted as unreachable.
 `providers_for` — which decides the keys onboarding asks for — contributes

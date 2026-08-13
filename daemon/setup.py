@@ -957,15 +957,21 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
     # answer stays empty - `providers_for` then drops the hosted tasks, so no
     # vendor's key is asked for on a guess.
     hosted = env.get("DAEMON_HOSTED_PROVIDER", "") or DEFAULT_HOSTED_PROVIDER
+    voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
+    # The wizard has no voice-provider question yet (it is admin-only), so an absent
+    # value means the field default rather than "nobody chose" - unlike `hosted`,
+    # this field *has* a default, and it is `gemini`. Hoisted to a local because the
+    # provider branches below need it too: a provider can be present for chat, for
+    # voice, or both, and only this value tells them which - `voice_on` alone does
+    # not, because voice can be on with a *different* provider.
+    voice_provider = env.get("DAEMON_VOICE_PROVIDER", "") or _settings_default(
+        "DAEMON_VOICE_PROVIDER"
+    )
     providers = providers_for(
         preset,
-        voice_enabled=_truthy(env.get("DAEMON_VOICE_ENABLED", "")),
+        voice_enabled=voice_on,
         hosted=hosted,
-        # The wizard has no voice-provider question yet (it is admin-only), so an
-        # absent value means the field default rather than "nobody chose" - unlike
-        # `hosted`, this field *has* a default, and it is `gemini`.
-        voice_provider=env.get("DAEMON_VOICE_PROVIDER", "")
-        or _settings_default("DAEMON_VOICE_PROVIDER"),
+        voice_provider=voice_provider,
     )
     needs: list[Need] = []
 
@@ -1022,12 +1028,13 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
         # exists to catch before the first conversation does.
     if OPENAI in providers:
         # OpenAI can be here for two unrelated reasons - it is the hosted chat
-        # provider, or voice is on and OpenAI is the voice provider - and the
-        # questions differ, so the reason has to be named rather than assumed.
-        # Mirrors the GEMINI branch below.
+        # provider, or it is the voice provider - and the questions differ, so the
+        # reason has to be named rather than assumed. `voice_on` alone is not that
+        # reason: voice can be on with a *different* provider, and gating the realtime
+        # model on it then asks for an id Settings never reads. Mirrors GEMINI below.
         openai_chat = hosted == OPENAI and HOSTED in PRESETS[preset].values()
-        voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
-        if openai_chat and voice_on:
+        openai_voice = voice_on and voice_provider == OPENAI
+        if openai_chat and openai_voice:
             why = "One key covers both: GPT answers, and voice is OpenAI's too."
         elif openai_chat:
             why = "You chose GPT for the hosted work. Your key, your account, your bill."
@@ -1053,7 +1060,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                     listed=True,
                 )
             )
-        if voice_on:
+        if openai_voice:
             needs.append(
                 Need(
                     key="DAEMON_OPENAI_REALTIME_MODEL",
@@ -1066,12 +1073,13 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
             )
     if GEMINI in providers:
         # Gemini can be here for two unrelated reasons - it is the hosted chat
-        # provider, or voice is on and native audio is Google's either way - and
-        # the questions differ, so the reason has to be named rather than assumed.
-        # It was assumed, back when voice was the only way to get here.
+        # provider, or it is the voice provider - and the questions differ, so the
+        # reason has to be named rather than assumed. It was assumed off `voice_on`,
+        # back when voice was always Google's; now voice can be OpenAI's while Gemini
+        # is only the chat model, so the Live id is gated on the provider, not the switch.
         gemini_chat = hosted == GEMINI and HOSTED in PRESETS[preset].values()
-        voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
-        if gemini_chat and voice_on:
+        gemini_voice = voice_on and voice_provider == GEMINI
+        if gemini_chat and gemini_voice:
             why = "One key covers both: Gemini answers, and voice is Google's too."
         elif gemini_chat:
             why = "You chose Gemini for the hosted work. Your key, your account, your bill."
@@ -1086,7 +1094,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 secret=True,
             )
         )
-        if voice_on:
+        if gemini_voice:
             needs.append(
                 Need(
                     key="DAEMON_GEMINI_LIVE_MODEL",
