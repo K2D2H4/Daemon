@@ -120,6 +120,11 @@ def recalled(content: str, *, role: str = "user", day: int = 2) -> RecalledItem:
         role=role,
         score=0.9,
         reason="both",
+        # Explicit rather than relying on the dataclass default, which is
+        # deliberately the closed value ("untrusted") - see `RecalledItem.origin`.
+        # These tests are about recall formatting, not provenance, and want the
+        # ordinary owner-said rendering `_label` gives "owner".
+        origin="owner",
     )
 
 

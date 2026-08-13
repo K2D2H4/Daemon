@@ -59,9 +59,8 @@ only from elapsed days (`"90일 전에 무언가 있었다"`) is the same conten
 nothing to say about. Withholding the memory's own words would not make the
 generator safer, it would make it pointless.
 
-The exception is bounded the same way non-negotiable 10 is: `origin` is a
-column a model cannot write, populated only from `authored_by_sender=True`
-turns, so `association_candidates` quotes `RecalledItem.content` — up to
+The exception is bounded: `origin` is a column a model cannot write, so
+`association_candidates` quotes `RecalledItem.content` — up to
 `ASSOCIATION_QUOTE_CHARS` (200) characters — only for items where
 `origin == "owner"`. An item recalled with any other origin is dropped before
 the loop that builds `reason` ever sees its content. Pinned:
@@ -69,6 +68,20 @@ the loop that builds `reason` ever sees its content. Pinned:
 `test_a_memory_the_owner_did_not_write_is_refused`. The rule and its exception
 are both stated in `daemon/proactivity/candidates.py`'s own module docstring, which is where a
 future reader will meet them first.
+
+**Correction (whole-branch review, finding 2): two claims above did not hold.**
+`origin` is **not** "populated only from `authored_by_sender=True` turns" —
+`daemon/memory/reindex.py` also populates it, by inferring `owner` from
+`role == 'user'` whenever it rebuilds the mirror from markdown, because the
+markdown carries no provenance at all (non-negotiable 3). A forward is
+`role='user'` exactly like the owner's own words, so a rebuild can hand it
+`origin='owner'` it never earned — and "bounded the same way non-negotiable 10
+is" was also wrong: that rule reads a *live* turn's
+`InboundMessage.authored_by_sender` (`daemon/tools/policy.py`), decided when
+the message arrived, not this column read back later by recall. Fixed by having
+`MemoryRecall.associate` additionally exclude `messages.reindexed` rows
+(`daemon/memory/recall.py`), so a reindex-fabricated `'owner'` cannot reach this
+check. Pinned: `tests/test_recall.py::test_a_reindexed_row_is_excluded_from_associate`.
 
 ### 2. The headphone probe was designed, approved, built, and then deleted by one measurement
 

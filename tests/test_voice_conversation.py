@@ -356,6 +356,9 @@ def _item(content: str = "치과 예약은 8월 5일 오후 3시") -> RecalledIt
         role="user",
         score=0.9,
         reason="both",
+        # Explicit rather than the dataclass default, which is deliberately the
+        # closed value ("untrusted") - this helper is for ordinary owner recall.
+        origin="owner",
     )
 
 

@@ -45,9 +45,10 @@ and the other four generators only ever produce a reminder.
 
 `association_candidates` is `async` and lives **outside** `generate_candidates`,
 which is synchronous. `associate()` awaits the embedder - a local model, Lane 1's
-existing allowance under non-negotiable 7, not a call that thinks - and a
-synchronous function cannot await it. `tick.run()` is async and awaits the two
-separately, then merges their output.
+existing allowance under non-negotiable 2 (not 7, which has no such allowance of
+its own - 7 states the same distinction for this module and points back at 2),
+not a call that thinks - and a synchronous function cannot await it. `tick.run()`
+is async and awaits the two separately, then merges their output.
 
 Type D's guards mean it produces nothing for the first two weeks of history. That
 is correct, not a bug: "the hour this person usually talks" is not a fact yet.
@@ -93,10 +94,18 @@ nothing to ask about without the memory's own words - a bare "you said something
 judge correctly declines it - so it quotes `RecalledItem.content`, up to
 `ASSOCIATION_QUOTE_CHARS` characters. What keeps this from being a hole in the
 rule above rather than a stated exception to it: it quotes only items where
-`origin == "owner"`. That column is the same unforgeable one CONTRACTS
-non-negotiable 10 relies on to keep a forward from steering a tool call; here it
-is what decides whether text may reach a prompt at all. An item recalled with any
-other origin is dropped before the loop that builds `reason` ever sees its
+`origin == "owner"`. That is `messages.origin` - a column a model cannot forge
+through prose (non-negotiable 3) - but it is **not** the same guarantee CONTRACTS
+non-negotiable 10 relies on, and an earlier version of this paragraph said it
+was. Non-negotiable 10 reads a *live* turn's `InboundMessage.authored_by_sender`
+(`daemon/tools/policy.py`), decided the moment the message arrived; this column
+can be re-derived later, by `daemon reindex`, from nothing but `role` - the
+markdown it rebuilds from carries no provenance at all (non-negotiable 3 again,
+the other direction). A forward stored as `role='user'` comes back `origin =
+'owner'` after any rebuild. So `MemoryRecall.associate` additionally excludes
+`messages.reindexed` rows (`daemon/memory/recall.py`) - found and fixed in the
+whole-branch review - and an item recalled with any other origin, or from a
+reindexed row, is dropped before the loop that builds `reason` ever sees its
 content.
 """
 
@@ -507,10 +516,13 @@ async def association_candidates(
     does not.** The rule it bends is stated at the top of the file and so is the
     exception: the source id is in `payload` "for a caller that wants the actual
     words and can decide to trust them", and `origin = 'owner'` is what deciding
-    looks like. Text that arrived from anywhere else is dropped before it can
-    reach a prompt - the same column CONTRACTS non-negotiable 10 relies on. Type
-    E cannot work without this: with only elapsed days in the reason it produces
-    exactly the 빈말 that `silence` produces.
+    looks like - checked by `MemoryRecall.associate`, which is this generator's
+    only entry point into recall, and which also excludes `messages.reindexed`
+    rows so `daemon reindex` cannot fabricate the `'owner'` this check trusts
+    (see `associate`'s docstring). Text that arrived from anywhere else, or
+    through a rebuild, is dropped before it can reach a prompt. Type E cannot
+    work without this: with only elapsed days in the reason it produces exactly
+    the 빈말 that `silence` produces.
     """
     moment = now or clock_now()
     recent = [
