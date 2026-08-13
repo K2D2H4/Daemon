@@ -356,21 +356,37 @@ request and response for both.
    central to the product and the most likely thing a compatible endpoint gets
    wrong.
 
+**Bars 2 and 3 were met by substitution, not as written.** What ran is
+`evals/openai_compatible_loop_spike.py` — the real loop, recall, tool registry,
+origin gate and audit table, on OpenRouter — rather than a Telegram conversation
+on Qwen. The reasons and what therefore stays unproven are recorded in
+`evals/CLAUDE.md`; read that before quoting this list as satisfied.
+
 ### Verification coverage, stated honestly
+
+The table below is what the design *planned* to verify. What actually happened,
+recorded here because this section demands the same honesty of everyone else:
 
 | Vendor | Status after this work |
 |---|---|
-| OpenRouter | **verified** — free key, `:free` model with tool support |
-| Qwen (DashScope) | **verified** — free-quota key, real `qwen-plus` |
+| OpenRouter | **verified** — free key, `:free` model with tool support (`openai/gpt-oss-20b:free`, 2026-08-11); both spikes pass, including a tool call through the assembled loop |
+| Qwen (DashScope) | **not verified — never exercised.** The available key is China-region: `403 AccessDenied.Unpurchased` on `/compatible-mode/v1`, `401` on the International endpoint. No request against it ever succeeded |
 | Kimi (Moonshot) | code-supported, **unverified** — API access requires a prepaid top-up |
 | DeepSeek | code-supported, **unverified** |
-| custom URL | code-supported, **unverified** |
+| custom URL | code-supported, **partly exercised** — `daemon setup` was driven end to end through the `custom URL` answer against OpenRouter's address typed by hand (2026-08-13), which is how the wizard's own defect on that path was found. No self-hosted server has been run |
 
-The two verified endpoints are complementary rather than redundant. OpenRouter
-proves the Chat Completions wire format cheaply and repeatedly. DashScope proves
-the base-URL handling, because `/compatible-mode/v1` is the most unusual path
-prefix of the five and is the one most likely to break a naive URL join —
-OpenRouter's ordinary `/api/v1` would let that bug through.
+**The plan called for two complementary endpoints and got one.** OpenRouter
+proves the Chat Completions wire format cheaply and repeatedly. DashScope was
+supposed to prove the base-URL handling, because `/compatible-mode/v1` is the most
+unusual path prefix of the five and the one most likely to break a naive URL join
+— OpenRouter's ordinary `/api/v1` would let such a bug through. That is the
+specific thing the DashScope run existed to prove and **it remains unproven**: no
+live request has ever gone to a base URL with a path prefix deeper than `/api/v1`.
+Unit tests cover the join (`tests/test_providers.py` uses the DashScope URL as its
+fixture), which is not the same as a socket agreeing.
+
+`evals/CLAUDE.md` states this correctly and always did; this table said
+"verified" and was wrong.
 
 An unverified vendor must not be described as supported without this
 qualification in release notes or docs.
