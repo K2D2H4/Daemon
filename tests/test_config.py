@@ -124,7 +124,7 @@ def test_override_requiring_a_key_fails_without_it() -> None:
         make_settings(preset="offline", route_overrides={Task.REFLECTION: "anthropic"})
 
 
-# --- voice is its own axis (docs/adr/0012) -----------------------------------
+# --- voice is its own axis (ADR 0012) ----------------------------------------
 
 
 def test_the_offline_preset_can_have_hosted_voice() -> None:
@@ -314,6 +314,22 @@ def test_routing_table_hides_voice_until_it_is_enabled() -> None:
 
     assert Task.CHAT_VOICE not in settings.routing_table()
     assert settings.routing_table()[Task.CHAT_TEXT] == Route("anthropic", settings.anthropic_model)
+
+
+def test_offline_with_voice_on_reaches_routing_table_and_active_tasks() -> None:
+    # `routing`/`route_for` are necessary but not sufficient: `routing_table()` and
+    # `active_tasks` are what `LLMGateway`/`_build_providers` actually read at boot
+    # (daemon/app.py), so this is the assertion that an `offline` install now
+    # builds a hosted voice provider client - not just that the table says so.
+    settings = make_settings(
+        preset="offline",
+        voice_enabled=True,
+        gemini_api_key="k",
+        gemini_live_model="m",
+    )
+
+    assert Task.CHAT_VOICE in settings.active_tasks
+    assert settings.routing_table()[Task.CHAT_VOICE] == Route("gemini", "m")
 
 
 # --- overrides and fallback -------------------------------------------------

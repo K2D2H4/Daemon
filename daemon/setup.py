@@ -185,6 +185,7 @@ DEFAULT_OPENAI_MODEL = "gpt-5.1"
 """Offered, then checked against the account's own model list before it is
 written - so a default that goes stale is a sentence here and a hint naming the
 ids that do exist, rather than a 404 at the first message."""
+DEFAULT_OPENAI_REALTIME_MODEL = "gpt-realtime"
 
 PRESET_ORDER = ("offline", "balanced", "quality")
 DEFAULT_PRESET = "balanced"
@@ -1020,25 +1021,49 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
         # question, because the default going stale is exactly what this wizard
         # exists to catch before the first conversation does.
     if OPENAI in providers:
+        # OpenAI can be here for two unrelated reasons - it is the hosted chat
+        # provider, or voice is on and OpenAI is the voice provider - and the
+        # questions differ, so the reason has to be named rather than assumed.
+        # Mirrors the GEMINI branch below.
+        openai_chat = hosted == OPENAI and HOSTED in PRESETS[preset].values()
+        voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
+        if openai_chat and voice_on:
+            why = "One key covers both: GPT answers, and voice is OpenAI's too."
+        elif openai_chat:
+            why = "You chose GPT for the hosted work. Your key, your account, your bill."
+        else:
+            why = "Voice is on, so audio goes to OpenAI's realtime model - with your key."
         needs.append(
             Need(
                 key="OPENAI_API_KEY",
                 label="OpenAI API key",
-                why="You chose GPT for the hosted work. Your key, your account, your bill.",
+                why=why,
                 url=OPENAI_KEYS_URL,
                 secret=True,
             )
         )
-        needs.append(
-            Need(
-                key="DAEMON_OPENAI_MODEL",
-                label="OpenAI model id",
-                why="Which model answers. Settings has no default here, so an empty "
-                "value would refuse to start.",
-                default=env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
-                listed=True,
+        if openai_chat:
+            needs.append(
+                Need(
+                    key="DAEMON_OPENAI_MODEL",
+                    label="OpenAI model id",
+                    why="Which model answers. Settings has no default here, so an empty "
+                    "value would refuse to start.",
+                    default=env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
+                    listed=True,
+                )
             )
-        )
+        if voice_on:
+            needs.append(
+                Need(
+                    key="DAEMON_OPENAI_REALTIME_MODEL",
+                    label="OpenAI Realtime model id",
+                    why="The realtime endpoint takes its own model id, not the text one.",
+                    default=env.get("DAEMON_OPENAI_REALTIME_MODEL")
+                    or DEFAULT_OPENAI_REALTIME_MODEL,
+                    listed=True,
+                )
+            )
     if GEMINI in providers:
         # Gemini can be here for two unrelated reasons - it is the hosted chat
         # provider, or voice is on and native audio is Google's either way - and
@@ -1948,13 +1973,13 @@ class Wizard:
         return chosen
 
     def _choose_voice(self, env: Mapping[str, str], updates: dict[str, str]) -> bool:
-        # No preset gate: every preset can carry voice now (docs/adr/0012), and the
+        # No preset gate: every preset can carry voice now (ADR 0012), and the
         # trade is stated in the question itself rather than by refusing to ask it.
         raw = env.get("DAEMON_VOICE_ENABLED", "")
         was = _truthy(raw) if raw else False
-        self.prompt.say("Turn voice on? Audio then goes to Google's native-audio model,")
-        self.prompt.say("with your own key. Off means no audio ever leaves this machine,")
-        self.prompt.say("and text mode loses nothing by it.")
+        self.prompt.say("Turn voice on? Audio then goes to your voice provider's native-audio")
+        self.prompt.say("model, with your own key. Off means no audio ever leaves this")
+        self.prompt.say("machine, and text mode loses nothing by it.")
         if raw:
             self.prompt.say(f"Currently {'on' if was else 'off'}. {KEEP_HINT}")
         enabled = self.prompt.ask_yes_no("Enable voice", default=was)

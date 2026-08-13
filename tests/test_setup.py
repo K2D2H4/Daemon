@@ -204,7 +204,7 @@ def answers_for(*, persona: Sequence[str] = ("", "", ""), pairing: Sequence[str]
     """Every answer a fresh `offline` install is asked for, in order.
 
     One place, because the order is the product: what it may do to this computer,
-    preset, whether voice is on (offline now carries that question too, docs/adr/0012),
+    preset, whether voice is on (offline now carries that question too, ADR 0012),
     credentials, write, then the two steps that used to be homework - the persona
     seed and pairing.
     """
@@ -3185,6 +3185,58 @@ def test_the_voice_key_follows_the_voice_provider() -> None:
 
     assert "OPENAI_API_KEY" in keys
     assert "GEMINI_API_KEY" not in keys
+    # The gap `daemon setup --check` fell into: OpenAI voice needs its own
+    # realtime model id, same as Gemini needs DAEMON_GEMINI_LIVE_MODEL.
+    assert "DAEMON_OPENAI_REALTIME_MODEL" in keys
+    # And not the unrelated *text* model id - nothing here talks to it.
+    assert "DAEMON_OPENAI_MODEL" not in keys
+
+
+# --- a walkthrough that says yes to voice -------------------------------------
+# Every other voice walkthrough above answers "n" to `_choose_voice`. Task 2
+# exists precisely for the offline + voice-on combination (ADR 0012), so it
+# needs its own end-to-end run rather than only the `needs_for` unit calls above.
+
+
+def test_offline_with_voice_on_walks_through_to_the_gemini_key(tmp_path: Path) -> None:
+    recorder = Recorder()
+    result = drive(
+        tmp_path,
+        [TOOLS_YES, "1", "y", "gemma3:4b", GOOD_GEMINI, "", GOOD_TOKEN, "y"],
+        checks=recorder.checks(),
+    )
+
+    assert result.code == 0
+    assert "GEMINI_API_KEY" in result.out
+    assert recorder.gemini == [GOOD_GEMINI]
+    assert "DAEMON_PRESET=offline" in result.written
+    assert "DAEMON_VOICE_ENABLED=true" in result.written
+    assert f"DAEMON_GEMINI_LIVE_MODEL={setup.DEFAULT_GEMINI_LIVE_MODEL}" in result.written
+
+
+def test_offline_with_openai_voice_asks_for_the_realtime_model(tmp_path: Path) -> None:
+    """The regression test for the `daemon setup --check` bug: DAEMON_VOICE_PROVIDER
+    already openai, voice turned on by re-running - the wizard must ask for
+    DAEMON_OPENAI_REALTIME_MODEL, not silently call the install complete."""
+    recorder = Recorder()
+    existing = (
+        "DAEMON_TOOLS_ENABLED=true\nDAEMON_PRESET=offline\nDAEMON_VOICE_ENABLED=false\n"
+        "DAEMON_VOICE_PROVIDER=openai\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n"
+    )
+    result = drive(
+        tmp_path,
+        [KEEP, KEEP, "y", "sk-proj-REALOPENAI7777", "", "y"],
+        existing=existing,
+        checks=recorder.checks(),
+    )
+
+    assert result.code == 0
+    assert "DAEMON_OPENAI_REALTIME_MODEL" in result.out
+    assert recorder.openai == ["sk-proj-REALOPENAI7777"]
+    assert "DAEMON_OPENAI_REALTIME_MODEL=gpt-realtime" in result.written
+    # The unrelated text model id was never asked for.
+    assert "DAEMON_OPENAI_MODEL" not in result.written
 
 
 # --- changing your mind -------------------------------------------------------
