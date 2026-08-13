@@ -101,7 +101,7 @@ PortAudio."""
 #   - PERSONA_RULE follows REFLECTION; both propagate into the whole graph.
 #   - CHAT_VOICE is absent from `offline` because no *preset* implies voice; the
 #     axis is DAEMON_VOICE_ENABLED, and `Settings.routing` adds the row when that
-#     is on (docs/adr/0012). What makes the promise in docs/PLAN.md 7 literally
+#     is on (ADR 0012). What makes the promise in docs/PLAN.md 7 literally
 #     true is voice being off - which is what that promise says.
 PRESETS: dict[str, dict[Task, str]] = {
     "offline": {
@@ -202,7 +202,7 @@ def providers_for(
     Voice contributes only while voice is on - that is what lets a text-only
     `balanced` install be set up without a hosted voice key (docs/PLAN.md 6.5) - and
     when it does, it contributes `voice_provider` under *every* preset, `offline`
-    included (docs/adr/0012).
+    included (ADR 0012).
 
     `hosted` resolves the HOSTED placeholder and is required: a caller that guesses
     it asks the user for the wrong key, which is how a person who chose GPT ends up
@@ -1045,7 +1045,7 @@ class Settings(BaseSettings):
         # text with hosted audio is a configuration people want, so the row is *added*
         # when voice is on rather than only rewritten when the table happened to hold
         # one. What keeps docs/PLAN.md 7 true is voice being off, which is what that
-        # promise has always said ("텍스트 모드 + 로컬 모델"). See docs/adr/0012.
+        # promise has always said ("텍스트 모드 + 로컬 모델"). See ADR 0012.
         if self.voice_enabled or Task.CHAT_VOICE in resolved:
             resolved[Task.CHAT_VOICE] = self.voice_provider
         return {**resolved, **self.route_overrides}

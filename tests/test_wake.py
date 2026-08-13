@@ -910,7 +910,7 @@ def voice_settings(**kwargs: Any) -> Settings:
     """A configuration where voice is genuinely available.
 
     `balanced` rather than `offline` only because these tests predate voice being its
-    own axis (docs/adr/0012) and there is no reason to churn them: both presets can
+    own axis (ADR 0012) and there is no reason to churn them: both presets can
     carry voice now, and this one already has the keys the wake path expects."""
     return Settings(
         _env_file=None,

@@ -158,8 +158,10 @@ In `daemon/config.py`, replace the body of `routing` (currently lines 1031-1044)
 ```
 
 The `or Task.CHAT_VOICE in resolved` half is load-bearing: with voice **off** under
-`balanced`/`quality` the row must stay present exactly as before, so that `route_for` reports
-"voice is off" rather than "not routed" and the existing routing-table tests keep passing.
+`balanced`/`quality` the row must stay present exactly as before, so that `routing` stays a
+faithful rendering of the preset table and the existing routing-table tests keep passing. It
+does not decide what `route_for` reports - Step 5 makes that check happen before the lookup,
+so "voice is off" is answered regardless of whether this row is present.
 
 - [ ] **Step 4: Delete the validator problem that is now unreachable**
 

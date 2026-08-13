@@ -130,8 +130,10 @@ Daemon은 ②③만 한다. ①은 안 한다.
 *누구 모델인가*를 답한다(anthropic / openai / gemini). 프리셋이 상용 대화를
 Anthropic으로 하드코딩하고 있었는데, 그러면 §3.2가 말한 provider-agnostic이 설정
 표면에서만 참이 된다. 두 축을 곱하면 프리셋이 9개가 되므로 질문을 분리했다.
-`CHAT_VOICE`만 예외로 Gemini를 명시한다 — native audio 세션이 그것뿐이고, 음성 세션이
-없는 provider를 가리키면 시작 시점이 아니라 첫 음성 턴에 터진다.
+`CHAT_VOICE`는 `DAEMON_VOICE_PROVIDER`라는 세 번째 축이다 (gemini 또는 openai) —
+프리셋과도, `DAEMON_HOSTED_PROVIDER`와도 무관하다
+(`docs/adr/0012-voice-is-its-own-axis.md`). 음성 세션이 없는 provider를 가리키면
+시작 시점이 아니라 첫 음성 턴에 터진다.
 
 **프리셋 3개로 노출한다.** 온보딩에서 7번 고르게 하면 아무도 안 쓴다.
 

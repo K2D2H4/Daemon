@@ -4,8 +4,8 @@ docs/design decision 3, and the M5 test gate: a patch is committed to `.env`
 **only** if a candidate `Settings` built from current-plus-patch constructs
 cleanly. `Settings` fails loudly at construction (daemon/config.py), so building
 one is the whole validation: an unknown preset, a non-numeric limit, a voice
-switch with no voice route all raise there, before a single byte is written. On
-failure the caller returns 400 and the file is untouched.
+switch with no realtime model id all raise there, before a single byte is
+written. On failure the caller returns 400 and the file is untouched.
 
 Secrets are indirect in both directions. GET reports `"set"`/`null`, never the
 value - the loopback admin has no auth (decision 1), so a value that never leaves
