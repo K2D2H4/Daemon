@@ -140,3 +140,33 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   hours after the last auth made the owner click through Notion's consent screen again.
   Stamping `obtained_at` at write and priming the context at build puts it back on the
   refresh branch: `POST /token 200`, no 401, 28 tools, verified live.
+- **The judge's decline few-shot, fitted to gemma3:4b, showed no measurable effect on
+  the hosted model that now also runs it.** PLAN 6.2.1 found a 4B local model reading a
+  `silence`/`pattern_time` reason — elapsed hours or a frequency, nothing else — filling
+  the gap with `또 왔네.`/`전혀 변한 게 없어.`; `daemon/proactivity/judge.py`'s two
+  worked examples exist to muzzle exactly that pair of kinds. Re-measured 2026-08-11
+  against the model `PROACTIVE_JUDGE` actually resolves to under `DAEMON_PRESET=quality`
+  — `gemini-3.6-flash`, confirmed off `daemon doctor`'s routing line and off
+  `Completion.model` on the real response, not off config — with `evals/proactive_judge.py`:
+  17 reasons across the five kinds, run twice, once against the current prompt (A) and
+  once with only the `silence`/`pattern_time` examples cut (B), nothing else touched.
+  Declines were identical on every kind, both variants: `silence` 3/3, `pattern_time`
+  3/3, `open_loop` 0/3, `emotional` 0/3, `association` 1/5. B never produced a single
+  spoken line on `silence` or `pattern_time` to check for filler — it declined all six
+  the same as A — so the pre-declared bar for adopting B ("B's lines on those two kinds
+  are not filler, and the seed's voice holds") has nothing to be judged against. Kept
+  (A): a tie is not evidence for removing a muzzle that costs six lines and no latency,
+  and the task this measurement was for says plainly that changing code because it was
+  expected to is worse than reporting no change needed with evidence.
+- **A live-data preview of the type-E generator turned up conversational chaff among
+  its own candidates, and the judge caught it without being told to.**
+  `association_candidates` (`daemon/proactivity/candidates.py`) quotes the owner's own
+  words with no content-worth filter of its own; previewing it against the real database
+  found two of three quoted associations were meta-utterances - `'우리 방금 무슨 얘기
+  했었지?'` among them. Fed to the judge verbatim on 2026-08-11 (`gemini-3.6-flash`,
+  both prompt variants), it declined - `{"say": ""}`, `why_not="nothing worth saying"` -
+  while a substance reason from the same run (`'교토 골목 국수집이 진짜 좋았어'`)
+  produced a natural line in both. One instance is not proof the generator never needs a
+  filter of its own, but on this model the judge's own content criterion ("구체적인
+  사건·감정·기억이 내용으로 적혀 있다") already screens chaff before anyone hears it, so
+  nothing in this run argues for adding one now.
