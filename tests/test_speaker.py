@@ -584,7 +584,7 @@ async def test_a_machine_with_nothing_to_speak_with_returns_false(
 
 
 # --- finding 5, whole-branch review: refuse while the mic is held -----------
-# docs/adr/0012 made `mic_busy` subtract our own hold, which stopped the gate
+# docs/adr/0013 made `mic_busy` subtract our own hold, which stopped the gate
 # from ever seeing a live voice session mid-call - so this file, not the gate,
 # has to refuse. `mic_held` is injected the same way presence.py injects it,
 # not exercised through the real `daemon.mic_hold` module, so these tests

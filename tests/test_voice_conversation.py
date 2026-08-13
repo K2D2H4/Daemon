@@ -1885,6 +1885,15 @@ async def test_run_voice_follows_the_owners_tool_mode(
     )
 
 
+# --- live screen share is gated on the provider (PR #79 review, Finding 1) ----
+# `OpenAIRealtimeSession.send_frame` is a deliberate no-op - no realtime video
+# input channel - so registering the live-share start/stop tools for it would
+# let the model tell the owner "I'm watching your screen now" while every frame
+# is silently dropped (ADR 0009 forbids exactly this). These drive the real
+# `run_voice` assembly and read what the session was actually offered, the same
+# way `test_run_voice_follows_the_owners_tool_mode` does.
+
+
 async def test_run_voice_openai_drops_live_share_tools_but_keeps_see_screen(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

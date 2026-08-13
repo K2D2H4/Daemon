@@ -152,7 +152,7 @@ one a requirement - that is a different act from starting a competing one.
 Yes, at the device: `SoundDeviceAudio` plays PCM through PortAudio while `say` is
 its own CoreAudio client, and nothing arbitrates between the two. This section
 used to say the interlock was upstream and this file needed none - that stopped
-being true on 2026-08-11 (docs/adr/0012), and the claim went uncorrected for
+being true on 2026-08-11 (docs/adr/0013), and the claim went uncorrected for
 weeks before the whole-branch review caught it.
 
 Before the split, `presence.py`'s probe genuinely could not tell our own speaker
@@ -314,7 +314,7 @@ class LocalSpeaker:
         if self._mic_held():
             # Finding 5, whole-branch review: a live voice session holds the
             # microphone for its entire run (daemon/voice/audio.py,
-            # daemon/voice/apple_audio.py), and since docs/adr/0012 `mic_busy`
+            # daemon/voice/apple_audio.py), and since docs/adr/0013 `mic_busy`
             # subtracts exactly that hold before the gate ever sees it - so
             # mid-session, on the user's own turn, `Gate._route` can return
             # `both` with nothing in the `Reading` saying a call is live. See

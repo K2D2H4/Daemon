@@ -1,4 +1,4 @@
-# 0012 — Split the presence signals
+# 0013 — Split the presence signals
 
 **Status:** accepted · 2026-08-11 · measured
 
@@ -247,14 +247,22 @@ model-call counting and stays true unchanged; the reason-text rule it is an
 exception to was never written into CONTRACTS.md in the first place, only
 into the module that has to obey it.
 
-One thing this ADR could not fix without touching a frozen comment: `Reading`'s
-own docstring (`daemon/proactivity/base.py:31`) says "See docs/adr/0010" —
-written when 0010 was the next free number. A later merge from origin/main
-(commit `1662b9e`) landed two upstream ADRs, `0010` and `0011`, about
-supersession-by-id, before this one was written down, so this decision is
-`0012` and that in-code cross-reference now points at the wrong file. Flagged
-rather than edited, per this milestone's rule that frozen files are not
-touched to make prose agree with them.
+This ADR was renumbered twice by merges landing while it was being written, and
+both times a cross-reference outlived it. It was `0010` when drafted; a merge
+from origin/main (`1662b9e`) landed upstream's `0010` and `0011` about
+supersession-by-id, so it became `0012`; a second merge (`a131b04`) landed
+upstream's `0012` about voice being its own axis, so it is `0013`. Every
+in-code reference has been walked to match — `daemon/proactivity/base.py`,
+`daemon/proactivity/speaker.py`, `tests/test_speaker.py`, `daemon/CLAUDE.md`,
+`docs/PLAN.md`, `docs/CONTRACTS.md`, `docs/ARCHITECTURE.md` — and references to
+upstream's `0010`, `0011` and `0012` were deliberately left alone, because they
+are correct about their own decisions.
+
+Worth saying plainly rather than filing away: a decision record whose number
+moves is a decision record whose citations rot silently, and `scripts/check_docs.py`
+cannot catch it because both files exist. The check that would catch it is a
+reader following a citation and finding the wrong subject — which is what the
+review of this branch did.
 
 ## What would change our mind
 

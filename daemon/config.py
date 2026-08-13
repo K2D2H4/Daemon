@@ -973,11 +973,11 @@ class Settings(BaseSettings):
         # there is no configuration where voice is on and a hosted session is
         # impossible. That makes load time the right place again, and the earlier
         # move unnecessary rather than wrong. What survives from it is this list
-        # having one home (`voice_session_problems`), which `run_voice` also
-        # applies where a session actually opens.
+        # having one home (`voice_session_problems`); `run_voice` no longer
+        # re-applies it, because by then `Settings` has already validated.
         if self.voice_enabled:
             problems += [
-                f"DAEMON_VOICE_ENABLED is on but {problem}"
+                f"DAEMON_VOICE_ENABLED is on with {problem}"
                 for problem in self.voice_session_problems()
             ]
         if not 0.0 < self.wake_vad_threshold <= 1.0:
@@ -1182,28 +1182,33 @@ class Settings(BaseSettings):
         """What stops a *hosted voice session* from running, as clauses a caller
         prefixes with its own context. Empty when nothing does.
 
-        One list, two callers, and the split is the point. `voice_enabled` came to
-        mean two things when the speaker switch merged into it - "a hosted session
-        may run" and "a proactive line may come out of the local speaker" - and
-        only the first needs any of this. `/usr/bin/say` needs neither a route nor
-        a model nor a key, so checking these at load time on `voice_enabled` alone
-        stopped `Settings` from loading on the `offline` preset, which stops the
-        daemon, and made docs/PLAN.md 7's promise about local proactive speech
-        unreachable on the one preset the promise is about.
+        **One caller: `_check`, at load time, guarded on `voice_enabled`.** Say so
+        before adding a clause here - anything that is only decidable when a
+        session opens does not belong in this list, because nothing re-runs it
+        then. A rotated key or an endpoint that went unreachable after startup
+        will not be caught here; that is the session's own problem to report.
 
-        So: `_check` applies these when `wake_enabled` is on, because a wake gate
-        that can never open a session is a misconfiguration worth refusing early;
-        and `daemon/app.py`'s `run_voice` applies them where a session actually
-        opens. The clauses are phrased to read after either prefix.
+        It briefly had two callers, and the detour is worth knowing because the
+        failure it worked around can return. `voice_enabled` came to mean two
+        things when the speaker switch merged into it - "a hosted session may run"
+        and "a proactive line may come out of the local speaker" - and only the
+        first needs any of this. `/usr/bin/say` needs neither a route nor a model
+        nor a key, so checking at load on `voice_enabled` alone stopped `Settings`
+        from loading under the `offline` preset, which stops the daemon, and made
+        docs/PLAN.md 7's promise about local proactive speech unreachable on the
+        one preset the promise is about. The workaround was to check late instead:
+        at load only when `wake_enabled`, and again in `run_voice`.
 
-        **What used to be first in this list is gone, and by a better fix than
-        this one.** It checked that the preset routed a voice task at all, which is
-        what made `offline` + `voice_enabled` unloadable. ADR 0012 removed the
-        premise instead: `routing` now *adds* the CHAT_VOICE row whenever voice is
-        on, because voice is its own axis and never was a property of the preset.
-        Both callers reach here only with voice on, so that clause could no longer
-        fire - and a check that cannot fire is worse than no check, because the
-        next reader budgets for it. What remains is the half that is still real:
+        ADR 0012 removed the premise rather than the symptom - `routing` now
+        *adds* the CHAT_VOICE row whenever voice is on, because voice is its own
+        axis and never was a property of the preset - so there is no longer a
+        configuration where voice is on and a session is impossible. Load time
+        became right again, `run_voice`'s repeat became a branch nothing can
+        reach, and the first clause in this list (does the preset route a voice
+        task) became one that cannot fire. All three are gone. A check that cannot
+        fire is worse than no check, because the next reader budgets for it.
+
+        What remains is the half that was always real:
         the chosen provider's own model and key.
         """
         problems: list[str] = []
