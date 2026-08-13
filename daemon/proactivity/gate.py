@@ -64,6 +64,16 @@ class UtteranceHistory(Protocol):
         """
         ...
 
+    def recent_bad_labels(self, *, since: datetime) -> Sequence[tuple[str, datetime]]:
+        """(kind, labeled_at) for every 👎 at or after `since`, newest first.
+
+        Same shape of question as `utterances_since`, and for the same reason:
+        `labeled_at` is UTC and the brake's rules are local-day and rolling-window
+        ones, so the gate resolves which rows are "today" or "the last 24h"
+        itself rather than asking the store to guess.
+        """
+        ...
+
 
 FOCUS_APPS: tuple[str, ...] = (
     "zoom",
@@ -128,6 +138,25 @@ def within_quiet_hours(local: time, start: time, end: time) -> bool:
     return local >= start or local < end
 
 
+KIND_REST_HOURS = 6
+"""Hours one kind rests after a single 👎 against it."""
+
+KIND_REST_REPEAT_HOURS = 24
+"""Both the window and the rest length for the second rule: two 👎 against the
+same kind inside this many hours rests that kind for this many hours."""
+
+DAY_STOP_LABELS = 3
+"""👎 presses in one local day that end the day.
+
+The brake exists because the C rhythm (6-10 a day) needs one, and because the
+button is already under every utterance - the gate routes `both` or `telegram`
+and never `local_speaker` alone, so a label is always reachable. macOS Focus was
+the other candidate and it is unreadable without Full Disk Access (measured
+2026-08-11), which is a change to the machine's security settings and not this
+project's to ask for.
+"""
+
+
 def local_day_start(moment: datetime) -> datetime:
     """Local midnight of the day `moment` falls in, expressed in UTC.
 
@@ -172,6 +201,10 @@ class Gate:
         budget = self._budget_block(candidate, moment)
         if budget is not None:
             return self._blocked(budget, reading)
+
+        brake = self._label_block(candidate, moment)
+        if brake is not None:
+            return self._blocked(brake, reading)
 
         delivery, downgrade = self._route(reading)
         why = "ok" if downgrade is None else f"ok - telegram: {downgrade}"
@@ -229,6 +262,44 @@ class Gate:
                     f"{candidate.kind} budget: {used} of {allowed} already spoken on {day} "
                     f"({total - spoken} of {total} left overall, for other kinds)"
                 )
+        return None
+
+    def _label_block(self, candidate: Candidate, moment: datetime) -> str | None:
+        """What the user said about this kind, recently, with a thumb.
+
+        Deterministic arithmetic on rows, like every other rule here - CONTRACTS
+        non-negotiable 7 puts no model in this file, and "the user asked for less
+        of this" is exactly the judgement a model would be worst at anyway.
+
+        The lookback passed to the store is `min(day, moment - 24h)`: whichever of
+        the two is earlier, so the fetched rows are a superset of both windows this
+        method actually needs - the local day (for the three-strikes count below)
+        and the trailing 24h (for the per-kind repeat count). `min` guarantees that
+        by construction, not by the size of either window on the day in question,
+        so it holds across a DST change too. The precise boundary for each rule is
+        then re-applied on the Python side (`at >= day`, `moment - at < ...`).
+        """
+        day = local_day_start(moment)
+        recent = self.history.recent_bad_labels(
+            since=min(day, moment - timedelta(hours=KIND_REST_REPEAT_HOURS))
+        )
+
+        today = [kind for kind, at in recent if at >= day]
+        if len(today) >= DAY_STOP_LABELS:
+            return (
+                f"stopped for the day: {len(today)} thumbs down since "
+                f"{day.astimezone().date().isoformat()}"
+            )
+
+        mine = [at for kind, at in recent if kind == candidate.kind]
+        within_repeat = [at for at in mine if moment - at < timedelta(hours=KIND_REST_REPEAT_HOURS)]
+        if len(within_repeat) >= 2:
+            return (
+                f"thumbs down: {candidate.kind} got {len(within_repeat)} in the last "
+                f"{KIND_REST_REPEAT_HOURS}h, resting"
+            )
+        if any(moment - at < timedelta(hours=KIND_REST_HOURS) for at in mine):
+            return f"thumbs down: {candidate.kind} is resting for {KIND_REST_HOURS}h"
         return None
 
     # --- routing ------------------------------------------------------------

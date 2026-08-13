@@ -1304,6 +1304,20 @@ class Store:
         counts["responded"] = int(responded["n"])
         return counts
 
+    def recent_bad_labels(self, *, since: datetime) -> list[tuple[str, datetime]]:
+        """(kind, labeled_at) for every 👎 at or after `since`, newest first.
+
+        The gate counts them itself, for the same reason it counts utterances
+        itself (`utterances_since`): the day boundary is local and `labeled_at`
+        is UTC, so which rows belong to today is the caller's question.
+        """
+        rows = self.conn.execute(
+            "SELECT kind, labeled_at FROM proactive_utterances "
+            "WHERE label = 'bad' AND labeled_at >= ? ORDER BY labeled_at DESC",
+            (utc_iso(since),),
+        ).fetchall()
+        return [(row["kind"], from_iso(row["labeled_at"])) for row in rows]
+
     # --- M5: telemetry the admin reads back ----------------------------------
 
     def record_proactive_round(

@@ -43,6 +43,7 @@ SPEAKER_ROUTES = {"local_speaker", "both"}
 OPEN_LOOP = Candidate(kind="open_loop", reason="어제 발표 어떻게 됐는지 안 물어봤다")
 EMOTIONAL = Candidate(kind="emotional", reason="힘들다고 한 뒤로 이틀 동안 말이 없다")
 ASSOCIATION = Candidate(kind="association", reason="교토 여행 얘기가 문득 떠올랐다")
+SILENCE = Candidate(kind="silence", reason="이틀째 대화가 없다")
 
 PRESENT = Reading(
     at=NOW,
@@ -119,6 +120,8 @@ class FakeHistory:
         self.last = last
         self.counts = dict(counts or {})
         self.asked_since: list[datetime] = []
+        self.bad: list[tuple[str, datetime]] = []
+        """(kind, labeled_at) rows, set directly by tests - the brake's input."""
 
     def last_utterance_at(self) -> datetime | None:
         return self.last
@@ -126,6 +129,9 @@ class FakeHistory:
     def utterances_since(self, *, since: datetime) -> list[dict[str, str]]:
         self.asked_since.append(since)
         return [{"kind": kind} for kind, n in self.counts.items() for _ in range(n)]
+
+    def recent_bad_labels(self, *, since: datetime) -> list[tuple[str, datetime]]:
+        return [(kind, at) for kind, at in self.bad if at >= since]
 
 
 class FakePresence:
@@ -448,6 +454,111 @@ def test_the_budget_rule_works_against_the_real_store(db: sqlite3.Connection) ->
         verdict = gate.judge(OPEN_LOOP, PRESENT, now=now)
         assert not verdict.allowed
         assert "open_loop budget" in verdict.why
+
+
+# --- the 👎 brake (Task 16) ---------------------------------------------------
+# label_counts() had one reader before this - a number in `daemon doctor`.
+# Pressing 👎 changed nothing. These are the three rules that make it a brake,
+# tested firing and not firing for the reason the module docstring gives: stuck
+# on and stuck off both look healthy from the outside.
+
+
+def test_one_thumbs_down_rests_that_kind_for_six_hours() -> None:
+    history = FakeHistory()
+    history.bad = [("association", NOW - timedelta(hours=2))]
+
+    rested = gate_for(history).judge(ASSOCIATION, PRESENT, now=NOW)
+    assert not rested.allowed
+    assert "thumbs down" in rested.why
+
+    others = gate_for(history).judge(EMOTIONAL, PRESENT, now=NOW)
+    assert others.allowed, "one kind resting must not silence the rest"
+
+
+def test_the_rest_expires() -> None:
+    history = FakeHistory()
+    history.bad = [("association", NOW - timedelta(hours=7))]
+
+    assert gate_for(history).judge(ASSOCIATION, PRESENT, now=NOW).allowed
+
+
+def test_two_in_a_day_rests_that_kind_for_twenty_four_hours() -> None:
+    history = FakeHistory()
+    history.bad = [
+        ("association", NOW - timedelta(hours=7)),
+        ("association", NOW - timedelta(hours=20)),
+    ]
+
+    verdict = gate_for(history).judge(ASSOCIATION, PRESENT, now=NOW)
+    assert not verdict.allowed
+    assert "thumbs down" in verdict.why
+
+
+def test_a_single_thumbs_down_per_kind_does_not_trigger_the_repeat_rule() -> None:
+    """Two different kinds, one 👎 each - the repeat rule counts per kind, not
+    per label, so this must read as two singles, not one pair."""
+    history = FakeHistory()
+    history.bad = [
+        ("association", NOW - timedelta(hours=2)),
+        ("emotional", NOW - timedelta(hours=2)),
+    ]
+
+    verdict = gate_for(history).judge(ASSOCIATION, PRESENT, now=NOW)
+    assert not verdict.allowed
+    assert "resting for 6h" in verdict.why  # the single-press rule, not the repeat one
+
+
+@needs_tzset
+def test_three_in_a_day_stops_everything() -> None:
+    """The owner's "be quiet" switch. Three presses and the day is over - no new
+    setting, no new UI, on the button that is already under every utterance.
+
+    TZ pinned on purpose: whether three timestamps up to 5h apart share a local
+    day depends on the local day's boundary, and a machine running this suite in
+    UTC disagrees with one running it in Seoul about how many of the three are
+    "today" unless the boundary is nailed down here.
+    """
+    history = FakeHistory()
+    history.bad = [
+        ("association", NOW - timedelta(hours=1)),
+        ("emotional", NOW - timedelta(hours=3)),
+        ("open_loop", NOW - timedelta(hours=5)),
+    ]
+
+    with timezone("Asia/Seoul"):
+        verdict = gate_for(history).judge(SILENCE, PRESENT, now=NOW)
+
+    assert not verdict.allowed
+    assert "stopped for the day" in verdict.why
+
+
+@needs_tzset
+def test_the_day_stop_is_checked_before_the_per_kind_rules() -> None:
+    """A candidate whose own kind has never been thumbed down still stops once the
+    day total reaches three - the day-stop message, not silence about its own
+    kind having nothing against it.
+
+    TZ pinned for the reason `test_three_in_a_day_stops_everything` is."""
+    history = FakeHistory()
+    history.bad = [
+        ("association", NOW - timedelta(hours=1)),
+        ("association", NOW - timedelta(hours=2)),
+        ("emotional", NOW - timedelta(hours=3)),
+    ]
+
+    with timezone("Asia/Seoul"):
+        verdict = gate_for(history).judge(SILENCE, PRESENT, now=NOW)
+    assert not verdict.allowed
+    assert "stopped for the day" in verdict.why
+
+
+def test_a_thumbs_down_outside_every_window_does_not_block() -> None:
+    """Two days old: outside the 24h repeat window and outside today, so none of
+    the three rules should fire."""
+    history = FakeHistory()
+    history.bad = [("association", NOW - timedelta(hours=48))]
+
+    assert gate_for(history).judge(ASSOCIATION, PRESENT, now=NOW).allowed
 
 
 # --- the six-signal routing table (Task 6) ------------------------------------
