@@ -412,9 +412,11 @@ a loop that wakes 288 times a day and whose correct answer is usually silence â€
 answering a contentless reason with an empty pleasantry (PLAN.md 6.2.1) is the reason
 somebody would.
 
-`Task.CHAT_VOICE` is pinned to Gemini: in native audio the model *is* both the
-brain and the voice, so it cannot be pointed at a provider without a voice
-session.
+`Task.CHAT_VOICE` is its own third axis, `DAEMON_VOICE_PROVIDER` (gemini or openai) -
+independent of the preset and of `DAEMON_HOSTED_PROVIDER`, and never `anthropic`: in
+native audio the model *is* both the brain and the voice, so it cannot be pointed at
+a provider without a voice session. See
+[ADR 0012](adr/0012-voice-is-its-own-axis.md).
 
 `Task.PERSONA_RULE` follows `Task.REFLECTION`'s routing in every preset: both
 write conclusions that propagate into everything downstream of them â€” the

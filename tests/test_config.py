@@ -16,7 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 from daemon import clock
-from daemon.config import PRESETS, ConfigError, Route, Settings
+from daemon.config import PRESETS, ConfigError, Route, Settings, providers_for
 from daemon.tasks import Task
 
 
@@ -124,26 +124,73 @@ def test_override_requiring_a_key_fails_without_it() -> None:
         make_settings(preset="offline", route_overrides={Task.REFLECTION: "anthropic"})
 
 
-# --- voice under the offline preset -----------------------------------------
+# --- voice is its own axis (ADR 0012) ----------------------------------------
 
 
-def test_offline_preset_refuses_voice() -> None:
-    settings = make_settings(preset="offline")
+def test_the_offline_preset_can_have_hosted_voice() -> None:
+    # Local text with hosted audio is a real configuration: the privacy promise in
+    # docs/PLAN.md 7 is conditioned on *text mode*, not on the preset table.
+    settings = make_settings(
+        preset="offline",
+        voice_enabled=True,
+        gemini_api_key="k",
+        gemini_live_model="m",
+    )
 
-    with pytest.raises(ConfigError, match="does not route chat_voice"):
-        settings.route_for(Task.CHAT_VOICE)
+    assert settings.routing[Task.CHAT_VOICE] == "gemini"
+    assert settings.route_for(Task.CHAT_VOICE) == Route(provider="gemini", model="m")
 
 
-def test_enabling_voice_on_the_offline_preset_fails_at_startup() -> None:
-    with pytest.raises(ConfigError, match="routes no voice task"):
-        make_settings(preset="offline", voice_enabled=True)
+def test_offline_voice_follows_the_voice_provider_not_the_preset_table() -> None:
+    settings = make_settings(
+        preset="offline",
+        voice_enabled=True,
+        voice_provider="openai",
+        openai_api_key="k",
+        openai_realtime_model="gpt-realtime",
+    )
+
+    assert settings.routing[Task.CHAT_VOICE] == "openai"
+    assert settings.route_for(Task.CHAT_VOICE) == Route(
+        provider="openai", model="gpt-realtime"
+    )
 
 
-def test_voice_is_refused_while_disabled_even_when_routed() -> None:
-    settings = make_settings(preset="balanced", anthropic_api_key="k", gemini_model="g")
+def test_voice_off_routes_no_voice_task_under_any_preset() -> None:
+    for preset in PRESETS:
+        settings = make_settings(preset=preset, anthropic_api_key="k", gemini_model="g")
 
-    with pytest.raises(ConfigError, match="voice is off"):
-        settings.route_for(Task.CHAT_VOICE)
+        # One message for one situation: before this, `offline` said "does not route
+        # chat_voice" while `balanced` said "voice is off" for the same reason.
+        with pytest.raises(ConfigError, match="voice is off"):
+            settings.route_for(Task.CHAT_VOICE)
+
+
+def test_voice_on_needs_its_own_model_under_the_offline_preset_too() -> None:
+    # The validator's voice-model check is what refuses voice now; the preset table
+    # no longer refuses anything.
+    with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_MODEL is empty"):
+        make_settings(preset="offline", voice_enabled=True, gemini_api_key="k")
+
+
+def test_providers_for_asks_for_the_voice_key_under_the_offline_preset() -> None:
+    assert providers_for(
+        "offline", voice_enabled=True, hosted="", voice_provider="gemini"
+    ) == ["gemini", "ollama"]
+    assert providers_for(
+        "offline", voice_enabled=False, hosted="", voice_provider="gemini"
+    ) == ["ollama"]
+
+
+def test_providers_for_follows_the_voice_provider_not_the_table() -> None:
+    # Reading CHAT_VOICE straight from the preset table asked a user who chose
+    # OpenAI voice for a Gemini key.
+    providers = providers_for(
+        "balanced", voice_enabled=True, hosted="anthropic", voice_provider="openai"
+    )
+
+    assert "openai" in providers
+    assert "gemini" not in providers
 
 
 def test_a_blank_endpointing_value_means_the_server_default(tmp_path: Any) -> None:
@@ -267,6 +314,22 @@ def test_routing_table_hides_voice_until_it_is_enabled() -> None:
 
     assert Task.CHAT_VOICE not in settings.routing_table()
     assert settings.routing_table()[Task.CHAT_TEXT] == Route("anthropic", settings.anthropic_model)
+
+
+def test_offline_with_voice_on_reaches_routing_table_and_active_tasks() -> None:
+    # `routing`/`route_for` are necessary but not sufficient: `routing_table()` and
+    # `active_tasks` are what `LLMGateway`/`_build_providers` actually read at boot
+    # (daemon/app.py), so this is the assertion that an `offline` install now
+    # builds a hosted voice provider client - not just that the table says so.
+    settings = make_settings(
+        preset="offline",
+        voice_enabled=True,
+        gemini_api_key="k",
+        gemini_live_model="m",
+    )
+
+    assert Task.CHAT_VOICE in settings.active_tasks
+    assert settings.routing_table()[Task.CHAT_VOICE] == Route("gemini", "m")
 
 
 # --- overrides and fallback -------------------------------------------------
