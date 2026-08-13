@@ -1019,7 +1019,7 @@ section{padding:48px 0}
         <div class="row"><span class="log">03:20  silence        </span><span style="color:var(--error)">BLOCKED</span><span class="log">  quiet hours: 23:00-09:00, and it is 03:20</span></div>
         <div class="row"><span class="log">09:15  open_loop      </span><span style="color:var(--ok)">ALLOWED</span><span class="log">  → telegram · Zoom in the foreground, so not the speaker</span></div>
         <div class="say row" style="padding-left:31ch">"You left the gate reason strings unfinished on Friday."</div>
-        <div class="row"><span class="log">10:00  open_loop      </span><span style="color:var(--error)">BLOCKED</span><span class="log">  open_loop budget: 1 of 1 already spoken today</span></div>
+        <div class="row"><span class="log">10:00  open_loop      </span><span style="color:var(--error)">BLOCKED</span><span class="log">  open_loop budget: 2 of 2 already spoken today</span></div>
         <div class="row"><span class="log">10:30  emotional      </span><span style="color:var(--error)">BLOCKED</span><span class="log">  cooldown: last spoke 15m ago, needs 30m</span></div>
         <div class="row"><span class="log">11:20  pattern_time   </span><span class="muted">SILENT </span><span class="log">  gate open; nothing worth saying</span></div>
         <div class="row"><span class="log">13:45  emotional      </span><span class="muted">SILENT </span><span class="log">  gate open; nothing worth saying</span></div>
@@ -1028,7 +1028,8 @@ section{padding:48px 0}
         <div class="row"><span class="log">23:10  open_loop      </span><span style="color:var(--error)">BLOCKED</span><span class="log">  quiet hours: 23:00-09:00, and it is 23:10</span></div>
       </div>
     </div>
-    <p class="muted" style="max-width:760px;font-size:12px">Ten of that day's decisions, and the one that produced a message. <strong style="color:var(--error);font-weight:400">BLOCKED</strong> is the deterministic gate — quiet hours, a 30-minute cooldown, a daily budget of eight, and a cap of one <code>open_loop</code>. <strong style="color:var(--tb);font-weight:400">SILENT</strong> is the single model call that only runs once the gate has opened, deciding there was nothing worth saying. Run <code>daemon proactive</code> for one round of the same rules against your own machine's state.</p>
+    <p class="muted" style="max-width:760px;font-size:12px">Ten of that day's decisions, and the one that produced a message. <strong style="color:var(--error);font-weight:400">BLOCKED</strong> is the deterministic gate — quiet hours, a 30-minute cooldown, a daily budget of eight, and a cap of two <code>open_loop</code>. <strong style="color:var(--tb);font-weight:400">SILENT</strong> is the single model call that only runs once the gate has opened, deciding there was nothing worth saying. Run <code>daemon proactive</code> for one round of the same rules against your own machine's state.</p>
+    <p class="muted" style="max-width:760px;font-size:12px">Every message it sends carries a 👍/👎 (Telegram's own inline buttons — no extra UI). One 👎 rests that reason for six hours; two 👎 on the same reason inside a day rest it for a full day; three 👎 of any kind end the day outright. No dashboard, no settings screen — the brake is the button already sitting under every line it says.</p>
   </div>
 </section>
 

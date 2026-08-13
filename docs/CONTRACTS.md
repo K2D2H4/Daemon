@@ -244,11 +244,14 @@ Then **the browser group** (`daemon/tools/browser.py`), behind its own
 > It can read the page the owner is looking at, so they can say "what does this
 > say?" instead of pasting it - and a forwarded message still cannot.
 
-Still out of scope: the type-E associative candidate generator (PLAN.md §6.1),
-the `osascript`-under-LaunchAgent question (PLAN.md §6.3.1), and pointing
-`daemon/proactivity/judge.py` at learned rules — it deliberately stays
-seed-only, a separate decision from M4
-(docs/design/2026-08-05-m4-persona-design.md).
+Still out of scope: the `osascript`-under-LaunchAgent question (PLAN.md §6.3.1),
+and pointing `daemon/proactivity/judge.py` at learned rules — it deliberately
+stays seed-only, a separate decision from M4
+(docs/design/2026-08-05-m4-persona-design.md). The type-E associative candidate
+generator (PLAN.md §6.1) that used to be listed here is built —
+`daemon/proactivity/candidates.py`'s `association_candidates`, wired into
+`daemon/proactivity/tick.py` — and its one exception to "no user text in a
+reason" is docs/adr/0012.
 
 The `recalled = 1` hygiene rule that was starving the observation table **was**
 fixed, after being scoped out first: PLAN.md §4.2's rule 2 is retired, because it
