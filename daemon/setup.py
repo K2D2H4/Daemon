@@ -2234,8 +2234,17 @@ class Wizard:
         picked = self._pick("Service", COMPATIBLE_CHOICES, default=default)
         vendor = next((v for v in COMPATIBLE_VENDORS if v.name == picked), None)
         if vendor is None:
-            # "custom" - nothing to prefill, so `needs_for` asks for the address
-            # with no default and the model question has no list behind it.
+            # "custom". On a fresh install there is nothing to prefill anyway,
+            # but on a re-run `needs_for` defaults the address question to
+            # whatever is already in `.env` - which, if that was a known
+            # vendor's URL, is the one thing the user just said no to. Left
+            # alone, Enter at the next question would silently keep it, so the
+            # question this branch answers is not "what to prefill" but
+            # "what to prefill instead": clear it when it belonged to the
+            # declined vendor, and leave it when it was already a custom
+            # address the user is presumably editing rather than replacing.
+            if saved_vendor is not None:
+                _record(updates, "DAEMON_OPENAI_COMPATIBLE_BASE_URL", "", current_url)
             return
         _record(updates, "DAEMON_OPENAI_COMPATIBLE_BASE_URL", vendor.base_url, current_url)
         if vendor.model and not env.get("DAEMON_OPENAI_COMPATIBLE_MODEL"):

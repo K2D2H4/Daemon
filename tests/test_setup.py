@@ -2369,6 +2369,48 @@ def test_a_re_run_can_move_a_custom_endpoint_to_a_new_address(tmp_path: Path) ->
     assert old_url not in result.written
 
 
+def test_choosing_custom_over_a_known_vendor_does_not_default_back_to_it(
+    tmp_path: Path,
+) -> None:
+    """Choosing "custom" is a no for the vendor whose address is saved, and Enter
+    at the very next question must not silently take it back.
+
+    `_choose_compatible_endpoint`'s `custom` branch used to write nothing, so
+    `needs_for` fell back to whatever `.env` already held for the address - which,
+    on a re-run pointed at a known vendor, is that vendor's own URL. The endpoint
+    question was then prefilled with Kimi's address one line after the user said
+    "custom", and pressing Enter reflexively kept the vendor they had just
+    declined. Asserted two ways: the empty answer is refused rather than quietly
+    accepted, and the vendor's URL never reaches the file.
+    """
+    kimi = next(v for v in setup.COMPATIBLE_VENDORS if v.name == "kimi")
+    new_url = "https://llm.internal/v1"
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai_compatible\n"
+        f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={kimi.base_url}\n"
+        f"DAEMON_OPENAI_COMPATIBLE_MODEL={kimi.model}\n"
+        "OPENAI_COMPATIBLE_API_KEY=sk-kimi-x\n"
+    )
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    answers = [
+        KEEP, KEEP, KEEP, "custom", "n", "gemma3:4b",
+        "",  # Enter at the address question - must be refused, not Kimi's URL
+        new_url, KEEP,
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, existing=existing, checks=checks)
+
+    assert result.code == 0
+    # The empty answer was rejected rather than quietly resolving to a default.
+    assert "This one is required" in flat(result.out)
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={new_url}" in result.written
+    assert kimi.base_url not in result.written
+
+
 def test_offline_is_never_asked_whose_model(tmp_path: Path) -> None:
     # It resolves no hosted task, so the question would be about a bill nobody is
     # going to get - and the answer would be written into the file as if it meant
