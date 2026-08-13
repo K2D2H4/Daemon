@@ -24,7 +24,7 @@ import pytest
 
 from daemon import cli, setup, tui
 from daemon.service import ServiceAction, ServiceError, ServiceStatus
-from daemon.setup import EXPAND, Checks, HealthState, OllamaState, Updates, Verdict
+from daemon.setup import EXPAND, Checks, HealthState, Need, OllamaState, Updates, Verdict
 
 
 @pytest.fixture(autouse=True)
@@ -783,6 +783,42 @@ def test_a_value_already_in_the_file_is_not_asked_for_again(tmp_path: Path) -> N
     # skip the step; keys were never the reason that phrase existed, and the three
     # steps that were skipped now ask with the current value as the default.
     assert "ANTHROPIC_API_KEY" not in result.out.split("── Review")[1]
+
+
+def test_probed_only_remembers_credentials_that_can_list_models(tmp_path: Path) -> None:
+    """`_fill` used to add every filled `Need.key` to `_probed`, not only the four
+    credentials `LISTED_BY` maps to - harmless while nothing collided with one of
+    them, and the silent-degradation shape this project measures hardest against
+    the moment something does: `_list_with_saved_key` reads `_probed` by
+    credential name, so a stray key sitting in that set would suppress a probe
+    for a future `LISTED_BY` value that happened to equal it.
+    """
+    recorder = Recorder()
+    wiz = setup.Wizard(
+        env_path=tmp_path / ".env",
+        prompt=setup.Prompt(io.StringIO(f"{GOOD_KEY}\n"), io.StringIO()),
+        checks=recorder.checks(),
+    )
+
+    wiz._fill(
+        Need(key="ANTHROPIC_API_KEY", label="Anthropic API key", why="key", secret=True),
+        {},
+    )
+    assert wiz._probed == {"ANTHROPIC_API_KEY"}
+
+    wiz.prompt = setup.Prompt(io.StringIO("gemma3:4b\n"), io.StringIO())
+    wiz._fill(
+        Need(
+            key="DAEMON_OLLAMA_MODEL",
+            label="local chat model",
+            why="model",
+            default="gemma3:4b",
+        ),
+        {},
+    )
+    # A model id is not a credential `LISTED_BY` can ever point at, so it must not
+    # join the set a credential's name is later looked up in.
+    assert wiz._probed == {"ANTHROPIC_API_KEY"}
 
 
 def test_an_in_place_update_does_not_duplicate_the_key(tmp_path: Path) -> None:

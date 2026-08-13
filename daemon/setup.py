@@ -1851,8 +1851,15 @@ class Wizard:
     """The bot's `@username`, kept from verifying the token so the pairing step
     can say which bot to message."""
     _probed: set[str] = field(default_factory=set, init=False)
-    """Credentials already used to list models this run, so two questions sharing
-    one key cost one call."""
+    """Credentials in `LISTED_BY.values()` already used to list models this run,
+    so two questions sharing one key cost one call.
+
+    `_fill` runs for every `Need` - model ids, tokens, the compatible endpoint -
+    and only a `LISTED_BY` credential belongs here. Widening the guard to every
+    passing verdict would still work today, because none of those other keys
+    collides with a `LISTED_BY` value, but a future one that did would silently
+    suppress its probe: `_list_with_saved_key` reads this set by credential name,
+    not by what kind of thing was just filled."""
     catalog: dict[str, tuple[str, ...]] = field(default_factory=dict, init=False)
     """What the account's own key listed, keyed by the `.env` key it answers.
 
@@ -2296,13 +2303,18 @@ class Wizard:
                 # Whatever that key was able to list, for the model questions that
                 # `needs_for` puts after it.
                 self.catalog.update(verdict.models)
-                # And that credential has now had its one probe for this run.
-                # Recorded even when the verdict carried no list at all, because a
-                # key answered here is in the env the *next* question sees - so
-                # `_list_with_saved_key` would otherwise re-probe the key it just
-                # watched being verified, which for an endpoint with no `/models`
-                # means a second chat call and a warning about a key that is fine.
-                self._probed.add(need.key)
+                # And that credential has now had its one probe for this run -
+                # but only if it *is* one of `LISTED_BY`'s credentials. Every
+                # passing verdict lands here, model ids and tokens included, and
+                # `_probed` means something specific to `_list_with_saved_key`:
+                # this credential need not be probed again. Recorded even when the
+                # verdict carried no list at all, because a key answered here is in
+                # the env the *next* question sees - so `_list_with_saved_key`
+                # would otherwise re-probe the key it just watched being verified,
+                # which for an endpoint with no `/models` means a second chat call
+                # and a warning about a key that is fine.
+                if need.key in set(LISTED_BY.values()):
+                    self._probed.add(need.key)
                 if verdict.detail:
                     # Still the last four characters and nothing more. Colour is
                     # added around `mask`, never instead of it.
