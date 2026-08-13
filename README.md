@@ -116,13 +116,22 @@ Every rule is a setting, and these are the shipped defaults:
 | | | |
 |---|---|---|
 | `DAEMON_PROACTIVE_ENABLED` | `false` | it says nothing until you turn this on |
-| `DAEMON_PROACTIVE_SPEAKER_ENABLED` | `false` | the speaker is a second, separate switch |
 | `DAEMON_PROACTIVE_QUIET_HOURS` | `23:00-09:00` | local time, never interrupted |
-| `DAEMON_PROACTIVE_COOLDOWN_MINUTES` | `90` | minimum gap between two things it says |
-| `DAEMON_PROACTIVE_DAILY_BUDGET` | `3` | most it will ever say in one day |
-| `DAEMON_PROACTIVE_OPEN_LOOP_BUDGET` | `1` | of those three, at most one unfinished-thread nudge |
+| `DAEMON_PROACTIVE_COOLDOWN_MINUTES` | `30` | minimum gap between two things it says |
+| `DAEMON_PROACTIVE_DAILY_BUDGET` | `8` | most it will ever say in one day, of any kind |
+| per-kind ceiling | 1–3 | each kind also has its own daily cap on top of the total, so the cheap-to-generate ones cannot spend the whole budget by themselves |
+| 👎 on a message | 6h / 24h / day | rests that one kind for 6h; two in 24h rests it for 24h; three in one day stops everything until tomorrow |
 
-Past the gate there is exactly one model call, which decides whether there is
+The speaker is not a second switch: `DAEMON_VOICE_ENABLED` (default `false`)
+alone governs whether a proactive line may also come out of the local speaker
+instead of only Telegram. The per-kind ceilings are JSON and replace the whole
+table when set, not just the kind you name:
+
+```
+DAEMON_PROACTIVE_KIND_BUDGETS={"association": 3, "emotional": 2, "open_loop": 2, "silence": 1, "pattern_time": 1}
+```
+
+That is also the shipped default. Past the gate there is exactly one model call, which decides whether there is
 anything worth saying at all — and usually there is not. The
 **[landing page](https://k2d2h4.github.io/Daemon/)** walks through a day of those
 verdicts.

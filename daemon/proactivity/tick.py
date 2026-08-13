@@ -17,11 +17,17 @@ Probing per candidate costs more and, worse, lets two candidates in the same tic
 disagree about where the user is - so the snapshot recorded against one utterance
 would not describe the moment another was suppressed.
 
-## Nothing here catches its own exceptions
+## Nothing here catches its own exceptions - with one exception
 
 `app.py`'s job wrapper does that, once, and logs it. A tick that swallowed its own
 failures would keep returning "nothing to say" forever and look exactly like a
 quiet week, which is this project's signature defect.
+
+`_association` (type E) is the one deliberate exception, because it is the only
+generator with a network dependency - the embedder - and an unreachable Ollama
+must not cost the four generators that need nothing but sqlite. It is narrow (it
+wraps only the `association_candidates` call) and loud (logged at warning), so it
+cannot decay into the silent failure this section otherwise guards against.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from daemon.clock import now as clock_now
 from daemon.config import Settings
@@ -45,7 +51,11 @@ from daemon.proactivity.base import (
     Utterance,
     Verdict,
 )
-from daemon.proactivity.candidates import generate_candidates
+from daemon.proactivity.candidates import (
+    AssociativeRecall,
+    association_candidates,
+    generate_candidates,
+)
 from daemon.proactivity.delivery import Delivered, ProactiveDelivery
 from daemon.proactivity.gate import Gate
 
@@ -117,6 +127,7 @@ class ProactiveTick:
         gate: Gate | None = None,
         judge: Judgement | None = None,
         delivery: ProactiveDelivery | None = None,
+        recall: AssociativeRecall | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -126,6 +137,10 @@ class ProactiveTick:
         # is what `daemon proactive` does to show its verdicts without speaking.
         self._judge = judge
         self._delivery = delivery
+        # Optional for the same reason recall is optional everywhere else: a
+        # broken embedder must not cost the four generators that need nothing
+        # but sqlite. `None` here means type E simply produces nothing.
+        self._recall = recall
 
     async def run(self, *, now: datetime | None = None) -> TickResult:
         moment = now or clock_now()
@@ -140,6 +155,7 @@ class ProactiveTick:
         # check sees the table in its settled state.
         expired = self._store.expire_candidates(now=moment)
         fresh = generate_candidates(self._store, self._settings, now=moment)
+        fresh += await self._association(moment)
         for candidate in fresh:
             self._store.insert_candidate(
                 kind=candidate.kind,
@@ -159,24 +175,36 @@ class ProactiveTick:
             verdict = self._gate.judge(candidate, reading, now=moment)
             utterance: Utterance | None = None
             delivered: Delivered | None = None
+            judged = False
 
             if verdict.allowed and self._judge is not None and self._delivery is not None:
+                judged = True
                 utterance = await self._judge.decide(candidate)
                 if utterance:
                     delivered = await self._delivery.deliver(
                         candidate, utterance, verdict, now=moment
                     )
+                    if delivered:
+                        spoke += 1
                 else:
                     declined += 1
+                    self._rest(candidate, moment)
 
             considered.append(Considered(candidate, verdict, utterance, delivered))
-            if delivered:
-                spoke += 1
-                # One utterance per tick, and the loop stops here. The gate counts
-                # the daily budget from rows already stored, so a second delivery
-                # in the same tick would read the same pre-tick count and overshoot
-                # it - and PLAN 6.2's budget of three is the brake the whole design
-                # leans on. Anything still due is reconsidered five minutes later.
+            if judged:
+                # One judge call per tick, whatever it decided. The gate counts the
+                # daily budget from rows already stored, so a second call in the
+                # same tick would read the same pre-tick count and a delivery would
+                # overshoot it - and PLAN 6.2's budget of three (now eight) is the
+                # brake the whole design leans on. That covers a second *delivery*,
+                # but a decline is a model call too - under the `quality` preset,
+                # PROACTIVE_JUDGE is hosted and paid for - and a tick with several
+                # due candidates used to run the judge on every one of them before
+                # this `break`, once per candidate, every five minutes, for as long
+                # as each stayed due. `_rest` below is what stops that on the next
+                # tick; this `break` is what stops it *within* this one. Anything
+                # still due is reconsidered later - a delivered one after the
+                # cooldown, a declined one after `_rest`.
                 break
 
         result = TickResult(
@@ -203,6 +231,47 @@ class ProactiveTick:
         )
         return result
 
+    def _rest(self, candidate: Candidate, moment: datetime) -> None:
+        """Push a declined candidate's `due_at` forward so the next tick does
+        not put it back in front of the judge unchanged.
+
+        Nothing about a decline marks the row: no state change, no cooldown -
+        `due_candidates` would offer it again five minutes later, the gate
+        would allow it again (a decline consumes no budget and sets no
+        cooldown), and the judge would run again on the same reason. A
+        `silence` candidate carries a 12-hour TTL, so unrested that is up to
+        144 calls for one already-answered question.
+
+        The rest is `proactive_cooldown_minutes` - the setting already governs
+        the minimum gap between two utterances, so a declined candidate is not
+        reconsidered any sooner than the daemon would be allowed to speak
+        again anyway. Reusing it means one knob tunes both paces instead of a
+        second constant nobody would think to change together with the first.
+        """
+        rest = timedelta(minutes=self._settings.proactive_cooldown_minutes)
+        self._store.push_candidate_due(candidate.id, due_at=moment + rest)
+
+    async def _association(self, moment: datetime) -> list[Candidate]:
+        """Type E, or nothing. Never raises.
+
+        The one place in this file that swallows an exception, and it is narrow
+        on purpose: the module docstring says nothing here catches its own
+        failures, because a tick that did would look exactly like a quiet week.
+        This is the exception because type E is the only generator with a network
+        dependency - the embedder - and an unreachable Ollama must not cost the
+        four generators that need nothing but sqlite. Logged at warning so it
+        cannot be silent.
+        """
+        if self._recall is None:
+            return []
+        try:
+            return await association_candidates(self._recall, self._store, now=moment)
+        except Exception:
+            logger.warning(
+                "proactive: type E generator failed; the other four still ran",
+                exc_info=True,
+            )
+            return []
 
 
 def row_candidate(row: sqlite3.Row) -> Candidate:

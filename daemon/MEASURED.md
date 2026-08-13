@@ -100,6 +100,36 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   safe, so `allowlist` refused every remote tool an owner added. `tool_grants` is
   that second axis, and it is read only for tools that are *not* `Executable` —
   a tool-level grant on `run_command` would be `mode=full` wearing one table row.
+- **A headphone probe was designed, approved, and implemented, then killed by
+  one `system_profiler` call.** The plan: read the default output device's
+  `Transport:` from `system_profiler SPAudioDataType` and treat `usb` /
+  `bluetooth` / `headphone` / `displayport` / `thunderbolt` as point-to-point.
+  Running it for real on the development machine found the default output is
+  *always* the virtual `MacBook Pro Speakers (eqMac)`, and it reports
+  `Transport: USB` — indistinguishable from real USB headphones — for the
+  laptop's own built-in speakers, whatever is actually plugged in:
+  ```
+  MacBook Pro Speakers (eqMac)  -> USB       (the default output, always)
+  MacBook Pro Speakers          -> Built-in
+  LG FULL HD                    -> HDMI
+  Microsoft Teams Audio         -> Virtual
+  eqMac Export                  -> USB
+  ```
+  Not a miscalibration to tune — the transport field cannot see past the virtual
+  device to the real hardware behind it, on this machine, ever. `headphones` is
+  the one presence signal that only *widens* what the speaker may do, so under
+  PLAN 6.4's asymmetry a probe that answers wrong in that direction is worse than
+  one that never answers. Removed rather than fixed; `Reading.headphones` stays
+  `None` (`daemon/proactivity/presence.py`, `daemon/proactivity/base.py`
+  unchanged). It was also the most expensive probe in the file at 0.21-0.30 s,
+  more than the `osascript` foreground fallback (168-233 ms) — so removing the
+  wrong signal also removed the biggest cost.
+- **`output_muted`'s two `osascript` calls, measured on this machine:** `MUTED`
+  134-178 ms, `VOLUME` (asked only when not muted) 145-247 ms. A reading now
+  costs ~155-200 ms muted and ~300-445 ms not muted, on top of the ~20 ms
+  `idle_seconds`/`foreground_app` already cost when `lsappinfo` answers.
+  `screen_locked`'s Quartz call is 0.09-0.15 ms warm (~18 ms the first time in a
+  process) — cheap enough that it now runs before `output_muted` in `read()`.
 - **"The SDK handles refresh on its own" was true only until the process restarted.**
   `OAuthContext` derives `token_expiry_time` from `expires_in` at the moment a token
   arrives and keeps it *in memory*; `TokenStorage` persists neither it nor the arrival
@@ -110,3 +140,60 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   hours after the last auth made the owner click through Notion's consent screen again.
   Stamping `obtained_at` at write and priming the context at build puts it back on the
   refresh branch: `POST /token 200`, no 401, 28 tools, verified live.
+- **The judge's decline few-shot, fitted to gemma3:4b, showed no measurable effect on
+  the hosted model that now also runs it.** PLAN 6.2.1 found a 4B local model reading a
+  `silence`/`pattern_time` reason — elapsed hours or a frequency, nothing else — filling
+  the gap with `또 왔네.`/`전혀 변한 게 없어.`; `daemon/proactivity/judge.py`'s two
+  worked examples exist to muzzle exactly that pair of kinds. Re-measured 2026-08-11
+  against the model `PROACTIVE_JUDGE` actually resolves to under `DAEMON_PRESET=quality`
+  — `gemini-3.6-flash`, confirmed off `daemon doctor`'s routing line and off
+  `Completion.model` on the real response, not off config — with `evals/proactive_judge.py`:
+  17 reasons across the five kinds, run twice, once against the current prompt (A) and
+  once with only the `silence`/`pattern_time` examples cut (B), nothing else touched.
+  Declines were identical on every kind, both variants: `silence` 3/3, `pattern_time`
+  3/3, `open_loop` 0/3, `emotional` 0/3, `association` 1/5. B never produced a single
+  spoken line on `silence` or `pattern_time` to check for filler — it declined all six
+  the same as A — so the pre-declared bar for adopting B ("B's lines on those two kinds
+  are not filler, and the seed's voice holds") has nothing to be judged against. Kept
+  (A): a tie is not evidence for removing a muzzle that costs six lines and no latency,
+  and the task this measurement was for says plainly that changing code because it was
+  expected to is worse than reporting no change needed with evidence.
+- **A live-data preview of the type-E generator turned up conversational chaff among
+  its own candidates, and the judge caught it without being told to.**
+  `association_candidates` (`daemon/proactivity/candidates.py`) quotes the owner's own
+  words with no content-worth filter of its own; previewing it against the real database
+  found two of three quoted associations were meta-utterances - `'우리 방금 무슨 얘기
+  했었지?'` among them. Fed to the judge verbatim on 2026-08-11 (`gemini-3.6-flash`,
+  both prompt variants), it declined - `{"say": ""}`, `why_not="nothing worth saying"` -
+  while a substance reason from the same run (`'교토 골목 국수집이 진짜 좋았어'`)
+  produced a natural line in both. One instance is not proof the generator never needs a
+  filter of its own, but on this model the judge's own content criterion ("구체적인
+  사건·감정·기억이 내용으로 적혀 있다") already screens chaff before anyone hears it, so
+  nothing in this run argues for adding one now.
+- **The C rhythm was accepted on the machine, not in the suite (2026-08-11).** Every
+  routing rule was driven against a live `Reading` from this Mac, with the daemon's
+  own microphone hold declared the way the wake listener declares it:
+  ```
+  editor in front, unmuted     -> both      ok
+    + muted                    -> telegram  output muted
+    + screen locked            -> telegram  screen locked
+    + somebody else on the mic -> telegram  microphone in use
+  Slack in the foreground      -> telegram  Slack is in the foreground
+  ```
+  `both` is the line that matters: it is the first time the local speaker has been
+  reachable at all. Before the split, `mic_busy` was `True` forever on any install
+  with `DAEMON_WAKE_ENABLED` on, so the speaker branch could not be selected —
+  switching voice on was what switched the voice route off. With the hold declared,
+  the same probe reads `mic_busy=False` while the device is genuinely running.
+  The 👎 brake was driven against the real `Settings` (budget 8/day, ceilings
+  association 3 · emotional 2 · open_loop 2 · silence 1 · pattern_time 1): one press
+  gives `thumbs down: association is resting for 6h` and leaves every other kind at
+  `ok`.
+- **Type E cannot fire on this install for about another month, and that is the
+  design (2026-08-11).** `ASSOCIATION_MIN_AGE_DAYS` is 30 and the whole conversation
+  history spans 2026-08-06..2026-08-11, so there are zero owner messages old enough
+  to be an association rather than a conversation. Same shape as `pattern_time`
+  needing 14 distinct days. Worth writing down because "the generator produces
+  nothing" and "the generator is broken" look identical from outside, and this one
+  is the former.
+

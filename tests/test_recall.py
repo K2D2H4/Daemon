@@ -939,6 +939,57 @@ async def test_associate_with_an_empty_query_makes_no_call(store: Store) -> None
     assert len(getattr(embedder, "calls", [])) == before
 
 
+async def test_a_reindexed_row_is_excluded_from_associate(store: Store) -> None:
+    """Finding 2 (whole-branch review): `daemon reindex` infers `origin='owner'`
+    for every rebuilt `role='user'` row, because the markdown it rebuilds from
+    carries no provenance (non-negotiable 3) - so a forward that was originally
+    `origin='untrusted'` comes back `'owner'` after a rebuild. `associate` is
+    type E's only entry point into recall and quotes `origin == 'owner'` items
+    verbatim into the judge's prompt, so a `reindexed` row must be excluded
+    regardless of what its `origin` column says."""
+    store.insert_message(
+        message("제주도에서 본 바다가 아직 기억나", ts=NOW - timedelta(days=90)),
+        log_file="memory/log/2026-08-02.md",
+        reindexed=True,
+    )
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    assert await recall.associate("바다", min_age_days=30) == []
+
+
+async def test_an_un_reindexed_row_is_the_control_for_the_test_above(store: Store) -> None:
+    """Same row, same age, same query, `reindexed` left `False` - proves the
+    exclusion above is about the flag and not about the row being unfindable for
+    some other reason."""
+    store.insert_message(
+        message("제주도에서 본 바다가 아직 기억나", ts=NOW - timedelta(days=90)),
+        log_file="memory/log/2026-08-02.md",
+        reindexed=False,
+    )
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    assert await recall.associate("바다", min_age_days=30)
+
+
+async def test_search_still_returns_a_reindexed_row(store: Store) -> None:
+    """The exclusion above is `associate`-only. `search` - the ordinary recall
+    lane read every turn - must not lose reindexed history; it only stops
+    letting type E treat a rebuilt `'owner'` as observed rather than inferred.
+    Rendering the distinction at read time is `daemon/companion.py`'s job, not
+    this lane's."""
+    store.insert_message(
+        message("제주도에서 본 바다", ts=NOW - timedelta(days=1)),
+        log_file="memory/log/2026-08-02.md",
+        reindexed=True,
+    )
+    recall = MemoryRecall(store, GramEmbedder(), now=NOW)
+    await recall.backfill()
+
+    assert await recall.search("바다")
+
+
 async def test_associate_degrades_to_the_keyword_lane_like_search_does(
     store: Store,
 ) -> None:

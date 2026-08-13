@@ -22,7 +22,7 @@ from conftest import FakeProvider
 from daemon.config import Route
 from daemon.llm.gateway import LLMGateway
 from daemon.proactivity.base import Candidate
-from daemon.proactivity.judge import MAX_CHARS, Judge
+from daemon.proactivity.judge import MAX_CHARS, SYSTEM, Judge
 from daemon.tasks import Task
 
 SEED = "너는 반말을 쓰고, 말수가 적다. 걱정을 길게 늘어놓지 않는다."
@@ -41,6 +41,31 @@ VAGUE = Candidate(
 )
 """A candidate that passes the gate and gives the model nothing concrete: the case
 declining exists for. Type D knows only that an hour usually has a conversation."""
+
+
+def test_the_two_conditions_name_the_same_three_kinds() -> None:
+    """SYSTEM's two conditions are AND'ed (`둘 다`): a candidate that satisfies 1
+    but not 2 is declined forever. Condition 1 admits 사건/감정/기억 (event, feeling,
+    memory - the last added for type E); condition 2 has to ask about the same
+    three or a reason that only ever names a memory - never an event or a feeling -
+    can pass 1 and always fail 2, which is exactly what shipped in review round 1:
+    every type E candidate declined regardless of content, making that generator's
+    output permanently inert.
+
+    Also checks the fix did not widen 2 the other way: the exclusion in 1's second
+    sentence (time/interval/frequency alone is not content) is 1's job, and 2 must
+    not independently start admitting it.
+    """
+    _, numbered = SYSTEM.split("\n\n1. ", 1)
+    condition_1, rest = numbered.split("\n2. ", 1)
+    condition_2, _ = rest.split("\n\n", 1)
+
+    for noun in ("사건", "감정", "기억"):
+        assert noun in condition_1, f"condition 1 no longer names {noun}"
+        assert noun in condition_2, f"condition 2 does not ask about {noun}"
+
+    for excluded in ("시간", "간격", "빈도"):
+        assert excluded not in condition_2
 
 
 def judge_for(
@@ -131,6 +156,49 @@ async def test_an_empty_seed_file_is_the_same_as_none(data_dir: Path) -> None:
     judge, provider = judge_for(data_dir, seed="   \n")
 
     assert not await judge.decide(OPEN_LOOP)
+    assert provider.calls == []
+
+
+async def test_learned_rules_reach_the_prompt(data_dir: Path) -> None:
+    """The text loop and voice both carry M4's learned rules. Proactivity not
+    carrying them meant the same person spoke differently depending on which
+    path reached them. Decided 2026-08-11; judge.py had left it open on purpose."""
+    (data_dir / "persona" / "learned.md").write_text(
+        "- 아침에는 말을 짧게 한다.", encoding="utf-8"
+    )
+    judge, provider = judge_for(data_dir)
+
+    await judge.decide(OPEN_LOOP)
+
+    assert "아침에는 말을 짧게" in system_text(provider)
+
+
+async def test_a_missing_seed_still_refuses_to_speak(data_dir: Path) -> None:
+    """Unchanged and load-bearing: PLAN 5 says a generic-assistant voice is the
+    one thing this product must not have, and nobody asked for this line."""
+    judge, _ = judge_for(data_dir, seed=None)
+
+    utterance = await judge.decide(OPEN_LOOP)
+
+    assert not utterance
+    assert "seed" in utterance.why_not
+
+
+async def test_learned_rules_alone_are_not_a_persona(data_dir: Path) -> None:
+    """The trap in this task. `load_persona` returns a non-empty string when
+    *either* file has content (loader.py:118), so checking its output instead of
+    the seed would let an install with no seed.md and a populated learned.md
+    speak first in nobody's voice. The seed is the anchor; accumulated rules are
+    not a substitute for it."""
+    (data_dir / "persona" / "learned.md").write_text(
+        "- 아침에는 말을 짧게 한다.", encoding="utf-8"
+    )
+    judge, provider = judge_for(data_dir, seed=None)
+
+    utterance = await judge.decide(OPEN_LOOP)
+
+    assert not utterance
+    assert "seed" in utterance.why_not
     assert provider.calls == []
 
 

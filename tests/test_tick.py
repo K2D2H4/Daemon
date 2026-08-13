@@ -28,7 +28,7 @@ NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
 class FakePresence:
     def __init__(self, reading: Reading | None = None) -> None:
         self.reading = reading or Reading(
-            at=NOW, idle_seconds=5.0, foreground_app="Warp", audio_busy=False
+            at=NOW, idle_seconds=5.0, foreground_app="Warp", mic_busy=False, output_busy=False
         )
         self.reads = 0
 
@@ -66,6 +66,13 @@ def settings(**overrides: Any) -> Settings:
         "proactive_enabled": True,
         "proactive_quiet_hours": "",
     }
+    # A caller passing `voice_enabled=True` gets the voice model and key with it:
+    # ADR 0012 made voice its own axis, so `offline` + voice is an ordinary
+    # configuration, but turning voice on still names a hosted provider and the
+    # validator still asks for its model and key. Supplying them beats bypassing
+    # the validator, which is what the `model_construct` hatch here used to do.
+    if overrides.get("voice_enabled"):
+        base |= {"gemini_api_key": "k", "gemini_live_model": "m"}
     return Settings(_env_file=None, **{**base, **overrides})
 
 
@@ -148,6 +155,39 @@ async def test_a_disabled_daemon_generates_nothing_but_still_reads_presence(
     assert result.generated == 0
 
 
+# --- type E, optional ---------------------------------------------------------
+
+
+async def test_a_tick_without_recall_still_runs_the_other_four(
+    store: Store, data_dir: Path
+) -> None:
+    """Recall is optional everywhere else in this codebase - a broken embedder
+    must not cost the conversation loop - and it is optional here for the same
+    reason. Four generators is a worse tick, not a dead one."""
+    add_candidate(store)
+    tick = ProactiveTick(store, settings(), FakePresence(), recall=None)
+
+    result = await tick.run(now=NOW)
+
+    assert result.disabled is False
+
+
+async def test_a_failing_recall_does_not_kill_the_tick(store: Store, data_dir: Path) -> None:
+    """An embedder that cannot be reached is an ordinary Tuesday. The other four
+    generators do not depend on it and must still be considered."""
+
+    class _Broken:
+        async def associate(self, *args: Any, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("ollama is down")
+
+    add_candidate(store)
+    tick = ProactiveTick(store, settings(), FakePresence(), recall=_Broken())
+
+    result = await tick.run(now=NOW)  # must not raise
+
+    assert result.disabled is False
+
+
 # --- the one model call ------------------------------------------------------
 
 
@@ -214,7 +254,7 @@ async def test_a_decline_sends_nothing_and_spends_nothing(
     store: Store, data_dir: Path
 ) -> None:
     """Silence is the default (non-negotiable 7). A judge that never declines is
-    one nobody should trust, so the path has to cost nothing."""
+    one nobody should trust, so the path has to cost nothing but a rest."""
     add_candidate(store)
     tick, _, channel = tick_for(store, data_dir, judge=FakeJudge(""))
 
@@ -223,8 +263,48 @@ async def test_a_decline_sends_nothing_and_spends_nothing(
     assert (result.declined, result.spoke) == (1, 0)
     assert channel.sent == []
     assert store.utterances_since(since=NOW) == []
-    # And the candidate is untouched, so a better moment can still use it.
-    assert len(store.due_candidates(now=NOW)) == 1
+    # Finding 1: an untouched candidate is exactly the bug. It is not fired,
+    # cancelled or expired - a better moment can still use it - but it is
+    # resting, so the very next tick does not put it back in front of the
+    # judge for the same already-answered question.
+    assert len(store.due_candidates(now=NOW)) == 0
+    rest = timedelta(minutes=settings().proactive_cooldown_minutes)
+    assert len(store.due_candidates(now=NOW + rest)) == 1
+
+
+async def test_an_unrested_decline_would_cost_a_call_every_tick(
+    store: Store, data_dir: Path
+) -> None:
+    """The regression finding 1 describes: without the rest, five minutes later
+    `due_candidates` returns the same declined candidate and the judge runs on it
+    again. Reproduced here by running two ticks five minutes apart on the
+    hosted-shaped setup (`silence`'s TTL is long enough to still be live)."""
+    add_candidate(store, "silence")
+    tick, judge, _ = tick_for(store, data_dir, judge=FakeJudge("", ""))
+
+    await tick.run(now=NOW)
+    await tick.run(now=NOW + timedelta(minutes=5))
+
+    # One call, not two: the rest from the first decline pushed `due_at` past
+    # the second tick's `now`, so the candidate was not offered to the judge
+    # again five minutes later.
+    assert len(judge.asked) == 1
+
+
+async def test_a_decline_still_stops_the_tick(store: Store, data_dir: Path) -> None:
+    """Finding 1's other half: the loop used to `break` only after a *delivery*,
+    so several due candidates in one tick each cost a judge call before a decline
+    stopped it - under the `quality` preset PROACTIVE_JUDGE is hosted, so that is
+    a paid call per candidate, not a free one."""
+    add_candidate(store, "silence")
+    add_candidate(store, "emotional")
+    tick, judge, channel = tick_for(store, data_dir, judge=FakeJudge(""))
+
+    result = await tick.run(now=NOW)
+
+    assert len(judge.asked) == 1
+    assert (result.declined, result.spoke) == (1, 0)
+    assert channel.sent == []
 
 
 async def test_a_decline_is_counted_separately_from_a_block(
@@ -318,7 +398,7 @@ async def test_the_recorded_route_is_telegram_when_no_speaker_is_wired(
     store: Store, data_dir: Path
 ) -> None:
     add_candidate(store)
-    tick, _, _ = tick_for(store, data_dir, proactive_speaker_enabled=True)
+    tick, _, _ = tick_for(store, data_dir, voice_enabled=True)
 
     await tick.run(now=NOW)
 

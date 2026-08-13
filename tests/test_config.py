@@ -411,7 +411,12 @@ def test_a_non_positive_half_life_fails_at_startup() -> None:
         make_settings(preset="offline", recall_half_life_days=0)
 
 
-def test_enabling_voice_without_a_live_model_fails_at_startup() -> None:
+def test_a_wake_gate_without_a_live_model_fails_at_startup() -> None:
+    """Keyed on the wake gate rather than on `voice_enabled`, since the merge that
+    made one switch govern the local speaker too: `/usr/bin/say` needs no model, so
+    refusing to load over a missing one took the `offline` install's only voice
+    feature away along with the daemon. The wake gate keeps the check because
+    opening a hosted session is the only thing it does."""
     with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_MODEL is empty"):
         make_settings(
             preset="balanced",
@@ -419,6 +424,8 @@ def test_enabling_voice_without_a_live_model_fails_at_startup() -> None:
             gemini_model="g",
             gemini_api_key="k",
             voice_enabled=True,
+            wake_enabled=True,
+            wake_aliases="벨라",
         )
 
 
@@ -443,13 +450,18 @@ def test_openai_voice_route_uses_the_realtime_model_and_provider() -> None:
 
 
 def test_openai_voice_requires_its_own_model_and_key() -> None:
+    """Same move as the gemini one above: these guard a hosted session, so at load
+    time they fire for the wake gate. `run_voice` applies the identical list when a
+    session actually opens - see tests/test_voice_conversation.py."""
+    wake = {"wake_enabled": True, "wake_aliases": "벨라"}
     with pytest.raises(ConfigError, match="DAEMON_OPENAI_REALTIME_MODEL"):
         make_settings(preset="quality", voice_enabled=True, voice_provider="openai",
-                      openai_api_key="sk-o", gemini_api_key="g", anthropic_api_key="a")
+                      openai_api_key="sk-o", gemini_api_key="g", anthropic_api_key="a", **wake)
     with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
         make_settings(
             preset="quality", voice_enabled=True, voice_provider="openai",
             openai_realtime_model="gpt-realtime", gemini_api_key="g", anthropic_api_key="a",
+            **wake,
         )
 
 
@@ -682,13 +694,6 @@ def test_an_empty_quiet_window_is_allowed() -> None:
     assert make_settings(preset="offline", proactive_quiet_hours="").proactive_quiet_hours == ""
 
 
-def test_an_open_loop_budget_above_the_daily_budget_fails_at_startup() -> None:
-    """The sub-cap exists to hold open loops *below* the overall budget; above it
-    the setting reads as a cap while capping nothing (docs/PLAN.md 6.2)."""
-    with pytest.raises(ConfigError, match="DAEMON_PROACTIVE_OPEN_LOOP_BUDGET"):
-        make_settings(preset="offline", proactive_daily_budget=3, proactive_open_loop_budget=5)
-
-
 def test_a_negative_budget_fails_at_startup() -> None:
     with pytest.raises(ConfigError, match="DAEMON_PROACTIVE_DAILY_BUDGET"):
         make_settings(preset="offline", proactive_daily_budget=-1)
@@ -701,21 +706,101 @@ def test_a_zero_silence_threshold_fails_at_startup() -> None:
         make_settings(preset="offline", proactive_silence_hours=0)
 
 
-def test_proactivity_and_the_speaker_are_off_by_default() -> None:
-    """Two separate switches, both off. An ignored notification costs nothing and a
-    voice in a meeting is an accident, so the speaker is not implied by turning
-    proactivity on (docs/PLAN.md 6.4)."""
+def test_proactivity_and_voice_are_off_by_default() -> None:
+    """Both off. `voice_enabled` now doubles as the proactive-speaker switch
+    (DAEMON_PROACTIVE_SPEAKER_ENABLED is gone), so a fresh install that never
+    turns on proactivity, or never turns on voice, gets no sound from either
+    path - not just no Telegram message."""
     settings = make_settings(preset="offline")
     assert settings.proactive_enabled is False
-    assert settings.proactive_speaker_enabled is False
+    assert settings.voice_enabled is False
+
+
+def test_the_speaker_switch_is_gone() -> None:
+    """One switch, not two. They were split because a voice in a meeting is an
+    accident and a Telegram message is not - but the gate now carries seven rules
+    for exactly that, and a second switch only made "voice on" mean two things.
+
+    `preset="offline"` rather than a bare `Settings()`: the default preset needs
+    a hosted provider and this test has nothing to do with that - it is here to
+    fail on a stray `hasattr`, not on an unrelated startup check."""
+    assert not hasattr(make_settings(preset="offline"), "proactive_speaker_enabled")
+
+
+def test_an_unset_legacy_speaker_switch_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pydantic must not reject an .env that still carries the old key: the user
+    upgrading is the whole point, and a settings file that refuses to load takes
+    the conversation loop down with it."""
+    monkeypatch.setenv("DAEMON_PROACTIVE_SPEAKER_ENABLED", "true")
+    settings = make_settings(preset="offline")  # must not raise
+    assert settings.voice_enabled in (True, False)
+
+
+def test_an_unset_legacy_open_loop_budget_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`proactive_open_loop_budget` is gone, replaced by `proactive_kind_budgets`
+    (docs/PLAN.md 6.2). The same upgrade concern as the speaker switch above: an
+    .env from before this change still sets the old key, and `extra="ignore"` is
+    what keeps that inert rather than a startup failure."""
+    monkeypatch.setenv("DAEMON_PROACTIVE_OPEN_LOOP_BUDGET", "1")
+    settings = make_settings(preset="offline")  # must not raise
+    assert not hasattr(settings, "proactive_open_loop_budget")
+    assert settings.proactive_kind_budgets["open_loop"] == 2
+
+
+def test_kind_budgets_reads_the_documented_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`proactive_kind_budgets` used to have no `DAEMON_` alias at all, so nothing
+    in `.env` could reach it."""
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PROACTIVE_KIND_BUDGETS", '{"open_loop": 1, "silence": 1}')
+
+    settings = Settings(_env_file=None)
+
+    assert settings.proactive_kind_budgets == {"open_loop": 1, "silence": 1}
+
+
+def test_an_empty_kind_budgets_means_no_per_kind_ceilings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PROACTIVE_KIND_BUDGETS", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.proactive_kind_budgets == {}
+
+
+def test_unparseable_kind_budgets_names_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PROACTIVE_KIND_BUDGETS", "open_loop: 1")
+
+    with pytest.raises(ValidationError, match="DAEMON_PROACTIVE_KIND_BUDGETS"):
+        Settings(_env_file=None)
+
+
+def test_an_unknown_kind_in_the_budget_table_is_a_config_error() -> None:
+    """The regression: `{"open_loop": 99, "nonsense": -5}` used to load clean with
+    no validator at all."""
+    with pytest.raises(ConfigError, match="unknown kind 'nonsense'"):
+        make_settings(preset="offline", proactive_kind_budgets={"nonsense": 1})
+
+
+def test_a_negative_kind_ceiling_is_a_config_error() -> None:
+    with pytest.raises(ConfigError, match="non-negative"):
+        make_settings(preset="offline", proactive_kind_budgets={"open_loop": -5})
 
 
 def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:
     """Zero is a legitimate answer - keep generating candidates, never speak - and
     is how someone tunes it down without losing the label history."""
-    assert make_settings(
-        preset="offline", proactive_daily_budget=0, proactive_open_loop_budget=0
-    ).proactive_daily_budget == 0
+    assert (
+        make_settings(preset="offline", proactive_daily_budget=0).proactive_daily_budget == 0
+    )
 
 
 # --- tool use ---------------------------------------------------------------

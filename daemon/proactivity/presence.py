@@ -5,7 +5,7 @@ probes, and the reason the shape is this careful is docs/PLAN.md 6.4: an ignored
 notification costs nothing, and **a voice coming out of the speaker during a
 meeting is an accident.** The asymmetry runs one way, so every failure here
 resolves towards `None` rather than towards a cheerful `False`, because `False`
-for `audio_busy` is what routes to the speaker.
+for `mic_busy` or `output_busy` is what routes to the speaker.
 
 ## What each probe is, and what it actually cost
 
@@ -17,11 +17,16 @@ machine docs/PLAN.md 6.3 recorded the probes working on:
 | `idle_seconds` | `ioreg -c IOHIDSystem` | 11-16 ms |
 | `foreground_app` | `lsappinfo`, two calls | 6.9-12 ms, median 7.7 ms |
 | `foreground_app` fallback | `osascript` + System Events | 168-233 ms warm, 464 ms cold |
-| `audio_busy` | CoreAudio, via ctypes | 0.08-0.14 ms warm, 77 ms first call |
+| `mic_busy` / `output_busy` | CoreAudio, via ctypes | 0.08-0.14 ms warm, 77 ms first call |
+| `screen_locked` | Quartz, in-process | 0.09-0.15 ms warm, ~18 ms cold |
+| `output_muted` | `osascript`: `MUTED`, `VOLUME` if not muted | 134-178 ms, +145-247 ms if not |
 
-A reading costs ~20 ms when `lsappinfo` answers and ~200 ms when it falls through
-to `osascript`. Either is fine on a five-minute tick and neither belongs on the
-voice latency path; nothing calls this from there.
+A reading costs ~20 ms when `lsappinfo` answers, plus `output_muted`'s cost:
+**~155-200 ms when the machine is muted** (one `osascript` call) and **~300-445 ms
+when it is not** (two). Add ~200 ms more on top of either if `foreground_app`
+falls through to its own `osascript` call. All of this is fine on a five-minute
+tick and none of it belongs on the voice latency path; nothing calls this from
+there.
 
 ## Why `foreground_app` has two probes and `lsappinfo` goes first
 
@@ -147,6 +152,7 @@ import sys
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 
+from daemon import mic_hold
 from daemon.clock import now as clock_now
 from daemon.proactivity.base import Reading
 
@@ -217,6 +223,17 @@ _HID_IDLE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
 node sits in the tree. So the value is found by pattern rather than by position,
 and a dump that does not contain it at all is a failed probe (below) rather than
 a zero."""
+
+MUTED = 'output muted of (get volume settings)'
+VOLUME = 'output volume of (get volume settings)'
+"""Two calls rather than one AppleScript returning a record: parsing
+`{output volume:50, output muted:true}` means owning a record parser, and the
+second call costs ~120 ms on a five-minute tick.
+
+`get volume settings` is Standard Additions, not System Events, so it needs no
+Automation grant - unlike the `osascript` foreground fallback this file already
+warns about. Verified answering on this machine (2026-08-11).
+"""
 
 
 class ProbeError(Exception):
@@ -307,27 +324,42 @@ def _uint32_property(obj: int, selector: int) -> int:
     return value.value
 
 
-def audio_running() -> bool:
-    """Whether the default input or output device is running for anybody.
+def audio_running(selector: int) -> bool:
+    """Whether the default device named by `selector` is running for anybody.
 
-    Blocking, and called through a thread - it is sub-millisecond warm but talks
-    to another process to do it, and `coreaudiod` restarting is a real thing.
+    One device per call, where this used to OR the two together. The merge is
+    what let the wake listener's own hold on the input device present as "the
+    audio hardware is busy", which the gate spent as "on a call" - so voice being
+    on was what kept the speaker route unreachable. The two directions mean
+    different things and the caller needs them apart.
 
-    A machine with no microphone has no default input device, which is not a
-    failure; it is only a failure when *neither* default exists, because then
-    nothing was measured and saying `False` would be a guess.
+    Blocking, and called through a thread: sub-millisecond warm, but it talks to
+    another process to do it and `coreaudiod` restarting is a real thing.
     """
-    measured = False
-    for default in (DEFAULT_OUTPUT, DEFAULT_INPUT):
-        device = _uint32_property(SYSTEM_OBJECT, default)
-        if device == UNKNOWN_OBJECT:
-            continue
-        measured = True
-        if _uint32_property(device, IS_RUNNING_SOMEWHERE):
-            return True
-    if not measured:
-        raise ProbeError("no default audio device")
-    return False
+    device = _uint32_property(SYSTEM_OBJECT, selector)
+    if device == UNKNOWN_OBJECT:
+        # A machine with no microphone has no default input device. Nothing was
+        # measured, so saying False would be a guess - and False on the input
+        # side is what routes to the speaker.
+        raise ProbeError("no such default audio device")
+    return bool(_uint32_property(device, IS_RUNNING_SOMEWHERE))
+
+
+# --- the session dictionary, through Quartz ---------------------------------
+
+
+def _window_server_session() -> dict[str, object] | None:
+    """The window server's session dictionary, or None if Quartz is unavailable.
+
+    Imported lazily: pyobjc is present in this install, but presence must keep
+    answering on a machine where it is not, and a module-scope import would make
+    that a crash at import time rather than one `None` field.
+    """
+    try:
+        import Quartz
+    except ImportError:
+        return None
+    return Quartz.CGSessionCopyCurrentDictionary()
 
 
 # --- the reading ------------------------------------------------------------
@@ -347,7 +379,9 @@ class MachinePresence:
         platform: str | None = None,
         timeout: float = PROBE_TIMEOUT_SECONDS,
         run: Callable[[Sequence[str]], Awaitable[str]] | None = None,
-        audio: Callable[[], bool] | None = None,
+        audio: Callable[[int], bool] | None = None,
+        mic_held: Callable[[], bool] | None = None,
+        session: Callable[[], dict[str, object] | None] | None = None,
         now: datetime | None = None,
     ) -> None:
         # sys.platform, not platform.system(): it is a constant fixed at compile
@@ -364,13 +398,15 @@ class MachinePresence:
         # a probe with no failure-path coverage at all.
         self._run = run if run is not None else self._spawn
         self._audio = audio if audio is not None else audio_running
+        self._mic_held = mic_held if mic_held is not None else mic_hold.held
+        self._session = session if session is not None else _window_server_session
         self._now = now
 
     async def read(self) -> Reading:
-        """The three probes, in one reading. Never raises."""
+        """The four probes, in one reading. Never raises."""
         at = self._now or clock_now()
         if self._platform != "darwin":
-            # One entry, not three: the fact is about the platform, and repeating
+            # One entry, not four: the fact is about the platform, and repeating
             # it per field would pad the gate snapshot without adding anything.
             # The fields are `None`, so the gate already sees nothing is known.
             return Reading(
@@ -379,17 +415,26 @@ class MachinePresence:
             )
 
         unknown: list[str] = []
-        # Sequential, cheapest first. Gathering them would save ~15 ms of the
-        # ~200 ms total - osascript dominates either way - and cost the property
-        # that a failure is attributed to exactly one probe.
+        # Sequential, cheapest first: `screen_locked` is an in-process Quartz
+        # call that costs a fraction of a millisecond warm, so it goes ahead of
+        # `output_muted`, which spawns one or two `osascript` processes (~155-445
+        # ms - see the module docstring). Gathering them would save little of that
+        # - `osascript` dominates either way - and cost the property that a
+        # failure is attributed to exactly one probe.
         idle = await self._probe("idle_seconds", self._idle_seconds, unknown)
         app = await self._probe("foreground_app", self._foreground_app, unknown)
-        busy = await self._probe("audio_busy", self._audio_busy, unknown)
+        mic = await self._probe("mic_busy", self._mic_busy, unknown)
+        output = await self._probe("output_busy", self._output_busy, unknown)
+        locked = await self._probe("screen_locked", self._screen_locked, unknown)
+        muted = await self._probe("output_muted", self._output_muted, unknown)
         return Reading(
             at=at,
             idle_seconds=idle,
             foreground_app=app,
-            audio_busy=busy,
+            mic_busy=mic,
+            output_busy=output,
+            screen_locked=locked,
+            output_muted=muted,
             unknown=tuple(unknown),
         )
 
@@ -483,22 +528,96 @@ class MachinePresence:
         has no way to request non-interactively - see the module docstring."""
         return _app_name(await self._run([OSASCRIPT, "-e", FRONTMOST]), "osascript")
 
-    async def _audio_busy(self) -> bool:
-        """Whether something holds the audio device - a call, a recording."""
+    async def _mic_busy(self) -> bool:
+        """Whether somebody *other than us* holds the microphone.
+
+        Our own hold is subtracted rather than probed around, because CoreAudio
+        has no per-process answer: `kAudioDevicePropertyDeviceIsRunningSomewhere`
+        is exactly as wide as its name. The daemon does know its own state, so it
+        asks itself (`daemon/mic_hold.py`) instead of guessing.
+
+        Checked *before* the probe: if we hold it, the device is busy by
+        definition and the answer cannot be anything else.
+        """
+        if self._mic_held():
+            return False
+        return await self._device_running(DEFAULT_INPUT)
+
+    async def _output_busy(self) -> bool:
+        return await self._device_running(DEFAULT_OUTPUT)
+
+    async def _device_running(self, selector: int) -> bool:
         try:
             async with asyncio.timeout(self._timeout):
                 # In a thread because this is a blocking IPC to coreaudiod. A
-                # timeout cannot actually cancel the thread, so a genuinely wedged
-                # coreaudiod leaks one worker per tick - accepted, because the
-                # alternative is blocking the event loop on the same call, and
-                # 0.1 ms warm makes this the improbable branch.
-                return await asyncio.to_thread(self._audio)
+                # timeout cannot cancel the thread, so a wedged coreaudiod leaks
+                # one worker per tick - accepted, because 0.1 ms warm makes this
+                # the improbable branch and the alternative is blocking the loop.
+                return await asyncio.to_thread(self._audio, selector)
         except TimeoutError:
             raise ProbeError(f"CoreAudio did not answer in {self._timeout:g}s") from None
         except OSError as exc:
-            # ctypes.CDLL raising: no CoreAudio framework, which is what a
-            # non-Apple platform reaching this code would look like.
             raise ProbeError(f"CoreAudio unavailable: {exc}") from exc
+
+    async def _screen_locked(self) -> bool:
+        """Whether the session is locked.
+
+        macOS *omits* `CGSSessionScreenIsLocked` when unlocked rather than
+        setting it to 0 (verified 2026-08-11), so an absent key is the answer
+        "unlocked" and not the answer "unknown". Reading it as unknown would send
+        every utterance to Telegram for the rest of the process's life, which is
+        this project's signature defect wearing a probe's clothes.
+        """
+        session = await asyncio.to_thread(self._session)
+        if session is None:
+            raise ProbeError("no window-server session dictionary")
+        return bool(session.get("CGSSessionScreenIsLocked", False))
+
+    async def _output_muted(self) -> bool:
+        """Muted, or turned all the way down.
+
+        Both are the same fact for this file's purpose - `say` exits 0 and the
+        room stays quiet either way (`daemon/proactivity/speaker.py` measured
+        that a misconfigured voice is silent with a clean exit). Treating only
+        the mute switch as mute would leave the zero-volume case recorded as a
+        line spoken aloud.
+        """
+        muted = (await self._run([OSASCRIPT, "-e", MUTED])).strip().casefold()
+        if muted == "true":
+            return True
+        if muted != "false":
+            raise ProbeError(f"osascript gave no mute state ({_excerpt(muted)})")
+        level = (await self._run([OSASCRIPT, "-e", VOLUME])).strip()
+        try:
+            return int(level) == 0
+        except ValueError:
+            raise ProbeError(f"osascript gave no volume ({_excerpt(level)})") from None
+
+    # `Reading.headphones` has no probe and stays `None` forever. There was one:
+    # `system_profiler SPAudioDataType`, reading the `Transport:` line of whichever
+    # device claims `Default Output Device: Yes`. It measured wrong on the machine
+    # this file is developed on, and not by a small margin. That machine's default
+    # output is always `MacBook Pro Speakers (eqMac)` - a virtual driver in front
+    # of the real hardware - and it answers `Transport: USB`, same as real USB
+    # headphones would. The other devices on that machine, for reference:
+    #
+    #   MacBook Pro Speakers (eqMac)  -> USB       (the default output, always)
+    #   MacBook Pro Speakers          -> Built-in
+    #   LG FULL HD                    -> HDMI
+    #   Microsoft Teams Audio         -> Virtual
+    #   eqMac Export                  -> USB
+    #
+    # So the probe read "headphones" for the laptop's own built-in speakers, every
+    # time, regardless of what was actually plugged in - not a miscalibration to
+    # tune, a signal this mechanism cannot see past the virtual device to obtain.
+    # And `headphones` is the one field that only ever *widens* what the gate
+    # allows (PLAN 6.4's asymmetry: an ignored notification costs nothing, a voice
+    # in a meeting is an accident) - so a signal this file cannot verify must stay
+    # unmeasured rather than measured wrong in the direction that costs more.
+    # `system_profiler` was also the single most expensive probe in this file
+    # (0.21-0.30 s) for a signal it could not actually deliver. Removed entirely
+    # rather than left disabled, so a later reader does not find dead code that
+    # looks load-bearing.
 
     async def _spawn(self, argv: Sequence[str]) -> str:
         """Run a probe command and return its stdout. Bounded, and never a shell.

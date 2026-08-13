@@ -64,6 +64,16 @@ class UtteranceHistory(Protocol):
         """
         ...
 
+    def recent_bad_labels(self, *, since: datetime) -> Sequence[tuple[str, datetime]]:
+        """(kind, labeled_at) for every 👎 at or after `since`, newest first.
+
+        Same shape of question as `utterances_since`, and for the same reason:
+        `labeled_at` is UTC and the brake's rules are local-day and rolling-window
+        ones, so the gate resolves which rows are "today" or "the last 24h"
+        itself rather than asking the store to guess.
+        """
+        ...
+
 
 FOCUS_APPS: tuple[str, ...] = (
     "zoom",
@@ -128,6 +138,25 @@ def within_quiet_hours(local: time, start: time, end: time) -> bool:
     return local >= start or local < end
 
 
+KIND_REST_HOURS = 6
+"""Hours one kind rests after a single 👎 against it."""
+
+KIND_REST_REPEAT_HOURS = 24
+"""Both the window and the rest length for the second rule: two 👎 against the
+same kind inside this many hours rests that kind for this many hours."""
+
+DAY_STOP_LABELS = 3
+"""👎 presses in one local day that end the day.
+
+The brake exists because the C rhythm (6-10 a day) needs one, and because the
+button is already under every utterance - the gate routes `both` or `telegram`
+and never `local_speaker` alone, so a label is always reachable. macOS Focus was
+the other candidate and it is unreadable without Full Disk Access (measured
+2026-08-11), which is a change to the machine's security settings and not this
+project's to ask for.
+"""
+
+
 def local_day_start(moment: datetime) -> datetime:
     """Local midnight of the day `moment` falls in, expressed in UTC.
 
@@ -173,6 +202,10 @@ class Gate:
         if budget is not None:
             return self._blocked(budget, reading)
 
+        brake = self._label_block(candidate, moment)
+        if brake is not None:
+            return self._blocked(brake, reading)
+
         delivery, downgrade = self._route(reading)
         why = "ok" if downgrade is None else f"ok - telegram: {downgrade}"
         return Verdict(allowed=True, why=why, reading=reading, delivery=delivery)
@@ -217,16 +250,56 @@ class Gate:
         if spoken >= total:
             return f"daily budget: {spoken} of {total} already spoken on {day}"
 
-        # PLAN 6.2: open loops are the cheap kind to generate, and on equal terms
-        # they eat the whole budget - which turns a companion into a reminder app.
-        if candidate.kind == "open_loop":
-            used = kinds.count("open_loop")
-            allowed = self.settings.proactive_open_loop_budget
+        # PLAN 6.2: per-kind ceilings, not allocations - they sum to more than the
+        # daily total on purpose. A kind with no ceiling here is bound only by the
+        # daily budget above; open_loop is the cheap kind to generate, and on equal
+        # terms it eats the whole budget, which turns a companion into a reminder app.
+        allowed = self.settings.proactive_kind_budgets.get(candidate.kind)
+        if allowed is not None:
+            used = kinds.count(candidate.kind)
             if used >= allowed:
                 return (
-                    f"open_loop budget: {used} of {allowed} already spoken on {day} "
+                    f"{candidate.kind} budget: {used} of {allowed} already spoken on {day} "
                     f"({total - spoken} of {total} left overall, for other kinds)"
                 )
+        return None
+
+    def _label_block(self, candidate: Candidate, moment: datetime) -> str | None:
+        """What the user said about this kind, recently, with a thumb.
+
+        Deterministic arithmetic on rows, like every other rule here - CONTRACTS
+        non-negotiable 7 puts no model in this file, and "the user asked for less
+        of this" is exactly the judgement a model would be worst at anyway.
+
+        The lookback passed to the store is `min(day, moment - 24h)`: whichever of
+        the two is earlier, so the fetched rows are a superset of both windows this
+        method actually needs - the local day (for the three-strikes count below)
+        and the trailing 24h (for the per-kind repeat count). `min` guarantees that
+        by construction, not by the size of either window on the day in question,
+        so it holds across a DST change too. The precise boundary for each rule is
+        then re-applied on the Python side (`at >= day`, `moment - at < ...`).
+        """
+        day = local_day_start(moment)
+        recent = self.history.recent_bad_labels(
+            since=min(day, moment - timedelta(hours=KIND_REST_REPEAT_HOURS))
+        )
+
+        today = [kind for kind, at in recent if at >= day]
+        if len(today) >= DAY_STOP_LABELS:
+            return (
+                f"stopped for the day: {len(today)} thumbs down since "
+                f"{day.astimezone().date().isoformat()}"
+            )
+
+        mine = [at for kind, at in recent if kind == candidate.kind]
+        within_repeat = [at for at in mine if moment - at < timedelta(hours=KIND_REST_REPEAT_HOURS)]
+        if len(within_repeat) >= 2:
+            return (
+                f"thumbs down: {candidate.kind} got {len(within_repeat)} in the last "
+                f"{KIND_REST_REPEAT_HOURS}h, resting"
+            )
+        if any(moment - at < timedelta(hours=KIND_REST_HOURS) for at in mine):
+            return f"thumbs down: {candidate.kind} is resting for {KIND_REST_HOURS}h"
         return None
 
     # --- routing ------------------------------------------------------------
@@ -234,11 +307,22 @@ class Gate:
     def _route(self, reading: Reading) -> tuple[Delivery, str | None]:
         """Where it would go, and why not the speaker if not the speaker.
 
+        Ordered cheapest-certainty first, and every rule here only ever *loses*
+        the speaker. PLAN 6.4's asymmetry is the whole shape of this method: an
+        ignored Telegram message costs nothing, a voice out of the laptop during
+        a meeting is an accident, so anything short of "provably safe to speak"
+        routes to text and the utterance itself survives.
+
         `both` rather than `local_speaker` when the user is here: PLAN 6.3 leaves
-        the same words in Telegram so nothing is lost when the speaker is not heard.
+        the same words in Telegram so nothing is lost when the speaker is not
+        heard - and it is what puts the label buttons on every utterance, which
+        the 👎 brake depends on.
         """
-        if not self.settings.proactive_speaker_enabled:
-            return "telegram", "DAEMON_PROACTIVE_SPEAKER_ENABLED is off"
+        if not self.settings.voice_enabled:
+            # DAEMON_PROACTIVE_SPEAKER_ENABLED used to be the switch checked here;
+            # it is gone, and DAEMON_VOICE_ENABLED now governs the speaker path
+            # too - one switch, so "voice on" cannot mean two different things.
+            return "telegram", "DAEMON_VOICE_ENABLED is off"
 
         at_keyboard = reading.at_keyboard
         if at_keyboard is None:
@@ -247,25 +331,42 @@ class Gate:
             return "telegram", f"presence unknown ({', '.join(reading.unknown) or 'no reading'})"
         if not at_keyboard:
             return "telegram", f"user away, idle {reading.idle_seconds:.0f}s"
-        if reading.audio_busy is not False:
-            # Both `True` and `None` cost the speaker and nothing else - this is
-            # the device we would grab, so anything short of "provably free" is a
-            # reason not to.
-            #
-            # `True` used to block the utterance outright, on the reading that a
-            # busy audio device means a call in progress and waiting is free.
-            # Running it disproved the premise: the probe is
-            # `kAudioDevicePropertyDeviceIsRunningSomewhere`, which is also true
-            # for a notification chime, an autoplaying video, or - observed on the
-            # development machine - a system-wide audio EQ holding the device all
-            # day. Blocking on that means someone who plays music is never
-            # messaged at all, which is the dead-bot end of the failure PLAN 6.1's
-            # gate is judged on. PLAN 6.4 already says which channel is safe: the
-            # text notification is ignorable, the voice is the accident. So this
-            # routes, exactly like the foreground app.
-            state = "in use" if reading.audio_busy else "state unknown"
-            return "telegram", f"audio device {state}"
-        if focus_app(reading.foreground_app) is not None:
+        if reading.screen_locked is not False:
+            # Sitting here with the screen locked is still away, and an unreadable
+            # lock state is not proof of presence.
+            state = "locked" if reading.screen_locked else "lock state unknown"
+            return "telegram", f"screen {state}"
+        if reading.output_muted is not False:
+            # `say` exits 0 into a muted device and the row would record a line
+            # spoken aloud that nobody heard (daemon/proactivity/speaker.py).
+            state = "muted" if reading.output_muted else "mute state unknown"
+            return "telegram", f"output {state}"
+        if reading.mic_busy is not False:
+            # Ours is already subtracted (daemon/mic_hold.py), so this is
+            # somebody else holding the microphone - which is what a call is.
+            state = "in use" if reading.mic_busy else "state unknown"
+            return "telegram", f"microphone {state}"
+        if reading.output_busy is not False:
+            # Deliberately the weak signal. It is `True` for a notification
+            # chime, an autoplaying video, and - observed on the development
+            # machine - a system-wide audio EQ holding the device all day, so
+            # blocking outright on it means someone who plays music is never
+            # messaged at all, the dead-bot end of the failure PLAN 6.1's gate is
+            # judged on. It costs the speaker and never the utterance, exactly
+            # like the foreground app below.
+            state = "in use" if reading.output_busy else "state unknown"
+            return "telegram", f"output device {state}"
+        if focus_app(reading.foreground_app) is not None and reading.headphones is not True:
+            # The only rule headphones excuse, and only on an explicit `True` -
+            # `is not True` rather than `not reading.headphones` so that `None`
+            # reads the same as `False` here, deliberately. A meeting app in
+            # front is a reason not to speak *into the room*; on headphones
+            # there is no room. But `headphones` has no probe today
+            # (presence.py measured it wrong - `Transport: USB` for this
+            # machine's own built-in speakers - and deleted it rather than ship
+            # a false excuse), so every real `Reading` has `headphones is None`,
+            # and unmeasured must not read as "on headphones". Every other block
+            # above still applies either way, including the microphone.
             return "telegram", f"{reading.foreground_app} is in the foreground"
         return "both", None
 

@@ -24,6 +24,8 @@ import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
+from daemon import mic_hold
+
 logger = logging.getLogger(__name__)
 
 INPUT_SAMPLE_RATE = 16_000
@@ -162,40 +164,58 @@ class SoundDeviceAudio:
                 logger.warning("audio: input stream reported %s", status)
             loop.call_soon_threadsafe(enqueue, bytes(indata))
 
-        stream = sd.RawInputStream(
-            samplerate=self.sample_rate,
-            channels=CHANNELS,
-            dtype=DTYPE,
-            blocksize=self._block_frames,
-            callback=on_block,
-        )
-        stream.start()
-        try:
-            while True:
-                yield await blocks.get()
-        finally:
-            # Reached on cancellation and on the consumer breaking out. An open
-            # input stream that nobody reads is a microphone light left on.
-            #
-            # Off the event loop, and not an oversight. `stream.stop()` is
-            # `Pa_StopStream` -> CoreAudio `AudioOutputUnitStop` -> a HAL mutex, and
-            # that mutex deadlocked once on the wake->voice handover - the session's
-            # macOS VoiceProcessing unit and this PortAudio stream contending the same
-            # device. Because it ran on the loop thread it took the whole daemon with
-            # it: no logs, no scheduler, no wake, only a `sample` of the process to
-            # show `__psynch_mutexwait` under `AudioOutputUnitStop`. It cannot move to
-            # `to_thread` either: this finally is reached through `aclose()` on a
-            # cancelled task, where a fresh await is cancelled before it starts (see
-            # daemon/voice/apple_audio.py, which met the same wall). So the release
-            # runs on a plain daemon thread that needs no await and cannot wedge the
-            # loop - if PortAudio hangs again, one detached thread parks instead of the
-            # process. The closure holds `stream`, so it is not collected mid-release.
-            threading.Thread(
-                target=_release_input_stream,
-                args=(stream,),
-                name="voice-mic-release",
-                daemon=True,
-            ).start()
+        # Tell the rest of the process the microphone is ours, so `presence.py`
+        # can subtract it from the CoreAudio probe. Without this the gate reads
+        # our own wake listener as somebody on a call and never routes to the
+        # local speaker again - see daemon/mic_hold.py. Entered before
+        # `RawInputStream` so a backend that fails to construct the stream never
+        # leaves the counter incremented, and released in `hold()`'s own
+        # `finally` so a stream that dies mid-read - cancelled, or the consumer
+        # breaking out - cannot leave it stuck either.
+        #
+        # It releases when the release *thread is handed the stream*, not when
+        # PortAudio has finished letting go, and that is the honest boundary:
+        # this counter answers "are we using the microphone", and by then we have
+        # stopped. The device itself lingers for about a second afterwards either
+        # way (see WAKE_REARM_SETTLE_SECONDS in daemon/app.py), which the probe
+        # reads as a brief, self-healing busy rather than as ours.
+        with mic_hold.hold():
+            stream = sd.RawInputStream(
+                samplerate=self.sample_rate,
+                channels=CHANNELS,
+                dtype=DTYPE,
+                blocksize=self._block_frames,
+                callback=on_block,
+            )
+            stream.start()
+            try:
+                while True:
+                    yield await blocks.get()
+            finally:
+                # Reached on cancellation and on the consumer breaking out. An open
+                # input stream that nobody reads is a microphone light left on.
+                #
+                # Off the event loop, and not an oversight. `stream.stop()` is
+                # `Pa_StopStream` -> CoreAudio `AudioOutputUnitStop` -> a HAL mutex,
+                # and that mutex deadlocked once on the wake->voice handover - the
+                # session's macOS VoiceProcessing unit and this PortAudio stream
+                # contending the same device. Because it ran on the loop thread it took
+                # the whole daemon with it: no logs, no scheduler, no wake, only a
+                # `sample` of the process to show `__psynch_mutexwait` under
+                # `AudioOutputUnitStop`. It cannot move to `to_thread` either: this
+                # finally is reached through `aclose()` on a cancelled task, where a
+                # fresh await is cancelled before it starts (see
+                # daemon/voice/apple_audio.py, which met the same wall). So the release
+                # runs on a plain daemon thread that needs no await and cannot wedge the
+                # loop - if PortAudio hangs again, one detached thread parks instead of
+                # the process. The closure holds `stream`, so it is not collected
+                # mid-release.
+                threading.Thread(
+                    target=_release_input_stream,
+                    args=(stream,),
+                    name="voice-mic-release",
+                    daemon=True,
+                ).start()
 
     async def play(self, chunk: bytes) -> None:
         """Queue a chunk. Returns immediately.

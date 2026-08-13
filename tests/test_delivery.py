@@ -51,7 +51,9 @@ class FakeSpeaker:
 
 
 def reading() -> Reading:
-    return Reading(at=NOW, idle_seconds=5.0, foreground_app="Warp", audio_busy=False)
+    return Reading(
+        at=NOW, idle_seconds=5.0, foreground_app="Warp", mic_busy=False, output_busy=False
+    )
 
 
 def verdict(delivery: str = "telegram") -> Verdict:

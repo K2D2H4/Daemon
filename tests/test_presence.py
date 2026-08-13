@@ -3,8 +3,9 @@
 Hard rule for this file: **no test here runs a real subprocess, and none of them
 depends on how long ago somebody touched this keyboard.** A test that reads the
 machine's actual idle time passes on the author's Mac and asserts nothing
-anywhere else, and `MachinePresence` has exactly two seams for that reason - the
-command runner and the audio call are both injectable.
+anywhere else, and `MachinePresence` has three seams for that reason - the
+command runner, the audio call, and whether we hold the microphone ourselves are
+all injectable.
 
 What is being pinned is the direction the failures resolve in. docs/PLAN.md 6.4:
 an ignored notification costs nothing, a voice out of the speaker during a
@@ -37,9 +38,11 @@ from daemon.proactivity.presence import (
     IOREG,
     IS_RUNNING_SOMEWHERE,
     LSAPPINFO,
+    MUTED,
     OSASCRIPT,
     SYSTEM_OBJECT,
     UNKNOWN_OBJECT,
+    VOLUME,
     MachinePresence,
     ProbeError,
     audio_running,
@@ -71,7 +74,10 @@ class FakeRunner:
 
     Keyed by command, and `lsappinfo`'s two calls are separate keys, because the
     chain fails in two different places and each one has to be reachable from a
-    test.
+    test. `osascript` is keyed by *script* (`argv[2]`, the text after `-e`), not
+    just by command: the foreground probe, the mute probe and the volume probe
+    are all `osascript`, and one canned answer for all three is how a mute-state
+    call would silently receive the foreground app's name instead.
     """
 
     def __init__(
@@ -81,11 +87,15 @@ class FakeRunner:
         ls_front: str | Exception = LS_FRONT,
         ls_info: str | Exception = LS_INFO,
         osascript: str | Exception = "Google Chrome\n",
+        muted: str | Exception = "false\n",
+        volume: str | Exception = "50\n",
     ) -> None:
         self.ioreg = ioreg
         self.ls_front = ls_front
         self.ls_info = ls_info
         self.osascript = osascript
+        self.muted = muted
+        self.volume = volume
         self.calls: list[list[str]] = []
 
     async def __call__(self, argv: Sequence[str]) -> str:
@@ -95,7 +105,15 @@ class FakeRunner:
         elif argv[0] == LSAPPINFO:
             reply = self.ls_front if argv[1] == "front" else self.ls_info
         elif argv[0] == OSASCRIPT:
-            reply = self.osascript
+            script = argv[2]
+            if script == MUTED:
+                reply = self.muted
+            elif script == VOLUME:
+                reply = self.volume
+            elif script == FRONTMOST:
+                reply = self.osascript
+            else:  # pragma: no cover - a new script must be added deliberately
+                raise AssertionError(f"unexpected osascript {script!r}")
         else:  # pragma: no cover - a new command must be added deliberately
             raise AssertionError(f"unexpected command {argv[0]!r}")
         if isinstance(reply, Exception):
@@ -106,14 +124,18 @@ class FakeRunner:
         return [argv for argv in self.calls if argv[0] == command]
 
 
-RUNNER_KEYS = ("ioreg", "ls_front", "ls_info", "osascript")
+RUNNER_KEYS = ("ioreg", "ls_front", "ls_info", "osascript", "muted", "volume")
 
 
 def build(**kwargs: object) -> tuple[MachinePresence, FakeRunner]:
     """A macOS presence whose hardware is entirely fake."""
     runner = FakeRunner(**{k: v for k, v in kwargs.items() if k in RUNNER_KEYS})  # type: ignore[arg-type]
     rest = {k: v for k, v in kwargs.items() if k not in RUNNER_KEYS}
-    rest.setdefault("audio", lambda: False)
+    rest.setdefault("audio", lambda selector: False)
+    # An unlocked session with no lock key, same as the real machine unlocked
+    # (verified 2026-08-11) - so a test that does not care about screen_locked
+    # does not have to fake one, and none of them touches the real Quartz call.
+    rest.setdefault("session", lambda: {})
     return (
         MachinePresence(platform="darwin", run=runner, now=PINNED, **rest),  # type: ignore[arg-type]
         runner,
@@ -131,14 +153,15 @@ def reason_for(reading: Reading, field: str) -> str:
 # --- the happy path ----------------------------------------------------------
 
 
-async def test_a_complete_reading_answers_all_three_probes() -> None:
-    reader, _ = build(audio=lambda: True)
+async def test_a_complete_reading_answers_every_probe() -> None:
+    reader, _ = build(audio=lambda selector: True)
     reading = await reader.read()
 
     assert reading.at == PINNED
     assert reading.idle_seconds == pytest.approx(6.654789416)
     assert reading.foreground_app == "Google Chrome"
-    assert reading.audio_busy is True
+    assert reading.mic_busy is True
+    assert reading.output_busy is True
     assert reading.unknown == ()
 
 
@@ -182,13 +205,19 @@ async def test_the_smallest_idle_time_wins_when_several_nodes_report_one() -> No
 async def test_lsappinfo_answers_and_osascript_is_never_asked() -> None:
     """The reason `lsappinfo` is primary: 8 ms against 233 ms, and no Automation
     grant. If this ever regresses, every reading silently costs 30x more and
-    acquires a permission dependency nobody asked for."""
+    acquires a permission dependency nobody asked for.
+
+    `osascript` is not asserted absent outright: the mute and headphone probes
+    are unconditional `osascript`/`system_profiler` users with nothing to do with
+    the foreground-app fallback this test pins. What must never happen is that
+    fallback - the `FRONTMOST` script - running while `lsappinfo` still answers.
+    """
     reader, runner = build()
 
     reading = await reader.read()
 
     assert reading.foreground_app == "Google Chrome"
-    assert runner.ran(OSASCRIPT) == []
+    assert all(argv[2] != FRONTMOST for argv in runner.ran(OSASCRIPT))
     assert [argv[1] for argv in runner.ran(LSAPPINFO)] == ["front", "info"]
 
 
@@ -332,7 +361,8 @@ async def test_an_ioreg_dump_without_hid_idle_time_is_unknown_not_zero() -> None
     assert "HIDIdleTime" in reason_for(reading, "idle_seconds")
     # The other two still answered - one dead probe is not a dead reading.
     assert reading.foreground_app == "Google Chrome"
-    assert reading.audio_busy is False
+    assert reading.mic_busy is False
+    assert reading.output_busy is False
 
 
 async def test_an_audio_probe_that_fails_is_unknown_not_idle() -> None:
@@ -340,15 +370,15 @@ async def test_an_audio_probe_that_fails_is_unknown_not_idle() -> None:
     "nothing is using the audio device" is the reading that clears a voice to come
     out of the speaker, and a probe that failed has not established it."""
 
-    def broken() -> bool:
+    def broken(selector: int) -> bool:
         raise ProbeError("CoreAudio returned OSStatus 1852797029")
 
     reader, _ = build(audio=broken)
     reading = await reader.read()
 
-    assert reading.audio_busy is None
-    assert "OSStatus" in reason_for(reading, "audio_busy")
-    assert reading.as_snapshot()["audio_busy"] is None
+    assert reading.mic_busy is None
+    assert "OSStatus" in reason_for(reading, "mic_busy")
+    assert reading.as_snapshot()["mic_busy"] is None
 
 
 async def test_every_probe_failing_still_produces_a_reading() -> None:
@@ -356,14 +386,15 @@ async def test_every_probe_failing_still_produces_a_reading() -> None:
         ioreg=ProbeError("ioreg timed out"),
         ls_front=ProbeError("lsappinfo timed out"),
         osascript=ProbeError("osascript timed out"),
-        audio=lambda: (_ for _ in ()).throw(ProbeError("no default audio device")),
+        audio=lambda selector: (_ for _ in ()).throw(ProbeError("no default audio device")),
     )
 
     reading = await reader.read()
 
-    assert (reading.idle_seconds, reading.foreground_app, reading.audio_busy) == (None, None, None)
+    fields = (reading.idle_seconds, reading.foreground_app, reading.mic_busy, reading.output_busy)
+    assert fields == (None, None, None, None)
     assert reading.at == PINNED
-    assert len(reading.unknown) == 3  # one entry per field, not per command
+    assert len(reading.unknown) == 4  # one entry per field, not per command
 
 
 async def test_read_never_raises_on_an_unanticipated_failure() -> None:
@@ -371,7 +402,7 @@ async def test_read_never_raises_on_an_unanticipated_failure() -> None:
     forever while presence never answers again (daemon/CLAUDE.md). So an exception
     nobody predicted has to come back as a reason, not as a traceback."""
 
-    def catastrophe() -> bool:
+    def catastrophe(selector: int) -> bool:
         raise MemoryError("ctypes went sideways")
 
     reader, _ = build(ioreg=ValueError("something nobody planned for"), audio=catastrophe)
@@ -379,9 +410,9 @@ async def test_read_never_raises_on_an_unanticipated_failure() -> None:
     reading = await reader.read()
 
     assert reading.idle_seconds is None
-    assert reading.audio_busy is None
+    assert reading.mic_busy is None
     assert "unexpected ValueError" in reason_for(reading, "idle_seconds")
-    assert "unexpected MemoryError" in reason_for(reading, "audio_busy")
+    assert "unexpected MemoryError" in reason_for(reading, "mic_busy")
 
 
 async def test_an_unexpected_failure_in_the_foreground_chain_is_still_a_reason() -> None:
@@ -404,14 +435,15 @@ async def test_a_non_macos_platform_answers_unknown_without_probing(platform: st
     named - and nothing spawned, because these commands do not exist there."""
     runner = FakeRunner()
 
-    def must_not_run() -> bool:
+    def must_not_run(selector: int) -> bool:
         raise AssertionError("the audio probe ran on a platform that has no CoreAudio")
 
     reading = await MachinePresence(
         platform=platform, run=runner, audio=must_not_run, now=PINNED
     ).read()
 
-    assert (reading.idle_seconds, reading.foreground_app, reading.audio_busy) == (None, None, None)
+    fields = (reading.idle_seconds, reading.foreground_app, reading.mic_busy, reading.output_busy)
+    assert fields == (None, None, None, None)
     assert reading.at_keyboard is None
     assert reading.unknown == (f"platform {platform!r}: no presence probes implemented",)
     assert runner.calls == []
@@ -497,7 +529,7 @@ async def test_a_hung_command_is_killed_reaped_and_reported(spawned: dict[str, o
     is one wedged tick every five minutes, forever."""
     process = FakeProcess(hang=True)
     spawned["process"] = process
-    reader = MachinePresence(platform="darwin", timeout=0.05, audio=lambda: False)
+    reader = MachinePresence(platform="darwin", timeout=0.05, audio=lambda selector: False)
 
     with pytest.raises(ProbeError, match="did not answer in 0.05s"):
         await reader._spawn([OSASCRIPT, "-e", "anything"])
@@ -511,7 +543,9 @@ async def test_a_timed_out_probe_becomes_an_unknown_rather_than_an_exception(
     spawned: dict[str, object],
 ) -> None:
     spawned["process"] = FakeProcess(hang=True)
-    reader = MachinePresence(platform="darwin", timeout=0.05, audio=lambda: False, now=PINNED)
+    reader = MachinePresence(
+        platform="darwin", timeout=0.05, audio=lambda selector: False, now=PINNED
+    )
 
     reading = await reader.read()
 
@@ -526,7 +560,7 @@ async def test_a_missing_binary_is_a_reason_not_a_traceback(
         raise FileNotFoundError(2, "No such file or directory")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", missing)
-    reader = MachinePresence(platform="darwin", audio=lambda: False, now=PINNED)
+    reader = MachinePresence(platform="darwin", audio=lambda selector: False, now=PINNED)
 
     reading = await reader.read()
 
@@ -541,7 +575,7 @@ async def test_a_nonzero_exit_carries_what_the_command_said(spawned: dict[str, o
     spawned["process"] = FakeProcess(
         returncode=1, stderr=b"execution error: Not authorized to send Apple events. (-1743)"
     )
-    reader = MachinePresence(platform="darwin", audio=lambda: False, now=PINNED)
+    reader = MachinePresence(platform="darwin", audio=lambda selector: False, now=PINNED)
 
     reading = await reader.read()
 
@@ -552,7 +586,7 @@ async def test_a_nonzero_exit_carries_what_the_command_said(spawned: dict[str, o
 
 async def test_a_silent_failure_still_says_something(spawned: dict[str, object]) -> None:
     spawned["process"] = FakeProcess(returncode=127)
-    reader = MachinePresence(platform="darwin", audio=lambda: False)
+    reader = MachinePresence(platform="darwin", audio=lambda selector: False)
     with pytest.raises(ProbeError, match="exited 127: no output"):
         await reader._spawn([IOREG])
 
@@ -564,7 +598,7 @@ async def test_every_command_is_a_list_with_no_shell_and_no_stdin(
     string", and a closed stdin is why a command that decides to read one cannot
     block the tick."""
     spawned["process"] = FakeProcess(stdout=IOREG_DUMP.encode())
-    reader = MachinePresence(platform="darwin", audio=lambda: False, now=PINNED)
+    reader = MachinePresence(platform="darwin", audio=lambda selector: False, now=PINNED)
 
     await reader.read()
 
@@ -587,7 +621,7 @@ async def test_undecodable_output_is_parsed_rather_than_raising(
     firmware says it is. A byte sequence that is not UTF-8 must not cost the tick
     a reading it otherwise had."""
     spawned["process"] = FakeProcess(stdout=b'  \xff\xfe "HIDIdleTime" = 1500000000\n')
-    reader = MachinePresence(platform="darwin", audio=lambda: False, now=PINNED)
+    reader = MachinePresence(platform="darwin", audio=lambda selector: False, now=PINNED)
 
     reading = await reader.read()
 
@@ -598,60 +632,49 @@ async def test_undecodable_output_is_parsed_rather_than_raising(
 
 
 @pytest.mark.parametrize(
-    ("output_running", "input_running", "expected"),
+    ("selector", "device_id", "running", "expected"),
     [
-        (0, 0, False),
-        (1, 0, True),  # music, or our own LocalSpeaker
-        (0, 1, True),  # the microphone is held - a call, which is what PLAN 6.4 is about
-        (1, 1, True),
+        (DEFAULT_OUTPUT, 84, 0, False),
+        (DEFAULT_OUTPUT, 84, 1, True),  # music, or our own LocalSpeaker
+        (DEFAULT_INPUT, 100, 0, False),
+        (DEFAULT_INPUT, 100, 1, True),  # the microphone is held - a call
     ],
 )
-def test_audio_busy_is_either_device_running(
-    monkeypatch: pytest.MonkeyPatch, output_running: int, input_running: int, expected: bool
+def test_audio_running_reads_one_device_by_selector(
+    monkeypatch: pytest.MonkeyPatch, selector: int, device_id: int, running: int, expected: bool
 ) -> None:
-    """Both directions, because a meeting shows up on the input device and the
-    output device only tells you the user is listening to something."""
-    devices = {DEFAULT_OUTPUT: 84, DEFAULT_INPUT: 100}
-    running = {84: output_running, 100: input_running}
+    """One device per call, not the OR of both - the merge is what let the wake
+    listener's own hold on the input device present as the audio hardware being
+    busy generally, which is the bug this split exists to fix."""
 
-    def fake_property(obj: int, selector: int) -> int:
+    def fake_property(obj: int, prop_selector: int) -> int:
         if obj == SYSTEM_OBJECT:
-            return devices[selector]
-        assert selector == IS_RUNNING_SOMEWHERE
-        return running[obj]
+            return device_id
+        assert prop_selector == IS_RUNNING_SOMEWHERE
+        return running
 
     monkeypatch.setattr(presence_module, "_uint32_property", fake_property)
-    assert audio_running() is expected
+    assert audio_running(selector) is expected
 
 
-def test_a_machine_with_no_microphone_is_measured_from_the_output_alone(
+def test_a_missing_default_device_is_a_probe_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_property(obj: int, selector: int) -> int:
-        if obj == SYSTEM_OBJECT:
-            return UNKNOWN_OBJECT if selector == DEFAULT_INPUT else 84
-        return 1
-
-    monkeypatch.setattr(presence_module, "_uint32_property", fake_property)
-    assert audio_running() is True
-
-
-def test_no_audio_device_at_all_is_a_failure_rather_than_quiet(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Nothing was measured, so "not busy" would be invented rather than read."""
+    """A machine with no microphone has no default input device. Nothing was
+    measured, so "not busy" would be invented rather than read - and each
+    selector now answers for itself instead of falling back to the other."""
     monkeypatch.setattr(
         presence_module, "_uint32_property", lambda obj, selector: UNKNOWN_OBJECT
     )
-    with pytest.raises(ProbeError, match="no default audio device"):
-        audio_running()
+    with pytest.raises(ProbeError, match="no such default audio device"):
+        audio_running(DEFAULT_INPUT)
 
 
 async def test_a_stalled_coreaudio_call_does_not_stall_the_reading() -> None:
     """It is 0.1 ms warm, so this branch is `coreaudiod` wedged. Bounded anyway,
     because the tick has to finish either way."""
 
-    def wedged() -> bool:
+    def wedged(selector: int) -> bool:
         time.sleep(0.5)
         return True
 
@@ -663,8 +686,8 @@ async def test_a_stalled_coreaudio_call_does_not_stall_the_reading() -> None:
     reading = await reader.read()
     elapsed = time.perf_counter() - started
 
-    assert reading.audio_busy is None
-    assert "did not answer" in reason_for(reading, "audio_busy")
+    assert reading.mic_busy is None
+    assert "did not answer" in reason_for(reading, "mic_busy")
     assert elapsed < 0.4, "the audio probe blocked the reading past its own timeout"
     # The rest of the reading survived it.
     assert reading.idle_seconds == pytest.approx(6.654789416)
@@ -683,3 +706,159 @@ async def test_the_snapshot_carries_the_reasons_a_bad_call_would_need() -> None:
     assert snapshot["idle_seconds"] == pytest.approx(6.654789416)
     assert snapshot["foreground_app"] is None
     assert snapshot["unknown"] == ["foreground_app: timed out; timed out"]
+
+
+# --- Reading: the merged audio signal split in two --------------------------
+
+
+def test_reading_separates_microphone_from_output() -> None:
+    """The merged `audio_busy` is what made enabling voice disable the speaker:
+    the wake listener holds the input device, and the gate could not tell that
+    apart from a call. See the spec, section 1.1 cause 3."""
+    reading = Reading(at=PINNED, mic_busy=False, output_busy=True)
+    assert reading.mic_busy is False
+    assert reading.output_busy is True
+
+
+def test_reading_snapshot_carries_every_new_field() -> None:
+    """gate_snapshot is how a bad call is diagnosed months later. A field the
+    gate reads but the snapshot drops is a decision nobody can reconstruct."""
+    reading = Reading(
+        at=PINNED,
+        idle_seconds=1.0,
+        foreground_app="Warp",
+        mic_busy=False,
+        output_busy=False,
+        output_muted=True,
+        screen_locked=False,
+        headphones=True,
+    )
+    snapshot = reading.as_snapshot()
+    for key in (
+        "idle_seconds", "foreground_app", "mic_busy", "output_busy",
+        "output_muted", "screen_locked", "headphones", "unknown",
+    ):
+        assert key in snapshot, f"{key} is missing from the gate snapshot"
+    assert "audio_busy" not in snapshot, "the merged field must be gone, not kept"
+
+
+# --- the microphone and the output device, read apart ------------------------
+
+
+def audio_probe(*, mic: bool, out: bool):
+    """A stand-in for the CoreAudio probe, answering per device selector."""
+
+    def probe(selector: int) -> bool:
+        return mic if selector == DEFAULT_INPUT else out
+
+    return probe
+
+
+async def test_our_own_microphone_hold_is_not_a_call() -> None:
+    """The whole point. With the wake listener running, the raw probe says the
+    input device is busy; the gate must not read that as somebody on a call."""
+    reader, _ = build(audio=audio_probe(mic=True, out=False), mic_held=lambda: True)
+    reading = await reader.read()
+    assert reading.mic_busy is False
+
+
+async def test_somebody_elses_microphone_hold_is_a_call() -> None:
+    reader, _ = build(audio=audio_probe(mic=True, out=False), mic_held=lambda: False)
+    reading = await reader.read()
+    assert reading.mic_busy is True
+
+
+async def test_output_is_read_independently_of_the_microphone() -> None:
+    reader, _ = build(audio=audio_probe(mic=False, out=True), mic_held=lambda: False)
+    reading = await reader.read()
+    assert reading.mic_busy is False
+    assert reading.output_busy is True
+
+
+async def test_we_do_not_probe_a_device_we_already_hold() -> None:
+    """Not an optimisation. If we hold it the device is busy by definition, so
+    the probe can only return the answer we must not act on."""
+
+    def must_not_run(selector: int) -> bool:
+        raise AssertionError("the microphone probe ran while we held the device")
+
+    reader, _ = build(audio=must_not_run, mic_held=lambda: True)
+    reading = await reader.read()
+    assert reading.mic_busy is False
+
+
+# --- mute and screen lock -----------------------------------------------------
+
+
+async def test_muted_output_is_read_as_muted() -> None:
+    reader, _ = build(muted="true\n")
+    reading = await reader.read()
+    assert reading.output_muted is True
+
+
+async def test_zero_volume_counts_as_muted() -> None:
+    """Nobody hears 0% either, and `say` still exits 0. The two states differ in
+    the Settings pane and not in the room."""
+    reader, _ = build(muted="false\n", volume="0\n")
+    reading = await reader.read()
+    assert reading.output_muted is True
+
+
+async def test_an_audible_machine_is_not_muted() -> None:
+    reader, _ = build(muted="false\n", volume="50\n")
+    reading = await reader.read()
+    assert reading.output_muted is False
+
+
+async def test_an_unreadable_mute_state_is_unknown_not_audible() -> None:
+    """`None` and not `False`: False is what lets a line be spoken aloud, and an
+    osascript that answered nonsense is not evidence anybody would hear it."""
+    reader, _ = build(muted="Google Chrome\n")
+    reading = await reader.read()
+    assert reading.output_muted is None
+    assert reason_for(reading, "output_muted") != ""
+
+
+async def test_an_unreadable_volume_when_not_muted_is_unknown_not_audible() -> None:
+    """The second half of the same rule. Muted answers `false` honestly, but the
+    volume call that decides the zero-volume case can *also* fail to parse - and
+    that failure must land as `None`, not fall back to "well, at least not
+    muted"."""
+    reader, _ = build(muted="false\n", volume="Google Chrome\n")
+    reading = await reader.read()
+    assert reading.output_muted is None
+    assert reason_for(reading, "output_muted") != ""
+
+
+async def test_a_locked_screen_is_recorded() -> None:
+    reader, _ = build(session=lambda: {"CGSSessionScreenIsLocked": 1})
+    reading = await reader.read()
+    assert reading.screen_locked is True
+
+
+async def test_an_absent_lock_key_means_unlocked_not_unknown() -> None:
+    """macOS omits the key entirely when unlocked - it does not set it to 0
+    (verified 2026-08-11). A probe that read the absence as "could not answer"
+    would route every utterance to Telegram for the life of the process."""
+    reader, _ = build(session=lambda: {"kCGSSessionOnConsoleKey": True})
+    reading = await reader.read()
+    assert reading.screen_locked is False
+
+
+async def test_no_quartz_is_unknown_rather_than_unlocked() -> None:
+    reader, _ = build(session=lambda: None)
+    reading = await reader.read()
+    assert reading.screen_locked is None
+
+
+async def test_headphones_has_no_probe_and_stays_unknown() -> None:
+    """There was a probe (`system_profiler`, reading the default output's
+    `Transport:`); it is gone. On the machine this file is developed on, the
+    default output is always the virtual `MacBook Pro Speakers (eqMac)`, which
+    answers `Transport: USB` - indistinguishable from real USB headphones - for
+    the laptop's own built-in speakers. `headphones` only ever *widens* what the
+    gate allows, so a signal this mechanism cannot verify stays unmeasured."""
+    reader, _ = build()
+    reading = await reader.read()
+    assert reading.headphones is None
+    assert reason_for(reading, "headphones") == ""  # not a failed probe - no probe

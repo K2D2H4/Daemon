@@ -40,14 +40,29 @@ class RecalledItem:
     reason: str
     """Why it surfaced - 'keyword', 'vector', 'both'. Goes in the golden-set
     report so a recall failure can be attributed instead of guessed at."""
-    origin: str = "owner"
+    origin: str = "untrusted"
     """Provenance, carried through from the column that keeps it unforgeable.
 
     Recall replays arbitrary old text, so an item that arrived from elsewhere - a
     forwarded message, an inline-bot result - must not be rendered as something
     the owner said: that is the distinction `messages.origin` exists to protect,
-    and rendering it as a plain `user:` line undid it one layer up. Defaults to
-    "owner" so existing constructors keep working."""
+    and rendering it as a plain `user:` line undid it one layer up.
+
+    Defaults closed, not open. It used to default to "owner" - convenient for
+    every constructor that always meant to set it, wrong for the one that forgot:
+    `daemon/proactivity/candidates.py`'s type E trusts this field to decide
+    whether a memory's own words may reach a model prompt at all, so a caller
+    that omits the argument should get the value that gets dropped, not the one
+    that gets through. `recall.py`'s two real constructors always pass it
+    explicitly; only test helpers ever relied on the old default, and they now
+    pass "owner" explicitly too."""
+    message_id: int | None = None
+    """`messages.id`, for a caller that needs a stable identity for this item -
+    `daemon/proactivity/candidates.py`'s type E dedups on it. `None` for the
+    curated tier (`_curated_item` in recall.py): those rows are `memory_entries`,
+    a different id space from `messages`, and stamping a `memory_entries` id in
+    here would let two unrelated memories collide on the same dedup key. Defaults
+    to `None` so existing constructors keep working."""
 
 
 @runtime_checkable

@@ -731,6 +731,35 @@ def test_a_broken_config_stops_a_command_that_needs_it(
     assert "unknown DAEMON_PRESET" in capsys.readouterr().err
 
 
+# --- daemon proactive: the presence lines ------------------------------------
+# `_render_presence` is a pure function precisely so this does not need
+# `build_proactive_tick`'s real `MachinePresence` (tests/CLAUDE.md: no test may
+# touch real hardware). Finding 3, whole-branch review: `output_muted` and
+# `screen_locked` decide `Gate._route` and this command used to print neither.
+
+
+def _reading(**kw: Any) -> Any:
+    from daemon.proactivity.base import Reading
+
+    return Reading(at=datetime(2026, 8, 4, 12, 0, tzinfo=UTC), **kw)
+
+
+def test_render_presence_reports_mute_and_lock_state() -> None:
+    lines = cli._render_presence(
+        _reading(mic_busy=False, output_busy=False, output_muted=True, screen_locked=False)
+    )
+    joined = "\n".join(lines)
+    assert "output muted" in joined
+    assert "screen unlocked" in joined
+
+
+def test_render_presence_reports_unknown_mute_and_lock_state() -> None:
+    lines = cli._render_presence(_reading())
+    joined = "\n".join(lines)
+    assert "output unknown" in joined
+    assert "screen unknown" in joined
+
+
 # --- doctor ------------------------------------------------------------------
 
 

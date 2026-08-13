@@ -248,3 +248,41 @@ def test_an_utterance_can_point_back_at_its_candidate(store: Store) -> None:
     row = store.utterances_since(since=NOW - timedelta(minutes=1))[0]
     assert row["candidate_id"] == cid
     assert row["route"] == "both"
+
+
+# --- the 👎 brake's reads -----------------------------------------------------
+
+
+def test_recent_bad_labels_reads_kind_and_when(store: Store) -> None:
+    utterance(store, "u1", kind="association")
+    store.label_utterance("u1", "bad", now=NOW)
+
+    assert store.recent_bad_labels(since=NOW - timedelta(minutes=1)) == [("association", NOW)]
+
+
+def test_recent_bad_labels_excludes_good_and_unlabeled(store: Store) -> None:
+    utterance(store, "u1", kind="association")
+    utterance(store, "u2", kind="emotional")
+    store.label_utterance("u1", "good", now=NOW)
+
+    assert store.recent_bad_labels(since=NOW - timedelta(minutes=1)) == []
+
+
+def test_recent_bad_labels_are_newest_first(store: Store) -> None:
+    utterance(store, "u1", kind="association", at=NOW - timedelta(hours=2))
+    utterance(store, "u2", kind="association", at=NOW - timedelta(hours=1))
+    store.label_utterance("u1", "bad", now=NOW - timedelta(hours=2))
+    store.label_utterance("u2", "bad", now=NOW - timedelta(hours=1))
+
+    rows = store.recent_bad_labels(since=NOW - timedelta(hours=3))
+    assert [at for _, at in rows] == [NOW - timedelta(hours=1), NOW - timedelta(hours=2)]
+
+
+def test_recent_bad_labels_respects_the_since_boundary(store: Store) -> None:
+    """The gate passes its own lookback rather than asking the store to guess
+    one - see `recent_bad_labels`'s docstring. A row just outside it must not
+    come back."""
+    utterance(store, "old", at=NOW - timedelta(hours=30))
+    store.label_utterance("old", "bad", now=NOW - timedelta(hours=30))
+
+    assert store.recent_bad_labels(since=NOW - timedelta(hours=24)) == []

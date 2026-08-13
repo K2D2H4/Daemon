@@ -71,6 +71,7 @@ from typing import Any
 
 import numpy as np
 
+from daemon import mic_hold
 from daemon.voice.audio import (
     CHANNELS,
     INPUT_SAMPLE_RATE,
@@ -302,28 +303,39 @@ class VoiceProcessingAudio:
             if pcm:
                 loop.call_soon_threadsafe(enqueue, pcm)
 
-        # Both tap calls block inside CoreAudio - `installTap` waits on the engine
-        # starting, `removeTap` on the render threads draining - so neither may run
-        # on the event loop. See `close` for what that cost when it wedged.
-        try:
-            # Inside the `try`, so a cancellation landing mid-install still reaches
-            # the `finally` that removes the tap. Outside it, the thread finished
-            # installing while the generator never entered its own cleanup, and the
-            # microphone stayed live (proved by tests/test_apple_audio.py).
-            await asyncio.to_thread(self._install_tap_blocking, on_buffer)
-            while True:
-                yield await blocks.get()
-        finally:
-            # Reached on cancellation and on the consumer breaking out. A tap
-            # nobody reads is a microphone light left on.
-            # Synchronous, unlike every other call here, and not an oversight: this
-            # runs in an async generator's `finally`, which is reached through
-            # `aclose()` on a cancelled task - and a fresh `await` there is
-            # cancelled before it can start, so the tap would leak (proved by
-            # tests/test_apple_audio.py). Removing a tap is also not where the
-            # measured deadlock was; that was `AudioOutputUnitStop` in `close`,
-            # which is on a thread now.
-            self._remove_tap_blocking()
+        # The second of the two holders `daemon/mic_hold.py`'s counter exists for -
+        # `SoundDeviceAudio.record()` in daemon/voice/audio.py is the first. It
+        # wraps the install rather than starting after it for the same reason the
+        # other one wraps stream construction: the engine can fail to start or the
+        # tap can fail to install, and a hold taken after that point would never be
+        # entered, never be released, and never be wrong in a way a green suite
+        # could see. Outermost, so every path out of the generator releases it -
+        # including the cancellation path the `finally` below exists for.
+        with mic_hold.hold():
+            # Both tap calls block inside CoreAudio - `installTap` waits on the
+            # engine starting, `removeTap` on the render threads draining - so
+            # neither may run on the event loop. See `close` for what that cost
+            # when it wedged.
+            try:
+                # Inside the `try`, so a cancellation landing mid-install still
+                # reaches the `finally` that removes the tap. Outside it, the
+                # thread finished installing while the generator never entered its
+                # own cleanup, and the microphone stayed live (proved by
+                # tests/test_apple_audio.py).
+                await asyncio.to_thread(self._install_tap_blocking, on_buffer)
+                while True:
+                    yield await blocks.get()
+            finally:
+                # Reached on cancellation and on the consumer breaking out. A tap
+                # nobody reads is a microphone light left on.
+                # Synchronous, unlike every other call here, and not an oversight:
+                # this runs in an async generator's `finally`, which is reached
+                # through `aclose()` on a cancelled task - and a fresh `await`
+                # there is cancelled before it can start, so the tap would leak
+                # (proved by tests/test_apple_audio.py). Removing a tap is also not
+                # where the measured deadlock was; that was `AudioOutputUnitStop`
+                # in `close`, which is on a thread now.
+                self._remove_tap_blocking()
 
     def _install_tap_blocking(self, on_buffer: Any) -> None:
         with self._guard:

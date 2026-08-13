@@ -752,6 +752,15 @@ async def build_proactive_tick(
     store = Store.open(settings.data_dir / DB_FILENAME)
     closers: list[Callable[[], Awaitable[None]]] = []
 
+    # Built regardless of `speak`: `daemon proactive` (no speaking, structurally)
+    # is how a human sees whether type E produces anything worth saying before it
+    # is ever allowed to say it.
+    recall, _status, embedder = _build_recall(settings, store)
+    if embedder is not None:
+        closer = getattr(embedder, "aclose", None)
+        if closer is not None:
+            closers.append(closer)
+
     judge = None
     delivery = None
     if speak:
@@ -774,7 +783,7 @@ async def build_proactive_tick(
             logger.error("proactive: no channel, so nothing can be delivered there: %s", exc)
 
         speaker = None
-        if settings.proactive_speaker_enabled:
+        if settings.voice_enabled:
             from daemon.proactivity.speaker import LocalSpeaker
 
             speaker = LocalSpeaker()
@@ -801,7 +810,7 @@ async def build_proactive_tick(
 
     return (
         ProactiveTick(
-            store, settings, MachinePresence(), judge=judge, delivery=delivery
+            store, settings, MachinePresence(), judge=judge, delivery=delivery, recall=recall
         ),
         close,
     )
@@ -1114,6 +1123,16 @@ async def run_voice(
     if not settings.voice_enabled:
         logger.error("voice is off; set DAEMON_VOICE_ENABLED=true (see `daemon setup`)")
         return PROBLEM
+    # `Settings._check` has already applied `voice_session_problems()` at load
+    # time, so there is deliberately no second application here. It briefly lived
+    # in this function, while `voice_enabled` meant both "a hosted session may
+    # run" and "a proactive line may leave the local speaker" and the `offline`
+    # preset could satisfy only the second - checking at load then stopped
+    # `Settings` from loading at all, which stops the daemon. ADR 0012 removed
+    # that premise by making voice its own axis, which put the checks back where
+    # they belong, and a repeat here would only be a branch no configuration can
+    # reach.
+    #
     # route_for raises with the specific reason - voice disabled, no live model
     # id - which is more use than anything this function could say about it.
     route = settings.route_for(Task.CHAT_VOICE)
@@ -1201,9 +1220,10 @@ async def run_voice(
         )
         # Seed and learned rules both, same as the text path, and through the same
         # `Companion.persona` -> `load_persona`: a conversation surface is a
-        # conversation surface, and M4's learned half reaches every one of them
-        # except the proactive judge, which stays seed-only on purpose
-        # (daemon/proactivity/judge.py).
+        # conversation surface. The proactive judge reaches the same two files too,
+        # just not through this path - it builds its own persona block directly
+        # (daemon/proactivity/judge.py, `Judge._persona`), because a background
+        # tick has no `Companion` to ask.
         seed = await companion.persona()
         # Owner, always: a microphone has no relay path, so a spoken turn is the
         # owner's own words (daemon/voice/conversation.py `_record`), and the origin

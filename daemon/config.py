@@ -90,6 +90,12 @@ OPENAI_REALTIME_VOICES = frozenset({
 """OpenAI Realtime voices. `marin`/`cedar` are gpt-realtime-only; a voice the chosen
 model rejects comes back as a session error, the same class as Gemini's 1007."""
 
+PROACTIVE_KINDS = ("open_loop", "emotional", "silence", "pattern_time", "association")
+"""The five candidate kinds - `daemon/proactivity/base.py`'s `CandidateKind`,
+repeated here for the same reason `GEMINI_LIVE_VOICES` below is: this module is
+foundation and `daemon/proactivity/` sits above it, so importing would invert the
+layering. Validates the keys of `DAEMON_PROACTIVE_KIND_BUDGETS`."""
+
 SENSITIVITIES = ("low", "high")
 """What the two speech-sensitivity settings accept, plus empty for "the server
 decides".
@@ -323,7 +329,17 @@ class Settings(BaseSettings):
 
     voice_enabled: bool = Field(default=False, alias="DAEMON_VOICE_ENABLED")
     """docs/PLAN.md 6.5: voice is the user's choice and text mode is a complete
-    product, so voice keys are only required once this is on."""
+    product, so voice keys are only required once this is on.
+
+    Also the only switch for whether a proactive utterance may leave the laptop
+    speaker - `DAEMON_PROACTIVE_SPEAKER_ENABLED` used to be a second one. It was
+    split off in the first place because the two failure costs are not
+    comparable (PLAN 6.4): an ignored Telegram message costs nothing, a voice in
+    a meeting is an accident. But `Gate._route` already carries that asymmetry
+    on its own - seven rules that downgrade to Telegram rather than block - so a
+    second top-level switch only bought "voice on" meaning two different things
+    depending which file you read. One switch; the gate still refuses to speak
+    into a meeting."""
 
     ollama_base_url: str = Field(default="http://127.0.0.1:11434", alias="DAEMON_OLLAMA_BASE_URL")
     ollama_model: str = Field(default="qwen3:14b", alias="DAEMON_OLLAMA_MODEL")
@@ -495,38 +511,51 @@ class Settings(BaseSettings):
     """Off until the user turns it on. Something that decides on its own to speak
     is not a default anyone should be opted into."""
 
-    proactive_daily_budget: int = Field(default=3, alias="DAEMON_PROACTIVE_DAILY_BUDGET")
-    """Utterances per local day, all kinds. Three, from PLAN 6.2."""
+    proactive_daily_budget: int = Field(default=8, alias="DAEMON_PROACTIVE_DAILY_BUDGET")
+    """Utterances per local day, all kinds. Eight, from PLAN 6.2."""
 
-    proactive_open_loop_budget: int = Field(
-        default=1, alias="DAEMON_PROACTIVE_OPEN_LOOP_BUDGET"
+    proactive_kind_budgets: Annotated[dict[str, int], NoDecode] = Field(
+        default_factory=lambda: {
+            "association": 3,
+            "emotional": 2,
+            "open_loop": 2,
+            "silence": 1,
+            "pattern_time": 1,
+        },
+        alias="DAEMON_PROACTIVE_KIND_BUDGETS",
     )
-    """Of the daily budget, at most this many may be `open_loop`.
+    """Per-kind ceilings for one local day. Replaces the single open_loop cap.
 
-    A separate cap because open loops are the easy kind to generate: left to
-    compete on equal terms they eat the whole budget and the result is a competent
-    reminder app. PLAN 6.2 says the point of the product lives in the kinds that
-    have no errand attached."""
+    They sum to 9 against a daily budget of 8 on purpose: these are ceilings, not
+    allocations, and the total is what binds. The shape is PLAN 6.2's - the cheap
+    kind to generate (open_loop) eats the budget on equal terms and turns a
+    companion into a reminder app, and the Her feeling comes from the kinds with
+    no business to transact. So the two businessless kinds get the most room.
 
-    proactive_cooldown_minutes: int = Field(default=90, alias="DAEMON_PROACTIVE_COOLDOWN_MINUTES")
+    As JSON, like DAEMON_ROUTE_OVERRIDES:
+    `DAEMON_PROACTIVE_KIND_BUDGETS={"open_loop": 1, "silence": 1}`. **Replaces the
+    whole table, it does not merge with the default above** - setting one kind
+    without repeating the rest removes every other kind's ceiling, leaving them
+    bound only by the daily total. `_check` validates keys against
+    `PROACTIVE_KINDS` and values as non-negative integers, because the setting
+    this one replaced had a validator and this one shipped without one:
+    `{"open_loop": 99, "nonsense": -5}` used to load clean, and a typo silently
+    wiping the ceilings is exactly the reminder-app failure PLAN 6.2 wrote this
+    table to prevent."""
+
+    proactive_cooldown_minutes: int = Field(default=30, alias="DAEMON_PROACTIVE_COOLDOWN_MINUTES")
     """Minimum gap between two proactive utterances, whatever their kind."""
 
     proactive_quiet_hours: str = Field(default="23:00-09:00", alias="DAEMON_PROACTIVE_QUIET_HOURS")
     """Local `HH:MM-HH:MM` when it never speaks. Wraps midnight when start > end."""
 
-    proactive_silence_hours: float = Field(default=20.0, alias="DAEMON_PROACTIVE_SILENCE_HOURS")
+    proactive_silence_hours: float = Field(default=12.0, alias="DAEMON_PROACTIVE_SILENCE_HOURS")
     """Hours without conversation before the `silence` kind becomes a candidate."""
 
-    proactive_speaker_enabled: bool = Field(
-        default=False, alias="DAEMON_PROACTIVE_SPEAKER_ENABLED"
-    )
-    """Whether it may talk out of the machine's speaker when the user is present.
-
-    Off by default and gated separately from `proactive_enabled`, because the two
-    failure costs are not comparable: an ignored Telegram message costs nothing and
-    a voice in a meeting is an accident (PLAN 6.4). Telegram-only proactivity is a
-    complete product; this is the addition that needs the gate to be trustworthy
-    first."""
+    # `DAEMON_PROACTIVE_SPEAKER_ENABLED` used to live here as a second switch.
+    # Removed: `voice_enabled` above now governs the speaker path too, and
+    # `model_config`'s `extra="ignore"` means an old .env that still sets it
+    # loads fine - the key is just inert, not honoured and not an error.
 
     # --- persona evolution (M4, docs/PLAN.md 5.5) -------------------------
     # No on/off switch, deliberately: the failure cost is the same shape as
@@ -733,6 +762,31 @@ class Settings(BaseSettings):
                 ) from exc
         return value
 
+    @field_validator("proactive_kind_budgets", mode="before")
+    @classmethod
+    def _parse_kind_budgets(cls, value: object) -> object:
+        """Empty means no per-kind ceilings (bound only by the daily total);
+        anything else must be the documented JSON. Same shape as
+        `_parse_overrides` and for the same reason: `NoDecode` on the field is
+        what lets this run at all, and unparseable text raises rather than
+        quietly becoming `{}` - which here would silently remove every ceiling
+        instead of leaving the default table in place. `_check` below still
+        validates the keys and values once this has produced a dict."""
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            import json
+
+            try:
+                return json.loads(text)
+            except ValueError as exc:
+                raise ValueError(
+                    "DAEMON_PROACTIVE_KIND_BUDGETS must be JSON per kind, as in "
+                    f'{{"open_loop": 1, "silence": 1}} - {exc}'
+                ) from exc
+        return value
+
     @field_validator("telegram_allowed_user_ids", mode="before")
     @classmethod
     def _split_ids(cls, value: object) -> object:
@@ -854,31 +908,16 @@ class Settings(BaseSettings):
                     f"(known: {', '.join(sorted(PROVIDER_KEY_ENV))})"
                 )
 
+        # A typo in the provider name is wrong whatever else is on, so this one
+        # is unconditional. What a *session* additionally needs lives in
+        # `voice_session_problems` - see the comment on the wake checks below for
+        # why that set is not applied here on `voice_enabled` alone.
         if self.voice_provider not in VOICE_PROVIDERS:
             problems.append(
                 f"DAEMON_VOICE_PROVIDER is {self.voice_provider!r}; expected one of "
                 f"{', '.join(VOICE_PROVIDERS)}"
             )
-        elif self.voice_enabled:
-            # The chosen provider's own realtime model + that provider's key. The
-            # text model (DAEMON_*_MODEL) is neither required nor read for voice.
-            if self.voice_provider == "gemini" and not self.gemini_live_model:
-                problems.append(
-                    "DAEMON_VOICE_ENABLED is on with DAEMON_VOICE_PROVIDER=gemini but "
-                    "DAEMON_GEMINI_LIVE_MODEL is empty; the native-audio endpoint needs its own id"
-                )
-            if self.voice_provider == "openai":
-                if not self.openai_realtime_model:
-                    problems.append(
-                        "DAEMON_VOICE_ENABLED is on with DAEMON_VOICE_PROVIDER=openai but "
-                        "DAEMON_OPENAI_REALTIME_MODEL is empty; the realtime endpoint needs "
-                        "its own id"
-                    )
-                if not self.openai_api_key:
-                    problems.append(
-                        "DAEMON_VOICE_ENABLED is on with DAEMON_VOICE_PROVIDER=openai but "
-                        "OPENAI_API_KEY is empty"
-                    )
+
 
         # Caught here rather than on the wire. The server answers a bad enum by
         # closing with 1007, which the session classifies as permanent - so a typo
@@ -919,6 +958,28 @@ class Settings(BaseSettings):
                 "only to open a voice session, so set DAEMON_VOICE_ENABLED=true or switch "
                 "the gate off"
             )
+        # On `voice_enabled`, at load time, and that took two goes to settle.
+        #
+        # These checks briefly moved off `voice_enabled` onto `wake_enabled`. The
+        # reason was real: the switch had just come to mean two things - "a hosted
+        # session may run" and "a proactive line may leave the local speaker" -
+        # and `/usr/bin/say` needs no route, no model and no key. Under the old
+        # preset table, `offline` could satisfy the second and never the first, so
+        # demanding both at load did not degrade that install, it stopped
+        # `Settings` from loading at all, which stops the daemon.
+        #
+        # ADR 0012 removed the premise. Voice is its own axis now: turning it on
+        # *adds* the CHAT_VOICE route rather than asking the preset for one, so
+        # there is no configuration where voice is on and a hosted session is
+        # impossible. That makes load time the right place again, and the earlier
+        # move unnecessary rather than wrong. What survives from it is this list
+        # having one home (`voice_session_problems`); `run_voice` no longer
+        # re-applies it, because by then `Settings` has already validated.
+        if self.voice_enabled:
+            problems += [
+                f"DAEMON_VOICE_ENABLED is on with {problem}"
+                for problem in self.voice_session_problems()
+            ]
         if not 0.0 < self.wake_vad_threshold <= 1.0:
             problems.append(
                 f"DAEMON_WAKE_VAD_THRESHOLD is {self.wake_vad_threshold}; it must be within "
@@ -967,15 +1028,8 @@ class Settings(BaseSettings):
                 f"DAEMON_PROACTIVE_QUIET_HOURS {self.proactive_quiet_hours!r} is not "
                 "HH:MM-HH:MM (24-hour, local). Leave it empty for no quiet window"
             )
-        if self.proactive_open_loop_budget > self.proactive_daily_budget:
-            problems.append(
-                f"DAEMON_PROACTIVE_OPEN_LOOP_BUDGET ({self.proactive_open_loop_budget}) is "
-                f"above DAEMON_PROACTIVE_DAILY_BUDGET ({self.proactive_daily_budget}); the "
-                "sub-cap exists to hold open loops *below* the overall budget"
-            )
         for name, value in (
             ("DAEMON_PROACTIVE_DAILY_BUDGET", self.proactive_daily_budget),
-            ("DAEMON_PROACTIVE_OPEN_LOOP_BUDGET", self.proactive_open_loop_budget),
             ("DAEMON_PROACTIVE_COOLDOWN_MINUTES", self.proactive_cooldown_minutes),
         ):
             if value < 0:
@@ -985,6 +1039,17 @@ class Settings(BaseSettings):
                 f"DAEMON_PROACTIVE_SILENCE_HOURS is {self.proactive_silence_hours}; "
                 "at zero or below, every tick would be a silence candidate"
             )
+        for kind, ceiling in self.proactive_kind_budgets.items():
+            if kind not in PROACTIVE_KINDS:
+                problems.append(
+                    f"DAEMON_PROACTIVE_KIND_BUDGETS names unknown kind {kind!r}; "
+                    f"expected one of {', '.join(PROACTIVE_KINDS)}"
+                )
+            elif not isinstance(ceiling, int) or isinstance(ceiling, bool) or ceiling < 0:
+                problems.append(
+                    f"DAEMON_PROACTIVE_KIND_BUDGETS[{kind!r}] is {ceiling!r}; it must "
+                    "be a non-negative integer"
+                )
         for name, value in (
             ("DAEMON_PERSONA_MAX_ACTIVE_RULES", self.persona_max_active_rules),
             ("DAEMON_PERSONA_MAX_NEW_PER_CYCLE", self.persona_max_new_per_cycle),
@@ -1112,6 +1177,59 @@ class Settings(BaseSettings):
         if self.voice_enabled or Task.CHAT_VOICE in resolved:
             resolved[Task.CHAT_VOICE] = self.voice_provider
         return {**resolved, **self.route_overrides}
+
+    def voice_session_problems(self) -> list[str]:
+        """What stops a *hosted voice session* from running, as clauses a caller
+        prefixes with its own context. Empty when nothing does.
+
+        **One caller: `_check`, at load time, guarded on `voice_enabled`.** Say so
+        before adding a clause here - anything that is only decidable when a
+        session opens does not belong in this list, because nothing re-runs it
+        then. A rotated key or an endpoint that went unreachable after startup
+        will not be caught here; that is the session's own problem to report.
+
+        It briefly had two callers, and the detour is worth knowing because the
+        failure it worked around can return. `voice_enabled` came to mean two
+        things when the speaker switch merged into it - "a hosted session may run"
+        and "a proactive line may come out of the local speaker" - and only the
+        first needs any of this. `/usr/bin/say` needs neither a route nor a model
+        nor a key, so checking at load on `voice_enabled` alone stopped `Settings`
+        from loading under the `offline` preset, which stops the daemon, and made
+        docs/PLAN.md 7's promise about local proactive speech unreachable on the
+        one preset the promise is about. The workaround was to check late instead:
+        at load only when `wake_enabled`, and again in `run_voice`.
+
+        ADR 0012 removed the premise rather than the symptom - `routing` now
+        *adds* the CHAT_VOICE row whenever voice is on, because voice is its own
+        axis and never was a property of the preset - so there is no longer a
+        configuration where voice is on and a session is impossible. Load time
+        became right again, `run_voice`'s repeat became a branch nothing can
+        reach, and the first clause in this list (does the preset route a voice
+        task) became one that cannot fire. All three are gone. A check that cannot
+        fire is worse than no check, because the next reader budgets for it.
+
+        What remains is the half that was always real:
+        the chosen provider's own model and key.
+        """
+        problems: list[str] = []
+        # The chosen provider's own realtime model plus that provider's key. The
+        # text model (DAEMON_*_MODEL) is neither required nor read for voice.
+        if self.voice_provider == "gemini" and not self.gemini_live_model:
+            problems.append(
+                "DAEMON_VOICE_PROVIDER=gemini but DAEMON_GEMINI_LIVE_MODEL is empty; "
+                "the native-audio endpoint needs its own id"
+            )
+        if self.voice_provider == "openai":
+            if not self.openai_realtime_model:
+                problems.append(
+                    "DAEMON_VOICE_PROVIDER=openai but DAEMON_OPENAI_REALTIME_MODEL is "
+                    "empty; the realtime endpoint needs its own id"
+                )
+            if not self.openai_api_key:
+                problems.append(
+                    "DAEMON_VOICE_PROVIDER=openai but OPENAI_API_KEY is empty"
+                )
+        return problems
 
     @property
     def active_tasks(self) -> list[Task]:

@@ -24,6 +24,7 @@ says "measured" was checked against the real thing, and the number is in the fil
 | [0010](0010-supersession-needs-an-id-not-a-name.md) | Supersession keys off an id, not a name | accepted, measured |
 | [0011](0011-the-file-holds-more-than-it-injects.md) | core.md holds every active fact, not the injected ones | accepted, measured |
 | [0012](0012-voice-is-its-own-axis.md) | Voice is its own axis, not a preset tier | accepted |
+| [0013](0013-split-the-presence-signals.md) | Split the presence signals | accepted, measured |
 
 ## Format
 

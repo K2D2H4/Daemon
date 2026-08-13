@@ -23,6 +23,12 @@ collapsed - a bad call has to be diagnosable afterwards instead of guessed at.
 And when a probe cannot answer, that is a third state, not a `False`. `Reading`
 carries `unknown` for exactly that: unknown presence must never route to the
 speaker, because the failure it risks is the expensive one.
+
+**Changed 2026-08-11, on purpose and not quietly.** `audio_busy` was one bool over
+both audio directions, and merging them is what made the wake listener silence the
+speaker route: it holds the input device, and the gate read that as a call. Split
+into `mic_busy` (ours subtracted) and `output_busy`, plus three probes the routing
+table needs. See docs/adr/0013.
 """
 
 from __future__ import annotations
@@ -51,8 +57,30 @@ class Reading:
     """Seconds since the last HID event. `None` means the probe could not answer -
     which is not "the user is here" and not "the user is away"."""
     foreground_app: str | None = None
-    audio_busy: bool | None = None
-    """Something else is holding the audio device - a call, a recording."""
+    mic_busy: bool | None = None
+    """Somebody *else* holds the microphone - a call, a recording.
+
+    Our own hold is subtracted before this is set (`daemon/mic_hold.py`), which
+    is what makes it a call signal at all: the wake listener holds the input
+    device whenever DAEMON_WAKE_ENABLED is on, so the raw probe is True forever
+    on a machine with voice switched on.
+    """
+    output_busy: bool | None = None
+    """The default output device is running for somebody.
+
+    Deliberately separate from `mic_busy` and deliberately the weaker of the two.
+    PLAN 6.4 records why: this reads True for a notification chime, an
+    autoplaying video, and a system-wide audio EQ - one of which is installed on
+    the development machine and held the device all day.
+    """
+    output_muted: bool | None = None
+    """Muted, or the volume is zero. `say` exits 0 either way and nobody hears
+    it (`daemon/proactivity/speaker.py`), so the speaker route is a lie here."""
+    screen_locked: bool | None = None
+    """The session is locked. Present at the keyboard and locked is still away."""
+    headphones: bool | None = None
+    """Output goes to headphones, so a spoken line reaches nobody but the user.
+    The one signal that *widens* what the speaker may do."""
     unknown: tuple[str, ...] = ()
     """Which probes failed, and why, for the gate snapshot."""
 
@@ -73,7 +101,11 @@ class Reading:
             "at": self.at.isoformat(),
             "idle_seconds": self.idle_seconds,
             "foreground_app": self.foreground_app,
-            "audio_busy": self.audio_busy,
+            "mic_busy": self.mic_busy,
+            "output_busy": self.output_busy,
+            "output_muted": self.output_muted,
+            "screen_locked": self.screen_locked,
+            "headphones": self.headphones,
             "unknown": list(self.unknown),
         }
 

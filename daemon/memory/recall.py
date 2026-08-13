@@ -221,17 +221,31 @@ class MemoryRecall:
         *,
         decay: bool,
         older_than: datetime | None = None,
+        exclude_reindexed: bool = False,
     ) -> list[tuple[float, int, RecalledItem]]:
         """Lane hits turned into scored items, best first.
 
         `decay=False` and `older_than` exist for `associate`, which wants what
         recency decay is there to bury. Shared with `search` so the two cannot
         drift in how a hit becomes an item - only in how it is ranked.
+
+        `exclude_reindexed`, also `associate`-only: `messages.reindexed` marks a
+        row `daemon/memory/reindex.py` rebuilt from markdown after the mirror was
+        thrown away or fell behind. The markdown carries no provenance
+        (non-negotiable 3), so a rebuilt row's `origin` is inferred from `role`,
+        not observed - a forward is `role='user'` exactly like the owner's own
+        words, so a reindex can hand it `origin='owner'` it never earned. `search`
+        still renders such a row (`_label` says "untrusted source" either way,
+        reindexed or not), but `associate` treats `origin == 'owner'` as licence
+        to quote the content verbatim into a model prompt, and that is exactly
+        the check a fabricated `'owner'` slips past.
         """
         rows = self._store.messages_by_ids(list(keyword.keys() | vector.keys()))
         now = self._now or clock_now()
         scored: list[tuple[float, int, RecalledItem]] = []
         for message_id, row in rows.items():
+            if exclude_reindexed and row["reindexed"]:
+                continue
             kw = keyword.get(message_id, 0.0)
             vec = vector.get(message_id, 0.0)
             ts = from_iso(row["ts"])
@@ -254,6 +268,7 @@ class MemoryRecall:
                         # Carried, not dropped: the column is unforgeable so the
                         # renderer can tell relayed text from the owner's own.
                         origin=row["origin"],
+                        message_id=message_id,
                     ),
                 )
             )
@@ -284,6 +299,14 @@ class MemoryRecall:
            generator that silently starves the reflection pass is worse than an
            absent one, which is why type E shipped as silence until this existed.
 
+        **It also excludes `messages.reindexed` rows**, which `search` does not -
+        see `_score`'s docstring. `association_candidates`
+        (`daemon/proactivity/candidates.py`) is this method's only caller and
+        trusts `origin == "owner"` to decide whether a memory's words may reach a
+        model prompt; a reindexed row's `origin` is inferred, not observed, so
+        letting one through here would let `daemon reindex` fabricate the one
+        thing that check relies on. `tests/test_recall.py` pins this.
+
         Makes no model call beyond the embedder, same as Lane 1.
         """
         if not query.strip():
@@ -294,7 +317,9 @@ class MemoryRecall:
         if not keyword and not vector:
             return []
         cutoff = (self._now or clock_now()) - timedelta(days=min_age_days)
-        scored = self._score(keyword, vector, decay=False, older_than=cutoff)
+        scored = self._score(
+            keyword, vector, decay=False, older_than=cutoff, exclude_reindexed=True
+        )
         return [item for _, _, item in scored[:limit]]
 
     # --- the curated tier (docs/PLAN.md 4.1 layer 2) -------------------------
@@ -655,6 +680,10 @@ def _curated_item(row: sqlite3.Row, *, triggered: bool) -> RecalledItem:
         # Carried verbatim, like a message's: a fact reflection drew from relayed
         # text is 'untrusted' and must not be rendered as the owner's own words.
         origin=row["origin"],
+        # `memory_entries` has its own id space, disjoint from `messages.id` -
+        # stamping this row's id in here would let a caller that dedups on
+        # `message_id` (type E) collide a curated fact with an unrelated message.
+        message_id=None,
     )
 
 

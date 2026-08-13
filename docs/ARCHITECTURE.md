@@ -247,10 +247,14 @@ never touches `consumed_by` on the observations the rule was built from —
 non-negotiable 6 makes `observations` append-only, and reverting it would let
 next week's pass revive the same rule from the same evidence.
 
-`daemon/proactivity/judge.py` deliberately does not go through
-`daemon/persona/loader.py`: it reads `seed.md` alone, because its prompt is kept
-intentionally minimal and widening it to learned rules is a separate decision
-this milestone does not make.
+`daemon/proactivity/judge.py` calls `daemon/persona/loader.py`'s `load_persona`
+(seed plus M4's learned rules), the same as the text loop and voice — decided
+2026-08-11: leaving proactivity on the seed alone meant one personality that
+spoke differently depending on which path reached the user, and the concern that
+kept it seed-only (an unprompted line has the least context to carry the voice)
+turned out to argue for including the rules, not against it. The seed alone is
+still required: `Judge._persona` returns "" — no persona, no proactive line —
+when `seed.md` is empty, even if `learned.md` is not.
 
 ## Proactivity: three stages, and exactly one model call
 
@@ -274,23 +278,33 @@ Declining is a first-class answer and the common one.
 
 **Presence is a reading, not a verdict, and it is three-valued.**
 `daemon/proactivity/presence.py` reports what each probe measured — idle seconds,
-foreground app, whether the audio device is running — and `None` when a probe could
-not answer, with the reason. `None` is neither "here" nor "away". The gate owns the
-thresholds and stores the whole reading in `proactive_utterances.gate_snapshot`, so a
-bad call is readable afterwards instead of reconstructed.
+foreground app, the microphone and the output device read separately — and `None`
+when a probe could not answer, with the reason. `None` is neither "here" nor "away".
+The gate owns the thresholds and stores the whole reading in
+`proactive_utterances.gate_snapshot`, so a bad call is readable afterwards instead of
+reconstructed. The microphone and the output device used to be one `audio_busy` bool;
+splitting them was necessary once the wake listener started holding the microphone
+whenever `DAEMON_WAKE_ENABLED` is on, because the merged bool then read the daemon's
+own wake hold as "on a call" and made the speaker route unreachable while voice was
+switched on ([docs/adr/0013](adr/0013-split-the-presence-signals.md)).
 
 **Blocking and routing are different decisions**, and PLAN.md 6.4's asymmetry is why:
 an ignored Telegram message costs nothing, a voice out of the laptop during a meeting
 is an accident. So quiet hours, the cooldown and the budgets block the utterance,
 while everything that bears only on interruption — an unreadable probe, a meeting app
-in front, an audio device in use — costs the *speaker* and sends the same words to
-Telegram. Two switches, both defaulting off and gated separately, because those two
-failure costs are not comparable:
+in front, the microphone or the output device in use — costs the *speaker* and sends
+the same words to Telegram (seven ordered rules in `Gate._route`). `DAEMON_VOICE_ENABLED`
+is the one switch gating both a hosted voice session and this local-speaker path — a
+second switch, `DAEMON_PROACTIVE_SPEAKER_ENABLED`, used to exist for the same reason the
+paragraph above states (the two failure costs are not comparable), but `Gate._route`
+already carries that asymmetry in its own seven rules, so the second switch only bought
+"voice on" meaning two different things depending which file was read. Merged into one,
+2026-08-11 (docs/adr/0013):
 
 | | |
 |---|---|
 | `DAEMON_PROACTIVE_ENABLED` | speak first at all |
-| `DAEMON_PROACTIVE_SPEAKER_ENABLED` | and out of this machine's speaker |
+| `DAEMON_VOICE_ENABLED` | and out loud, including out of this machine's speaker |
 
 There are also **two cooldowns**, which are not the same brake:
 `proactive_candidates.cooldown_secs` is per-candidate ("do not raise *this* reason

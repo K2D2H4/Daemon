@@ -581,3 +581,42 @@ async def test_a_machine_with_nothing_to_speak_with_returns_false(
 
     assert await LocalSpeaker(platform="linux", spawn=spawner).say("안녕") is False
     assert spoke == []
+
+
+# --- finding 5, whole-branch review: refuse while the mic is held -----------
+# docs/adr/0013 made `mic_busy` subtract our own hold, which stopped the gate
+# from ever seeing a live voice session mid-call - so this file, not the gate,
+# has to refuse. `mic_held` is injected the same way presence.py injects it,
+# not exercised through the real `daemon.mic_hold` module, so these tests
+# cannot leak state into any other test's process-wide counter.
+
+
+async def test_speaking_is_refused_while_the_microphone_is_held() -> None:
+    """The regression: a live voice session holds the microphone for its whole
+    run, and `Gate._route` can still return `both` mid-session (nothing in a
+    `Reading` says a call is live once our own hold is subtracted). Without this
+    check `say` would speak over the session and into the open microphone."""
+    spawner = Spawner()
+    speaker = LocalSpeaker(platform="darwin", spawn=spawner, mic_held=lambda: True)
+
+    assert await speaker.say(UTTERANCE) is False
+    assert spawner.calls == []
+
+
+async def test_speaking_proceeds_when_the_microphone_is_free() -> None:
+    """The control for the test above: the same speaker, the same utterance,
+    only `mic_held` differs - proves the refusal is about the hold and not
+    about something else in the setup."""
+    speaker, spawner = _speaker()
+
+    assert await speaker.say(UTTERANCE) is True
+    assert spawner.calls != []
+
+
+async def test_a_refused_utterance_logs_why(caplog: pytest.LogCaptureFixture) -> None:
+    speaker = LocalSpeaker(platform="darwin", spawn=Spawner(), mic_held=lambda: True)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        await speaker.say(UTTERANCE)
+
+    assert "microphone" in caplog.text
