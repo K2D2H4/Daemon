@@ -21,8 +21,8 @@ from test_loop import FakeChannel, FakeMemory, gateway_for
 
 from daemon.channels.base import InboundMessage
 from daemon.companion import TOOL_CONTRACT, Companion
-from daemon.llm.base import Completion, ToolCall
-from daemon.loop import APPROVAL_NO_CODE, INCOMPLETE_NOTICE, ConversationLoop
+from daemon.llm.base import Completion, ProviderError, ToolCall
+from daemon.loop import APPROVAL_NO_CODE, FAILURE_NOTICE, INCOMPLETE_NOTICE, ConversationLoop
 from daemon.memory.store import Store
 from daemon.tools.base import Registry
 from daemon.tools.builtin import builtin_tools
@@ -253,6 +253,103 @@ async def test_an_empty_final_answer_is_never_delivered_as_silence(
     assert channel.sent, "the turn delivered nothing at all"
     assert channel.sent[0].text == INCOMPLETE_NOTICE
     assert channel.sent[0].text.strip(), "an empty reply was sent as silence"
+
+
+async def test_a_round_limit_provider_error_degrades_to_incomplete_notice(
+    data_dir: Path, store: Store, tmp_path: Path
+) -> None:
+    """The same emptiness as the test above, but raised instead of returned.
+
+    A reasoning model can spend its whole output budget on reasoning tokens and
+    come back with neither text nor a tool call - every provider's contract
+    (`llm/base.py`) says to raise `ProviderError` for exactly that shape, not
+    return an empty `Completion`. So the round-limit escape call - tools-off,
+    just trying to summarise - can fail this way too, and it must land on the
+    same `INCOMPLETE_NOTICE` as the empty-text case, not `run()`'s generic
+    `FAILURE_NOTICE`. Reproduced with the real trigger: a Korean '기억해줘'
+    ('remember this') that burns every tool round trying to persist the fact.
+    """
+    (tmp_path / "notes.md").write_text("hi")
+
+    class BurnsTheBudget:
+        """Tool calls every round; the tools-off escape call raises, the way a
+        reasoning model that spent its whole budget on reasoning tokens does."""
+
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.offered_tools: list[tuple] = []
+
+        async def complete(self, messages, *, model, tools=None, **kw):  # type: ignore[no-untyped-def]
+            self.offered_tools.append(tuple(tools or ()))
+            if not tools:
+                raise ProviderError("spent the whole budget on reasoning tokens")
+            return Completion(
+                text="", model=model, tool_calls=(read_file_call(tmp_path / "notes.md"),)
+            )
+
+        async def health(self) -> bool:
+            return True
+
+    channel = FakeChannel([inbound("아까 말한 카페 이름 기억해줘")])
+    await loop_for(
+        channel, BurnsTheBudget(), FakeMemory(), data_dir,
+        runner(store, tmp_path, mode="ask"), max_tool_rounds=2,
+    ).run()
+
+    assert channel.sent, "the turn delivered nothing at all"
+    assert channel.sent[0].text == INCOMPLETE_NOTICE
+
+
+async def test_a_first_call_provider_error_still_fails_the_turn(
+    data_dir: Path, store: Store, tmp_path: Path
+) -> None:
+    """Pins the boundary of the round-limit catch: a provider outage on the very
+    first call - before any tool round, let alone the cap - is a genuine failure
+    on an ordinary turn and must still surface as `FAILURE_NOTICE`, not be
+    mistaken for the round-limit escape hatch degrading gracefully."""
+    provider = FakeProvider(fail=True)
+    channel = FakeChannel([inbound("메모 읽어줘")])
+
+    await loop_for(
+        channel, provider, FakeMemory(), data_dir, runner(store, tmp_path, mode="ask")
+    ).run()
+
+    assert channel.sent[0].text == FAILURE_NOTICE
+
+
+async def test_a_mid_loop_provider_error_still_fails_the_turn(
+    data_dir: Path, store: Store, tmp_path: Path
+) -> None:
+    """Pins the same boundary from the other side: a provider outage on a tool
+    round that has not yet reached the cap must still fail the turn, not be
+    swallowed the way only the round-limit escape call is allowed to be."""
+    (tmp_path / "notes.md").write_text("hi")
+
+    class DiesOnSecondRound:
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, *, model, tools=None, **kw):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 2:
+                raise ProviderError("outage mid-loop, nowhere near the cap")
+            return Completion(
+                text="", model=model, tool_calls=(read_file_call(tmp_path / "notes.md"),)
+            )
+
+        async def health(self) -> bool:
+            return True
+
+    channel = FakeChannel([inbound("계속 읽어봐")])
+    await loop_for(
+        channel, DiesOnSecondRound(), FakeMemory(), data_dir,
+        runner(store, tmp_path, mode="ask"), max_tool_rounds=5,
+    ).run()
+
+    assert channel.sent[0].text == FAILURE_NOTICE
 
 
 async def test_a_denied_call_tells_the_model_why(
