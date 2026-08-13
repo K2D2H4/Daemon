@@ -56,7 +56,7 @@ flowchart LR
 
   subgraph out["providers"]
     OLL["ollama"]
-    HOST["anthropic · openai · gemini"]
+    HOST["anthropic · openai · gemini · openai_compatible"]
     LIVE["voice/gemini_live.py<br/>native audio"]
   end
 
@@ -129,7 +129,7 @@ both macOS-only. On demand, `see_screen` (`daemon/tools/screen.py`) shells out t
 `screencapture`+`sips` — no new dependency — and returns `ToolOutput(content, images)`;
 `daemon/tools/runner.py` carries `images` onto `ToolResult`, and `daemon/loop.py` attaches
 them as a fresh `user` turn framed by `screen_note` rather than inside the `tool`-role
-message, because a `user` turn holding an image is the one shape all four providers
+message, because a `user` turn holding an image is the one shape all five providers
 accept (ADR 0009). Live and voice-only, `start_screen_share`/`stop_screen_share` toggle a
 `ScreenSharePump` (`daemon/voice/screen_share.py`, the one file in this stack that imports
 Pillow) that captures at `screen_fps` (default 1), dhashes each frame against the last one
@@ -373,7 +373,7 @@ otherwise speaking is its own excuse to speak.
 
 | protocol | in | implementations |
 |---|---|---|
-| `Provider` | `daemon/llm/base.py` | ollama · anthropic · openai · gemini |
+| `Provider` | `daemon/llm/base.py` | ollama · anthropic · openai · gemini · openai_compatible |
 | `Embedder` | `daemon/llm/base.py` | ollama (`bge-m3`) |
 | `Channel` | `daemon/channels/base.py` | telegram |
 | `Cursor` | `daemon/channels/base.py` | `memory.store.Store` |

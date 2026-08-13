@@ -904,3 +904,59 @@ def test_a_chromium_relative_can_be_named() -> None:
         DAEMON_BROWSER_APP="Arc",
     )
     assert settings.browser_app == "Arc"
+
+
+# --- openai_compatible: a fourth hosted provider, endpoint named by the user --
+
+
+COMPAT_ENV = {
+    "DAEMON_PRESET": "balanced",
+    "DAEMON_HOSTED_PROVIDER": "openai_compatible",
+    "OPENAI_COMPATIBLE_API_KEY": "sk-compat-test",
+    "DAEMON_OPENAI_COMPATIBLE_MODEL": "qwen-plus",
+    "DAEMON_OPENAI_COMPATIBLE_BASE_URL": "https://api.deepseek.com/v1",
+}
+
+
+def test_openai_compatible_is_a_choosable_hosted_provider() -> None:
+    settings = Settings(_env_file=None, **COMPAT_ENV)
+    route = settings.route_for(Task.CHAT_TEXT)
+    assert route == Route("openai_compatible", "qwen-plus")
+
+
+def test_openai_compatible_needs_a_base_url() -> None:
+    """Settings raises ConfigError at construction time - see `_check` - rather
+    than exposing a separate problems() accessor, so the missing endpoint has to
+    surface the same way every other provider problem here does."""
+    with pytest.raises(ConfigError, match="DAEMON_OPENAI_COMPATIBLE_BASE_URL"):
+        Settings(_env_file=None, **{**COMPAT_ENV, "DAEMON_OPENAI_COMPATIBLE_BASE_URL": ""})
+
+
+def test_openai_compatible_base_url_drops_a_trailing_slash() -> None:
+    settings = Settings(
+        _env_file=None,
+        **{**COMPAT_ENV, "DAEMON_OPENAI_COMPATIBLE_BASE_URL": "https://api.deepseek.com/v1/"},
+    )
+    assert settings.openai_compatible_base_url == "https://api.deepseek.com/v1"
+
+
+def test_openai_compatible_base_url_rejects_the_full_endpoint_and_says_what_to_use() -> None:
+    with pytest.raises(ValidationError) as caught:
+        Settings(
+            _env_file=None,
+            **{
+                **COMPAT_ENV,
+                "DAEMON_OPENAI_COMPATIBLE_BASE_URL": (
+                    "https://api.deepseek.com/v1/chat/completions"
+                ),
+            },
+        )
+    assert "https://api.deepseek.com/v1" in str(caught.value)
+
+
+def test_openai_compatible_base_url_must_be_http() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            **{**COMPAT_ENV, "DAEMON_OPENAI_COMPATIBLE_BASE_URL": "api.deepseek.com"},
+        )

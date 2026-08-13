@@ -12,6 +12,8 @@ automated. This is that one, plus the spike that needed a real key.
 | `m0_voice_spike.py` | the six things about Gemini Live only a live key could settle |
 | `m1c_voice_tools_spike.py` | whether answering a voice tool call costs the answer — it does not |
 | `m1c_text_tools_spike.py` | whether our provider survives a real Gemini 3 tool round-trip — the `thoughtSignature` contract |
+| `openai_compatible_spike.py` | whether a real OpenAI-compatible endpoint answers `/models`, a Korean turn, and a tool round-trip |
+| `openai_compatible_loop_spike.py` | whether the *assembled* app survives a real turn on that endpoint — loop, recall, tool policy, audit table |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py
@@ -131,6 +133,107 @@ The contract is Gemini-3-only. On a 2.5 id the spike says so and treats its own
 green as vacuous — the `evals/` rule that a run proving nothing is worse than a red
 one. It is why this is a spike and not a `tests/` case: only a live key can settle
 whether the field we emit is the field the API wants.
+
+## openai_compatible_spike.py
+
+```bash
+python3 -m evals.openai_compatible_spike
+python3 -m evals.openai_compatible_spike --base-url https://openrouter.ai/api/v1
+```
+
+Needs `OPENAI_COMPATIBLE_API_KEY`, `DAEMON_OPENAI_COMPATIBLE_BASE_URL` and a model
+id. Drives the real `OpenAICompatibleProvider`, not a hand-built request, over
+three checks in order: `GET /models`, a plain Korean turn, and a forced tool call
+whose result is fed back on a second turn. Also lists the endpoint's models that
+are both free and tool-capable, since the free catalogue rotates and a hardcoded
+id goes stale.
+
+Measured 2026-08-11 on OpenRouter, model `openai/gpt-oss-20b:free`: all three
+checks passed. That model is a reasoning one, and at `max_tokens: 40` it spent its
+entire budget on reasoning tokens (37 of 40) and returned `content: None` with
+`finish_reason: "length"` — our provider correctly raised `ProviderError("no text
+content")` rather than treating that as an empty answer. At `max_tokens: 600` the
+same prompt answered normally with room to spare, which is the budget the spike
+uses for its three real checks; a bonus, informational check reproduces the tiny
+budget on purpose so the shape is visible rather than assumed. This is a real
+model behaviour, not a provider defect — a small output budget on a reasoning
+model is genuinely insufficient for it to reason and answer, and raising rather
+than returning empty text is the correct call for `daemon/loop.py`, which cannot
+distinguish "the model refused" from "the model was cut off empty" any other way.
+
+One more thing worth knowing before reading a raw response body: **observed
+2026-08-11**, an OpenRouter non-streaming response arrived with blank-line padding
+in front of the JSON, which shows up in the raw dump this spike prints. Nothing
+was consumed by it — `httpx`'s and the standard library's JSON parsing both skip
+leading whitespace — so it is cosmetic here. The keep-alive padding OpenRouter
+*documents* is for streaming responses, so treat the non-streaming case as one
+run's observation rather than as vendor-documented behaviour: it has been seen
+once, not explained.
+
+**Not exercised**: Qwen's DashScope endpoint (`--base-url
+https://dashscope-intl.aliyuncs.com/compatible-mode/v1 --model qwen-plus`).
+Nothing in `daemon/llm/providers/openai_compatible.py` is Qwen-specific, so this is expected to work
+once a Singapore-region key exists — the China-region key available when this was
+last run gets `403 AccessDenied.Unpurchased` from `/chat/completions` and `401`
+from the International endpoint. Code-supported, unverified; do not call it
+working until a run against it is recorded here. Kimi, DeepSeek and a custom
+self-hosted URL are unverified for the same reason: no key, no run, no claim.
+
+## openai_compatible_loop_spike.py
+
+```bash
+python3 -m evals.openai_compatible_loop_spike
+```
+
+Needs the same three `.env` values as the spike above. Reuses
+`tests/test_acceptance.py`'s assembly — `Store` + `FileMemoryWriter` +
+`MemoryRecall` + `LLMGateway` + the real tool stack + `Companion` +
+`ConversationLoop` — with exactly one substitution: the fake `Provider` becomes
+the real `OpenAICompatibleProvider`. `DAEMON_DATA_DIR` is a temporary directory,
+torn down at exit, so the owner's real `data/` is never touched. The embedder
+stays the offline fake: recall's *quality* is `golden_set.py`'s job, and what is
+asked here is whether recall's *wiring* survives a real provider.
+
+Measured 2026-08-11 on OpenRouter, model `openai/gpt-oss-20b:free`, all four
+PASS:
+
+| | |
+|---|---|
+| 1 | a Korean turn through `ConversationLoop.handle` gets a non-empty reply |
+| 2 | the exchange lands in the conversation markdown *and* the SQLite mirror |
+| 3 | a tool is decided, executed and written to the `tool_calls` audit table — the real registry and the real `ToolPolicy` origin gate, driven by this provider's own `tool_calls` shape |
+| 4 | recall carries turn 1's fact into turn 4's prompt, as a `recalled-memory:` block |
+
+`PACING_SECONDS = 5.0` between turns, because the free tier answers rapid
+back-to-back calls with `429` — found by hitting it mid-run.
+
+**One real defect came out of this run, in `daemon/loop.py`, and it is not
+fixed.** The first attempt phrased turn 1 as "...잊지 말고 기억해줘" ("don't
+forget, remember it"). With the production-default full tool access, the model
+read that as an instruction to *use a tool* to persist the fact, spent all six
+`MAX_TOOL_ROUNDS` trying, and the loop's forced final-answer call — the safety
+valve that exists to get *some* reply out of a turn that hit the limit — then hit
+the same reasoning-emptied-content case, so `ProviderError` propagated uncaught.
+In production that reaches the user as the generic `FAILURE_NOTICE` for an
+entirely ordinary message. The safety valve can fail the same way the thing it
+guards fails. Filed as follow-up work, not fixed on this branch.
+
+### The acceptance bar this replaced
+
+State it plainly, because it was substituted rather than met. `docs/PLAN.md`'s
+"Done when" for this work was: **a real Telegram conversation on Qwen, including
+one successful tool call.** What was actually run is this spike, on OpenRouter.
+
+Deliberate, for two reasons that do not go away by being restated: a second
+poller on the owner's bot token would `409`-conflict with their running daemon,
+and no working Qwen key exists (the available one is China-region — `403
+AccessDenied.Unpurchased` there, `401` on the International endpoint).
+
+So what is proven is the real loop, the real recall path, the real tool registry,
+the real origin gate and the real audit table, against a real endpoint. What
+remains **unproven**: `create_app`, the Telegram channel, `daemon run` as a
+resident process, and any Qwen endpoint at all. Nobody may read the four PASSes
+above as "a real Telegram conversation ran on Qwen".
 
 ## Common changes
 

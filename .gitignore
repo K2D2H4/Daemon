@@ -1,6 +1,15 @@
 node_modules/
 __pycache__/
 .env
+
+# ...and any copy of it, for the same reason `/data.*/` below exists: setting the
+# real thing aside before an edit - `cp .env .env.bak.$(date +%s)`, or the
+# `.env.old-YYYY-MM-DD` an install leaves behind - produced a file holding every
+# key in it that git was happy to track. `.env` matches that one name exactly.
+# `.env.example` is the copy that is meant to be here, and carries no secrets.
+.env.*
+!.env.example
+
 *.pyc
 .venv/
 dist/

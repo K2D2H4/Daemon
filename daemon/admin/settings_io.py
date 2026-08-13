@@ -47,16 +47,21 @@ STR_FIELDS: dict[str, str] = {
     "hosted_provider": "DAEMON_HOSTED_PROVIDER",
     "tools_mode": "DAEMON_TOOLS_MODE",
     "gemini_live_voice": "DAEMON_GEMINI_LIVE_VOICE",
-    # Model ids, one per provider the `hosted_provider` list offers. All three, not
-    # just the one in use: `DAEMON_OPENAI_MODEL` has no default, so a page that let
-    # you pick `openai` without letting you name its model could only ever answer
-    # the choice with a 400 the page itself could not fix.
+    # Model ids, one per provider the `hosted_provider` list offers - all of them,
+    # not just the one in use: `DAEMON_OPENAI_MODEL` has no default, so a page that
+    # let you pick `openai` without letting you name its model could only ever
+    # answer the choice with a 400 the page itself could not fix.
     "anthropic_model": "DAEMON_ANTHROPIC_MODEL",
     "openai_model": "DAEMON_OPENAI_MODEL",
     "gemini_model": "DAEMON_GEMINI_MODEL",
     # The realtime endpoint does not take the text endpoint's id (config.py), which
     # is why voice has its own.
     "gemini_live_model": "DAEMON_GEMINI_LIVE_MODEL",
+    "openai_compatible_model": "DAEMON_OPENAI_COMPATIBLE_MODEL",
+    # The endpoint belongs beside the model for the same reason the model ids do:
+    # a page that lets you choose `openai_compatible` without letting you name its
+    # address could only ever answer the choice with an error it cannot fix.
+    "openai_compatible_base_url": "DAEMON_OPENAI_COMPATIBLE_BASE_URL",
     # Voice provider is its own axis (config.py): gemini or openai. Its own realtime
     # model + voice, exactly like the gemini pair, so voice is fully web-configurable.
     "voice_provider": "DAEMON_VOICE_PROVIDER",
@@ -92,6 +97,7 @@ SECRET_FIELDS: dict[str, str] = {
     "openai_api_key": "OPENAI_API_KEY",
     "gemini_api_key": "GEMINI_API_KEY",
     "telegram_bot_token": "TELEGRAM_BOT_TOKEN",
+    "openai_compatible_api_key": "OPENAI_COMPATIBLE_API_KEY",
 }
 ROUTE_OVERRIDES = "route_overrides"
 ROUTE_OVERRIDES_ENV = "DAEMON_ROUTE_OVERRIDES"

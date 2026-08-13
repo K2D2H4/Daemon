@@ -127,9 +127,10 @@ Daemon은 ②③만 한다. ①은 안 한다.
 | 페르소나 규칙 생성 | 주 1회 | 성찰과 동일 | |
 
 **축을 두 개로 나눈다.** 프리셋은 *어디서 도는가*를 답하고, `DAEMON_HOSTED_PROVIDER`가
-*누구 모델인가*를 답한다(anthropic / openai / gemini). 프리셋이 상용 대화를
-Anthropic으로 하드코딩하고 있었는데, 그러면 §3.2가 말한 provider-agnostic이 설정
-표면에서만 참이 된다. 두 축을 곱하면 프리셋이 9개가 되므로 질문을 분리했다.
+*누구 모델인가*를 답한다(anthropic / openai / gemini / openai_compatible). 네 번째는
+Chat Completions API를 말하는 모든 엔드포인트다 — Qwen, Kimi, DeepSeek, OpenRouter,
+직접 띄운 서버. 주소를 유저가 정하므로 vendor 목록이 아니라 provider 하나로 둔다. 프리셋이 상용 대화를 Anthropic으로 하드코딩하고 있었는데, 그러면
+§3.2가 말한 provider-agnostic이 설정 표면에서만 참이 된다. 두 축을 곱하면 프리셋이 12개가 되므로 질문을 분리했다.
 `CHAT_VOICE`는 `DAEMON_VOICE_PROVIDER`라는 세 번째 축이다 (gemini 또는 openai) —
 프리셋과도, `DAEMON_HOSTED_PROVIDER`와도 무관하다
 (`docs/adr/0012-voice-is-its-own-axis.md`). 음성 세션이 없는 provider를 가리키면
