@@ -2636,6 +2636,32 @@ def test_a_model_the_compatible_endpoint_did_not_date_keeps_its_place() -> None:
     assert ids == ("dated-new", "dated-old", "undated-a", "undated-b")
 
 
+def test_a_bare_json_array_from_models_costs_the_menu_not_the_wizard() -> None:
+    """A `200` whose body is a bare array must come back as a `Verdict`.
+
+    `_newest_first` guarded `ValueError` but called `.get("data")` on whatever
+    decoded, so a list body raised `AttributeError` - and `setup.run` catches only
+    `Cancelled` and `KeyboardInterrupt`, making that a traceback out of the
+    wizard. Harmless with `api.openai.com` and `api.anthropic.com`, which never
+    do this; this provider is the first to point the function at an address the
+    user named, and `llm/providers/openai_compatible.py` documents a proxy
+    answering with a bare array as real.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"id": "qwen-plus"}])
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "qwen-plus", client=client
+        )
+
+    # The key is proved - it is the *list* that was unreadable - so the model
+    # question falls back to free text rather than the run ending.
+    assert verdict.ok
+    assert verdict.models["DAEMON_OPENAI_COMPATIBLE_MODEL"] == ()
+
+
 def test_compatible_probe_flags_a_model_id_that_is_not_in_the_list() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": [{"id": "qwen-plus"}]})

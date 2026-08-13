@@ -976,10 +976,21 @@ def _newest_first(response: httpx.Response, stamp: str) -> tuple[str, ...]:
 
     Entries the provider did not date keep the order it sent them in, after the
     dated ones: a missing field must cost the ordering, not the menu.
+
+    Anything that is not the documented shape reads as an empty list rather than
+    raising - the same rule as `_gemini_models`, and it stopped being theoretical
+    when this function started pointing at an endpoint the *user* names. A proxy
+    in front of a compatible endpoint can answer `/models` with a bare JSON array
+    (`llm/providers/openai_compatible.py` documents the same shape), and
+    `.get("data")` on a list is an `AttributeError` that `setup.run` does not
+    catch: a traceback out of the wizard instead of a `Verdict`.
     """
     try:
-        items = response.json().get("data") or []
+        body = response.json()
     except ValueError:
+        return ()
+    items = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(items, list):
         return ()
     rows = [
         (item["id"], _stamp_value(item.get(stamp)))
