@@ -88,6 +88,7 @@ from daemon.config import (
     PRESETS,
     ConfigError,
     Settings,
+    clean_base_url,
     preset_providers,
     providers_for,
 )
@@ -1875,7 +1876,15 @@ class Wizard:
         }
         self._step(3, "Keys and tokens")
         for need in needs_for(merged):
-            value = self._fill(need, merged)
+            # `{**merged, **updates}`, not `merged`: an answer typed at one of
+            # these questions is the input to the next one. The endpoint is asked
+            # immediately before the key that has to be proved *against* it, and
+            # a `merged` frozen before the loop handed the probe an empty address
+            # - so httpx refused a relative URL, the wizard reported it as a bad
+            # key three times, and setup aborted having written nothing. It only
+            # ever worked for a known vendor, whose address lands in `updates`
+            # during the service sub-question, before this dict is built.
+            value = self._fill(need, {**merged, **updates})
             if value:
                 updates[need.key] = value
 
@@ -2261,6 +2270,13 @@ class Wizard:
                 # Whatever that key was able to list, for the model questions that
                 # `needs_for` puts after it.
                 self.catalog.update(verdict.models)
+                # And that credential has now had its one probe for this run.
+                # Recorded even when the verdict carried no list at all, because a
+                # key answered here is in the env the *next* question sees - so
+                # `_list_with_saved_key` would otherwise re-probe the key it just
+                # watched being verified, which for an endpoint with no `/models`
+                # means a second chat call and a warning about a key that is fine.
+                self._probed.add(need.key)
                 if verdict.detail:
                     # Still the last four characters and nothing more. Colour is
                     # added around `mask`, never instead of it.
@@ -2301,9 +2317,23 @@ class Wizard:
             return self.checks.openai(value, env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL)
         if need.key == "GEMINI_API_KEY":
             return self.checks.gemini(value)
+        if need.key == "DAEMON_OPENAI_COMPATIBLE_BASE_URL":
+            # Checked here so a mistyped address is a sentence under the question
+            # that asked for it. Without this the first thing to notice was the
+            # key probe one question later, which reported `could not reach`
+            # about a key that was fine. `config.clean_base_url` is Settings' own
+            # rule, called rather than copied: a value this wizard accepts and
+            # startup then refuses is the exact failure `_finish` exists to catch,
+            # and catching it there means the file is already written.
+            try:
+                clean_base_url(value)
+            except ValueError as exc:
+                return Verdict(False, str(exc))
+            return Verdict(True, "")
         if need.key == "OPENAI_COMPATIBLE_API_KEY":
-            # The endpoint question comes first in `needs_for`, so by the time the
-            # key is typed its address is already in `updates` and merged into `env`.
+            # The endpoint question comes first in `needs_for` and `Wizard.run`
+            # merges each answer into the env the next question sees, so by the
+            # time the key is typed its address is there to prove it against.
             return self.checks.openai_compatible(
                 value,
                 env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", ""),

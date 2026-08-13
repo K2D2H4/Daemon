@@ -163,6 +163,39 @@ the time it is needed; before then this is the honest stand-in and hosted tasks
 drop out of any enumeration rather than being guessed at."""
 
 
+def clean_base_url(value: str) -> str:
+    """The compatible endpoint, normalised - or `ValueError` naming the mistake.
+
+    Strips the trailing slash and refuses the whole endpoint URL. Vendor docs
+    print `.../v1/chat/completions`, and pasting that whole line is the
+    predictable mistake. Left alone the provider appends the path a second time
+    and the resulting 404 explains nothing. Rejected rather than quietly
+    repaired, and the message carries the value to use instead - the same choice
+    QUIET_HOURS_RE makes: loud beats degraded.
+
+    A module-level function rather than only a validator body, because
+    `daemon/setup.py` has to be able to answer the same question *at the question
+    that asks for it*: a bad address caught only by `Settings` surfaces one
+    question later as a key that "could not be verified", which puts the message
+    next to the wrong mistake. One authority, not two that can drift - the
+    wizard must never accept a value startup will refuse.
+    """
+    text = value.strip().rstrip("/")
+    if not text:
+        return ""
+    if not text.startswith(("http://", "https://")):
+        raise ValueError(
+            f"DAEMON_OPENAI_COMPATIBLE_BASE_URL must start with http:// or https:// - "
+            f"got {text!r}"
+        )
+    if text.endswith("/chat/completions"):
+        raise ValueError(
+            "DAEMON_OPENAI_COMPATIBLE_BASE_URL must not include /chat/completions - "
+            f"use {text.removesuffix('/chat/completions')}"
+        )
+    return text
+
+
 def preset_providers(preset: str, hosted: str) -> dict[Task, str]:
     """A preset's table with HOSTED resolved to a real provider name.
 
@@ -751,30 +784,9 @@ class Settings(BaseSettings):
     @field_validator("openai_compatible_base_url", mode="before")
     @classmethod
     def _clean_base_url(cls, value: object) -> object:
-        """Strip the trailing slash, and refuse the whole endpoint URL.
-
-        Vendor docs print `.../v1/chat/completions`, and pasting that whole line
-        is the predictable mistake. Left alone the provider appends the path a
-        second time and the resulting 404 explains nothing. Rejected rather than
-        quietly repaired, and the message carries the value to use instead - the
-        same choice QUIET_HOURS_RE makes: loud beats degraded.
-        """
         if not isinstance(value, str):
             return value
-        text = value.strip().rstrip("/")
-        if not text:
-            return ""
-        if not text.startswith(("http://", "https://")):
-            raise ValueError(
-                f"DAEMON_OPENAI_COMPATIBLE_BASE_URL must start with http:// or https:// - "
-                f"got {text!r}"
-            )
-        if text.endswith("/chat/completions"):
-            raise ValueError(
-                "DAEMON_OPENAI_COMPATIBLE_BASE_URL must not include /chat/completions - "
-                f"use {text.removesuffix('/chat/completions')}"
-            )
-        return text
+        return clean_base_url(value)
 
     @model_validator(mode="after")
     def _check(self) -> Settings:

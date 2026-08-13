@@ -2211,6 +2211,85 @@ def test_enter_at_a_saved_custom_endpoint_keeps_it_rather_than_naming_a_vendor(
         assert vendor.base_url not in result.written
 
 
+def test_a_typed_endpoint_reaches_the_probe_that_verifies_the_key(tmp_path: Path) -> None:
+    """The key is proved *against an address*, and that address is the answer to
+    the question immediately before it.
+
+    Every other wizard test for this provider stubs the probe with a lambda that
+    discards its `url` argument, and that stub shape is how this shipped:
+    `Wizard.run` built one merged environment *before* the question loop, so an
+    answer typed inside the loop was invisible to every question after it. The
+    endpoint question is asked only when `.env` cannot supply the address -
+    `needs_for` drops it otherwise - so `check_openai_compatible` was handed
+    `""`, httpx refused the relative URL, and the wizard blamed the *key* three
+    times and then aborted without writing anything. Only a probe that records
+    what it was called with can see that.
+    """
+    typed_url = "https://openrouter.ai/api/v1"
+    seen: list[tuple[str, str, str]] = []
+
+    def probe(key: str, url: str, model: str) -> Verdict:
+        seen.append((key, url, model))
+        return Verdict(True, "key works")
+
+    checks = replace(working_checks(), openai_compatible=probe)
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "custom", "n", "gemma3:4b",
+        typed_url, "sk-or-typed", "some-model",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=checks)
+
+    assert result.code == 0
+    assert seen, "the key was never verified against anything"
+    # Every call, not just the first: whatever asks this probe during the run,
+    # the address the user typed is the one it has to be asked about.
+    assert [url for _, url, _ in seen] == [typed_url] * len(seen)
+    assert seen[0][0] == "sk-or-typed"
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={typed_url}" in result.written
+    assert "OPENAI_COMPATIBLE_API_KEY=sk-or-typed" in result.written
+
+
+def test_a_mistyped_endpoint_fails_at_its_own_question_not_at_the_key(
+    tmp_path: Path,
+) -> None:
+    """A bad address is answered under the question that asked for it.
+
+    Without a check here the first thing to notice is the key probe, one
+    question later, which reports `could not reach` about a key that is fine -
+    the message lands next to the wrong mistake. The rules are Settings' own
+    (`config.clean_base_url`), not a second copy that could drift from what
+    startup will accept.
+    """
+    good = "https://openrouter.ai/api/v1"
+    seen: list[str] = []
+
+    def probe(key: str, url: str, model: str) -> Verdict:
+        seen.append(url)
+        return Verdict(True, "key works")
+
+    checks = replace(working_checks(), openai_compatible=probe)
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "custom", "n", "gemma3:4b",
+        "openrouter.ai/api/v1",  # no scheme
+        f"{good}/chat/completions",  # the whole endpoint URL, as vendor docs print it
+        good,
+        "sk-or-typed", "some-model",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=checks)
+
+    assert result.code == 0
+    assert "must start with http" in result.out
+    assert "must not include /chat/completions" in result.out
+    # The refused values never reached the probe, and never reached `.env`.
+    assert set(seen) == {good}
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={good}\n" in result.written
+    assert "chat/completions" not in result.written
+
+
 def test_offline_is_never_asked_whose_model(tmp_path: Path) -> None:
     # It resolves no hosted task, so the question would be about a bill nobody is
     # going to get - and the answer would be written into the file as if it meant
