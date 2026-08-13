@@ -150,14 +150,32 @@ one a requirement - that is a different act from starting a competing one.
 ## Can this collide with `daemon/voice/audio.py`?
 
 Yes, at the device: `SoundDeviceAudio` plays PCM through PortAudio while `say` is
-its own CoreAudio client, and nothing arbitrates between the two. The interlock is
-upstream and already exists. `daemon/proactivity/presence.py` reads
-`kAudioDevicePropertyDeviceIsRunningSomewhere`, and its docstring notes that this
-"cannot distinguish *our own* speaker from someone else's call" - so a live voice
-conversation reads `mic_busy=True`, and the gate declines before routing here.
-That over-broad reading is load-bearing rather than a wart, and it is why this file
-holds no lock against the voice path: the two cannot both be reached for the same
-tick unless the gate is bypassed.
+its own CoreAudio client, and nothing arbitrates between the two. This section
+used to say the interlock was upstream and this file needed none - that stopped
+being true on 2026-08-11 (docs/adr/0012), and the claim went uncorrected for
+weeks before the whole-branch review caught it.
+
+Before the split, `presence.py`'s probe genuinely could not tell our own speaker
+from someone else's call, so *any* audio in or out read `mic_busy=True` and the
+gate declined every proactive utterance for as long as voice was running -
+over-broad, but safe by accident. The split fixed the over-broad half on
+purpose: `mic_busy` now subtracts our own hold (`daemon/mic_hold.py`), so the
+wake listener does not permanently look like a call. That also removed the
+accidental safety: a live voice session holds the microphone through
+`daemon/voice/audio.py` or `daemon/voice/apple_audio.py` for its entire run, so
+`mic_busy` now reads `False` **because** we are the one on the call, and
+nothing else in a `Reading` says a session is live - `output_busy` is `False`
+between turns too, the same as silence. Mid-session, on the user's own turn,
+`Gate._route` can return `both`, and this file held no lock against the voice
+path to catch what the gate missed - `/usr/bin/say` would speak over the live
+session and into the microphone it is speaking through, PLAN 6.4's accident
+with an echo added.
+
+Fixed here rather than in the gate, for the same reason `presence.py` asks
+`daemon/mic_hold.py` instead of importing the voice layer directly: `say` now
+refuses outright while `daemon.mic_hold.held()` is true, logs it, and reports
+`False` - which costs nothing, per the same asymmetry every other refusal in
+this file already reports `False` instead of raising for.
 
 ## Never raising is the contract, not politeness
 
@@ -176,6 +194,8 @@ import shutil
 import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+from daemon import mic_hold
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +253,7 @@ class LocalSpeaker:
         voice: str | None = DEFAULT_VOICE,
         platform: str | None = None,
         spawn: Callable[..., Awaitable[Any]] | None = None,
+        mic_held: Callable[[], bool] | None = None,
     ) -> None:
         self._voice = voice
         # sys.platform for the same reason presence.py gives: a compile-time
@@ -244,6 +265,11 @@ class LocalSpeaker:
         # timeout-kill-reap logic is what gets tested instead of being faked away.
         # tests/CLAUDE.md forbids a test that makes the machine talk.
         self._spawn = spawn if spawn is not None else asyncio.create_subprocess_exec
+        # Same seam `presence.py` uses for the same module. `mic_hold` is a plain
+        # in-process counter, not hardware, so a test could call it directly -
+        # injectable anyway, for the same reason presence.py's is: a test should
+        # not have to touch a module-level global to make a case happen.
+        self._mic_held = mic_held if mic_held is not None else mic_hold.held
         self._speaking = asyncio.Lock()
         self._process: Any = None
 
@@ -283,6 +309,23 @@ class LocalSpeaker:
             # `Utterance.text` is how base.py spells *declining to speak*, which
             # must never be reported as speech.
             logger.debug("speaker: nothing to say")
+            return False
+
+        if self._mic_held():
+            # Finding 5, whole-branch review: a live voice session holds the
+            # microphone for its entire run (daemon/voice/audio.py,
+            # daemon/voice/apple_audio.py), and since docs/adr/0012 `mic_busy`
+            # subtracts exactly that hold before the gate ever sees it - so
+            # mid-session, on the user's own turn, `Gate._route` can return
+            # `both` with nothing in the `Reading` saying a call is live. See
+            # the module docstring's "Can this collide with
+            # daemon/voice/audio.py?" section. Refused here rather than
+            # upstream, for the same reason `presence.py` asks
+            # `daemon/mic_hold.py` instead of importing the voice layer.
+            logger.warning(
+                "speaker: refusing to speak while this process holds the "
+                "microphone (a wake listener or voice session is active)"
+            )
             return False
 
         argv = self.command()
