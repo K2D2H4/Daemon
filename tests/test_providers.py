@@ -23,6 +23,7 @@ from daemon.llm.base import (
     ToolSpec,
     decode_tool_arguments,
 )
+from daemon.llm.providers import openai_compatible
 from daemon.llm.providers.anthropic import AnthropicProvider
 from daemon.llm.providers.gemini import GeminiProvider
 from daemon.llm.providers.ollama import OllamaProvider
@@ -2016,15 +2017,86 @@ async def test_compatible_turns_a_timeout_into_a_provider_error_after_one_retry(
 
 
 async def test_compatible_never_reveals_the_key() -> None:
+    """Redact the whole body first, *then* bound it - not the other way around.
+
+    The body is built so a repetition of the key lands exactly on the raw
+    200-character cut. Slicing before redacting truncates that repetition to
+    `sk-live-do-not-leak-01`, which no longer exact-matches the key string and so
+    survives `_redact`'s `.replace()` - a real key prefix in a raised message:
+
+        openai_compatible rejected the request: HTTP 401 ... key sk-liv
+
+    The previous version of this test used a 45-character body wholly inside the
+    cut, so it passed whichever order the code used. A fragment assertion is what
+    makes it a test; `test_a_korean_error_body_from_a_compatible_endpoint_is_
+    bounded_and_redacted` in tests/test_setup.py is the same case for the wizard's
+    own probe, and this is its provider-side twin.
+    """
+    body = f"키 {SECRET} 가 거부되었습니다. " * 20
+    assert 200 in range(*_key_span(body, SECRET)), "the key must straddle the cut"
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, text=f"Incorrect API key provided: {SECRET}")
+        return httpx.Response(401, text=body)
 
     async with mock_client(handler) as client:
         provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
         with pytest.raises(ProviderError) as caught:
             await provider.complete(PROMPT, model="qwen-plus")
 
-    assert SECRET not in chain_text(caught.value)
+    said = chain_text(caught.value)
+    assert SECRET not in said
+    # Not merely the whole key - no recognizable fragment of it either. This is
+    # the assertion that fails against slice-then-redact.
+    assert SECRET[:12] not in said
+    # And genuinely redacted rather than cut short before reaching the key: the
+    # marker is the evidence that `_redact` ran on the whole body.
+    assert "<redacted>" in said
+    # The upstream diagnosis still arrives, and still bounded.
+    assert "거부되었습니다" in said
+    assert len(str(caught.value)) <= openai_compatible.BODY_LIMIT + 80
+
+
+def _key_span(body: str, key: str) -> tuple[int, int]:
+    """Where the last occurrence of `key` sits in `body`, as a `range` pair."""
+    start = body.rindex(key, 0, 200 + len(key))
+    return start, start + len(key)
+
+
+async def test_compatible_strips_an_escape_sequence_out_of_an_error_body() -> None:
+    # The same reason `_telegram_said` drops control characters: this text is
+    # untrusted and lands in a terminal, where an escape sequence would repaint
+    # whatever is printed after it.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="\x1b[2Jmodel not found\nfor this account")
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError) as caught:
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    said = str(caught.value)
+    assert "\x1b" not in said
+    assert "\n" not in said
+    assert "model not found for this account" in said
+
+
+async def test_compatible_retries_a_rate_limit_exactly_once() -> None:
+    # 429 shares its branch with 5xx (`status_code == 429 or status_code >= 500`)
+    # and only the 5xx half was exercised. A rate limit is the *likelier* half:
+    # OpenRouter's free tier is rate-limited by design.
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, text="rate limit exceeded")
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError, match="HTTP 429"):
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    assert calls == 2
 
 
 async def test_compatible_keeps_the_key_out_of_a_transport_failure_chain(

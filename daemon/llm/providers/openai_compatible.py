@@ -33,6 +33,13 @@ from daemon.llm.base import (
 
 DEFAULT_TIMEOUT = 60.0
 
+BODY_LIMIT = 200
+"""How much of an upstream error body reaches the exception message.
+
+Same figure as `daemon/setup.py`'s `BODY_LIMIT`, and for the same reason: enough
+of a 4xx body to name the cause, not enough for a stack trace to become the
+response body of whatever the endpoint was actually serving."""
+
 
 class OpenAICompatibleProvider:
     name = "openai_compatible"
@@ -156,6 +163,23 @@ class OpenAICompatibleProvider:
         """
         return text.replace(self._api_key, "<redacted>")
 
+    def _quoted(self, body: str) -> str:
+        """An upstream error body, in the order that makes it safe to quote.
+
+        Redact, collapse, strip, *then* bound - and the order is the whole point.
+        Slicing first can cut the key across the boundary, and `_redact`'s
+        `.replace()` only matches the key whole, so the remaining prefix survives
+        into the raised message. That leaked `HTTP 401 ... key sk-liv` from a real
+        401 body; `daemon/setup.py:check_openai_compatible` and `_telegram_said`
+        already fixed the same ordering and this module was written before them.
+
+        Whitespace is collapsed so words split across lines do not run together,
+        and non-printable characters go because an escape sequence in an upstream
+        body would otherwise repaint whatever a terminal prints after this.
+        """
+        collapsed = " ".join(self._redact(body).split())
+        return "".join(char for char in collapsed if char.isprintable())[:BODY_LIMIT]
+
     async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST with exactly one retry (llm/base.py: the gateway decides about
         fallback, providers do not build retry chains)."""
@@ -180,7 +204,7 @@ class OpenAICompatibleProvider:
                 # paid model on an unfunded account), 404 wrong endpoint or model.
                 raise ProviderError(
                     f"openai_compatible rejected the request: HTTP {response.status_code} "
-                    f"{self._redact(response.text[:200])}"
+                    f"{self._quoted(response.text)}"
                 )
             try:
                 data: dict[str, Any] = response.json()
