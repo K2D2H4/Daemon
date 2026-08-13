@@ -1114,9 +1114,8 @@ async def run_voice(
     if not settings.voice_enabled:
         logger.error("voice is off; set DAEMON_VOICE_ENABLED=true (see `daemon setup`)")
         return PROBLEM
-    # route_for raises with the specific reason - no voice route in this preset,
-    # voice disabled, no live model id - which is more use than anything this
-    # function could say about it.
+    # route_for raises with the specific reason - voice disabled, no live model
+    # id - which is more use than anything this function could say about it.
     route = settings.route_for(Task.CHAT_VOICE)
 
     harden_existing(settings.data_dir)

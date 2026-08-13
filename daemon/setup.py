@@ -187,6 +187,7 @@ DEFAULT_OPENAI_MODEL = "gpt-5.1"
 """Offered, then checked against the account's own model list before it is
 written - so a default that goes stale is a sentence here and a hint naming the
 ids that do exist, rather than a 404 at the first message."""
+DEFAULT_OPENAI_REALTIME_MODEL = "gpt-realtime"
 
 PRESET_ORDER = ("offline", "balanced", "quality")
 DEFAULT_PRESET = "balanced"
@@ -194,15 +195,16 @@ DEFAULT_PRESET = "balanced"
 PRESET_CHOICES: tuple[Choice, ...] = (
     Choice(
         "offline",
-        "Everything on this machine. No keys, no accounts. Voice unavailable.",
+        "Everything on this machine. No keys and no accounts, unless you add voice.",
         (
             "Conversation, the daily reflection and the decision to speak first all "
-            "run here through Ollama. Nothing leaves the machine.",
-            "Voice is not available, and that is the trade rather than a gap: "
-            "native-audio voice means a hosted model is both the brain and the "
-            "voice, and leaving that out is exactly what makes the privacy promise "
+            "run here through Ollama. With voice off, nothing leaves the machine.",
+            "Voice is the one thing you can opt into: native audio needs a hosted "
+            "model, so turning it on sends audio to the provider you choose, with "
+            "your own key. Leaving it off is exactly what makes the privacy promise "
             "true instead of aspirational (docs/PLAN.md 7).",
-            "Needs Ollama and two local models. No API keys and no accounts.",
+            "Needs Ollama and two local models. No API keys and no accounts until "
+            "you turn voice on.",
         ),
     ),
     Choice(
@@ -1127,10 +1129,21 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
     # answer stays empty - `providers_for` then drops the hosted tasks, so no
     # vendor's key is asked for on a guess.
     hosted = env.get("DAEMON_HOSTED_PROVIDER", "") or DEFAULT_HOSTED_PROVIDER
+    voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
+    # The wizard has no voice-provider question yet (it is admin-only), so an absent
+    # value means the field default rather than "nobody chose" - unlike `hosted`,
+    # this field *has* a default, and it is `gemini`. Hoisted to a local because the
+    # provider branches below need it too: a provider can be present for chat, for
+    # voice, or both, and only this value tells them which - `voice_on` alone does
+    # not, because voice can be on with a *different* provider.
+    voice_provider = env.get("DAEMON_VOICE_PROVIDER", "") or _settings_default(
+        "DAEMON_VOICE_PROVIDER"
+    )
     providers = providers_for(
         preset,
-        voice_enabled=_truthy(env.get("DAEMON_VOICE_ENABLED", "")),
+        voice_enabled=voice_on,
         hosted=hosted,
+        voice_provider=voice_provider,
     )
     needs: list[Need] = []
 
@@ -1186,33 +1199,59 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
         # question, because the default going stale is exactly what this wizard
         # exists to catch before the first conversation does.
     if OPENAI in providers:
+        # OpenAI can be here for two unrelated reasons - it is the hosted chat
+        # provider, or it is the voice provider - and the questions differ, so the
+        # reason has to be named rather than assumed. `voice_on` alone is not that
+        # reason: voice can be on with a *different* provider, and gating the realtime
+        # model on it then asks for an id Settings never reads. Mirrors GEMINI below.
+        openai_chat = hosted == OPENAI and HOSTED in PRESETS[preset].values()
+        openai_voice = voice_on and voice_provider == OPENAI
+        if openai_chat and openai_voice:
+            why = "One key covers both: GPT answers, and voice is OpenAI's too."
+        elif openai_chat:
+            why = "You chose GPT for the hosted work. Your key, your account, your bill."
+        else:
+            why = "Voice is on, so audio goes to OpenAI's realtime model - with your key."
         needs.append(
             Need(
                 key="OPENAI_API_KEY",
                 label="OpenAI API key",
-                why="You chose GPT for the hosted work. Your key, your account, your bill.",
+                why=why,
                 url=OPENAI_KEYS_URL,
                 secret=True,
             )
         )
-        needs.append(
-            Need(
-                key="DAEMON_OPENAI_MODEL",
-                label="OpenAI model id",
-                why="Which model answers. Settings has no default here, so an empty "
-                "value would refuse to start.",
-                default=env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
-                listed=True,
+        if openai_chat:
+            needs.append(
+                Need(
+                    key="DAEMON_OPENAI_MODEL",
+                    label="OpenAI model id",
+                    why="Which model answers. Settings has no default here, so an empty "
+                    "value would refuse to start.",
+                    default=env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
+                    listed=True,
+                )
             )
-        )
+        if openai_voice:
+            needs.append(
+                Need(
+                    key="DAEMON_OPENAI_REALTIME_MODEL",
+                    label="OpenAI Realtime model id",
+                    why="The realtime endpoint takes its own model id, not the text one.",
+                    default=env.get("DAEMON_OPENAI_REALTIME_MODEL")
+                    or DEFAULT_OPENAI_REALTIME_MODEL,
+                    listed=True,
+                )
+            )
     if GEMINI in providers:
         # Gemini can be here for two unrelated reasons - it is the hosted chat
-        # provider, or voice is on and native audio is Google's either way - and
-        # the questions differ, so the reason has to be named rather than assumed.
-        # It was assumed, back when voice was the only way to get here.
+        # provider, or it is the voice provider - and the questions differ, so the
+        # reason has to be named rather than assumed. It was assumed off `voice_on`,
+        # back when voice was always Google's; now voice can be OpenAI's while Gemini
+        # is only the chat model, so the Live id is gated on the provider, not the switch.
         gemini_chat = hosted == GEMINI and HOSTED in PRESETS[preset].values()
-        voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
-        if gemini_chat and voice_on:
+        gemini_voice = voice_on and voice_provider == GEMINI
+        if gemini_chat and gemini_voice:
             why = "One key covers both: Gemini answers, and voice is Google's too."
         elif gemini_chat:
             why = "You chose Gemini for the hosted work. Your key, your account, your bill."
@@ -1227,7 +1266,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 secret=True,
             )
         )
-        if voice_on:
+        if gemini_voice:
             needs.append(
                 Need(
                     key="DAEMON_GEMINI_LIVE_MODEL",
@@ -1240,22 +1279,25 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                     listed=True,
                 )
             )
-        needs.append(
-            Need(
-                key="DAEMON_GEMINI_MODEL",
-                label="Gemini text model id",
-                why="Which model answers."
-                if gemini_chat
-                else "Required alongside the Live id; not used by voice itself.",
-                default=env.get("DAEMON_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
-                # Settings resolves a model for every routed task, and the voice
-                # task routes to gemini, so this must be non-empty even when only
-                # voice brought us here. Asking twice for one capability is noise,
-                # so in that case it is filled in rather than asked.
-                silent=not gemini_chat,
-                listed=True,
+        if gemini_chat:
+            # The text model id is a *chat* need, gated on gemini_chat exactly like
+            # DAEMON_OPENAI_MODEL is gated on openai_chat above. Voice never reads it:
+            # route_for(CHAT_VOICE) resolves gemini_live_model, and _provider_problems
+            # returns before the model check for voice tasks - so a voice-only Gemini
+            # (say OpenRouter for chat, Gemini for audio) does not need it, and asking
+            # for it made `daemon setup --check` demand a value `daemon doctor` was
+            # perfectly happy without. It used to be appended unconditionally with a
+            # silent auto-fill and a comment claiming voice routing required it; both
+            # were wrong.
+            needs.append(
+                Need(
+                    key="DAEMON_GEMINI_MODEL",
+                    label="Gemini text model id",
+                    why="Which model answers.",
+                    default=env.get("DAEMON_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
+                    listed=True,
+                )
             )
-        )
     if OPENAI_COMPATIBLE in providers:
         current_url = env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", "")
         needs.append(
@@ -1890,7 +1932,7 @@ class Wizard:
         self._step(2, "How should Daemon think?")
         preset = self._choose_preset(env, updates)
         hosted = self._choose_hosted(preset, env, updates)
-        voice = self._choose_voice(preset, hosted, env, updates)
+        voice = self._choose_voice(env, updates)
 
         merged = {
             **env,
@@ -2250,25 +2292,14 @@ class Wizard:
         if vendor.model and not env.get("DAEMON_OPENAI_COMPATIBLE_MODEL"):
             updates["DAEMON_OPENAI_COMPATIBLE_MODEL"] = vendor.model
 
-    def _choose_voice(
-        self, preset: str, hosted: str, env: Mapping[str, str], updates: dict[str, str]
-    ) -> bool:
-        # `hosted` is passed even though CHAT_VOICE is pinned to Gemini today: the
-        # question is whether this preset has a voice task at all, and answering it
-        # from a table with an unresolved placeholder in it is how the wrong key
-        # gets asked for the moment that pinning changes.
-        if GEMINI not in providers_for(preset, voice_enabled=True, hosted=hosted):
-            self.prompt.say(f"Voice is not part of the {preset} preset: native audio has to")
-            self.prompt.say("run on a hosted model, and leaving it out is what makes 'nothing")
-            self.prompt.say("leaves this machine' literally true. Text mode is the whole product.")
-            self.prompt.say()
-            return False
-
+    def _choose_voice(self, env: Mapping[str, str], updates: dict[str, str]) -> bool:
+        # No preset gate: every preset can carry voice now (ADR 0012), and the
+        # trade is stated in the question itself rather than by refusing to ask it.
         raw = env.get("DAEMON_VOICE_ENABLED", "")
         was = _truthy(raw) if raw else False
-        self.prompt.say("Turn voice on? Audio then goes to Google's native-audio model,")
-        self.prompt.say("with your own key. Off means no audio ever leaves this machine,")
-        self.prompt.say("and text mode loses nothing by it.")
+        self.prompt.say("Turn voice on? Audio then goes to your voice provider's native-audio")
+        self.prompt.say("model, with your own key. Off means no audio ever leaves this")
+        self.prompt.say("machine, and text mode loses nothing by it.")
         if raw:
             self.prompt.say(f"Currently {'on' if was else 'off'}. {KEEP_HINT}")
         enabled = self.prompt.ask_yes_no("Enable voice", default=was)
