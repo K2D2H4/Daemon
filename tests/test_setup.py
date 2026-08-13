@@ -2097,8 +2097,10 @@ def test_choosing_a_known_vendor_fills_the_address_and_never_names_it(
         working_checks(),
         openai_compatible=lambda key, url, model: Verdict(True, "key works"),
     )
+    # The endpoint question is asked with the vendor's address already filled in,
+    # so KEEP is how that prefill is accepted.
     answers = [
-        TOOLS_YES, "2", "openai_compatible", "qwen", "n", "gemma3:4b", "sk-qwen-x", "",
+        TOOLS_YES, "2", "openai_compatible", "qwen", "n", "gemma3:4b", KEEP, "sk-qwen-x", "",
         GOOD_TOKEN, "y", "", "", "", "n",
     ]
 
@@ -2127,7 +2129,7 @@ def test_the_env_the_wizard_writes_for_a_compatible_endpoint_loads_and_routes(
         openai_compatible=lambda key, url, model: Verdict(True, "key works"),
     )
     answers = [
-        TOOLS_YES, "2", "openai_compatible", "deepseek", "n", "gemma3:4b", "sk-ds-x", "",
+        TOOLS_YES, "2", "openai_compatible", "deepseek", "n", "gemma3:4b", KEEP, "sk-ds-x", "",
         GOOD_TOKEN, "y", "", "", "", "n",
     ]
 
@@ -2168,8 +2170,12 @@ def test_enter_at_a_saved_vendor_keeps_that_vendor_not_the_first_one(
         openai_compatible=lambda key, url, model: Verdict(True, "key works"),
     )
     # Every question already decided is answered with Enter, including the
-    # vendor sub-question - which is the one this test exists to hold honest.
-    answers = [KEEP, KEEP, KEEP, KEEP, "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y", "", "", "", "n"]
+    # vendor sub-question - which is the one this test exists to hold honest -
+    # and the endpoint question it prefills.
+    answers = [
+        KEEP, KEEP, KEEP, KEEP, "n", "gemma3:4b", KEEP, KEEP,
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
 
     result = drive(tmp_path, answers, existing=existing, checks=checks)
 
@@ -2199,7 +2205,10 @@ def test_enter_at_a_saved_custom_endpoint_keeps_it_rather_than_naming_a_vendor(
         working_checks(),
         openai_compatible=lambda key, url, model: Verdict(True, "key works"),
     )
-    answers = [KEEP, KEEP, KEEP, KEEP, "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y", "", "", "", "n"]
+    answers = [
+        KEEP, KEEP, KEEP, KEEP, "n", "gemma3:4b", KEEP, KEEP,
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
 
     result = drive(tmp_path, answers, existing=existing, checks=checks)
 
@@ -2288,6 +2297,40 @@ def test_a_mistyped_endpoint_fails_at_its_own_question_not_at_the_key(
     assert set(seen) == {good}
     assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={good}\n" in result.written
     assert "chat/completions" not in result.written
+
+
+def test_a_re_run_can_move_a_custom_endpoint_to_a_new_address(tmp_path: Path) -> None:
+    """The wizard has to be able to change a custom endpoint, not only leave it.
+
+    `_choose_compatible_endpoint` offers the service menu on a re-run, but
+    answering `custom` wrote nothing, and `needs_for` then dropped the endpoint
+    question because `.env` already held a value - so no question was ever asked
+    and the old address survived. That is the unreachable-answer problem
+    `KEEP_HINT` exists to remove, and it left the wizard able to move between
+    known vendors but never onto, off, or between custom URLs.
+    """
+    old_url = "https://llm.internal/v1"
+    new_url = "https://llm2.internal/v1"
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai_compatible\n"
+        f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={old_url}\n"
+        "DAEMON_OPENAI_COMPATIBLE_MODEL=my-model\n"
+        "OPENAI_COMPATIBLE_API_KEY=sk-custom-x\n"
+    )
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    answers = [
+        KEEP, KEEP, KEEP, "custom", "n", "gemma3:4b", new_url, KEEP,
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, existing=existing, checks=checks)
+
+    assert result.code == 0
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={new_url}" in result.written
+    assert old_url not in result.written
 
 
 def test_offline_is_never_asked_whose_model(tmp_path: Path) -> None:
@@ -3534,6 +3577,41 @@ def test_needs_asks_for_endpoint_key_and_model_when_compatible_is_chosen() -> No
     assert "DAEMON_OPENAI_COMPATIBLE_MODEL" in keys
     # The endpoint is asked before the key, because the probe needs it.
     assert keys.index("DAEMON_OPENAI_COMPATIBLE_BASE_URL") < keys.index("OPENAI_COMPATIBLE_API_KEY")
+
+
+def test_a_saved_endpoint_is_asked_again_but_a_saved_key_is_not() -> None:
+    # A decided address has to stay changeable by re-running this command
+    # (KEEP_HINT), and the service sub-question cannot do it: answering `custom`
+    # has nothing to prefill, so it wrote nothing and this filter then dropped the
+    # question - leaving no way to edit a custom URL at all. A *credential* is the
+    # other case: nobody wants to re-paste a working key.
+    keys = [
+        need.key
+        for need in setup.needs_for(
+            {
+                "DAEMON_PRESET": "balanced",
+                "DAEMON_HOSTED_PROVIDER": "openai_compatible",
+                "DAEMON_OPENAI_COMPATIBLE_BASE_URL": "https://llm.internal/v1",
+                "OPENAI_COMPATIBLE_API_KEY": "sk-saved",
+            }
+        )
+    ]
+
+    assert "DAEMON_OPENAI_COMPATIBLE_BASE_URL" in keys
+    assert "OPENAI_COMPATIBLE_API_KEY" not in keys
+    endpoint = next(
+        need
+        for need in setup.needs_for(
+            {
+                "DAEMON_PRESET": "balanced",
+                "DAEMON_HOSTED_PROVIDER": "openai_compatible",
+                "DAEMON_OPENAI_COMPATIBLE_BASE_URL": "https://llm.internal/v1",
+            }
+        )
+        if need.key == "DAEMON_OPENAI_COMPATIBLE_BASE_URL"
+    )
+    # And asked with the saved value as its default, so Enter keeps it.
+    assert endpoint.default == "https://llm.internal/v1"
 
 
 def test_offline_never_asks_about_a_compatible_endpoint() -> None:

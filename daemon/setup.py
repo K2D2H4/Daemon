@@ -1298,16 +1298,24 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
             skippable=True,
         )
     )
-    # A value already in the file drops out - except a model id, which is asked
-    # again with the current value as its default. The reasoning is the preset's,
-    # one layer down: a decided model id was unreachable, so the only way to change
-    # one was to hand-edit `.env`, and this command exists to remove that. A
-    # *credential* is different - nobody wants to re-paste a working key, and the
-    # question would print a secret back at them.
+    # A value already in the file drops out - except a model id and the compatible
+    # endpoint, which are asked again with the current value as their default. The
+    # reasoning is the preset's, one layer down: a decided answer was unreachable,
+    # so the only way to change it was to hand-edit `.env`, and this command exists
+    # to remove that. A *credential* is different - nobody wants to re-paste a
+    # working key, and the question would print a secret back at them.
+    #
+    # The endpoint has to be here rather than relying on the service sub-question,
+    # which offers `custom URL` and then has nothing to prefill: it wrote nothing,
+    # this filter dropped the question, and so a re-run could move an install
+    # between *known* vendors but never onto, off, or between custom addresses -
+    # with no question ever asked about it. That is KEEP_HINT's own defect.
     return [
         need
         for need in needs
-        if need.listed or not env.get(need.key)
+        if need.listed
+        or need.key == "DAEMON_OPENAI_COMPATIBLE_BASE_URL"
+        or not env.get(need.key)
     ]
 
 
