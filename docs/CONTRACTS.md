@@ -18,7 +18,7 @@ daemon/
   llm/
     base.py           Provider protocol, Message, Completion. FROZEN.
     gateway.py        LLMGateway: routes Task -> Provider
-    providers/        ollama.py, anthropic.py, openai.py, gemini.py
+    providers/        ollama.py, anthropic.py, openai.py, gemini.py, openai_compatible.py
   channels/
     base.py           Channel protocol, InboundMessage, OutboundMessage. FROZEN.
     telegram.py
@@ -250,7 +250,7 @@ Still out of scope: the `osascript`-under-LaunchAgent question (PLAN.md §6.3.1)
 The type-E associative candidate generator (PLAN.md §6.1) that used to be listed
 here is built — `daemon/proactivity/candidates.py`'s `association_candidates`,
 wired into `daemon/proactivity/tick.py` — and its one exception to "no user text
-in a reason" is docs/adr/0012.
+in a reason" is docs/adr/0013.
 
 Pointing `daemon/proactivity/judge.py` at learned rules used to be out of scope
 too — it deliberately stayed seed-only, a separate decision from M4

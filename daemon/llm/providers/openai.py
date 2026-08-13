@@ -201,7 +201,10 @@ class OpenAIProvider:
                 # and the gateway should fall back instead.
                 raise ProviderError(
                     f"openai rejected the request: HTTP {response.status_code} "
-                    f"{self._redact(response.text[:200])}"
+                    # Redact the whole body before slicing - the cut can land inside
+                    # a key the response echoed back, and a truncated key no longer
+                    # matches `_redact`'s exact-string `.replace()`.
+                    f"{self._redact(response.text)[:200]}"
                 )
             try:
                 data: dict[str, Any] = response.json()

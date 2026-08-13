@@ -23,7 +23,7 @@ import logging
 from daemon import clock
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
-from daemon.llm.base import Message
+from daemon.llm.base import Message, ProviderError
 from daemon.llm.gateway import LLMGateway
 from daemon.memory.base import LoggedMessage
 from daemon.tasks import Task
@@ -214,10 +214,30 @@ class ConversationLoop:
                 # Asked again with no tools on offer, so the answer cannot be
                 # another tool call. Breaking without this would reply with the
                 # empty text that came back alongside the calls.
-                completion = await self._gateway.complete(
-                    Task.CHAT_TEXT,
-                    [*messages, Message(role="system", content=ROUND_LIMIT_NOTICE)],
-                )
+                try:
+                    completion = await self._gateway.complete(
+                        Task.CHAT_TEXT,
+                        [*messages, Message(role="system", content=ROUND_LIMIT_NOTICE)],
+                    )
+                except ProviderError:
+                    # A reasoning model can spend this whole call's output budget on
+                    # reasoning tokens and return neither text nor a tool call - the
+                    # provider contract (llm/base.py) requires raising for exactly
+                    # that emptiness rather than returning it. The `not
+                    # completion.text.strip()` check below already forgives that
+                    # emptiness when it comes back as an empty completion; this call
+                    # is the one place it can arrive as a raise instead, because it
+                    # is the only call made with no tools on offer. A first-call or
+                    # mid-loop ProviderError is a genuine failure on an ordinary turn
+                    # and must still reach run()'s FAILURE_NOTICE - only this last
+                    # call, already past the round cap and just trying to summarise,
+                    # degrades to the same notice as empty text.
+                    logger.warning(
+                        "tool round limit (%d) escape call raised; sending the "
+                        "incomplete notice",
+                        self._max_tool_rounds,
+                    )
+                    return INCOMPLETE_NOTICE, outcome
                 break
             rounds += 1
 

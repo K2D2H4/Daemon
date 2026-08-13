@@ -154,19 +154,21 @@ def settings(**overrides: Any) -> Settings:
     one rule it names. The defaults themselves are asserted in their own tests.
 
     `voice_enabled=True` under the offline preset used to need a `model_construct`
-    escape hatch here: `Settings` refused the combination outright, because the
-    switch was overloaded to also mean "the hosted conversation route exists,"
-    which the offline preset never satisfies. Now that the switch's two meanings
-    are checked where each is actually needed - the routed-session check moved to
-    session start - the offline preset legitimately allows `voice_enabled=True`
-    (it is what lets `/usr/bin/say` run without a route), so this builds like any
-    other `Settings` call.
+    escape hatch here, because `Settings` refused the combination outright: the
+    preset table decided whether voice was possible, and `offline` carried no
+    voice row. ADR 0012 made voice its own axis, so the combination is now
+    ordinary - but turning voice on is still an explicit act that names a hosted
+    provider, so the voice model and key are supplied here rather than bypassed.
+    Constructing a configuration that is actually valid beats constructing one
+    that skips its own validator.
     """
     base: dict[str, Any] = {
         "preset": "offline",
         "proactive_enabled": True,
         "proactive_quiet_hours": "",
         "voice_enabled": True,
+        "gemini_api_key": "k",
+        "gemini_live_model": "m",
     }
     return Settings(_env_file=None, **{**base, **overrides})
 

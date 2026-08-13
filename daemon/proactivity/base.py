@@ -28,7 +28,7 @@ speaker, because the failure it risks is the expensive one.
 both audio directions, and merging them is what made the wake listener silence the
 speaker route: it holds the input device, and the gate read that as a call. Split
 into `mic_busy` (ours subtracted) and `output_busy`, plus three probes the routing
-table needs. See docs/adr/0012.
+table needs. See docs/adr/0013.
 """
 
 from __future__ import annotations

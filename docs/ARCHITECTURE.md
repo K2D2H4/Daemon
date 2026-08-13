@@ -56,7 +56,7 @@ flowchart LR
 
   subgraph out["providers"]
     OLL["ollama"]
-    HOST["anthropic · openai · gemini"]
+    HOST["anthropic · openai · gemini · openai_compatible"]
     LIVE["voice/gemini_live.py<br/>native audio"]
   end
 
@@ -129,7 +129,7 @@ both macOS-only. On demand, `see_screen` (`daemon/tools/screen.py`) shells out t
 `screencapture`+`sips` — no new dependency — and returns `ToolOutput(content, images)`;
 `daemon/tools/runner.py` carries `images` onto `ToolResult`, and `daemon/loop.py` attaches
 them as a fresh `user` turn framed by `screen_note` rather than inside the `tool`-role
-message, because a `user` turn holding an image is the one shape all four providers
+message, because a `user` turn holding an image is the one shape all five providers
 accept (ADR 0009). Live and voice-only, `start_screen_share`/`stop_screen_share` toggle a
 `ScreenSharePump` (`daemon/voice/screen_share.py`, the one file in this stack that imports
 Pillow) that captures at `screen_fps` (default 1), dhashes each frame against the last one
@@ -286,7 +286,7 @@ reconstructed. The microphone and the output device used to be one `audio_busy` 
 splitting them was necessary once the wake listener started holding the microphone
 whenever `DAEMON_WAKE_ENABLED` is on, because the merged bool then read the daemon's
 own wake hold as "on a call" and made the speaker route unreachable while voice was
-switched on ([docs/adr/0012](adr/0012-split-the-presence-signals.md)).
+switched on ([docs/adr/0013](adr/0013-split-the-presence-signals.md)).
 
 **Blocking and routing are different decisions**, and PLAN.md 6.4's asymmetry is why:
 an ignored Telegram message costs nothing, a voice out of the laptop during a meeting
@@ -299,7 +299,7 @@ second switch, `DAEMON_PROACTIVE_SPEAKER_ENABLED`, used to exist for the same re
 paragraph above states (the two failure costs are not comparable), but `Gate._route`
 already carries that asymmetry in its own seven rules, so the second switch only bought
 "voice on" meaning two different things depending which file was read. Merged into one,
-2026-08-11 (docs/adr/0012):
+2026-08-11 (docs/adr/0013):
 
 | | |
 |---|---|
@@ -387,7 +387,7 @@ otherwise speaking is its own excuse to speak.
 
 | protocol | in | implementations |
 |---|---|---|
-| `Provider` | `daemon/llm/base.py` | ollama · anthropic · openai · gemini |
+| `Provider` | `daemon/llm/base.py` | ollama · anthropic · openai · gemini · openai_compatible |
 | `Embedder` | `daemon/llm/base.py` | ollama (`bge-m3`) |
 | `Channel` | `daemon/channels/base.py` | telegram |
 | `Cursor` | `daemon/channels/base.py` | `memory.store.Store` |
@@ -426,9 +426,11 @@ a loop that wakes 288 times a day and whose correct answer is usually silence �
 answering a contentless reason with an empty pleasantry (PLAN.md 6.2.1) is the reason
 somebody would.
 
-`Task.CHAT_VOICE` is pinned to Gemini: in native audio the model *is* both the
-brain and the voice, so it cannot be pointed at a provider without a voice
-session.
+`Task.CHAT_VOICE` is its own third axis, `DAEMON_VOICE_PROVIDER` (gemini or openai) -
+independent of the preset and of `DAEMON_HOSTED_PROVIDER`, and never `anthropic`: in
+native audio the model *is* both the brain and the voice, so it cannot be pointed at
+a provider without a voice session. See
+[ADR 0012](adr/0012-voice-is-its-own-axis.md).
 
 `Task.PERSONA_RULE` follows `Task.REFLECTION`'s routing in every preset: both
 write conclusions that propagate into everything downstream of them — the

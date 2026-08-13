@@ -33,6 +33,7 @@ from daemon.config import (
     GEMINI,
     OLLAMA,
     OPENAI,
+    OPENAI_COMPATIBLE,
     ConfigError,
     Settings,
 )
@@ -480,6 +481,7 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
     from daemon.llm.providers.gemini import GeminiProvider
     from daemon.llm.providers.ollama import OllamaProvider
     from daemon.llm.providers.openai import OpenAIProvider
+    from daemon.llm.providers.openai_compatible import OpenAICompatibleProvider
 
     wanted = {route.provider for route in settings.routing_table().values()}
     fallback = settings.fallback_route()
@@ -498,10 +500,16 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
             providers[name] = GeminiProvider(
                 settings.gemini_api_key, thinking_level=settings.gemini_thinking_level
             )
+        elif name == OPENAI_COMPATIBLE:
+            providers[name] = OpenAICompatibleProvider(
+                settings.openai_compatible_api_key,
+                settings.openai_compatible_base_url,
+            )
         else:
             raise ConfigError(
                 f"routing names provider {name!r}, which has no implementation yet "
-                f"(M1a ships {OLLAMA} and {ANTHROPIC})"
+                f"(this build ships {OLLAMA}, {ANTHROPIC}, {OPENAI}, {GEMINI} and "
+                f"{OPENAI_COMPATIBLE})"
             )
     return providers
 
@@ -1115,21 +1123,18 @@ async def run_voice(
     if not settings.voice_enabled:
         logger.error("voice is off; set DAEMON_VOICE_ENABLED=true (see `daemon setup`)")
         return PROBLEM
-    # Moved here from `Settings._check` (config.py), not deleted: these two used to
-    # fire on `voice_enabled` alone, at load time. That was correct while the
-    # switch meant only "a hosted voice session may run", and became wrong once it
-    # also came to mean "a proactive line may come out of the local speaker" -
-    # `/usr/bin/say` needs neither a route nor a model, so refusing to *load*
-    # `Settings` over them took the `offline` install's only voice feature away
-    # along with the daemon itself. A hosted session is the only thing these two
-    # guard, and opening one is the only thing this function does - so they run
-    # right here, where that actually happens, with the same messages as before.
-    problems = [
-        f"DAEMON_VOICE_ENABLED is on but {problem}"
-        for problem in settings.voice_session_problems()
-    ]
-    if problems:
-        raise ConfigError("; ".join(problems))
+    # `Settings._check` has already applied `voice_session_problems()` at load
+    # time, so there is deliberately no second application here. It briefly lived
+    # in this function, while `voice_enabled` meant both "a hosted session may
+    # run" and "a proactive line may leave the local speaker" and the `offline`
+    # preset could satisfy only the second - checking at load then stopped
+    # `Settings` from loading at all, which stops the daemon. ADR 0012 removed
+    # that premise by making voice its own axis, which put the checks back where
+    # they belong, and a repeat here would only be a branch no configuration can
+    # reach.
+    #
+    # route_for raises with the specific reason - voice disabled, no live model
+    # id - which is more use than anything this function could say about it.
     route = settings.route_for(Task.CHAT_VOICE)
 
     harden_existing(settings.data_dir)

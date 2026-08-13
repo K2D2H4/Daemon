@@ -973,7 +973,7 @@ section{padding:48px 0}
         <div class="say" data-out>daemon is awake. say "hey daemon".</div>
       </div>
     </div>
-    <p class="muted" style="max-width:720px;font-size:12px"><code>daemon setup</code> asks where the thinking should happen, whose model, and a Telegram bot token. Pick <code>offline</code> and you need no API key at all — just Ollama.</p>
+    <p class="muted" style="max-width:720px;font-size:12px"><code>daemon setup</code> asks where the thinking should happen, whose model, and a Telegram bot token. Pick <code>offline</code> and you need no API key at all — just Ollama, unless you turn voice on.</p>
   </div>
 </section>
 
@@ -1139,7 +1139,7 @@ Rule added → do not open with a greeting before 09:00.</div>
     <span class="lab">07 &nbsp;YOUR DATA, AND WHERE IT GOES</span>
     <ul class="stack" style="gap:16px;max-width:760px">
       <li class="muted">Memory and personality are <strong style="color:var(--tb)">files on your machine</strong>. Nothing is synced.</li>
-      <li class="muted"><strong style="color:var(--tb)">Text mode with a local model is fully offline.</strong> The <code>offline</code> preset routes every task to Ollama and has no voice route at all.</li>
+      <li class="muted"><strong style="color:var(--tb)">Text mode with a local model is fully offline.</strong> The <code>offline</code> preset routes every task to Ollama; voice is the one thing you can opt into, and leaving it off is what makes this true.</li>
       <li class="muted"><strong style="color:var(--tb)">Voice sends audio to the provider you chose</strong>, with your own key. Turn voice off and it does not.</li>
       <li class="muted"><strong style="color:var(--tb)">Telegram means your messages cross Telegram's servers.</strong> It is the first channel because it is the only one that reaches your phone for free.</li>
       <li class="muted">Hosted models are <strong style="color:var(--tb)">bring-your-own-key</strong> throughout, with a hard spend limit.</li>

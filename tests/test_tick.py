@@ -66,13 +66,13 @@ def settings(**overrides: Any) -> Settings:
         "proactive_enabled": True,
         "proactive_quiet_hours": "",
     }
-    # `voice_enabled=True` under the offline preset used to need a
-    # `model_construct` escape hatch here, because `Settings` refused it outright
-    # (the switch was overloaded to also mean "the hosted conversation route
-    # exists," which offline never satisfies). That routed-session check now
-    # lives at session start instead, so the offline preset legitimately allows
-    # `voice_enabled=True` - it is what lets `/usr/bin/say` run without a route -
-    # and this builds like any other `Settings` call.
+    # A caller passing `voice_enabled=True` gets the voice model and key with it:
+    # ADR 0012 made voice its own axis, so `offline` + voice is an ordinary
+    # configuration, but turning voice on still names a hosted provider and the
+    # validator still asks for its model and key. Supplying them beats bypassing
+    # the validator, which is what the `model_construct` hatch here used to do.
+    if overrides.get("voice_enabled"):
+        base |= {"gemini_api_key": "k", "gemini_live_model": "m"}
     return Settings(_env_file=None, **{**base, **overrides})
 
 

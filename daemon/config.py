@@ -25,6 +25,7 @@ OLLAMA = "ollama"
 ANTHROPIC = "anthropic"
 OPENAI = "openai"
 GEMINI = "gemini"
+OPENAI_COMPATIBLE = "openai_compatible"
 
 # Env var carrying the API key, or None for a provider that needs no key.
 # Every name here is buildable: tests/test_reachable.py fails if one is nameable
@@ -34,6 +35,7 @@ PROVIDER_KEY_ENV: dict[str, str | None] = {
     ANTHROPIC: "ANTHROPIC_API_KEY",
     OPENAI: "OPENAI_API_KEY",
     GEMINI: "GEMINI_API_KEY",
+    OPENAI_COMPATIBLE: "OPENAI_COMPATIBLE_API_KEY",
 }
 
 HOSTED = "hosted"
@@ -49,9 +51,13 @@ CHAT_VOICE is deliberately not HOSTED: it names GEMINI because Gemini Live is th
 only native-audio session implemented, and pointing it at a provider with no voice
 session would fail at the first voice turn instead of at startup."""
 
-HOSTED_PROVIDERS = ("anthropic", "openai", "gemini")
+HOSTED_PROVIDERS = ("anthropic", "openai", "gemini", "openai_compatible")
 """What DAEMON_HOSTED_PROVIDER accepts. Ollama is not here - "hosted" is the
-opposite of local, and the offline preset never resolves HOSTED at all."""
+opposite of local, and the offline preset never resolves HOSTED at all.
+
+`openai_compatible` is one name for many vendors on purpose: Qwen, Kimi,
+DeepSeek, OpenRouter and a self-hosted server differ by endpoint, not by
+protocol, so the endpoint is configuration and the protocol is the provider."""
 
 VOICE_TASKS = frozenset({Task.CHAT_VOICE})
 """Tasks that need a hosted native-audio model. The offline preset has none."""
@@ -105,8 +111,10 @@ PortAudio."""
 #   - PROACTIVE_JUDGE stays local except under `quality`: it runs on a 5-minute
 #     tick, so hosted cost accumulates whether or not it ever speaks.
 #   - PERSONA_RULE follows REFLECTION; both propagate into the whole graph.
-#   - CHAT_VOICE is deliberately ABSENT from `offline`. That absence is what
-#     makes the privacy promise in docs/PLAN.md 7 literally true.
+#   - CHAT_VOICE is absent from `offline` because no *preset* implies voice; the
+#     axis is DAEMON_VOICE_ENABLED, and `Settings.routing` adds the row when that
+#     is on (ADR 0012). What makes the promise in docs/PLAN.md 7 literally
+#     true is voice being off - which is what that promise says.
 PRESETS: dict[str, dict[Task, str]] = {
     "offline": {
         Task.CHAT_TEXT: OLLAMA,
@@ -175,6 +183,39 @@ the time it is needed; before then this is the honest stand-in and hosted tasks
 drop out of any enumeration rather than being guessed at."""
 
 
+def clean_base_url(value: str) -> str:
+    """The compatible endpoint, normalised - or `ValueError` naming the mistake.
+
+    Strips the trailing slash and refuses the whole endpoint URL. Vendor docs
+    print `.../v1/chat/completions`, and pasting that whole line is the
+    predictable mistake. Left alone the provider appends the path a second time
+    and the resulting 404 explains nothing. Rejected rather than quietly
+    repaired, and the message carries the value to use instead - the same choice
+    QUIET_HOURS_RE makes: loud beats degraded.
+
+    A module-level function rather than only a validator body, because
+    `daemon/setup.py` has to be able to answer the same question *at the question
+    that asks for it*: a bad address caught only by `Settings` surfaces one
+    question later as a key that "could not be verified", which puts the message
+    next to the wrong mistake. One authority, not two that can drift - the
+    wizard must never accept a value startup will refuse.
+    """
+    text = value.strip().rstrip("/")
+    if not text:
+        return ""
+    if not text.startswith(("http://", "https://")):
+        raise ValueError(
+            f"DAEMON_OPENAI_COMPATIBLE_BASE_URL must start with http:// or https:// - "
+            f"got {text!r}"
+        )
+    if text.endswith("/chat/completions"):
+        raise ValueError(
+            "DAEMON_OPENAI_COMPATIBLE_BASE_URL must not include /chat/completions - "
+            f"use {text.removesuffix('/chat/completions')}"
+        )
+    return text
+
+
 def preset_providers(preset: str, hosted: str) -> dict[Task, str]:
     """A preset's table with HOSTED resolved to a real provider name.
 
@@ -199,30 +240,37 @@ def providers_for(
     *,
     voice_enabled: bool,
     hosted: str = DEFAULT_HOSTED_PROVIDER,
+    voice_provider: str,
 ) -> list[str]:
     """Providers a preset actually needs, so onboarding asks for those keys only.
 
-    Voice tasks are excluded while voice is off - the same rule as
-    `Settings.active_tasks`. That is what lets a text-only `balanced` install be
-    set up without a hosted voice key (docs/PLAN.md 6.5).
+    Voice contributes only while voice is on - that is what lets a text-only
+    `balanced` install be set up without a hosted voice key (docs/PLAN.md 6.5) - and
+    when it does, it contributes `voice_provider` under *every* preset, `offline`
+    included (ADR 0012).
 
     `hosted` resolves the HOSTED placeholder and is required: a caller that guesses
     it asks the user for the wrong key, which is how a person who chose GPT ends up
     being asked for an Anthropic one. Pass "" before the question has been answered
     and hosted tasks simply drop out of the list.
+
+    `voice_provider` is required for the same reason, and is not defaulted here even
+    though the field has a default: reading CHAT_VOICE from the preset table instead
+    asked a user who had chosen OpenAI voice for a Gemini key.
     """
     if preset not in PRESETS:
         raise ConfigError(
             f"unknown preset {preset!r}; expected one of {', '.join(sorted(PRESETS))}"
         )
-    return sorted(
-        {
-            provider
-            for task, provider in preset_providers(preset, hosted).items()
-            # An unanswered question contributes nothing rather than a guess.
-            if (voice_enabled or task not in VOICE_TASKS) and provider != HOSTED
-        }
-    )
+    providers = {
+        provider
+        for task, provider in preset_providers(preset, hosted).items()
+        # An unanswered question contributes nothing rather than a guess.
+        if task not in VOICE_TASKS and provider != HOSTED
+    }
+    if voice_enabled:
+        providers.add(voice_provider)
+    return sorted(providers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +346,17 @@ class Settings(BaseSettings):
     anthropic_model: str = Field(default="claude-sonnet-5", alias="DAEMON_ANTHROPIC_MODEL")
     openai_model: str = Field(default="", alias="DAEMON_OPENAI_MODEL")
     gemini_model: str = Field(default="", alias="DAEMON_GEMINI_MODEL")
+    openai_compatible_model: str = Field(
+        default="", alias="DAEMON_OPENAI_COMPATIBLE_MODEL"
+    )
+    openai_compatible_base_url: str = Field(
+        default="", alias="DAEMON_OPENAI_COMPATIBLE_BASE_URL"
+    )
+    """Which OpenAI-compatible endpoint answers, up to and including the version
+    segment - `https://api.deepseek.com/v1`, not the `/chat/completions` below it.
+
+    No default, deliberately, for the reason `DAEMON_GEMINI_LIVE_MODEL` has none:
+    a guessed endpoint fails at the first conversation instead of at startup."""
 
     gemini_thinking_level: str = Field(default="low", alias="DAEMON_GEMINI_THINKING_LEVEL")
     """How hard a Gemini 3 model thinks before answering: `low`, `high`, or empty
@@ -523,6 +582,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    openai_compatible_api_key: str = Field(default="", alias="OPENAI_COMPATIBLE_API_KEY")
 
     telegram_dm_policy: str = Field(default="pairing", alias="DAEMON_TELEGRAM_DM_POLICY")
     """How an unknown sender is handled. `pairing` is the default because the
@@ -809,6 +869,13 @@ class Settings(BaseSettings):
             return tuple(part.strip() for part in text.split(",") if part.strip())
         return value
 
+    @field_validator("openai_compatible_base_url", mode="before")
+    @classmethod
+    def _clean_base_url(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        return clean_base_url(value)
+
     @model_validator(mode="after")
     def _check(self) -> Settings:
         if self.preset not in PRESETS:
@@ -891,22 +958,26 @@ class Settings(BaseSettings):
                 "only to open a voice session, so set DAEMON_VOICE_ENABLED=true or switch "
                 "the gate off"
             )
-        # These two used to fire on `voice_enabled` alone. That was correct while
-        # the switch meant only "a hosted voice session may run", and became wrong
-        # when it also came to mean "a proactive line may come out of the local
-        # speaker" - because `/usr/bin/say` needs neither a route nor a model, and
-        # the `offline` preset can satisfy the second meaning while never
-        # satisfying the first. Requiring both at load time did not degrade an
-        # offline install, it stopped `Settings` from loading at all, which stops
-        # the daemon. And it made docs/PLAN.md 7's stated promise - proactive
-        # speech out the local speaker crossing no route - unreachable on the one
-        # preset that promise is about.
+        # On `voice_enabled`, at load time, and that took two goes to settle.
         #
-        # The wake gate is different and keeps its check: it exists only to open a
-        # hosted session, so under a preset routing none it can never do anything.
-        if self.wake_enabled:
+        # These checks briefly moved off `voice_enabled` onto `wake_enabled`. The
+        # reason was real: the switch had just come to mean two things - "a hosted
+        # session may run" and "a proactive line may leave the local speaker" -
+        # and `/usr/bin/say` needs no route, no model and no key. Under the old
+        # preset table, `offline` could satisfy the second and never the first, so
+        # demanding both at load did not degrade that install, it stopped
+        # `Settings` from loading at all, which stops the daemon.
+        #
+        # ADR 0012 removed the premise. Voice is its own axis now: turning it on
+        # *adds* the CHAT_VOICE route rather than asking the preset for one, so
+        # there is no configuration where voice is on and a hosted session is
+        # impossible. That makes load time the right place again, and the earlier
+        # move unnecessary rather than wrong. What survives from it is this list
+        # having one home (`voice_session_problems`), which `run_voice` also
+        # applies where a session actually opens.
+        if self.voice_enabled:
             problems += [
-                f"DAEMON_WAKE_ENABLED is on but {problem}"
+                f"DAEMON_VOICE_ENABLED is on but {problem}"
                 for problem in self.voice_session_problems()
             ]
         if not 0.0 < self.wake_vad_threshold <= 1.0:
@@ -1082,6 +1153,11 @@ class Settings(BaseSettings):
                 f"{context} routes to {provider!r} but no model is set "
                 f"(DAEMON_{provider.upper()}_MODEL)"
             )
+        if provider == OPENAI_COMPATIBLE and not self.openai_compatible_base_url:
+            found.append(
+                f"{context} routes to {provider!r} but no endpoint is set "
+                "(DAEMON_OPENAI_COMPATIBLE_BASE_URL)"
+            )
         return found
 
     @property
@@ -1092,10 +1168,13 @@ class Settings(BaseSettings):
             task: (self.hosted_provider if provider == HOSTED else provider)
             for task, provider in PRESETS[self.preset].items()
         }
-        # Voice provider is its own axis (DAEMON_VOICE_PROVIDER), not the preset's
-        # literal CHAT_VOICE entry. Override it here so route_for, active_tasks and
-        # the key/model checks all see the provider that will actually be dialled.
-        if Task.CHAT_VOICE in resolved:
+        # Voice is its own axis - DAEMON_VOICE_ENABLED and DAEMON_VOICE_PROVIDER - and
+        # not a property of the preset. `offline` carries no CHAT_VOICE row, but local
+        # text with hosted audio is a configuration people want, so the row is *added*
+        # when voice is on rather than only rewritten when the table happened to hold
+        # one. What keeps docs/PLAN.md 7 true is voice being off, which is what that
+        # promise has always said ("텍스트 모드 + 로컬 모델"). See ADR 0012.
+        if self.voice_enabled or Task.CHAT_VOICE in resolved:
             resolved[Task.CHAT_VOICE] = self.voice_provider
         return {**resolved, **self.route_overrides}
 
@@ -1116,13 +1195,18 @@ class Settings(BaseSettings):
         that can never open a session is a misconfiguration worth refusing early;
         and `daemon/app.py`'s `run_voice` applies them where a session actually
         opens. The clauses are phrased to read after either prefix.
+
+        **What used to be first in this list is gone, and by a better fix than
+        this one.** It checked that the preset routed a voice task at all, which is
+        what made `offline` + `voice_enabled` unloadable. ADR 0012 removed the
+        premise instead: `routing` now *adds* the CHAT_VOICE row whenever voice is
+        on, because voice is its own axis and never was a property of the preset.
+        Both callers reach here only with voice on, so that clause could no longer
+        fire - and a check that cannot fire is worse than no check, because the
+        next reader budgets for it. What remains is the half that is still real:
+        the chosen provider's own model and key.
         """
         problems: list[str] = []
-        if not VOICE_TASKS <= self.routing.keys():
-            problems.append(
-                f"preset {self.preset!r} routes no voice task; voice needs a hosted "
-                "native-audio provider (docs/PLAN.md 3.2)"
-            )
         # The chosen provider's own realtime model plus that provider's key. The
         # text model (DAEMON_*_MODEL) is neither required nor read for voice.
         if self.voice_provider == "gemini" and not self.gemini_live_model:
@@ -1162,18 +1246,16 @@ class Settings(BaseSettings):
 
     def route_for(self, task: Task) -> Route:
         """Resolve one Task, or explain precisely why it cannot be served."""
-        provider = self.routing.get(task)
-        if provider is None:
-            extra = (
-                " - it needs a hosted native-audio provider (docs/PLAN.md 3.2)"
-                if task in VOICE_TASKS
-                else ""
-            )
-            raise ConfigError(f"preset {self.preset!r} does not route {task.value}{extra}")
+        # Before the routing lookup, because voice-off is now the only reason a voice
+        # task is missing from the table, and the honest answer is the switch rather
+        # than the preset.
         if task in VOICE_TASKS and not self.voice_enabled:
             raise ConfigError(
                 f"{task.value} was requested but voice is off (DAEMON_VOICE_ENABLED)"
             )
+        provider = self.routing.get(task)
+        if provider is None:
+            raise ConfigError(f"preset {self.preset!r} does not route {task.value}")
         if task in VOICE_TASKS:
             # The native-audio endpoint takes its own model id (never DAEMON_*_MODEL).
             model = self.gemini_live_model if provider == "gemini" else self.openai_realtime_model

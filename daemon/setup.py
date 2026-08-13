@@ -84,9 +84,11 @@ from daemon.config import (
     HOSTED_PROVIDERS,
     OLLAMA,
     OPENAI,
+    OPENAI_COMPATIBLE,
     PRESETS,
     ConfigError,
     Settings,
+    clean_base_url,
     preset_providers,
     providers_for,
 )
@@ -185,6 +187,7 @@ DEFAULT_OPENAI_MODEL = "gpt-5.1"
 """Offered, then checked against the account's own model list before it is
 written - so a default that goes stale is a sentence here and a hint naming the
 ids that do exist, rather than a 404 at the first message."""
+DEFAULT_OPENAI_REALTIME_MODEL = "gpt-realtime"
 
 PRESET_ORDER = ("offline", "balanced", "quality")
 DEFAULT_PRESET = "balanced"
@@ -192,15 +195,16 @@ DEFAULT_PRESET = "balanced"
 PRESET_CHOICES: tuple[Choice, ...] = (
     Choice(
         "offline",
-        "Everything on this machine. No keys, no accounts. Voice unavailable.",
+        "Everything on this machine. No keys and no accounts, unless you add voice.",
         (
             "Conversation, the daily reflection and the decision to speak first all "
-            "run here through Ollama. Nothing leaves the machine.",
-            "Voice is not available, and that is the trade rather than a gap: "
-            "native-audio voice means a hosted model is both the brain and the "
-            "voice, and leaving that out is exactly what makes the privacy promise "
+            "run here through Ollama. With voice off, nothing leaves the machine.",
+            "Voice is the one thing you can opt into: native audio needs a hosted "
+            "model, so turning it on sends audio to the provider you choose, with "
+            "your own key. Leaving it off is exactly what makes the privacy promise "
             "true instead of aspirational (docs/PLAN.md 7).",
-            "Needs Ollama and two local models. No API keys and no accounts.",
+            "Needs Ollama and two local models. No API keys and no accounts until "
+            "you turn voice on.",
         ),
     ),
     Choice(
@@ -260,9 +264,90 @@ HOSTED_CHOICES: tuple[Choice, ...] = (
             "'Standard' keys - the wizard says so if yours is one.",
         ),
     ),
+    Choice(
+        "openai_compatible",
+        "Something else — Qwen, Kimi, DeepSeek, OpenRouter, or your own server.",
+        (
+            "Anything that speaks OpenAI's API works here; the next question asks "
+            "which, and fills in its address for you.",
+            "One name covers them all because they differ by address, not by "
+            "protocol - so `daemon doctor` says openai_compatible and the address "
+            "says who that is.",
+        ),
+    ),
 )
 """What separates them, rather than which model ids they publish - ids change
 every few months and are the wrong thing to choose a vendor by."""
+
+
+@dataclass(frozen=True, slots=True)
+class Vendor:
+    """One known OpenAI-compatible service, and what to prefill for it."""
+
+    name: str
+    label: str
+    base_url: str
+    model: str
+    """Empty when the vendor's catalogue rotates too fast for a default to age
+    well - OpenRouter's free ids carry a `:free` suffix and come and go."""
+    keys_url: str
+
+
+COMPATIBLE_VENDORS: tuple[Vendor, ...] = (
+    Vendor(
+        "qwen",
+        "Qwen (Alibaba Model Studio)",
+        # International (Singapore). The new-account free quota is only granted
+        # on this endpoint, and the China one does not honour it.
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "qwen-plus",
+        "https://bailian.console.alibabacloud.com/",
+    ),
+    Vendor(
+        "kimi",
+        "Kimi (Moonshot)",
+        "https://api.moonshot.ai/v1",
+        "kimi-k2.5",
+        "https://platform.moonshot.ai/console/api-keys",
+    ),
+    Vendor(
+        "deepseek",
+        "DeepSeek",
+        "https://api.deepseek.com/v1",
+        "deepseek-chat",
+        "https://platform.deepseek.com/api_keys",
+    ),
+    Vendor(
+        "openrouter",
+        "OpenRouter",
+        "https://openrouter.ai/api/v1",
+        "",
+        "https://openrouter.ai/keys",
+    ),
+)
+"""The endpoints the wizard can prefill. Not a whitelist - a fifth choice takes
+any URL - and not stored: `.env` holds the URL alone, and `vendor_label` reads
+the name back out of it. Two stored values that can disagree would leave no way
+to tell which is the truth."""
+
+COMPATIBLE_CHOICES: tuple[Choice, ...] = (
+    *(Choice(v.name, v.label) for v in COMPATIBLE_VENDORS),
+    Choice("custom", "Something else — your own server, or a service not listed."),
+)
+
+
+def vendor_label(base_url: str) -> str:
+    """A known endpoint's human name, or the URL unchanged.
+
+    The reverse of the table: `.env` stores only the URL, so this is how
+    `daemon doctor` says "Qwen" rather than a hostname.
+    """
+    stripped = base_url.rstrip("/")
+    for vendor in COMPATIBLE_VENDORS:
+        if vendor.base_url == stripped:
+            return vendor.label
+    return base_url
+
 
 DEFAULT_HOSTED_CHOICE = HOSTED_CHOICES[0].name
 """What the provider prompt puts in its brackets for someone who just presses
@@ -573,6 +658,83 @@ def check_openai(key: str, model: str) -> Verdict:
     return Verdict(True, "key works", models=listed)
 
 
+def check_openai_compatible(
+    key: str, base_url: str, model: str, *, client: httpx.Client | None = None
+) -> Verdict:
+    """Prove the key against the endpoint, and list its models when it can.
+
+    Two steps rather than one, because `/models` is optional in the compatible
+    spec while `/chat/completions` is the thing this install will actually call:
+
+    1. `GET /models` costs no tokens, proves the key, and its ids become the menu.
+    2. Anything other than 200 or a definitive 401/403 means the endpoint may
+       simply not implement it, so fall back to a one-token chat call. That
+       proves the exact path the daemon will use - `/models` succeeding does not
+       imply `/chat/completions` will, which is how an unfunded OpenRouter
+       account lists a paid model happily and then answers 402.
+    """
+    root = base_url.rstrip("/")
+    headers = {"authorization": f"Bearer {key}"}
+    owns = client is None
+    http = client or httpx.Client(timeout=HTTP_TIMEOUT)
+    try:
+        try:
+            response = http.get(f"{root}/models", headers=headers)
+        except httpx.HTTPError as exc:
+            return Verdict(False, f"could not reach {root}: {_redact(str(exc), key)}")
+
+        if response.status_code in (401, 403):
+            return Verdict(
+                False,
+                f"the endpoint rejected the key (HTTP {response.status_code}).",
+                hint="Check that the key belongs to the service at that address.",
+            )
+        if response.status_code == 200:
+            ids = _newest_first(response, "created")
+            listed = {"DAEMON_OPENAI_COMPATIBLE_MODEL": ids}
+            if model and ids and model not in ids:
+                return Verdict(
+                    True,
+                    f"key works, but {model!r} is not in that endpoint's model list",
+                    hint="The next question offers the ids that do exist.",
+                    models=listed,
+                )
+            return Verdict(True, "key works", models=listed)
+
+        # No usable list. Prove the key on the path that matters instead.
+        try:
+            chat = http.post(
+                f"{root}/chat/completions",
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                },
+            )
+        except httpx.HTTPError as exc:
+            return Verdict(False, f"could not reach {root}: {_redact(str(exc), key)}")
+
+        if chat.status_code == 200:
+            return Verdict(
+                True,
+                "key works (that endpoint lists no models, so the next question "
+                "takes an id you type)",
+            )
+        # Same order as `_telegram_said`, and for the same reason: redact first,
+        # because slicing before redacting can cut the key in half and leave the
+        # unmatched remainder printed - `_redact`'s `.replace()` only catches the
+        # whole string. Collapse whitespace and drop control characters before
+        # bounding it, so an embedded escape sequence cannot repaint the prompt
+        # printed after it, and words split across lines do not run together.
+        collapsed = " ".join(_redact(chat.text, key).split())
+        said = truncate("".join(char for char in collapsed if char.isprintable()), BODY_LIMIT)
+        return Verdict(False, f"{root} returned HTTP {chat.status_code}: {said}")
+    finally:
+        if owns:
+            http.close()
+
+
 def check_gemini(key: str) -> Verdict:
     """Validate the key, name the Standard-key trap, and keep the model list.
 
@@ -761,6 +923,7 @@ class Checks:
 
     anthropic: Callable[[str, str], Verdict] = check_anthropic
     openai: Callable[[str, str], Verdict] = check_openai
+    openai_compatible: Callable[[str, str, str], Verdict] = check_openai_compatible
     gemini: Callable[[str], Verdict] = check_gemini
     telegram: Callable[[str], Verdict] = check_telegram
     ollama: Callable[[str], OllamaState] = check_ollama
@@ -815,10 +978,21 @@ def _newest_first(response: httpx.Response, stamp: str) -> tuple[str, ...]:
 
     Entries the provider did not date keep the order it sent them in, after the
     dated ones: a missing field must cost the ordering, not the menu.
+
+    Anything that is not the documented shape reads as an empty list rather than
+    raising - the same rule as `_gemini_models`, and it stopped being theoretical
+    when this function started pointing at an endpoint the *user* names. A proxy
+    in front of a compatible endpoint can answer `/models` with a bare JSON array
+    (`llm/providers/openai_compatible.py` documents the same shape), and
+    `.get("data")` on a list is an `AttributeError` that `setup.run` does not
+    catch: a traceback out of the wizard instead of a `Verdict`.
     """
     try:
-        items = response.json().get("data") or []
+        body = response.json()
     except ValueError:
+        return ()
+    items = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(items, list):
         return ()
     rows = [
         (item["id"], _stamp_value(item.get(stamp)))
@@ -955,10 +1129,21 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
     # answer stays empty - `providers_for` then drops the hosted tasks, so no
     # vendor's key is asked for on a guess.
     hosted = env.get("DAEMON_HOSTED_PROVIDER", "") or DEFAULT_HOSTED_PROVIDER
+    voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
+    # The wizard has no voice-provider question yet (it is admin-only), so an absent
+    # value means the field default rather than "nobody chose" - unlike `hosted`,
+    # this field *has* a default, and it is `gemini`. Hoisted to a local because the
+    # provider branches below need it too: a provider can be present for chat, for
+    # voice, or both, and only this value tells them which - `voice_on` alone does
+    # not, because voice can be on with a *different* provider.
+    voice_provider = env.get("DAEMON_VOICE_PROVIDER", "") or _settings_default(
+        "DAEMON_VOICE_PROVIDER"
+    )
     providers = providers_for(
         preset,
-        voice_enabled=_truthy(env.get("DAEMON_VOICE_ENABLED", "")),
+        voice_enabled=voice_on,
         hosted=hosted,
+        voice_provider=voice_provider,
     )
     needs: list[Need] = []
 
@@ -1014,33 +1199,59 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
         # question, because the default going stale is exactly what this wizard
         # exists to catch before the first conversation does.
     if OPENAI in providers:
+        # OpenAI can be here for two unrelated reasons - it is the hosted chat
+        # provider, or it is the voice provider - and the questions differ, so the
+        # reason has to be named rather than assumed. `voice_on` alone is not that
+        # reason: voice can be on with a *different* provider, and gating the realtime
+        # model on it then asks for an id Settings never reads. Mirrors GEMINI below.
+        openai_chat = hosted == OPENAI and HOSTED in PRESETS[preset].values()
+        openai_voice = voice_on and voice_provider == OPENAI
+        if openai_chat and openai_voice:
+            why = "One key covers both: GPT answers, and voice is OpenAI's too."
+        elif openai_chat:
+            why = "You chose GPT for the hosted work. Your key, your account, your bill."
+        else:
+            why = "Voice is on, so audio goes to OpenAI's realtime model - with your key."
         needs.append(
             Need(
                 key="OPENAI_API_KEY",
                 label="OpenAI API key",
-                why="You chose GPT for the hosted work. Your key, your account, your bill.",
+                why=why,
                 url=OPENAI_KEYS_URL,
                 secret=True,
             )
         )
-        needs.append(
-            Need(
-                key="DAEMON_OPENAI_MODEL",
-                label="OpenAI model id",
-                why="Which model answers. Settings has no default here, so an empty "
-                "value would refuse to start.",
-                default=env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
-                listed=True,
+        if openai_chat:
+            needs.append(
+                Need(
+                    key="DAEMON_OPENAI_MODEL",
+                    label="OpenAI model id",
+                    why="Which model answers. Settings has no default here, so an empty "
+                    "value would refuse to start.",
+                    default=env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
+                    listed=True,
+                )
             )
-        )
+        if openai_voice:
+            needs.append(
+                Need(
+                    key="DAEMON_OPENAI_REALTIME_MODEL",
+                    label="OpenAI Realtime model id",
+                    why="The realtime endpoint takes its own model id, not the text one.",
+                    default=env.get("DAEMON_OPENAI_REALTIME_MODEL")
+                    or DEFAULT_OPENAI_REALTIME_MODEL,
+                    listed=True,
+                )
+            )
     if GEMINI in providers:
         # Gemini can be here for two unrelated reasons - it is the hosted chat
-        # provider, or voice is on and native audio is Google's either way - and
-        # the questions differ, so the reason has to be named rather than assumed.
-        # It was assumed, back when voice was the only way to get here.
+        # provider, or it is the voice provider - and the questions differ, so the
+        # reason has to be named rather than assumed. It was assumed off `voice_on`,
+        # back when voice was always Google's; now voice can be OpenAI's while Gemini
+        # is only the chat model, so the Live id is gated on the provider, not the switch.
         gemini_chat = hosted == GEMINI and HOSTED in PRESETS[preset].values()
-        voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
-        if gemini_chat and voice_on:
+        gemini_voice = voice_on and voice_provider == GEMINI
+        if gemini_chat and gemini_voice:
             why = "One key covers both: Gemini answers, and voice is Google's too."
         elif gemini_chat:
             why = "You chose Gemini for the hosted work. Your key, your account, your bill."
@@ -1055,7 +1266,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 secret=True,
             )
         )
-        if voice_on:
+        if gemini_voice:
             needs.append(
                 Need(
                     key="DAEMON_GEMINI_LIVE_MODEL",
@@ -1068,19 +1279,64 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                     listed=True,
                 )
             )
+        if gemini_chat:
+            # The text model id is a *chat* need, gated on gemini_chat exactly like
+            # DAEMON_OPENAI_MODEL is gated on openai_chat above. Voice never reads it:
+            # route_for(CHAT_VOICE) resolves gemini_live_model, and _provider_problems
+            # returns before the model check for voice tasks - so a voice-only Gemini
+            # (say OpenRouter for chat, Gemini for audio) does not need it, and asking
+            # for it made `daemon setup --check` demand a value `daemon doctor` was
+            # perfectly happy without. It used to be appended unconditionally with a
+            # silent auto-fill and a comment claiming voice routing required it; both
+            # were wrong.
+            needs.append(
+                Need(
+                    key="DAEMON_GEMINI_MODEL",
+                    label="Gemini text model id",
+                    why="Which model answers.",
+                    default=env.get("DAEMON_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
+                    listed=True,
+                )
+            )
+    if OPENAI_COMPATIBLE in providers:
+        current_url = env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", "")
         needs.append(
             Need(
-                key="DAEMON_GEMINI_MODEL",
-                label="Gemini text model id",
-                why="Which model answers."
-                if gemini_chat
-                else "Required alongside the Live id; not used by voice itself.",
-                default=env.get("DAEMON_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
-                # Settings resolves a model for every routed task, and the voice
-                # task routes to gemini, so this must be non-empty even when only
-                # voice brought us here. Asking twice for one capability is noise,
-                # so in that case it is filled in rather than asked.
-                silent=not gemini_chat,
+                key="DAEMON_OPENAI_COMPATIBLE_BASE_URL",
+                label="endpoint",
+                why="The address of the service, up to the version segment - "
+                "https://api.deepseek.com/v1, not the /chat/completions below it.",
+                default=current_url,
+            )
+        )
+        needs.append(
+            Need(
+                key="OPENAI_COMPATIBLE_API_KEY",
+                label="API key",
+                why="Your key for that service. Your account, your bill - Daemon is "
+                "not a reseller.",
+                url=next(
+                    (
+                        v.keys_url
+                        for v in COMPATIBLE_VENDORS
+                        if v.base_url == current_url.rstrip("/")
+                    ),
+                    "",
+                ),
+                secret=True,
+            )
+        )
+        needs.append(
+            Need(
+                key="DAEMON_OPENAI_COMPATIBLE_MODEL",
+                label="model id",
+                why="Which model answers. Settings has no default here, so an empty "
+                "value would refuse to start. Avoid a reasoning model if the list "
+                "offers a choice: it can spend its whole output budget thinking and "
+                "return nothing, and the proactive judge's small budget is where "
+                "that bites first - silently, since a failed judge call just stays "
+                "quiet rather than erroring where you would see it.",
+                default=env.get("DAEMON_OPENAI_COMPATIBLE_MODEL", ""),
                 listed=True,
             )
         )
@@ -1095,16 +1351,24 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
             skippable=True,
         )
     )
-    # A value already in the file drops out - except a model id, which is asked
-    # again with the current value as its default. The reasoning is the preset's,
-    # one layer down: a decided model id was unreachable, so the only way to change
-    # one was to hand-edit `.env`, and this command exists to remove that. A
-    # *credential* is different - nobody wants to re-paste a working key, and the
-    # question would print a secret back at them.
+    # A value already in the file drops out - except a model id and the compatible
+    # endpoint, which are asked again with the current value as their default. The
+    # reasoning is the preset's, one layer down: a decided answer was unreachable,
+    # so the only way to change it was to hand-edit `.env`, and this command exists
+    # to remove that. A *credential* is different - nobody wants to re-paste a
+    # working key, and the question would print a secret back at them.
+    #
+    # The endpoint has to be here rather than relying on the service sub-question,
+    # which offers `custom URL` and then has nothing to prefill: it wrote nothing,
+    # this filter dropped the question, and so a re-run could move an install
+    # between *known* vendors but never onto, off, or between custom addresses -
+    # with no question ever asked about it. That is KEEP_HINT's own defect.
     return [
         need
         for need in needs
-        if need.listed or not env.get(need.key)
+        if need.listed
+        or need.key == "DAEMON_OPENAI_COMPATIBLE_BASE_URL"
+        or not env.get(need.key)
     ]
 
 
@@ -1494,6 +1758,7 @@ LISTED_BY = {
     "DAEMON_OPENAI_MODEL": "OPENAI_API_KEY",
     "DAEMON_GEMINI_MODEL": "GEMINI_API_KEY",
     "DAEMON_GEMINI_LIVE_MODEL": "GEMINI_API_KEY",
+    "DAEMON_OPENAI_COMPATIBLE_MODEL": "OPENAI_COMPATIBLE_API_KEY",
 }
 """Which credential can list the ids for each model question.
 
@@ -1514,7 +1779,9 @@ answered and had nothing. Both fall back to exactly the old question, because a
 list that could not be fetched must cost the menu and not the wizard."""
 
 
-DATED_LISTS = frozenset({"DAEMON_ANTHROPIC_MODEL", "DAEMON_OPENAI_MODEL"})
+DATED_LISTS = frozenset(
+    {"DAEMON_ANTHROPIC_MODEL", "DAEMON_OPENAI_MODEL", "DAEMON_OPENAI_COMPATIBLE_MODEL"}
+)
 """Which lists arrive already in a real newest-first order (`_newest_first`).
 
 The asymmetry is the provider's, not a preference: Anthropic dates every model with
@@ -1522,7 +1789,17 @@ The asymmetry is the provider's, not a preference: Anthropic dates every model w
 creation date at all. So two of the three menus are ordered by a fact and the third
 falls back to reading a version out of the id (`model_version`). Worth naming here
 because the next reader will otherwise try to unify them and find there is nothing
-to unify them with."""
+to unify them with.
+
+The compatible endpoints join the dated side, not because every one of them dates
+its models - OpenRouter's `created` is real and DeepSeek's may be absent - but
+because `check_openai_compatible` runs every list through the same `_newest_first`
+either way, and that function already puts the undated remainder back in arrival
+order rather than raising or dropping them (see its docstring). `dated=False` here
+would have `model_version` re-guess an order from ids the account chose, not this
+project - `kimi-k2.5` reads as version `(2, 5)` to that regex, which would rank it
+above a model `_newest_first` already knows is newer. Trusting the arrival order
+is right whether or not this particular account's endpoint dated anything."""
 
 
 MODEL_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
@@ -1616,8 +1893,15 @@ class Wizard:
     """The bot's `@username`, kept from verifying the token so the pairing step
     can say which bot to message."""
     _probed: set[str] = field(default_factory=set, init=False)
-    """Credentials already used to list models this run, so two questions sharing
-    one key cost one call."""
+    """Credentials in `LISTED_BY.values()` already used to list models this run,
+    so two questions sharing one key cost one call.
+
+    `_fill` runs for every `Need` - model ids, tokens, the compatible endpoint -
+    and only a `LISTED_BY` credential belongs here. Widening the guard to every
+    passing verdict would still work today, because none of those other keys
+    collides with a `LISTED_BY` value, but a future one that did would silently
+    suppress its probe: `_list_with_saved_key` reads this set by credential name,
+    not by what kind of thing was just filled."""
     catalog: dict[str, tuple[str, ...]] = field(default_factory=dict, init=False)
     """What the account's own key listed, keyed by the `.env` key it answers.
 
@@ -1648,7 +1932,7 @@ class Wizard:
         self._step(2, "How should Daemon think?")
         preset = self._choose_preset(env, updates)
         hosted = self._choose_hosted(preset, env, updates)
-        voice = self._choose_voice(preset, hosted, env, updates)
+        voice = self._choose_voice(env, updates)
 
         merged = {
             **env,
@@ -1660,7 +1944,15 @@ class Wizard:
         }
         self._step(3, "Keys and tokens")
         for need in needs_for(merged):
-            value = self._fill(need, merged)
+            # `{**merged, **updates}`, not `merged`: an answer typed at one of
+            # these questions is the input to the next one. The endpoint is asked
+            # immediately before the key that has to be proved *against* it, and
+            # a `merged` frozen before the loop handed the probe an empty address
+            # - so httpx refused a relative URL, the wizard reported it as a bad
+            # key three times, and setup aborted having written nothing. It only
+            # ever worked for a known vendor, whose address lands in `updates`
+            # during the service sub-question, before this dict is built.
+            value = self._fill(need, {**merged, **updates})
             if value:
                 updates[need.key] = value
 
@@ -1749,6 +2041,9 @@ class Wizard:
             "GEMINI_API_KEY": lambda: self.checks.gemini(key),
             "ANTHROPIC_API_KEY": lambda: self.checks.anthropic(key, need.default),
             "OPENAI_API_KEY": lambda: self.checks.openai(key, need.default),
+            "OPENAI_COMPATIBLE_API_KEY": lambda: self.checks.openai_compatible(
+                key, env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", ""), need.default
+            ),
         }[credential]
         try:
             verdict = probe()
@@ -1801,7 +2096,14 @@ class Wizard:
             # failure in docs/PLAN.md 9, and it is silent until the first voice
             # turn. Leaving a known-absent id as the default would be a decision
             # too, and the worse one.
-            say(status(theme, "warn", f"{need.default} is not in that list."))
+            if need.default:
+                say(status(theme, "warn", f"{need.default} is not in that list."))
+            # Nothing to warn about when there is no default at all, which is the
+            # compatible model id on a fresh install - the only Need here that
+            # Settings has no default for. A live run printed the bare sentence
+            # `warn:  is not in that list.` above the account's own catalogue.
+            # The affordance line is still the one without Enter in it: an empty
+            # default is not an answer either.
             say(theme.dim(f"  A number, {EXPAND}, or an id of your own."))
             return ids
         say(theme.dim(f"  A number, {EXPAND}, an id of your own, or Enter."))
@@ -1939,27 +2241,65 @@ class Wizard:
             "Provider", HOSTED_CHOICES, default=current or DEFAULT_HOSTED_CHOICE
         )
         _record(updates, "DAEMON_HOSTED_PROVIDER", chosen, current)
+        if chosen == OPENAI_COMPATIBLE:
+            self._choose_compatible_endpoint(env, updates)
         return chosen
 
-    def _choose_voice(
-        self, preset: str, hosted: str, env: Mapping[str, str], updates: dict[str, str]
-    ) -> bool:
-        # `hosted` is passed even though CHAT_VOICE is pinned to Gemini today: the
-        # question is whether this preset has a voice task at all, and answering it
-        # from a table with an unresolved placeholder in it is how the wrong key
-        # gets asked for the moment that pinning changes.
-        if GEMINI not in providers_for(preset, voice_enabled=True, hosted=hosted):
-            self.prompt.say(f"Voice is not part of the {preset} preset: native audio has to")
-            self.prompt.say("run on a hosted model, and leaving it out is what makes 'nothing")
-            self.prompt.say("leaves this machine' literally true. Text mode is the whole product.")
-            self.prompt.say()
-            return False
+    def _choose_compatible_endpoint(
+        self, env: Mapping[str, str], updates: dict[str, str]
+    ) -> None:
+        """Which compatible service, and therefore which address to prefill.
 
+        Asked as a second question rather than as four more entries in the
+        provider menu, because the vendor is not a provider: the menu would show
+        `qwen` as a peer of `anthropic` while `.env` and every log line said
+        `openai_compatible`, and a choice that is not the thing stored is the
+        confusion DEFAULT_HOSTED_PROVIDER was emptied to end.
+        """
+        current_url = env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", "")
+        if current_url:
+            self.prompt.say(f"Currently {vendor_label(current_url)}. {KEEP_HINT}")
+        # The default has to agree with the line above it, or "Enter keeps it" is
+        # a promise this question breaks: nothing saved defaults to the first
+        # vendor, a saved known vendor defaults to itself, and a saved URL that
+        # matches no vendor defaults to "custom" - never silently renamed to a
+        # vendor it happens to resemble.
+        saved_vendor = next(
+            (v.name for v in COMPATIBLE_VENDORS if v.base_url == current_url.rstrip("/")), None
+        )
+        if saved_vendor is not None:
+            default = saved_vendor
+        elif current_url:
+            default = "custom"
+        else:
+            default = COMPATIBLE_VENDORS[0].name
+        picked = self._pick("Service", COMPATIBLE_CHOICES, default=default)
+        vendor = next((v for v in COMPATIBLE_VENDORS if v.name == picked), None)
+        if vendor is None:
+            # "custom". On a fresh install there is nothing to prefill anyway,
+            # but on a re-run `needs_for` defaults the address question to
+            # whatever is already in `.env` - which, if that was a known
+            # vendor's URL, is the one thing the user just said no to. Left
+            # alone, Enter at the next question would silently keep it, so the
+            # question this branch answers is not "what to prefill" but
+            # "what to prefill instead": clear it when it belonged to the
+            # declined vendor, and leave it when it was already a custom
+            # address the user is presumably editing rather than replacing.
+            if saved_vendor is not None:
+                _record(updates, "DAEMON_OPENAI_COMPATIBLE_BASE_URL", "", current_url)
+            return
+        _record(updates, "DAEMON_OPENAI_COMPATIBLE_BASE_URL", vendor.base_url, current_url)
+        if vendor.model and not env.get("DAEMON_OPENAI_COMPATIBLE_MODEL"):
+            updates["DAEMON_OPENAI_COMPATIBLE_MODEL"] = vendor.model
+
+    def _choose_voice(self, env: Mapping[str, str], updates: dict[str, str]) -> bool:
+        # No preset gate: every preset can carry voice now (ADR 0012), and the
+        # trade is stated in the question itself rather than by refusing to ask it.
         raw = env.get("DAEMON_VOICE_ENABLED", "")
         was = _truthy(raw) if raw else False
-        self.prompt.say("Turn voice on? Audio then goes to Google's native-audio model,")
-        self.prompt.say("with your own key. Off means no audio ever leaves this machine,")
-        self.prompt.say("and text mode loses nothing by it.")
+        self.prompt.say("Turn voice on? Audio then goes to your voice provider's native-audio")
+        self.prompt.say("model, with your own key. Off means no audio ever leaves this")
+        self.prompt.say("machine, and text mode loses nothing by it.")
         if raw:
             self.prompt.say(f"Currently {'on' if was else 'off'}. {KEEP_HINT}")
         enabled = self.prompt.ask_yes_no("Enable voice", default=was)
@@ -2003,6 +2343,18 @@ class Wizard:
                 # Whatever that key was able to list, for the model questions that
                 # `needs_for` puts after it.
                 self.catalog.update(verdict.models)
+                # And that credential has now had its one probe for this run -
+                # but only if it *is* one of `LISTED_BY`'s credentials. Every
+                # passing verdict lands here, model ids and tokens included, and
+                # `_probed` means something specific to `_list_with_saved_key`:
+                # this credential need not be probed again. Recorded even when the
+                # verdict carried no list at all, because a key answered here is in
+                # the env the *next* question sees - so `_list_with_saved_key`
+                # would otherwise re-probe the key it just watched being verified,
+                # which for an endpoint with no `/models` means a second chat call
+                # and a warning about a key that is fine.
+                if need.key in set(LISTED_BY.values()):
+                    self._probed.add(need.key)
                 if verdict.detail:
                     # Still the last four characters and nothing more. Colour is
                     # added around `mask`, never instead of it.
@@ -2043,6 +2395,28 @@ class Wizard:
             return self.checks.openai(value, env.get("DAEMON_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL)
         if need.key == "GEMINI_API_KEY":
             return self.checks.gemini(value)
+        if need.key == "DAEMON_OPENAI_COMPATIBLE_BASE_URL":
+            # Checked here so a mistyped address is a sentence under the question
+            # that asked for it. Without this the first thing to notice was the
+            # key probe one question later, which reported `could not reach`
+            # about a key that was fine. `config.clean_base_url` is Settings' own
+            # rule, called rather than copied: a value this wizard accepts and
+            # startup then refuses is the exact failure `_finish` exists to catch,
+            # and catching it there means the file is already written.
+            try:
+                clean_base_url(value)
+            except ValueError as exc:
+                return Verdict(False, str(exc))
+            return Verdict(True, "")
+        if need.key == "OPENAI_COMPATIBLE_API_KEY":
+            # The endpoint question comes first in `needs_for` and `Wizard.run`
+            # merges each answer into the env the next question sees, so by the
+            # time the key is typed its address is there to prove it against.
+            return self.checks.openai_compatible(
+                value,
+                env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", ""),
+                env.get("DAEMON_OPENAI_COMPATIBLE_MODEL", ""),
+            )
         if need.key == "TELEGRAM_BOT_TOKEN":
             verdict = self.checks.telegram(value)
             # getMe already told us the handle; the pairing step would otherwise

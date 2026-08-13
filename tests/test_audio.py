@@ -15,6 +15,7 @@ import builtins
 import contextlib
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,9 @@ class FakeStream:
         self.written: list[bytes] = []
         self.aborted = 0
         self.closed = False
+        self.closed_event = threading.Event()
+        """Set by `close`, so a test can wait for record()'s detached release thread
+        without polling - the close no longer happens on the event loop."""
         self.callback = kwargs.get("callback")
         self.arrivals: asyncio.Queue[bytes] = asyncio.Queue()
         self._loop = asyncio.get_running_loop()
@@ -62,6 +66,7 @@ class FakeStream:
 
     def close(self) -> None:
         self.closed = True
+        self.closed_event.set()
 
     def feed(self, pcm: bytes) -> None:
         """Deliver a block the way PortAudio's own thread would."""
@@ -105,6 +110,17 @@ async def settle() -> None:
     """Give the writer a chance to do something, for the assertions that it did
     not."""
     await asyncio.sleep(0.05)
+
+
+async def released(stream: FakeStream) -> None:
+    """Wait for `record`'s detached release thread to stop and close the stream.
+
+    The stop runs off the event loop now (it can deadlock inside CoreAudio), so
+    `aclose()` returns before the device is actually closed. Waited on a worker
+    thread rather than polled, and bounded, because tests/CLAUDE.md forbids a test
+    that can hang."""
+    got = await asyncio.to_thread(stream.closed_event.wait, 5.0)
+    assert got, "record()'s release thread did not close the stream within 5s"
 
 
 # --- the lazy import ---------------------------------------------------------
@@ -207,6 +223,7 @@ async def test_record_yields_microphone_blocks(backend: FakeSoundDevice) -> None
     assert stream.kwargs["channels"] == 1
     assert stream.kwargs["dtype"] == "int16"
     await blocks.aclose()
+    await released(stream)  # the stop/close runs on a detached thread now
     assert stream.closed  # a microphone nobody reads is a light left on
 
 
@@ -258,6 +275,7 @@ async def test_ending_recording_closes_the_stream(backend: FakeSoundDevice) -> N
     await blocks.aclose()
 
     (stream,) = backend.inputs
+    await released(stream)  # record()'s finally releases the stream off the loop
     assert not stream.active
     assert stream.closed
 
@@ -307,6 +325,60 @@ async def test_the_hold_is_released_when_recording_raises(
     with pytest.raises(RuntimeError):
         await anext(io.record())
     assert mic_hold.held() is False
+
+
+async def test_a_wedged_stream_stop_does_not_freeze_teardown() -> None:
+    """The daemon-freeze regression.
+
+    `record`'s finally stopped the input stream synchronously on the event-loop
+    thread. One day that stop deadlocked inside CoreAudio - the wake gate's PortAudio
+    stream and the session's macOS VoiceProcessing unit contending the same device on
+    the wake->voice handover - and because it ran on the loop thread the whole daemon
+    froze: no logs, no scheduler, no answer to the wake word, only a `sample` of the
+    process showing `__psynch_mutexwait` under `AudioOutputUnitStop`.
+
+    The stop runs on a detached thread now, so a stop that never returns costs one
+    parked thread, not the loop. Proof: `aclose()` returns even while the stream's
+    stop() is wedged forever - under the old code this await never came back."""
+    never_returns = threading.Event()
+
+    class WedgingStream(FakeStream):
+        def stop(self) -> None:
+            never_returns.wait()  # a deadlocked Pa_StopStream, until the test frees it
+            super().stop()
+
+    class WedgingBackend(FakeSoundDevice):
+        def RawInputStream(self, **kwargs: Any) -> FakeStream:  # noqa: N802
+            stream = WedgingStream(**kwargs)
+            self.inputs.append(stream)
+            return stream
+
+    backend = WedgingBackend()
+    io = SoundDeviceAudio(backend=backend)
+    blocks = io.record()
+
+    async def push() -> None:
+        await asyncio.sleep(0)
+        backend.inputs[0].feed(b"\x00\x00")
+
+    task = asyncio.create_task(push())
+    async with asyncio.timeout(5):
+        async for _ in blocks:
+            break
+    await task
+
+    try:
+        # The finally runs here and starts the release thread, where stop() wedges.
+        # Under the bug this await ran stop() inline and never returned; the timeout
+        # is what turns "the daemon froze" into a failing test instead of a hung one.
+        async with asyncio.timeout(5):
+            await blocks.aclose()
+    finally:
+        never_returns.set()  # let the parked thread finish so it does not outlive us
+
+    (stream,) = backend.inputs
+    await released(stream)  # and once freed, it does stop and close the device
+    assert stream.closed
 
 
 async def test_play_queues_at_the_output_rate(backend: FakeSoundDevice) -> None:

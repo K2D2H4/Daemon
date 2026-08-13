@@ -127,21 +127,27 @@ Daemon은 ②③만 한다. ①은 안 한다.
 | 페르소나 규칙 생성 | 주 1회 | 성찰과 동일 | |
 
 **축을 두 개로 나눈다.** 프리셋은 *어디서 도는가*를 답하고, `DAEMON_HOSTED_PROVIDER`가
-*누구 모델인가*를 답한다(anthropic / openai / gemini). 프리셋이 상용 대화를
-Anthropic으로 하드코딩하고 있었는데, 그러면 §3.2가 말한 provider-agnostic이 설정
-표면에서만 참이 된다. 두 축을 곱하면 프리셋이 9개가 되므로 질문을 분리했다.
-`CHAT_VOICE`만 예외로 Gemini를 명시한다 — native audio 세션이 그것뿐이고, 음성 세션이
-없는 provider를 가리키면 시작 시점이 아니라 첫 음성 턴에 터진다.
+*누구 모델인가*를 답한다(anthropic / openai / gemini / openai_compatible). 네 번째는
+Chat Completions API를 말하는 모든 엔드포인트다 — Qwen, Kimi, DeepSeek, OpenRouter,
+직접 띄운 서버. 주소를 유저가 정하므로 vendor 목록이 아니라 provider 하나로 둔다. 프리셋이 상용 대화를 Anthropic으로 하드코딩하고 있었는데, 그러면
+§3.2가 말한 provider-agnostic이 설정 표면에서만 참이 된다. 두 축을 곱하면 프리셋이 12개가 되므로 질문을 분리했다.
+`CHAT_VOICE`는 `DAEMON_VOICE_PROVIDER`라는 세 번째 축이다 (gemini 또는 openai) —
+프리셋과도, `DAEMON_HOSTED_PROVIDER`와도 무관하다
+(`docs/adr/0012-voice-is-its-own-axis.md`). 음성 세션이 없는 provider를 가리키면
+시작 시점이 아니라 첫 음성 턴에 터진다.
 
 **프리셋 3개로 노출한다.** 온보딩에서 7번 고르게 하면 아무도 안 쓴다.
 
 | 프리셋 | 대화 | 성찰 | 선제성 판단 | 음성 |
 |---|---|---|---|---|
-| **완전 오프라인** | 로컬 | 로컬 | 로컬 | 불가 |
+| **완전 오프라인** | 로컬 | 로컬 | 로컬 | 켜면 가능(상용) |
 | **균형** (기본값) | 상용 | 상용 | 로컬 | 가능 |
 | **품질 우선** | 상용 | 상용 | 상용 | 가능 |
 
-고급 설정에서 개별 덮어쓰기 허용. **"완전 오프라인"이 실재해야 §7의 약속이 참이 된다.**
+고급 설정에서 개별 덮어쓰기 허용. **"완전 오프라인"이 실재해야 §7의 약속이 참이 된다** —
+단 그 약속을 지탱하는 것은 프리셋 표가 아니라 `DAEMON_VOICE_ENABLED`가 꺼져 있다는 사실이다
+(§7의 문구도 "텍스트 모드 + 로컬 모델"이다). 음성은 프리셋의 등급이 아니라 별도 축이다:
+`docs/adr/0012-voice-is-its-own-axis.md`.
 
 ### 3.2.1 오프라인 프리셋 실측 (2026-08-03, M4 Max)
 
@@ -380,7 +386,7 @@ AI가 재작성하는 파일이 겹치지 않는다. (겹치는 지점에는 콘
 같아진다. 그래서 예외를 뒀다: `origin == 'owner'`인 기억만, 최대 200자까지 인용한다.
 그 컬럼은 CONTRACTS 비협상 10이 이미 위조 불가능하다고 못박은 것과 같은 컬럼이고,
 여기서는 프롬프트에 텍스트가 들어갈지 자체를 가른다. 근거와 실측은
-[docs/adr/0012](adr/0012-split-the-presence-signals.md).
+[docs/adr/0013](adr/0013-split-the-presence-signals.md).
 
 ### 6.2 왜 이 구조인가
 
@@ -449,7 +455,7 @@ PC 앞에 있다        자리에 없다 / 잠금
 거부하는 것이 §6.4의 비대칭이고, 그게 이 필드가 `bool`이 아닌 이유다.
 
 **위 그림은 개념이고, 실제 판정은 순서가 정해진 규칙 7개다 (`Gate._route`,
-2026-08-11 — 오디오 신호를 마이크/출력으로 가른 뒤의 모양, [docs/adr/0012](adr/0012-split-the-presence-signals.md)).**
+2026-08-11 — 오디오 신호를 마이크/출력으로 가른 뒤의 모양, [docs/adr/0013](adr/0013-split-the-presence-signals.md)).**
 "PC 앞"과 "자리 없음/잠금"만으로는 지금의 판정을 못 그린다:
 
 | 순서 | 신호 | 텔레그램으로 내려가는 조건 |
@@ -517,7 +523,7 @@ PC 앞에 있다        자리에 없다 / 잠금
 막으면 👎 브레이크(§8.3, 라벨 튜닝)가 매달리는 버튼 자체가 사라진다: `Gate._route`는
 `local_speaker` 단독을 절대 내지 않고 늘 `both`나 `telegram`이라, 발화가 막히지
 않고 나가야 라벨 버튼도 함께 나간다. 통화 중에 후보 하나를 조용히 태우는 대신,
-그 순간에도 "이건 아니다"라고 누를 자리를 남겨둔다. 근거와 실측은 [docs/adr/0012](adr/0012-split-the-presence-signals.md).
+그 순간에도 "이건 아니다"라고 누를 자리를 남겨둔다. 근거와 실측은 [docs/adr/0013](adr/0013-split-the-presence-signals.md).
 
 ### 6.5 음성
 
@@ -717,7 +723,7 @@ M2는 ✅다**: `search()`가 검색 히트 뒤에 항상 주입되는 큐레이
 갖고 있었다(§6.3의 규칙 7개) — 그래서 두 번째 스위치는 "voice on"이 파일마다 다른
 뜻이 되는 것 말고는 아무것도 사지 못했다. `DAEMON_VOICE_ENABLED` 하나가 이제 세션도,
 로컬 스피커 경로도 함께 관장한다. 이 변경이 `offline` 프리셋에서 한 번 터졌다가
-고쳐진 이야기와 근거는 [docs/adr/0012](adr/0012-split-the-presence-signals.md).
+고쳐진 이야기와 근거는 [docs/adr/0013](adr/0013-split-the-presence-signals.md).
 **쿨다운도 둘이다** — `proactive_candidates.cooldown_secs`는 "이 이유를 다시 꺼내지
 않는다"(후보별, 기본 1일)이고 `DAEMON_PROACTIVE_COOLDOWN_MINUTES`는 발화 사이의 전역
 간격이다(측정 당시 기본 90분, 2026-08-11부터 30분 — §6.2와 같은 라벨 없는 숫자
@@ -895,7 +901,7 @@ seed만 유지한다: 판단 프롬프트를 의도적으로 최소로 둔 자�
       `MemoryRecall.associate()` 위에 `daemon/proactivity/candidates.py`의
       `association_candidates()`가 얹혔고 `daemon/proactivity/tick.py`가 비동기로
       기다린다. `origin == 'owner'`인 기억만 인용하는 예외를 뒀다 — 근거는
-      [docs/adr/0012](adr/0012-split-the-presence-signals.md).
+      [docs/adr/0013](adr/0013-split-the-presence-signals.md).
 - [ ] **LaunchAgent 아래 `osascript`의 TCC 동작** (§6.3.1) — 거부·지연·정상 중 무엇인지
       확인하려면 동의 대화상자를 눌러 새 권한을 써야 한다. 아무것도 막지 않으므로 열어
       둔다: `lsappinfo`가 권한 없이 같은 필드를 채우고 세 결과 모두 처리돼 있다.

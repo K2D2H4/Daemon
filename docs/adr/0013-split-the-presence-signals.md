@@ -176,20 +176,33 @@ about: the `offline` preset deliberately omits `CHAT_VOICE` so that promise is
 literally true, and the merged check then refused to load before the local
 speaker ever got a chance to prove it.
 
-Resolved by splitting what `voice_enabled` implies from when it is checked,
-not by splitting the switch back apart. `Settings.voice_session_problems()`
-holds every clause that is actually about a *hosted session* — a routed voice
-task, a model id, a key — and it is applied in two places for two different
-reasons: at load time when `wake_enabled` is on (a wake gate that can never
-open a session is a misconfiguration worth refusing early), and at session
-start inside `run_voice` (`daemon/app.py:1091`) for every other path, which is
-where a session actually needs any of it. `voice_enabled` alone no longer
-carries those requirements, so it can be true under `offline` without the
-process refusing to start. Verified: `Settings(preset="offline",
-voice_enabled=True)` now loads; `tests/test_config.py::test_offline_preset_refuses_voice`
-still holds for what it is actually testing (no hosted session), and
-`test_an_offline_install_may_speak_out_of_its_own_speaker` pins the new
-behaviour directly.
+Resolved twice, and the second one is the one that stands.
+
+The first fix split *what* `voice_enabled` implies from *when* it is checked:
+`Settings.voice_session_problems()` collected every clause that is really about
+a hosted session — a routed voice task, a model id, a key — and applied them at
+load time only when `wake_enabled` was on, plus at session start in
+`run_voice`. That made `Settings(preset="offline", voice_enabled=True)` load,
+which was the thing that mattered, and it treated the preset table as fixed.
+
+[ADR 0012](0012-voice-is-its-own-axis.md) then removed the premise instead of
+working around it: voice is its own axis, so turning it on *adds* the
+`CHAT_VOICE` route rather than asking the preset for one. There is now no
+configuration where voice is on and a hosted session is impossible — which is a
+better answer than the one above, because it makes the awkward case ordinary
+rather than tolerated.
+
+So the checks went back to load time on `voice_enabled`, where they had started.
+What survives from the detour is the list having one home:
+`voice_session_problems()` is still where those clauses live, and its route
+clause is gone because it can no longer fire. The `run_voice` application is
+gone for the same reason — `Settings` has already validated by then, and a
+branch no configuration can reach is worse than no branch, because the next
+reader budgets for it.
+
+The record is kept rather than tidied away because the failure it describes is
+real and could return: a switch that means two things, checked at the moment
+only one of them needs.
 
 ### 5. macOS Focus was rejected as the brake
 
