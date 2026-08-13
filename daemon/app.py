@@ -88,6 +88,19 @@ DB_FILENAME = "daemon.sqlite3"
 """Lives inside the data dir. Deleting it must never lose user data - the
 markdown log is the original (CONTRACTS.md non-negotiable 1)."""
 
+VIDEO_CAPABLE_VOICE_PROVIDERS = frozenset({"gemini"})
+"""Voice providers whose session actually accepts video frames via `send_frame`.
+
+`OpenAIRealtimeSession.send_frame` (daemon/voice/openai_realtime.py) is a
+deliberate no-op - OpenAI Realtime has no realtime video input channel - so
+building a `ScreenShareController` and its start/stop tools for it would let the
+model tell the owner "I'm watching your screen now" while every frame is
+silently dropped. ADR 0009 (docs/adr/0009-images-in-the-message-contract.md)
+is explicit that a capability the code cannot deliver must say so, not attach a
+frame and hope. Gated on this set, not on the current session's `route.provider`
+string inline, so the question reads as "can this provider take video" rather
+than a bare provider-name check."""
+
 PROACTIVE_TICK_MINUTES = 5
 """docs/PLAN.md 6.1's tick. Deterministic work only, unless a candidate is due and
 passes the gate - so the cost of the interval is a few sqlite reads and three
@@ -1046,14 +1059,25 @@ async def _build_voice_runtime(
     """
     screen_share = None
     if settings.screen_enabled:
-        # Guarded like run_voice's own block: a missing Pillow must cost the
-        # feature, not the resident.
-        try:
-            from daemon.voice.screen_share import ScreenShareController
+        route = settings.route_for(Task.CHAT_VOICE)
+        if route.provider not in VIDEO_CAPABLE_VOICE_PROVIDERS:
+            # See VIDEO_CAPABLE_VOICE_PROVIDERS: this provider's session drops
+            # every frame, so building the controller here would only let the
+            # model promise a screen it will never see.
+            logger.warning(
+                "live screen share unavailable on voice provider %r (send_frame "
+                "is a no-op there); live-share tools will not be offered",
+                route.provider,
+            )
+        else:
+            # Guarded like run_voice's own block: a missing Pillow must cost the
+            # feature, not the resident.
+            try:
+                from daemon.voice.screen_share import ScreenShareController
 
-            screen_share = ScreenShareController()
-        except ImportError as exc:
-            logger.warning("voice screen sharing off (missing dependency): %s", exc)
+                screen_share = ScreenShareController()
+            except ImportError as exc:
+                logger.warning("voice screen sharing off (missing dependency): %s", exc)
     voice_mode = "allowlist" if settings.tools_mode == "ask" else settings.tools_mode
     tools, mcp, _status = await _build_tools(
         settings, store, mode=voice_mode, screen_share=screen_share
@@ -1085,6 +1109,7 @@ async def run_voice(
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
     from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
+    from daemon.voice.openai_realtime import OpenAIRealtimeError, OpenAIRealtimeSession
 
     if not settings.voice_enabled:
         logger.error("voice is off; set DAEMON_VOICE_ENABLED=true (see `daemon setup`)")
@@ -1120,7 +1145,19 @@ async def run_voice(
             # and a fresh controller per attempt would leave them pointing at a stale
             # one.
             screen_share = None
-            if settings.screen_enabled:
+            if settings.screen_enabled and route.provider not in VIDEO_CAPABLE_VOICE_PROVIDERS:
+                # See VIDEO_CAPABLE_VOICE_PROVIDERS: this provider's session drops
+                # every frame it is handed (OpenAIRealtimeSession.send_frame is a
+                # no-op), so building the controller - and registering its
+                # start/stop tools below - would let the model tell the owner
+                # it is watching a screen it will never see. ADR 0009 requires
+                # the code say so instead.
+                logger.warning(
+                    "live screen share unavailable on voice provider %r (send_frame "
+                    "is a no-op there); live-share tools will not be offered",
+                    route.provider,
+                )
+            elif settings.screen_enabled:
                 # Guarded like the screen-tool block in `_build_tools`: screen sharing
                 # needs Pillow (daemon/voice/screen_share.py imports it at module
                 # scope). A missing Pillow must lose only the feature, not crash the
@@ -1193,6 +1230,14 @@ async def run_voice(
             """A fresh session per attempt. Reconnecting means starting clean: the
             old one carries a half-flushed transcript, a partial-transcript queue
             nobody will read again, and a log filter holding the API key."""
+            if route.provider == "openai":
+                return OpenAIRealtimeSession(
+                    api_key=settings.openai_api_key,
+                    model=route.model,
+                    system_instruction=system_instruction,
+                    tools=tool_specs,
+                    voice_name=settings.openai_realtime_voice,
+                )
             return GeminiLiveSession(
                 api_key=settings.gemini_api_key,
                 model=route.model,
@@ -1243,7 +1288,7 @@ async def run_voice(
                 new_session,
                 audio,
                 companion,
-                GeminiLiveError,
+                (GeminiLiveError, OpenAIRealtimeError),
                 opening_audio=opening_audio,
                 opening_text=opening_text,
                 screen_share=screen_share,
@@ -1360,7 +1405,7 @@ async def _voice_attempts(
     new_session: Callable[[], Any],
     audio: AudioIO,
     companion: Companion,
-    session_error: type[Exception],
+    session_error: type[Exception] | tuple[type[Exception], ...],
     opening_audio: bytes = b"",
     opening_text: str = "",
     screen_share: Any = None,

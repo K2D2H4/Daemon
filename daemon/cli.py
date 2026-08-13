@@ -16,12 +16,15 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+import textwrap
+import time
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,7 +32,7 @@ from typing import Any
 from daemon import __version__
 from daemon.config import ENV_FILE, OLLAMA, OPENAI_COMPATIBLE, ConfigError, Settings
 from daemon.fs import DIR_MODE
-from daemon.service import ServiceAction, ServiceError, ServiceStatus, service_for
+from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus, service_for
 
 OK = 0
 PROBLEM = 1
@@ -48,11 +51,54 @@ here would silently drop the extra on the next `daemon update`. The version cap
 lives in the extra (pyproject `mcp>=1.9,<2`), so `[mcp]` also keeps `daemon update`
 off the incompatible mcp 2.0."""
 
+_GROUP_ORDER = (
+    "the resident",
+    "every day",
+    "when something looks wrong",
+    "setup",
+    "now and then",
+)
+"""The order the help prints its groups in, and the set `build_parser` will accept.
+Ordered by how often a command is typed, so the top of the list is the part an
+owner actually uses."""
+
+_LOG_LINES = 50
+"""How much history `daemon log` shows before it starts following."""
+
+_TAIL_BLOCK = 8192
+"""How much `daemon log` reads per step when walking a log backwards."""
+
+_LOG_POLL_SECONDS = 0.25
+"""How long `daemon log -f` sleeps when the file has nothing new. Short enough to
+feel live, long enough that watching an idle daemon is not a spin loop."""
+
+_LOG_NOISE = re.compile(
+    # The admin console re-reads several endpoints on a timer and Telegram is
+    # long-polled once a second: together 56% of a measured 22,790-line log.
+    #
+    # Two things are deliberately narrow. Both patterns anchor on a success status,
+    # because a 409 from getUpdates is the exact line that explains a bot token
+    # clash and a 500 from the admin is never noise. And the admin pattern matches
+    # GET only: the first version dropped every successful admin request, which
+    # silently swallowed the `PATCH /api/settings` that had just rewritten `.env`
+    # and the `POST /api/mcp/connect` the owner was waiting on. Reads can repeat
+    # unprompted; a write is always something that happened.
+    #
+    # `oauth/callback` is the exception that proves the method is a proxy and not
+    # the thing itself: it is a GET because an OAuth redirect has to be, and it
+    # lands tokens on disk. A successful one is the only line saying a connection
+    # finished, so it survives.
+    r'uvicorn\.access\b.*"GET (?!\S*oauth/callback).*"\s+[23]\d\d\s*$'
+    r"|getUpdates\s+\"HTTP/[\d.]+\s+2\d\d[^\"]*\"\s*$"
+)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="daemon",
         description="Self-hosted AI companion. `daemon run` with no arguments is the default.",
+        # The command list is laid out by hand below; argparse must not re-wrap it.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # Handled in `main` rather than argparse's `action="version"`, which raises
     # SystemExit - every other command here returns an int, and a bug report's
@@ -60,32 +106,102 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version", action="store_true", help="print the installed version and exit"
     )
-    sub = parser.add_subparsers(dest="command")
-    sub.add_parser("run", help="run the daemon in the foreground (what the service supervises)")
-    setup = sub.add_parser(
-        "setup", help="first-run onboarding: pick a preset, verify keys, write .env"
+    # `metavar` collapses argparse's brace blob into one token. Not SUPPRESS: that
+    # would also drop `<command>` from the usage line. The commands themselves are
+    # registered without a `help=`, which is what keeps argparse from listing them
+    # a second time - the grouped epilog below is the only listing.
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    groups: dict[str, list[tuple[str, str]]] = {}
+
+    def add(name: str, *, group: str, help: str, **kwargs: Any) -> argparse.ArgumentParser:
+        """Register a command and file it under a group, in one call.
+
+        Sixteen commands in one flat list gave no clue which are typed daily and
+        which are typed once ever. Grouping them is only safe if the group cannot
+        drift from the command, so `group` is required here and there is no other
+        way in: a command added without one does not compile, rather than quietly
+        vanishing from the help.
+        """
+        assert group in _GROUP_ORDER, f"unknown help group {group!r}"
+        groups.setdefault(group, []).append((name, help))
+        # `help` is deliberately not forwarded: argparse only lists a subcommand if
+        # it was given one, and passing SUPPRESS prints the string "==SUPPRESS==".
+        # Withholding it is what leaves the epilog as the single listing.
+        return sub.add_parser(name, **kwargs)
+
+    add(
+        "run",
+        group="the resident",
+        help="run the daemon in the foreground (what the service supervises)",
+    )
+    setup = add(
+        "setup",
+        group="setup",
+        help="first-run onboarding: pick a preset, verify keys, write .env",
     )
     setup.add_argument(
         "--check",
         action="store_true",
         help="report what is missing and exit; asks nothing, contacts nobody",
     )
-    install = sub.add_parser("install", help="install the OS service so it survives a reboot")
+    install = add(
+        "install", group="setup", help="install the OS service so it survives a reboot"
+    )
     install.add_argument(
         "--force",
         action="store_true",
         help="replace an existing unit file after showing what changes",
     )
-    sub.add_parser("uninstall", help="stop the OS service and remove its unit file")
-    sub.add_parser("status", help="is the service installed and running")
-    sub.add_parser("doctor", help="check configuration, Ollama, data dir and schema")
-    sub.add_parser("reindex", help="rebuild the sqlite mirror from the markdown log")
-    sub.add_parser(
+    add("uninstall", group="setup", help="stop the OS service and remove its unit file")
+    add("status", group="every day", help="is the service installed and running")
+    log = add(
+        "log",
+        group="every day",
+        help="what the resident has been writing to its log (`-f` to keep streaming)",
+    )
+    log.add_argument(
+        "-f", "--follow", action="store_true", help="keep streaming new lines until Ctrl-C"
+    )
+    log.add_argument(
+        "-n",
+        "--lines",
+        type=int,
+        default=_LOG_LINES,
+        help=f"how many past lines to show ({_LOG_LINES} if omitted)",
+    )
+    log.add_argument(
+        "--raw",
+        action="store_true",
+        help="do not filter anything out, including the polling that is over half "
+        "the file",
+    )
+    help_cmd = add(
+        "help",
+        group="every day",
+        help="this list, or `daemon help <command>` for one command's own help",
+    )
+    help_cmd.add_argument(
+        "topic", nargs="?", help="a command name; omitted, print this list"
+    )
+    add(
+        "doctor",
+        group="when something looks wrong",
+        help="check configuration, Ollama, data dir and schema",
+    )
+    add(
+        "reindex",
+        group="when something looks wrong",
+        help="rebuild the sqlite mirror from the markdown log",
+    )
+    add(
         "update",
+        group="setup",
         help="reinstall the latest release in place (needs uv; source installs use git pull)",
     )
-    reflect = sub.add_parser(
-        "reflect", help="consolidate a day of conversation into memory and observations"
+    reflect = add(
+        "reflect",
+        group="now and then",
+        help="consolidate a day of conversation into memory and observations",
     )
     reflect.add_argument(
         "--date",
@@ -95,8 +211,9 @@ def build_parser() -> argparse.ArgumentParser:
     reflect.add_argument(
         "--force", action="store_true", help="redo a day that already has an artifact"
     )
-    proactive = sub.add_parser(
+    proactive = add(
         "proactive",
+        group="now and then",
         help="run one proactivity round now and print its verdicts (dry by default)",
     )
     proactive.add_argument(
@@ -106,15 +223,18 @@ def build_parser() -> argparse.ArgumentParser:
         "stops at the gate and costs no model call.",
     )
 
-    sub.add_parser("voice", help="hold one spoken conversation at this machine")
+    add("voice", group="now and then", help="hold one spoken conversation at this machine")
 
-    sub.add_parser(
+    add(
         "request-mic",
+        group="setup",
         help="claim macOS microphone access (used by Daemon.app during install)",
     )
 
-    wake = sub.add_parser(
-        "wake", help="the always-on wake phrase: measure it on your voice, then hear it work"
+    wake = add(
+        "wake",
+        group="now and then",
+        help="the always-on wake phrase: measure it on your voice, then hear it work",
     )
     wake_sub = wake.add_subparsers(dest="wake_command", required=True)
     calibrate = wake_sub.add_parser(
@@ -141,14 +261,18 @@ def build_parser() -> argparse.ArgumentParser:
         "leaving a television on and watching for a false wake needs.",
     )
 
-    pairing = sub.add_parser("pairing", help="see and approve who may talk to Daemon")
+    pairing = add(
+        "pairing", group="every day", help="see and approve who may talk to Daemon"
+    )
     pairing_sub = pairing.add_subparsers(dest="pairing_command", required=True)
     pairing_sub.add_parser("list", help="pending pairing requests and their codes")
     approve = pairing_sub.add_parser("approve", help="approve a pairing code")
     approve.add_argument("code", help="the 8-character code the bot replied with")
 
-    persona = sub.add_parser(
-        "persona", help="see active learned persona rules (M4); no subcommand just lists them"
+    persona = add(
+        "persona",
+        group="now and then",
+        help="see active learned persona rules (M4); no subcommand just lists them",
     )
     persona_sub = persona.add_subparsers(dest="persona_command")
     evolve = persona_sub.add_parser(
@@ -167,14 +291,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     persona_forget.add_argument("id", type=int, help="the rule id, from `daemon persona`")
     persona_forget.add_argument("--why", required=True, help="why this rule should be retired")
-    tools = sub.add_parser("tools", help="what Daemon may do to this machine, and what it did")
+    tools = add(
+        "tools",
+        group="every day",
+        help="what Daemon may do to this machine, and what it did",
+    )
     tools_sub = tools.add_subparsers(dest="tools_command", required=True)
     tools_sub.add_parser("list", help="the tools that are loaded, and the policy in force")
     tools_sub.add_parser("log", help="recent tool calls, including the refused ones")
     tools_sub.add_parser("pending", help="approvals waiting on an answer")
     forget = tools_sub.add_parser("forget", help="drop a standing approval granted with 'always'")
     forget.add_argument("pattern", help="the command pattern to stop trusting, e.g. 'git status'")
+
+    parser.epilog = _grouped_commands(groups)
+    # Read by `daemon help <command>` and by the test that checks no command
+    # escaped a group. Set here because `add` above is the only registration path,
+    # so these two cannot disagree with what the parser actually accepts.
+    parser.command_groups = groups  # type: ignore[attr-defined]
+    parser.command_parsers = sub.choices  # type: ignore[attr-defined]
     return parser
+
+
+def _grouped_commands(groups: dict[str, list[tuple[str, str]]]) -> str:
+    """The command list, grouped by when you would reach for them.
+
+    This is the *only* rendering of the list - the subparsers are registered
+    without a `help=` at all, which is what stops argparse listing them a second
+    time - so there is no second copy to keep in step. See `add` for why
+    withholding the argument is not the same as passing SUPPRESS.
+    """
+    width = max(len(name) for entries in groups.values() for name, _ in entries)
+    columns = min(shutil.get_terminal_size(fallback=(80, 24)).columns, 100)
+    lines: list[str] = []
+    for title in _GROUP_ORDER:
+        entries = groups.get(title)
+        if not entries:
+            continue
+        lines.append(f"{title}:")
+        for name, text in entries:
+            lines.extend(
+                textwrap.wrap(
+                    text,
+                    width=max(columns, width + 24),
+                    initial_indent=f"  {name.ljust(width)}  ",
+                    subsequent_indent=" " * (width + 4),
+                )
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -192,6 +356,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     command: str = args.command
 
+    if command == "help":
+        # Before Settings, like doctor and setup: the moment you most need to be
+        # told what the commands are is the moment the configuration is broken.
+        return _help(args.topic)
+    if command == "log":
+        # Also before Settings, and for a sharper version of the same reason: a
+        # configuration the process cannot load is one of the ways the resident
+        # fails, and the log is where that failure is written down. Refusing to
+        # open it until the configuration parses withholds the evidence about the
+        # very thing that is broken.
+        return _log(follow=args.follow, lines=args.lines, raw=args.raw)
     if command == "doctor":
         # Doctor is the one command that must survive a configuration it cannot
         # load - explaining the breakage is its whole job.
@@ -291,6 +466,206 @@ def main(argv: Sequence[str] | None = None) -> int:
         return PROBLEM
 
     raise AssertionError(f"unhandled command {command!r}")  # pragma: no cover
+
+
+def _help(topic: str | None) -> int:
+    """`daemon help`, and `daemon help <command>`.
+
+    `daemon help` prints the same parser's `--help`, not a second document written
+    beside it, so the two can never drift apart.
+    """
+    parser = build_parser()
+    if topic is None:
+        parser.print_help()
+        return OK
+    choices: dict[str, argparse.ArgumentParser] = parser.command_parsers  # type: ignore[attr-defined]
+    target = choices.get(topic)
+    if target is None:
+        print(f"daemon: no such command: {topic}", file=sys.stderr)
+        print(f"daemon: commands are: {', '.join(sorted(choices))}", file=sys.stderr)
+        return USAGE
+    target.print_help()
+    return OK
+
+
+def _log(*, follow: bool, lines: int, raw: bool) -> int:
+    """`daemon log`: what the resident has been writing.
+
+    The resident's own stderr, which is where every logger in the process ends up.
+    Not the tool audit trail - that is `daemon tools log`, a different question.
+    """
+    path = _err_log_path()
+    if not path.exists():
+        print(f"daemon: no log at {path}", file=sys.stderr)
+        print(
+            "daemon: the service may never have run here - `daemon status` says.",
+            file=sys.stderr,
+        )
+        return PROBLEM
+
+    keep = _keeper(raw)
+    for line in _tail_lines(path, lines, keep):
+        print(line)
+
+    if not follow:
+        return OK
+    try:
+        for line in _stream_lines(path):
+            if keep(line):
+                print(line, flush=True)
+    except KeyboardInterrupt:
+        # Ctrl-C is how you stop following. It is not an error, and a traceback
+        # here would be the last thing printed after a good session.
+        print()
+    return OK
+
+
+def _err_log_path() -> Path:
+    """Where the resident writes its stderr, even when `Settings` will not build.
+
+    The happy path is `service_for`, so a working install and `daemon status` agree
+    on one path. The fallback exists because `daemon log` is dispatched before the
+    Settings gate on purpose: only two values decide the path, both have defaults,
+    and reading those defaults off the model rather than repeating them here is
+    what keeps this from drifting away from `config.py`.
+
+    No configuration can make this raise. That is the promise, and it is narrower
+    than "nothing can": the last line still calls `Path.cwd()`, which fails if the
+    working directory has been deleted out from under the process - a broken machine
+    rather than a broken `.env`, and not something a fallback path can paper over.
+
+    Within that, three attempts, each catching everything, because listing the
+    failures instead of catching them all has now let a traceback through twice:
+    ConfigError from the model validator, then pydantic's ValidationError from a
+    field that will not coerce, then UnicodeDecodeError from a `.env` an editor saved
+    as CP949 - which `Settings` raises while reading the file, before any of the rest
+    can apply. This runs precisely when the configuration is already broken, and the
+    module docstring's promise - print what you found rather than a traceback - is
+    worth least when it only holds for configurations that parse.
+    """
+    try:
+        return service_for(Settings()).err_log
+    except Exception:  # noqa: BLE001 - every way a configuration can be unusable
+        pass
+    try:
+        return _log_path(_env_setting("DAEMON_SERVICE_LABEL", "service_label"))
+    except Exception:  # noqa: BLE001 - and every way the values in it can be
+        pass
+    # Defaults only, and they are the model's own, so this last line cannot fail
+    # for a reason the configuration caused. If no resident ever ran here, `_log`
+    # says so and prints the path it looked at.
+    return _log_path(_default("service_label"), data_dir=Path(_default("data_dir")))
+
+
+def _log_path(label: str, *, data_dir: Path | None = None) -> Path:
+    """The err-log path `Service` would compute for this label and data dir."""
+    if data_dir is None:
+        data_dir = Path(_env_setting("DAEMON_DATA_DIR", "data_dir")).expanduser()
+    return Service(label=label, working_dir=Path.cwd(), log_dir=data_dir / "logs").err_log
+
+
+def _default(field: str) -> str:
+    """A field's default, read off the model so it cannot drift from `config.py`."""
+    return str(Settings.model_fields[field].default)
+
+
+def _env_setting(alias: str, field: str) -> str:
+    """What `Settings` would read for one alias, without building `Settings`.
+
+    Case-insensitive, and last-match-wins within a source, because that is what
+    `case_sensitive=False` actually does: pydantic-settings case-folds the names
+    into a dict, so with both `DAEMON_DATA_DIR` and `daemon_data_dir` set the second
+    one is the one that counts. Returning the first match instead pointed this at a
+    different directory than the resident would use.
+    """
+    filed: dict[str, str] = {}
+    env_file = Path(ENV_FILE)
+    try:
+        if env_file.exists():
+            from daemon.setup import parse_env
+
+            filed = parse_env(env_file.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - an unreadable .env is one we cannot consult
+        filed = {}
+
+    # Environment before file, matching pydantic-settings' source precedence.
+    for source in (os.environ, filed):
+        matches = [value for key, value in source.items() if key.upper() == alias and value]
+        if matches:
+            return matches[-1]
+    return _default(field)
+
+
+def _keeper(raw: bool) -> Callable[[str], bool]:
+    if raw:
+        return lambda _: True
+    return lambda line: not _LOG_NOISE.search(line)
+
+
+def _tail_lines(path: Path, count: int, keep: Callable[[str], bool]) -> list[str]:
+    """The last `count` lines this would actually print.
+
+    Filtering after taking the last N would be the wrong way round: over half the
+    file is polling, so `daemon log -n 12` on an idle daemon showed twelve lines of
+    noise reduced to an empty screen, which reads as "the log is broken". `-n` is
+    how much you want to *see*, so the filter runs first and the count is of what
+    survives.
+
+    Reads backwards a block at a time and stops as soon as it has enough - the file
+    this points at was 2.4MB after five days.
+    """
+    if count <= 0:
+        return []
+    kept: list[str] = []
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        held = b""
+        at_start = position == 0
+        while not at_start and len(kept) < count:
+            step = min(_TAIL_BLOCK, position)
+            position -= step
+            at_start = position == 0
+            handle.seek(position)
+            held = handle.read(step) + held
+            pieces = held.split(b"\n")
+            # Unless this block starts the file, its first piece is the tail of a
+            # line whose head is in the block before it: hold it back.
+            held = b"" if at_start else pieces.pop(0)
+            lines = (piece.decode("utf-8", errors="replace") for piece in pieces)
+            kept = [line for line in lines if line and keep(line)] + kept
+    return kept[-count:]
+
+
+def _stream_lines(path: Path) -> Iterator[str]:
+    """New lines as they are appended, forever.
+
+    Opens and seeks to the end here rather than inside the generator: a generator
+    body does not run until the first `next()`, so a lazy version would decide
+    where "the end" is at some arbitrary later moment and silently skip whatever
+    was written in between. That is also what makes the follow path testable - a
+    test can append a line after this returns and be sure it will be seen.
+    """
+    handle = path.open("r", encoding="utf-8", errors="replace")
+    handle.seek(0, os.SEEK_END)
+    return _emit_appended(handle, path)
+
+
+def _emit_appended(handle: Any, path: Path) -> Iterator[str]:
+    with handle:
+        while True:
+            line = handle.readline()
+            if line:
+                yield line.rstrip("\n")
+                continue
+            try:
+                # Truncated or replaced under us - `daemon install` re-prepares the
+                # log files. Start again from the top of the new one.
+                if path.stat().st_size < handle.tell():
+                    handle.seek(0)
+            except OSError:
+                return
+            time.sleep(_LOG_POLL_SECONDS)
 
 
 # --- seams the tests replace -------------------------------------------------
@@ -495,7 +870,13 @@ def _restart_after_update() -> None:
     """
     try:
         settings = Settings()
-    except ConfigError:
+    except Exception:  # noqa: BLE001 - any unusable configuration, see _err_log_path
+        # Not just ConfigError. `daemon update` runs before the Settings gate on
+        # purpose - you may be updating because a version is broken - so this is
+        # reached with any `.env` at all, including the ones that raise pydantic's
+        # ValidationError or UnicodeDecodeError. Narrower, it turned a reinstall
+        # that had already succeeded into a traceback on its last line, which is
+        # the one outcome the docstring above rules out.
         print(
             "the code is updated; restart the service yourself to pick it up "
             "(config did not load here, so I could not do it automatically)."
@@ -885,7 +1266,14 @@ class Check:
 def _doctor() -> int:
     try:
         settings = Settings()
-    except ConfigError as exc:
+    except Exception as exc:  # noqa: BLE001 - see below
+        # Everything, for the reason `_err_log_path` says at length: ConfigError is
+        # only the failure the model validator produces. `DAEMON_PORT=abc` raises
+        # pydantic's ValidationError from field parsing and a `.env` saved as CP949
+        # raises UnicodeDecodeError from reading the file, and catching only
+        # ConfigError made the command whose whole job is explaining the breakage
+        # print a traceback instead - the exact trap config.py records. Reporting a
+        # failure this command cannot classify still beats a stack trace.
         checks = [Check("config", False, str(exc))]
         admin = None
     else:

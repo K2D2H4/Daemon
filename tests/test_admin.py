@@ -331,6 +331,32 @@ def test_shell_page_renders_offline(tmp_path: Path) -> None:
     assert "Daemon" in resp.text
 
 
+def test_voice_sensitivities_are_wired_through_the_provider_aware_block(
+    tmp_path: Path,
+) -> None:
+    """voice_start/end_sensitivity are Gemini-only (daemon/voice/openai_realtime.py
+    never reads them, and app.py passes them only in the GeminiLiveSession branch).
+    The shell has no JS harness, so this cannot drive a real provider switch - but it
+    can assert the source is structured so a switch would work: the two sensitivity
+    fields must be emitted from inside `voiceField()`, the function the `voice_provider`
+    `change` listener re-renders, rather than unconditionally in `renderSettings()`.
+    Reverting to the old unconditional emission (both fieldStr calls sitting in
+    renderSettings, outside voiceField) would fail this test.
+    """
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+    html = client.get("/admin/").text
+
+    start = html.index("function voiceField(")
+    end = html.index("\nfunction ", start + 1)
+    voice_field_fn = html[start:end]
+    outside = html[:start] + html[end:]
+
+    for name in ("voice_start_sensitivity", "voice_end_sensitivity"):
+        assert name in voice_field_fn, f"{name} must render from inside voiceField()"
+        assert name not in outside, f"{name} must not also render unconditionally"
+
+
 def test_restart_refuses_when_not_supervised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -512,6 +538,46 @@ def test_patch_sets_the_gemini_live_voice(tmp_path: Path) -> None:
     )
 
 
+def test_patch_sets_the_openai_voice_provider_and_voice(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch("/admin/api/settings", json={
+        "voice_provider": "openai",
+        "openai_realtime_voice": "alloy",
+        "openai_realtime_model": "gpt-realtime",
+    })
+    assert resp.status_code == 200
+    text = env.read_text(encoding="utf-8")
+    assert "DAEMON_VOICE_PROVIDER=openai" in text
+    assert "DAEMON_OPENAI_REALTIME_VOICE=alloy" in text
+    assert "DAEMON_OPENAI_REALTIME_MODEL=gpt-realtime" in text
+
+    got = client.get("/admin/api/settings").json()
+    voice_providers = got["options"]["voice_providers"]
+    assert "openai" in voice_providers and "gemini" in voice_providers
+    assert got["options"]["openai_realtime_voices"][0] == ""  # server-default offered first
+    assert "alloy" in got["options"]["openai_realtime_voices"]
+
+
+def test_patch_rejects_an_unknown_voice_provider_and_openai_voice(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    original = "DAEMON_PRESET=offline\n"
+    env.write_text(original, encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    bad_provider = client.patch("/admin/api/settings", json={"voice_provider": "anthropic"})
+    assert bad_provider.status_code == 400
+    bad_voice = client.patch("/admin/api/settings", json={"openai_realtime_voice": "nope"})
+    assert bad_voice.status_code == 400
+    assert env.read_text(encoding="utf-8") == original, "a rejected patch still wrote"
+
+
 def test_patch_rejects_an_unknown_gemini_live_voice(tmp_path: Path) -> None:
     env = tmp_path / ".env"
     original = "DAEMON_PRESET=offline\n"
@@ -545,39 +611,41 @@ def test_a_newline_in_a_route_override_is_refused(tmp_path: Path) -> None:
     assert env.read_text(encoding="utf-8") == original
 
 
-def test_voice_sample_serves_a_present_clip(
+def test_voice_sample_serves_both_providers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     samples = tmp_path / "voice-samples"
-    samples.mkdir()
-    (samples / "Kore.mp3").write_bytes(b"ID3-fake-mp3-bytes")
-    monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
-
-    app = create_app(_settings(tmp_path))
-    client = TestClient(app, base_url=LOOPBACK)
-    resp = client.get("/admin/api/voice-sample/Kore")
-
-    assert resp.status_code == 200
-    assert resp.headers["content-type"] == "audio/mpeg"
-    assert resp.content == b"ID3-fake-mp3-bytes"
-
-
-def test_voice_sample_404_for_missing_or_unknown_and_never_reads_a_bad_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    samples = tmp_path / "voice-samples"
-    samples.mkdir()
+    (samples / "gemini").mkdir(parents=True)
+    (samples / "openai").mkdir(parents=True)
+    (samples / "gemini" / "Kore.mp3").write_bytes(b"ID3-gemini")
+    (samples / "openai" / "alloy.mp3").write_bytes(b"ID3-openai")
     monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
 
     app = create_app(_settings(tmp_path))
     client = TestClient(app, base_url=LOOPBACK)
 
-    # Known voice, but no file generated yet -> 404, not 500.
-    assert client.get("/admin/api/voice-sample/Kore").status_code == 404
-    # A name outside the allowlist -> 404, and the allowlist check runs before any
-    # filesystem touch, so a traversal attempt never resolves a path.
-    assert client.get("/admin/api/voice-sample/Nope").status_code == 404
-    assert client.get("/admin/api/voice-sample/..%2f..%2fetc%2fpasswd").status_code == 404
+    g = client.get("/admin/api/voice-sample/gemini/Kore")   # Gemini no-regression
+    assert g.status_code == 200 and g.headers["content-type"] == "audio/mpeg"
+    assert g.content == b"ID3-gemini"
+    o = client.get("/admin/api/voice-sample/openai/alloy")
+    assert o.status_code == 200 and o.content == b"ID3-openai"
+
+
+def test_voice_sample_404_for_unknown_provider_voice_or_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    samples = tmp_path / "voice-samples"
+    (samples / "gemini").mkdir(parents=True)
+    monkeypatch.setattr("daemon.admin.routes.VOICE_SAMPLES", samples)
+
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+
+    assert client.get("/admin/api/voice-sample/gemini/Kore").status_code == 404   # known, no file
+    assert client.get("/admin/api/voice-sample/gemini/Nope").status_code == 404   # unknown voice
+    assert client.get("/admin/api/voice-sample/openai/Kore").status_code == 404   # wrong provider
+    assert client.get("/admin/api/voice-sample/nope/Kore").status_code == 404     # unknown provider
+    assert client.get("/admin/api/voice-sample/gemini/..%2f..%2fetc%2fpasswd").status_code == 404
 
 
 # --- the switches and ids that used to be hand-edit-only ----------------------

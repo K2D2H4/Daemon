@@ -24,7 +24,7 @@ from conftest import FakeProvider
 
 from daemon import app as daemon_app
 from daemon import cli, macapp
-from daemon.config import Route, Settings
+from daemon.config import ConfigError, Route, Settings
 from daemon.fs import DIR_MODE
 from daemon.llm.gateway import LLMGateway
 from daemon.memory.base import LoggedMessage
@@ -1329,3 +1329,409 @@ def test_reindex_restores_persona_rules_from_learned_md(
         assert len(store.active_persona_rules()) == 5, "a second reindex must not duplicate rows"
     finally:
         store.close()
+
+
+# --- `daemon help` -----------------------------------------------------------
+
+
+def test_help_prints_exactly_what_dash_dash_help_prints(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The whole point of the subcommand: one document, reachable two ways. If
+    these ever differ, someone has written a second command list by hand."""
+    assert cli.main(["help"]) == 0
+    printed = capsys.readouterr().out
+    assert printed == cli.build_parser().format_help()
+
+
+def test_every_command_is_filed_under_a_group() -> None:
+    """The grouped epilog is the only listing there is, so a command missing from
+    it is a command nobody can discover."""
+    parser = cli.build_parser()
+    grouped = {name for entries in parser.command_groups.values() for name, _ in entries}
+    assert grouped == set(parser.command_parsers)
+
+
+def test_groups_are_the_declared_ones() -> None:
+    parser = cli.build_parser()
+    assert set(parser.command_groups) <= set(cli._GROUP_ORDER)
+
+
+def test_help_lists_each_command_once(capsys: pytest.CaptureFixture[str]) -> None:
+    cli.main(["help"])
+    printed = capsys.readouterr().out
+    for name in cli.build_parser().command_parsers:
+        listed = [
+            line for line in printed.splitlines() if line.startswith(f"  {name} ")
+        ]
+        assert len(listed) == 1, f"{name} appears {len(listed)} times"
+
+
+def test_help_for_one_command_prints_that_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["help", "log"]) == 0
+    printed = capsys.readouterr().out
+    assert "usage: daemon log" in printed
+    assert "--raw" in printed
+
+
+def test_help_for_an_unknown_command_names_the_real_ones(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["help", "lgo"]) == cli.USAGE
+    err = capsys.readouterr().err
+    assert "no such command: lgo" in err
+    assert "doctor" in err
+
+
+def test_help_works_without_a_usable_configuration(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Being told what the commands are is most needed when nothing else works."""
+
+    def broken() -> Settings:
+        raise AssertionError("help must not construct Settings")
+
+    monkeypatch.setattr(cli, "Settings", broken)
+    assert cli.main(["help"]) == 0
+    assert "every day:" in capsys.readouterr().out
+
+
+# --- `daemon log` ------------------------------------------------------------
+
+NOISE = (
+    '2026-08-11 11:03:49,334 INFO uvicorn.access 127.0.0.1:54813 - '
+    '"GET /admin/api/health HTTP/1.1" 200'
+)
+POLL = (
+    "2026-08-11 11:03:01,433 INFO httpx HTTP Request: POST "
+    'https://api.telegram.org/bot<token>/getUpdates "HTTP/1.1 200 OK"'
+)
+SIGNAL = "2026-08-11 11:01:27,688 INFO daemon.app proactive: silent - 0 generated"
+WRITE = (
+    "2026-08-11 11:03:49,371 INFO uvicorn.access 127.0.0.1:54813 - "
+    '"PATCH /admin/api/settings HTTP/1.1" 200'
+)
+"""A successful admin *write*. The first filter dropped every successful admin
+request, which swallowed the settings change that had just rewritten `.env`."""
+
+
+@pytest.fixture
+def log_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point `daemon log` at a log this test owns, never a developer's real one."""
+    path = tmp_path / "ai.daemon.default.err.log"
+    monkeypatch.setattr(
+        cli, "service_for", lambda settings: SimpleNamespace(err_log=path)
+    )
+    return path
+
+
+def test_log_drops_the_polling_and_keeps_the_rest(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_file.write_text("\n".join([NOISE, SIGNAL, POLL, NOISE]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_raw_keeps_the_polling(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_file.write_text("\n".join([NOISE, SIGNAL, POLL]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log", "--raw"]) == 0
+    assert capsys.readouterr().out.splitlines() == [NOISE, SIGNAL, POLL]
+
+
+def test_log_counts_the_lines_it_shows_not_the_lines_it_reads(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Over half a real log is polling. Filtering *after* taking the last N made
+    `daemon log` print an empty screen on an idle daemon, which reads as broken."""
+    log_file.write_text(
+        "\n".join([SIGNAL, *([NOISE] * 200), SIGNAL]) + "\n", encoding="utf-8"
+    )
+
+    assert cli.main(["log", "-n", "2"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL, SIGNAL]
+
+
+def test_log_keeps_a_failed_poll(log_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A 409 from getUpdates is the line that explains two bots sharing a token -
+    exactly the failure this filter must never hide."""
+    conflict = POLL.replace("200 OK", "409 Conflict")
+    server_error = NOISE.replace("HTTP/1.1\" 200", "HTTP/1.1\" 500")
+    log_file.write_text("\n".join([conflict, server_error]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [conflict, server_error]
+
+
+def test_log_without_a_file_says_so(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["log"]) == cli.PROBLEM
+    assert "no log at" in capsys.readouterr().err
+
+
+def test_tail_reads_back_across_block_boundaries(tmp_path: Path) -> None:
+    """The backward reader stitches blocks together; a line split across two of
+    them must not come back mangled or doubled."""
+    path = tmp_path / "big.log"
+    lines = [f"{n:05d} " + "x" * 200 for n in range(400)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert cli._tail_lines(path, 3, cli._keeper(raw=True)) == lines[-3:]
+    assert cli._tail_lines(path, 400, cli._keeper(raw=True)) == lines
+    assert cli._tail_lines(path, 900, cli._keeper(raw=True)) == lines
+
+
+def test_tail_of_an_empty_log_is_empty(tmp_path: Path) -> None:
+    path = tmp_path / "empty.log"
+    path.write_text("", encoding="utf-8")
+    assert cli._tail_lines(path, 10, cli._keeper(raw=True)) == []
+
+
+def test_follow_yields_lines_as_they_are_appended(tmp_path: Path) -> None:
+    """The follow path is a generator precisely so it can be tested without a
+    thread and without waiting on a loop that never ends."""
+    path = tmp_path / "live.log"
+    path.write_text("already here\n", encoding="utf-8")
+
+    stream = cli._stream_lines(path)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("first\nsecond\n")
+    try:
+        assert next(stream) == "first"
+        assert next(stream) == "second"
+    finally:
+        stream.close()
+
+
+def _unusable(reason: str) -> type[Settings]:
+    """A `Settings` that refuses to build, but is still the class.
+
+    Replacing the name with a bare function would also remove `model_fields`,
+    which the fallback path reads to find the defaults - the test would then fail
+    for a reason the product never hits.
+    """
+
+    class Unusable(Settings):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise ConfigError(reason)
+
+    return Unusable
+
+
+def test_log_keeps_what_the_admin_console_changed(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reads repeat unprompted; a write is always something that happened. Only
+    the polling GETs are noise, and only when they succeeded."""
+    log_file.write_text("\n".join([NOISE, WRITE, NOISE]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [WRITE]
+
+
+def test_log_reads_the_default_path_when_the_configuration_will_not_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A configuration the process cannot load is one of the ways the resident
+    fails, and the log is where that failure is written down - so `daemon log` must
+    not be gated on the same validation that is refusing to pass."""
+    monkeypatch.chdir(tmp_path)
+    # Cleared so this really exercises the model's own default (`./data`) rather
+    # than the value the sandbox fixture exports.
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "Settings", _unusable("preset 'offline' routes no voice"))
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_honours_a_configured_data_dir_without_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fallback still reads DAEMON_DATA_DIR - it falls back to the model's own
+    defaults, not to a second copy of them."""
+    monkeypatch.chdir(tmp_path)
+    logs = tmp_path / "elsewhere" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "elsewhere"))
+
+    monkeypatch.setattr(cli, "Settings", _unusable("nope"))
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+OAUTH = (
+    "2026-08-11 11:03:49,371 INFO uvicorn.access 127.0.0.1:54813 - "
+    '"GET /admin/api/mcp/oauth/callback?code=abc&state=xyz HTTP/1.1" 200'
+)
+"""A GET that is a write: the OAuth redirect has to be a GET, and completing it
+lands MCP tokens on disk. The only line that says a connection finished."""
+
+
+def test_log_keeps_the_oauth_callback(
+    log_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The method is a proxy for read-vs-write, not the thing itself. Dropping
+    every successful GET would hide the one admin GET that changes state."""
+    log_file.write_text("\n".join([NOISE, OAUTH, NOISE]) + "\n", encoding="utf-8")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [OAUTH]
+
+
+def test_log_survives_a_field_that_will_not_coerce(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A typo'd number in `.env` raises pydantic's ValidationError, not ConfigError -
+    it comes from field parsing, before the model validator that raises ConfigError
+    runs at all. Catching only the latter left the ordinary broken `.env` printing a
+    traceback from the command that exists to survive one."""
+    monkeypatch.chdir(tmp_path)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DAEMON_PORT", "not-a-number")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_survives_a_service_label_that_is_not_usable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`Settings` rejects the label and so does `Service`, from a different
+    exception type - so the fallback re-raised as a traceback the command it was
+    added to protect. The label is the filename, so an unusable one never named a
+    log; the default is the name a resident would have run under."""
+    monkeypatch.chdir(tmp_path)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("DAEMON_SERVICE_LABEL", "bad label!")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_honours_a_lowercase_env_var(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`Settings` is `case_sensitive=False`, so a working build honours
+    `daemon_data_dir`. A stricter lookup in the fallback would send the two paths to
+    different directories for the same environment."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    logs = tmp_path / "mydata" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    monkeypatch.setenv("daemon_data_dir", str(tmp_path / "mydata"))
+    monkeypatch.setenv("DAEMON_PORT", "not-a-number")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_survives_an_env_file_the_encoding_of_which_is_wrong(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A `.env` holding Korean, saved once by an editor as CP949, is not valid UTF-8.
+    `Settings` raises UnicodeDecodeError while *reading the file* - a ValueError, so
+    neither the ConfigError nor the OSError guard saw it, and the command that exists
+    to survive a broken configuration printed a traceback for a plausible one."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    (tmp_path / ".env").write_bytes("DAEMON_PERSONA_SEED=연희동에 산다\n".encode("cp949"))
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_log_survives_a_data_dir_that_is_not_a_usable_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An embedded NUL makes `Path.resolve` raise ValueError, not ServiceError, so the
+    label guard did not cover it and the retry reused the same bad directory. Falls
+    all the way back to the model's defaults."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    logs = tmp_path / "data" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
+    (tmp_path / ".env").write_bytes(b"DAEMON_DATA_DIR=/tmp/bad\x00dir\n")
+
+    assert cli.main(["log"]) == 0
+    assert capsys.readouterr().out.splitlines() == [SIGNAL]
+
+
+def test_the_last_of_two_cases_wins_like_settings_does(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`case_sensitive=False` case-folds into a dict, so the later name is the one
+    that counts. Returning the first match sent the fallback to a directory the
+    resident would not have used."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DAEMON_DATA_DIR", raising=False)
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "first"))
+    monkeypatch.setenv("daemon_data_dir", str(tmp_path / "second"))
+
+    assert Settings(preset="offline").data_dir == tmp_path / "second", "premise"
+    assert cli._env_setting("DAEMON_DATA_DIR", "data_dir") == str(tmp_path / "second")
+
+
+def test_doctor_reports_a_field_that_will_not_coerce(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The command whose whole job is explaining a configuration that will not load
+    must not be the one that raises. ConfigError is only what the model validator
+    produces; a field that will not coerce raises pydantic's ValidationError first."""
+    monkeypatch.setenv("DAEMON_PORT", "not-a-number")
+
+    assert cli.main(["doctor"]) == cli.PROBLEM
+    printed = capsys.readouterr().out
+    assert "[FAIL] config:" in printed
+    assert "DAEMON_PORT" in printed
+
+
+def test_doctor_survives_an_env_file_the_encoding_of_which_is_wrong(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The third of the three reasons `_doctor`'s catch is wide, and the one the
+    commit that widened it named while leaving it untested: `Settings` raises
+    UnicodeDecodeError while *reading* a `.env` that an editor saved as CP949, so
+    neither ConfigError nor ValidationError describes it."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_bytes("DAEMON_PERSONA_SEED=연희동에 산다\n".encode("cp949"))
+
+    assert cli.main(["doctor"]) == cli.PROBLEM
+    assert "[FAIL] config:" in capsys.readouterr().out
+
+
+def test_update_that_cannot_load_the_config_still_reports_success(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`daemon update` runs before the Settings gate on purpose, so its restart step
+    meets every `.env` there is. A traceback on the last line of a reinstall that
+    already succeeded is the one outcome its docstring rules out."""
+    monkeypatch.setenv("DAEMON_PORT", "not-a-number")
+
+    cli._restart_after_update()
+
+    assert "the code is updated" in capsys.readouterr().out

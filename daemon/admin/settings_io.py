@@ -28,8 +28,10 @@ from typing import Any
 from daemon.config import (
     GEMINI_LIVE_VOICES,
     HOSTED_PROVIDERS,
+    OPENAI_REALTIME_VOICES,
     PRESETS,
     SENSITIVITIES,
+    VOICE_PROVIDERS,
     Settings,
 )
 from daemon.fs import write_private_replace
@@ -60,6 +62,11 @@ STR_FIELDS: dict[str, str] = {
     # a page that lets you choose `openai_compatible` without letting you name its
     # address could only ever answer the choice with an error it cannot fix.
     "openai_compatible_base_url": "DAEMON_OPENAI_COMPATIBLE_BASE_URL",
+    # Voice provider is its own axis (config.py): gemini or openai. Its own realtime
+    # model + voice, exactly like the gemini pair, so voice is fully web-configurable.
+    "voice_provider": "DAEMON_VOICE_PROVIDER",
+    "openai_realtime_model": "DAEMON_OPENAI_REALTIME_MODEL",
+    "openai_realtime_voice": "DAEMON_OPENAI_REALTIME_VOICE",
     # Both halves of the pair: `Settings` validates each against SENSITIVITIES, and
     # offering only the start one would leave the end one hand-edit-only for no
     # reason a reader could infer.
@@ -167,6 +174,8 @@ def current_settings_payload(settings: Settings, env_path: Path | None = None) -
             "hosted_providers": list(HOSTED_PROVIDERS),
             "tool_modes": list(TOOL_MODES),
             "gemini_live_voices": ["", *sorted(GEMINI_LIVE_VOICES)],
+            "voice_providers": list(VOICE_PROVIDERS),
+            "openai_realtime_voices": ["", *sorted(OPENAI_REALTIME_VOICES)],
             # Empty is a real choice - "leave it to the server" (config.py).
             "sensitivities": ["", *SENSITIVITIES],
         },

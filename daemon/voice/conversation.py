@@ -23,8 +23,11 @@ Four things here are load-bearing rather than incidental:
    at the turn boundary, in the same server event as the first audio chunk of the
    answer. Measured, twice. So the prefetch fires when the answer has already
    started and what it finds is context for the *next* turn. The machinery stays -
-   it is right for a provider that streams partials, which OpenAI Realtime does -
-   and the claim that it makes recall free is retracted.
+   it would be right for a provider that streams partials, which as it turns out
+   neither hosted provider does today: OpenAI Realtime's `partial_transcripts()`
+   also yields one item per turn, the completed utterance, not a growing
+   fragment (daemon/voice/openai_realtime.py, whisper-1 sends no deltas) - and
+   the claim that this machinery makes recall free is retracted.
 3. **A barge-in is the provider's call, not ours, and it does two things or it does
    nothing.** `session.interrupt()` stops the abandoned turn's audio from arriving,
    `audio.stop_playback()` drops what is already queued; either alone leaves the

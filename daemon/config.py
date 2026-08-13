@@ -78,6 +78,18 @@ GEMINI_LIVE_VOICES = frozenset({
 from daemon/voice/*: importing the voice layer into config inverts the layering,
 the same reason SENSITIVITIES is duplicated."""
 
+VOICE_PROVIDERS = ("gemini", "openai")
+"""Which hosted native-audio backend a voice session uses. Independent of the text
+`hosted_provider`: voice-model availability is a separate axis, and being explicit
+turns a mismatch into a startup error, not a first-turn failure."""
+
+OPENAI_REALTIME_VOICES = frozenset({
+    "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse",
+    "marin", "cedar",
+})
+"""OpenAI Realtime voices. `marin`/`cedar` are gpt-realtime-only; a voice the chosen
+model rejects comes back as a session error, the same class as Gemini's 1007."""
+
 SENSITIVITIES = ("low", "high")
 """What the two speech-sensitivity settings accept, plus empty for "the server
 decides".
@@ -357,6 +369,19 @@ class Settings(BaseSettings):
     GEMINI_LIVE_VOICES, or empty to leave it to the server. Checked at construction,
     not on the wire: an unknown name comes back as a 1007 close the session treats as
     permanent, so a typo would end voice mode rather than fail the setting."""
+
+    voice_provider: str = Field(default="gemini", alias="DAEMON_VOICE_PROVIDER")
+    """Which native-audio backend voice mode uses: one of VOICE_PROVIDERS. Not derived
+    from the text hosted_provider."""
+
+    openai_realtime_model: str = Field(default="", alias="DAEMON_OPENAI_REALTIME_MODEL")
+    """OpenAI Realtime model id (e.g. gpt-realtime), distinct from DAEMON_OPENAI_MODEL:
+    the realtime endpoint takes its own id. No default - a guessed id fails at the first
+    voice turn, which is what this module exists to prevent."""
+
+    openai_realtime_voice: str = Field(default="", alias="DAEMON_OPENAI_REALTIME_VOICE")
+    """Which prebuilt OpenAI voice: one of OPENAI_REALTIME_VOICES, or empty for the
+    server default. Checked at construction, not on the wire."""
 
     # --- how the server decides a turn ended (daemon/voice/gemini_live.py) ---
     # All four are empty or None by default, and that is not laziness: an omitted
@@ -825,11 +850,31 @@ class Settings(BaseSettings):
                 f"DAEMON_VOICE_ENABLED is on but preset {self.preset!r} routes no voice task; "
                 "voice needs a hosted native-audio provider (docs/PLAN.md 3.2)"
             )
-        if self.voice_enabled and not self.gemini_live_model:
+        if self.voice_provider not in VOICE_PROVIDERS:
             problems.append(
-                "DAEMON_VOICE_ENABLED is on but DAEMON_GEMINI_LIVE_MODEL is empty; "
-                "the native-audio endpoint needs its own model id"
+                f"DAEMON_VOICE_PROVIDER is {self.voice_provider!r}; expected one of "
+                f"{', '.join(VOICE_PROVIDERS)}"
             )
+        elif self.voice_enabled:
+            # The chosen provider's own realtime model + that provider's key. The
+            # text model (DAEMON_*_MODEL) is neither required nor read for voice.
+            if self.voice_provider == "gemini" and not self.gemini_live_model:
+                problems.append(
+                    "DAEMON_VOICE_ENABLED is on with DAEMON_VOICE_PROVIDER=gemini but "
+                    "DAEMON_GEMINI_LIVE_MODEL is empty; the native-audio endpoint needs its own id"
+                )
+            if self.voice_provider == "openai":
+                if not self.openai_realtime_model:
+                    problems.append(
+                        "DAEMON_VOICE_ENABLED is on with DAEMON_VOICE_PROVIDER=openai but "
+                        "DAEMON_OPENAI_REALTIME_MODEL is empty; the realtime endpoint needs "
+                        "its own id"
+                    )
+                if not self.openai_api_key:
+                    problems.append(
+                        "DAEMON_VOICE_ENABLED is on with DAEMON_VOICE_PROVIDER=openai but "
+                        "OPENAI_API_KEY is empty"
+                    )
 
         # Caught here rather than on the wire. The server answers a bad enum by
         # closing with 1007, which the session classifies as permanent - so a typo
@@ -849,6 +894,12 @@ class Settings(BaseSettings):
             problems.append(
                 f"DAEMON_GEMINI_LIVE_VOICE is {self.gemini_live_voice!r}; expected one of "
                 "the Gemini Live voices, or empty to leave it to the server"
+            )
+
+        if self.openai_realtime_voice and self.openai_realtime_voice not in OPENAI_REALTIME_VOICES:
+            problems.append(
+                f"DAEMON_OPENAI_REALTIME_VOICE is {self.openai_realtime_voice!r}; expected one of "
+                "the OpenAI Realtime voices, or empty to leave it to the server"
             )
 
         if self.wake_enabled and not self.wake_aliases:
@@ -1048,6 +1099,11 @@ class Settings(BaseSettings):
             task: (self.hosted_provider if provider == HOSTED else provider)
             for task, provider in PRESETS[self.preset].items()
         }
+        # Voice provider is its own axis (DAEMON_VOICE_PROVIDER), not the preset's
+        # literal CHAT_VOICE entry. Override it here so route_for, active_tasks and
+        # the key/model checks all see the provider that will actually be dialled.
+        if Task.CHAT_VOICE in resolved:
+            resolved[Task.CHAT_VOICE] = self.voice_provider
         return {**resolved, **self.route_overrides}
 
     @property
@@ -1083,9 +1139,9 @@ class Settings(BaseSettings):
                 f"{task.value} was requested but voice is off (DAEMON_VOICE_ENABLED)"
             )
         if task in VOICE_TASKS:
-            # The native-audio endpoint takes its own model id, which is why
-            # DAEMON_GEMINI_MODEL is neither required nor read for a voice route.
-            return Route(provider=provider, model=self.gemini_live_model)
+            # The native-audio endpoint takes its own model id (never DAEMON_*_MODEL).
+            model = self.gemini_live_model if provider == "gemini" else self.openai_realtime_model
+            return Route(provider=provider, model=model)
         return Route(provider=provider, model=self.provider_model(provider))
 
     def routing_table(self) -> dict[Task, Route]:
