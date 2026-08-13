@@ -1277,7 +1277,11 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 key="DAEMON_OPENAI_COMPATIBLE_MODEL",
                 label="model id",
                 why="Which model answers. Settings has no default here, so an empty "
-                "value would refuse to start.",
+                "value would refuse to start. Avoid a reasoning model if the list "
+                "offers a choice: it can spend its whole output budget thinking and "
+                "return nothing, and the proactive judge's small budget is where "
+                "that bites first - silently, since a failed judge call just stays "
+                "quiet rather than erroring where you would see it.",
                 default=env.get("DAEMON_OPENAI_COMPATIBLE_MODEL", ""),
                 listed=True,
             )
