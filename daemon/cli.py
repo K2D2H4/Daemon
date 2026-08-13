@@ -32,6 +32,7 @@ from typing import Any
 from daemon import __version__
 from daemon.config import ENV_FILE, OLLAMA, ConfigError, Settings
 from daemon.fs import DIR_MODE
+from daemon.proactivity.base import Reading
 from daemon.service import ServiceAction, ServiceError, ServiceStatus, service_for
 
 OK = 0
@@ -974,6 +975,29 @@ def _reindex(settings: Settings) -> int:
         store.close()
 
 
+def _render_presence(reading: Reading) -> list[str]:
+    """The presence lines `daemon proactive` prints, pulled out of `_proactive` so
+    they are testable without going through `build_proactive_tick`'s real
+    `MachinePresence` (tests/CLAUDE.md: no test may touch real hardware).
+
+    Reports `output_muted` and `screen_locked` as of the whole-branch review
+    (finding 3): `Gate._route` can decline the speaker on either, and this
+    command was the only human-readable window into a tick - but it printed
+    neither, so "why did it stay quiet" had no answer for the two rules that
+    decided it in this milestone's own acceptance run.
+    """
+    idle = "unknown" if reading.idle_seconds is None else f"{reading.idle_seconds:.0f}s"
+    tristate = {True: "busy", False: "free", None: "unknown"}
+    mic = tristate[reading.mic_busy]
+    output = tristate[reading.output_busy]
+    muted = {True: "muted", False: "unmuted", None: "unknown"}[reading.output_muted]
+    locked = {True: "locked", False: "unlocked", None: "unknown"}[reading.screen_locked]
+    return [
+        f"presence: idle {idle} · app {reading.foreground_app or 'unknown'}",
+        f"          mic {mic} · output {output} · output {muted} · screen {locked}",
+    ]
+
+
 async def _proactive(settings: Settings, *, speak: bool = False) -> int:
     """One tick, printed. This is how the deterministic half gets checked.
 
@@ -995,12 +1019,8 @@ async def _proactive(settings: Settings, *, speak: bool = False) -> int:
         await closing()
 
     reading = result.reading
-    idle = "unknown" if reading.idle_seconds is None else f"{reading.idle_seconds:.0f}s"
-    tristate = {True: "busy", False: "free", None: "unknown"}
-    mic = tristate[reading.mic_busy]
-    output = tristate[reading.output_busy]
-    print(f"presence: idle {idle} · app {reading.foreground_app or 'unknown'}")
-    print(f"          mic {mic} · output {output}")
+    for line in _render_presence(reading):
+        print(line)
     for reason in reading.unknown:
         print(f"  ! {reason}")
 

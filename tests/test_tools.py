@@ -1115,6 +1115,17 @@ async def test_system_state_reports_what_the_presence_measured() -> None:
     assert presence.reads == 1, "it must ask the presence, not probe on its own"
 
 
+async def test_system_state_reports_mute_and_lock_state() -> None:
+    """Finding 3 (whole-branch review): `output_muted` and `screen_locked` decide
+    `Gate._route`, and this tool was silent on both - so the model asked "is the
+    owner here" got no answer for the two rules that decide whether a proactive
+    utterance may speak or must fall back to Telegram."""
+    presence = FakePresence(reading(output_muted=True, screen_locked=False))
+    out = await SystemState(presence).run({})
+    assert "output muted: yes" in out
+    assert "screen locked: no" in out
+
+
 async def test_at_the_keyboard_keeps_its_three_way_answer() -> None:
     """`at_keyboard` is None when it cannot be known, and None is not "away" -
     flattening it to a boolean is the mistake `Reading` documents against."""

@@ -3,7 +3,7 @@
   "model": "gemini-3.6-flash",
   "provider": "gemini",
   "preset": "quality",
-  "data_dir": "/Users/gimdaehyeon/Daemon/data",
+  "data_dir": "~/Daemon/data",
   "criteria": "판정 기준 (측정 전 고정):\n- (B)를 채택한다 - silence/pattern_time에서 (B)의 발화가 빈말(또 왔네, 요즘 어때,\n  별일 없어 계열)이 아니고, 씨앗의 말투가 유지될 때.\n- (A)를 유지한다 - 그 외 전부. 특히 (B)가 내용 없는 이유에 문장을 만들어내면 (A)다.",
   "variants": [
     {

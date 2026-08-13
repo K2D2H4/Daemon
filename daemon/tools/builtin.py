@@ -697,6 +697,10 @@ class SystemState:
             lines.append(f"microphone in use: {'yes' if reading.mic_busy else 'no'}")
         if reading.output_busy is not None:
             lines.append(f"output device in use: {'yes' if reading.output_busy else 'no'}")
+        if reading.output_muted is not None:
+            lines.append(f"output muted: {'yes' if reading.output_muted else 'no'}")
+        if reading.screen_locked is not None:
+            lines.append(f"screen locked: {'yes' if reading.screen_locked else 'no'}")
         for note in reading.unknown:
             # Said rather than dropped: a probe that failed is a fact about the
             # answer, and omitting it silently reads as "nothing to report".

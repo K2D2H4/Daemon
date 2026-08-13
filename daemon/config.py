@@ -84,6 +84,12 @@ OPENAI_REALTIME_VOICES = frozenset({
 """OpenAI Realtime voices. `marin`/`cedar` are gpt-realtime-only; a voice the chosen
 model rejects comes back as a session error, the same class as Gemini's 1007."""
 
+PROACTIVE_KINDS = ("open_loop", "emotional", "silence", "pattern_time", "association")
+"""The five candidate kinds - `daemon/proactivity/base.py`'s `CandidateKind`,
+repeated here for the same reason `GEMINI_LIVE_VOICES` below is: this module is
+foundation and `daemon/proactivity/` sits above it, so importing would invert the
+layering. Validates the keys of `DAEMON_PROACTIVE_KIND_BUDGETS`."""
+
 SENSITIVITIES = ("low", "high")
 """What the two speech-sensitivity settings accept, plus empty for "the server
 decides".
@@ -449,14 +455,15 @@ class Settings(BaseSettings):
     proactive_daily_budget: int = Field(default=8, alias="DAEMON_PROACTIVE_DAILY_BUDGET")
     """Utterances per local day, all kinds. Eight, from PLAN 6.2."""
 
-    proactive_kind_budgets: dict[str, int] = Field(
+    proactive_kind_budgets: Annotated[dict[str, int], NoDecode] = Field(
         default_factory=lambda: {
             "association": 3,
             "emotional": 2,
             "open_loop": 2,
             "silence": 1,
             "pattern_time": 1,
-        }
+        },
+        alias="DAEMON_PROACTIVE_KIND_BUDGETS",
     )
     """Per-kind ceilings for one local day. Replaces the single open_loop cap.
 
@@ -465,7 +472,17 @@ class Settings(BaseSettings):
     kind to generate (open_loop) eats the budget on equal terms and turns a
     companion into a reminder app, and the Her feeling comes from the kinds with
     no business to transact. So the two businessless kinds get the most room.
-    """
+
+    As JSON, like DAEMON_ROUTE_OVERRIDES:
+    `DAEMON_PROACTIVE_KIND_BUDGETS={"open_loop": 1, "silence": 1}`. **Replaces the
+    whole table, it does not merge with the default above** - setting one kind
+    without repeating the rest removes every other kind's ceiling, leaving them
+    bound only by the daily total. `_check` validates keys against
+    `PROACTIVE_KINDS` and values as non-negative integers, because the setting
+    this one replaced had a validator and this one shipped without one:
+    `{"open_loop": 99, "nonsense": -5}` used to load clean, and a typo silently
+    wiping the ceilings is exactly the reminder-app failure PLAN 6.2 wrote this
+    table to prevent."""
 
     proactive_cooldown_minutes: int = Field(default=30, alias="DAEMON_PROACTIVE_COOLDOWN_MINUTES")
     """Minimum gap between two proactive utterances, whatever their kind."""
@@ -682,6 +699,31 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "DAEMON_ROUTE_OVERRIDES must be JSON per task, as in "
                     f'{{"reflection": "ollama"}} - {exc}'
+                ) from exc
+        return value
+
+    @field_validator("proactive_kind_budgets", mode="before")
+    @classmethod
+    def _parse_kind_budgets(cls, value: object) -> object:
+        """Empty means no per-kind ceilings (bound only by the daily total);
+        anything else must be the documented JSON. Same shape as
+        `_parse_overrides` and for the same reason: `NoDecode` on the field is
+        what lets this run at all, and unparseable text raises rather than
+        quietly becoming `{}` - which here would silently remove every ceiling
+        instead of leaving the default table in place. `_check` below still
+        validates the keys and values once this has produced a dict."""
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            import json
+
+            try:
+                return json.loads(text)
+            except ValueError as exc:
+                raise ValueError(
+                    "DAEMON_PROACTIVE_KIND_BUDGETS must be JSON per kind, as in "
+                    f'{{"open_loop": 1, "silence": 1}} - {exc}'
                 ) from exc
         return value
 
@@ -926,6 +968,17 @@ class Settings(BaseSettings):
                 f"DAEMON_PROACTIVE_SILENCE_HOURS is {self.proactive_silence_hours}; "
                 "at zero or below, every tick would be a silence candidate"
             )
+        for kind, ceiling in self.proactive_kind_budgets.items():
+            if kind not in PROACTIVE_KINDS:
+                problems.append(
+                    f"DAEMON_PROACTIVE_KIND_BUDGETS names unknown kind {kind!r}; "
+                    f"expected one of {', '.join(PROACTIVE_KINDS)}"
+                )
+            elif not isinstance(ceiling, int) or isinstance(ceiling, bool) or ceiling < 0:
+                problems.append(
+                    f"DAEMON_PROACTIVE_KIND_BUDGETS[{kind!r}] is {ceiling!r}; it must "
+                    "be a non-negative integer"
+                )
         for name, value in (
             ("DAEMON_PERSONA_MAX_ACTIVE_RULES", self.persona_max_active_rules),
             ("DAEMON_PERSONA_MAX_NEW_PER_CYCLE", self.persona_max_new_per_cycle),

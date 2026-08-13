@@ -705,6 +705,50 @@ def test_an_unset_legacy_open_loop_budget_is_not_an_error(
     assert settings.proactive_kind_budgets["open_loop"] == 2
 
 
+def test_kind_budgets_reads_the_documented_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`proactive_kind_budgets` used to have no `DAEMON_` alias at all, so nothing
+    in `.env` could reach it."""
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PROACTIVE_KIND_BUDGETS", '{"open_loop": 1, "silence": 1}')
+
+    settings = Settings(_env_file=None)
+
+    assert settings.proactive_kind_budgets == {"open_loop": 1, "silence": 1}
+
+
+def test_an_empty_kind_budgets_means_no_per_kind_ceilings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PROACTIVE_KIND_BUDGETS", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.proactive_kind_budgets == {}
+
+
+def test_unparseable_kind_budgets_names_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PROACTIVE_KIND_BUDGETS", "open_loop: 1")
+
+    with pytest.raises(ValidationError, match="DAEMON_PROACTIVE_KIND_BUDGETS"):
+        Settings(_env_file=None)
+
+
+def test_an_unknown_kind_in_the_budget_table_is_a_config_error() -> None:
+    """The regression: `{"open_loop": 99, "nonsense": -5}` used to load clean with
+    no validator at all."""
+    with pytest.raises(ConfigError, match="unknown kind 'nonsense'"):
+        make_settings(preset="offline", proactive_kind_budgets={"nonsense": 1})
+
+
+def test_a_negative_kind_ceiling_is_a_config_error() -> None:
+    with pytest.raises(ConfigError, match="non-negative"):
+        make_settings(preset="offline", proactive_kind_budgets={"open_loop": -5})
+
+
 def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:
     """Zero is a legitimate answer - keep generating candidates, never speak - and
     is how someone tunes it down without losing the label history."""

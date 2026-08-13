@@ -107,6 +107,27 @@ def check_env_table(text: str, defaults: dict[str, str], where: str) -> list[str
         for alias in re.findall(r"DAEMON_[A-Z_]+", line):
             value = defaults.get(alias)
             if value is None:
+                # Not "nothing to check" - `read_defaults` only sees a literal
+                # `Field(default=..., alias="...")`, so this also fires for a
+                # real setting shaped some other way (`default_factory=`, no
+                # `alias=` at all). That is a defect in this checker's coverage,
+                # not proof the document is wrong - but a name that used to be a
+                # real setting and was deleted looks identical to that from here,
+                # and it is the more dangerous of the two to wave through: it
+                # shipped once (DAEMON_PROACTIVE_SPEAKER_ENABLED, the row that
+                # got past this exact `continue`) and documented a switch that no
+                # longer does anything, in the direction that turns proactive
+                # speech on rather than off. So this fails loudly either way; a
+                # real setting this cannot see needs `read_defaults` widened or
+                # an explicit exemption here, not a silent skip.
+                problems.append(
+                    f"{where}:{i} names {alias}, which read_defaults() cannot find "
+                    f"as a Field(default=..., alias=...) in daemon/config.py - "
+                    f"either it no longer exists (delete the row) or it is real but "
+                    f"shaped in a way this script does not parse yet (widen "
+                    f"read_defaults or exempt it here, by name, with why): "
+                    f"{line.strip()[:70]!r}"
+                )
                 continue
             # `false` in a document is the honest rendering of Python's False
             wanted = {value, value.lower()}
