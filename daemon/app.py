@@ -27,7 +27,16 @@ from daemon import __version__
 from daemon.channels.base import Channel
 from daemon.clock import now_iso
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
-from daemon.config import ANTHROPIC, ENV_FILE, GEMINI, OLLAMA, OPENAI, ConfigError, Settings
+from daemon.config import (
+    ANTHROPIC,
+    ENV_FILE,
+    GEMINI,
+    OLLAMA,
+    OPENAI,
+    OPENAI_COMPATIBLE,
+    ConfigError,
+    Settings,
+)
 from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
@@ -472,6 +481,7 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
     from daemon.llm.providers.gemini import GeminiProvider
     from daemon.llm.providers.ollama import OllamaProvider
     from daemon.llm.providers.openai import OpenAIProvider
+    from daemon.llm.providers.openai_compatible import OpenAICompatibleProvider
 
     wanted = {route.provider for route in settings.routing_table().values()}
     fallback = settings.fallback_route()
@@ -490,10 +500,16 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
             providers[name] = GeminiProvider(
                 settings.gemini_api_key, thinking_level=settings.gemini_thinking_level
             )
+        elif name == OPENAI_COMPATIBLE:
+            providers[name] = OpenAICompatibleProvider(
+                settings.openai_compatible_api_key,
+                settings.openai_compatible_base_url,
+            )
         else:
             raise ConfigError(
                 f"routing names provider {name!r}, which has no implementation yet "
-                f"(M1a ships {OLLAMA} and {ANTHROPIC})"
+                f"(this build ships {OLLAMA}, {ANTHROPIC}, {OPENAI}, {GEMINI} and "
+                f"{OPENAI_COMPATIBLE})"
             )
     return providers
 

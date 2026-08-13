@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from daemon import __version__
-from daemon.config import ENV_FILE, OLLAMA, ConfigError, Settings
+from daemon.config import ENV_FILE, OLLAMA, OPENAI_COMPATIBLE, ConfigError, Settings
 from daemon.fs import DIR_MODE
 from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus, service_for
 
@@ -1277,14 +1277,24 @@ def _doctor() -> int:
         checks = [Check("config", False, str(exc))]
         admin = None
     else:
+        from daemon.setup import vendor_label
+
         table = ", ".join(
             f"{task.value}->{route.provider}" for task, route in settings.routing_table().items()
         )
+        endpoint = ""
+        if any(
+            route.provider == OPENAI_COMPATIBLE
+            for route in settings.routing_table().values()
+        ):
+            # The provider name is one word for many services, so the config line
+            # would otherwise not say which one is answering.
+            endpoint = f" endpoint={vendor_label(settings.openai_compatible_base_url)}"
         checks = [
             Check(
                 "config",
                 True,
-                f"preset={settings.preset} voice={settings.voice_enabled} [{table}]",
+                f"preset={settings.preset} voice={settings.voice_enabled} [{table}]{endpoint}",
             ),
             _env_override_check(settings),
             _data_dir_check(settings),

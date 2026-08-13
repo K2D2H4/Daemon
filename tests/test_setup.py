@@ -10,6 +10,7 @@ us to, not a string a fake made up.
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 from collections.abc import Callable, Sequence
@@ -23,7 +24,7 @@ import pytest
 
 from daemon import cli, setup, tui
 from daemon.service import ServiceAction, ServiceError, ServiceStatus
-from daemon.setup import EXPAND, Checks, HealthState, OllamaState, Updates, Verdict
+from daemon.setup import EXPAND, Checks, HealthState, Need, OllamaState, Updates, Verdict
 
 
 @pytest.fixture(autouse=True)
@@ -782,6 +783,42 @@ def test_a_value_already_in_the_file_is_not_asked_for_again(tmp_path: Path) -> N
     # skip the step; keys were never the reason that phrase existed, and the three
     # steps that were skipped now ask with the current value as the default.
     assert "ANTHROPIC_API_KEY" not in result.out.split("── Review")[1]
+
+
+def test_probed_only_remembers_credentials_that_can_list_models(tmp_path: Path) -> None:
+    """`_fill` used to add every filled `Need.key` to `_probed`, not only the four
+    credentials `LISTED_BY` maps to - harmless while nothing collided with one of
+    them, and the silent-degradation shape this project measures hardest against
+    the moment something does: `_list_with_saved_key` reads `_probed` by
+    credential name, so a stray key sitting in that set would suppress a probe
+    for a future `LISTED_BY` value that happened to equal it.
+    """
+    recorder = Recorder()
+    wiz = setup.Wizard(
+        env_path=tmp_path / ".env",
+        prompt=setup.Prompt(io.StringIO(f"{GOOD_KEY}\n"), io.StringIO()),
+        checks=recorder.checks(),
+    )
+
+    wiz._fill(
+        Need(key="ANTHROPIC_API_KEY", label="Anthropic API key", why="key", secret=True),
+        {},
+    )
+    assert wiz._probed == {"ANTHROPIC_API_KEY"}
+
+    wiz.prompt = setup.Prompt(io.StringIO("gemma3:4b\n"), io.StringIO())
+    wiz._fill(
+        Need(
+            key="DAEMON_OLLAMA_MODEL",
+            label="local chat model",
+            why="model",
+            default="gemma3:4b",
+        ),
+        {},
+    )
+    # A model id is not a credential `LISTED_BY` can ever point at, so it must not
+    # join the set a credential's name is later looked up in.
+    assert wiz._probed == {"ANTHROPIC_API_KEY"}
 
 
 def test_an_in_place_update_does_not_duplicate_the_key(tmp_path: Path) -> None:
@@ -2082,6 +2119,298 @@ def test_the_env_the_wizard_writes_loads_and_routes_to_that_provider(
     assert routes[Task.REFLECTION].provider == provider
 
 
+def test_choosing_a_known_vendor_fills_the_address_and_never_names_it(
+    tmp_path: Path,
+) -> None:
+    """The fourth provider choice asks a second question - which service - and
+    that answer only ever becomes an address in `.env`, never a vendor name.
+
+    Two stored values that could disagree (a vendor field and a URL) would leave
+    no way to tell which is true, so `.env` holds the URL alone and
+    `vendor_label` reads the name back out of it for display.
+    """
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    # The endpoint question is asked with the vendor's address already filled in,
+    # so KEEP is how that prefill is accepted.
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "qwen", "n", "gemma3:4b", KEEP, "sk-qwen-x", "",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=checks)
+
+    assert result.code == 0
+    qwen = setup.COMPATIBLE_VENDORS[0]
+    assert qwen.name == "qwen"
+    assert "DAEMON_HOSTED_PROVIDER=openai_compatible" in result.written
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={qwen.base_url}" in result.written
+    assert "OPENAI_COMPATIBLE_API_KEY=sk-qwen-x" in result.written
+    # No key anywhere in the file names the vendor - only the address does.
+    assert "VENDOR" not in result.written.upper()
+
+
+def test_the_env_the_wizard_writes_for_a_compatible_endpoint_loads_and_routes(
+    tmp_path: Path,
+) -> None:
+    """Same acceptance question as the three named providers: does what the
+    wizard wrote actually start and route to it?"""
+    from daemon.config import Settings
+    from daemon.tasks import Task
+
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "deepseek", "n", "gemma3:4b", KEEP, "sk-ds-x", "",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=checks)
+
+    assert result.code == 0
+    settings = Settings(_env_file=result.env_path)
+    routes = settings.routing_table()
+    assert routes[Task.CHAT_TEXT].provider == "openai_compatible"
+    assert routes[Task.CHAT_TEXT].model  # a provider with no model id cannot start
+    assert settings.openai_compatible_base_url == "https://api.deepseek.com/v1"
+
+
+def test_enter_at_a_saved_vendor_keeps_that_vendor_not_the_first_one(
+    tmp_path: Path,
+) -> None:
+    """`_choose_compatible_endpoint` prints "Currently Kimi (Moonshot). Enter
+    keeps it." on a re-run - so Enter has to actually keep Kimi, not silently
+    fall back to whichever vendor happens to be first in the table.
+
+    The bug this guards against: the default was hardcoded to
+    `COMPATIBLE_VENDORS[0].name` regardless of what was saved, so re-running
+    setup for an unrelated reason (say, turning voice on) and pressing Enter at
+    every already-decided question would quietly swap Kimi's endpoint for
+    Qwen's while leaving `DAEMON_OPENAI_COMPATIBLE_MODEL=kimi-k2.5` in place -
+    Qwen's address paired with Kimi's model, a combination nobody chose.
+    """
+    kimi = next(v for v in setup.COMPATIBLE_VENDORS if v.name == "kimi")
+    assert kimi is not setup.COMPATIBLE_VENDORS[0]  # the bug's default, for contrast
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai_compatible\n"
+        f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={kimi.base_url}\n"
+        f"DAEMON_OPENAI_COMPATIBLE_MODEL={kimi.model}\n"
+        "OPENAI_COMPATIBLE_API_KEY=sk-kimi-x\n"
+    )
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    # Every question already decided is answered with Enter, including the
+    # vendor sub-question - which is the one this test exists to hold honest -
+    # and the endpoint question it prefills.
+    answers = [
+        KEEP, KEEP, KEEP, KEEP, "n", "gemma3:4b", KEEP, KEEP,
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, existing=existing, checks=checks)
+
+    assert result.code == 0
+    assert "currently kimi" in result.out.lower()
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={kimi.base_url}" in result.written
+    assert f"DAEMON_OPENAI_COMPATIBLE_MODEL={kimi.model}" in result.written
+    # Not Qwen's address under Kimi's model - the broken combination.
+    assert setup.COMPATIBLE_VENDORS[0].base_url not in result.written
+
+
+def test_enter_at_a_saved_custom_endpoint_keeps_it_rather_than_naming_a_vendor(
+    tmp_path: Path,
+) -> None:
+    """A saved URL that matches no known vendor must default to "custom", not to
+    the first vendor in the table - otherwise Enter on a from-scratch server
+    would silently rewrite it to Qwen's address.
+    """
+    custom_url = "https://llm.internal/v1"
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai_compatible\n"
+        f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={custom_url}\n"
+        "DAEMON_OPENAI_COMPATIBLE_MODEL=my-model\n"
+        "OPENAI_COMPATIBLE_API_KEY=sk-custom-x\n"
+    )
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    answers = [
+        KEEP, KEEP, KEEP, KEEP, "n", "gemma3:4b", KEEP, KEEP,
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, existing=existing, checks=checks)
+
+    assert result.code == 0
+    assert f"Currently {custom_url}" in result.out
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={custom_url}" in result.written
+    assert "DAEMON_OPENAI_COMPATIBLE_MODEL=my-model" in result.written
+    for vendor in setup.COMPATIBLE_VENDORS:
+        assert vendor.base_url not in result.written
+
+
+def test_a_typed_endpoint_reaches_the_probe_that_verifies_the_key(tmp_path: Path) -> None:
+    """The key is proved *against an address*, and that address is the answer to
+    the question immediately before it.
+
+    Every other wizard test for this provider stubs the probe with a lambda that
+    discards its `url` argument, and that stub shape is how this shipped:
+    `Wizard.run` built one merged environment *before* the question loop, so an
+    answer typed inside the loop was invisible to every question after it. The
+    endpoint question is asked only when `.env` cannot supply the address -
+    `needs_for` drops it otherwise - so `check_openai_compatible` was handed
+    `""`, httpx refused the relative URL, and the wizard blamed the *key* three
+    times and then aborted without writing anything. Only a probe that records
+    what it was called with can see that.
+    """
+    typed_url = "https://openrouter.ai/api/v1"
+    seen: list[tuple[str, str, str]] = []
+
+    def probe(key: str, url: str, model: str) -> Verdict:
+        seen.append((key, url, model))
+        return Verdict(True, "key works")
+
+    checks = replace(working_checks(), openai_compatible=probe)
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "custom", "n", "gemma3:4b",
+        typed_url, "sk-or-typed", "some-model",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=checks)
+
+    assert result.code == 0
+    assert seen, "the key was never verified against anything"
+    # Every call, not just the first: whatever asks this probe during the run,
+    # the address the user typed is the one it has to be asked about.
+    assert [url for _, url, _ in seen] == [typed_url] * len(seen)
+    assert seen[0][0] == "sk-or-typed"
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={typed_url}" in result.written
+    assert "OPENAI_COMPATIBLE_API_KEY=sk-or-typed" in result.written
+
+
+def test_a_mistyped_endpoint_fails_at_its_own_question_not_at_the_key(
+    tmp_path: Path,
+) -> None:
+    """A bad address is answered under the question that asked for it.
+
+    Without a check here the first thing to notice is the key probe, one
+    question later, which reports `could not reach` about a key that is fine -
+    the message lands next to the wrong mistake. The rules are Settings' own
+    (`config.clean_base_url`), not a second copy that could drift from what
+    startup will accept.
+    """
+    good = "https://openrouter.ai/api/v1"
+    seen: list[str] = []
+
+    def probe(key: str, url: str, model: str) -> Verdict:
+        seen.append(url)
+        return Verdict(True, "key works")
+
+    checks = replace(working_checks(), openai_compatible=probe)
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "custom", "n", "gemma3:4b",
+        "openrouter.ai/api/v1",  # no scheme
+        f"{good}/chat/completions",  # the whole endpoint URL, as vendor docs print it
+        good,
+        "sk-or-typed", "some-model",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=checks)
+
+    assert result.code == 0
+    assert "must start with http" in result.out
+    assert "must not include /chat/completions" in result.out
+    # The refused values never reached the probe, and never reached `.env`.
+    assert set(seen) == {good}
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={good}\n" in result.written
+    assert "chat/completions" not in result.written
+
+
+def test_a_re_run_can_move_a_custom_endpoint_to_a_new_address(tmp_path: Path) -> None:
+    """The wizard has to be able to change a custom endpoint, not only leave it.
+
+    `_choose_compatible_endpoint` offers the service menu on a re-run, but
+    answering `custom` wrote nothing, and `needs_for` then dropped the endpoint
+    question because `.env` already held a value - so no question was ever asked
+    and the old address survived. That is the unreachable-answer problem
+    `KEEP_HINT` exists to remove, and it left the wizard able to move between
+    known vendors but never onto, off, or between custom URLs.
+    """
+    old_url = "https://llm.internal/v1"
+    new_url = "https://llm2.internal/v1"
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai_compatible\n"
+        f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={old_url}\n"
+        "DAEMON_OPENAI_COMPATIBLE_MODEL=my-model\n"
+        "OPENAI_COMPATIBLE_API_KEY=sk-custom-x\n"
+    )
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    answers = [
+        KEEP, KEEP, KEEP, "custom", "n", "gemma3:4b", new_url, KEEP,
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, existing=existing, checks=checks)
+
+    assert result.code == 0
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={new_url}" in result.written
+    assert old_url not in result.written
+
+
+def test_choosing_custom_over_a_known_vendor_does_not_default_back_to_it(
+    tmp_path: Path,
+) -> None:
+    """Choosing "custom" is a no for the vendor whose address is saved, and Enter
+    at the very next question must not silently take it back.
+
+    `_choose_compatible_endpoint`'s `custom` branch used to write nothing, so
+    `needs_for` fell back to whatever `.env` already held for the address - which,
+    on a re-run pointed at a known vendor, is that vendor's own URL. The endpoint
+    question was then prefilled with Kimi's address one line after the user said
+    "custom", and pressing Enter reflexively kept the vendor they had just
+    declined. Asserted two ways: the empty answer is refused rather than quietly
+    accepted, and the vendor's URL never reaches the file.
+    """
+    kimi = next(v for v in setup.COMPATIBLE_VENDORS if v.name == "kimi")
+    new_url = "https://llm.internal/v1"
+    existing = (
+        "DAEMON_PRESET=balanced\nDAEMON_HOSTED_PROVIDER=openai_compatible\n"
+        f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={kimi.base_url}\n"
+        f"DAEMON_OPENAI_COMPATIBLE_MODEL={kimi.model}\n"
+        "OPENAI_COMPATIBLE_API_KEY=sk-kimi-x\n"
+    )
+    checks = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(True, "key works"),
+    )
+    answers = [
+        KEEP, KEEP, KEEP, "custom", "n", "gemma3:4b",
+        "",  # Enter at the address question - must be refused, not Kimi's URL
+        new_url, KEEP,
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, existing=existing, checks=checks)
+
+    assert result.code == 0
+    # The empty answer was rejected rather than quietly resolving to a default.
+    assert "This one is required" in flat(result.out)
+    assert f"DAEMON_OPENAI_COMPATIBLE_BASE_URL={new_url}" in result.written
+    assert kimi.base_url not in result.written
+
+
 def test_offline_is_never_asked_whose_model(tmp_path: Path) -> None:
     # It resolves no hosted task, so the question would be about a bill nobody is
     # going to get - and the answer would be written into the file as if it meant
@@ -2212,6 +2541,217 @@ def test_the_openai_key_travels_in_a_header_not_the_url(
 
     assert "sk-SECRET" not in str(seen["url"])
     assert seen["headers"] == {"authorization": "Bearer sk-SECRET"}
+
+
+# --- the openai-compatible endpoint: vendor table and probe --------------------
+# The vendor is never written to `.env` - only the address is, and `vendor_label`
+# reads the name back out of it (setup.COMPATIBLE_VENDORS's docstring). So the
+# probe below is the same shape as `check_openai`'s but takes the address as an
+# argument, and it is injectable (`client=`) rather than patching `httpx.get`,
+# because the wizard-authored `Checks.openai_compatible` slot takes one client per
+# call rather than one global one - see docs/CONTRACTS.md on no test touching the
+# network.
+
+
+def test_vendor_label_names_a_known_endpoint_and_echoes_an_unknown_one() -> None:
+    assert "Qwen" in setup.vendor_label("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+    assert setup.vendor_label("https://llm.internal/v1") == "https://llm.internal/v1"
+
+
+def test_vendor_label_ignores_a_trailing_slash() -> None:
+    # `.env` and Settings both strip it (config._clean_base_url); the reverse
+    # lookup has to agree or a re-run's "Currently ..." line would print the raw
+    # URL for an endpoint the wizard itself wrote.
+    assert (
+        setup.vendor_label("https://api.deepseek.com/v1/")
+        == setup.vendor_label("https://api.deepseek.com/v1")
+    )
+
+
+def test_every_vendor_base_url_is_one_settings_would_accept() -> None:
+    # Settings rejects a base URL ending in /chat/completions or missing a scheme
+    # (config._clean_base_url). A vendor table entry that failed that check would
+    # write a `.env` the wizard itself could not start - so pin it here rather
+    # than discover it against a real account.
+    from daemon.config import Settings
+
+    for vendor in setup.COMPATIBLE_VENDORS:
+        settings = Settings(
+            _env_file=None,
+            DAEMON_HOSTED_PROVIDER="openai_compatible",
+            DAEMON_OPENAI_COMPATIBLE_BASE_URL=vendor.base_url,
+            OPENAI_COMPATIBLE_API_KEY="sk-x",
+            DAEMON_OPENAI_COMPATIBLE_MODEL=vendor.model or "some-model",
+        )
+        assert settings.openai_compatible_base_url == vendor.base_url
+
+
+def test_compatible_probe_lists_models_when_the_endpoint_has_them() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/models")
+        return httpx.Response(200, json={"data": [{"id": "qwen-plus"}, {"id": "qwen-max"}]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "qwen-plus", client=client
+        )
+
+    assert verdict.ok
+    assert verdict.models["DAEMON_OPENAI_COMPATIBLE_MODEL"] == ("qwen-plus", "qwen-max")
+
+
+def test_compatible_probe_falls_back_to_a_one_token_chat_when_models_is_missing() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/models"):
+            return httpx.Response(404, text="not found")
+        body = json.loads(request.content)
+        assert body["max_tokens"] == 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "custom-model", client=client
+        )
+
+    assert verdict.ok
+    assert any(path.endswith("/chat/completions") for path in seen)
+    # No list to offer, so the wizard falls through to NO_LIST_NOTE.
+    assert not verdict.models
+
+
+def test_compatible_probe_does_not_fall_back_on_a_rejected_key() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(401, text="bad key")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-bad", "https://x.test/v1", "qwen-plus", client=client
+        )
+
+    assert not verdict.ok
+    # 401 is a definitive answer about the key; a second call would only cost time.
+    assert not any(path.endswith("/chat/completions") for path in seen)
+
+
+def test_compatible_probe_never_reveals_the_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="bad request for key sk-secret-abc")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-secret-abc", "https://x.test/v1", "m", client=client
+        )
+
+    assert "sk-secret-abc" not in verdict.detail
+
+
+def test_a_korean_error_body_from_a_compatible_endpoint_is_bounded_and_redacted() -> None:
+    """Same rule as `_telegram_said`: redact the whole body first, *then* bound it
+    by display columns - not the other way around.
+
+    The repeated key lands exactly on the raw 200-character cut this body was
+    chosen to produce: slicing before redacting truncates the last repetition to
+    `...sk-secret` (missing `-abc`), which does not exact-match the full key
+    string and survives `_redact`'s `.replace()` unredacted. That is a real key
+    fragment on a real terminal, and "the whole key string is absent" does not
+    catch it - which is exactly how this test passed once already while the bug
+    it exists to catch was live. It must fail if the fix is reverted, not just
+    stay green by coincidence.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, text="키 sk-secret-abc 가 거부되었습니다. " * 20
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-secret-abc", "https://x.test/v1", "m", client=client
+        )
+
+    assert not verdict.ok
+    assert "sk-secret-abc" not in verdict.detail
+    # Not just the whole key - no recognizable fragment of it either. This is
+    # the assertion that actually fails against the pre-fix code: the old body
+    # slices to `...키 sk-secret`, nine characters of the key with nothing left
+    # to redact it against.
+    assert "sk-secret" not in verdict.detail
+    # And genuinely redacted, not merely cut short before reaching the key -
+    # `<token>` appearing is the evidence that `_redact` ran on the whole body.
+    assert "<token>" in verdict.detail
+    assert "거부되었습니다" in verdict.detail
+    assert tui.display_width(verdict.detail) <= setup.BODY_LIMIT + 60
+
+
+def test_a_model_the_compatible_endpoint_did_not_date_keeps_its_place() -> None:
+    # Not every compatible vendor dates its models (setup.DATED_LISTS's docstring)
+    # - a missing `created` must cost the ordering, not the menu.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "undated-a"},
+                    {"id": "dated-old", "created": 1_600_000_000},
+                    {"id": "dated-new", "created": 1_770_000_000},
+                    {"id": "undated-b"},
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "dated-new", client=client
+        )
+
+    ids = verdict.models["DAEMON_OPENAI_COMPATIBLE_MODEL"]
+    assert ids == ("dated-new", "dated-old", "undated-a", "undated-b")
+
+
+def test_a_bare_json_array_from_models_costs_the_menu_not_the_wizard() -> None:
+    """A `200` whose body is a bare array must come back as a `Verdict`.
+
+    `_newest_first` guarded `ValueError` but called `.get("data")` on whatever
+    decoded, so a list body raised `AttributeError` - and `setup.run` catches only
+    `Cancelled` and `KeyboardInterrupt`, making that a traceback out of the
+    wizard. Harmless with `api.openai.com` and `api.anthropic.com`, which never
+    do this; this provider is the first to point the function at an address the
+    user named, and `llm/providers/openai_compatible.py` documents a proxy
+    answering with a bare array as real.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"id": "qwen-plus"}])
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "qwen-plus", client=client
+        )
+
+    # The key is proved - it is the *list* that was unreadable - so the model
+    # question falls back to free text rather than the run ending.
+    assert verdict.ok
+    assert verdict.models["DAEMON_OPENAI_COMPATIBLE_MODEL"] == ()
+
+
+def test_compatible_probe_flags_a_model_id_that_is_not_in_the_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "qwen-plus"}]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        verdict = setup.check_openai_compatible(
+            "sk-x", "https://x.test/v1", "qwen-turbo", client=client
+        )
+
+    assert verdict.ok
+    assert "not in that endpoint's model list" in verdict.detail
+    assert "next question" in verdict.hint
 
 
 # --- the model id, offered from the account's own list -------------------------
@@ -2616,7 +3156,14 @@ def test_a_dated_list_is_not_second_guessed_by_reading_versions_out_of_names() -
 def test_which_lists_are_dated_is_settled_by_the_provider_not_by_taste() -> None:
     # The asymmetry is worth pinning: it is the reason there are two orderings, and
     # a future reader trying to unify them should fail this test first.
-    assert setup.DATED_LISTS == {"DAEMON_ANTHROPIC_MODEL", "DAEMON_OPENAI_MODEL"}
+    # DAEMON_OPENAI_COMPATIBLE_MODEL joins the dated side because its probe runs
+    # every list through the same `_newest_first` as OpenAI's - not because every
+    # compatible vendor publishes a date (see setup.DATED_LISTS's docstring).
+    assert setup.DATED_LISTS == {
+        "DAEMON_ANTHROPIC_MODEL",
+        "DAEMON_OPENAI_MODEL",
+        "DAEMON_OPENAI_COMPATIBLE_MODEL",
+    }
     assert "DAEMON_GEMINI_MODEL" not in setup.DATED_LISTS
     assert "DAEMON_GEMINI_LIVE_MODEL" not in setup.DATED_LISTS
 
@@ -2852,6 +3399,39 @@ def test_the_folded_tail_is_one_keypress_away_and_the_numbers_do_not_move(
     # Expanded, then the ninth - which is the ninth of the same order.
     assert "live-20" in result.out
     assert "DAEMON_GEMINI_LIVE_MODEL=live-09" in result.written
+
+
+def test_a_question_with_no_default_warns_about_nothing(tmp_path: Path) -> None:
+    """"`warn:  is not in that list.`" is not a sentence.
+
+    Found by running the wizard live: the compatible model id is the only `Need`
+    here that `Settings` has no default for, so on a fresh install the
+    "your default is absent from this list" warning fired with nothing to name,
+    printing a bare warning above the account's own 410-model catalogue. There is
+    no default to name and nothing is wrong. Enter is still not an answer, which
+    is the affordance line's job to say.
+    """
+    listing = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(
+            True, "key works", models={"DAEMON_OPENAI_COMPATIBLE_MODEL": ("a/one", "b/two")}
+        ),
+    )
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "custom", "n", "gemma3:4b",
+        "https://llm.internal/v1", "sk-x", "1",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=listing)
+
+    assert result.code == 0
+    assert "is not in that list" not in flat(result.out)
+    # The list was still offered, and picking `1` off it still worked.
+    assert "1) a/one" in result.out
+    assert "an id of your own." in flat(result.out)
+    assert "or Enter" not in flat(result.out)
+    assert "DAEMON_OPENAI_COMPATIBLE_MODEL=a/one" in result.written
 
 
 def test_a_default_the_account_did_not_list_is_said_out_loud(tmp_path: Path) -> None:
@@ -3116,9 +3696,67 @@ def test_the_chosen_provider_decides_which_key_is_asked_for() -> None:
     assert "GEMINI_API_KEY" in keys("gemini")
     assert "ANTHROPIC_API_KEY" not in keys("gemini")
     assert "OPENAI_API_KEY" in keys("openai")
+    assert "OPENAI_COMPATIBLE_API_KEY" in keys("openai_compatible")
+    assert "ANTHROPIC_API_KEY" not in keys("openai_compatible")
     # And answering it removes it from the list of things still to answer.
-    for hosted in ("anthropic", "openai", "gemini"):
+    for hosted in ("anthropic", "openai", "gemini", "openai_compatible"):
         assert "DAEMON_HOSTED_PROVIDER" not in keys(hosted)
+
+
+def test_needs_asks_for_endpoint_key_and_model_when_compatible_is_chosen() -> None:
+    needs = setup.needs_for(
+        {"DAEMON_PRESET": "balanced", "DAEMON_HOSTED_PROVIDER": "openai_compatible"}
+    )
+    keys = [need.key for need in needs]
+
+    assert "DAEMON_OPENAI_COMPATIBLE_BASE_URL" in keys
+    assert "OPENAI_COMPATIBLE_API_KEY" in keys
+    assert "DAEMON_OPENAI_COMPATIBLE_MODEL" in keys
+    # The endpoint is asked before the key, because the probe needs it.
+    assert keys.index("DAEMON_OPENAI_COMPATIBLE_BASE_URL") < keys.index("OPENAI_COMPATIBLE_API_KEY")
+
+
+def test_a_saved_endpoint_is_asked_again_but_a_saved_key_is_not() -> None:
+    # A decided address has to stay changeable by re-running this command
+    # (KEEP_HINT), and the service sub-question cannot do it: answering `custom`
+    # has nothing to prefill, so it wrote nothing and this filter then dropped the
+    # question - leaving no way to edit a custom URL at all. A *credential* is the
+    # other case: nobody wants to re-paste a working key.
+    keys = [
+        need.key
+        for need in setup.needs_for(
+            {
+                "DAEMON_PRESET": "balanced",
+                "DAEMON_HOSTED_PROVIDER": "openai_compatible",
+                "DAEMON_OPENAI_COMPATIBLE_BASE_URL": "https://llm.internal/v1",
+                "OPENAI_COMPATIBLE_API_KEY": "sk-saved",
+            }
+        )
+    ]
+
+    assert "DAEMON_OPENAI_COMPATIBLE_BASE_URL" in keys
+    assert "OPENAI_COMPATIBLE_API_KEY" not in keys
+    endpoint = next(
+        need
+        for need in setup.needs_for(
+            {
+                "DAEMON_PRESET": "balanced",
+                "DAEMON_HOSTED_PROVIDER": "openai_compatible",
+                "DAEMON_OPENAI_COMPATIBLE_BASE_URL": "https://llm.internal/v1",
+            }
+        )
+        if need.key == "DAEMON_OPENAI_COMPATIBLE_BASE_URL"
+    )
+    # And asked with the saved value as its default, so Enter keeps it.
+    assert endpoint.default == "https://llm.internal/v1"
+
+
+def test_offline_never_asks_about_a_compatible_endpoint() -> None:
+    needs = setup.needs_for({"DAEMON_PRESET": "offline"})
+    keys = [need.key for need in needs]
+
+    assert not any(key.startswith("DAEMON_OPENAI_COMPATIBLE") for key in keys)
+    assert "OPENAI_COMPATIBLE_API_KEY" not in keys
 
 
 def test_offline_is_never_asked_for_a_provider() -> None:

@@ -7,6 +7,9 @@ was actually missed the time it shipped broken; orientation is in
 
 **A new LLM provider.** Implement `Provider` in `daemon/llm/base.py` under `daemon/llm/providers/`, name
 it in `HOSTED_PROVIDERS`, build it in `daemon/app.py`, offer it in `daemon/setup.py`. Missing the last two shipped once.
+**A vendor is not always a provider.** Qwen, Kimi, DeepSeek and OpenRouter all speak Chat Completions,
+so they share `openai_compatible` and differ by `DAEMON_OPENAI_COMPATIBLE_BASE_URL`. Reach for a new
+module only when the *protocol* is new; a new address is configuration.
 
 **A new channel.** Implement `Channel` in `daemon/channels/base.py`; the `Cursor` it needs is already
 `daemon.memory.store.Store`. **Don't** invent a second allowlist — `daemon/channels/pairing.py` owns who the owner is.

@@ -18,7 +18,7 @@ daemon/
   llm/
     base.py           Provider protocol, Message, Completion. FROZEN.
     gateway.py        LLMGateway: routes Task -> Provider
-    providers/        ollama.py, anthropic.py, openai.py, gemini.py
+    providers/        ollama.py, anthropic.py, openai.py, gemini.py, openai_compatible.py
   channels/
     base.py           Channel protocol, InboundMessage, OutboundMessage. FROZEN.
     telegram.py

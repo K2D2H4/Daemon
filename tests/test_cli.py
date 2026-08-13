@@ -746,6 +746,48 @@ def test_doctor_is_happy_with_a_sound_install(
     assert "FAIL" not in out
 
 
+def test_doctor_names_the_service_behind_a_compatible_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    data_dir: Path,
+    reachable_ollama: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`openai_compatible` is one word for many services, so the config line would
+    otherwise not say which one is answering - only the address does, and this is
+    the same `vendor_label` reverse lookup the wizard uses.
+    """
+    monkeypatch.setenv("DAEMON_PRESET", "balanced")
+    monkeypatch.setenv("DAEMON_HOSTED_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("DAEMON_OPENAI_COMPATIBLE_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("DAEMON_OPENAI_COMPATIBLE_MODEL", "deepseek-chat")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "sk-x")
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert "[ok] config" in out
+    assert "endpoint=DeepSeek" in out
+    assert "FAIL" not in out
+
+
+def test_doctor_names_no_endpoint_for_a_named_hosted_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    data_dir: Path,
+    reachable_ollama: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Anthropic, OpenAI and Gemini already say who they are; the `endpoint=`
+    suffix exists only for the one provider name that does not."""
+    monkeypatch.setenv("DAEMON_PRESET", "balanced")
+    monkeypatch.setenv("DAEMON_HOSTED_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert "endpoint=" not in out
+
+
 def test_doctor_explains_a_config_it_cannot_even_load(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
