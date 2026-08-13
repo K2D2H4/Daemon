@@ -118,8 +118,8 @@ Every rule is a setting, and these are the shipped defaults:
 | `DAEMON_PROACTIVE_ENABLED` | `false` | it says nothing until you turn this on |
 | `DAEMON_PROACTIVE_SPEAKER_ENABLED` | `false` | the speaker is a second, separate switch |
 | `DAEMON_PROACTIVE_QUIET_HOURS` | `23:00-09:00` | local time, never interrupted |
-| `DAEMON_PROACTIVE_COOLDOWN_MINUTES` | `90` | minimum gap between two things it says |
-| `DAEMON_PROACTIVE_DAILY_BUDGET` | `3` | most it will ever say in one day |
+| `DAEMON_PROACTIVE_COOLDOWN_MINUTES` | `30` | minimum gap between two things it says |
+| `DAEMON_PROACTIVE_DAILY_BUDGET` | `8` | most it will ever say in one day |
 
 Past the gate there is exactly one model call, which decides whether there is
 anything worth saying at all — and usually there is not. The
