@@ -1111,6 +1111,23 @@ class Store:
         )
         self.conn.commit()
 
+    def push_candidate_due(self, candidate_id: int, *, due_at: datetime) -> None:
+        """Move a candidate's `due_at` forward without touching `state` or
+        `fire_count`.
+
+        For a judge that declined: `due_candidates` reads `due_at` and not the
+        clock the judge ran on, so leaving it alone means the very next tick
+        offers the same candidate again - one hosted-model call per tick,
+        forever, for a decision that already had its answer. This is the rest
+        `daemon/proactivity/tick.py` gives a declined candidate; state and
+        `fire_count` stay as they were because nothing fired.
+        """
+        self.conn.execute(
+            "UPDATE proactive_candidates SET due_at = ? WHERE id = ?",
+            (utc_iso(due_at), candidate_id),
+        )
+        self.conn.commit()
+
     def mark_candidate_fired(self, candidate_id: int, *, now: datetime) -> None:
         """One more firing against this candidate's own budget.
 

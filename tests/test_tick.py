@@ -254,7 +254,7 @@ async def test_a_decline_sends_nothing_and_spends_nothing(
     store: Store, data_dir: Path
 ) -> None:
     """Silence is the default (non-negotiable 7). A judge that never declines is
-    one nobody should trust, so the path has to cost nothing."""
+    one nobody should trust, so the path has to cost nothing but a rest."""
     add_candidate(store)
     tick, _, channel = tick_for(store, data_dir, judge=FakeJudge(""))
 
@@ -263,8 +263,48 @@ async def test_a_decline_sends_nothing_and_spends_nothing(
     assert (result.declined, result.spoke) == (1, 0)
     assert channel.sent == []
     assert store.utterances_since(since=NOW) == []
-    # And the candidate is untouched, so a better moment can still use it.
-    assert len(store.due_candidates(now=NOW)) == 1
+    # Finding 1: an untouched candidate is exactly the bug. It is not fired,
+    # cancelled or expired - a better moment can still use it - but it is
+    # resting, so the very next tick does not put it back in front of the
+    # judge for the same already-answered question.
+    assert len(store.due_candidates(now=NOW)) == 0
+    rest = timedelta(minutes=settings().proactive_cooldown_minutes)
+    assert len(store.due_candidates(now=NOW + rest)) == 1
+
+
+async def test_an_unrested_decline_would_cost_a_call_every_tick(
+    store: Store, data_dir: Path
+) -> None:
+    """The regression finding 1 describes: without the rest, five minutes later
+    `due_candidates` returns the same declined candidate and the judge runs on it
+    again. Reproduced here by running two ticks five minutes apart on the
+    hosted-shaped setup (`silence`'s TTL is long enough to still be live)."""
+    add_candidate(store, "silence")
+    tick, judge, _ = tick_for(store, data_dir, judge=FakeJudge("", ""))
+
+    await tick.run(now=NOW)
+    await tick.run(now=NOW + timedelta(minutes=5))
+
+    # One call, not two: the rest from the first decline pushed `due_at` past
+    # the second tick's `now`, so the candidate was not offered to the judge
+    # again five minutes later.
+    assert len(judge.asked) == 1
+
+
+async def test_a_decline_still_stops_the_tick(store: Store, data_dir: Path) -> None:
+    """Finding 1's other half: the loop used to `break` only after a *delivery*,
+    so several due candidates in one tick each cost a judge call before a decline
+    stopped it - under the `quality` preset PROACTIVE_JUDGE is hosted, so that is
+    a paid call per candidate, not a free one."""
+    add_candidate(store, "silence")
+    add_candidate(store, "emotional")
+    tick, judge, channel = tick_for(store, data_dir, judge=FakeJudge(""))
+
+    result = await tick.run(now=NOW)
+
+    assert len(judge.asked) == 1
+    assert (result.declined, result.spoke) == (1, 0)
+    assert channel.sent == []
 
 
 async def test_a_decline_is_counted_separately_from_a_block(

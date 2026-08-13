@@ -37,7 +37,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from daemon.clock import now as clock_now
 from daemon.config import Settings
@@ -175,24 +175,36 @@ class ProactiveTick:
             verdict = self._gate.judge(candidate, reading, now=moment)
             utterance: Utterance | None = None
             delivered: Delivered | None = None
+            judged = False
 
             if verdict.allowed and self._judge is not None and self._delivery is not None:
+                judged = True
                 utterance = await self._judge.decide(candidate)
                 if utterance:
                     delivered = await self._delivery.deliver(
                         candidate, utterance, verdict, now=moment
                     )
+                    if delivered:
+                        spoke += 1
                 else:
                     declined += 1
+                    self._rest(candidate, moment)
 
             considered.append(Considered(candidate, verdict, utterance, delivered))
-            if delivered:
-                spoke += 1
-                # One utterance per tick, and the loop stops here. The gate counts
-                # the daily budget from rows already stored, so a second delivery
-                # in the same tick would read the same pre-tick count and overshoot
-                # it - and PLAN 6.2's budget of three is the brake the whole design
-                # leans on. Anything still due is reconsidered five minutes later.
+            if judged:
+                # One judge call per tick, whatever it decided. The gate counts the
+                # daily budget from rows already stored, so a second call in the
+                # same tick would read the same pre-tick count and a delivery would
+                # overshoot it - and PLAN 6.2's budget of three (now eight) is the
+                # brake the whole design leans on. That covers a second *delivery*,
+                # but a decline is a model call too - under the `quality` preset,
+                # PROACTIVE_JUDGE is hosted and paid for - and a tick with several
+                # due candidates used to run the judge on every one of them before
+                # this `break`, once per candidate, every five minutes, for as long
+                # as each stayed due. `_rest` below is what stops that on the next
+                # tick; this `break` is what stops it *within* this one. Anything
+                # still due is reconsidered later - a delivered one after the
+                # cooldown, a declined one after `_rest`.
                 break
 
         result = TickResult(
@@ -218,6 +230,26 @@ class ProactiveTick:
             now=moment,
         )
         return result
+
+    def _rest(self, candidate: Candidate, moment: datetime) -> None:
+        """Push a declined candidate's `due_at` forward so the next tick does
+        not put it back in front of the judge unchanged.
+
+        Nothing about a decline marks the row: no state change, no cooldown -
+        `due_candidates` would offer it again five minutes later, the gate
+        would allow it again (a decline consumes no budget and sets no
+        cooldown), and the judge would run again on the same reason. A
+        `silence` candidate carries a 12-hour TTL, so unrested that is up to
+        144 calls for one already-answered question.
+
+        The rest is `proactive_cooldown_minutes` - the setting already governs
+        the minimum gap between two utterances, so a declined candidate is not
+        reconsidered any sooner than the daemon would be allowed to speak
+        again anyway. Reusing it means one knob tunes both paces instead of a
+        second constant nobody would think to change together with the first.
+        """
+        rest = timedelta(minutes=self._settings.proactive_cooldown_minutes)
+        self._store.push_candidate_due(candidate.id, due_at=moment + rest)
 
     async def _association(self, moment: datetime) -> list[Candidate]:
         """Type E, or nothing. Never raises.

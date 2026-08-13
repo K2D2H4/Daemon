@@ -153,9 +153,15 @@ class Judge:
         # everything a prompted one gets - turns out to cut the other way. An
         # unprompted line is the one with the least context to carry the voice.
         #
-        # The cost worried about was volume, and that was overestimated: the
-        # judge runs only for candidates that passed the gate (`tick.py`), so it
-        # is bounded by the daily budget - a dozen calls, not 288.
+        # The cost worried about was volume. "Only for candidates that passed
+        # the gate" is true, but it does not by itself bound the count to the
+        # daily budget - a decline used to leave the candidate untouched, so
+        # `tick.py` offered it to the judge again on the very next tick, and
+        # again, for as long as it stayed due (up to ~144 calls for one
+        # `silence` candidate's 12h TTL, found in the whole-branch review that
+        # measured this claim and corrected `tick.py` to match it: one judge
+        # call per tick, and a decline rests the candidate instead of leaving
+        # it due).
         self._data_dir = Path(data_dir)
 
     async def decide(self, candidate: Candidate) -> Utterance:
