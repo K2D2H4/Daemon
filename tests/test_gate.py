@@ -42,6 +42,7 @@ SPEAKER_ROUTES = {"local_speaker", "both"}
 
 OPEN_LOOP = Candidate(kind="open_loop", reason="어제 발표 어떻게 됐는지 안 물어봤다")
 EMOTIONAL = Candidate(kind="emotional", reason="힘들다고 한 뒤로 이틀 동안 말이 없다")
+ASSOCIATION = Candidate(kind="association", reason="교토 여행 얘기가 문득 떠올랐다")
 
 PRESENT = Reading(
     at=NOW,
@@ -333,35 +334,54 @@ def test_the_daily_budget_blocks_once_it_is_spent() -> None:
 
 
 def test_the_daily_budget_allows_the_last_one() -> None:
-    history = FakeHistory(counts={"emotional": 2})
+    # Two *other* kinds, not two of the candidate's own - the daily budget is the
+    # rule under test here, and the candidate's own per-kind ceiling (2) would
+    # otherwise block it for a second, unrelated reason.
+    history = FakeHistory(counts={"open_loop": 1, "association": 1})
     assert gate_for(history, proactive_daily_budget=3).judge(EMOTIONAL, PRESENT, now=NOW).allowed
 
 
-def test_the_open_loop_sub_cap_fires_while_the_overall_budget_has_room() -> None:
-    """PLAN 6.2: open loops are the cheap kind to generate, so on equal terms they
-    eat the budget and the companion becomes a reminder app. One open loop is spent
-    and two of three overall are free - the reminder is blocked anyway."""
-    history = FakeHistory(counts={"open_loop": 1})
-    gate = gate_for(history, proactive_daily_budget=3, proactive_open_loop_budget=1)
+def test_each_kind_has_its_own_ceiling() -> None:
+    """PLAN 6.2: the cheap kind to generate eats the budget on equal terms, and
+    then the companion is a reminder app. Type E makes that a live race."""
+    history = FakeHistory(counts={"association": 3})  # the default association ceiling
+    verdict = gate_for(history).judge(ASSOCIATION, PRESENT, now=NOW)
 
-    verdict = gate.judge(OPEN_LOOP, PRESENT, now=NOW)
     assert not verdict.allowed
-    assert "open_loop budget" in verdict.why
-    assert "2 of 3" in verdict.why  # the room it is deliberately not allowed to use
+    assert "association budget" in verdict.why
 
 
-def test_the_open_loop_sub_cap_does_not_touch_the_other_kinds() -> None:
-    """The same moment, the same spent open loop: the kind with no errand attached
-    still passes. That asymmetry is the point of having two caps."""
-    history = FakeHistory(counts={"open_loop": 1})
-    gate = gate_for(history, proactive_daily_budget=3, proactive_open_loop_budget=1)
-
-    assert gate.judge(EMOTIONAL, PRESENT, now=NOW).allowed
+def test_a_kind_at_its_ceiling_does_not_block_the_others() -> None:
+    history = FakeHistory(counts={"open_loop": 2})  # the default open_loop ceiling
+    assert gate_for(history).judge(ASSOCIATION, PRESENT, now=NOW).allowed
 
 
-def test_an_open_loop_passes_while_its_own_cap_has_room() -> None:
-    gate = gate_for(FakeHistory(), proactive_daily_budget=3, proactive_open_loop_budget=1)
-    assert gate.judge(OPEN_LOOP, PRESENT, now=NOW).allowed
+def test_the_overall_budget_still_wins() -> None:
+    """Per-kind ceilings sum to 9 against a total of 8, deliberately - they are
+    ceilings, not allocations."""
+    history = FakeHistory(
+        counts={
+            "silence": 1,
+            "pattern_time": 1,
+            "open_loop": 2,
+            "emotional": 2,
+            "association": 2,
+        }
+    )
+    verdict = gate_for(history).judge(ASSOCIATION, PRESENT, now=NOW)
+
+    assert not verdict.allowed
+    assert "daily budget" in verdict.why
+
+
+def test_a_kind_absent_from_the_table_is_bound_only_by_the_daily_total() -> None:
+    """`pattern_time`'s own ceiling is 1; a kind with no entry at all - the shape a
+    future generator would arrive in before anyone adds it a line here - must not
+    silently inherit a limit of zero and be blocked forever."""
+    history = FakeHistory(counts={"unlisted_kind": 5})
+    candidate = Candidate(kind="unlisted_kind", reason="아직 표에 없는 유형")
+
+    assert gate_for(history).judge(candidate, PRESENT, now=NOW).allowed
 
 
 @needs_tzset
@@ -417,7 +437,7 @@ def test_the_budget_rule_works_against_the_real_store(db: sqlite3.Connection) ->
         gate = gate_for(
             store,
             proactive_daily_budget=3,
-            proactive_open_loop_budget=1,
+            proactive_kind_budgets={"open_loop": 1},
             proactive_cooldown_minutes=0,
         )
 

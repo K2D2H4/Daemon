@@ -648,13 +648,6 @@ def test_an_empty_quiet_window_is_allowed() -> None:
     assert make_settings(preset="offline", proactive_quiet_hours="").proactive_quiet_hours == ""
 
 
-def test_an_open_loop_budget_above_the_daily_budget_fails_at_startup() -> None:
-    """The sub-cap exists to hold open loops *below* the overall budget; above it
-    the setting reads as a cap while capping nothing (docs/PLAN.md 6.2)."""
-    with pytest.raises(ConfigError, match="DAEMON_PROACTIVE_OPEN_LOOP_BUDGET"):
-        make_settings(preset="offline", proactive_daily_budget=3, proactive_open_loop_budget=5)
-
-
 def test_a_negative_budget_fails_at_startup() -> None:
     with pytest.raises(ConfigError, match="DAEMON_PROACTIVE_DAILY_BUDGET"):
         make_settings(preset="offline", proactive_daily_budget=-1)
@@ -699,12 +692,25 @@ def test_an_unset_legacy_speaker_switch_is_not_an_error(
     assert settings.voice_enabled in (True, False)
 
 
+def test_an_unset_legacy_open_loop_budget_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`proactive_open_loop_budget` is gone, replaced by `proactive_kind_budgets`
+    (docs/PLAN.md 6.2). The same upgrade concern as the speaker switch above: an
+    .env from before this change still sets the old key, and `extra="ignore"` is
+    what keeps that inert rather than a startup failure."""
+    monkeypatch.setenv("DAEMON_PROACTIVE_OPEN_LOOP_BUDGET", "1")
+    settings = make_settings(preset="offline")  # must not raise
+    assert not hasattr(settings, "proactive_open_loop_budget")
+    assert settings.proactive_kind_budgets["open_loop"] == 2
+
+
 def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:
     """Zero is a legitimate answer - keep generating candidates, never speak - and
     is how someone tunes it down without losing the label history."""
-    assert make_settings(
-        preset="offline", proactive_daily_budget=0, proactive_open_loop_budget=0
-    ).proactive_daily_budget == 0
+    assert (
+        make_settings(preset="offline", proactive_daily_budget=0).proactive_daily_budget == 0
+    )
 
 
 # --- tool use ---------------------------------------------------------------

@@ -1374,9 +1374,12 @@ def _proactivity_check(settings: Settings) -> Check:
 
     speaker = "speaker on" if settings.voice_enabled else "telegram only"
     quiet = settings.proactive_quiet_hours or "no quiet window"
+    kinds = ", ".join(
+        f"{kind} {cap}" for kind, cap in settings.proactive_kind_budgets.items()
+    )
     detail = (
         f"on, {speaker} · budget {settings.proactive_daily_budget}/day "
-        f"({settings.proactive_open_loop_budget} open_loop) · quiet {quiet}"
+        f"({kinds}) · quiet {quiet}"
     )
 
     path = settings.data_dir / DB_FILENAME

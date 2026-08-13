@@ -217,14 +217,16 @@ class Gate:
         if spoken >= total:
             return f"daily budget: {spoken} of {total} already spoken on {day}"
 
-        # PLAN 6.2: open loops are the cheap kind to generate, and on equal terms
-        # they eat the whole budget - which turns a companion into a reminder app.
-        if candidate.kind == "open_loop":
-            used = kinds.count("open_loop")
-            allowed = self.settings.proactive_open_loop_budget
+        # PLAN 6.2: per-kind ceilings, not allocations - they sum to more than the
+        # daily total on purpose. A kind with no ceiling here is bound only by the
+        # daily budget above; open_loop is the cheap kind to generate, and on equal
+        # terms it eats the whole budget, which turns a companion into a reminder app.
+        allowed = self.settings.proactive_kind_budgets.get(candidate.kind)
+        if allowed is not None:
+            used = kinds.count(candidate.kind)
             if used >= allowed:
                 return (
-                    f"open_loop budget: {used} of {allowed} already spoken on {day} "
+                    f"{candidate.kind} budget: {used} of {allowed} already spoken on {day} "
                     f"({total - spoken} of {total} left overall, for other kinds)"
                 )
         return None

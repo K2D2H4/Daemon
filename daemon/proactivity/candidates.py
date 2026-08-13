@@ -563,7 +563,7 @@ async def association_candidates(
 
 _KIND_ORDER: tuple[CandidateKind, ...] = ("open_loop", "emotional", "silence", "pattern_time")
 """Stable output order, and **not** a priority. Which kind gets the day's budget is
-the gate's decision (`proactive_open_loop_budget` exists for exactly that), and
+the gate's decision (`proactive_kind_budgets` exists for exactly that), and
 deciding it here by sort order would put the decision in two places."""
 
 

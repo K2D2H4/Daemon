@@ -39,7 +39,9 @@ CLAIMS: tuple[tuple[str, str, str], ...] = (
     ("DAEMON_PROACTIVE_QUIET_HOURS", "{}", "quiet hours window"),
     ("DAEMON_PROACTIVE_COOLDOWN_MINUTES", "needs {}m", "cooldown, in the log's reason string"),
     ("DAEMON_PROACTIVE_DAILY_BUDGET", "daily budget of {}", "daily budget, in the caption"),
-    ("DAEMON_PROACTIVE_OPEN_LOOP_BUDGET", "{} of {} already spoken", "open_loop cap, in the log"),
+    # DAEMON_PROACTIVE_OPEN_LOOP_BUDGET is gone - replaced by the per-kind
+    # `proactive_kind_budgets` table, which has no alias and so is not a
+    # Field(default=..., alias=...) this regex-based check can see.
 )
 
 # Claims that are about a boolean default rather than a number. If proactivity

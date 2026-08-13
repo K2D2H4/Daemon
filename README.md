@@ -120,7 +120,6 @@ Every rule is a setting, and these are the shipped defaults:
 | `DAEMON_PROACTIVE_QUIET_HOURS` | `23:00-09:00` | local time, never interrupted |
 | `DAEMON_PROACTIVE_COOLDOWN_MINUTES` | `90` | minimum gap between two things it says |
 | `DAEMON_PROACTIVE_DAILY_BUDGET` | `3` | most it will ever say in one day |
-| `DAEMON_PROACTIVE_OPEN_LOOP_BUDGET` | `1` | of those three, at most one unfinished-thread nudge |
 
 Past the gate there is exactly one model call, which decides whether there is
 anything worth saying at all — and usually there is not. The

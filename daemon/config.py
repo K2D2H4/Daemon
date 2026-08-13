@@ -446,26 +446,34 @@ class Settings(BaseSettings):
     """Off until the user turns it on. Something that decides on its own to speak
     is not a default anyone should be opted into."""
 
-    proactive_daily_budget: int = Field(default=3, alias="DAEMON_PROACTIVE_DAILY_BUDGET")
-    """Utterances per local day, all kinds. Three, from PLAN 6.2."""
+    proactive_daily_budget: int = Field(default=8, alias="DAEMON_PROACTIVE_DAILY_BUDGET")
+    """Utterances per local day, all kinds. Eight, from PLAN 6.2."""
 
-    proactive_open_loop_budget: int = Field(
-        default=1, alias="DAEMON_PROACTIVE_OPEN_LOOP_BUDGET"
+    proactive_kind_budgets: dict[str, int] = Field(
+        default_factory=lambda: {
+            "association": 3,
+            "emotional": 2,
+            "open_loop": 2,
+            "silence": 1,
+            "pattern_time": 1,
+        }
     )
-    """Of the daily budget, at most this many may be `open_loop`.
+    """Per-kind ceilings for one local day. Replaces the single open_loop cap.
 
-    A separate cap because open loops are the easy kind to generate: left to
-    compete on equal terms they eat the whole budget and the result is a competent
-    reminder app. PLAN 6.2 says the point of the product lives in the kinds that
-    have no errand attached."""
+    They sum to 9 against a daily budget of 8 on purpose: these are ceilings, not
+    allocations, and the total is what binds. The shape is PLAN 6.2's - the cheap
+    kind to generate (open_loop) eats the budget on equal terms and turns a
+    companion into a reminder app, and the Her feeling comes from the kinds with
+    no business to transact. So the two businessless kinds get the most room.
+    """
 
-    proactive_cooldown_minutes: int = Field(default=90, alias="DAEMON_PROACTIVE_COOLDOWN_MINUTES")
+    proactive_cooldown_minutes: int = Field(default=30, alias="DAEMON_PROACTIVE_COOLDOWN_MINUTES")
     """Minimum gap between two proactive utterances, whatever their kind."""
 
     proactive_quiet_hours: str = Field(default="23:00-09:00", alias="DAEMON_PROACTIVE_QUIET_HOURS")
     """Local `HH:MM-HH:MM` when it never speaks. Wraps midnight when start > end."""
 
-    proactive_silence_hours: float = Field(default=20.0, alias="DAEMON_PROACTIVE_SILENCE_HOURS")
+    proactive_silence_hours: float = Field(default=12.0, alias="DAEMON_PROACTIVE_SILENCE_HOURS")
     """Hours without conversation before the `silence` kind becomes a candidate."""
 
     # `DAEMON_PROACTIVE_SPEAKER_ENABLED` used to live here as a second switch.
@@ -907,15 +915,8 @@ class Settings(BaseSettings):
                 f"DAEMON_PROACTIVE_QUIET_HOURS {self.proactive_quiet_hours!r} is not "
                 "HH:MM-HH:MM (24-hour, local). Leave it empty for no quiet window"
             )
-        if self.proactive_open_loop_budget > self.proactive_daily_budget:
-            problems.append(
-                f"DAEMON_PROACTIVE_OPEN_LOOP_BUDGET ({self.proactive_open_loop_budget}) is "
-                f"above DAEMON_PROACTIVE_DAILY_BUDGET ({self.proactive_daily_budget}); the "
-                "sub-cap exists to hold open loops *below* the overall budget"
-            )
         for name, value in (
             ("DAEMON_PROACTIVE_DAILY_BUDGET", self.proactive_daily_budget),
-            ("DAEMON_PROACTIVE_OPEN_LOOP_BUDGET", self.proactive_open_loop_budget),
             ("DAEMON_PROACTIVE_COOLDOWN_MINUTES", self.proactive_cooldown_minutes),
         ):
             if value < 0:

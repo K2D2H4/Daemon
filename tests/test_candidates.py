@@ -469,7 +469,7 @@ def test_silence_respects_the_users_setting(store: Store, reader: SqlReader) -> 
 
 
 def test_below_the_threshold_is_not_silence(store: Store, reader: SqlReader) -> None:
-    said(store, "잘 자", at=NOW - timedelta(hours=19))
+    said(store, "잘 자", at=NOW - timedelta(hours=10))  # below the default 12.0
 
     assert silence_candidates(reader, settings(), NOW) == []
 
