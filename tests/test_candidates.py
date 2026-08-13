@@ -341,6 +341,42 @@ def test_the_daemons_own_words_are_not_an_open_loop(store: Store, reader: SqlRea
     assert open_loop_candidates(reader, NOW) == []
 
 
+@pytest.mark.parametrize(
+    ("text", "said_at"),
+    [
+        # "내일" said the day before NOW's date comes due at NOW (20:00 KST
+        # followup hour, NOW is 21:00 KST) - the same shape as
+        # `test_naeil_balpyo_comes_due_the_next_evening` above.
+        ("내일 발표회 있어", datetime(2026, 8, 3, 2, 0, tzinfo=UTC)),
+        ("내일 상견례야", datetime(2026, 8, 3, 2, 0, tzinfo=UTC)),
+        ("내일 이사 견적 받기로 했어", datetime(2026, 8, 3, 2, 0, tzinfo=UTC)),
+        ("내일 건강검진 예약했어", datetime(2026, 8, 3, 2, 0, tzinfo=UTC)),
+        # "모레" is +2 days, so said two days before NOW's date lands due at
+        # the same NOW.
+        ("모레 자격증 시험 봐", datetime(2026, 8, 2, 2, 0, tzinfo=UTC)),
+    ],
+)
+def test_more_events_are_recognised(
+    text: str, said_at: datetime, store: Store, reader: SqlReader
+) -> None:
+    said(store, text, at=said_at)
+    found = open_loop_candidates(reader, NOW)
+    assert len(found) == 1, f"{text!r} produced no candidate"
+
+
+@pytest.mark.parametrize("text", [
+    "다음주에 발표 있어",
+    "금요일에 면접이야",
+    "주말에 병원 가",
+])
+def test_week_and_weekday_markers_stay_out(text: str, store: Store, reader: SqlReader) -> None:
+    """Resolving these to a date is a guess, and a wrong due time makes the
+    daemon ask how something went before it happened. That reads as broken,
+    which costs more than the candidate it misses."""
+    said(store, text, at=datetime(2026, 8, 3, 2, 0, tzinfo=UTC))
+    assert open_loop_candidates(reader, NOW) == []
+
+
 # --- type B: emotional follow-up ---------------------------------------------
 
 
