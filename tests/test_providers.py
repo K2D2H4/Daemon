@@ -622,6 +622,41 @@ async def test_openai_keeps_the_key_out_of_an_error_it_raises(
     assert "<redacted>" in str(exc)
 
 
+async def test_openai_never_reveals_the_key_across_the_200_char_cut() -> None:
+    """Redact the whole body first, *then* bound it to 200 chars - not the other
+    way around.
+
+    The body above sits wholly inside the cut, so it passes whichever order
+    `_post` uses. This one is built so the key straddles the raw 200-character
+    slice: slicing before redacting truncates it mid-key, and the truncated
+    fragment no longer exact-matches `self._api_key`, so `_redact`'s `.replace()`
+    lets a real key prefix through into a raised, logged `ProviderError`. This is
+    the provider-side twin of `test_compatible_never_reveals_the_key`.
+    """
+    prefix = "Incorrect API key provided: "
+    filler = ("please retry the request. " * 10)[: 185 - len(prefix)]
+    body = f"{prefix}{filler}{SECRET}. Check the key and try again."
+    start, end = _key_span(body, SECRET)
+    assert start < 200 < end, "the key must straddle the cut"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text=body)
+
+    async with mock_client(handler) as client:
+        provider = OpenAIProvider(SECRET, client=client)
+        with pytest.raises(ProviderError) as caught:
+            await provider.complete(PROMPT, model="gpt-5.1")
+
+    said = chain_text(caught.value)
+    assert SECRET not in said
+    # Not merely the whole key - no recognizable fragment of it either. This is
+    # the assertion that fails against slice-then-redact.
+    assert SECRET[:12] not in said
+    # And genuinely redacted rather than cut short before reaching the key: the
+    # marker is the evidence that `_redact` ran on the whole body.
+    assert "<redacted>" in said
+
+
 async def test_openai_keeps_the_key_out_of_a_transport_failure_chain(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1092,6 +1127,41 @@ async def test_gemini_keeps_the_key_out_of_an_error_it_raises(
     assert SECRET not in chain_text(exc)
     assert SECRET not in caplog.text
     assert "<redacted>" in str(exc)
+
+
+async def test_gemini_never_reveals_the_key_across_the_200_char_cut() -> None:
+    """Redact the whole body first, *then* bound it to 200 chars - not the other
+    way around.
+
+    The body above sits wholly inside the cut, so it passes whichever order
+    `_post` uses. This one is built so the key straddles the raw 200-character
+    slice: slicing before redacting truncates it mid-key, and the truncated
+    fragment no longer exact-matches `self._api_key`, so `_redact`'s `.replace()`
+    lets a real key prefix through into a raised, logged `ProviderError`. This is
+    the provider-side twin of `test_compatible_never_reveals_the_key`.
+    """
+    prefix = "API_KEY_INVALID: the submitted key "
+    filler = ("please retry the request. " * 10)[: 185 - len(prefix)]
+    body = f"{prefix}{filler}{SECRET} was rejected."
+    start, end = _key_span(body, SECRET)
+    assert start < 200 < end, "the key must straddle the cut"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text=body)
+
+    async with mock_client(handler) as client:
+        provider = GeminiProvider(SECRET, client=client)
+        with pytest.raises(ProviderError) as caught:
+            await provider.complete(PROMPT, model="gemini-2.5-flash")
+
+    said = chain_text(caught.value)
+    assert SECRET not in said
+    # Not merely the whole key - no recognizable fragment of it either. This is
+    # the assertion that fails against slice-then-redact.
+    assert SECRET[:12] not in said
+    # And genuinely redacted rather than cut short before reaching the key: the
+    # marker is the evidence that `_redact` ran on the whole body.
+    assert "<redacted>" in said
 
 
 async def test_gemini_keeps_the_key_out_of_a_transport_failure_chain(
