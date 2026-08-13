@@ -76,7 +76,9 @@ justified in [docs/adr/0009-images-in-the-message-contract.md](adr/0009-images-i
    may be set later.
 
 7. **Proactivity: silence is the default.** Candidate generation and the gate
-   are deterministic (no model). Exactly one LLM call, and only for candidates
+   make zero *LLM* calls - same distinction non-negotiable 2 draws, and the same
+   allowance: type E's `association_candidates` awaits the embedder every tick,
+   which is not a call that thinks. Exactly one LLM call, and only for candidates
    that already passed the gate.
 
 8. **Timestamps** are ISO-8601 UTC with `Z`, stored as TEXT. Use one helper,
@@ -244,14 +246,18 @@ Then **the browser group** (`daemon/tools/browser.py`), behind its own
 > It can read the page the owner is looking at, so they can say "what does this
 > say?" instead of pasting it - and a forwarded message still cannot.
 
-Still out of scope: the `osascript`-under-LaunchAgent question (PLAN.md §6.3.1),
-and pointing `daemon/proactivity/judge.py` at learned rules — it deliberately
-stays seed-only, a separate decision from M4
-(docs/design/2026-08-05-m4-persona-design.md). The type-E associative candidate
-generator (PLAN.md §6.1) that used to be listed here is built —
-`daemon/proactivity/candidates.py`'s `association_candidates`, wired into
-`daemon/proactivity/tick.py` — and its one exception to "no user text in a
-reason" is docs/adr/0012.
+Still out of scope: the `osascript`-under-LaunchAgent question (PLAN.md §6.3.1).
+The type-E associative candidate generator (PLAN.md §6.1) that used to be listed
+here is built — `daemon/proactivity/candidates.py`'s `association_candidates`,
+wired into `daemon/proactivity/tick.py` — and its one exception to "no user text
+in a reason" is docs/adr/0012.
+
+Pointing `daemon/proactivity/judge.py` at learned rules used to be out of scope
+too — it deliberately stayed seed-only, a separate decision from M4
+(docs/design/2026-08-05-m4-persona-design.md) — and no longer is: `daemon/proactivity/judge.py` now
+calls `load_persona`, so a proactive utterance carries the same learned rules the
+text loop and voice already do, one persona regardless of which path reached the
+user. Decided 2026-08-11, in the same milestone that built type E.
 
 The `recalled = 1` hygiene rule that was starving the observation table **was**
 fixed, after being scoped out first: PLAN.md §4.2's rule 2 is retired, because it

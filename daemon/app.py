@@ -1215,9 +1215,10 @@ async def run_voice(
         )
         # Seed and learned rules both, same as the text path, and through the same
         # `Companion.persona` -> `load_persona`: a conversation surface is a
-        # conversation surface, and M4's learned half reaches every one of them
-        # except the proactive judge, which stays seed-only on purpose
-        # (daemon/proactivity/judge.py).
+        # conversation surface. The proactive judge reaches the same two files too,
+        # just not through this path - it builds its own persona block directly
+        # (daemon/proactivity/judge.py, `Judge._persona`), because a background
+        # tick has no `Companion` to ask.
         seed = await companion.persona()
         # Owner, always: a microphone has no relay path, so a spoken turn is the
         # owner's own words (daemon/voice/conversation.py `_record`), and the origin

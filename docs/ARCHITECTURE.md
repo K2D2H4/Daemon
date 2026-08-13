@@ -247,10 +247,14 @@ never touches `consumed_by` on the observations the rule was built from —
 non-negotiable 6 makes `observations` append-only, and reverting it would let
 next week's pass revive the same rule from the same evidence.
 
-`daemon/proactivity/judge.py` deliberately does not go through
-`daemon/persona/loader.py`: it reads `seed.md` alone, because its prompt is kept
-intentionally minimal and widening it to learned rules is a separate decision
-this milestone does not make.
+`daemon/proactivity/judge.py` calls `daemon/persona/loader.py`'s `load_persona`
+(seed plus M4's learned rules), the same as the text loop and voice — decided
+2026-08-11: leaving proactivity on the seed alone meant one personality that
+spoke differently depending on which path reached the user, and the concern that
+kept it seed-only (an unprompted line has the least context to carry the voice)
+turned out to argue for including the rules, not against it. The seed alone is
+still required: `Judge._persona` returns "" — no persona, no proactive line —
+when `seed.md` is empty, even if `learned.md` is not.
 
 ## Proactivity: three stages, and exactly one model call
 
