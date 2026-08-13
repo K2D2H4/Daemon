@@ -3323,6 +3323,39 @@ def test_the_folded_tail_is_one_keypress_away_and_the_numbers_do_not_move(
     assert "DAEMON_GEMINI_LIVE_MODEL=live-09" in result.written
 
 
+def test_a_question_with_no_default_warns_about_nothing(tmp_path: Path) -> None:
+    """"`warn:  is not in that list.`" is not a sentence.
+
+    Found by running the wizard live: the compatible model id is the only `Need`
+    here that `Settings` has no default for, so on a fresh install the
+    "your default is absent from this list" warning fired with nothing to name,
+    printing a bare warning above the account's own 410-model catalogue. There is
+    no default to name and nothing is wrong. Enter is still not an answer, which
+    is the affordance line's job to say.
+    """
+    listing = replace(
+        working_checks(),
+        openai_compatible=lambda key, url, model: Verdict(
+            True, "key works", models={"DAEMON_OPENAI_COMPATIBLE_MODEL": ("a/one", "b/two")}
+        ),
+    )
+    answers = [
+        TOOLS_YES, "2", "openai_compatible", "custom", "n", "gemma3:4b",
+        "https://llm.internal/v1", "sk-x", "1",
+        GOOD_TOKEN, "y", "", "", "", "n",
+    ]
+
+    result = drive(tmp_path, answers, checks=listing)
+
+    assert result.code == 0
+    assert "is not in that list" not in flat(result.out)
+    # The list was still offered, and picking `1` off it still worked.
+    assert "1) a/one" in result.out
+    assert "an id of your own." in flat(result.out)
+    assert "or Enter" not in flat(result.out)
+    assert "DAEMON_OPENAI_COMPATIBLE_MODEL=a/one" in result.written
+
+
 def test_a_default_the_account_did_not_list_is_said_out_loud(tmp_path: Path) -> None:
     """Named, not silently replaced - and the default is dropped so Enter cannot
     take it.

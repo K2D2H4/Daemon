@@ -2047,7 +2047,14 @@ class Wizard:
             # failure in docs/PLAN.md 9, and it is silent until the first voice
             # turn. Leaving a known-absent id as the default would be a decision
             # too, and the worse one.
-            say(status(theme, "warn", f"{need.default} is not in that list."))
+            if need.default:
+                say(status(theme, "warn", f"{need.default} is not in that list."))
+            # Nothing to warn about when there is no default at all, which is the
+            # compatible model id on a fresh install - the only Need here that
+            # Settings has no default for. A live run printed the bare sentence
+            # `warn:  is not in that list.` above the account's own catalogue.
+            # The affordance line is still the one without Enter in it: an empty
+            # default is not an answer either.
             say(theme.dim(f"  A number, {EXPAND}, or an id of your own."))
             return ids
         say(theme.dim(f"  A number, {EXPAND}, an id of your own, or Enter."))
