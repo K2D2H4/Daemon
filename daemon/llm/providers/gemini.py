@@ -258,7 +258,10 @@ class GeminiProvider:
                 hint = STANDARD_KEY_HINT if response.status_code in (401, 403) else ""
                 raise ProviderError(
                     f"gemini rejected the request: HTTP {response.status_code} "
-                    f"{self._redact(response.text[:200])}{hint}"
+                    # Redact the whole body before slicing - the cut can land inside
+                    # a key the response echoed back, and a truncated key no longer
+                    # matches `_redact`'s exact-string `.replace()`.
+                    f"{self._redact(response.text)[:200]}{hint}"
                 )
             try:
                 data: dict[str, Any] = response.json()
