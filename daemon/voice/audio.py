@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -83,6 +84,21 @@ def _sounddevice() -> Any:
             "Debian/Ubuntu: apt install libportaudio2)"
         ) from None
     return sounddevice
+
+
+def _release_input_stream(stream: Any) -> None:
+    """Stop and close a PortAudio input stream, off the event loop.
+
+    Runs on a detached daemon thread from `record`'s finally: the stop can deadlock
+    inside CoreAudio, and on the loop thread that froze the whole daemon (see the
+    call site). Never raises - the thread has nobody to report to, and a stream that
+    will not close is a leaked microphone, not a crash.
+    """
+    try:
+        stream.stop()
+        stream.close()
+    except Exception:
+        logger.exception("audio: could not release the microphone stream")
 
 
 class SoundDeviceAudio:
@@ -160,8 +176,26 @@ class SoundDeviceAudio:
         finally:
             # Reached on cancellation and on the consumer breaking out. An open
             # input stream that nobody reads is a microphone light left on.
-            stream.stop()
-            stream.close()
+            #
+            # Off the event loop, and not an oversight. `stream.stop()` is
+            # `Pa_StopStream` -> CoreAudio `AudioOutputUnitStop` -> a HAL mutex, and
+            # that mutex deadlocked once on the wake->voice handover - the session's
+            # macOS VoiceProcessing unit and this PortAudio stream contending the same
+            # device. Because it ran on the loop thread it took the whole daemon with
+            # it: no logs, no scheduler, no wake, only a `sample` of the process to
+            # show `__psynch_mutexwait` under `AudioOutputUnitStop`. It cannot move to
+            # `to_thread` either: this finally is reached through `aclose()` on a
+            # cancelled task, where a fresh await is cancelled before it starts (see
+            # daemon/voice/apple_audio.py, which met the same wall). So the release
+            # runs on a plain daemon thread that needs no await and cannot wedge the
+            # loop - if PortAudio hangs again, one detached thread parks instead of the
+            # process. The closure holds `stream`, so it is not collected mid-release.
+            threading.Thread(
+                target=_release_input_stream,
+                args=(stream,),
+                name="voice-mic-release",
+                daemon=True,
+            ).start()
 
     async def play(self, chunk: bytes) -> None:
         """Queue a chunk. Returns immediately.
