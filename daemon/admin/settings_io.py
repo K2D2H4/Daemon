@@ -45,10 +45,10 @@ STR_FIELDS: dict[str, str] = {
     "hosted_provider": "DAEMON_HOSTED_PROVIDER",
     "tools_mode": "DAEMON_TOOLS_MODE",
     "gemini_live_voice": "DAEMON_GEMINI_LIVE_VOICE",
-    # Model ids, one per provider the `hosted_provider` list offers. All three, not
-    # just the one in use: `DAEMON_OPENAI_MODEL` has no default, so a page that let
-    # you pick `openai` without letting you name its model could only ever answer
-    # the choice with a 400 the page itself could not fix.
+    # Model ids, one per provider the `hosted_provider` list offers - all of them,
+    # not just the one in use: `DAEMON_OPENAI_MODEL` has no default, so a page that
+    # let you pick `openai` without letting you name its model could only ever
+    # answer the choice with a 400 the page itself could not fix.
     "anthropic_model": "DAEMON_ANTHROPIC_MODEL",
     "openai_model": "DAEMON_OPENAI_MODEL",
     "gemini_model": "DAEMON_GEMINI_MODEL",

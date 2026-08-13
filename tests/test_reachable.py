@@ -274,6 +274,23 @@ def test_a_route_to_an_unbuildable_provider_fails_at_startup(
         _build_providers(settings)
 
 
+def test_every_hosted_provider_is_offered_by_onboarding() -> None:
+    """A provider `DAEMON_HOSTED_PROVIDER` accepts must be pickable in `daemon setup`.
+
+    The other direction matters too: a menu entry naming a provider `Settings`
+    rejects is a question whose answer refuses to start.
+
+    This is reachability of the *question*, which is why it belongs here. Adding a
+    provider to `HOSTED_PROVIDERS` and forgetting `HOSTED_CHOICES` leaves it
+    configurable only by hand-editing `.env` - daemon/RECIPES.md records that this
+    shipped once, and nothing in tests/ would have caught it happening again.
+    """
+    from daemon.config import HOSTED_PROVIDERS
+    from daemon.setup import HOSTED_CHOICES
+
+    assert {choice.name for choice in HOSTED_CHOICES} == set(HOSTED_PROVIDERS)
+
+
 # --- tasks -------------------------------------------------------------------
 
 

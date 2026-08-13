@@ -495,7 +495,8 @@ def _build_providers(settings: Settings) -> dict[str, Provider]:
         else:
             raise ConfigError(
                 f"routing names provider {name!r}, which has no implementation yet "
-                f"(M1a ships {OLLAMA} and {ANTHROPIC})"
+                f"(this build ships {OLLAMA}, {ANTHROPIC}, {OPENAI}, {GEMINI} and "
+                f"{OPENAI_COMPATIBLE})"
             )
     return providers
 
