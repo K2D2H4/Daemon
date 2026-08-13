@@ -15,6 +15,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
+from daemon import tui
 from daemon.llm.base import (
     ImageBlock,
     Message,
@@ -2060,6 +2061,61 @@ def _key_span(body: str, key: str) -> tuple[int, int]:
     """Where the last occurrence of `key` sits in `body`, as a `range` pair."""
     start = body.rindex(key, 0, 200 + len(key))
     return start, start + len(key)
+
+
+async def test_compatible_bounds_a_cjk_body_by_display_columns_not_length() -> None:
+    """A Chinese or Korean error body is bounded the way `daemon/setup.py`'s two
+    quoting sites already bound theirs - by terminal columns, with a mark left
+    where it was cut - not by `len()`.
+
+    Qwen, Kimi and DeepSeek all answer a bad request in their own language, and
+    `_quoted` used to slice by character count: a CJK body got roughly twice the
+    screen `check_openai_compatible` and `_telegram_said` allow theirs, and
+    nothing distinguished a cut body from a short one. This is the provider-side
+    twin of `test_a_korean_error_body_from_a_compatible_endpoint_is_bounded_and_
+    redacted` in tests/test_setup.py, which pins the same rule for the wizard's
+    own probe.
+    """
+    body = "모델을 찾을 수 없습니다. " * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text=body)
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError, match="HTTP 404") as caught:
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    quoted = str(caught.value).split("HTTP 404 ", 1)[1]
+    assert tui.display_width(quoted) <= openai_compatible.BODY_LIMIT
+    # Cut, not merely short: the body is long enough that it must have been, and
+    # the mark is what tells a reader that rather than leaving them to guess.
+    assert quoted.endswith("…")
+    assert len(quoted) < len(body)
+
+
+async def test_compatible_bounds_an_unreadable_cjk_response_the_same_way() -> None:
+    """The `repr(data)` quoted into "unreadable response" and "no text content"
+    used to be leak-free but unbounded - `_redact` with no `_quoted` after it.
+    Routing them through `_quoted` like the `_post` failure above means all
+    three quoting sites in this module bound a CJK body the same way.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Not the documented shape - `choices` should be a list - and long
+        # enough in Korean that an uncapped `repr` would exceed the limit.
+        return httpx.Response(
+            200, json={"choices": "정말 이해할 수 없는 응답 형식입니다 " * 20}
+        )
+
+    async with mock_client(handler) as client:
+        provider = OpenAICompatibleProvider(SECRET, COMPAT_URL, client=client)
+        with pytest.raises(ProviderError, match="unreadable response") as caught:
+            await provider.complete(PROMPT, model="qwen-plus")
+
+    quoted = str(caught.value).split("unreadable response: ", 1)[1]
+    assert tui.display_width(quoted) <= openai_compatible.BODY_LIMIT
+    assert quoted.endswith("…")
 
 
 async def test_compatible_strips_an_escape_sequence_out_of_an_error_body() -> None:

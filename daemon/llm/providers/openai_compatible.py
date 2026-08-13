@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import unicodedata
 from collections.abc import Sequence
 from typing import Any
 
@@ -34,11 +35,52 @@ from daemon.llm.base import (
 DEFAULT_TIMEOUT = 60.0
 
 BODY_LIMIT = 200
-"""How much of an upstream error body reaches the exception message.
+"""How much of an upstream error body reaches the exception message, in display
+columns rather than characters - see `_display_width`.
 
 Same figure as `daemon/setup.py`'s `BODY_LIMIT`, and for the same reason: enough
 of a 4xx body to name the cause, not enough for a stack trace to become the
 response body of whatever the endpoint was actually serving."""
+
+_WIDE = frozenset("WF")
+"""East Asian Width classes that print two terminal columns, the same set
+`daemon/tui.py`'s `_WIDE` uses. Duplicated rather than imported: this module's
+design spec (docs/superpowers/specs/2026-08-11-openai-compatible-provider-design.md,
+decision 5) already chose duplicating ~40 lines of HTTP scaffolding over coupling
+this provider to `openai.py`, and `daemon/tui.py` is presentation for a process
+that may have no terminal at all - every other provider in this package imports
+only `httpx` and `daemon/llm/base.py`, and a provider reaching into onboarding's
+renderer would be a new kind of coupling, not a continuation of an old one. What
+is duplicated here is one line of classification, not the renderer itself."""
+
+
+def _display_width(text: str) -> int:
+    """Terminal columns `text` would occupy - Qwen, Kimi and DeepSeek all answer
+    a bad request in Chinese, and a limit counted in `len()` gives a CJK body
+    roughly twice the screen `daemon/setup.py`'s twin quoting sites allow."""
+    return sum(2 if unicodedata.east_asian_width(char) in _WIDE else 1 for char in text)
+
+
+def _bounded(text: str, limit: int, *, marker: str = "…") -> str:
+    """`text` cut to at most `limit` display columns, marked when it was.
+
+    Bounding by raw length silently gives a CJK body about double the intended
+    budget and never says the body was cut - the two problems `_quoted`'s
+    docstring below names. Cutting on a column boundary rather than a character
+    one matters for the same reason `daemon/tui.truncate` cuts there: leaving a
+    wide character's other half in would overshoot `limit` by one column.
+    """
+    if _display_width(text) <= limit:
+        return text
+    budget = limit - _display_width(marker)
+    width = 0
+    cut = 0
+    for index, char in enumerate(text):
+        width += 2 if unicodedata.east_asian_width(char) in _WIDE else 1
+        if width > budget:
+            break
+        cut = index + 1
+    return text[:cut] + marker
 
 
 class OpenAICompatibleProvider:
@@ -119,17 +161,21 @@ class OpenAICompatibleProvider:
             finish = str(choices[0].get("finish_reason", "")) if choices else ""
         except (AttributeError, IndexError, TypeError, ValueError) as exc:
             # Per llm/base.py every failure leaves as ProviderError - including a
-            # body that simply is not shaped like the documented one.
+            # body that simply is not shaped like the documented one. `_quoted`,
+            # not bare `_redact`: an unexpected shape is still an upstream body
+            # of unknown size, and this exception message deserves the same
+            # bound as the one `_post` raises below rather than an unlimited
+            # `repr` of whatever came back.
             raise ProviderError(
                 f"openai_compatible returned an unreadable response: "
-                f"{self._redact(repr(data))}"
+                f"{self._quoted(repr(data))}"
             ) from exc
 
         if not text and not calls:
             # A turn that only asked for tools has no text, and that one is fine.
             # Everything else here is a refusal or an empty answer.
             raise ProviderError(
-                f"openai_compatible returned no text content: {self._redact(repr(data))}"
+                f"openai_compatible returned no text content: {self._quoted(repr(data))}"
             )
 
         return Completion(
@@ -164,7 +210,8 @@ class OpenAICompatibleProvider:
         return text.replace(self._api_key, "<redacted>")
 
     def _quoted(self, body: str) -> str:
-        """An upstream error body, in the order that makes it safe to quote.
+        """The one way this module quotes an upstream body back into an
+        exception message - every site that does, does it through here.
 
         Redact, collapse, strip, *then* bound - and the order is the whole point.
         Slicing first can cut the key across the boundary, and `_redact`'s
@@ -174,11 +221,17 @@ class OpenAICompatibleProvider:
         already fixed the same ordering and this module was written before them.
 
         Whitespace is collapsed so words split across lines do not run together,
-        and non-printable characters go because an escape sequence in an upstream
-        body would otherwise repaint whatever a terminal prints after this.
+        non-printable characters go because an escape sequence in an upstream body
+        would otherwise repaint whatever a terminal prints after this, and the
+        bound is `_bounded`'s - display columns, not `len()` - because Qwen,
+        Kimi and DeepSeek all answer a bad request in Chinese, and a raw
+        character slice was giving a CJK body roughly twice the screen
+        `daemon/setup.py`'s twin quoting sites allow it, with nothing marking
+        that it had been cut.
         """
         collapsed = " ".join(self._redact(body).split())
-        return "".join(char for char in collapsed if char.isprintable())[:BODY_LIMIT]
+        printable = "".join(char for char in collapsed if char.isprintable())
+        return _bounded(printable, BODY_LIMIT)
 
     async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST with exactly one retry (llm/base.py: the gateway decides about
