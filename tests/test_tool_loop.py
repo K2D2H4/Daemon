@@ -352,6 +352,43 @@ async def test_a_mid_loop_provider_error_still_fails_the_turn(
     assert channel.sent[0].text == FAILURE_NOTICE
 
 
+async def test_a_non_provider_error_at_the_round_limit_still_fails_the_turn(
+    data_dir: Path, store: Store, tmp_path: Path
+) -> None:
+    """Pins the catch to `ProviderError` specifically, not just to this call site.
+
+    The three tests above only pin *where* the catch sits; a bare `except Exception`
+    at the same round-limit escape call would still pass all three, because a
+    `ProviderError` there would still be caught. This raises something else
+    (`RuntimeError`) from that exact call - the escape call made with no tools -
+    so it must fall through the narrow `except ProviderError` uncaught, reach
+    `run()`'s generic handler, and answer `FAILURE_NOTICE`. If the catch is ever
+    widened to bare `Exception`, this test flips to `INCOMPLETE_NOTICE` and fails.
+    """
+    (tmp_path / "notes.md").write_text("hi")
+
+    class RaisesSomethingElseAtTheEscapeCall:
+        name = "fake"
+
+        async def complete(self, messages, *, model, tools=None, **kw):  # type: ignore[no-untyped-def]
+            if not tools:
+                raise RuntimeError("boom")
+            return Completion(
+                text="", model=model, tool_calls=(read_file_call(tmp_path / "notes.md"),)
+            )
+
+        async def health(self) -> bool:
+            return True
+
+    channel = FakeChannel([inbound("계속 읽어봐")])
+    await loop_for(
+        channel, RaisesSomethingElseAtTheEscapeCall(), FakeMemory(), data_dir,
+        runner(store, tmp_path, mode="ask"), max_tool_rounds=2,
+    ).run()
+
+    assert channel.sent[0].text == FAILURE_NOTICE
+
+
 async def test_a_denied_call_tells_the_model_why(
     data_dir: Path, store: Store, tmp_path: Path
 ) -> None:
