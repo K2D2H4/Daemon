@@ -170,3 +170,30 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   filter of its own, but on this model the judge's own content criterion ("구체적인
   사건·감정·기억이 내용으로 적혀 있다") already screens chaff before anyone hears it, so
   nothing in this run argues for adding one now.
+- **The C rhythm was accepted on the machine, not in the suite (2026-08-11).** Every
+  routing rule was driven against a live `Reading` from this Mac, with the daemon's
+  own microphone hold declared the way the wake listener declares it:
+  ```
+  editor in front, unmuted     -> both      ok
+    + muted                    -> telegram  output muted
+    + screen locked            -> telegram  screen locked
+    + somebody else on the mic -> telegram  microphone in use
+  Slack in the foreground      -> telegram  Slack is in the foreground
+  ```
+  `both` is the line that matters: it is the first time the local speaker has been
+  reachable at all. Before the split, `mic_busy` was `True` forever on any install
+  with `DAEMON_WAKE_ENABLED` on, so the speaker branch could not be selected —
+  switching voice on was what switched the voice route off. With the hold declared,
+  the same probe reads `mic_busy=False` while the device is genuinely running.
+  The 👎 brake was driven against the real `Settings` (budget 8/day, ceilings
+  association 3 · emotional 2 · open_loop 2 · silence 1 · pattern_time 1): one press
+  gives `thumbs down: association is resting for 6h` and leaves every other kind at
+  `ok`.
+- **Type E cannot fire on this install for about another month, and that is the
+  design (2026-08-11).** `ASSOCIATION_MIN_AGE_DAYS` is 30 and the whole conversation
+  history spans 2026-08-06..2026-08-11, so there are zero owner messages old enough
+  to be an association rather than a conversation. Same shape as `pattern_time`
+  needing 14 distinct days. Worth writing down because "the generator produces
+  nothing" and "the generator is broken" look identical from outside, and this one
+  is the former.
+
