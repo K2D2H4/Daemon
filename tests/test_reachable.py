@@ -175,6 +175,19 @@ WIRED_CLASSES = (
     "ToolRunner",
     "McpBridge",
     "Registry",
+
+    # Async delegation: a voice turn queues through `delegate_task`
+    # (`_build_tools`, when `delegate_wake` is set), and `_lifespan` builds and
+    # starts the worker that actually runs each request and reports it back.
+    # `CaptureChannel` is not listed here even though `_lifespan` reaches it
+    # (through `build_run_request`): it is both defined and constructed in
+    # `daemon/delegation.py`, and `_constructed` skips any file that defines the
+    # name it is looking for (to keep `test_no_name_this_file_reasons_about_...`
+    # unambiguous about *which* definition it found) - so this checker cannot see
+    # a same-file construction site at all, the same blind spot `PENDING_WIRING`
+    # exists for method calls rather than classes.
+    "DelegateTask",
+    "DelegationWorker",
 )
 
 
