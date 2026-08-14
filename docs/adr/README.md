@@ -25,6 +25,7 @@ says "measured" was checked against the real thing, and the number is in the fil
 | [0011](0011-the-file-holds-more-than-it-injects.md) | core.md holds every active fact, not the injected ones | accepted, measured |
 | [0012](0012-voice-is-its-own-axis.md) | Voice is its own axis, not a preset tier | accepted |
 | [0013](0013-split-the-presence-signals.md) | Split the presence signals | accepted, measured |
+| [0014](0014-provider-is-the-axis.md) | The provider is the axis; presets are gone | accepted |
 
 ## Format
 

@@ -99,7 +99,7 @@ def test_build_resident_service_is_the_plain_service_off_darwin(monkeypatch) -> 
     """Off macOS, residency is the plain console-script service - no .app, and no
     launcher in its ProgramArguments."""
     monkeypatch.setattr(macapp.sys, "platform", "linux")
-    service = build_resident_service(Settings(_env_file=None, preset="offline"))
+    service = build_resident_service(Settings(_env_file=None, provider="ollama"))
     assert service.program == default_program()
 
 
@@ -112,7 +112,7 @@ def test_build_resident_service_points_the_launchagent_at_the_launcher_on_darwin
     fake_launcher = tmp_path / "Daemon.app" / "Contents" / "MacOS" / "launcher"
     monkeypatch.setattr(macapp, "build_bundle", lambda app_dir: fake_launcher)
 
-    service = build_resident_service(Settings(_env_file=None, preset="offline"))
+    service = build_resident_service(Settings(_env_file=None, provider="ollama"))
 
     assert service.program == (str(fake_launcher), *default_program())
 

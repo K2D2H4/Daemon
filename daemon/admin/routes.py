@@ -170,8 +170,8 @@ async def health(request: Request) -> dict[str, Any]:
 async def chat_test(request: Request) -> JSONResponse:
     """A routed provider round-trip and nothing else - the chat version of /health.
 
-    No persona, no recall, no history, no tools, no write. Just: is the model this
-    preset routes `chat_text` to reachable, and what does it say back? Everything
+    No persona, no recall, no history, no tools, no write. Just: is the model
+    DAEMON_PROVIDER routes `chat_text` to reachable, and what does it say back? Everything
     that would make it a conversation is deliberately absent (see module docstring).
     """
     try:

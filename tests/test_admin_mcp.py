@@ -48,7 +48,7 @@ OAUTH_REDIRECT = "http://127.0.0.1:8787/admin/api/mcp/oauth/callback"
 
 
 def _settings(tmp_path: Path, **kw: object) -> Settings:
-    return Settings(_env_file=None, preset="offline", data_dir=tmp_path, **kw)
+    return Settings(_env_file=None, provider="ollama", data_dir=tmp_path, **kw)
 
 
 class FakeBridge:
@@ -773,7 +773,7 @@ def test_connect_writes_passthrough_credentials_and_makes_them_effective_now(
     value the owner just typed unusable until a restart."""
     monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_ID", raising=False)
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
     app = _enabled_app(tmp_path)
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
@@ -794,7 +794,7 @@ def test_connect_refuses_a_variable_the_entry_does_not_declare(tmp_path: Path) -
     """The allowlist is the catalog's, not the client's (CONTRACTS 13). Otherwise a
     page could write arbitrary environment into the owner's `.env`."""
     env = tmp_path / ".env"
-    original = "DAEMON_PRESET=offline\n"
+    original = "DAEMON_PROVIDER=ollama\n"
     env.write_text(original, encoding="utf-8")
     app = _enabled_app(tmp_path)
     app.state.env_path = env

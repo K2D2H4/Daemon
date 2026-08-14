@@ -145,10 +145,10 @@ def store(db: sqlite3.Connection) -> Store:
 
 
 def settings(**overrides: object) -> Settings:
-    """`offline` because it is the one preset that needs no hosted provider, and a
+    """`ollama` because it is the one provider that needs no hosted key, and a
     candidate generator makes no model call of any kind to route anyway."""
     base: dict[str, object] = {
-        "preset": "offline",
+        "provider": "ollama",
         "ollama_model": "gemma3:4b",
         "proactive_enabled": True,
     }

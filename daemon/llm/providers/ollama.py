@@ -1,6 +1,6 @@
 """Local provider (Ollama `/api/chat`).
 
-The offline preset runs entirely on this, which is what makes the privacy
+`DAEMON_PROVIDER=ollama` runs entirely on this, which is what makes the privacy
 promise in docs/PLAN.md 7 true rather than aspirational.
 
 M1a is single-shot: no streaming. Streaming only matters once a UI renders

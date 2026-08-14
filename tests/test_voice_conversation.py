@@ -1816,11 +1816,10 @@ def _voice_settings(tmp_path: pathlib.Path, **overrides: str) -> Any:
 
     base = {
         "_env_file": None,
-        "DAEMON_PRESET": "balanced",
+        "DAEMON_PROVIDER": "gemini",
         "DAEMON_OLLAMA_MODEL": "gemma3:4b",
         "DAEMON_DATA_DIR": str(tmp_path),
         "TELEGRAM_BOT_TOKEN": "123456:AAHfake-token-value",
-        "DAEMON_HOSTED_PROVIDER": "gemini",
         "GEMINI_API_KEY": "k",
         "DAEMON_VOICE_ENABLED": "true",
         "DAEMON_GEMINI_LIVE_MODEL": "gemini-3.1-flash-live-preview",

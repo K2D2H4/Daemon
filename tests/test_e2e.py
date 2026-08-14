@@ -166,7 +166,7 @@ def settings_for(tmp_path: Path, **extra: Any) -> Settings:
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     values: dict[str, Any] = {
-        "DAEMON_PRESET": "offline",
+        "DAEMON_PROVIDER": "ollama",
         "DAEMON_OLLAMA_MODEL": "gemma3:4b",
         "DAEMON_DATA_DIR": str(tmp_path),
         "TELEGRAM_BOT_TOKEN": TOKEN,
@@ -704,7 +704,7 @@ async def test_the_audit_trail_is_readable_from_the_cli(
 
     from daemon.cli import main
 
-    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PROVIDER", "ollama")
     monkeypatch.setenv("DAEMON_OLLAMA_MODEL", "gemma3:4b")
     monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DAEMON_TOOLS_ENABLED", "true")

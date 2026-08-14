@@ -157,9 +157,9 @@ Full layout, the write order and the measured latency budget:
 The honest version, because it is more useful than a slogan:
 
 - Memory and personality are **files on your machine**. Nothing is synced.
-- **Text mode with a local model is fully offline.** The `offline` preset routes
-  every task to Ollama; voice is the one thing you can opt into, and leaving it
-  off is what makes that sentence true rather than aspirational.
+- **Text mode with a local model is fully offline.** Set `DAEMON_PROVIDER=ollama`
+  and every task routes to Ollama; voice is the one thing you can opt into, and
+  leaving it off is what makes that sentence true rather than aspirational.
 - **Voice sends audio to the provider you chose**, with your own key. Turn voice
   off and it does not. Proactive speech at your desk uses your local speaker and
   touches no network.

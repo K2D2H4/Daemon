@@ -62,12 +62,12 @@ class FakeChannel:
 
 def settings(**overrides: Any) -> Settings:
     base: dict[str, Any] = {
-        "preset": "offline",
+        "provider": "ollama",
         "proactive_enabled": True,
         "proactive_quiet_hours": "",
     }
     # A caller passing `voice_enabled=True` gets the voice model and key with it:
-    # ADR 0012 made voice its own axis, so `offline` + voice is an ordinary
+    # ADR 0012 made voice its own axis, so `ollama` + voice is an ordinary
     # configuration, but turning voice on still names a hosted provider and the
     # validator still asks for its model and key. Supplying them beats bypassing
     # the validator, which is what the `model_construct` hatch here used to do.
@@ -294,8 +294,8 @@ async def test_an_unrested_decline_would_cost_a_call_every_tick(
 async def test_a_decline_still_stops_the_tick(store: Store, data_dir: Path) -> None:
     """Finding 1's other half: the loop used to `break` only after a *delivery*,
     so several due candidates in one tick each cost a judge call before a decline
-    stopped it - under the `quality` preset PROACTIVE_JUDGE is hosted, so that is
-    a paid call per candidate, not a free one."""
+    stopped it - with `proactive_judge_local=False` PROACTIVE_JUDGE is hosted, so
+    that is a paid call per candidate, not a free one."""
     add_candidate(store, "silence")
     add_candidate(store, "emotional")
     tick, judge, channel = tick_for(store, data_dir, judge=FakeJudge(""))

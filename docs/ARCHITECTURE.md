@@ -416,26 +416,30 @@ by something, or declared pending with the milestone that owns it.
 
 ## Routing
 
-Two axes, deliberately not multiplied together. A **preset** answers *where work
-runs* (`offline` · `balanced` · `quality`); `DAEMON_HOSTED_PROVIDER` answers *whose
-model*. Per-task overrides win over both. `Task.EMBED` stays local in every
-preset because it runs on every message and every query;
-`Task.PROACTIVE_JUDGE` stays local everywhere except `quality`, because it belongs to
-a loop that wakes 288 times a day and whose correct answer is usually silence — under
-`quality` that trade is made the other way on purpose, and a 4B model's habit of
-answering a contentless reason with an empty pleasantry (PLAN.md 6.2.1) is the reason
-somebody would.
+Two axes, computed rather than looked up in a table
+([ADR 0014](adr/0014-provider-is-the-axis.md)). `DAEMON_PROVIDER` answers *whose
+model* answers `Task.CHAT_TEXT`, `RECALL_ESCALATION`, `REFLECTION` and
+`PERSONA_RULE` - `ollama` (fully local, no key) or one of the four hosted names.
+`DAEMON_PROACTIVE_JUDGE_LOCAL` (bool, default true) answers whether
+`Task.PROACTIVE_JUDGE` rides along with that provider or stays local regardless -
+it belongs to a loop that wakes 288 times a day and whose correct answer is usually
+silence, so hosted cost accumulates for nothing most ticks unless that trade is
+made on purpose (a 4B model's habit of answering a contentless reason with an empty
+pleasantry, PLAN.md 6.2.1, is the reason somebody would). Per-task
+`DAEMON_ROUTE_OVERRIDES` win over both axes. `Task.EMBED` stays on `ollama`
+unconditionally, independent of either axis, because it runs on every message and
+every query.
 
 `Task.CHAT_VOICE` is its own third axis, `DAEMON_VOICE_PROVIDER` (gemini or openai) -
-independent of the preset and of `DAEMON_HOSTED_PROVIDER`, and never `anthropic`: in
-native audio the model *is* both the brain and the voice, so it cannot be pointed at
-a provider without a voice session. See
+independent of `DAEMON_PROVIDER` and of `DAEMON_PROACTIVE_JUDGE_LOCAL`, and never
+`anthropic`: in native audio the model *is* both the brain and the voice, so it
+cannot be pointed at a provider without a voice session. See
 [ADR 0012](adr/0012-voice-is-its-own-axis.md).
 
-`Task.PERSONA_RULE` follows `Task.REFLECTION`'s routing in every preset: both
-write conclusions that propagate into everything downstream of them — the
-curated tier and entity graph for one, the whole personality for the other —
-so both get the same preference for a hosted model.
+`Task.PERSONA_RULE` follows `Task.REFLECTION`'s routing always: both write
+conclusions that propagate into everything downstream of them — the curated tier
+and entity graph for one, the whole personality for the other — so both follow
+`DAEMON_PROVIDER` together rather than one of them getting its own axis.
 
 ## Latency budget (measured)
 

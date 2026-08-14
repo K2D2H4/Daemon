@@ -266,7 +266,7 @@ def test_a_route_to_an_unbuildable_provider_fails_at_startup(
     with pytest.raises(ConfigError, match="no model is set"):
         Settings(
             _env_file=None,
-            DAEMON_PRESET="offline",
+            DAEMON_PROVIDER="ollama",
             DAEMON_OLLAMA_MODEL="gemma3:4b",
             DAEMON_DATA_DIR="/tmp/daemon-reachability",
             DAEMON_ROUTE_OVERRIDES={"reflection": "imaginary"},
@@ -279,7 +279,7 @@ def test_a_route_to_an_unbuildable_provider_fails_at_startup(
     )
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR="/tmp/daemon-reachability",
         DAEMON_ROUTE_OVERRIDES={"reflection": "imaginary"},
@@ -520,7 +520,7 @@ def test_the_allowlist_accepts_what_a_person_would_type(
 
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR="/tmp/daemon-allowlist",
         TELEGRAM_BOT_TOKEN="fake",

@@ -34,7 +34,7 @@ reasons carry only elapsed hours and a frequency: it fills the gap with `또 왔
 and `전혀 변한 게 없어.` A 4B model reading only the reason cannot tell that those
 two kinds never have anything to ask about, and it should not have to - "this kind
 speaks less often" is a budget, and budgets are `gate.py`'s. Worth revisiting when
-`PROACTIVE_JUDGE` routes hosted (the `quality` preset already does).
+`PROACTIVE_JUDGE` routes hosted (`proactive_judge_local=False` already does).
 
 ## Why the reply is JSON for one short sentence
 

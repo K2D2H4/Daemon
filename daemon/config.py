@@ -56,9 +56,9 @@ MODEL_SUGGESTIONS: dict[str, tuple[str, ...]] = {
     "gemini": ("gemini-3.6-flash", "gemini-3.1-pro-preview"),
 }
 """Datalist suggestions for the admin's chat-model field, newest first. NOT VALIDATED -
-unlike PRESETS or GEMINI_LIVE_VOICES, this is not a constraint: a model id absent here
-must still save (Settings validates model ids only as non-empty), because a just-released
-id would otherwise be unselectable. Do not add a membership check."""
+unlike GEMINI_LIVE_VOICES or HOSTED_PROVIDERS, this is not a constraint: a model id
+absent here must still save (Settings validates model ids only as non-empty), because
+a just-released id would otherwise be unselectable. Do not add a membership check."""
 
 VOICE_TASKS = frozenset({Task.CHAT_VOICE})
 """Tasks that need a hosted native-audio model. Voice is its own axis
@@ -82,7 +82,7 @@ the same reason SENSITIVITIES is duplicated."""
 
 VOICE_PROVIDERS = ("gemini", "openai")
 """Which hosted native-audio backend a voice session uses. Independent of the text
-`hosted_provider`: voice-model availability is a separate axis, and being explicit
+`provider`: voice-model availability is a separate axis, and being explicit
 turns a mismatch into a startup error, not a first-turn failure."""
 
 OPENAI_REALTIME_VOICES = frozenset({
@@ -334,7 +334,7 @@ class Settings(BaseSettings):
 
     voice_provider: str = Field(default="gemini", alias="DAEMON_VOICE_PROVIDER")
     """Which native-audio backend voice mode uses: one of VOICE_PROVIDERS. Not derived
-    from the text hosted_provider."""
+    from the text provider."""
 
     openai_realtime_model: str = Field(default="", alias="DAEMON_OPENAI_REALTIME_MODEL")
     """OpenAI Realtime model id (e.g. gpt-realtime), distinct from DAEMON_OPENAI_MODEL:

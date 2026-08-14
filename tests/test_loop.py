@@ -780,13 +780,13 @@ def test_health_reports_routing_and_a_stopped_loop(_isolated_env: None) -> None:
     # /health rather than swallowed.
     from fastapi.testclient import TestClient
 
-    app = create_app(Settings(_env_file=None, preset="offline"))
+    app = create_app(Settings(_env_file=None, provider="ollama"))
 
     with TestClient(app) as client:
         body = client.get("/health").json()
 
     assert body["status"] == "ok"
-    assert body["preset"] == "offline"
+    assert body["provider"] == "ollama"
     assert body["routing"][Task.CHAT_TEXT.value] == "ollama"
     assert body["conversation_loop"] == "stopped"
 
@@ -805,7 +805,7 @@ def test_health_reports_a_running_loop_when_io_is_injected(_isolated_env: None) 
             return stream()
 
     app = create_app(
-        Settings(_env_file=None, preset="offline"),
+        Settings(_env_file=None, provider="ollama"),
         channel=IdleChannel([]),
         memory=FakeMemory(),
     )
@@ -828,7 +828,7 @@ def test_health_reports_whether_recall_is_wired(_isolated_env: None) -> None:
             return stream()
 
     app = create_app(
-        Settings(_env_file=None, preset="offline"),
+        Settings(_env_file=None, provider="ollama"),
         channel=IdleChannel([]),
         memory=FakeMemory(),
         recall=FakeRecall(),
@@ -850,7 +850,7 @@ def test_health_reports_microphone_status(
 
     monkeypatch.setattr(app_module, "_mic_health", lambda: "authorized")
 
-    app = create_app(Settings(_env_file=None, preset="offline"))
+    app = create_app(Settings(_env_file=None, provider="ollama"))
 
     with TestClient(app) as client:
         body = client.get("/health").json()
@@ -871,7 +871,7 @@ def test_a_recall_stack_that_will_not_load_does_not_stop_the_boot(_isolated_env:
     later, so a missing embedder must cost memory, never the conversation loop."""
     from daemon.app import _build_recall
 
-    recall, status, embedder = _build_recall(Settings(_env_file=None, preset="offline"), object())
+    recall, status, embedder = _build_recall(Settings(_env_file=None, provider="ollama"), object())
 
     assert (recall is None) == status.startswith("unavailable")
     # Whatever it managed to build has to be closeable, or every restart leaks a
