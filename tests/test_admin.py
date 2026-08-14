@@ -53,6 +53,14 @@ def _settings(tmp_path: Path, **kw: object) -> Settings:
     return Settings(_env_file=None, data_dir=tmp_path, **kw)
 
 
+def _served_index(tmp_path: Path) -> str:
+    """The shell HTML string, as `test_shell_page_renders_offline` reads it - the
+    structural tests below slice a named JS function's body out of this text."""
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+    return client.get("/admin/").text
+
+
 @pytest.fixture(autouse=True)
 def _no_live_model_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     """GET /settings now probes the hosted three for live model ids
@@ -474,6 +482,58 @@ def test_voice_sensitivities_are_wired_through_the_provider_aware_block(
     for name in ("voice_start_sensitivity", "voice_end_sensitivity"):
         assert name in voice_field_fn, f"{name} must render from inside voiceField()"
         assert name not in outside, f"{name} must not also render unconditionally"
+
+
+# --- g. the MODEL card asks provider first, then that provider's model (D5/D7/D9) --
+
+
+def test_model_fields_render_from_brainfield_not_rendersettings(tmp_path: Path) -> None:
+    """Every model-shaped field must come from inside `brainField()` - the function
+    the provider `<select>`'s change handler re-renders - not unconditionally from
+    `renderSettings()`, which cannot react to a provider switch. The old flat
+    eight-box card (`fieldStr('preset', ...)` / `fieldStr('hosted_provider', ...)`)
+    must be gone entirely, not just supplemented."""
+    html = _served_index(tmp_path)
+    start = html.index("function brainField(")
+    body = html[start : html.index("\nfunction ", start + 1)]
+    for name in (
+        "provider",
+        "proactive_judge_local",
+        "ollama_model",
+        "openai_compatible_base_url",
+    ):
+        assert name in body, f"{name} must render from inside brainField()"
+    assert "fieldStr('preset'" not in html and "fieldStr('hosted_provider'" not in html
+
+
+def test_the_chat_model_field_prefers_the_live_list(tmp_path: Path) -> None:
+    """D5/D6: the hosted-three model field's datalist prefers the live probe result
+    (`options.model_lists`), falling back to the static `options.model_suggestions`
+    only when the probe found nothing."""
+    html = _served_index(tmp_path)
+    assert "model_lists" in html and "model_suggestions" in html
+
+
+def test_collect_patch_emits_provider_from_the_brain_select(tmp_path: Path) -> None:
+    """The provider select carries `data-brain`, not `data-f`, so the generic
+    `[data-f]` loop in `collectPatch()` skips it - a provider switch is a structural
+    change (which model field exists, whether the toggle shows) that brainField's
+    own re-render handles, not something the loop's per-field logic understands.
+    `collectPatch()` must still read it explicitly and emit `patch.provider` when it
+    differs from the value the form was drawn with."""
+    html = _served_index(tmp_path)
+    start = html.index("function collectPatch(")
+    body = html[start : html.index("\nfunction ", start + 1)]
+    assert 'data-brain="provider"' in body
+    assert "patch.provider" in body
+
+
+def test_status_meta_reads_provider_not_preset(tmp_path: Path) -> None:
+    """/health carries `provider`, not `preset` (Task 3 reshaped the payload) - the
+    top bar's own rendering must read the field that actually exists."""
+    html = _served_index(tmp_path)
+    assert "h.provider" in html
+    assert "h.preset" not in html
 
 
 def test_restart_refuses_when_not_supervised(
