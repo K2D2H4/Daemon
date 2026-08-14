@@ -2,6 +2,8 @@ import asyncio
 
 from daemon.channels.base import OutboundMessage
 from daemon.delegation import (
+    EMPTY_REPLY_MESSAGE,
+    FAILURE_PREFIX,
     CaptureChannel,
     DelegationWorker,
     build_run_request,
@@ -122,6 +124,66 @@ async def test_drain_once_returns_false_when_the_queue_is_empty(db):
     store = Store(db)
     worker = DelegationWorker(store, None, None, wake=asyncio.Event())
     assert await worker.drain_once() is False
+
+
+class _RaisingDoneStore:
+    """Wraps a real Store but blows up on mark_task_done - a mid-write crash."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def claim_next_queued(self, *args, **kwargs):
+        return self._store.claim_next_queued(*args, **kwargs)
+
+    def mark_task_done(self, *args, **kwargs):
+        raise RuntimeError("disk full")
+
+    def mark_task_failed(self, *args, **kwargs):
+        return self._store.mark_task_failed(*args, **kwargs)
+
+
+async def test_mark_done_failure_does_not_flip_a_real_success_into_a_failure(db):
+    real_store = Store(db)
+    tid = real_store.enqueue_task(request="노션에 페이지 만들어줘", origin="owner",
+                                   channel="voice", sender_id=None)
+    store = _RaisingDoneStore(real_store)
+    delivered = []
+
+    async def fake_run(request):
+        return "만들었어요"
+
+    async def fake_deliver(text, task_row):
+        delivered.append(text)
+
+    worker = DelegationWorker(store, fake_run, fake_deliver, wake=asyncio.Event())
+    ran = await worker.drain_once()
+    assert ran is True
+    # The work really happened - the owner must hear the real reply, not a
+    # manufactured failure, even though recording it as done blew up.
+    assert delivered == ["만들었어요"]
+    assert FAILURE_PREFIX not in delivered[0]
+    row = db.execute("SELECT status FROM delegated_tasks WHERE id=?", (tid,)).fetchone()
+    assert row["status"] == "running"  # the mark-done write never landed
+
+
+async def test_empty_reply_is_delivered_as_an_honest_message_not_silence(db):
+    store = Store(db)
+    tid = store.enqueue_task(request="r", origin="owner", channel="voice", sender_id=None)
+    delivered = []
+
+    async def fake_run(request):
+        return ""
+
+    async def fake_deliver(text, task_row):
+        delivered.append(text)
+
+    worker = DelegationWorker(store, fake_run, fake_deliver, wake=asyncio.Event())
+    ran = await worker.drain_once()
+    assert ran is True
+    assert delivered == [EMPTY_REPLY_MESSAGE]
+    assert delivered[0] != ""
+    row = db.execute("SELECT status, result FROM delegated_tasks WHERE id=?", (tid,)).fetchone()
+    assert row["status"] == "done" and row["result"] == EMPTY_REPLY_MESSAGE
 
 
 async def test_build_run_request_runs_the_text_loop_and_returns_the_reply(monkeypatch):

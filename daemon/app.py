@@ -503,7 +503,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # that escaped the finally block - skipping the channel close, the sqlite
         # close, the scheduler shutdown and every provider aclose below it. A
         # revoked bot token was enough to leak the lot on every restart.
-        for name in ("backfill_task", "loop_task", "wake_task", "reflection_boot_task"):
+        for name in (
+            "backfill_task",
+            "loop_task",
+            "wake_task",
+            "reflection_boot_task",
+            "delegation_task",
+        ):
             pending = getattr(app.state, name, None)
             if pending is None:
                 continue

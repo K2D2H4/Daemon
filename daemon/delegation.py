@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 FAILURE_PREFIX = "그 작업을 하려다 실패했어"
 
+EMPTY_REPLY_MESSAGE = "작업은 처리했는데 돌려줄 결과 메시지가 비어 있어. 노션/로그를 확인해줘."
+
 
 async def deliver_result(
     text: str, *, presence: Any, speaker: Any, channel: Any, recipient_id: str | None
@@ -138,11 +140,19 @@ class DelegationWorker:
         try:
             assert self._run_request is not None
             reply = await self._run_request(request)
-            self._store.mark_task_done(task_id, reply)
         except Exception as exc:
             logger.exception("delegation: task %s failed", task_id)
             reply = f"{FAILURE_PREFIX}: {exc}"
             self._store.mark_task_failed(task_id, str(exc))
+        else:
+            # The work already happened - a failure to record it must not turn a
+            # real result into a reported failure. Log it, deliver the real reply.
+            if not reply.strip():
+                reply = EMPTY_REPLY_MESSAGE
+            try:
+                self._store.mark_task_done(task_id, reply)
+            except Exception:
+                logger.exception("delegation: could not mark task %s done", task_id)
         if self._deliver is not None:
             try:
                 await self._deliver(reply, row)
