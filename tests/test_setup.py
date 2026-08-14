@@ -359,9 +359,11 @@ def test_anthropic_asks_for_its_key_but_not_for_voice(tmp_path: Path) -> None:
     result = drive(
         tmp_path,
         # "" after "anthropic" is Enter at the background toggle (kept local,
-        # the old `balanced` default); the "" after the key is Enter at the
-        # Anthropic model id, which has a question of its own.
-        [TOOLS_YES, "anthropic", "", "n", GOOD_KEY, "", GOOD_TOKEN, "y"],
+        # the old `balanced` default) - which is why the local model question
+        # still follows: the five-minute judge runs on it even though chat does
+        # not. The "" after the key is Enter at the Anthropic model id, which
+        # has a question of its own.
+        [TOOLS_YES, "anthropic", "", "n", "gemma3:4b", GOOD_KEY, "", GOOD_TOKEN, "y"],
         checks=recorder.checks(),
     )
 
@@ -377,7 +379,7 @@ def test_voice_only_gemini_writes_the_live_id_but_not_the_text_id(tmp_path: Path
     result = drive(
         tmp_path,
         [
-            TOOLS_YES, "anthropic", "", "y", GOOD_KEY, "", "AIzaGEMINIKEY", "",
+            TOOLS_YES, "anthropic", "", "y", "gemma3:4b", GOOD_KEY, "", "AIzaGEMINIKEY", "",
             GOOD_TOKEN, "y",
         ],
         checks=recorder.checks(),
@@ -470,7 +472,7 @@ def test_a_rejected_key_is_re_asked_and_the_bad_one_is_never_written(
     result = drive(
         tmp_path,
         [
-            TOOLS_YES, "anthropic", "", "n", "sk-ant-TYPO", GOOD_KEY, "", GOOD_TOKEN,
+            TOOLS_YES, "anthropic", "", "n", "gemma3:4b", "sk-ant-TYPO", GOOD_KEY, "", GOOD_TOKEN,
             "y",
         ],
         checks=checks,
@@ -502,7 +504,7 @@ def test_the_key_is_checked_against_the_configured_model(tmp_path: Path) -> None
     existing = "DAEMON_PROVIDER=anthropic\nDAEMON_ANTHROPIC_MODEL=claude-opus-4-1\n"
     drive(
         tmp_path,
-        [KEEP, KEEP, "", "n", GOOD_KEY, "", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", "n", "gemma3:4b", GOOD_KEY, "", GOOD_TOKEN, "y"],
         existing=existing,
         checks=checks,
     )
@@ -518,7 +520,7 @@ def test_giving_up_on_a_key_writes_nothing(tmp_path: Path) -> None:
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
     )
     answers = [
-        TOOLS_YES, "anthropic", "", "n", "bad1", "bad2", "bad3",
+        TOOLS_YES, "anthropic", "", "n", "gemma3:4b", "bad1", "bad2", "bad3",
         GOOD_TOKEN, "y",
     ]
     result = drive(tmp_path, answers, checks=checks)
@@ -771,7 +773,7 @@ def test_a_value_already_in_the_file_is_not_asked_for_again(tmp_path: Path) -> N
     existing = f"DAEMON_PROVIDER=anthropic\nANTHROPIC_API_KEY={GOOD_KEY}\n"
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "", "n", KEEP, GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(),
     )
@@ -1107,7 +1109,10 @@ def test_check_does_not_call_a_model_id_missing_while_printing_its_value(
     (tmp_path / ".env").write_text(
         "DAEMON_PROVIDER=openai\n"
         f"OPENAI_API_KEY=sk-real\nDAEMON_OPENAI_MODEL=gpt-5.1\n"
-        f"TELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n",
+        # The default background toggle keeps the five-minute judge on ollama,
+        # so a *complete* install still needs this - dropping it would make the
+        # fixture demonstrate the warn path instead of the one this test is about.
+        f"DAEMON_OLLAMA_MODEL=gemma3:4b\nTELEGRAM_BOT_TOKEN={GOOD_TOKEN}\n",
         encoding="utf-8",
     )
     out = io.StringIO()
@@ -2090,9 +2095,11 @@ def test_the_chosen_provider_is_the_one_whose_key_is_asked_for(
     # product (docs/PLAN.md 3.2).
     key_name, key_value = HOSTED_KEY[provider]
     recorder = Recorder()
-    # the chosen provider, background kept local, voice off, then the model id
-    # where one is asked for (anthropic has a Settings default, so it is not).
-    answers = [TOOLS_YES, provider, "", "n", key_value]
+    # the chosen provider, background kept local (so the judge's own model is
+    # still asked even though chat does not run on it), voice off, then the
+    # model id where one is asked for (anthropic has a Settings default, so it
+    # is not).
+    answers = [TOOLS_YES, provider, "", "n", "gemma3:4b", key_value]
     if provider != "anthropic":
         answers.append("")  # the offered model id
     answers += [GOOD_TOKEN, "y", "", "", "", "n"]
@@ -2124,7 +2131,7 @@ def test_the_env_the_wizard_writes_loads_and_routes_to_that_provider(
     from daemon.tasks import Task
 
     _, key_value = HOSTED_KEY[provider]
-    answers = [TOOLS_YES, provider, "", "n", key_value]
+    answers = [TOOLS_YES, provider, "", "n", "gemma3:4b", key_value]
     if provider != "anthropic":
         answers.append("")
     answers += [GOOD_TOKEN, "y", "", "", "", "n"]
@@ -2156,7 +2163,7 @@ def test_choosing_a_known_vendor_fills_the_address_and_never_names_it(
     # The endpoint question is asked with the vendor's address already filled in,
     # so KEEP is how that prefill is accepted.
     answers = [
-        TOOLS_YES, "openai_compatible", "qwen", "", "n", KEEP, "sk-qwen-x", "",
+        TOOLS_YES, "openai_compatible", "qwen", "", "n", "gemma3:4b", KEEP, "sk-qwen-x", "",
         GOOD_TOKEN, "y", "", "", "", "n",
     ]
 
@@ -2185,7 +2192,7 @@ def test_the_env_the_wizard_writes_for_a_compatible_endpoint_loads_and_routes(
         openai_compatible=lambda key, url, model: Verdict(True, "key works"),
     )
     answers = [
-        TOOLS_YES, "openai_compatible", "deepseek", "", "n", KEEP, "sk-ds-x", "",
+        TOOLS_YES, "openai_compatible", "deepseek", "", "n", "gemma3:4b", KEEP, "sk-ds-x", "",
         GOOD_TOKEN, "y", "", "", "", "n",
     ]
 
@@ -2229,7 +2236,7 @@ def test_enter_at_a_saved_vendor_keeps_that_vendor_not_the_first_one(
     # vendor sub-question - which is the one this test exists to hold honest -
     # and the endpoint question it prefills.
     answers = [
-        KEEP, KEEP, KEEP, "", "n", KEEP, KEEP,
+        KEEP, KEEP, KEEP, "", "n", "gemma3:4b", KEEP, KEEP,
         GOOD_TOKEN, "y", "", "", "", "n",
     ]
 
@@ -2262,7 +2269,7 @@ def test_enter_at_a_saved_custom_endpoint_keeps_it_rather_than_naming_a_vendor(
         openai_compatible=lambda key, url, model: Verdict(True, "key works"),
     )
     answers = [
-        KEEP, KEEP, KEEP, "", "n", KEEP, KEEP,
+        KEEP, KEEP, KEEP, "", "n", "gemma3:4b", KEEP, KEEP,
         GOOD_TOKEN, "y", "", "", "", "n",
     ]
 
@@ -2299,7 +2306,7 @@ def test_a_typed_endpoint_reaches_the_probe_that_verifies_the_key(tmp_path: Path
 
     checks = replace(working_checks(), openai_compatible=probe)
     answers = [
-        TOOLS_YES, "openai_compatible", "custom", "", "n",
+        TOOLS_YES, "openai_compatible", "custom", "", "n", "gemma3:4b",
         typed_url, "sk-or-typed", "some-model",
         GOOD_TOKEN, "y", "", "", "", "n",
     ]
@@ -2336,7 +2343,7 @@ def test_a_mistyped_endpoint_fails_at_its_own_question_not_at_the_key(
 
     checks = replace(working_checks(), openai_compatible=probe)
     answers = [
-        TOOLS_YES, "openai_compatible", "custom", "", "n",
+        TOOLS_YES, "openai_compatible", "custom", "", "n", "gemma3:4b",
         "openrouter.ai/api/v1",  # no scheme
         f"{good}/chat/completions",  # the whole endpoint URL, as vendor docs print it
         good,
@@ -2378,7 +2385,7 @@ def test_a_re_run_can_move_a_custom_endpoint_to_a_new_address(tmp_path: Path) ->
         openai_compatible=lambda key, url, model: Verdict(True, "key works"),
     )
     answers = [
-        KEEP, KEEP, "custom", "", "n", new_url, KEEP,
+        KEEP, KEEP, "custom", "", "n", "gemma3:4b", new_url, KEEP,
         GOOD_TOKEN, "y", "", "", "", "n",
     ]
 
@@ -2416,7 +2423,7 @@ def test_choosing_custom_over_a_known_vendor_does_not_default_back_to_it(
         openai_compatible=lambda key, url, model: Verdict(True, "key works"),
     )
     answers = [
-        KEEP, KEEP, "custom", "", "n",
+        KEEP, KEEP, "custom", "", "n", "gemma3:4b",
         "",  # Enter at the address question - must be refused, not Kimi's URL
         new_url, KEEP,
         GOOD_TOKEN, "y", "", "", "", "n",
@@ -2453,7 +2460,7 @@ def test_gemini_as_the_chat_provider_still_warns_about_standard_keys(
     result = drive(
         tmp_path,
         [
-            TOOLS_YES, "gemini", "", "n", "AIza-STANDARD", "AIza-STANDARD",
+            TOOLS_YES, "gemini", "", "n", "gemma3:4b", "AIza-STANDARD", "AIza-STANDARD",
             "AIza-STANDARD",
         ],
         checks=Recorder().checks(gemini_verdict=verdict),
@@ -2471,7 +2478,7 @@ def test_an_openai_key_is_masked_in_the_change_list(tmp_path: Path) -> None:
     secret = "sk-proj-REALOPENAI7777"
     result = drive(
         tmp_path,
-        [TOOLS_YES, "openai", "", "n", secret, "", GOOD_TOKEN, "y", "", "", "", "n"],
+        [TOOLS_YES, "openai", "", "n", "gemma3:4b", secret, "", GOOD_TOKEN, "y", "", "", "", "n"],
     )
 
     assert result.code == 0
@@ -2491,7 +2498,7 @@ def test_a_provider_already_chosen_is_offered_again_and_enter_keeps_it(
     result = drive(
         tmp_path,
         [
-            KEEP, KEEP, "", "n", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "",
+            KEEP, KEEP, "", "n", "gemma3:4b", "sk-proj-KEY9999", "", GOOD_TOKEN, "y", "", "", "",
             "n",
         ],
         existing=existing,
@@ -2834,8 +2841,10 @@ def gemini_listing(
     )
 
 
-VOICE_ANSWERS = [TOOLS_YES, "gemini", "", "y", GOOD_GEMINI]
-"""Gemini as the provider, background kept local, voice on, the key.
+VOICE_ANSWERS = [TOOLS_YES, "gemini", "", "y", "gemma3:4b", GOOD_GEMINI]
+"""Gemini as the provider, background kept local, voice on, the local model (the
+background toggle being kept means the five-minute judge still reads it even
+though chat does not), then the key.
 
 The next two questions are the Live id and the text id, in that order, and the key
 comes first - which is what makes a list available by the time either is asked.
@@ -3233,7 +3242,7 @@ def test_choosing_which_claude_is_a_question_with_a_menu_behind_it(
     # menu. `1` is the Settings default, because Enter and `1` have to agree.
     result = drive(
         tmp_path,
-        [TOOLS_YES, "anthropic", "", "n", GOOD_KEY, "2", GOOD_TOKEN, "y"],
+        [TOOLS_YES, "anthropic", "", "n", "gemma3:4b", GOOD_KEY, "2", GOOD_TOKEN, "y"],
         checks=checks,
     )
 
@@ -3260,7 +3269,7 @@ def test_an_id_the_account_never_listed_is_still_accepted_for_claude(
     result = drive(
         tmp_path,
         [
-            TOOLS_YES, "anthropic", "", "n", GOOD_KEY, "claude-opus-6-20260901",
+            TOOLS_YES, "anthropic", "", "n", "gemma3:4b", GOOD_KEY, "claude-opus-6-20260901",
             GOOD_TOKEN, "y",
         ],
         checks=checks,
@@ -3290,7 +3299,7 @@ def test_a_saved_anthropic_key_still_produces_a_menu_on_a_re_install(
     )
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "", "n", KEEP, GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
         existing=f"DAEMON_PROVIDER=anthropic\nANTHROPIC_API_KEY={GOOD_KEY}\n",
         checks=checks,
     )
@@ -3369,7 +3378,7 @@ def test_the_openai_list_reaches_the_openai_question(tmp_path: Path) -> None:
     verdict = Verdict(True, "key works", models={"DAEMON_OPENAI_MODEL": ("gpt-4.1", "o3-mini")})
     result = drive(
         tmp_path,
-        [TOOLS_YES, "openai", "", "n", "sk-proj-REALOPENAI7777", "1", "", "y"],
+        [TOOLS_YES, "openai", "", "n", "gemma3:4b", "sk-proj-REALOPENAI7777", "1", "", "y"],
         checks=Recorder().checks(openai_verdict=verdict),
     )
 
@@ -3436,7 +3445,7 @@ def test_a_question_with_no_default_warns_about_nothing(tmp_path: Path) -> None:
         ),
     )
     answers = [
-        TOOLS_YES, "openai_compatible", "custom", "", "n",
+        TOOLS_YES, "openai_compatible", "custom", "", "n", "gemma3:4b",
         "https://llm.internal/v1", "sk-x", "1",
         GOOD_TOKEN, "y", "", "", "", "n",
     ]
@@ -3708,6 +3717,26 @@ def test_hosted_provider_asks_its_key_only() -> None:
     assert "GEMINI_API_KEY" not in k and "OPENAI_API_KEY" not in k
 
 
+def test_hosted_provider_with_the_judge_kept_local_still_asks_for_its_model() -> None:
+    # Task.PROACTIVE_JUDGE routes to ollama whenever DAEMON_PROACTIVE_JUDGE_LOCAL
+    # is true (config.py's routing table) - regardless of what the chat provider
+    # is. The most common install (a hosted provider, judge kept local - the
+    # default) previously never asked for this, silently falling back to
+    # Settings.ollama_model's built-in default: qwen3:14b, the slow reasoning
+    # model DAEMON_OLLAMA_MODEL's own `Need.blocking` docstring measures at
+    # ~11.8s against gemma3's ~1.7s.
+    k = keys(DAEMON_PROVIDER="anthropic", DAEMON_PROACTIVE_JUDGE_LOCAL="true")
+    assert "DAEMON_OLLAMA_MODEL" in k
+
+
+def test_hosted_provider_with_the_judge_hosted_too_skips_the_local_model() -> None:
+    # Nothing chat-like routes to ollama once the judge is hosted too - EMBED
+    # always reads embed_model, never ollama_model - so asking here would be a
+    # question about a value nothing reads.
+    k = keys(DAEMON_PROVIDER="anthropic", DAEMON_PROACTIVE_JUDGE_LOCAL="false")
+    assert "DAEMON_OLLAMA_MODEL" not in k
+
+
 def test_a_stale_preset_env_still_names_the_provider_keys() -> None:
     # needs_for reads DAEMON_PROVIDER, not DAEMON_PRESET; a leftover preset is inert here
     # (Settings is what refuses it loudly - Task 1).
@@ -3720,9 +3749,14 @@ def test_no_vendor_key_is_asked_for_until_a_provider_is_chosen() -> None:
     # nothing rather than a guess: the guess used to be Anthropic, so someone who
     # ran setup before this question existed silently got Claude and could not
     # tell that from a choice.
+    #
+    # DAEMON_OLLAMA_MODEL is asked here too, even with no provider chosen yet:
+    # DAEMON_PROACTIVE_JUDGE_LOCAL defaults true, and the five-minute proactive
+    # judge runs on ollama whenever that is so - regardless of what the chat
+    # provider turns out to be (config.py's routing table).
     unanswered = keys()
 
-    assert unanswered == {"DAEMON_PROVIDER", "TELEGRAM_BOT_TOKEN"}
+    assert unanswered == {"DAEMON_PROVIDER", "DAEMON_OLLAMA_MODEL", "TELEGRAM_BOT_TOKEN"}
 
 
 def test_the_chosen_provider_decides_which_key_is_asked_for() -> None:
@@ -3948,7 +3982,7 @@ def test_a_provider_can_actually_be_changed_by_re_running(tmp_path: Path) -> Non
         tmp_path,
         # Order matters and is the product: provider, background, voice, then the
         # credentials the chosen provider actually needs.
-        [KEEP, "gemini", "", "n", GOOD_GEMINI, "", GOOD_TOKEN, "y"],
+        [KEEP, "gemini", "", "n", "gemma3:4b", GOOD_GEMINI, "", GOOD_TOKEN, "y"],
         existing="DAEMON_PROVIDER=ollama\n",
     )
 
@@ -4004,7 +4038,7 @@ def test_enter_at_the_voice_question_keeps_it_on(tmp_path: Path) -> None:
     )
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "", KEEP, KEEP, "", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", KEEP, "gemma3:4b", KEEP, "", GOOD_TOKEN, "y"],
         existing=existing,
     )
 
@@ -4031,7 +4065,7 @@ def test_a_saved_key_still_gets_the_account_a_list(tmp_path: Path) -> None:
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "", "n", "1", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", "n", "gemma3:4b", "1", GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(
             gemini_verdict=Verdict(
@@ -4054,7 +4088,7 @@ def test_one_probe_answers_both_gemini_questions(tmp_path: Path) -> None:
 
     drive(
         tmp_path,
-        [KEEP, KEEP, "", KEEP, "1", "1", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", KEEP, "gemma3:4b", "1", "1", GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(
             gemini_verdict=Verdict(
@@ -4085,7 +4119,7 @@ def test_a_model_id_already_in_the_file_is_still_offered(tmp_path: Path) -> None
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "", KEEP, "1", "1", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", KEEP, "gemma3:4b", "1", "1", GOOD_TOKEN, "y"],
         existing=existing,
         checks=gemini_listing(
             live=("gemini-2.5-flash-native-audio",), text=("gemini-2.5-flash",)
@@ -4109,7 +4143,7 @@ def test_a_saved_model_id_is_the_default_not_the_built_in_one(tmp_path: Path) ->
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "", "n", KEEP, GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", "n", "gemma3:4b", KEEP, GOOD_TOKEN, "y"],
         existing=existing,
         checks=gemini_listing(text=("gemini-2.5-flash", "gemini-2.5-pro")),
     )
@@ -4126,7 +4160,7 @@ def test_a_saved_key_that_stopped_working_is_said_out_loud(tmp_path: Path) -> No
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "", "n", "gemini-2.5-flash", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", "n", "gemma3:4b", "gemini-2.5-flash", GOOD_TOKEN, "y"],
         existing=existing,
         checks=Recorder().checks(
             gemini_verdict=Verdict(False, "Google refused the key (HTTP 403).")
@@ -4158,7 +4192,7 @@ def test_one_probe_even_when_only_one_of_the_two_lists_came_back(
 
     result = drive(
         tmp_path,
-        [KEEP, KEEP, "", KEEP, "1", "gemini-2.5-pro", GOOD_TOKEN, "y"],
+        [KEEP, KEEP, "", KEEP, "gemma3:4b", "1", "gemini-2.5-pro", GOOD_TOKEN, "y"],
         existing=existing,
         checks=recorder.checks(
             gemini_verdict=Verdict(

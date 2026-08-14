@@ -1125,12 +1125,20 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 "no default, so a choice is never confused with a fallback.",
             )
         )
-    if provider == OLLAMA:
+    if provider == OLLAMA or proactive_judge_local:
+        # Not just `provider == OLLAMA`: `Task.PROACTIVE_JUDGE` routes to ollama
+        # whenever `proactive_judge_local` is true (config.py's routing table),
+        # regardless of what `provider` is - so a hosted install that keeps the
+        # judge local (the default) still reads this model every five minutes.
+        # Missing that case left the judge silently on `Settings.ollama_model`'s
+        # built-in default, `qwen3:14b` - the slow reasoning model `Need.blocking`
+        # above measures at ~11.8s against gemma3's ~1.7s.
         needs.append(
             Need(
                 key="DAEMON_OLLAMA_MODEL",
                 label="local chat model",
-                why="Ollama model used for conversation. Do not use a reasoning model here.",
+                why="Ollama model used for conversation, for the five-minute "
+                "proactive judge, or both. Do not use a reasoning model here.",
                 default=DEFAULT_OLLAMA_MODEL,
             )
         )
