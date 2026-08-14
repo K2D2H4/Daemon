@@ -484,6 +484,29 @@ def test_voice_sensitivities_are_wired_through_the_provider_aware_block(
         assert name not in outside, f"{name} must not also render unconditionally"
 
 
+def test_voice_model_ids_render_from_the_provider_aware_block_not_unconditionally(
+    tmp_path: Path,
+) -> None:
+    """gemini_live_model and openai_realtime_model are each read by only one
+    voice_provider (config.py) - the old flat MODEL card showed both regardless of
+    which provider was selected, the exact "shown but not in force" problem the
+    provider-first redesign exists to remove. Both must render from inside
+    `voiceField()` - the function the `voice_provider` `change` listener
+    re-renders - never unconditionally from `renderSettings()`."""
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+    html = client.get("/admin/").text
+
+    start = html.index("function voiceField(")
+    end = html.index("\nfunction ", start + 1)
+    voice_field_fn = html[start:end]
+    outside = html[:start] + html[end:]
+
+    for name in ("gemini_live_model", "openai_realtime_model"):
+        assert name in voice_field_fn, f"{name} must render from inside voiceField()"
+        assert name not in outside, f"{name} must not also render unconditionally"
+
+
 # --- g. the MODEL card asks provider first, then that provider's model (D5/D7/D9) --
 
 

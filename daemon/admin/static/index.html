@@ -1041,21 +1041,27 @@ function fieldToggle(name,running){
     <span class="td">${esc(EXPLAIN[name]||'')}</span></span>
     <span class="sw" role="switch" tabindex="0" data-f="${name}" data-v="${v?'true':'false'}" aria-checked="${v?'true':'false'}"><i></i></span></div>`;
 }
-// Provider-aware voice block. Renders the SELECTED provider's voice select + preview,
-// plus (gemini only) the two sensitivity knobs - openai_realtime.py never reads them,
-// so showing them under DAEMON_VOICE_PROVIDER=openai promised a control the backend
-// ignores. All of it lives inside the replaceable #voice-field, so changing the
-// provider re-renders the whole block at once (display:contents keeps its children
-// as direct .grid2 items, same as before this wrapper existed).
+// Provider-aware voice block. Renders the SELECTED provider's own model id, voice
+// select + preview, plus (gemini only) the two sensitivity knobs - openai_realtime.py
+// never reads sensitivities, so showing them under DAEMON_VOICE_PROVIDER=openai
+// promised a control the backend ignores, and the same reasoning applies to the
+// model id field: the other provider's realtime endpoint never reads it either, so
+// only the one in force is shown (same principle as brainField's MODEL card - every
+// control shown is a control currently in force). The model id is plain text, no
+// datalist - D8 keeps voice static, no live probing. All of it lives inside the
+// replaceable #voice-field, so changing the provider re-renders the whole block at
+// once (display:contents keeps its children as direct .grid2 items, same as before
+// this wrapper existed).
 function voiceField(provider,e,o){
   const isO=provider==='openai';
+  const modelName=isO?'openai_realtime_model':'gemini_live_model';
   const name=isO?'openai_realtime_voice':'gemini_live_voice';
   const opts=(isO?o.openai_realtime_voices:o.gemini_live_voices)||[''];
   const v=val(name,e[name]);
   const os=opts.map(x=>`<option ${x===v?'selected':''}>${esc(x)}</option>`).join('');
   const sens=isO?'':fieldStr('voice_start_sensitivity',e.voice_start_sensitivity,o.sensitivities)
     +fieldStr('voice_end_sensitivity',e.voice_end_sensitivity,o.sensitivities);
-  return `<div id="voice-field" style="display:contents"><div class="field">${nameCell(name)}<select data-f="${name}">${os}</select>
+  return `<div id="voice-field" style="display:contents">${fieldStr(modelName,e[modelName])}<div class="field">${nameCell(name)}<select data-f="${name}">${os}</select>
     <div class="voice-preview"><button type="button" class="btn" id="voice-play">▶ preview</button>
     <span class="cap" id="voice-preview-msg"></span><audio id="voice-sample" preload="none"></audio></div></div>${sens}</div>`;
 }
@@ -1120,13 +1126,6 @@ function renderSettings(){
     +'<div class="grid2" style="margin-top:16px">'
     +fieldStr('voice_provider',e.voice_provider,o.voice_providers)
     +voiceField(val('voice_provider',e.voice_provider),e,o)
-    // The realtime/Live model ids used to sit in the flat MODEL card even though
-    // they are voice-axis, not chat-provider, fields (docs/design "sit in the
-    // wrong card"). Now that MODEL only renders the chat provider's own field
-    // (brainField), these belong here instead - unconditionally, exactly as
-    // before, since voiceField() itself is out of scope for this change.
-    +fieldStr('gemini_live_model',e.gemini_live_model)
-    +fieldStr('openai_realtime_model',e.openai_realtime_model)
     +fieldStr('wake_aliases',e.wake_aliases)+'</div>'
     +'<p class="cap" style="margin:12px 0 0">Aliases are what the recognizer actually hears, comma-separated — `daemon wake calibrate` measures them. Empty sensitivity leaves it to the server (Gemini only - OpenAI Realtime has no equivalent knob).</p>');
   h+=card('MEMORY','<div class="grid2">'+fieldNum('recall_limit',e.recall_limit)
