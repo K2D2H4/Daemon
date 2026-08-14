@@ -1,8 +1,11 @@
-"""Settings and the three routing presets.
+"""Settings and the two routing axes.
 
-docs/PLAN.md 3.2: routing is a per-Task table, not one global switch, and users
-see three presets instead of seven questions. Advanced users override single
-tasks.
+docs/PLAN.md 3.2 / ADR 0014: routing is a per-Task table, computed from two
+orthogonal choices - `DAEMON_PROVIDER` (which model answers chat, recall,
+reflection and persona rules) and `DAEMON_PROACTIVE_JUDGE_LOCAL` (whether the
+5-minute proactive tick runs on that provider or stays local) - rather than a
+named preset table. Advanced users override single tasks with
+`DAEMON_ROUTE_OVERRIDES`.
 
 Everything here fails loudly at construction time. A missing API key must not
 surface as a broken conversation turn three hours later.
@@ -38,29 +41,28 @@ PROVIDER_KEY_ENV: dict[str, str | None] = {
     OPENAI_COMPATIBLE: "OPENAI_COMPATIBLE_API_KEY",
 }
 
-HOSTED = "hosted"
-"""Placeholder in the preset tables for "whichever hosted provider was chosen".
-
-The presets used to name ANTHROPIC directly, which made "provider-agnostic
-gateway" true of the config surface and false of the product: a user who wanted
-GPT or Gemini for conversation had no way to say so. Multiplying the presets by
-the providers would have given nine, so the two questions stay separate - a preset
-answers *where the work runs*, and DAEMON_HOSTED_PROVIDER answers *whose model*.
-
-CHAT_VOICE is deliberately not HOSTED: it names GEMINI because Gemini Live is the
-only native-audio session implemented, and pointing it at a provider with no voice
-session would fail at the first voice turn instead of at startup."""
-
 HOSTED_PROVIDERS = ("anthropic", "openai", "gemini", "openai_compatible")
-"""What DAEMON_HOSTED_PROVIDER accepts. Ollama is not here - "hosted" is the
-opposite of local, and the offline preset never resolves HOSTED at all.
+"""What DAEMON_PROVIDER accepts besides `ollama`. Ollama is not here - "hosted" is
+the opposite of local, and `DAEMON_PROVIDER=ollama` never resolves to one of these.
 
 `openai_compatible` is one name for many vendors on purpose: Qwen, Kimi,
 DeepSeek, OpenRouter and a self-hosted server differ by endpoint, not by
 protocol, so the endpoint is configuration and the protocol is the provider."""
 
+MODEL_SUGGESTIONS: dict[str, tuple[str, ...]] = {
+    "ollama": ("qwen3:14b", "gemma3:4b"),
+    "anthropic": ("claude-opus-5", "claude-sonnet-5"),
+    "openai": ("gpt-5.2", "gpt-5.1"),
+    "gemini": ("gemini-3.6-flash", "gemini-3.1-pro-preview"),
+}
+"""Datalist suggestions for the admin's chat-model field, newest first. NOT VALIDATED -
+unlike PRESETS or GEMINI_LIVE_VOICES, this is not a constraint: a model id absent here
+must still save (Settings validates model ids only as non-empty), because a just-released
+id would otherwise be unselectable. Do not add a membership check."""
+
 VOICE_TASKS = frozenset({Task.CHAT_VOICE})
-"""Tasks that need a hosted native-audio model. The offline preset has none."""
+"""Tasks that need a hosted native-audio model. Voice is its own axis
+(DAEMON_VOICE_ENABLED, ADR 0012) and carries no route unless that is on."""
 
 THINKING_LEVELS = ("", "low", "high")
 """What DAEMON_GEMINI_THINKING_LEVEL accepts: `low`, `high`, or empty to leave it
@@ -106,45 +108,6 @@ importing the voice layer into it would invert the layering. The cost of the cop
 is one line; the cost of the import is that config cannot be read without
 PortAudio."""
 
-# docs/PLAN.md 3.2. Notes on the non-obvious cells:
-#   - RECALL_ESCALATION follows chat, because Lane 2 is a conversation turn.
-#   - PROACTIVE_JUDGE stays local except under `quality`: it runs on a 5-minute
-#     tick, so hosted cost accumulates whether or not it ever speaks.
-#   - PERSONA_RULE follows REFLECTION; both propagate into the whole graph.
-#   - CHAT_VOICE is absent from `offline` because no *preset* implies voice; the
-#     axis is DAEMON_VOICE_ENABLED, and `Settings.routing` adds the row when that
-#     is on (ADR 0012). What makes the promise in docs/PLAN.md 7 literally
-#     true is voice being off - which is what that promise says.
-PRESETS: dict[str, dict[Task, str]] = {
-    "offline": {
-        Task.CHAT_TEXT: OLLAMA,
-        Task.RECALL_ESCALATION: OLLAMA,
-        Task.PROACTIVE_JUDGE: OLLAMA,
-        Task.REFLECTION: OLLAMA,
-        Task.PERSONA_RULE: OLLAMA,
-        Task.EMBED: OLLAMA,
-    },
-    "balanced": {
-        Task.CHAT_TEXT: HOSTED,
-        Task.CHAT_VOICE: GEMINI,
-        Task.RECALL_ESCALATION: HOSTED,
-        Task.PROACTIVE_JUDGE: OLLAMA,
-        Task.REFLECTION: HOSTED,
-        Task.PERSONA_RULE: HOSTED,
-        Task.EMBED: OLLAMA,
-    },
-    "quality": {
-        Task.CHAT_TEXT: HOSTED,
-        Task.CHAT_VOICE: GEMINI,
-        Task.RECALL_ESCALATION: HOSTED,
-        Task.PROACTIVE_JUDGE: HOSTED,
-        Task.REFLECTION: HOSTED,
-        Task.PERSONA_RULE: HOSTED,
-        Task.EMBED: OLLAMA,
-    },
-}
-
-
 ENV_FILE = ".env"
 """The one file credentials live in. The service unit deliberately carries no
 secrets and only points at the directory holding this file (daemon/service.py),
@@ -171,16 +134,6 @@ A regex rather than importing the gate's parser: `config.py` is foundation and
 
 class ConfigError(RuntimeError):
     """Bad configuration. Raised at startup, never mid-conversation."""
-
-
-DEFAULT_HOSTED_PROVIDER = ""
-"""No default, expressed as a value so callers can name the absence.
-
-It used to be "anthropic", which meant a configuration that never chose a
-provider silently became Claude and the person who was never asked could not tell
-a choice from a fallback. Onboarding always runs, so the answer always exists by
-the time it is needed; before then this is the honest stand-in and hosted tasks
-drop out of any enumeration rather than being guessed at."""
 
 
 def clean_base_url(value: str) -> str:
@@ -216,58 +169,23 @@ def clean_base_url(value: str) -> str:
     return text
 
 
-def preset_providers(preset: str, hosted: str) -> dict[Task, str]:
-    """A preset's table with HOSTED resolved to a real provider name.
-
-    Anything reading PRESETS to decide what a configuration needs has to go
-    through this, or it sees the placeholder and treats "hosted" as a provider.
-
-    `hosted` is required and has no default on purpose. It used to default to
-    anthropic, which meant a configuration that never named a provider silently
-    got Claude - and someone who had not been asked the question could not tell
-    the difference between a choice and a fallback. Onboarding always runs, so
-    the answer always exists; an empty one is a configuration to fix, not a
-    value to guess.
-    """
-    return {
-        task: (hosted if provider == HOSTED and hosted else provider)
-        for task, provider in PRESETS[preset].items()
-    }
-
-
 def providers_for(
-    preset: str,
     *,
+    provider: str,
+    proactive_judge_local: bool,
     voice_enabled: bool,
-    hosted: str = DEFAULT_HOSTED_PROVIDER,
     voice_provider: str,
 ) -> list[str]:
-    """Providers a preset actually needs, so onboarding asks for those keys only.
-
-    Voice contributes only while voice is on - that is what lets a text-only
-    `balanced` install be set up without a hosted voice key (docs/PLAN.md 6.5) - and
-    when it does, it contributes `voice_provider` under *every* preset, `offline`
-    included (ADR 0012).
-
-    `hosted` resolves the HOSTED placeholder and is required: a caller that guesses
-    it asks the user for the wrong key, which is how a person who chose GPT ends up
-    being asked for an Anthropic one. Pass "" before the question has been answered
-    and hosted tasks simply drop out of the list.
-
-    `voice_provider` is required for the same reason, and is not defaulted here even
-    though the field has a default: reading CHAT_VOICE from the preset table instead
-    asked a user who had chosen OpenAI voice for a Gemini key.
-    """
-    if preset not in PRESETS:
-        raise ConfigError(
-            f"unknown preset {preset!r}; expected one of {', '.join(sorted(PRESETS))}"
-        )
-    providers = {
-        provider
-        for task, provider in preset_providers(preset, hosted).items()
-        # An unanswered question contributes nothing rather than a guess.
-        if task not in VOICE_TASKS and provider != HOSTED
-    }
+    """Providers onboarding must ask keys for, from the two axes. `ollama` and `""`
+    contribute no hosted key. Voice contributes `voice_provider` only when voice is on
+    (ADR 0012). `proactive_judge_local` is accepted for symmetry with the axes even
+    though every hosted role already implies the provider's key - it changes nothing
+    about which *keys* are needed, only which model runs the judge."""
+    providers: set[str] = set()
+    if provider and provider != OLLAMA:
+        providers.add(provider)
+    elif provider == OLLAMA:
+        providers.add(OLLAMA)
     if voice_enabled:
         providers.add(voice_provider)
     return sorted(providers)
@@ -284,7 +202,7 @@ class Route:
 class Settings(BaseSettings):
     """Loaded from the environment and `.env` - see .env.example.
 
-    Field names are usable as keyword arguments (`Settings(preset="offline")`),
+    Field names are usable as keyword arguments (`Settings(provider="ollama")`),
     which is how tests build a configuration without touching the environment.
     """
 
@@ -296,12 +214,38 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    preset: str = Field(default="balanced", alias="DAEMON_PRESET")
+    provider: str = Field(default="", alias="DAEMON_PROVIDER")
+    """Which provider answers conversation, recall, reflection and persona rules -
+    `ollama` for fully local, or one of the hosted names. Empty by default: a hosted
+    task with no provider fails at startup pointing at `daemon setup`, rather than
+    quietly becoming Claude (ADR 0007, carried into ADR 0014). `ollama` here means the
+    old `offline` preset - every hosted role resolves local. Per-task `route_overrides`
+    still win over this."""
+
+    proactive_judge_local: bool = Field(default=True, alias="DAEMON_PROACTIVE_JUDGE_LOCAL")
+    """Run PROACTIVE_JUDGE on the local model instead of the provider. True by default
+    (the old `balanced`): the judge fires on a 5-minute tick, so hosted cost accrues
+    whether or not it ever speaks. False is the old `quality`. Ignored when `provider`
+    is `ollama` - everything is local then anyway. It moves this one task and no other;
+    REFLECTION stays on the provider regardless (that was the only balanced/quality
+    difference)."""
+
+    stale_preset: str = Field(default="", alias="DAEMON_PRESET")
+    """Not a real setting - `DAEMON_PRESET` was removed (ADR 0014). Captured here,
+    rather than left to `extra="ignore"`, so a leftover value from before the rename
+    can be refused loudly instead of silently dropped: a `DAEMON_PRESET=offline`
+    install that was never rewritten would otherwise start dialing a hosted
+    provider, the privacy version of ADR 0007's footgun. See `_check` below.
+
+    No leading underscore, deliberately: pydantic reserves that spelling for a
+    private attribute and refuses to build the class at all (`NameError`) if a
+    `Field(...)` is attached to one - this field has to be an ordinary field to
+    receive `DAEMON_PRESET` through the alias mechanism in the first place."""
 
     route_overrides: Annotated[dict[Task, str], NoDecode] = Field(
         default_factory=dict, alias="DAEMON_ROUTE_OVERRIDES"
     )
-    """Per-task override on top of the preset, as JSON:
+    """Per-task override on top of the computed routing, as JSON:
     `DAEMON_ROUTE_OVERRIDES={"reflection": "ollama"}`.
 
     NoDecode for the same reason as TELEGRAM_ALLOWED_USER_IDS below, and it was
@@ -318,14 +262,6 @@ class Settings(BaseSettings):
     `None` is what "unset" means to every reader of this field, and a dotenv can only
     write that as an empty value - which `_blank_is_unset` below normalises, because
     `""` reaching those readers reported a bogus unknown provider at startup."""
-
-    hosted_provider: str = Field(default="", alias="DAEMON_HOSTED_PROVIDER")
-    """Which commercial model answers wherever a preset says "hosted".
-
-    One of HOSTED_PROVIDERS, and deliberately empty by default: a preset that
-    needs a hosted provider and does not have one fails at startup pointing at
-    `daemon setup`, rather than quietly becoming Claude. Per-task overrides still
-    win over this."""
 
     voice_enabled: bool = Field(default=False, alias="DAEMON_VOICE_ENABLED")
     """docs/PLAN.md 6.5: voice is the user's choice and text mode is a complete
@@ -370,9 +306,10 @@ class Settings(BaseSettings):
     embed_model: str = Field(default="bge-m3", alias="DAEMON_EMBED_MODEL")
     """Embedding model for recall, separate from the chat model even though both
     run on Ollama: chat may move to a hosted provider while embeddings stay local
-    (Task.EMBED is local in every preset). bge-m3 is multilingual, which the
-    Korean recall path depends on - docs/PLAN.md 4.3 shows FTS5 alone missing
-    inflected Korean, and that is the whole reason vectors were pulled into M1b."""
+    (Task.EMBED is always `ollama`, whatever `DAEMON_PROVIDER` is). bge-m3 is
+    multilingual, which the Korean recall path depends on - docs/PLAN.md 4.3 shows
+    FTS5 alone missing inflected Korean, and that is the whole reason vectors were
+    pulled into M1b."""
 
     recall_limit: int = Field(default=6, alias="DAEMON_RECALL_LIMIT")
     """Top N recalled items injected per turn. Small on purpose: this text is
@@ -744,8 +681,9 @@ class Settings(BaseSettings):
 
         `NoDecode` on the field is what lets this run at all - see its docstring.
         Unparseable text raises rather than quietly becoming `{}`: an override that
-        is dropped sends its task to the preset's provider instead of the chosen one
-        and says nothing, which is the degradation this module exists to prevent.
+        is dropped sends its task to the computed route's provider instead of the
+        chosen one and says nothing, which is the degradation this module exists to
+        prevent.
         """
         if isinstance(value, str):
             text = value.strip()
@@ -878,26 +816,21 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check(self) -> Settings:
-        if self.preset not in PRESETS:
+        if self.stale_preset:
             raise ConfigError(
-                f"unknown DAEMON_PRESET {self.preset!r}; expected one of "
-                f"{', '.join(sorted(PRESETS))}"
+                "DAEMON_PRESET has been removed. Set DAEMON_PROVIDER (ollama | "
+                f"{' | '.join(HOSTED_PROVIDERS)}) and DAEMON_PROACTIVE_JUDGE_LOCAL "
+                "instead - see docs/adr/0014-provider-is-the-axis.md."
             )
-
-        needs_hosted = any(
-            provider == HOSTED for provider in PRESETS[self.preset].values()
-        )
-        if not self.hosted_provider:
-            if needs_hosted:
-                raise ConfigError(
-                    f"preset {self.preset!r} sends work to a hosted model but "
-                    "DAEMON_HOSTED_PROVIDER is empty; run `daemon setup` to choose one "
-                    f"({', '.join(HOSTED_PROVIDERS)})"
-                )
-        elif self.hosted_provider not in HOSTED_PROVIDERS:
+        if self.provider and self.provider != OLLAMA and self.provider not in HOSTED_PROVIDERS:
             raise ConfigError(
-                f"unknown DAEMON_HOSTED_PROVIDER {self.hosted_provider!r}; expected one "
-                f"of {', '.join(HOSTED_PROVIDERS)}"
+                f"unknown DAEMON_PROVIDER {self.provider!r}; expected ollama or one of "
+                f"{', '.join(HOSTED_PROVIDERS)}"
+            )
+        if not self.provider and self._routes_a_hosted_task():
+            raise ConfigError(
+                "a hosted task is routed but DAEMON_PROVIDER is empty; run `daemon setup` "
+                f"to choose one (ollama | {', '.join(HOSTED_PROVIDERS)})"
             )
 
         problems: list[str] = []
@@ -1160,23 +1093,33 @@ class Settings(BaseSettings):
             )
         return found
 
+    # Fixed task -> role. "provider" means DAEMON_PROVIDER; "judge" is local unless the
+    # toggle says otherwise; embed is always local; voice is its own axis (ADR 0012).
+    _HOSTED_ROLE_TASKS = (
+        Task.CHAT_TEXT, Task.RECALL_ESCALATION, Task.REFLECTION, Task.PERSONA_RULE,
+    )
+
     @property
     def routing(self) -> dict[Task, str]:
-        """Effective Task -> provider name table: preset, then the chosen hosted
-        provider substituted in, then explicit overrides on top."""
-        resolved = {
-            task: (self.hosted_provider if provider == HOSTED else provider)
-            for task, provider in PRESETS[self.preset].items()
-        }
-        # Voice is its own axis - DAEMON_VOICE_ENABLED and DAEMON_VOICE_PROVIDER - and
-        # not a property of the preset. `offline` carries no CHAT_VOICE row, but local
-        # text with hosted audio is a configuration people want, so the row is *added*
-        # when voice is on rather than only rewritten when the table happened to hold
-        # one. What keeps docs/PLAN.md 7 true is voice being off, which is what that
-        # promise has always said ("텍스트 모드 + 로컬 모델"). See ADR 0012.
-        if self.voice_enabled or Task.CHAT_VOICE in resolved:
+        """Effective Task -> provider name, computed from the two axes (ADR 0014),
+        then explicit overrides on top."""
+        resolved: dict[Task, str] = {task: self.provider for task in self._HOSTED_ROLE_TASKS}
+        resolved[Task.PROACTIVE_JUDGE] = (
+            OLLAMA if (self.proactive_judge_local or self.provider == OLLAMA) else self.provider
+        )
+        resolved[Task.EMBED] = OLLAMA
+        # Voice: added off DAEMON_VOICE_ENABLED, mapped to DAEMON_VOICE_PROVIDER (ADR 0012).
+        if self.voice_enabled:
             resolved[Task.CHAT_VOICE] = self.voice_provider
         return {**resolved, **self.route_overrides}
+
+    def _routes_a_hosted_task(self) -> bool:
+        """Whether any of the always-routed tasks resolves to something other than
+        `ollama` - used only to decide whether an empty `DAEMON_PROVIDER` is an error.
+        With `provider=""`, every hosted-role task maps to `""` here, which is neither
+        `None` nor `OLLAMA`, so this is True and the empty provider is refused. With
+        `provider="ollama"`, every role is `OLLAMA`, so this is False."""
+        return any(self.routing.get(t) not in (None, OLLAMA) for t in self._HOSTED_ROLE_TASKS)
 
     def voice_session_problems(self) -> list[str]:
         """What stops a *hosted voice session* from running, as clauses a caller
@@ -1253,14 +1196,14 @@ class Settings(BaseSettings):
         """Resolve one Task, or explain precisely why it cannot be served."""
         # Before the routing lookup, because voice-off is now the only reason a voice
         # task is missing from the table, and the honest answer is the switch rather
-        # than the preset.
+        # than the routing.
         if task in VOICE_TASKS and not self.voice_enabled:
             raise ConfigError(
                 f"{task.value} was requested but voice is off (DAEMON_VOICE_ENABLED)"
             )
         provider = self.routing.get(task)
         if provider is None:
-            raise ConfigError(f"preset {self.preset!r} does not route {task.value}")
+            raise ConfigError(f"no route for {task.value}")
         if task in VOICE_TASKS:
             # The native-audio endpoint takes its own model id (never DAEMON_*_MODEL).
             model = self.gemini_live_model if provider == "gemini" else self.openai_realtime_model
