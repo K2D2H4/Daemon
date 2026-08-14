@@ -879,6 +879,19 @@ def test_roots_split_the_same_way() -> None:
     assert settings.tools_roots == ("~/Documents", "~/My Projects")
 
 
+def test_the_default_round_cap_matches_the_loop_constant() -> None:
+    """The resident's tool-round cap is `settings.tools_max_rounds`, which `app.py`
+    wires into `ConversationLoop` - `loop.MAX_TOOL_ROUNDS` is only the constructor's
+    fallback, unused by the assembled app. So the two must agree, or a change to the
+    loop constant silently does nothing for the running daemon. Shipped exactly that
+    way once: v0.1.49 bumped the constant 6 -> 25 to stop cutting real builds short,
+    while this default stayed 6, so the live cap never moved and the bug reproduced
+    on the owner's machine after the update."""
+    from daemon.loop import MAX_TOOL_ROUNDS
+
+    assert make_settings(preset="offline").tools_max_rounds == MAX_TOOL_ROUNDS
+
+
 @pytest.mark.parametrize(
     ("kwargs", "expected"),
     [
