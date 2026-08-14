@@ -308,6 +308,26 @@ def test_the_off_provider_note_ignores_voices_own_provider(tmp_path: Path) -> No
     assert payload["editable"]["off_provider_note"] is None
 
 
+def test_the_off_provider_note_also_covers_the_fallback_provider(tmp_path: Path) -> None:
+    """D9 names both `route_overrides` and `fallback_provider` as the two
+    hand-edit-only ways work can land off-`provider` - `fallback_provider` is a
+    separate attribute `settings.routing` does not fold in (it is only consulted
+    via `fallback_route()`/`routing_table()`), so the note has to check it too or
+    it silently misses a genuine off-provider config."""
+    settings = _settings(
+        tmp_path,
+        provider="gemini",
+        gemini_model="g",
+        gemini_api_key="k",
+        anthropic_model="c",
+        anthropic_api_key="k",
+        fallback_provider="anthropic",
+    )
+    payload = current_settings_payload(settings)
+    assert payload["editable"]["off_provider_note"] is not None
+    assert "anthropic" in payload["editable"]["off_provider_note"]
+
+
 def test_patch_rejects_an_endpoint_carrying_the_full_path(tmp_path: Path) -> None:
     env = tmp_path / ".env"
     original = "DAEMON_PROVIDER=ollama\n"
@@ -756,6 +776,27 @@ def test_patch_sets_a_switch_the_overview_reports_on(tmp_path: Path) -> None:
         "the switch main added in v0.1.27 must survive the round-trip, or the page "
         "silently reverts a value the owner set by hand"
     )
+
+
+def test_patch_sets_proactive_judge_local(tmp_path: Path) -> None:
+    """`proactive_judge_local` is a BOOL_FIELD like the switches above, not a
+    STR_FIELD - only a GET-default test covered it before this; this proves the
+    PATCH direction round-trips too."""
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch("/admin/api/settings", json={"proactive_judge_local": False})
+    assert resp.status_code == 200, resp.text
+    assert "DAEMON_PROACTIVE_JUDGE_LOCAL=false" in env.read_text(encoding="utf-8")
+
+    restarted = Settings(_env_file=str(env), data_dir=tmp_path)
+    assert restarted.proactive_judge_local is False
+
+    got = TestClient(create_app(restarted), base_url=LOOPBACK).get("/admin/api/settings").json()
+    assert got["editable"]["proactive_judge_local"] is False
 
 
 def test_wake_aliases_round_trip_as_the_comma_form_a_person_types(tmp_path: Path) -> None:

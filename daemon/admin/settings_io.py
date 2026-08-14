@@ -167,16 +167,23 @@ def current_settings_payload(settings: Settings, env_path: Path | None = None) -
         # "set"/null, never the value. The one place this module could leak.
         editable[name] = "set" if getattr(settings, name) else None
 
-    # D9: a read-only note when `routing` sends a task somewhere other than
-    # `provider` - only `route_overrides`/`fallback_provider` can do that, both
-    # hand-edit-only. CHAT_VOICE is excluded: its provider is `voice_provider`,
-    # expected to differ from the chat provider, not an out-of-band route.
-    off = sorted({
+    # D9: a read-only note when work can land on a provider other than
+    # `provider` - only `route_overrides` (folded into `settings.routing`) and
+    # `fallback_provider` (a separate attribute - `routing` does not fold it in,
+    # it is only consulted via `fallback_route()`/`routing_table()`) can do
+    # that, both hand-edit-only. CHAT_VOICE is excluded: its provider is
+    # `voice_provider`, expected to differ from the chat provider, not an
+    # out-of-band route.
+    off = {
         p for t, p in settings.routing.items()
         if p not in ("", settings.provider) and p != OLLAMA and t is not Task.CHAT_VOICE
-    })
+    }
+    fallback = settings.fallback_provider
+    if fallback and fallback not in ("", settings.provider, OLLAMA):
+        off.add(fallback)
     editable["off_provider_note"] = (
-        f"route_overrides / fallback send work to {', '.join(off)} — edit in .env" if off else None
+        f"route_overrides / fallback send work to {', '.join(sorted(off))} — edit in .env"
+        if off else None
     )
 
     return {
