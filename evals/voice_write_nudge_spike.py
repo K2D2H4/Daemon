@@ -48,6 +48,12 @@ set), not the contract wording, not read-vs-write (a flat create fires). The fix
 this measured is not a prompt: it is to keep nested-schema tools off the voice
 session and route their work through a flat delegate tool to the text path. Design:
 `docs/superpowers/specs/2026-08-14-async-delegation-design.md`.
+
+**Shipped-fix verification (2026-08-14, N=3):** cell 5 applies the real
+`is_flat_schema` + `surface="voice"` filter (nested tools withheld, `delegate_task`
+offered) to the same create request. `delegate_task` fires **3/3** where the nested
+create faked 0/3 - the voice model reliably reaches for the flat escape hatch. The
+fix works on the live audio path, measured, not inferred.
 """
 
 from __future__ import annotations
@@ -90,6 +96,7 @@ CREATE_REQUEST = "노션에 '내일 준비물'이라는 새 페이지를 만들�
 CREATE_TOOL = "notion__notion-create-pages"
 FLAT_CREATE_TOOL = "create_note"
 OPEN_TOOL = "open_path"
+DELEGATE_TOOL = "delegate_task"
 
 
 def _tool_specs(crowd: int, *, flat: bool = False) -> list[Any]:
@@ -314,9 +321,37 @@ async def _run_once(api_key: str, model: str, system_instruction: str,
                             said.append(event.text)
             except TimeoutError:
                 break
-            if not got or CREATE_TOOL in called or OPEN_TOOL in called:
+            if not got or CREATE_TOOL in called or OPEN_TOOL in called or DELEGATE_TOOL in called:
                 break
     return called, said
+
+
+def _voice_filtered_specs(crowd: int) -> list[Any]:
+    """The shipped fix, applied to the crowded set: what `Companion.specs(surface=
+    "voice")` actually offers - every flat-schema tool plus `delegate_task`, with the
+    nested tools (notion-create-pages and friends) withheld. Uses the REAL
+    `is_flat_schema` from the product, so this cell exercises the code that ships, not
+    a hand-rolled copy of its rule."""
+    from daemon.llm.base import ToolSpec
+    from daemon.tools.schema import is_flat_schema
+
+    specs = _tool_specs(crowd)  # includes the nested CREATE_TOOL the fix withholds
+    delegate = ToolSpec(
+        name=DELEGATE_TOOL,
+        description=(
+            "Hand a task off to be done in the background and reported back when "
+            "finished. Use this for anything you cannot do in one direct step - "
+            "creating or editing a Notion page, multi-step work. Pass the owner's "
+            "request in plain language; do not try to do it yourself first."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"request": {"type": "string"}},
+            "required": ["request"],
+        },
+    )
+    kept = [s for s in specs if s.name == DELEGATE_TOOL or is_flat_schema(s.parameters)]
+    return [delegate, *kept]
 
 
 async def _cell(api_key: str, model: str, label: str, system_instruction: str,
@@ -377,12 +412,20 @@ async def main() -> int:
     flat_specs = _tool_specs(args.crowd, flat=True)
     flat = await _cell(api_key, model, "4. baseline nudge + FLAT-schema create  (schema test)",
                        baseline, flat_specs, create_pcm, FLAT_CREATE_TOOL, args.runs)
+    # The shipped fix: voice is offered the surface="voice" set (flat tools + delegate,
+    # nested withheld) and asked to create. It cannot create directly, so it should
+    # reach for delegate_task - the flat escape hatch it CAN call.
+    voice_specs = _voice_filtered_specs(args.crowd)
+    delegated = await _cell(
+        api_key, model, "5. SHIPPED FIX: voice-filtered set + create  (expect delegate)",
+        baseline, voice_specs, create_pcm, DELEGATE_TOOL, args.runs)
 
     print("\n================ verdict ================")
     print(f"open_path (flat schema),      baseline : {ctrl}/{args.runs}   (control)")
     print(f"notion-create (nested schema), baseline : {bug}/{args.runs}   (the failure)")
     print(f"notion-create (nested schema), patched  : {fix}/{args.runs}   (nudge fix)")
     print(f"create_note (flat schema),     baseline : {flat}/{args.runs}   (schema test)")
+    print(f"delegate_task (shipped fix),   baseline : {delegated}/{args.runs}   (the fix)")
     if ctrl <= bug:
         print("=> Control did NOT beat the failure cell - suspect the harness (audio never")
         print("   engaged?), not the hypothesis. Read the transcripts before trusting the rest.")
