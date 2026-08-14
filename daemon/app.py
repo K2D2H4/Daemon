@@ -185,7 +185,8 @@ def health_payload(state: Any, settings: Settings) -> dict[str, Any]:
     task = getattr(state, "loop_task", None)
     return {
         "status": "ok",
-        "preset": settings.preset,
+        "provider": settings.provider,
+        "proactive_judge_local": settings.proactive_judge_local,
         "voice_enabled": settings.voice_enabled,
         # When this process came up, so a reader can tell "quiet for a week" from
         # "restarted a minute ago and has not had time to do anything yet". Absent

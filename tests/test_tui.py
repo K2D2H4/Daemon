@@ -65,7 +65,7 @@ def sample_choices() -> tuple[Choice, ...]:
 
 def sample_rows() -> tuple[Row, ...]:
     return (
-        Row("DAEMON_PRESET", "balanced", "was offline"),
+        Row("DAEMON_PROVIDER", "anthropic", "was ollama"),
         Row("DAEMON_VOICE_ENABLED", "false"),
         Row("ANTHROPIC_API_KEY", "...9999", "was (empty)"),
         Row("한국어_설정", "켜짐", "was 꺼짐"),
@@ -401,10 +401,10 @@ def test_no_choices_renders_nothing() -> None:
 def test_table_aligns_values_including_korean_keys() -> None:
     rendered = tui.table(Theme(width=80), sample_rows())
     assert rendered.splitlines() == [
-        "  DAEMON_PRESET         balanced  was offline",
+        "  DAEMON_PROVIDER       anthropic  was ollama",
         "  DAEMON_VOICE_ENABLED  false",
-        "  ANTHROPIC_API_KEY     ...9999   was (empty)",
-        "  한국어_설정           켜짐      was 꺼짐",
+        "  ANTHROPIC_API_KEY     ...9999    was (empty)",
+        "  한국어_설정           켜짐       was 꺼짐",
     ]
 
 

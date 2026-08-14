@@ -196,12 +196,11 @@ def answers_for(takes: int = 3, *, enable: str | None = None, write: str = "y") 
     return ["", *[""] * takes, *([] if enable is None else [enable]), write]
 
 
-VOICE_OFF = "DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
+VOICE_OFF = "DAEMON_PROVIDER=ollama\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
 """A `.env` that loads and has voice off - the state a first calibration is in."""
 
 VOICE_ON = (
-    "DAEMON_PRESET=balanced\n"
-    "DAEMON_HOSTED_PROVIDER=gemini\n"
+    "DAEMON_PROVIDER=gemini\n"
     "GEMINI_API_KEY=AIzaSyFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000\n"
     "DAEMON_GEMINI_MODEL=gemini-2.5-flash\n"
     "DAEMON_GEMINI_LIVE_MODEL=gemini-live-2.5-flash-preview\n"
@@ -249,7 +248,7 @@ def settings_for(tmp_path: Path, *, aliases: str = "헤이 대문,루시") -> Se
     """
     return Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path / "data"),
         DAEMON_WAKE_ALIASES=aliases,
@@ -879,7 +878,7 @@ def test_wake_calibrate_is_reachable_and_needs_no_configuration(
     nothing out of the configuration, and an install whose `.env` does not load yet
     is exactly the one that has never calibrated."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env").write_text("DAEMON_PRESET=nonsense\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("DAEMON_PROVIDER=nonsense\n", encoding="utf-8")
     seen: dict[str, Any] = {}
 
     def fake(**kwargs: Any) -> int:
@@ -896,20 +895,20 @@ def test_wake_test_is_reachable_and_is_given_the_settings(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
-        f"DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
+        f"DAEMON_PROVIDER=ollama\nDAEMON_OLLAMA_MODEL=gemma3:4b\n"
         f"DAEMON_DATA_DIR={tmp_path / 'data'}\n",
         encoding="utf-8",
     )
     seen: dict[str, Any] = {}
 
     def fake(settings: Settings, **kwargs: Any) -> int:
-        seen["preset"] = settings.preset
+        seen["provider"] = settings.provider
         seen.update(kwargs)
         return 0
 
     monkeypatch.setattr(wake_cli, "listen", fake)
     assert cli.main(["wake", "test", "--seconds", "5"]) == 0
-    assert seen == {"preset": "offline", "seconds": 5}
+    assert seen == {"provider": "ollama", "seconds": 5}
 
 
 def test_the_app_seam_hands_the_gate_every_value_it_was_configured_with(
@@ -945,7 +944,7 @@ def test_the_app_seam_hands_the_gate_every_value_it_was_configured_with(
 
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_WAKE_ALIASES="헤이 대문, 루씨",
         DAEMON_WAKE_VAD_THRESHOLD="0.7",

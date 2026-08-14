@@ -30,6 +30,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from daemon.admin.restart import is_supervised
+from daemon.admin.settings_io import current_settings_payload
 from daemon.app import create_app
 from daemon.config import Route, Settings
 from daemon.llm.gateway import LLMGateway
@@ -42,12 +43,42 @@ LOOPBACK = "http://127.0.0.1"
 
 
 def _settings(tmp_path: Path, **kw: object) -> Settings:
-    """A valid offline configuration, isolated from the developer's own `.env`.
+    """A valid all-local configuration, isolated from the developer's own `.env`.
 
-    `offline` needs no key and no hosted provider, so it is the cheapest base a
-    validation test can start from - and `_env_file=None` keeps the worktree's own
-    `.env` out of it (the same reason `conftest` strips the environment)."""
-    return Settings(_env_file=None, preset="offline", data_dir=tmp_path, **kw)
+    `provider="ollama"` needs no key and no hosted provider, so it is the cheapest
+    base a validation test can start from - and `_env_file=None` keeps the
+    worktree's own `.env` out of it (the same reason `conftest` strips the
+    environment)."""
+    kw.setdefault("provider", "ollama")
+    return Settings(_env_file=None, data_dir=tmp_path, **kw)
+
+
+def _served_index(tmp_path: Path) -> str:
+    """The shell HTML string, as `test_shell_page_renders_offline` reads it - the
+    structural tests below slice a named JS function's body out of this text."""
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+    return client.get("/admin/").text
+
+
+@pytest.fixture(autouse=True)
+def _no_live_model_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /settings now probes the hosted three for live model ids
+    (routes.py `_live_model_lists`) - a real `httpx.get` to Anthropic/OpenAI/Gemini
+    for any provider whose key is set. Several tests in this module set a fake key
+    (e.g. `gemini_api_key="k"`) for reasons unrelated to this feature, and the
+    suite may never touch the network (tests/CLAUDE.md) - so stub all three probes
+    here by default. The live-model-list tests below override individual probes
+    with their own `monkeypatch.setattr`."""
+    from daemon.admin import routes
+    from daemon.setup import Verdict
+
+    def fake(*_a: object, **_k: object) -> Verdict:
+        return Verdict(ok=True, detail="stub")
+
+    monkeypatch.setattr(routes, "check_anthropic", fake)
+    monkeypatch.setattr(routes, "check_openai", fake)
+    monkeypatch.setattr(routes, "check_gemini", fake)
 
 
 def _with_gateway(app, provider) -> None:
@@ -150,17 +181,17 @@ def test_patch_with_an_invalid_value_is_400_and_leaves_env_untouched(
     tmp_path: Path,
 ) -> None:
     env = tmp_path / ".env"
-    original = "DAEMON_PRESET=offline\n"
+    original = "DAEMON_PROVIDER=ollama\n"
     env.write_text(original, encoding="utf-8")
 
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
 
-    resp = client.patch("/admin/api/settings", json={"preset": "does-not-exist"})
+    resp = client.patch("/admin/api/settings", json={"provider": "does-not-exist"})
 
     assert resp.status_code == 400
-    assert "preset" in resp.json()["detail"].lower()
+    assert "provider" in resp.json()["detail"].lower()
     assert env.read_text(encoding="utf-8") == original, "a rejected patch still wrote"
 
 
@@ -169,7 +200,7 @@ def test_patch_with_an_invalid_value_is_400_and_leaves_env_untouched(
 
 def test_patch_with_a_valid_value_writes_only_that_key(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
 
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
@@ -184,7 +215,7 @@ def test_patch_with_a_valid_value_writes_only_that_key(tmp_path: Path) -> None:
 
     text = env.read_text(encoding="utf-8")
     assert "DAEMON_RECALL_LIMIT=10" in text
-    assert "DAEMON_PRESET=offline" in text, "an unrelated line was lost"
+    assert "DAEMON_PROVIDER=ollama" in text, "an unrelated line was lost"
 
 
 # --- d. secrets never leave the machine --------------------------------------
@@ -208,7 +239,7 @@ def test_get_settings_masks_secrets(tmp_path: Path) -> None:
 
 def test_patch_sets_the_compatible_endpoint_and_model(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
 
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
@@ -217,21 +248,117 @@ def test_patch_sets_the_compatible_endpoint_and_model(tmp_path: Path) -> None:
     resp = client.patch(
         "/admin/api/settings",
         json={
-            "hosted_provider": "openai_compatible",
+            "provider": "openai_compatible",
             "openai_compatible_base_url": "https://api.deepseek.com/v1",
             "openai_compatible_model": "deepseek-chat",
+            "openai_compatible_api_key": "sk-compat-key",
         },
     )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     written = env.read_text(encoding="utf-8")
+    assert "DAEMON_PROVIDER=openai_compatible" in written
     assert "DAEMON_OPENAI_COMPATIBLE_BASE_URL=https://api.deepseek.com/v1" in written
     assert "DAEMON_OPENAI_COMPATIBLE_MODEL=deepseek-chat" in written
 
 
+# --- f. the settings payload speaks provider, not preset (docs/adr/0014) -----
+
+
+def test_settings_offers_the_provider_axis_not_a_preset(tmp_path: Path) -> None:
+    app = create_app(
+        _settings(tmp_path, provider="gemini", gemini_model="g", gemini_api_key="k")
+    )
+    client = TestClient(app, base_url=LOOPBACK)
+
+    got = client.get("/admin/api/settings").json()
+
+    assert "preset" not in got["editable"] and "hosted_provider" not in got["editable"]
+    assert got["editable"]["provider"] == "gemini"
+    assert got["editable"]["proactive_judge_local"] is True
+    assert got["options"]["providers"][0] == "", (
+        "empty (no provider chosen yet) must be offered first"
+    )
+    assert "ollama" in got["options"]["providers"]
+    assert got["options"]["model_suggestions"]["gemini"]  # non-empty
+
+
+def test_patch_sets_ollama_as_the_provider_and_its_model(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch(
+        "/admin/api/settings", json={"provider": "ollama", "ollama_model": "qwen3:14b"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    text = env.read_text(encoding="utf-8")
+    assert "DAEMON_PROVIDER=ollama" in text and "DAEMON_OLLAMA_MODEL=qwen3:14b" in text
+    assert "DAEMON_PRESET" not in text
+
+
+def test_the_off_provider_note_appears_only_for_out_of_band_routing(tmp_path: Path) -> None:
+    plain = current_settings_payload(
+        _settings(tmp_path, provider="gemini", gemini_model="g", gemini_api_key="k")
+    )
+    assert plain["editable"]["off_provider_note"] is None
+
+    routed = current_settings_payload(_settings(
+        tmp_path,
+        provider="gemini",
+        gemini_model="g",
+        gemini_api_key="k",
+        anthropic_model="c",
+        anthropic_api_key="k",
+        route_overrides={"reflection": "anthropic"},
+    ))
+    assert routed["editable"]["off_provider_note"] is not None
+    assert "anthropic" in routed["editable"]["off_provider_note"]
+
+
+def test_the_off_provider_note_ignores_voices_own_provider(tmp_path: Path) -> None:
+    """Voice is its own axis (ADR 0012): `voice_provider` is expected to differ
+    from the chat `provider`, so CHAT_VOICE resolving to a different provider is
+    not the out-of-band routing D9 exists to surface."""
+    settings = _settings(
+        tmp_path,
+        provider="ollama",
+        voice_enabled=True,
+        voice_provider="gemini",
+        gemini_live_model="live-model",
+        gemini_api_key="k",
+    )
+    assert settings.routing[Task.CHAT_VOICE] == "gemini"
+    payload = current_settings_payload(settings)
+    assert payload["editable"]["off_provider_note"] is None
+
+
+def test_the_off_provider_note_also_covers_the_fallback_provider(tmp_path: Path) -> None:
+    """D9 names both `route_overrides` and `fallback_provider` as the two
+    hand-edit-only ways work can land off-`provider` - `fallback_provider` is a
+    separate attribute `settings.routing` does not fold in (it is only consulted
+    via `fallback_route()`/`routing_table()`), so the note has to check it too or
+    it silently misses a genuine off-provider config."""
+    settings = _settings(
+        tmp_path,
+        provider="gemini",
+        gemini_model="g",
+        gemini_api_key="k",
+        anthropic_model="c",
+        anthropic_api_key="k",
+        fallback_provider="anthropic",
+    )
+    payload = current_settings_payload(settings)
+    assert payload["editable"]["off_provider_note"] is not None
+    assert "anthropic" in payload["editable"]["off_provider_note"]
+
+
 def test_patch_rejects_an_endpoint_carrying_the_full_path(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    original = "DAEMON_PRESET=offline\n"
+    original = "DAEMON_PROVIDER=ollama\n"
     env.write_text(original, encoding="utf-8")
 
     app = create_app(_settings(tmp_path))
@@ -264,7 +391,7 @@ def test_settings_offer_openai_compatible_as_a_provider(tmp_path: Path) -> None:
 
     payload = client.get("/admin/api/settings").json()
 
-    assert "openai_compatible" in payload["options"]["hosted_providers"]
+    assert "openai_compatible" in payload["options"]["providers"]
 
 
 def test_the_compatible_fields_survive_a_restart_with_the_key_still_masked(
@@ -277,7 +404,7 @@ def test_the_compatible_fields_survive_a_restart_with_the_key_still_masked(
     `Settings` from the written `.env` and confirm *that* process's GET shows the
     endpoint and model back, and the key as `"set"` - never in plaintext."""
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
@@ -285,21 +412,21 @@ def test_the_compatible_fields_survive_a_restart_with_the_key_still_masked(
     resp = client.patch(
         "/admin/api/settings",
         json={
-            "hosted_provider": "openai_compatible",
+            "provider": "openai_compatible",
             "openai_compatible_base_url": "https://api.deepseek.com/v1",
             "openai_compatible_model": "deepseek-chat",
             "openai_compatible_api_key": "sk-compat-SUPERSECRET",
         },
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     assert resp.json()["restart_required"] is True
 
-    restarted = create_app(Settings(_env_file=str(env), preset="offline", data_dir=tmp_path))
+    restarted = create_app(Settings(_env_file=str(env), data_dir=tmp_path))
     got = TestClient(restarted, base_url=LOOPBACK).get("/admin/api/settings")
     assert "SUPERSECRET" not in got.text
 
     editable = got.json()["editable"]
-    assert editable["hosted_provider"] == "openai_compatible"
+    assert editable["provider"] == "openai_compatible"
     assert editable["openai_compatible_base_url"] == "https://api.deepseek.com/v1"
     assert editable["openai_compatible_model"] == "deepseek-chat"
     assert editable["openai_compatible_api_key"] == "set"
@@ -317,7 +444,7 @@ def test_admin_health_matches_the_health_endpoint(tmp_path: Path) -> None:
 
     assert admin.status_code == 200
     assert admin.json() == plain.json()
-    assert admin.json()["preset"] == "offline"
+    assert admin.json()["provider"] == "ollama"
 
 
 def test_shell_page_renders_offline(tmp_path: Path) -> None:
@@ -355,6 +482,81 @@ def test_voice_sensitivities_are_wired_through_the_provider_aware_block(
     for name in ("voice_start_sensitivity", "voice_end_sensitivity"):
         assert name in voice_field_fn, f"{name} must render from inside voiceField()"
         assert name not in outside, f"{name} must not also render unconditionally"
+
+
+def test_voice_model_ids_render_from_the_provider_aware_block_not_unconditionally(
+    tmp_path: Path,
+) -> None:
+    """gemini_live_model and openai_realtime_model are each read by only one
+    voice_provider (config.py) - the old flat MODEL card showed both regardless of
+    which provider was selected, the exact "shown but not in force" problem the
+    provider-first redesign exists to remove. Both must render from inside
+    `voiceField()` - the function the `voice_provider` `change` listener
+    re-renders - never unconditionally from `renderSettings()`."""
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+    html = client.get("/admin/").text
+
+    start = html.index("function voiceField(")
+    end = html.index("\nfunction ", start + 1)
+    voice_field_fn = html[start:end]
+    outside = html[:start] + html[end:]
+
+    for name in ("gemini_live_model", "openai_realtime_model"):
+        assert name in voice_field_fn, f"{name} must render from inside voiceField()"
+        assert name not in outside, f"{name} must not also render unconditionally"
+
+
+# --- g. the MODEL card asks provider first, then that provider's model (D5/D7/D9) --
+
+
+def test_model_fields_render_from_brainfield_not_rendersettings(tmp_path: Path) -> None:
+    """Every model-shaped field must come from inside `brainField()` - the function
+    the provider `<select>`'s change handler re-renders - not unconditionally from
+    `renderSettings()`, which cannot react to a provider switch. The old flat
+    eight-box card (`fieldStr('preset', ...)` / `fieldStr('hosted_provider', ...)`)
+    must be gone entirely, not just supplemented."""
+    html = _served_index(tmp_path)
+    start = html.index("function brainField(")
+    body = html[start : html.index("\nfunction ", start + 1)]
+    for name in (
+        "provider",
+        "proactive_judge_local",
+        "ollama_model",
+        "openai_compatible_base_url",
+    ):
+        assert name in body, f"{name} must render from inside brainField()"
+    assert "fieldStr('preset'" not in html and "fieldStr('hosted_provider'" not in html
+
+
+def test_the_chat_model_field_prefers_the_live_list(tmp_path: Path) -> None:
+    """D5/D6: the hosted-three model field's datalist prefers the live probe result
+    (`options.model_lists`), falling back to the static `options.model_suggestions`
+    only when the probe found nothing."""
+    html = _served_index(tmp_path)
+    assert "model_lists" in html and "model_suggestions" in html
+
+
+def test_collect_patch_emits_provider_from_the_brain_select(tmp_path: Path) -> None:
+    """The provider select carries `data-brain`, not `data-f`, so the generic
+    `[data-f]` loop in `collectPatch()` skips it - a provider switch is a structural
+    change (which model field exists, whether the toggle shows) that brainField's
+    own re-render handles, not something the loop's per-field logic understands.
+    `collectPatch()` must still read it explicitly and emit `patch.provider` when it
+    differs from the value the form was drawn with."""
+    html = _served_index(tmp_path)
+    start = html.index("function collectPatch(")
+    body = html[start : html.index("\nfunction ", start + 1)]
+    assert 'data-brain="provider"' in body
+    assert "patch.provider" in body
+
+
+def test_status_meta_reads_provider_not_preset(tmp_path: Path) -> None:
+    """/health carries `provider`, not `preset` (Task 3 reshaped the payload) - the
+    top bar's own rendering must read the field that actually exists."""
+    html = _served_index(tmp_path)
+    assert "h.provider" in html
+    assert "h.preset" not in html
 
 
 def test_restart_refuses_when_not_supervised(
@@ -422,7 +624,7 @@ def test_a_cross_site_origin_on_a_write_is_refused(tmp_path: Path) -> None:
     """A simple cross-site POST/PATCH (no preflight) must not land its side effect.
     The Host is loopback here, so this isolates the Origin check."""
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
@@ -434,7 +636,7 @@ def test_a_cross_site_origin_on_a_write_is_refused(tmp_path: Path) -> None:
     )
     assert resp.status_code == 403
     # And the side effect never happened.
-    assert env.read_text(encoding="utf-8") == "DAEMON_PRESET=offline\n"
+    assert env.read_text(encoding="utf-8") == "DAEMON_PROVIDER=ollama\n"
 
 
 def test_a_cross_site_fetch_metadata_header_is_refused(tmp_path: Path) -> None:
@@ -456,7 +658,7 @@ def test_a_same_origin_write_still_works(tmp_path: Path) -> None:
     """The guard must not break the page it protects: a same-origin write, the
     browser's own fetch from the admin tab, still lands."""
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
@@ -497,7 +699,7 @@ def test_a_non_json_body_is_a_400_not_a_500(tmp_path: Path, fake_provider) -> No
 
 def test_a_newline_in_a_secret_is_refused_and_writes_nothing(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    original = "DAEMON_PRESET=offline\n"
+    original = "DAEMON_PROVIDER=ollama\n"
     env.write_text(original, encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
@@ -519,7 +721,7 @@ def test_patch_sets_the_gemini_live_voice(tmp_path: Path) -> None:
     contract is proven by simulating the restart: build a fresh `Settings` from the
     written `.env` and confirm *that* process surfaces the value."""
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
@@ -529,7 +731,7 @@ def test_patch_sets_the_gemini_live_voice(tmp_path: Path) -> None:
     assert resp.json()["restart_required"] is True
     assert "DAEMON_GEMINI_LIVE_VOICE=Kore" in env.read_text(encoding="utf-8")
 
-    restarted = create_app(Settings(_env_file=str(env), preset="offline", data_dir=tmp_path))
+    restarted = create_app(Settings(_env_file=str(env), data_dir=tmp_path))
     got = TestClient(restarted, base_url=LOOPBACK).get("/admin/api/settings").json()
     assert got["editable"]["gemini_live_voice"] == "Kore"
     assert "Kore" in got["options"]["gemini_live_voices"]
@@ -540,7 +742,7 @@ def test_patch_sets_the_gemini_live_voice(tmp_path: Path) -> None:
 
 def test_patch_sets_the_openai_voice_provider_and_voice(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
@@ -565,7 +767,7 @@ def test_patch_sets_the_openai_voice_provider_and_voice(tmp_path: Path) -> None:
 
 def test_patch_rejects_an_unknown_voice_provider_and_openai_voice(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    original = "DAEMON_PRESET=offline\n"
+    original = "DAEMON_PROVIDER=ollama\n"
     env.write_text(original, encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
@@ -580,7 +782,7 @@ def test_patch_rejects_an_unknown_voice_provider_and_openai_voice(tmp_path: Path
 
 def test_patch_rejects_an_unknown_gemini_live_voice(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    original = "DAEMON_PRESET=offline\n"
+    original = "DAEMON_PROVIDER=ollama\n"
     env.write_text(original, encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
@@ -593,7 +795,7 @@ def test_patch_rejects_an_unknown_gemini_live_voice(tmp_path: Path) -> None:
 
 def test_a_newline_in_a_route_override_is_refused(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    original = "DAEMON_PRESET=offline\n"
+    original = "DAEMON_PROVIDER=ollama\n"
     env.write_text(original, encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
@@ -658,7 +860,7 @@ def test_voice_sample_404_for_unknown_provider_voice_or_traversal(
 
 def test_patch_sets_a_switch_the_overview_reports_on(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
@@ -671,7 +873,7 @@ def test_patch_sets_a_switch_the_overview_reports_on(tmp_path: Path) -> None:
     assert "DAEMON_PROACTIVE_ENABLED=true" in written
     assert "DAEMON_VOICE_BARGE_IN=false" in written
 
-    restarted = Settings(_env_file=str(env), preset="offline", data_dir=tmp_path)
+    restarted = Settings(_env_file=str(env), data_dir=tmp_path)
     assert restarted.proactive_enabled is True
     assert restarted.voice_barge_in is False, (
         "the switch main added in v0.1.27 must survive the round-trip, or the page "
@@ -679,11 +881,32 @@ def test_patch_sets_a_switch_the_overview_reports_on(tmp_path: Path) -> None:
     )
 
 
+def test_patch_sets_proactive_judge_local(tmp_path: Path) -> None:
+    """`proactive_judge_local` is a BOOL_FIELD like the switches above, not a
+    STR_FIELD - only a GET-default test covered it before this; this proves the
+    PATCH direction round-trips too."""
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    resp = client.patch("/admin/api/settings", json={"proactive_judge_local": False})
+    assert resp.status_code == 200, resp.text
+    assert "DAEMON_PROACTIVE_JUDGE_LOCAL=false" in env.read_text(encoding="utf-8")
+
+    restarted = Settings(_env_file=str(env), data_dir=tmp_path)
+    assert restarted.proactive_judge_local is False
+
+    got = TestClient(create_app(restarted), base_url=LOOPBACK).get("/admin/api/settings").json()
+    assert got["editable"]["proactive_judge_local"] is False
+
+
 def test_wake_aliases_round_trip_as_the_comma_form_a_person_types(tmp_path: Path) -> None:
     """Korean, because that is what the recognizer returns for this owner and the
     JSON-array form a naive round-trip produces is not what `.env` holds."""
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
@@ -692,7 +915,7 @@ def test_wake_aliases_round_trip_as_the_comma_form_a_person_types(tmp_path: Path
     assert resp.status_code == 200, resp.text
     assert "DAEMON_WAKE_ALIASES=헤이 대문,루씨" in env.read_text(encoding="utf-8")
 
-    restarted = Settings(_env_file=str(env), preset="offline", data_dir=tmp_path)
+    restarted = Settings(_env_file=str(env), data_dir=tmp_path)
     assert restarted.wake_aliases == ("헤이 대문", "루씨")
 
     shown = TestClient(
@@ -705,8 +928,8 @@ def test_wake_aliases_round_trip_as_the_comma_form_a_person_types(tmp_path: Path
 
 def test_the_telegram_token_is_never_reported_back(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\nTELEGRAM_BOT_TOKEN=123:secret\n", encoding="utf-8")
-    settings = Settings(_env_file=str(env), preset="offline", data_dir=tmp_path)
+    env.write_text("DAEMON_PROVIDER=ollama\nTELEGRAM_BOT_TOKEN=123:secret\n", encoding="utf-8")
+    settings = Settings(_env_file=str(env), data_dir=tmp_path)
     client = TestClient(create_app(settings), base_url=LOOPBACK)
 
     body = client.get("/admin/api/settings").json()
@@ -723,7 +946,7 @@ def test_an_incoherent_switch_combination_is_refused_and_writes_nothing(
     the next boot would die on - the whole reason a patch is validated by
     constructing a candidate before a byte is written."""
     env = tmp_path / ".env"
-    original = "DAEMON_PRESET=offline\n"
+    original = "DAEMON_PROVIDER=ollama\n"
     env.write_text(original, encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
@@ -745,8 +968,8 @@ def test_a_saved_value_is_reported_as_pending_until_the_restart(tmp_path: Path) 
     says what `.env` holds *beside* what the process is running - never instead of
     it, because the admin's one job is not to lie about the daemon's actual state."""
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=offline\nDAEMON_RECALL_LIMIT=6\n", encoding="utf-8")
-    app = create_app(Settings(_env_file=str(env), preset="offline", data_dir=tmp_path))
+    env.write_text("DAEMON_PROVIDER=ollama\nDAEMON_RECALL_LIMIT=6\n", encoding="utf-8")
+    app = create_app(Settings(_env_file=str(env), data_dir=tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
 
@@ -766,7 +989,7 @@ def test_an_unreadable_env_reports_no_pending_rather_than_failing(tmp_path: Path
     cannot be built into a candidate must cost the reader that convenience, never
     the page."""
     env = tmp_path / ".env"
-    env.write_text("DAEMON_PRESET=nonsense-preset\n", encoding="utf-8")
+    env.write_text("DAEMON_PROVIDER=nonsense-provider\n", encoding="utf-8")
     app = create_app(_settings(tmp_path))
     app.state.env_path = env
     client = TestClient(app, base_url=LOOPBACK)
@@ -775,3 +998,61 @@ def test_an_unreadable_env_reports_no_pending_rather_than_failing(tmp_path: Path
 
     assert resp.status_code == 200
     assert resp.json()["pending"] == {}
+
+
+# --- g. live model lists probe off the event loop, never the network in tests -
+
+
+async def test_live_model_lists_fall_back_to_empty_when_a_probe_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from daemon.admin import routes
+
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(routes, "check_gemini", boom)
+    lists = await routes._live_model_lists(
+        _settings(tmp_path, provider="gemini", gemini_model="g", gemini_api_key="k")
+    )
+    assert lists.get("gemini") == [], "failure must fall back to empty, never raise"
+
+
+async def test_live_model_lists_skip_providers_without_a_key(tmp_path: Path) -> None:
+    from daemon.admin import routes
+
+    # provider=gemini needs its own key to construct at all (config.py); the point
+    # here is anthropic, which has none, so it must be skipped rather than probed.
+    lists = await routes._live_model_lists(
+        _settings(tmp_path, provider="gemini", gemini_model="g", gemini_api_key="k")
+    )
+    assert "anthropic" not in lists, "no key means not probed, not an empty list"
+
+
+def test_get_settings_includes_live_model_lists_for_configured_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The wiring in `get_settings`, not just `_live_model_lists` in isolation:
+    a provider with a key gets its live ids under `options.model_lists`, and one
+    without a key is simply absent - through the real endpoint, monkeypatched
+    module attribute and all (a regression test for a dict built once at import
+    time silently ignoring the patch and hitting the real network instead)."""
+    from daemon.admin import routes
+    from daemon.setup import Verdict
+
+    monkeypatch.setattr(
+        routes,
+        "check_gemini",
+        lambda key: Verdict(
+            ok=True, detail="ok", models={"DAEMON_GEMINI_MODEL": ("gemini-2.5-flash",)}
+        ),
+    )
+    app = create_app(
+        _settings(tmp_path, provider="gemini", gemini_model="g", gemini_api_key="k")
+    )
+    client = TestClient(app, base_url=LOOPBACK)
+
+    got = client.get("/admin/api/settings").json()
+
+    assert got["options"]["model_lists"]["gemini"] == ["gemini-2.5-flash"]
+    assert "anthropic" not in got["options"]["model_lists"]

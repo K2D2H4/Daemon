@@ -14,11 +14,12 @@ You own the resident process. Read `docs/CONTRACTS.md` first; it is binding.
 - **`daemon/llm/`** — `LLMGateway.complete(task, ...)` routes a `Task` to a provider.
   Five providers behind `Provider` in `llm/base.py` (frozen): ollama, anthropic,
   openai, gemini, openai_compatible. One fallback hop at most, and only if configured.
-- **`daemon/config.py`** — two axes that are deliberately not multiplied: a *preset*
-  (`offline` / `balanced` / `quality`) answers where work runs,
-  `DAEMON_HOSTED_PROVIDER` answers whose model. Three presets, not nine. No default
-  hosted provider — a configuration that never chose one fails at startup naming
-  `daemon setup` (see `docs/adr/0007`).
+- **`daemon/config.py`** — two axes, computed rather than table-driven: `DAEMON_PROVIDER`
+  (`ollama` or one of four hosted names) answers whose model answers chat, recall,
+  reflection and persona rules; `DAEMON_PROACTIVE_JUDGE_LOCAL` answers whether the
+  proactive judge rides along or stays local regardless. No default provider — a
+  configuration that never chose one fails at startup naming `daemon setup` (see
+  `docs/adr/0007`, `docs/adr/0014`).
 - **`daemon/app.py`** — the composition root, and **the only file allowed to import a
   concrete provider, channel or writer**. Its imports are function-local so the
   exception stays visible. Also `build_reflection` and `build_proactive_tick`.

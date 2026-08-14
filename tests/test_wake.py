@@ -895,11 +895,12 @@ async def test_the_app_seam_passes_the_tuning_settings_through(
 
 
 def wake_settings(**kwargs: Any) -> Settings:
-    """The offline preset, so no case here needs a key. Voice stays off - anything
-    that turns it on wants `voice_settings` below."""
+    """`DAEMON_PROVIDER=ollama`, so no case here needs a key (reconstructs the old
+    `offline` preset). Voice stays off - anything that turns it on wants
+    `voice_settings` below."""
     return Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR="/tmp/daemon-wake",
         **kwargs,
@@ -909,13 +910,13 @@ def wake_settings(**kwargs: Any) -> Settings:
 def voice_settings(**kwargs: Any) -> Settings:
     """A configuration where voice is genuinely available.
 
-    `balanced` rather than `offline` only because these tests predate voice being its
-    own axis (ADR 0012) and there is no reason to churn them: both presets can
-    carry voice now, and this one already has the keys the wake path expects."""
+    A hosted `DAEMON_PROVIDER` rather than `ollama` only because these tests predate
+    voice being its own axis (ADR 0012) and there is no reason to churn them: any
+    provider can carry voice now, and this one already has the keys the wake path
+    expects."""
     return Settings(
         _env_file=None,
-        DAEMON_PRESET="balanced",
-        DAEMON_HOSTED_PROVIDER="anthropic",
+        DAEMON_PROVIDER="anthropic",
         ANTHROPIC_API_KEY="k",
         GEMINI_API_KEY="k",
         DAEMON_OLLAMA_MODEL="gemma3:4b",

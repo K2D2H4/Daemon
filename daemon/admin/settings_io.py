@@ -3,7 +3,7 @@
 docs/design decision 3, and the M5 test gate: a patch is committed to `.env`
 **only** if a candidate `Settings` built from current-plus-patch constructs
 cleanly. `Settings` fails loudly at construction (daemon/config.py), so building
-one is the whole validation: an unknown preset, a non-numeric limit, a voice
+one is the whole validation: an unknown provider, a non-numeric limit, a voice
 switch with no realtime model id all raise there, before a single byte is
 written. On failure the caller returns 400 and the file is untouched.
 
@@ -28,8 +28,9 @@ from typing import Any
 from daemon.config import (
     GEMINI_LIVE_VOICES,
     HOSTED_PROVIDERS,
+    MODEL_SUGGESTIONS,
+    OLLAMA,
     OPENAI_REALTIME_VOICES,
-    PRESETS,
     SENSITIVITIES,
     VOICE_PROVIDERS,
     Settings,
@@ -43,14 +44,14 @@ from daemon.tools.policy import MODES as TOOL_MODES
 # keyword `Settings(**candidate)` accepts (config aliases are these names, with
 # populate_by_name on), so one map serves reading, validating and writing.
 STR_FIELDS: dict[str, str] = {
-    "preset": "DAEMON_PRESET",
-    "hosted_provider": "DAEMON_HOSTED_PROVIDER",
+    "provider": "DAEMON_PROVIDER",
     "tools_mode": "DAEMON_TOOLS_MODE",
     "gemini_live_voice": "DAEMON_GEMINI_LIVE_VOICE",
-    # Model ids, one per provider the `hosted_provider` list offers - all of them,
-    # not just the one in use: `DAEMON_OPENAI_MODEL` has no default, so a page that
+    # Model ids, one per provider the `provider` list offers - all of them, not
+    # just the one in use: `DAEMON_OPENAI_MODEL` has no default, so a page that
     # let you pick `openai` without letting you name its model could only ever
     # answer the choice with a 400 the page itself could not fix.
+    "ollama_model": "DAEMON_OLLAMA_MODEL",
     "anthropic_model": "DAEMON_ANTHROPIC_MODEL",
     "openai_model": "DAEMON_OPENAI_MODEL",
     "gemini_model": "DAEMON_GEMINI_MODEL",
@@ -85,6 +86,10 @@ BOOL_FIELDS: dict[str, str] = {
     "wake_enabled": "DAEMON_WAKE_ENABLED",
     "voice_barge_in": "DAEMON_VOICE_BARGE_IN",
     "proactive_enabled": "DAEMON_PROACTIVE_ENABLED",
+    # The `proactive_judge_local` axis (docs/adr/0014): whether PROACTIVE_JUDGE
+    # runs on the local model instead of `provider`. A bool like the switches
+    # above, not a STR_FIELD - it flows through the same read/patch handling.
+    "proactive_judge_local": "DAEMON_PROACTIVE_JUDGE_LOCAL",
 }
 LIST_FIELDS: dict[str, str] = {"wake_aliases": "DAEMON_WAKE_ALIASES"}
 """Comma-separated in `.env` and tuple-valued on `Settings`. Reported and accepted
@@ -161,6 +166,26 @@ def current_settings_payload(settings: Settings, env_path: Path | None = None) -
     for name in SECRET_FIELDS:
         # "set"/null, never the value. The one place this module could leak.
         editable[name] = "set" if getattr(settings, name) else None
+
+    # D9: a read-only note when work can land on a provider other than
+    # `provider` - only `route_overrides` (folded into `settings.routing`) and
+    # `fallback_provider` (a separate attribute - `routing` does not fold it in,
+    # it is only consulted via `fallback_route()`/`routing_table()`) can do
+    # that, both hand-edit-only. CHAT_VOICE is excluded: its provider is
+    # `voice_provider`, expected to differ from the chat provider, not an
+    # out-of-band route.
+    off = {
+        p for t, p in settings.routing.items()
+        if p not in ("", settings.provider) and p != OLLAMA and t is not Task.CHAT_VOICE
+    }
+    fallback = settings.fallback_provider
+    if fallback and fallback not in ("", settings.provider, OLLAMA):
+        off.add(fallback)
+    editable["off_provider_note"] = (
+        f"route_overrides / fallback send work to {', '.join(sorted(off))} — edit in .env"
+        if off else None
+    )
+
     return {
         "editable": editable,
         "pending": pending_values(settings, env_path) if env_path is not None else {},
@@ -170,8 +195,8 @@ def current_settings_payload(settings: Settings, env_path: Path | None = None) -
             "data_dir": str(settings.data_dir),
         },
         "options": {
-            "presets": sorted(PRESETS),
-            "hosted_providers": list(HOSTED_PROVIDERS),
+            "providers": ["", *HOSTED_PROVIDERS, "ollama"],
+            "model_suggestions": {k: list(v) for k, v in MODEL_SUGGESTIONS.items()},
             "tool_modes": list(TOOL_MODES),
             "gemini_live_voices": ["", *sorted(GEMINI_LIVE_VOICES)],
             "voice_providers": list(VOICE_PROVIDERS),

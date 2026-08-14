@@ -5,10 +5,10 @@ model to decline a `silence` or `pattern_time` reason outright - see its module
 docstring, "What the local model actually did with that prompt (gemma3:4b,
 2026-08-04)". Those two examples exist because a 4B local model, reading a reason
 with nothing in it but elapsed hours or a frequency, filled the gap with an empty
-line (`또 왔네.`) instead of declining. `DAEMON_PRESET=quality` routes
-`PROACTIVE_JUDGE` to a hosted model, which may not have that weakness at all - and
-if it does not, the two examples are dead weight the model never needed, fitted to
-a install this one is not.
+line (`또 왔네.`) instead of declining. `DAEMON_PROACTIVE_JUDGE_LOCAL=false` routes
+`PROACTIVE_JUDGE` to the hosted `DAEMON_PROVIDER`, which may not have that weakness
+at all - and if it does not, the two examples are dead weight the model never
+needed, fitted to a install this one is not.
 
 This settles it by running both variants against the real gateway and the real
 persona seed, not by reasoning about model capability from a spec sheet:
@@ -300,9 +300,10 @@ def build_judge_gateway(settings: Settings) -> tuple[LLMGateway, _RecordingProvi
     if route.provider == OLLAMA:
         raise RoutedToLocalModel(
             f"PROACTIVE_JUDGE routes to 'ollama' ({route.model}) under "
-            f"DAEMON_PRESET={settings.preset!r}. Run `daemon doctor` and check "
-            "DAEMON_PRESET/DAEMON_ROUTE_OVERRIDES before trusting any number here - "
-            "this task measures the hosted model, not the local one."
+            f"DAEMON_PROVIDER={settings.provider!r}. Run `daemon doctor` and check "
+            "DAEMON_PROVIDER/DAEMON_PROACTIVE_JUDGE_LOCAL/DAEMON_ROUTE_OVERRIDES "
+            "before trusting any number here - this task measures the hosted "
+            "model, not the local one."
         )
     provider = _build_provider(route.provider, settings)
     recorder = _RecordingProvider(provider)
@@ -371,12 +372,16 @@ CRITERIA = """판정 기준 (측정 전 고정):
 
 
 def format_report(
-    model: str, provider: str, preset: str, data_dir: Path, runs: tuple[VariantRun, ...]
+    model: str, provider: str, daemon_provider: str, data_dir: Path, runs: tuple[VariantRun, ...]
 ) -> str:
+    """`provider` is the route that actually answered (`route.provider`);
+    `daemon_provider` is the `DAEMON_PROVIDER` axis value. Usually the same, but
+    `DAEMON_ROUTE_OVERRIDES` can send `PROACTIVE_JUDGE` to a provider other than the
+    one `DAEMON_PROVIDER` names, so both are worth showing."""
     lines = [
         f"proactive judge decline few-shot: {len(CASES)} cases "
         f"({len(_KIND_ORDER)} kinds), model={model} provider={provider} "
-        f"preset={preset} data_dir={data_dir}",
+        f"daemon_provider={daemon_provider} data_dir={data_dir}",
         "",
         CRITERIA,
         "",
@@ -409,7 +414,7 @@ def format_report(
 
 
 def as_record(
-    model: str, provider: str, preset: str, data_dir: Path, runs: tuple[VariantRun, ...]
+    model: str, provider: str, daemon_provider: str, data_dir: Path, runs: tuple[VariantRun, ...]
 ) -> dict[str, object]:
     def variant_record(run: VariantRun) -> dict[str, object]:
         return {
@@ -436,7 +441,7 @@ def as_record(
         "measured_at": now_iso(),
         "model": model,
         "provider": provider,
-        "preset": preset,
+        "daemon_provider": daemon_provider,
         "data_dir": str(data_dir),
         "criteria": CRITERIA,
         "variants": [variant_record(run) for run in runs],
@@ -460,10 +465,12 @@ async def _main(args: argparse.Namespace) -> int:
 
     route = settings.route_for(Task.PROACTIVE_JUDGE)
     model = recorder.last_model or route.model
-    print(format_report(model, route.provider, settings.preset, settings.data_dir, tuple(runs)))
+    print(format_report(model, route.provider, settings.provider, settings.data_dir, tuple(runs)))
 
     if args.json is not None:
-        record = as_record(model, route.provider, settings.preset, settings.data_dir, tuple(runs))
+        record = as_record(
+            model, route.provider, settings.provider, settings.data_dir, tuple(runs)
+        )
         args.json.write_text(
             json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )

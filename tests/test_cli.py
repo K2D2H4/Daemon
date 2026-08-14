@@ -66,7 +66,7 @@ def _sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         if name.startswith(("DAEMON_", "TELEGRAM_")) or name.endswith("_API_KEY"):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PROVIDER", "ollama")
     monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "data"))
     return tmp_path
 
@@ -254,7 +254,7 @@ def test_no_arguments_still_runs_the_server(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(cli, "_serve", lambda settings: served.append(settings) or 0)
 
     assert cli.main([]) == 0
-    assert served[0].preset == "offline"
+    assert served[0].provider == "ollama"
 
 
 def test_run_serves(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -490,7 +490,7 @@ def test_run_warns_when_the_shell_overrides_the_env_file(
     """
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
-        "DAEMON_PRESET=offline\n"
+        "DAEMON_PROVIDER=ollama\n"
         "DAEMON_OLLAMA_MODEL=gemma3:4b\n"
         "TELEGRAM_BOT_TOKEN=1111111111:AAH-in-the-file\n",
         encoding="utf-8",
@@ -513,7 +513,7 @@ def test_run_is_quiet_when_the_environment_agrees(
     """A warning on every start would be a warning nobody reads."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
-        "DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n", encoding="utf-8"
+        "DAEMON_PROVIDER=ollama\nDAEMON_OLLAMA_MODEL=gemma3:4b\n", encoding="utf-8"
     )
     monkeypatch.setattr(cli, "_serve", lambda settings: 0)
 
@@ -728,7 +728,7 @@ def test_a_broken_config_stops_a_command_that_needs_it(
     monkeypatch.setenv("DAEMON_PRESET", "cheap")
 
     assert cli.main(["status"]) == 2
-    assert "unknown DAEMON_PRESET" in capsys.readouterr().err
+    assert "DAEMON_PRESET has been removed" in capsys.readouterr().err
 
 
 # --- daemon proactive: the presence lines ------------------------------------
@@ -785,8 +785,7 @@ def test_doctor_names_the_service_behind_a_compatible_endpoint(
     otherwise not say which one is answering - only the address does, and this is
     the same `vendor_label` reverse lookup the wizard uses.
     """
-    monkeypatch.setenv("DAEMON_PRESET", "balanced")
-    monkeypatch.setenv("DAEMON_HOSTED_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("DAEMON_PROVIDER", "openai_compatible")
     monkeypatch.setenv("DAEMON_OPENAI_COMPATIBLE_BASE_URL", "https://api.deepseek.com/v1")
     monkeypatch.setenv("DAEMON_OPENAI_COMPATIBLE_MODEL", "deepseek-chat")
     monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "sk-x")
@@ -807,8 +806,7 @@ def test_doctor_names_no_endpoint_for_a_named_hosted_provider(
 ) -> None:
     """Anthropic, OpenAI and Gemini already say who they are; the `endpoint=`
     suffix exists only for the one provider name that does not."""
-    monkeypatch.setenv("DAEMON_PRESET", "balanced")
-    monkeypatch.setenv("DAEMON_HOSTED_PROVIDER", "anthropic")
+    monkeypatch.setenv("DAEMON_PROVIDER", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
 
     assert cli.main(["doctor"]) == 0
@@ -825,7 +823,7 @@ def test_doctor_explains_a_config_it_cannot_even_load(
     monkeypatch.setenv("DAEMON_PRESET", "cheap")
 
     assert cli.main(["doctor"]) == 1
-    assert "[FAIL] config: unknown DAEMON_PRESET" in capsys.readouterr().out
+    assert "[FAIL] config: DAEMON_PRESET has been removed" in capsys.readouterr().out
 
 
 def test_doctor_notices_a_missing_data_dir(
@@ -855,8 +853,8 @@ def test_doctor_notices_that_ollama_is_down(
     assert cli.main(["doctor"]) == 1
     out = capsys.readouterr().out
     assert "[FAIL] ollama" in out
-    # Embeddings are local in every preset, so this breaks recall even for a
-    # fully hosted setup. The message has to say so.
+    # Embeddings always run on Ollama regardless of DAEMON_PROVIDER, so this
+    # breaks recall even for a fully hosted setup. The message has to say so.
     assert "bge-m3" in out
 
 
@@ -1579,7 +1577,9 @@ def test_log_reads_the_default_path_when_the_configuration_will_not_build(
     logs.mkdir(parents=True)
     (logs / "ai.daemon.default.err.log").write_text(SIGNAL + "\n", encoding="utf-8")
 
-    monkeypatch.setattr(cli, "Settings", _unusable("preset 'offline' routes no voice"))
+    monkeypatch.setattr(
+        cli, "Settings", _unusable("DAEMON_VOICE_ENABLED is on but no voice provider key is set")
+    )
 
     assert cli.main(["log"]) == 0
     assert capsys.readouterr().out.splitlines() == [SIGNAL]
@@ -1721,7 +1721,7 @@ def test_the_last_of_two_cases_wins_like_settings_does(
     monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "first"))
     monkeypatch.setenv("daemon_data_dir", str(tmp_path / "second"))
 
-    assert Settings(preset="offline").data_dir == tmp_path / "second", "premise"
+    assert Settings(provider="ollama").data_dir == tmp_path / "second", "premise"
     assert cli._env_setting("DAEMON_DATA_DIR", "data_dir") == str(tmp_path / "second")
 
 

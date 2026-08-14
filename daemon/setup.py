@@ -12,8 +12,8 @@ questions offer the ids that exist instead of a hard-coded guess.
 
 Three more rules the shape of this module comes from:
 
-  * It asks only what the chosen preset's routing table actually requires
-    (docs/PLAN.md 3.2), so an `offline` install is never asked for a hosted key
+  * It asks only what the chosen provider's routing table actually requires
+    (docs/PLAN.md 3.2), so an `ollama` install is never asked for a hosted key
     and a text-only install is never asked for a voice key.
   * Credentials are read from and written to `./.env` only, never the shell
     environment. The OS service unit carries no secrets and sees no shell
@@ -77,26 +77,21 @@ from pydantic import ValidationError
 
 from daemon.config import (
     ANTHROPIC,
-    DEFAULT_HOSTED_PROVIDER,
     ENV_FILE,
     GEMINI,
-    HOSTED,
     HOSTED_PROVIDERS,
     OLLAMA,
     OPENAI,
     OPENAI_COMPATIBLE,
-    PRESETS,
     ConfigError,
     Settings,
     clean_base_url,
-    preset_providers,
     providers_for,
 )
 from daemon.fs import secure_dir, write_private_replace
 from daemon.macapp import build_resident_service, grant_after_install
 from daemon.service import SUPPORTED as SERVICE_PLATFORMS
 from daemon.service import Service, ServiceError
-from daemon.tasks import Task
 from daemon.tui import (
     Choice,
     Row,
@@ -189,61 +184,10 @@ written - so a default that goes stale is a sentence here and a hint naming the
 ids that do exist, rather than a 404 at the first message."""
 DEFAULT_OPENAI_REALTIME_MODEL = "gpt-realtime"
 
-PRESET_ORDER = ("offline", "balanced", "quality")
-DEFAULT_PRESET = "balanced"
-
-PRESET_CHOICES: tuple[Choice, ...] = (
-    Choice(
-        "offline",
-        "Everything on this machine. No keys and no accounts, unless you add voice.",
-        (
-            "Conversation, the daily reflection and the decision to speak first all "
-            "run here through Ollama. With voice off, nothing leaves the machine.",
-            "Voice is the one thing you can opt into: native audio needs a hosted "
-            "model, so turning it on sends audio to the provider you choose, with "
-            "your own key. Leaving it off is exactly what makes the privacy promise "
-            "true instead of aspirational (docs/PLAN.md 7).",
-            "Needs Ollama and two local models. No API keys and no accounts until "
-            "you turn voice on.",
-        ),
-    ),
-    Choice(
-        "balanced",
-        "Hosted conversation, local proactive check. Voice available.",
-        (
-            "Conversation and the daily reflection go to a hosted model, because "
-            "reflection quality propagates into the whole memory graph.",
-            "The 'should I speak?' check stays local. It runs every five minutes "
-            "whether or not it ever speaks, so hosted cost would accumulate for "
-            "nothing.",
-            "Needs one hosted API key - whose is the next question - plus Ollama "
-            "for the local check and for recall embeddings.",
-        ),
-    ),
-    Choice(
-        "quality",
-        "Everything hosted. Best answers, highest bill. Voice available.",
-        (
-            "Including the five-minute proactive check, which is the one that runs "
-            "whether or not it ever speaks.",
-            "Embeddings stay local in every preset, so recall still wants Ollama - "
-            "`daemon doctor` checks that. Needs one hosted API key.",
-        ),
-    ),
-)
-"""The three presets as a folded list: one line to choose by, the argument behind
-it one keypress away.
-
-The prose used to be printed in full, six to eight lines per preset, before the
-question - too long to read while choosing, and the part about voice was then
-repeated by the voice question two lines later. Folding is not shortening: every
-sentence is still here, including the one that carries docs/PLAN.md 7, which is
-the whole reason `offline` is a real option rather than a marketing bullet."""
-
 HOSTED_CHOICES: tuple[Choice, ...] = (
     Choice(
         "anthropic",
-        "Claude. The default, and what the presets were measured against.",
+        "Claude. The default, and what conversation quality here was measured against.",
         (
             "Reads long conversations well, which is what the daily reflection does "
             "before its conclusions propagate into the whole memory graph.",
@@ -252,7 +196,7 @@ HOSTED_CHOICES: tuple[Choice, ...] = (
     Choice(
         "openai",
         "GPT. Pick this if it is the account you already pay for.",
-        ("Nothing else about Daemon changes - same presets, same memory.",),
+        ("Nothing else about Daemon changes - same routing, same memory.",),
     ),
     Choice(
         "gemini",
@@ -349,14 +293,38 @@ def vendor_label(base_url: str) -> str:
     return base_url
 
 
-DEFAULT_HOSTED_CHOICE = HOSTED_CHOICES[0].name
-"""What the provider prompt puts in its brackets for someone who just presses
-Enter.
+OLLAMA_CHOICE = Choice(
+    "ollama",
+    "Everything on this machine. No keys, no accounts, unless you add voice.",
+    (
+        "Conversation, the daily reflection and the decision to speak first all "
+        "run here through Ollama. With voice off, nothing leaves the machine.",
+        "Voice is the one thing you can opt into: native audio needs a hosted "
+        "model, so turning it on sends audio to the provider you choose, with "
+        "your own key. Leaving it off is exactly what makes the privacy promise "
+        "true instead of aspirational (docs/PLAN.md 7).",
+        "Needs Ollama and a local chat model. No API keys and no accounts until "
+        "you turn voice on.",
+    ),
+)
+"""The privacy trade the old `offline` preset stated, folded onto the provider
+menu instead of a menu of its own (docs/adr/0014) - the whole reason `ollama` is
+a real option here rather than a marketing bullet."""
 
-Deliberately not `config.DEFAULT_HOSTED_PROVIDER`, which is now empty on purpose
-to mean "nobody has answered yet". That absence is the right value for a
-configuration to hold and the wrong thing to put in a prompt: this wizard exists
-to turn the absence into an answer, not to pass it along."""
+PROVIDER_CHOICES: tuple[Choice, ...] = (OLLAMA_CHOICE, *HOSTED_CHOICES)
+"""Every value `DAEMON_PROVIDER` accepts, folded: one line to choose by, the
+argument behind it one keypress away. `ollama` comes first because it needs
+nothing else answered; the four hosted names follow in `HOSTED_CHOICES`' order."""
+
+DEFAULT_PROVIDER_CHOICE = "anthropic"
+"""What the provider prompt puts in its brackets for someone who just presses
+Enter - unchanged from the old hosted-provider default, now that there is one
+question instead of two.
+
+Deliberately not `config.Settings.provider`'s own default, which is empty on
+purpose to mean "nobody has answered yet". That absence is the right value for
+a configuration to hold and the wrong thing to put in a prompt: this wizard
+exists to turn the absence into an answer, not to pass it along."""
 
 EXPAND = "?"
 """Typed at a choice prompt, shows every reason behind every option.
@@ -1079,12 +1047,13 @@ def _redact(text: str, secret: str) -> str:
     return text.replace(secret, "<token>") if secret else text
 
 
-# --- what a preset requires --------------------------------------------------
+# --- what the chosen provider requires ---------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class Need:
-    """One `.env` key the chosen preset requires, and how to obtain it."""
+    """One `.env` key the chosen provider (and voice axis) requires, and how to
+    obtain it."""
 
     key: str
     label: str
@@ -1122,16 +1091,11 @@ class Need:
 
 def needs_for(env: Mapping[str, str]) -> list[Need]:
     """The keys this configuration is missing an answer for, in asking order."""
-    preset = env.get("DAEMON_PRESET", "") or DEFAULT_PRESET
-    # The preset tables hold a HOSTED placeholder, so the chosen provider has to be
-    # passed in: defaulting it would ask a user who picked GPT for an Anthropic key,
-    # and reading the table raw would ask them for a key for "hosted". An empty
-    # answer stays empty - `providers_for` then drops the hosted tasks, so no
-    # vendor's key is asked for on a guess.
-    hosted = env.get("DAEMON_HOSTED_PROVIDER", "") or DEFAULT_HOSTED_PROVIDER
+    provider = env.get("DAEMON_PROVIDER", "")
+    proactive_judge_local = _truthy(env.get("DAEMON_PROACTIVE_JUDGE_LOCAL", "true"))
     voice_on = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
     # The wizard has no voice-provider question yet (it is admin-only), so an absent
-    # value means the field default rather than "nobody chose" - unlike `hosted`,
+    # value means the field default rather than "nobody chose" - unlike `provider`,
     # this field *has* a default, and it is `gemini`. Hoisted to a local because the
     # provider branches below need it too: a provider can be present for chat, for
     # voice, or both, and only this value tells them which - `voice_on` alone does
@@ -1140,33 +1104,41 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
         "DAEMON_VOICE_PROVIDER"
     )
     providers = providers_for(
-        preset,
+        provider=provider,
+        proactive_judge_local=proactive_judge_local,
         voice_enabled=voice_on,
-        hosted=hosted,
         voice_provider=voice_provider,
     )
     needs: list[Need] = []
 
-    if HOSTED in PRESETS[preset].values() and not hosted:
+    if not provider:
         # First, because it decides which of the keys below are even asked for -
         # and reported by `--check`, because Settings refuses to start without it.
         # Silently reporting a complete file here is what let someone run setup
         # before this question existed and then wonder why they had Claude.
         needs.append(
             Need(
-                key="DAEMON_HOSTED_PROVIDER",
-                label="hosted provider",
-                why=f"This preset sends work to a hosted model; pick whose - one of "
-                f"{', '.join(HOSTED_PROVIDERS)}. There is no default, so that a "
-                "choice is never confused with a fallback.",
+                key="DAEMON_PROVIDER",
+                label="provider",
+                why="Chat, recall and reflection all need a provider chosen - ollama "
+                f"for fully local, or one of {', '.join(HOSTED_PROVIDERS)}. There is "
+                "no default, so a choice is never confused with a fallback.",
             )
         )
-    if OLLAMA in _chat_providers(preset, hosted):
+    if provider == OLLAMA or proactive_judge_local:
+        # Not just `provider == OLLAMA`: `Task.PROACTIVE_JUDGE` routes to ollama
+        # whenever `proactive_judge_local` is true (config.py's routing table),
+        # regardless of what `provider` is - so a hosted install that keeps the
+        # judge local (the default) still reads this model every five minutes.
+        # Missing that case left the judge silently on `Settings.ollama_model`'s
+        # built-in default, `qwen3:14b` - the slow reasoning model `Need.blocking`
+        # above measures at ~11.8s against gemma3's ~1.7s.
         needs.append(
             Need(
                 key="DAEMON_OLLAMA_MODEL",
                 label="local chat model",
-                why="Ollama model used for conversation. Do not use a reasoning model here.",
+                why="Ollama model used for conversation, for the five-minute "
+                "proactive judge, or both. Do not use a reasoning model here.",
                 default=DEFAULT_OLLAMA_MODEL,
             )
         )
@@ -1175,7 +1147,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
             Need(
                 key="ANTHROPIC_API_KEY",
                 label="Anthropic API key",
-                why="Your preset sends conversation and reflection to Claude. Your key, "
+                why="Chat, recall and reflection all go to Claude. Your key, "
                 "your account, your bill.",
                 url=ANTHROPIC_KEYS_URL,
                 secret=True,
@@ -1204,12 +1176,15 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
         # reason has to be named rather than assumed. `voice_on` alone is not that
         # reason: voice can be on with a *different* provider, and gating the realtime
         # model on it then asks for an id Settings never reads. Mirrors GEMINI below.
-        openai_chat = hosted == OPENAI and HOSTED in PRESETS[preset].values()
+        openai_chat = provider == OPENAI
         openai_voice = voice_on and voice_provider == OPENAI
         if openai_chat and openai_voice:
             why = "One key covers both: GPT answers, and voice is OpenAI's too."
         elif openai_chat:
-            why = "You chose GPT for the hosted work. Your key, your account, your bill."
+            why = (
+                "You chose GPT for chat, recall and reflection. Your key, your "
+                "account, your bill."
+            )
         else:
             why = "Voice is on, so audio goes to OpenAI's realtime model - with your key."
         needs.append(
@@ -1249,12 +1224,15 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
         # reason has to be named rather than assumed. It was assumed off `voice_on`,
         # back when voice was always Google's; now voice can be OpenAI's while Gemini
         # is only the chat model, so the Live id is gated on the provider, not the switch.
-        gemini_chat = hosted == GEMINI and HOSTED in PRESETS[preset].values()
+        gemini_chat = provider == GEMINI
         gemini_voice = voice_on and voice_provider == GEMINI
         if gemini_chat and gemini_voice:
             why = "One key covers both: Gemini answers, and voice is Google's too."
         elif gemini_chat:
-            why = "You chose Gemini for the hosted work. Your key, your account, your bill."
+            why = (
+                "You chose Gemini for chat, recall and reflection. Your key, your "
+                "account, your bill."
+            )
         else:
             why = "Voice is on, so audio goes to Google's native-audio model - with your key."
         needs.append(
@@ -1353,7 +1331,7 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
     )
     # A value already in the file drops out - except a model id and the compatible
     # endpoint, which are asked again with the current value as their default. The
-    # reasoning is the preset's, one layer down: a decided answer was unreachable,
+    # reasoning is the provider's, one layer down: a decided answer was unreachable,
     # so the only way to change it was to hand-edit `.env`, and this command exists
     # to remove that. A *credential* is different - nobody wants to re-paste a
     # working key, and the question would print a secret back at them.
@@ -1372,34 +1350,11 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
     ]
 
 
-def _chat_providers(preset: str, hosted: str) -> set[str]:
-    """Providers doing real generation, i.e. excluding embeddings.
-
-    The distinction matters for exactly one question: whether setup should insist
-    on a reachable Ollama. Under `quality` only `Task.EMBED` is local, and an
-    embedding model that is not pulled yet degrades recall rather than blocking
-    the first conversation - so it belongs to `daemon doctor`, not to a wizard
-    standing between the user and their first message.
-
-    `hosted` is required for the same reason `config.preset_providers` made it
-    required: every caller here runs *after* the question has been answered, so a
-    default would only ever be a way to forget to pass the answer.
-    """
-    # Through preset_providers, not PRESETS directly: the tables hold a HOSTED
-    # placeholder now, and reading them raw would ask the user for a key for a
-    # provider called "hosted".
-    return {
-        provider
-        for task, provider in preset_providers(preset, hosted).items()
-        if task is not Task.EMBED
-    }
-
-
 KEEP_HINT = "Enter keeps it."
 """Said whenever a step shows an answer already in `.env`.
 
 The wizard used to print "already in .env, keeping it" and move on, which made a
-decided answer unreachable: the only way to change a preset was to hand-edit
+decided answer unreachable: the only way to change one was to hand-edit
 `.env`, and hand-editing config is the thing this command exists to remove - the
 same reason nobody types their own numeric Telegram id. Re-running setup is now
 how you change your mind, and Enter is how you do not.
@@ -1930,15 +1885,14 @@ class Wizard:
         tools = self._choose_tools(env, updates)
 
         self._step(2, "How should Daemon think?")
-        preset = self._choose_preset(env, updates)
-        hosted = self._choose_hosted(preset, env, updates)
+        provider = self._choose_provider(env, updates)
+        self._choose_background(provider, env, updates)
         voice = self._choose_voice(env, updates)
 
         merged = {
             **env,
             **updates,
-            "DAEMON_PRESET": preset,
-            "DAEMON_HOSTED_PROVIDER": hosted,
+            "DAEMON_PROVIDER": provider,
             "DAEMON_VOICE_ENABLED": str(voice).lower(),
             "DAEMON_TOOLS_ENABLED": str(tools).lower(),
         }
@@ -1956,10 +1910,9 @@ class Wizard:
             if value:
                 updates[need.key] = value
 
-        # The answered provider, not a default: `_chat_providers` decides whether a
-        # local chat model is wanted at all, and under `quality` the answer changes
-        # which of these lines is even true.
-        self._check_ollama(preset, hosted, {**merged, **updates})
+        # The answered provider, not a default: `needs_for`'s `DAEMON_OLLAMA_MODEL`
+        # need only fires when the provider itself is `ollama`, and this mirrors it.
+        self._check_ollama(provider, {**merged, **updates})
 
         if not updates:
             say("Nothing to change in .env - this install is already configured.")
@@ -1980,7 +1933,7 @@ class Wizard:
     # --- presentation --------------------------------------------------------
 
     STEPS = 5
-    """PC control, preset, credentials, persona, pairing. Printed as `2/5` so the question a
+    """PC control, provider, credentials, persona, pairing. Printed as `2/5` so the question a
     person has partway through - how much of this is left - has an answer without
     them having to ask it."""
 
@@ -2116,7 +2069,7 @@ class Wizard:
 
         Not `choices()`: that folds the *reasoning* behind a handful of options,
         and a model id has none - what has to fold here is the tail of a fifty-item
-        list. Same `?` key either way, so the gesture is the one the preset menu
+        list. Same `?` key either way, so the gesture is the one the provider menu
         taught two steps ago.
         """
         theme = self.prompt.theme
@@ -2134,7 +2087,7 @@ class Wizard:
 
         `_pick` is the other list prompt in this module and is deliberately not
         reused. It hands `ask_choice` a closed set and re-asks until the answer is
-        inside it, which is right for three presets and wrong for a model id: one
+        inside it, which is right for five providers and wrong for a model id: one
         released this morning is in no list this wizard can fetch, and refusing an
         id the API would have accepted is a worse dead end than the one the list was
         added to remove. So the list is an offer and free text is still the
@@ -2153,7 +2106,7 @@ class Wizard:
                 self._show_models(offered, need.default)
                 continue
             # A bare number is an index - the same bargain `ask_choice` makes when
-            # it takes "2" for `balanced`, and safe for the same reason: no model
+            # it takes "2" for `anthropic`, and safe for the same reason: no model
             # id is a bare number.
             if answer.isdigit() and 1 <= int(answer) <= len(offered):
                 return offered[int(answer) - 1]
@@ -2200,50 +2153,54 @@ class Wizard:
         self.prompt.say()
         return enabled
 
-    def _choose_preset(self, env: Mapping[str, str], updates: dict[str, str]) -> str:
-        current = env.get("DAEMON_PRESET", "")
-        if current in PRESETS:
-            self.prompt.say(f"Where should the thinking happen? Currently {current}.")
+    def _choose_provider(self, env: Mapping[str, str], updates: dict[str, str]) -> str:
+        """Which model does the real thinking: `ollama` for fully local, or one of
+        the four hosted names (docs/adr/0014).
+
+        Asked first, and alone, because every other question in this step - the
+        background toggle, the compatible endpoint, which key gets asked for in
+        step 3 - depends on the answer. Two axes rather than nine presets: this
+        says *whose model* runs the work, `_choose_background` says *how much of
+        it* stays local.
+        """
+        current = env.get("DAEMON_PROVIDER", "")
+        if current in (OLLAMA, *HOSTED_PROVIDERS):
+            self.prompt.say(f"Which provider should do the thinking? Currently {current}.")
             self.prompt.say(KEEP_HINT)
         else:
-            self.prompt.say("Where should the thinking happen? You can change this later.")
-        preset = self._pick("Preset", PRESET_CHOICES, default=current or DEFAULT_PRESET)
-        _record(updates, "DAEMON_PRESET", preset, current)
-        return preset
-
-    def _choose_hosted(self, preset: str, env: Mapping[str, str], updates: dict[str, str]) -> str:
-        """Which commercial provider answers wherever the preset says "hosted".
-
-        A second axis rather than nine presets: a preset says *where* work runs,
-        this says *whose model* runs it. Asked right after the preset because it
-        decides which key the next few questions are about - and not asked at all
-        under `offline`, which resolves no hosted task and would be answering a
-        question about a bill nobody is going to get.
-        """
-        if HOSTED not in PRESETS[preset].values():
-            self.prompt.say(f"Nothing in the {preset} preset talks to a hosted model, so there")
-            self.prompt.say("is no provider to choose and no API key to paste.")
-            self.prompt.say()
-            # Nothing is written either, deliberately. Writing a provider nobody
-            # was asked about would mean that switching to `balanced` later
-            # silently used it - which is exactly the confusion that removing the
-            # default was meant to end. Startup refuses instead, naming this
-            # command, and this command then asks.
-            return DEFAULT_HOSTED_PROVIDER
-
-        current = env.get("DAEMON_HOSTED_PROVIDER", "")
-        self.prompt.say("Whose model should the hosted work go to? The preset decided where")
-        self.prompt.say("work runs; this decides who runs it. One key either way - Daemon is")
-        self.prompt.say("not a reseller, you bring your own.")
-        if current in HOSTED_PROVIDERS:
-            self.prompt.say(f"Currently {current}. {KEEP_HINT}")
+            self.prompt.say("Which provider should do the thinking? You can change this later.")
         chosen = self._pick(
-            "Provider", HOSTED_CHOICES, default=current or DEFAULT_HOSTED_CHOICE
+            "Provider", PROVIDER_CHOICES, default=current or DEFAULT_PROVIDER_CHOICE
         )
-        _record(updates, "DAEMON_HOSTED_PROVIDER", chosen, current)
+        _record(updates, "DAEMON_PROVIDER", chosen, current)
         if chosen == OPENAI_COMPATIBLE:
             self._choose_compatible_endpoint(env, updates)
         return chosen
+
+    def _choose_background(
+        self, provider: str, env: Mapping[str, str], updates: dict[str, str]
+    ) -> None:
+        """The old `balanced`/`quality` difference, as its own yes/no question.
+
+        Only `Task.PROACTIVE_JUDGE` moves (docs/adr/0014, D3) - reflection stays on
+        `provider` regardless, because reflection quality propagates into the
+        whole memory graph and the judge fires on a five-minute tick whether or
+        not it ever speaks. Not asked at all when there is no hosted work to
+        weigh it against: `provider` empty means the question ahead of this one
+        was not answered, and `ollama` already runs everything locally.
+        """
+        if provider not in ("", OLLAMA):
+            current = env.get("DAEMON_PROACTIVE_JUDGE_LOCAL", "")
+            was = _truthy(current) if current else True
+            self.prompt.say("Keep the 'should I speak?' check on the local model? It runs")
+            self.prompt.say("every five minutes whether or not it ever speaks, so hosted cost")
+            self.prompt.say(f"would accrue for nothing. Chat and reflection still go to {provider}")
+            self.prompt.say("either way.")
+            if current:
+                self.prompt.say(f"Currently {'local' if was else provider}. {KEEP_HINT}")
+            chosen = self.prompt.ask_yes_no("Run it locally", default=was)
+            _record(updates, "DAEMON_PROACTIVE_JUDGE_LOCAL", str(chosen).lower(), current)
+            self.prompt.say()
 
     def _choose_compatible_endpoint(
         self, env: Mapping[str, str], updates: dict[str, str]
@@ -2254,7 +2211,7 @@ class Wizard:
         provider menu, because the vendor is not a provider: the menu would show
         `qwen` as a peer of `anthropic` while `.env` and every log line said
         `openai_compatible`, and a choice that is not the thing stored is the
-        confusion DEFAULT_HOSTED_PROVIDER was emptied to end.
+        confusion `Settings.provider`'s empty-by-default exists to end.
         """
         current_url = env.get("DAEMON_OPENAI_COMPATIBLE_BASE_URL", "")
         if current_url:
@@ -2293,8 +2250,9 @@ class Wizard:
             updates["DAEMON_OPENAI_COMPATIBLE_MODEL"] = vendor.model
 
     def _choose_voice(self, env: Mapping[str, str], updates: dict[str, str]) -> bool:
-        # No preset gate: every preset can carry voice now (ADR 0012), and the
-        # trade is stated in the question itself rather than by refusing to ask it.
+        # No provider gate: voice is its own axis regardless of DAEMON_PROVIDER
+        # (ADR 0012), and the trade is stated in the question itself rather than
+        # by refusing to ask it.
         raw = env.get("DAEMON_VOICE_ENABLED", "")
         was = _truthy(raw) if raw else False
         self.prompt.say("Turn voice on? Audio then goes to your voice provider's native-audio")
@@ -2425,11 +2383,11 @@ class Wizard:
             return verdict
         return Verdict(True, "")
 
-    def _check_ollama(self, preset: str, hosted: str, env: Mapping[str, str]) -> None:
-        if OLLAMA not in _chat_providers(preset, hosted):
+    def _check_ollama(self, provider: str, env: Mapping[str, str]) -> None:
+        if provider != OLLAMA:
             embed_model = env.get("DAEMON_EMBED_MODEL") or DEFAULT_EMBED_MODEL
-            self.prompt.say("Nothing in this preset needs a local chat model. Recall")
-            self.prompt.say("embeddings are local in every preset though, so `ollama pull")
+            self.prompt.say("Nothing here needs a local chat model.")
+            self.prompt.say("Recall embeddings are always local, so `ollama pull")
             self.prompt.say(f"{embed_model}` is still worth doing - `daemon doctor` checks it.")
             self.prompt.say()
             return
@@ -2995,24 +2953,22 @@ def _all_needs() -> list[Need]:
     """Every key any configuration can require, deduplicated: used to decide
     whether a value may be printed, and to list what `--check` found already set.
 
-    Every hosted provider, not just the default one. Iterating presets alone left
-    `OPENAI_API_KEY` out of the set of keys known to be secret, which is the sort
-    of omission that ends with a key printed in the change list.
+    Every provider, not just the default one. Iterating only the empty value
+    left `OPENAI_API_KEY` out of the set of keys known to be secret, which is
+    the sort of omission that ends with a key printed in the change list.
     """
     seen: dict[str, Need] = {}
-    for preset in PRESET_ORDER:
-        # The empty string included: it is what a file that has not answered the
-        # provider question holds, and DAEMON_HOSTED_PROVIDER is itself one of the
-        # keys this has to know about.
-        for hosted in ("", *HOSTED_PROVIDERS):
-            for need in needs_for(
-                {
-                    "DAEMON_PRESET": preset,
-                    "DAEMON_HOSTED_PROVIDER": hosted,
-                    "DAEMON_VOICE_ENABLED": "true",
-                }
-            ):
-                seen.setdefault(need.key, need)
+    # The empty string included: it is what a file that has not answered the
+    # provider question holds, and DAEMON_PROVIDER is itself one of the keys
+    # this has to know about.
+    for provider in ("", OLLAMA, *HOSTED_PROVIDERS):
+        for need in needs_for(
+            {
+                "DAEMON_PROVIDER": provider,
+                "DAEMON_VOICE_ENABLED": "true",
+            }
+        ):
+            seen.setdefault(need.key, need)
     return list(seen.values())
 
 
@@ -3099,19 +3055,26 @@ def report(path: Path, prompt: Prompt) -> int:
     prompt.say(
         status(theme, "ok" if found else "missing", f"{shown} - {'found' if found else 'no file'}")
     )
-    preset = env.get("DAEMON_PRESET", "") or DEFAULT_PRESET
-    if preset not in PRESETS:
-        prompt.say(status(theme, "fail", f"DAEMON_PRESET={preset!r} is not a preset"))
+    if env.get("DAEMON_PRESET"):
+        # Same guard as `Settings._check` (docs/adr/0014), stated here too so a
+        # stale preset is caught by `--check` rather than only at startup - the
+        # command whose whole job is explaining the breakage before it happens.
+        prompt.say(
+            status(
+                theme,
+                "fail",
+                f"DAEMON_PRESET={env['DAEMON_PRESET']!r} has been removed - set "
+                "DAEMON_PROVIDER and DAEMON_PROACTIVE_JUDGE_LOCAL instead "
+                "(docs/adr/0014-provider-is-the-axis.md)",
+            )
+        )
         return PROBLEM
     voice = _truthy(env.get("DAEMON_VOICE_ENABLED", ""))
-    default_note = "" if env.get("DAEMON_PRESET") else " (default, not set in the file)"
-    hosted = env.get("DAEMON_HOSTED_PROVIDER", "") or DEFAULT_HOSTED_PROVIDER
+    provider = env.get("DAEMON_PROVIDER", "")
     prompt.say(
-        f"preset: {preset}{default_note}, "
         # Named rather than left blank: an empty value here is the whole point of
-        # removing the default, and "hosted provider: " reads like a bug.
-        f"hosted provider: {hosted or 'not chosen yet'}, "
-        f"voice {'on' if voice else 'off'}"
+        # having no default, and "provider: " reads like a bug.
+        f"provider: {provider or 'not chosen yet'}, voice {'on' if voice else 'off'}"
     )
     prompt.say()
 

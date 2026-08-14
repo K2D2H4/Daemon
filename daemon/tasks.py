@@ -3,7 +3,7 @@
 Every LLM call in Daemon belongs to exactly one Task. The gateway routes per
 Task, not per global setting - see docs/PLAN.md 3.2.
 
-Do not add a task without also adding it to the preset tables in config.
+Do not add a task without also adding it to `Settings.routing` in config.
 """
 
 from enum import StrEnum
@@ -37,5 +37,5 @@ class Task(StrEnum):
 
     EMBED = "embed"
     """Text -> vector, for recall. Runs on every message and on every recall
-    query, so it sits on the voice latency path and stays local in every preset:
+    query, so it sits on the voice latency path and stays local regardless of provider:
     a network round trip per turn would cost more than all of Lane 1."""

@@ -11,7 +11,7 @@ Design rationale for everything here: [docs/PLAN.md](PLAN.md).
 ```
 daemon/
   tasks.py            Task enum — the LLM routing key. FROZEN.
-  config.py           settings + the 3 presets
+  config.py           settings + the two routing axes (provider, proactive-judge-local)
   app.py              single-process entrypoint (FastAPI + APScheduler)
   companion.py        what the daemon can do, for both endpoints. Read this before
                       adding a capability to loop.py or voice/conversation.py.
@@ -228,7 +228,7 @@ And **M1c — PC control**, pulled forward from post-M4 (docs/PLAN.md 8.2, §10)
 One piece: `daemon/tools/`, plus tool calling in the provider contract and four
 tables in `daemon/memory/schema.sql`. Both frozen files were extended additively; nothing that
 compiled before stopped compiling. No new `Task` - tool-using chat is still
-`chat_text`, so the preset tables are untouched.
+`chat_text`, so routing is untouched.
 
 The fourth table, `tool_grants`, was added later and is a *second* standing axis
 rather than a widening of the first. `tool_allowlist` holds argv prefixes, and a

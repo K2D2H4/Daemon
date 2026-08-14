@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup = add(
         "setup",
         group="setup",
-        help="first-run onboarding: pick a preset, verify keys, write .env",
+        help="first-run onboarding: pick a provider, verify keys, write .env",
     )
     setup.add_argument(
         "--check",
@@ -1262,8 +1262,8 @@ async def _persona(settings: Settings, args: Any) -> int:
 
 
 async def probe_ollama(settings: Settings) -> tuple[bool, str]:
-    """Is Ollama reachable? Every preset routes embeddings there, so recall is
-    dead without it even under a fully hosted setup."""
+    """Is Ollama reachable? Every DAEMON_PROVIDER routes embeddings there, so
+    recall is dead without it even under a fully hosted setup."""
     from daemon.llm.providers.ollama import OllamaProvider
 
     provider = OllamaProvider(settings.ollama_base_url)
@@ -1315,7 +1315,8 @@ def _doctor() -> int:
             Check(
                 "config",
                 True,
-                f"preset={settings.preset} voice={settings.voice_enabled} [{table}]{endpoint}",
+                f"provider={settings.provider} judge_local={settings.proactive_judge_local} "
+                f"voice={settings.voice_enabled} [{table}]{endpoint}",
             ),
             _env_override_check(settings),
             _data_dir_check(settings),

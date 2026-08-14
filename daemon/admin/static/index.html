@@ -602,7 +602,7 @@ function renderHealth(h){
   pill.className='pill'+(state==='error'?' err':(state==='suspended'?' warn':''));
   pill.textContent='● '+(state==='error'?'ERROR':(state==='suspended'?'SUSPENDED':'RUNNING'));
   const up=uptime(h.started_at);
-  $('#status-meta').textContent=[up?'uptime '+up:null,'preset '+h.preset,
+  $('#status-meta').textContent=[up?'uptime '+up:null,'provider '+h.provider,
     h.routing&&h.routing.chat_text].filter(Boolean).join(' · ');
   $('#brand-chip').innerHTML=sprite(state==='error'?'error':'running');
   // The tiles show what /health says, verbatim. Re-phrasing it here would make the
@@ -1003,7 +1003,7 @@ $('#chat-in').addEventListener('keydown',e=>{if(e.key==='Enter')sendChat();});
 // --- settings ---------------------------------------------------------------
 let SETTINGS=null, PENDING=null;
 const BOOLS=['voice_enabled','mcp_enabled','browser_enabled','tools_enabled',
-  'screen_enabled','wake_enabled','voice_barge_in','proactive_enabled'];
+  'screen_enabled','wake_enabled','voice_barge_in','proactive_enabled','proactive_judge_local'];
 const SECRETS=['anthropic_api_key','openai_api_key','gemini_api_key','telegram_bot_token','openai_compatible_api_key'];
 const EXPLAIN={
   tools_enabled:'The master switch for PC control. Off means no tool runs, whatever the mode says.',
@@ -1013,7 +1013,8 @@ const EXPLAIN={
   voice_enabled:'Hold spoken conversations. The realtime endpoint needs its own model id.',
   wake_enabled:'Listen for the wake phrase. Needs at least one alias below.',
   voice_barge_in:'Let your voice cut it off mid-answer. Off is half-duplex: answers always finish, and you talk in the gaps.',
-  proactive_enabled:'Let it speak first, inside the budget and quiet hours on the Overview.'};
+  proactive_enabled:'Let it speak first, inside the budget and quiet hours on the Overview.',
+  proactive_judge_local:'Run the proactive judge on Ollama instead of the hosted provider - it fires every few minutes, so the hosted cost adds up.'};
 // A field whose `.env` value differs from the running one shows the saved value and
 // says so. The alternative - showing what the process is running - made a reload
 // after a save look exactly like a save that was lost.
@@ -1040,23 +1041,74 @@ function fieldToggle(name,running){
     <span class="td">${esc(EXPLAIN[name]||'')}</span></span>
     <span class="sw" role="switch" tabindex="0" data-f="${name}" data-v="${v?'true':'false'}" aria-checked="${v?'true':'false'}"><i></i></span></div>`;
 }
-// Provider-aware voice block. Renders the SELECTED provider's voice select + preview,
-// plus (gemini only) the two sensitivity knobs - openai_realtime.py never reads them,
-// so showing them under DAEMON_VOICE_PROVIDER=openai promised a control the backend
-// ignores. All of it lives inside the replaceable #voice-field, so changing the
-// provider re-renders the whole block at once (display:contents keeps its children
-// as direct .grid2 items, same as before this wrapper existed).
+// Provider-aware voice block. Renders the SELECTED provider's own model id, voice
+// select + preview, plus (gemini only) the two sensitivity knobs - openai_realtime.py
+// never reads sensitivities, so showing them under DAEMON_VOICE_PROVIDER=openai
+// promised a control the backend ignores, and the same reasoning applies to the
+// model id field: the other provider's realtime endpoint never reads it either, so
+// only the one in force is shown (same principle as brainField's MODEL card - every
+// control shown is a control currently in force). The model id is plain text, no
+// datalist - D8 keeps voice static, no live probing. All of it lives inside the
+// replaceable #voice-field, so changing the provider re-renders the whole block at
+// once (display:contents keeps its children as direct .grid2 items, same as before
+// this wrapper existed).
 function voiceField(provider,e,o){
   const isO=provider==='openai';
+  const modelName=isO?'openai_realtime_model':'gemini_live_model';
   const name=isO?'openai_realtime_voice':'gemini_live_voice';
   const opts=(isO?o.openai_realtime_voices:o.gemini_live_voices)||[''];
   const v=val(name,e[name]);
   const os=opts.map(x=>`<option ${x===v?'selected':''}>${esc(x)}</option>`).join('');
   const sens=isO?'':fieldStr('voice_start_sensitivity',e.voice_start_sensitivity,o.sensitivities)
     +fieldStr('voice_end_sensitivity',e.voice_end_sensitivity,o.sensitivities);
-  return `<div id="voice-field" style="display:contents"><div class="field">${nameCell(name)}<select data-f="${name}">${os}</select>
+  return `<div id="voice-field" style="display:contents">${fieldStr(modelName,e[modelName])}<div class="field">${nameCell(name)}<select data-f="${name}">${os}</select>
     <div class="voice-preview"><button type="button" class="btn" id="voice-play">▶ preview</button>
     <span class="cap" id="voice-preview-msg"></span><audio id="voice-sample" preload="none"></audio></div></div>${sens}</div>`;
+}
+// Known OpenAI-compatible endpoints (daemon/setup.py's COMPATIBLE_VENDORS, base_url
+// only - not fetched from the server, this is presentational and the field stays
+// free text either way (D7): a vendor the list has never heard of is not an error).
+const COMPAT_VENDOR_URLS=['https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+  'https://api.moonshot.ai/v1','https://api.deepseek.com/v1','https://openrouter.ai/api/v1'];
+// A text input backed by a <datalist> rather than a hard <select>: a just-released
+// model id must stay typeable the day it ships, before any list - live or static -
+// knows about it (D5c). `liveList` wins over `suggestions` when the probe found
+// anything; the running/pending value is never excluded, so a stale list can't
+// block a save.
+function fieldModel(name,running,liveList,suggestions){
+  const v=val(name,running);
+  const opts=(liveList&&liveList.length)?liveList:(suggestions||[]);
+  const dl='dl-'+name;
+  const os=opts.map(x=>`<option value="${esc(x)}">`).join('');
+  return `<label class="field">${nameCell(name)}<input type="text" list="${dl}" data-f="${name}" value="${esc(v??'')}">
+    <datalist id="${dl}">${os}</datalist></label>`;
+}
+// Provider-first MODEL card (D5/D7/D9): the provider select, then only the field(s)
+// that provider actually uses - never all of them at once, which was the eight-box
+// card this replaces. Same #.../display:contents re-render trick as voiceField:
+// the provider select lives *inside* this block (unlike voiceField's, which sits
+// outside voiceField() in renderSettings), so switching providers replaces the
+// whole thing, select included, redrawn with the new value already selected.
+function brainField(provider,e,o){
+  const popts=o.providers.map(x=>`<option ${x===provider?'selected':''}>${esc(x)}</option>`).join('');
+  let inner=`<label class="field">${nameCell('provider')}<select data-brain="provider">${popts}</select></label>`;
+  if(provider===''){
+    inner+='<p class="cap">Choose a provider to pick its model.</p>';
+  }else if(provider==='ollama'){
+    inner+=fieldModel('ollama_model',e.ollama_model,[],[])
+      +'<p class="cap" style="margin:12px 0 0">Everything runs on this machine - no key, and nothing to run in the background elsewhere.</p>';
+  }else{
+    const name=provider+'_model';
+    inner+=fieldModel(name,e[name],(o.model_lists&&o.model_lists[provider])||[],(o.model_suggestions&&o.model_suggestions[provider])||[]);
+    if(provider==='openai_compatible'){
+      inner+=fieldModel('openai_compatible_base_url',e.openai_compatible_base_url,[],COMPAT_VENDOR_URLS)
+        +'<p class="cap" style="margin:12px 0 0">Stops at the version segment (…/v1) - not the …/chat/completions path below it, which is refused.</p>';
+    }
+    inner+=fieldToggle('proactive_judge_local',e.proactive_judge_local);
+  }
+  inner+='<p class="cap" style="margin:12px 0 0">Recall embeddings always run locally on Ollama (bge-m3).</p>';
+  if(e.off_provider_note)inner+=`<p class="cap">${esc(e.off_provider_note)}</p>`;
+  return `<div id="brain-field" style="display:contents">${inner}</div>`;
 }
 function card(title,inner){return `<div class="card pad"><span class="card-title">${title}</span>
   <div style="margin-top:14px">${inner}</div></div>`;}
@@ -1067,16 +1119,7 @@ function renderSettings(){
   const e=SETTINGS.editable,o=SETTINGS.options,r=SETTINGS.readonly;
   const toggles=names=>names.map(b=>fieldToggle(b,e[b])).join('');
   let h='';
-  h+=card('MODEL','<div class="grid2">'+fieldStr('preset',e.preset,o.presets)
-    +fieldStr('hosted_provider',e.hosted_provider,['',...o.hosted_providers])
-    +fieldStr('anthropic_model',e.anthropic_model)
-    +fieldStr('openai_model',e.openai_model)
-    +fieldStr('gemini_model',e.gemini_model)
-    +fieldStr('gemini_live_model',e.gemini_live_model)
-    +fieldStr('openai_realtime_model',e.openai_realtime_model)
-    +fieldStr('openai_compatible_base_url',e.openai_compatible_base_url)
-    +fieldStr('openai_compatible_model',e.openai_compatible_model)+'</div>'
-    +'<p class="cap" style="margin:12px 0 0">Each provider takes its own model id. Switching the hosted provider without naming its model is refused, so fill the one you are switching to. The compatible endpoint stops at the version segment (…/v1) — not the …/chat/completions path below it, which is refused.</p>');
+  h+=card('MODEL','<div class="grid2">'+brainField(val('provider',e.provider),e,o)+'</div>');
   h+=card('CAPABILITIES',toggles(['tools_enabled','browser_enabled','screen_enabled','mcp_enabled','proactive_enabled'])
     +'<div class="grid2" style="margin-top:16px">'+fieldStr('tools_mode',e.tools_mode,o.tool_modes)+'</div>');
   h+=card('VOICE',toggles(['voice_enabled','wake_enabled','voice_barge_in'])
@@ -1119,6 +1162,12 @@ function collectPatch(){
     if(SECRETS.includes(f)){if(v.trim())patch[f]=v;return;}
     if(v!==(base(f)??''))patch[f]=v;
   });
+  // The provider select carries data-brain, not data-f, so the loop above skips
+  // it - picking a new provider is a structural change (which model field exists,
+  // whether the background toggle shows) that brainField's own re-render handles,
+  // not something the per-field diffing above understands.
+  const brainSel=$('#brain-field select[data-brain="provider"]');
+  if(brainSel&&brainSel.value!==base('provider'))patch.provider=brainSel.value;
   return patch;
 }
 function updateDirty(){
@@ -1139,6 +1188,10 @@ $('#settings-form').addEventListener('change',ev=>{
   if(ev.target.dataset && ev.target.dataset.f==='voice_provider'){
     const vf=$('#voice-field');
     if(vf){vf.outerHTML=voiceField(ev.target.value,SETTINGS.editable,SETTINGS.options);updateDirty();}
+  }
+  if(ev.target.dataset && ev.target.dataset.brain==='provider'){
+    const bf=$('#brain-field');
+    if(bf){bf.outerHTML=brainField(ev.target.value,SETTINGS.editable,SETTINGS.options);updateDirty();}
   }
 });
 $('#settings-form').addEventListener('click',ev=>{

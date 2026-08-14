@@ -197,7 +197,7 @@ class ProactiveTick:
                 # same tick would read the same pre-tick count and a delivery would
                 # overshoot it - and PLAN 6.2's budget of three (now eight) is the
                 # brake the whole design leans on. That covers a second *delivery*,
-                # but a decline is a model call too - under the `quality` preset,
+                # but a decline is a model call too - with `proactive_judge_local=False`,
                 # PROACTIVE_JUDGE is hosted and paid for - and a tick with several
                 # due candidates used to run the judge on every one of them before
                 # this `break`, once per candidate, every five minutes, for as long

@@ -96,7 +96,7 @@ class Embedder:
 def _settings(tmp_path: Path, **extra: Any) -> Settings:
     return Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path),
         TELEGRAM_BOT_TOKEN=TOKEN,
@@ -456,7 +456,7 @@ def test_doctor_says_when_the_shell_is_overriding_the_env_file(
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
-        "DAEMON_PRESET=offline\n"
+        "DAEMON_PROVIDER=ollama\n"
         "DAEMON_OLLAMA_MODEL=gemma3:4b\n"
         "TELEGRAM_BOT_TOKEN=1111111111:AAH-the-one-in-the-file\n",
         encoding="utf-8",
@@ -486,9 +486,9 @@ def test_doctor_is_quiet_when_the_environment_agrees_with_the_file(
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
-        "DAEMON_PRESET=offline\nDAEMON_OLLAMA_MODEL=gemma3:4b\n", encoding="utf-8"
+        "DAEMON_PROVIDER=ollama\nDAEMON_OLLAMA_MODEL=gemma3:4b\n", encoding="utf-8"
     )
-    monkeypatch.setenv("DAEMON_PRESET", "offline")
+    monkeypatch.setenv("DAEMON_PROVIDER", "ollama")
 
     main(["doctor"])
     printed = capsys.readouterr().out
@@ -620,7 +620,7 @@ async def test_it_speaks_first_and_the_utterance_can_be_labelled(tmp_path: Path)
         provider = Provider(reply='{"say": "발표 어떻게 됐어?"}')
         settings = Settings(
             _env_file=None,
-            preset="offline",
+            provider="ollama",
             data_dir=tmp_path,
             proactive_enabled=True,
             proactive_quiet_hours="",
@@ -909,7 +909,7 @@ async def test_it_stays_silent_when_the_gate_says_so(tmp_path: Path) -> None:
             store,
             Settings(
                 _env_file=None,
-                preset="offline",
+                provider="ollama",
                 data_dir=tmp_path,
                 proactive_enabled=True,
                 proactive_quiet_hours="00:00-23:59",
@@ -938,7 +938,7 @@ def test_the_tool_layer_can_be_switched_off_entirely(tmp_path: Path) -> None:
     to be inferred."""
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path),
         TELEGRAM_BOT_TOKEN=TOKEN,
@@ -957,7 +957,7 @@ def test_the_default_install_has_tools_in_full_mode(tmp_path: Path) -> None:
     still off, and MCP on but contributing nothing until a server is configured."""
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path),
         TELEGRAM_BOT_TOKEN=TOKEN,
@@ -983,7 +983,7 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
     MCP is turned off here, which also covers the disabled path: no bridge at all."""
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path),
         TELEGRAM_BOT_TOKEN=TOKEN,
@@ -1015,7 +1015,7 @@ def test_the_tool_mode_can_be_pinned_past_the_setting(tmp_path: Path) -> None:
     """
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path),
         TELEGRAM_BOT_TOKEN=TOKEN,
@@ -1098,7 +1098,7 @@ async def test_a_label_press_lands_through_the_channel_the_app_builds(
         )
         settings = Settings(
             _env_file=None,
-            preset="offline",
+            provider="ollama",
             data_dir=tmp_path,
             telegram_bot_token=TOKEN,
             telegram_allowed_user_ids=(str(OWNER),),
@@ -1328,15 +1328,14 @@ def test_asking_for_a_gate_with_nothing_to_hear_with_is_reported(tmp_path: Path)
         async def transcribe(self, pcm: bytes) -> str:  # pragma: no cover - never asked
             return ""
 
-    # Not via `_settings`: this needs a preset that routes voice, and `_settings`
-    # pins `offline`, which by design routes none (docs/PLAN.md 3.2).
+    # Not via `_settings`: this needs a voice provider and key, and `_settings`
+    # pins `ollama`, which has neither (docs/PLAN.md 3.2).
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="balanced",
+        DAEMON_PROVIDER="gemini",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path),
         TELEGRAM_BOT_TOKEN=TOKEN,
-        DAEMON_HOSTED_PROVIDER="gemini",
         GEMINI_API_KEY="k",
         DAEMON_VOICE_ENABLED="true",
         DAEMON_GEMINI_LIVE_MODEL="gemini-3.1-flash-live-preview",
@@ -1519,7 +1518,7 @@ def test_the_browser_is_off_unless_asked_for(tmp_path: Path) -> None:
     letting it read over the owner's shoulder."""
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path),
         TELEGRAM_BOT_TOKEN=TOKEN,
@@ -1542,7 +1541,7 @@ def test_the_browser_is_off_unless_asked_for(tmp_path: Path) -> None:
 def test_switching_the_browser_on_adds_three_tools(tmp_path: Path) -> None:
     settings = Settings(
         _env_file=None,
-        DAEMON_PRESET="offline",
+        DAEMON_PROVIDER="ollama",
         DAEMON_OLLAMA_MODEL="gemma3:4b",
         DAEMON_DATA_DIR=str(tmp_path),
         TELEGRAM_BOT_TOKEN=TOKEN,

@@ -37,7 +37,7 @@ LOOPBACK = "http://127.0.0.1"
 
 
 def _settings(tmp_path: Path, **kw: object) -> Settings:
-    return Settings(_env_file=None, preset="offline", data_dir=tmp_path, **kw)
+    return Settings(_env_file=None, provider="ollama", data_dir=tmp_path, **kw)
 
 
 @pytest.fixture

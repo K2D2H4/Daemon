@@ -163,7 +163,7 @@ def settings(**overrides: Any) -> Settings:
     that skips its own validator.
     """
     base: dict[str, Any] = {
-        "preset": "offline",
+        "provider": "ollama",
         "proactive_enabled": True,
         "proactive_quiet_hours": "",
         "voice_enabled": True,
