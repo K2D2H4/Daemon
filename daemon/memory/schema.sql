@@ -373,6 +373,26 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_ts ON tool_calls (ts);
 
+-- Owner-requested work handed off from a voice turn to the text agent and run in
+-- the background (docs/superpowers/specs/2026-08-14-async-delegation-design.md).
+-- Durable so a restart cannot silently swallow a promised task: the ack was
+-- already spoken.
+CREATE TABLE IF NOT EXISTS delegated_tasks (
+    id           INTEGER PRIMARY KEY,
+    request      TEXT    NOT NULL,
+    status       TEXT    NOT NULL DEFAULT 'queued'
+                         CHECK (status IN ('queued', 'running', 'done', 'failed')),
+    result       TEXT,
+    error        TEXT,
+    created_ts   TEXT    NOT NULL,
+    finished_ts  TEXT,
+    origin       TEXT    NOT NULL,
+    channel      TEXT    NOT NULL,
+    sender_id    TEXT
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_delegated_tasks_status ON delegated_tasks (status, id);
+
 -- Pending approval codes. Shaped after channel_pairing, which had the security
 -- details worked out already, with one addition: `fingerprint` binds the approval
 -- to the exact call. OpenClaw's exec approvals bind cwd, argv and the resolved

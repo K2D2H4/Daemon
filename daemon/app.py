@@ -297,6 +297,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     close_io: Callable[[], None] | None = None
     embedder: Any = None
     tools: Any = None
+    store: Any = None
     if channel is None or memory is None:
         try:
             io = _build_io(settings)
@@ -309,8 +310,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             channel, memory = io.channel, io.memory
             recall, resolve_id, close_io = io.recall, io.resolve_id, io.close
             embedder = io.embedder
+            store = io.store
             app.state.recall = recall
             app.state.recall_status = io.recall_status
+            # Created before `_build_voice_runtime` regardless of whether that call
+            # happens below: the delegation worker (assembled further down, once
+            # `channel`/`memory` are confirmed) waits on this same event, and it
+            # must exist even when voice/wake is off so that assembly does not
+            # depend on this `if`.
+            app.state.delegate_wake = asyncio.Event()
             tools, app.state.mcp, app.state.tools_status = await _build_tools(
                 settings, io.store
             )
@@ -322,7 +330,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # does it take six seconds to answer", paid per call.
                 try:
                     app.state.voice_runtime = await _build_voice_runtime(
-                        settings, io.store, memory, recall
+                        settings,
+                        io.store,
+                        memory,
+                        recall,
+                        delegate_wake=app.state.delegate_wake,
                     )
                 except Exception as exc:
                     # The wake round falls back to building its own per call -
@@ -361,6 +373,65 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # so even asyncio's "never retrieved" warning never fires.
         task.add_done_callback(_report_loop_death)
         app.state.loop_task = task
+
+        if store is not None:
+            # The other half of `delegate_task` (daemon/tools/delegate.py): a voice
+            # turn only queues a row, and this is what actually runs it - through
+            # the same text ConversationLoop the Telegram path uses, so a
+            # nested-schema tool the voice model could not call is called here
+            # where it can be - and reports the result back by presence. `store`
+            # is only set when `_build_io` ran above; the fake channel/memory a
+            # couple of tests inject carry no store, and delegation is simply not
+            # wired for them - the same degrade-not-crash shape as `tools`.
+            from daemon.delegation import DelegationWorker, build_run_request, deliver_result
+            from daemon.proactivity.presence import MachinePresence
+            from daemon.proactivity.speaker import LocalSpeaker
+
+            def _delegate_companion_factory() -> Companion:
+                return Companion(
+                    memory,
+                    data_dir=settings.data_dir,
+                    recall=recall,
+                    recall_limit=settings.recall_limit,
+                    resolve_id=resolve_id,
+                    tools=tools,
+                )
+
+            run_request = build_run_request(
+                gateway=gateway, companion_factory=_delegate_companion_factory
+            )
+            presence = MachinePresence()
+            speaker = LocalSpeaker()
+
+            async def deliver(text: str, task_row: Any) -> None:
+                await deliver_result(
+                    text,
+                    presence=presence,
+                    speaker=speaker,
+                    channel=channel,
+                    recipient_id=None,
+                )
+
+            worker = DelegationWorker(
+                store, run_request, deliver, wake=app.state.delegate_wake
+            )
+
+            # Boot recovery: a restart mid-task leaves a queued row nobody will ever
+            # finish - the worker only claims what it can run, and a task claimed by
+            # a process that is gone stays "running" forever otherwise. Reported,
+            # not resumed: resuming would re-run a request whose side effects (a
+            # created Notion page) may have already landed.
+            for row in store.pending_tasks():
+                await deliver(
+                    f"아까 부탁한 '{row['request'][:40]}' 작업을 다 못 끝내고 재시작됐어. "
+                    "다시 시켜줘.",
+                    row,
+                )
+                store.mark_task_failed(row["id"], "interrupted by restart")
+
+            app.state.delegation_task = asyncio.create_task(
+                worker.run(), name="delegation-worker"
+            )
 
     if recall is not None:
         # Backfill after the loop is already serving, and in the background: a
@@ -432,7 +503,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # that escaped the finally block - skipping the channel close, the sqlite
         # close, the scheduler shutdown and every provider aclose below it. A
         # revoked bot token was enough to leak the lot on every restart.
-        for name in ("backfill_task", "loop_task", "wake_task", "reflection_boot_task"):
+        for name in (
+            "backfill_task",
+            "loop_task",
+            "wake_task",
+            "reflection_boot_task",
+            "delegation_task",
+        ):
             pending = getattr(app.state, name, None)
             if pending is None:
                 continue
@@ -1056,7 +1133,12 @@ class VoiceRuntime:
 
 
 async def _build_voice_runtime(
-    settings: Settings, store: Any, writer: Any, recall: Any
+    settings: Settings,
+    store: Any,
+    writer: Any,
+    recall: Any,
+    *,
+    delegate_wake: asyncio.Event | None = None,
 ) -> VoiceRuntime:
     """The voice half of the tool layer, built once at startup.
 
@@ -1089,7 +1171,11 @@ async def _build_voice_runtime(
                 logger.warning("voice screen sharing off (missing dependency): %s", exc)
     voice_mode = "allowlist" if settings.tools_mode == "ask" else settings.tools_mode
     tools, mcp, _status = await _build_tools(
-        settings, store, mode=voice_mode, screen_share=screen_share
+        settings,
+        store,
+        mode=voice_mode,
+        screen_share=screen_share,
+        delegate_wake=delegate_wake,
     )
     return VoiceRuntime(
         store=store, writer=writer, recall=recall, tools=tools, mcp=mcp, screen_share=screen_share
@@ -1229,7 +1315,7 @@ async def run_voice(
         # owner's own words (daemon/voice/conversation.py `_record`), and the origin
         # gate offers tools only to it. Empty when tools are off, which leaves the
         # session declaring none and so never yielding a tool call.
-        tool_specs = companion.specs(origin="owner")
+        tool_specs = companion.specs(origin="owner", surface="voice")
         # The tool contract rides with the persona in the system instruction, so the
         # endpoint getting tools inherits the rules the text path already has instead
         # of being written without them - which is exactly how voice came to have no
@@ -1823,7 +1909,12 @@ async def build_wake_gate(
 
 
 async def _build_tools(
-    settings: Settings, store: Any, *, mode: str | None = None, screen_share: Any = None
+    settings: Settings,
+    store: Any,
+    *,
+    mode: str | None = None,
+    screen_share: Any = None,
+    delegate_wake: asyncio.Event | None = None,
 ) -> tuple[Any, Any, str]:
     """Assemble the tool layer. Returns (runner, mcp bridge, status).
 
@@ -1845,6 +1936,12 @@ async def _build_tools(
     `ScreenShareController` for the live-share start/stop tools to toggle. `None`
     (the default, and always what `create_app`'s text path passes) means those two
     tools are never registered at all, so the text loop can never offer them.
+
+    `delegate_wake`, likewise, is only ever passed by `_build_voice_runtime` - the
+    resident's boot-once voice tool layer. `None` (the default, and what the text
+    path and `run_voice`'s own call pass) means `delegate_task` is never
+    registered: it is a voice-only tool, since it exists for work the native-audio
+    model cannot do itself.
     """
     if not settings.tools_enabled:
         return None, None, "off (DAEMON_TOOLS_ENABLED)"
@@ -1876,6 +1973,21 @@ async def _build_tools(
         # tools at all rather than tools with no idea where they may look.
         logger.error("built-in tools could not be built, continuing without them: %s", exc)
         return None, None, f"unavailable: {exc}"
+
+    if delegate_wake is not None:
+        # Voice-only: a spoken turn has no direct path to a nested-schema tool
+        # (evals/voice_write_nudge_spike.py), so this is the one flat-schema tool
+        # that hands such work to the background worker in `daemon/delegation.py`.
+        from daemon.tools.delegate import DelegateTask
+
+        registry.register(
+            DelegateTask(
+                enqueue=lambda request: store.enqueue_task(
+                    request=request, origin="owner", channel="voice", sender_id=None
+                ),
+                notify=delegate_wake.set,
+            )
+        )
 
     if settings.browser_enabled:
         # Guarded like the built-ins above: a name collision or an import failure

@@ -22,6 +22,7 @@ from daemon import clock
 from daemon.companion import TOOL_CONTRACT, Companion, google_account_hint, render_recall
 from daemon.llm.base import ToolSpec
 from daemon.memory.base import LoggedMessage
+from daemon.tools.schema import DELEGATE_TOOL_NAME
 
 
 def said(text: str, role: str = "user") -> LoggedMessage:
@@ -51,6 +52,38 @@ class FakeTools:
 
     def specs(self) -> tuple[ToolSpec, ...]:
         return self._specs
+
+
+class _SurfaceRunner:
+    """A runner fake that carries real `ToolSpec.parameters`, unlike `FakeTools`
+    (whose specs are always flat, with `parameters={}`) - needed to exercise the
+    voice/text split, which turns on schema shape rather than tool name."""
+
+    def __init__(self, *specs: ToolSpec) -> None:
+        self._specs = specs
+
+    def __len__(self) -> int:
+        return len(self._specs)
+
+    def specs(self) -> tuple[ToolSpec, ...]:
+        return self._specs
+
+
+_FLAT_SPEC = ToolSpec(
+    name="open_path",
+    description="",
+    parameters={"type": "object", "properties": {"target": {"type": "string"}}},
+)
+_NESTED_SPEC = ToolSpec(
+    name="notion__notion-create-pages",
+    description="",
+    parameters={"type": "object", "properties": {"pages": {"type": "array"}}},
+)
+_DELEGATE_SPEC = ToolSpec(
+    name=DELEGATE_TOOL_NAME,
+    description="",
+    parameters={"type": "object", "properties": {"request": {"type": "string"}}},
+)
 
 
 # --- what goes in front of the model ----------------------------------------
@@ -97,6 +130,45 @@ async def test_an_empty_registry_is_not_a_tool_layer(data_dir: Path) -> None:
 
     assert companion.specs(origin="owner") == ()
     assert await companion.context("hello") == ()
+
+
+def test_voice_surface_drops_nested_tools_but_keeps_flat_and_delegate(
+    data_dir: Path,
+) -> None:
+    """The native-audio model fakes a nested-argument call instead of making it, so
+    a voice turn is offered only flat schemas plus the one escape hatch."""
+    companion = Companion(
+        FakeMemory(),
+        data_dir=data_dir,
+        tools=_SurfaceRunner(_FLAT_SPEC, _NESTED_SPEC, _DELEGATE_SPEC),
+    )
+
+    names = {s.name for s in companion.specs(origin="owner", surface="voice")}
+
+    assert names == {"open_path", DELEGATE_TOOL_NAME}
+
+
+def test_text_surface_keeps_nested_and_drops_delegate(data_dir: Path) -> None:
+    """The text path can call nested tools directly, so it has no use for the
+    delegate escape hatch."""
+    companion = Companion(
+        FakeMemory(),
+        data_dir=data_dir,
+        tools=_SurfaceRunner(_FLAT_SPEC, _NESTED_SPEC, _DELEGATE_SPEC),
+    )
+
+    names = {s.name for s in companion.specs(origin="owner", surface="text")}
+
+    assert names == {"open_path", "notion__notion-create-pages"}
+
+
+def test_non_owner_gets_nothing_on_either_surface(data_dir: Path) -> None:
+    companion = Companion(
+        FakeMemory(), data_dir=data_dir, tools=_SurfaceRunner(_FLAT_SPEC, _DELEGATE_SPEC)
+    )
+
+    assert companion.specs(origin="untrusted", surface="voice") == ()
+    assert companion.specs(origin="untrusted", surface="text") == ()
 
 
 def test_google_account_hint_names_the_account_when_a_google_tool_is_offered() -> None:

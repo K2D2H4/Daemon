@@ -43,6 +43,7 @@ from daemon.tools.base import ToolResult
 from daemon.tools.mcp import NAME_SEPARATOR, google_authenticated_email
 from daemon.tools.policy import Claimed, Command
 from daemon.tools.runner import Outcome, ToolRunner, TurnContext
+from daemon.tools.schema import DELEGATE_TOOL_NAME, is_flat_schema
 
 logger = logging.getLogger(__name__)
 
@@ -424,7 +425,7 @@ class Companion:
 
     # --- tools ---------------------------------------------------------------
 
-    def specs(self, *, origin: str) -> tuple[ToolSpec, ...]:
+    def specs(self, *, origin: str, surface: str = "text") -> tuple[ToolSpec, ...]:
         """What may be offered to the model on a turn from `origin`. The origin gate.
 
         Empty for a turn that is not the owner's own words, so the model is never put
@@ -433,10 +434,25 @@ class Companion:
         the call becomes true rather than aspirational. `ToolPolicy.decide` still
         refuses it at execution: two layers on purpose, because the offering side is a
         convenience and the gate is the guarantee (docs/CONTRACTS.md 10).
+
+        `surface` splits the offer by endpoint. A voice session is offered only
+        flat-schema tools plus `delegate_task`: the native-audio model fakes a
+        nested-argument call instead of making it (docs/superpowers/specs/
+        2026-08-14-async-delegation-design.md), so a nested tool on a voice turn is
+        an invitation to confabulate. The text path gets every tool except
+        `delegate_task`, which it does not need - it can call the nested tools
+        directly. Default is `"text"` so existing callers are unaffected.
         """
         if self._tools is None or not len(self._tools) or origin != "owner":
             return ()
-        return self._tools.specs()
+        all_specs = self._tools.specs()
+        if surface == "voice":
+            return tuple(
+                spec
+                for spec in all_specs
+                if spec.name == DELEGATE_TOOL_NAME or is_flat_schema(spec.parameters)
+            )
+        return tuple(spec for spec in all_specs if spec.name != DELEGATE_TOOL_NAME)
 
     async def run_tools(
         self,

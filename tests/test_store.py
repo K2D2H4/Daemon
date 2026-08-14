@@ -134,3 +134,59 @@ def test_bad_provenance_is_rejected_by_the_schema(db: sqlite3.Connection) -> Non
     store = Store(db)
     with pytest.raises(sqlite3.IntegrityError):
         store.insert_message(replace(message("x"), origin="whoever"), log_file="f.md")
+
+
+def test_enqueue_then_claim_marks_running_and_returns_it(db: sqlite3.Connection) -> None:
+    store = Store(db)
+    tid = store.enqueue_task(
+        request="노션에 페이지 만들어줘",
+        origin="owner",
+        channel="voice",
+        sender_id=None,
+    )
+    assert tid > 0
+    row = store.claim_next_queued()
+    assert row is not None
+    assert row["id"] == tid
+    assert row["request"] == "노션에 페이지 만들어줘"
+    assert row["status"] == "running"
+    # Only one queued row existed, so the next claim finds nothing.
+    assert store.claim_next_queued() is None
+
+
+def test_mark_done_records_the_result(db: sqlite3.Connection) -> None:
+    store = Store(db)
+    tid = store.enqueue_task(request="r", origin="owner", channel="voice", sender_id=None)
+    store.claim_next_queued()
+    store.mark_task_done(tid, "만들었어요")
+    (row,) = [r for r in store.pending_tasks()] or [None]
+    assert row is None  # a done task is not pending
+    done = store.conn.execute(
+        "SELECT status, result FROM delegated_tasks WHERE id=?", (tid,)
+    ).fetchone()
+    assert done["status"] == "done"
+    assert done["result"] == "만들었어요"
+
+
+def test_mark_failed_records_the_error(db: sqlite3.Connection) -> None:
+    store = Store(db)
+    tid = store.enqueue_task(request="r", origin="owner", channel="voice", sender_id=None)
+    store.claim_next_queued()
+    store.mark_task_failed(tid, "notion 400")
+    row = store.conn.execute(
+        "SELECT status, error FROM delegated_tasks WHERE id=?", (tid,)
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["error"] == "notion 400"
+
+
+def test_pending_reports_queued_and_running_left_by_a_restart(
+    db: sqlite3.Connection,
+) -> None:
+    store = Store(db)
+    a = store.enqueue_task(request="a", origin="owner", channel="voice", sender_id=None)
+    b = store.enqueue_task(request="b", origin="owner", channel="voice", sender_id=None)
+    store.claim_next_queued()  # a -> running
+    pending = store.pending_tasks()
+    assert [r["id"] for r in pending] == [a, b]
+    assert {r["status"] for r in pending} == {"running", "queued"}
