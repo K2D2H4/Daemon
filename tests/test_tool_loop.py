@@ -216,6 +216,84 @@ async def test_the_round_cap_forces_an_answer(
     assert "I will stop." in channel.sent[0].text
 
 
+async def test_a_repeating_call_stops_before_the_cap(
+    data_dir: Path, store: Store, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A model stuck re-issuing the identical call is cut off by no-progress
+    detection, not left to burn every round up to the (now generous) cap. This is
+    the real pathology the bound exists for; the cap is only the last-resort net."""
+    (tmp_path / "notes.md").write_text("hi")
+    provider = FakeProvider(
+        reply="I will stop.",
+        scripted_calls=[[read_file_call(tmp_path / "notes.md")] for _ in range(20)],
+    )
+    channel = FakeChannel([inbound("keep going")])
+
+    with caplog.at_level("WARNING"):
+        await loop_for(
+            channel, provider, FakeMemory(), data_dir,
+            runner(store, tmp_path, mode="ask"), max_tool_rounds=20,
+        ).run()
+
+    # Stopped a few identical rounds in, nowhere near the cap of 20.
+    assert len(provider.calls) <= 5, "a stuck loop ran nearly to the cap"
+    assert any("repeat" in record.message.lower() for record in caplog.records)
+    assert provider.offered_tools[-1] == (), "the escape call must offer no tools"
+    assert "I will stop." in channel.sent[0].text
+
+
+async def test_alternating_calls_are_progress_not_a_loop(
+    data_dir: Path, store: Store, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No-progress detection keys on *consecutive* identical calls. A turn that
+    alternates between two real files is making progress and must run to the end,
+    even though each call recurs - a total-occurrence counter would wrongly trip it,
+    the way a productive turn re-running `git status` between edits would."""
+    (tmp_path / "a").write_text("A")
+    (tmp_path / "b").write_text("B")
+    a = read_file_call(tmp_path / "a", "1")
+    b = read_file_call(tmp_path / "b", "2")
+    provider = FakeProvider(reply="done", scripted_calls=[[a], [b], [a], [b], [a]])
+    channel = FakeChannel([inbound("compare them")])
+
+    with caplog.at_level("WARNING"):
+        await loop_for(
+            channel, provider, FakeMemory(), data_dir,
+            runner(store, tmp_path, mode="ask"), max_tool_rounds=10,
+        ).run()
+
+    assert "done" in channel.sent[0].text
+    assert len(provider.calls) == 6, "all five rounds ran, then the answer"
+    assert not any("repeat" in record.message.lower() for record in caplog.records)
+    assert not any("round limit" in record.message for record in caplog.records)
+
+
+async def test_a_long_productive_turn_runs_past_six_rounds(
+    data_dir: Path, store: Store, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Real agentic work - write a script, register it, test it - runs well past the
+    old six-round cap. The bound is a runaway-cost net set generously high, not a
+    budget that cuts an honest build short at six."""
+    calls = []
+    for i in range(8):
+        target = tmp_path / f"f{i}"
+        target.write_text(str(i))
+        calls.append(read_file_call(target, str(i)))
+    provider = FakeProvider(reply="all eight read", scripted_calls=[[c] for c in calls])
+    channel = FakeChannel([inbound("read all eight")])
+
+    with caplog.at_level("WARNING"):
+        # Default cap: the point is that eight rounds no longer trips it.
+        await loop_for(
+            channel, provider, FakeMemory(), data_dir, runner(store, tmp_path, mode="ask")
+        ).run()
+
+    assert "all eight read" in channel.sent[0].text
+    assert not any("round limit" in record.message for record in caplog.records)
+    ran = [row for row in store.recent_tool_calls() if row["ran"]]
+    assert len(ran) == 8, "a distinct-call build was cut off by the cap"
+
+
 async def test_an_empty_final_answer_is_never_delivered_as_silence(
     data_dir: Path, store: Store, tmp_path: Path
 ) -> None:

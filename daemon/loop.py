@@ -18,12 +18,13 @@ Telegram, that memory is markdown, or which of recall and tools the companion ha
 
 from __future__ import annotations
 
+import json
 import logging
 
 from daemon import clock
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
-from daemon.llm.base import Message, ProviderError
+from daemon.llm.base import Message, ProviderError, ToolCall
 from daemon.llm.gateway import LLMGateway
 from daemon.memory.base import LoggedMessage
 from daemon.tasks import Task
@@ -37,11 +38,24 @@ FAILURE_NOTICE = "Something went wrong on my side, so I could not answer that on
 """Said to the user when a turn fails. Silence would read as being ignored,
 which is worse than an admission."""
 
-MAX_TOOL_ROUNDS = 6
-"""Model call, tools, model call again - how many times round before the turn is
-made to answer with what it has. A bound rather than a target: without one, a
-model that keeps re-reading the same file spends the user's money in a loop no one
-is watching."""
+MAX_TOOL_ROUNDS = 25
+"""Model call, tools, model call again - the last-resort ceiling before the turn is
+made to answer with what it has. Set generously high on purpose: honest agentic
+work - write a script, register it, test it - runs well past a handful of rounds,
+and six cut real builds short mid-way (the launchd-scheduler turn that shipped this
+change). The thing this actually guards against - a model re-issuing the same call
+forever, spending the owner's money in a loop no one is watching - is caught far
+earlier and far more precisely by LOOP_REPEAT_LIMIT below; this number is only the
+net for a turn that keeps making *different*, plausible-looking calls without ever
+converging."""
+
+LOOP_REPEAT_LIMIT = 3
+"""How many times the exact same call, fired back to back, counts as a stuck loop
+rather than progress. Consecutive is the whole point: a productive turn that
+re-runs `git status` between edits is not looping, so a total-occurrence counter
+would cut it off wrongly; the identical call three rounds straight with nothing
+else in between is the real pathology, and this catches it without waiting for the
+generous MAX_TOOL_ROUNDS ceiling."""
 
 ROUND_LIMIT_NOTICE = (
     "You have used every tool call available for this turn. Answer now with what you "
@@ -76,6 +90,20 @@ APPROVAL_DENIED = "Understood, I have not run it."
 APPROVAL_NOT_OWNER = (
     "Approvals only count when they come from you directly, not forwarded on."
 )
+
+
+def _round_signature(tool_calls: tuple[ToolCall, ...]) -> tuple[tuple[str, str], ...]:
+    """A stable fingerprint of one round's calls: name plus canonicalised arguments,
+    order-independent. Two rounds asking for the very same thing share a signature,
+    which is how the loop tells a stuck repeat from progress. Keys are sorted so the
+    same calls in a different order still match; arguments are JSON with sorted keys
+    so `{a, b}` and `{b, a}` do too."""
+    return tuple(
+        sorted(
+            (call.name, json.dumps(call.arguments, sort_keys=True, ensure_ascii=False))
+            for call in tool_calls
+        )
+    )
 
 
 class ConversationLoop:
@@ -205,12 +233,24 @@ class ConversationLoop:
         completion = await self._gateway.complete(Task.CHAT_TEXT, messages, tools=specs)
 
         rounds = 0
+        repeats = 0
+        last_signature: tuple[tuple[str, str], ...] | None = None
         while completion.tool_calls:
-            if rounds >= self._max_tool_rounds:
-                logger.warning(
-                    "tool round limit (%d) reached; making the turn answer",
-                    self._max_tool_rounds,
+            signature = _round_signature(completion.tool_calls)
+            repeats = repeats + 1 if signature == last_signature else 1
+            last_signature = signature
+
+            capped = rounds >= self._max_tool_rounds
+            stalled = repeats >= LOOP_REPEAT_LIMIT
+            if capped or stalled:
+                # Either the last-resort ceiling, or the same call fired back to back
+                # with no progress. Both end the same way: answer with what we have.
+                reason = (
+                    f"tool round limit ({self._max_tool_rounds}) reached"
+                    if capped
+                    else f"the same tool call repeated {repeats} rounds with no progress"
                 )
+                logger.warning("%s; making the turn answer", reason)
                 # Asked again with no tools on offer, so the answer cannot be
                 # another tool call. Breaking without this would reply with the
                 # empty text that came back alongside the calls.
@@ -233,9 +273,8 @@ class ConversationLoop:
                     # call, already past the round cap and just trying to summarise,
                     # degrades to the same notice as empty text.
                     logger.warning(
-                        "tool round limit (%d) escape call raised; sending the "
-                        "incomplete notice",
-                        self._max_tool_rounds,
+                        "%s, and the escape call raised; sending the incomplete notice",
+                        reason,
                     )
                     return INCOMPLETE_NOTICE, outcome
                 break
