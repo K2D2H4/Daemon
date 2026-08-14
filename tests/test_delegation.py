@@ -1,0 +1,64 @@
+from daemon.channels.base import OutboundMessage
+from daemon.delegation import deliver_result
+
+
+class _FakeReading:
+    def __init__(self, at_keyboard):
+        self.at_keyboard = at_keyboard
+
+
+class _FakePresence:
+    def __init__(self, at_keyboard):
+        self._r = _FakeReading(at_keyboard)
+
+    async def read(self):
+        return self._r
+
+
+class _FakeSpeaker:
+    def __init__(self, ok=True):
+        self.said = []
+        self._ok = ok
+
+    async def say(self, text):
+        self.said.append(text)
+        return self._ok
+
+
+class _FakeChannel:
+    name = "telegram"
+
+    def __init__(self, ok=True):
+        self.sent = []
+        self._ok = ok
+
+    async def send(self, message: OutboundMessage):
+        if not self._ok:
+            raise RuntimeError("channel down")
+        self.sent.append(message)
+
+
+async def test_at_keyboard_speaks_and_sends():
+    speaker, channel = _FakeSpeaker(), _FakeChannel()
+    route = await deliver_result("만들었어요", presence=_FakePresence(True),
+                                 speaker=speaker, channel=channel, recipient_id="42")
+    assert route == "both"
+    assert speaker.said == ["만들었어요"]
+    assert channel.sent[0].text == "만들었어요"
+    assert channel.sent[0].recipient_id == "42"
+
+
+async def test_away_sends_to_channel_only():
+    speaker, channel = _FakeSpeaker(), _FakeChannel()
+    route = await deliver_result("만들었어요", presence=_FakePresence(False),
+                                 speaker=speaker, channel=channel, recipient_id="42")
+    assert route == "telegram"
+    assert speaker.said == []
+    assert len(channel.sent) == 1
+
+
+async def test_channel_failure_degrades_route_not_raises():
+    speaker, channel = _FakeSpeaker(), _FakeChannel(ok=False)
+    route = await deliver_result("x", presence=_FakePresence(True),
+                                 speaker=speaker, channel=channel, recipient_id="42")
+    assert route == "local_speaker"  # spoke, send failed
