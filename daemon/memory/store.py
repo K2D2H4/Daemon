@@ -510,6 +510,67 @@ class Store:
         self.conn.commit()
         return cursor.rowcount
 
+    # --- delegated tasks - async work queue ----------------------------------
+
+    def enqueue_task(
+        self,
+        *,
+        request: str,
+        origin: str,
+        channel: str,
+        sender_id: str | None,
+        now: datetime | None = None,
+    ) -> int:
+        """Insert a queued task, returning its id."""
+        cursor = self.conn.execute(
+            "INSERT INTO delegated_tasks (request, status, created_ts, origin, channel, sender_id) "
+            "VALUES (?, 'queued', ?, ?, ?, ?)",
+            (request, utc_iso(now or datetime.now(UTC)), origin, channel, sender_id),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    def claim_next_queued(self, *, now: datetime | None = None) -> sqlite3.Row | None:
+        """Flip the oldest queued row to running and return it, atomically."""
+        row = self.conn.execute(
+            "SELECT * FROM delegated_tasks WHERE status='queued' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        self.conn.execute(
+            "UPDATE delegated_tasks SET status='running' WHERE id=?", (row["id"],)
+        )
+        self.conn.commit()
+        return self.conn.execute(
+            "SELECT * FROM delegated_tasks WHERE id=?", (row["id"],)
+        ).fetchone()
+
+    def mark_task_done(
+        self, task_id: int, result: str, *, now: datetime | None = None
+    ) -> None:
+        """Mark a task as done with its result."""
+        self.conn.execute(
+            "UPDATE delegated_tasks SET status='done', result=?, finished_ts=? WHERE id=?",
+            (result, utc_iso(now or datetime.now(UTC)), task_id),
+        )
+        self.conn.commit()
+
+    def mark_task_failed(
+        self, task_id: int, error: str, *, now: datetime | None = None
+    ) -> None:
+        """Mark a task as failed with its error message."""
+        self.conn.execute(
+            "UPDATE delegated_tasks SET status='failed', error=?, finished_ts=? WHERE id=?",
+            (error, utc_iso(now or datetime.now(UTC)), task_id),
+        )
+        self.conn.commit()
+
+    def pending_tasks(self) -> list[sqlite3.Row]:
+        """Every row still queued or running, oldest first."""
+        return self.conn.execute(
+            "SELECT * FROM delegated_tasks WHERE status IN ('queued', 'running') ORDER BY id"
+        ).fetchall()
+
     def schema_version(self) -> int | None:
         """None for a database that has no version recorded yet - including a
         brand new file, where the table itself does not exist so the version has
