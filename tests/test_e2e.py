@@ -861,12 +861,22 @@ async def test_the_round_cap_ends_a_runaway_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A model that keeps asking for tools must be made to answer, or one turn spends
-    the owner's money in a loop nobody is watching."""
+    the owner's money in a loop nobody is watching.
+
+    The calls are *distinct* each round on purpose: a model re-issuing the identical
+    call is caught earlier by no-progress detection (`LOOP_REPEAT_LIMIT`), so to reach
+    the cap - the last-resort ceiling - the turn has to keep making new,
+    plausible-looking calls that never converge. That is exactly what this drives."""
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
-    (workspace / "notes.md").write_text("hi", encoding="utf-8")
+    for i in range(6):
+        (workspace / f"notes{i}.md").write_text("hi", encoding="utf-8")
 
     class Insatiable(ScriptedModel):
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **k)
+            self.round = 0
+
         async def complete(
             self, messages: list[Message], *, model: str, tools: Any = None, **kw: Any
         ) -> Completion:
@@ -874,14 +884,17 @@ async def test_the_round_cap_ends_a_runaway_turn(
             self.offered.append(tuple(tools or ()))
             if not tools:
                 return Completion(text="알았어, 그만할게.", model=model)
+            # A different file every round: real-looking progress that never ends,
+            # so the cap is what stops it, not the repeat detector.
+            self.round += 1
             return Completion(
                 text="",
                 model=model,
                 tool_calls=(
                     ToolCall(
-                        id="c",
+                        id=f"c{self.round}",
                         name="read_file",
-                        arguments={"path": str(workspace / "notes.md")},
+                        arguments={"path": str(workspace / f"notes{self.round}.md")},
                     ),
                 ),
             )

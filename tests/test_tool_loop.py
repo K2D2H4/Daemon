@@ -216,27 +216,148 @@ async def test_the_round_cap_forces_an_answer(
     assert "I will stop." in channel.sent[0].text
 
 
-async def test_an_empty_final_answer_is_never_delivered_as_silence(
+async def test_a_repeating_call_stops_before_the_cap(
+    data_dir: Path, store: Store, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A model stuck re-issuing the identical call is cut off by no-progress
+    detection, not left to burn every round up to the (now generous) cap. This is
+    the real pathology the bound exists for; the cap is only the last-resort net."""
+    (tmp_path / "notes.md").write_text("hi")
+    provider = FakeProvider(
+        reply="I will stop.",
+        scripted_calls=[[read_file_call(tmp_path / "notes.md")] for _ in range(20)],
+    )
+    channel = FakeChannel([inbound("keep going")])
+
+    with caplog.at_level("WARNING"):
+        await loop_for(
+            channel, provider, FakeMemory(), data_dir,
+            runner(store, tmp_path, mode="ask"), max_tool_rounds=20,
+        ).run()
+
+    # Stopped a few identical rounds in, nowhere near the cap of 20.
+    assert len(provider.calls) <= 5, "a stuck loop ran nearly to the cap"
+    assert any("repeat" in record.message.lower() for record in caplog.records)
+    assert provider.offered_tools[-1] == (), "the escape call must offer no tools"
+    assert "I will stop." in channel.sent[0].text
+
+
+async def test_alternating_calls_are_progress_not_a_loop(
+    data_dir: Path, store: Store, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No-progress detection keys on *consecutive* identical calls. A turn that
+    alternates between two real files is making progress and must run to the end,
+    even though each call recurs - a total-occurrence counter would wrongly trip it,
+    the way a productive turn re-running `git status` between edits would."""
+    (tmp_path / "a").write_text("A")
+    (tmp_path / "b").write_text("B")
+    a = read_file_call(tmp_path / "a", "1")
+    b = read_file_call(tmp_path / "b", "2")
+    provider = FakeProvider(reply="done", scripted_calls=[[a], [b], [a], [b], [a]])
+    channel = FakeChannel([inbound("compare them")])
+
+    with caplog.at_level("WARNING"):
+        await loop_for(
+            channel, provider, FakeMemory(), data_dir,
+            runner(store, tmp_path, mode="ask"), max_tool_rounds=10,
+        ).run()
+
+    assert "done" in channel.sent[0].text
+    assert len(provider.calls) == 6, "all five rounds ran, then the answer"
+    assert not any("repeat" in record.message.lower() for record in caplog.records)
+    assert not any("round limit" in record.message for record in caplog.records)
+
+
+async def test_a_long_productive_turn_runs_past_six_rounds(
+    data_dir: Path, store: Store, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Real agentic work - write a script, register it, test it - runs well past the
+    old six-round cap. The bound is a runaway-cost net set generously high, not a
+    budget that cuts an honest build short at six."""
+    calls = []
+    for i in range(8):
+        target = tmp_path / f"f{i}"
+        target.write_text(str(i))
+        calls.append(read_file_call(target, str(i)))
+    provider = FakeProvider(reply="all eight read", scripted_calls=[[c] for c in calls])
+    channel = FakeChannel([inbound("read all eight")])
+
+    with caplog.at_level("WARNING"):
+        # Default cap: the point is that eight rounds no longer trips it.
+        await loop_for(
+            channel, provider, FakeMemory(), data_dir, runner(store, tmp_path, mode="ask")
+        ).run()
+
+    assert "all eight read" in channel.sent[0].text
+    assert not any("round limit" in record.message for record in caplog.records)
+    ran = [row for row in store.recent_tool_calls() if row["ran"]]
+    assert len(ran) == 8, "a distinct-call build was cut off by the cap"
+
+
+async def test_the_round_limit_answer_is_salvaged_by_a_trimmed_re_ask(
     data_dir: Path, store: Store, tmp_path: Path
 ) -> None:
-    """A turn must never go silent. Measured on gemini-3.6-flash: a request no tool
-    could satisfy ('next week's weather') burned the round cap and then, on the
-    no-tools escape call, returned another bare tool call with no text - so the reply
-    was empty, the channel refused it, and the owner got nothing until they poked
-    again. When there is no answer text, a short admission goes out instead."""
+    """The real fix. Measured on gemini-3.6-flash: after a long turn, the tools-off
+    escape call carries the whole tool transcript, which primes the model to emit yet
+    another tool call instead of prose - so the owner got the generic "ask differently"
+    even though real work (a plist written) had happened. When the escape yields no
+    prose, the loop re-asks once with a *trimmed* context (just the request and what
+    ran), which is what actually gets the model to summarise. That summary is the
+    reply."""
     (tmp_path / "notes.md").write_text("hi")
 
-    class NeverAnswers:
-        """Always a tool call, never any prose - even when no tools are offered, the
-        way flash hallucinated one on the escape call."""
+    class TalksOnlyOnTheTrimmedRetry:
+        """A tool call while tools are offered, and again on the first tools-off escape
+        (the transcript-primed hallucination) - but prose on the second tools-off call,
+        the trimmed salvage."""
 
         name = "fake"
 
         def __init__(self) -> None:
-            self.offered_tools: list[tuple] = []
+            self.toolfree_calls = 0
 
         async def complete(self, messages, *, model, tools=None, **kw):  # type: ignore[no-untyped-def]
-            self.offered_tools.append(tuple(tools or ()))
+            if tools:
+                return Completion(
+                    text="", model=model, tool_calls=(read_file_call(tmp_path / "notes.md"),)
+                )
+            self.toolfree_calls += 1
+            if self.toolfree_calls == 1:
+                return Completion(
+                    text="", model=model, tool_calls=(read_file_call(tmp_path / "notes.md"),)
+                )
+            return Completion(text="Set up the plist; registering it is left.", model=model)
+
+        async def health(self) -> bool:
+            return True
+
+    channel = FakeChannel([inbound("build me the scheduler")])
+    await loop_for(
+        channel, TalksOnlyOnTheTrimmedRetry(), FakeMemory(), data_dir,
+        runner(store, tmp_path, mode="ask"), max_tool_rounds=2,
+    ).run()
+
+    assert channel.sent[0].text == "Set up the plist; registering it is left."
+    assert channel.sent[0].text != INCOMPLETE_NOTICE
+
+
+async def test_a_turn_that_never_speaks_still_reports_what_it_did(
+    data_dir: Path, store: Store, tmp_path: Path
+) -> None:
+    """The belt-and-suspenders. A turn must never go silent, and now it must never go
+    empty-handed either: when even the trimmed re-ask fails to produce prose, the loop
+    falls back to a deterministic note built from what actually ran, so the owner gets
+    'here is how far I got' plus a next step - not the old dead-end 'ask differently'
+    on top of work that really happened."""
+    (tmp_path / "notes.md").write_text("hi")
+
+    class NeverAnswers:
+        """Always a tool call, never any prose - even when no tools are offered, the
+        way flash hallucinated one on the escape call, and again on the retry."""
+
+        name = "fake"
+
+        async def complete(self, messages, *, model, tools=None, **kw):  # type: ignore[no-untyped-def]
             return Completion(
                 text="", model=model, tool_calls=(read_file_call(tmp_path / "notes.md"),)
             )
@@ -251,37 +372,37 @@ async def test_an_empty_final_answer_is_never_delivered_as_silence(
     ).run()
 
     assert channel.sent, "the turn delivered nothing at all"
-    assert channel.sent[0].text == INCOMPLETE_NOTICE
-    assert channel.sent[0].text.strip(), "an empty reply was sent as silence"
+    reply = channel.sent[0].text
+    assert reply.strip(), "an empty reply was sent as silence"
+    assert reply != INCOMPLETE_NOTICE, "fell back to the dead-end notice despite work having run"
+    assert "step limit" in reply.lower(), "the reply does not admit the limit"
+    assert "read_file" in reply, "the reply does not say what it got done"
 
 
-async def test_a_round_limit_provider_error_degrades_to_incomplete_notice(
+async def test_a_round_limit_provider_error_still_reports_what_it_did(
     data_dir: Path, store: Store, tmp_path: Path
 ) -> None:
-    """The same emptiness as the test above, but raised instead of returned.
+    """The same emptiness as the salvage test above, but raised instead of returned.
 
     A reasoning model can spend its whole output budget on reasoning tokens and
     come back with neither text nor a tool call - every provider's contract
     (`llm/base.py`) says to raise `ProviderError` for exactly that shape, not
-    return an empty `Completion`. So the round-limit escape call - tools-off,
-    just trying to summarise - can fail this way too, and it must land on the
-    same `INCOMPLETE_NOTICE` as the empty-text case, not `run()`'s generic
-    `FAILURE_NOTICE`. Reproduced with the real trigger: a Korean '기억해줘'
-    ('remember this') that burns every tool round trying to persist the fact.
+    return an empty `Completion`. So both the escape call and the trimmed re-ask -
+    tools-off, just trying to summarise - can fail this way, and when they do the
+    turn must still land on the deterministic progress note (never `run()`'s generic
+    `FAILURE_NOTICE`, which is for genuine mid-turn outages). Reproduced with the real
+    trigger: a Korean '기억해줘' ('remember this') that burns every tool round.
     """
     (tmp_path / "notes.md").write_text("hi")
 
     class BurnsTheBudget:
-        """Tool calls every round; the tools-off escape call raises, the way a
-        reasoning model that spent its whole budget on reasoning tokens does."""
+        """Tool calls while tools are offered; every tools-off call raises, the way a
+        reasoning model that spent its whole budget on reasoning tokens does - so both
+        the escape and the salvage re-ask fail."""
 
         name = "fake"
 
-        def __init__(self) -> None:
-            self.offered_tools: list[tuple] = []
-
         async def complete(self, messages, *, model, tools=None, **kw):  # type: ignore[no-untyped-def]
-            self.offered_tools.append(tuple(tools or ()))
             if not tools:
                 raise ProviderError("spent the whole budget on reasoning tokens")
             return Completion(
@@ -298,7 +419,9 @@ async def test_a_round_limit_provider_error_degrades_to_incomplete_notice(
     ).run()
 
     assert channel.sent, "the turn delivered nothing at all"
-    assert channel.sent[0].text == INCOMPLETE_NOTICE
+    reply = channel.sent[0].text
+    assert reply != INCOMPLETE_NOTICE
+    assert "step limit" in reply.lower() and "read_file" in reply
 
 
 async def test_a_first_call_provider_error_still_fails_the_turn(

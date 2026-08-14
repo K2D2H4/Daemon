@@ -596,8 +596,13 @@ class Settings(BaseSettings):
     """Characters of tool output given to the model. Paid for on every subsequent
     round of the same turn, since the result stays in the context."""
 
-    tools_max_rounds: int = Field(default=6, alias="DAEMON_TOOLS_MAX_ROUNDS")
-    """Tool round-trips allowed in one turn before it must answer."""
+    tools_max_rounds: int = Field(default=25, alias="DAEMON_TOOLS_MAX_ROUNDS")
+    """Tool round-trips allowed in one turn before it must answer. This is the value
+    the assembled app actually uses (`app.py` passes it to `ConversationLoop`), so it
+    is the live cap - not `loop.MAX_TOOL_ROUNDS`, which is only the constructor's
+    fallback. Keep the two in step (`test_the_default_round_cap_matches_the_loop_constant`):
+    a generous last-resort ceiling, since a stuck loop is caught far earlier by
+    `loop.LOOP_REPEAT_LIMIT`. Six cut honest multi-step builds short."""
 
     browser_enabled: bool = Field(default=False, alias="DAEMON_BROWSER_ENABLED")
     """Whether Daemon may fetch web pages and read the owner's open browser tabs.
