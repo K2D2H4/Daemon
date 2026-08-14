@@ -11,6 +11,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `fixtures/` | four days of Korean fixture conversation, 79 messages, 50 questions |
 | `m0_voice_spike.py` | the six things about Gemini Live only a live key could settle |
 | `m1c_voice_tools_spike.py` | whether answering a voice tool call costs the answer — it does not |
+| `voice_write_nudge_spike.py` | why voice fakes a write it never performs — the wall is nested tool-argument **schema**, not crowding or the contract wording |
 | `m1c_text_tools_spike.py` | whether our provider survives a real Gemini 3 tool round-trip — the `thoughtSignature` contract |
 | `openai_compatible_spike.py` | whether a real OpenAI-compatible endpoint answers `/models`, a Korean turn, and a tool round-trip |
 | `openai_compatible_loop_spike.py` | whether the *assembled* app survives a real turn on that endpoint — loop, recall, tool policy, audit table |
