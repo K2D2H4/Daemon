@@ -64,6 +64,7 @@ from daemon.app import health_payload, open_store
 from daemon.config import GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES, VOICE_PROVIDERS
 from daemon.llm.base import Message, ProviderError
 from daemon.mcp_catalog import CATALOG, lookup
+from daemon.setup import check_anthropic, check_gemini, check_openai
 from daemon.tasks import Task
 from daemon.tools.mcp import (
     load_config,
@@ -201,11 +202,62 @@ async def chat_test(request: Request) -> JSONResponse:
     return JSONResponse({"reply": completion.text})
 
 
+_PROBES: dict[str, tuple[str, str, str]] = {
+    # provider -> (key attr, model attr, the `.env` key its model list answers).
+    "anthropic": ("anthropic_api_key", "anthropic_model", "DAEMON_ANTHROPIC_MODEL"),
+    "openai": ("openai_api_key", "openai_model", "DAEMON_OPENAI_MODEL"),
+    "gemini": ("gemini_api_key", "gemini_model", "DAEMON_GEMINI_MODEL"),
+}
+
+
+async def _live_model_lists(settings: Any) -> dict[str, list[str]]:
+    """The chat-three providers' live model ids, keyed by provider, for the admin
+    datalist (D6, "the daemon-freeze guard").
+
+    `check_anthropic`/`check_openai`/`check_gemini` are sync and hit the network with
+    the user's key - up to `HTTP_TIMEOUT` (15s) each. Called directly inside this
+    `async def` handler, one slow or hung provider would block the event loop for
+    that long, freezing the whole daemon (channel loop, scheduler), not just this
+    request - the PortAudio-deadlock class of bug. So each probe runs in its own
+    thread (`asyncio.to_thread`) and all three run concurrently (`asyncio.gather`);
+    a raise or timeout in any one becomes an empty list for that provider, never a
+    propagated exception. Only providers whose key is set are probed at all - a
+    provider without a key is absent from the result, not `[]`.
+    """
+
+    async def one(
+        name: str, key_attr: str, model_attr: str, env_key: str
+    ) -> tuple[str, list[str] | None]:
+        key = getattr(settings, key_attr, "")
+        if not key:
+            return name, None
+        try:
+            # Dispatched on bare names rather than a dict of function objects built
+            # once at import time: that would freeze the original check_gemini and
+            # make a test's `monkeypatch.setattr(routes, "check_gemini", ...)`
+            # silently miss it, running the real (network) one instead. A bare name
+            # resolves fresh from this module's globals on every call, so the
+            # patched version is what actually runs.
+            model = getattr(settings, model_attr, "")
+            if name == "gemini":  # check_gemini takes only the key
+                verdict = await asyncio.to_thread(check_gemini, key)
+            elif name == "openai":
+                verdict = await asyncio.to_thread(check_openai, key, model)
+            else:
+                verdict = await asyncio.to_thread(check_anthropic, key, model)
+            return name, list(verdict.models.get(env_key, ()))
+        except Exception:  # noqa: BLE001 - a bad key or a down provider, never our problem
+            return name, []
+
+    pairs = await asyncio.gather(*(one(name, *cfg) for name, cfg in _PROBES.items()))
+    return {name: ids for name, ids in pairs if ids is not None}
+
+
 @router.get("/api/settings")
 async def get_settings(request: Request) -> dict[str, Any]:
-    payload = current_settings_payload(
-        request.app.state.settings, request.app.state.env_path
-    )
+    settings = request.app.state.settings
+    payload = current_settings_payload(settings, request.app.state.env_path)
+    payload["options"]["model_lists"] = await _live_model_lists(settings)
     payload["supervised"] = is_supervised()
     return payload
 

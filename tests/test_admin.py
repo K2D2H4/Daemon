@@ -53,6 +53,26 @@ def _settings(tmp_path: Path, **kw: object) -> Settings:
     return Settings(_env_file=None, data_dir=tmp_path, **kw)
 
 
+@pytest.fixture(autouse=True)
+def _no_live_model_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /settings now probes the hosted three for live model ids
+    (routes.py `_live_model_lists`) - a real `httpx.get` to Anthropic/OpenAI/Gemini
+    for any provider whose key is set. Several tests in this module set a fake key
+    (e.g. `gemini_api_key="k"`) for reasons unrelated to this feature, and the
+    suite may never touch the network (tests/CLAUDE.md) - so stub all three probes
+    here by default. The live-model-list tests below override individual probes
+    with their own `monkeypatch.setattr`."""
+    from daemon.admin import routes
+    from daemon.setup import Verdict
+
+    def fake(*_a: object, **_k: object) -> Verdict:
+        return Verdict(ok=True, detail="stub")
+
+    monkeypatch.setattr(routes, "check_anthropic", fake)
+    monkeypatch.setattr(routes, "check_openai", fake)
+    monkeypatch.setattr(routes, "check_gemini", fake)
+
+
 def _with_gateway(app, provider) -> None:
     """Wire a fake-backed gateway the way the lifespan would, minus the network."""
     app.state.gateway = LLMGateway(
@@ -895,3 +915,61 @@ def test_an_unreadable_env_reports_no_pending_rather_than_failing(tmp_path: Path
 
     assert resp.status_code == 200
     assert resp.json()["pending"] == {}
+
+
+# --- g. live model lists probe off the event loop, never the network in tests -
+
+
+async def test_live_model_lists_fall_back_to_empty_when_a_probe_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from daemon.admin import routes
+
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(routes, "check_gemini", boom)
+    lists = await routes._live_model_lists(
+        _settings(tmp_path, provider="gemini", gemini_model="g", gemini_api_key="k")
+    )
+    assert lists.get("gemini") == [], "failure must fall back to empty, never raise"
+
+
+async def test_live_model_lists_skip_providers_without_a_key(tmp_path: Path) -> None:
+    from daemon.admin import routes
+
+    # provider=gemini needs its own key to construct at all (config.py); the point
+    # here is anthropic, which has none, so it must be skipped rather than probed.
+    lists = await routes._live_model_lists(
+        _settings(tmp_path, provider="gemini", gemini_model="g", gemini_api_key="k")
+    )
+    assert "anthropic" not in lists, "no key means not probed, not an empty list"
+
+
+def test_get_settings_includes_live_model_lists_for_configured_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The wiring in `get_settings`, not just `_live_model_lists` in isolation:
+    a provider with a key gets its live ids under `options.model_lists`, and one
+    without a key is simply absent - through the real endpoint, monkeypatched
+    module attribute and all (a regression test for a dict built once at import
+    time silently ignoring the patch and hitting the real network instead)."""
+    from daemon.admin import routes
+    from daemon.setup import Verdict
+
+    monkeypatch.setattr(
+        routes,
+        "check_gemini",
+        lambda key: Verdict(
+            ok=True, detail="ok", models={"DAEMON_GEMINI_MODEL": ("gemini-2.5-flash",)}
+        ),
+    )
+    app = create_app(
+        _settings(tmp_path, provider="gemini", gemini_model="g", gemini_api_key="k")
+    )
+    client = TestClient(app, base_url=LOOPBACK)
+
+    got = client.get("/admin/api/settings").json()
+
+    assert got["options"]["model_lists"]["gemini"] == ["gemini-2.5-flash"]
+    assert "anthropic" not in got["options"]["model_lists"]
