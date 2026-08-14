@@ -550,6 +550,10 @@ def test_the_chat_model_field_is_a_click_open_select_not_a_datalist(tmp_path: Pa
     body = html[ms : html.index("\nfunction ", ms + 1)]
     assert "<select" in body and "MODEL_CUSTOM" in body  # the free-text escape option
     assert "MODEL_CUSTOM='__custom__'" in html.replace(" ", "")  # sentinel is defined
+    # An empty running value must keep an empty option selected, or the <select> would
+    # default to its first option and phantom-select a model the user never chose when
+    # they switch to a not-yet-configured provider. The head option must carry selected.
+    assert 'value="" selected' in body
     # No <datalist> element / `list=` input remains anywhere on the page (the old,
     # click-broken form). Match the element form so the prose comment explaining the
     # removal does not trip the assertion.
