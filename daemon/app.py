@@ -1229,7 +1229,7 @@ async def run_voice(
         # owner's own words (daemon/voice/conversation.py `_record`), and the origin
         # gate offers tools only to it. Empty when tools are off, which leaves the
         # session declaring none and so never yielding a tool call.
-        tool_specs = companion.specs(origin="owner")
+        tool_specs = companion.specs(origin="owner", surface="voice")
         # The tool contract rides with the persona in the system instruction, so the
         # endpoint getting tools inherits the rules the text path already has instead
         # of being written without them - which is exactly how voice came to have no
