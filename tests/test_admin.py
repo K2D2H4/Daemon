@@ -530,11 +530,34 @@ def test_model_fields_render_from_brainfield_not_rendersettings(tmp_path: Path) 
 
 
 def test_the_chat_model_field_prefers_the_live_list(tmp_path: Path) -> None:
-    """D5/D6: the hosted-three model field's datalist prefers the live probe result
+    """D5/D6: the hosted-three model field prefers the live probe result
     (`options.model_lists`), falling back to the static `options.model_suggestions`
     only when the probe found nothing."""
     html = _served_index(tmp_path)
     assert "model_lists" in html and "model_suggestions" in html
+
+
+def test_the_chat_model_field_is_a_click_open_select_not_a_datalist(tmp_path: Path) -> None:
+    """A <datalist> does not open on click - it reads as empty/broken (reported). With
+    a list to offer, fieldModel renders a real <select> (opens on click, like the
+    wizard) whose last option swaps to free text, so a not-yet-listed id stays typable.
+    No <datalist>/`list=` input remains for a model field."""
+    html = _served_index(tmp_path)
+    # fieldModel delegates the has-a-list case to modelSelect, which builds a real
+    # <select> with the free-text escape option.
+    assert "modelSelect(" in html
+    ms = html.index("function modelSelect(")
+    body = html[ms : html.index("\nfunction ", ms + 1)]
+    assert "<select" in body and "MODEL_CUSTOM" in body  # the free-text escape option
+    assert "MODEL_CUSTOM='__custom__'" in html.replace(" ", "")  # sentinel is defined
+    # An empty running value must keep an empty option selected, or the <select> would
+    # default to its first option and phantom-select a model the user never chose when
+    # they switch to a not-yet-configured provider. The head option must carry selected.
+    assert 'value="" selected' in body
+    # No <datalist> element / `list=` input remains anywhere on the page (the old,
+    # click-broken form). Match the element form so the prose comment explaining the
+    # removal does not trip the assertion.
+    assert "<datalist id" not in html and 'list="dl-' not in html
 
 
 def test_collect_patch_emits_provider_from_the_brain_select(tmp_path: Path) -> None:

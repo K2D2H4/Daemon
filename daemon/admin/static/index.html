@@ -1070,18 +1070,45 @@ function voiceField(provider,e,o){
 // free text either way (D7): a vendor the list has never heard of is not an error).
 const COMPAT_VENDOR_URLS=['https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
   'https://api.moonshot.ai/v1','https://api.deepseek.com/v1','https://openrouter.ai/api/v1'];
-// A text input backed by a <datalist> rather than a hard <select>: a just-released
-// model id must stay typeable the day it ships, before any list - live or static -
-// knows about it (D5c). `liveList` wins over `suggestions` when the probe found
-// anything; the running/pending value is never excluded, so a stale list can't
-// block a save.
+// A model field. With a list to offer (the hosted-three chat models, whose ids the
+// server probes live), a <datalist> was wrong: it does not open on click - you have to
+// type or press the down-arrow, so it reads as empty and broken (reported). Instead a
+// real <select> that opens on click, like the setup wizard's list, plus a "custom id"
+// option that swaps to free text so a just-released model id is never locked out. With
+// no list (ollama, the compatible model - open/local model spaces) it stays free text.
 function fieldModel(name,running,liveList,suggestions){
   const v=val(name,running);
   const opts=(liveList&&liveList.length)?liveList:(suggestions||[]);
-  const dl='dl-'+name;
-  const os=opts.map(x=>`<option value="${esc(x)}">`).join('');
-  return `<label class="field">${nameCell(name)}<input type="text" list="${dl}" data-f="${name}" value="${esc(v??'')}">
-    <datalist id="${dl}">${os}</datalist></label>`;
+  const inner=opts.length?modelSelect(name,v,opts)
+    :`<input type="text" data-f="${name}" value="${esc(v??'')}">`;
+  return `<label class="field">${nameCell(name)}${inner}</label>`;
+}
+const MODEL_CUSTOM='__custom__';
+function modelSelect(name,v,opts){
+  const cur=v??'';
+  // The head option carries `selected`, because a <select> with no selected option
+  // silently defaults .value to its FIRST option - which would phantom-select (and
+  // let Save write) a model the user never chose the moment they switch to a provider
+  // whose model is still unset. So: empty value -> an empty placeholder stays selected
+  // (Save then treats it as "no value", same as the old empty text field); a saved id
+  // the account no longer lists -> prepend it, selected, so it is never silently dropped.
+  const head=!cur?'<option value="" selected>choose a model…</option>'
+    :(!opts.includes(cur)?`<option value="${esc(cur)}" selected>${esc(cur)}</option>`:'');
+  const os=opts.map(x=>`<option value="${esc(x)}" ${x===cur?'selected':''}>${esc(x)}</option>`).join('');
+  return `<select data-f="${name}" data-combo="${name}">${head}${os}<option value="${MODEL_CUSTOM}">✎ enter a custom id…</option></select>`;
+}
+function modelText(name,v){
+  return `<span class="combo-text" style="display:flex;gap:6px;align-items:center">`
+    +`<input type="text" data-f="${name}" value="${esc(v??'')}" placeholder="model id" style="flex:1">`
+    +`<button type="button" class="btn" data-combo-back="${name}">↩ list</button></span>`;
+}
+// Options for one model field, for rebuilding its <select> when the user backs out of
+// custom entry - derived from the field name the same way brainField picked them.
+function modelOptsFor(name){
+  const o=SETTINGS.options||{};
+  if(name==='openai_compatible_base_url')return COMPAT_VENDOR_URLS;
+  const prov=name.replace(/_model$/,'');
+  return (o.model_lists&&o.model_lists[prov])||(o.model_suggestions&&o.model_suggestions[prov])||[];
 }
 // Provider-first MODEL card (D5/D7/D9): the provider select, then only the field(s)
 // that provider actually uses - never all of them at once, which was the eight-box
@@ -1160,6 +1187,7 @@ function collectPatch(){
       return;
     }
     if(SECRETS.includes(f)){if(v.trim())patch[f]=v;return;}
+    if(v===MODEL_CUSTOM)return;  // transient sentinel before the swap to a text input
     if(v!==(base(f)??''))patch[f]=v;
   });
   // The provider select carries data-brain, not data-f, so the loop above skips
@@ -1193,10 +1221,30 @@ $('#settings-form').addEventListener('change',ev=>{
     const bf=$('#brain-field');
     if(bf){bf.outerHTML=brainField(ev.target.value,SETTINGS.editable,SETTINGS.options);updateDirty();}
   }
+  // Model combo picked "custom": swap just this <select> for a free-text input
+  // (local surgery, so a sibling field's unsaved edit is not lost to a re-render).
+  const combo=ev.target.dataset&&ev.target.dataset.combo;
+  if(combo&&ev.target.value===MODEL_CUSTOM){
+    // Seed the text box with the value the field was drawn with, so switching to
+    // custom entry is not itself an edit (picking "custom" on a configured field must
+    // not instantly mark it dirty-with-empty). The user edits from there.
+    ev.target.outerHTML=modelText(combo,val(combo,SETTINGS.editable[combo]));
+    const t=$(`#settings-form input[data-f="${combo}"]`);if(t){t.focus();t.select();}
+    updateDirty();
+  }
 });
 $('#settings-form').addEventListener('click',ev=>{
   const sw=ev.target.closest('.sw');
   if(sw){const on=sw.dataset.v!=='true';sw.dataset.v=String(on);sw.setAttribute('aria-checked',String(on));updateDirty();return;}
+  // "↩ list": rebuild this field's <select> (preserving what was typed) so the user
+  // can go back to picking from the list without losing sibling edits.
+  const back=ev.target.dataset&&ev.target.dataset.comboBack;
+  if(back){
+    const span=ev.target.closest('.combo-text');
+    const typed=span.querySelector('input[data-f]').value;
+    span.outerHTML=modelSelect(back,typed,modelOptsFor(back));
+    updateDirty();return;
+  }
   if(ev.target.id!=='voice-play')return;
   const prov=$('[data-f="voice_provider"]');
   const sel=$('#voice-field select');
