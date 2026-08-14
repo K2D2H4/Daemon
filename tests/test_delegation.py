@@ -1,5 +1,8 @@
+import asyncio
+
 from daemon.channels.base import OutboundMessage
-from daemon.delegation import deliver_result
+from daemon.delegation import CaptureChannel, DelegationWorker, deliver_result
+from daemon.memory.store import Store
 
 
 class _FakeReading:
@@ -62,3 +65,55 @@ async def test_channel_failure_degrades_route_not_raises():
     route = await deliver_result("x", presence=_FakePresence(True),
                                  speaker=speaker, channel=channel, recipient_id="42")
     assert route == "local_speaker"  # spoke, send failed
+
+
+async def test_capture_channel_records_the_reply():
+    ch = CaptureChannel()
+    await ch.send(OutboundMessage(text="만들었어요"))
+    assert ch.reply == "만들었어요"
+
+
+async def test_worker_runs_a_queued_task_marks_done_and_delivers(db):
+    store = Store(db)
+    tid = store.enqueue_task(request="노션에 페이지 만들어줘", origin="owner",
+                             channel="voice", sender_id=None)
+    delivered = []
+
+    async def fake_run(request):
+        assert request == "노션에 페이지 만들어줘"
+        return "만들었어요"
+
+    async def fake_deliver(text, task_row):
+        delivered.append((text, task_row["id"]))
+
+    worker = DelegationWorker(store, fake_run, fake_deliver, wake=asyncio.Event())
+    ran = await worker.drain_once()
+    assert ran is True
+    assert delivered == [("만들었어요", tid)]
+    row = db.execute("SELECT status, result FROM delegated_tasks WHERE id=?", (tid,)).fetchone()
+    assert row["status"] == "done" and row["result"] == "만들었어요"
+
+
+async def test_worker_marks_failed_and_delivers_the_failure(db):
+    store = Store(db)
+    tid = store.enqueue_task(request="r", origin="owner", channel="voice", sender_id=None)
+    delivered = []
+
+    async def boom(request):
+        raise RuntimeError("notion 400")
+
+    async def fake_deliver(text, task_row):
+        delivered.append(text)
+
+    worker = DelegationWorker(store, boom, fake_deliver, wake=asyncio.Event())
+    ran = await worker.drain_once()
+    assert ran is True
+    assert delivered and "notion 400" in delivered[0]
+    row = db.execute("SELECT status, error FROM delegated_tasks WHERE id=?", (tid,)).fetchone()
+    assert row["status"] == "failed" and "notion 400" in row["error"]
+
+
+async def test_drain_once_returns_false_when_the_queue_is_empty(db):
+    store = Store(db)
+    worker = DelegationWorker(store, None, None, wake=asyncio.Event())
+    assert await worker.drain_once() is False
