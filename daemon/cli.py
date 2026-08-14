@@ -1315,7 +1315,8 @@ def _doctor() -> int:
             Check(
                 "config",
                 True,
-                f"preset={settings.preset} voice={settings.voice_enabled} [{table}]{endpoint}",
+                f"provider={settings.provider} judge_local={settings.proactive_judge_local} "
+                f"voice={settings.voice_enabled} [{table}]{endpoint}",
             ),
             _env_override_check(settings),
             _data_dir_check(settings),
