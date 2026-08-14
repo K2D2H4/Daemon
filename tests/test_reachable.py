@@ -289,7 +289,7 @@ def test_a_route_to_an_unbuildable_provider_fails_at_startup(
 
 
 def test_every_hosted_provider_is_offered_by_onboarding() -> None:
-    """A provider `DAEMON_HOSTED_PROVIDER` accepts must be pickable in `daemon setup`.
+    """A provider `DAEMON_PROVIDER` accepts must be pickable in `daemon setup`.
 
     The other direction matters too: a menu entry naming a provider `Settings`
     rejects is a question whose answer refuses to start.
