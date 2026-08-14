@@ -47,7 +47,14 @@ class FakeStream:
         without polling - the close no longer happens on the event loop."""
         self.callback = kwargs.get("callback")
         self.arrivals: asyncio.Queue[bytes] = asyncio.Queue()
-        self._loop = asyncio.get_running_loop()
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Input streams are opened on a worker thread now (record() offloads the
+            # blocking Pa_OpenStream off the loop), so construction can happen with no
+            # running loop. Only the output path uses `_loop`, and those are still
+            # constructed on the loop, so None here is harmless for a microphone stream.
+            self._loop = None  # type: ignore[assignment]
 
     def start(self) -> None:
         self.active = True
@@ -379,6 +386,117 @@ async def test_a_wedged_stream_stop_does_not_freeze_teardown() -> None:
     (stream,) = backend.inputs
     await released(stream)  # and once freed, it does stop and close the device
     assert stream.closed
+
+
+async def test_a_wedged_stream_open_does_not_freeze_the_loop() -> None:
+    """The other face of the daemon-freeze regression - the one v0.1.45 did not cover.
+
+    `record` opened its PortAudio input stream synchronously on the event-loop thread:
+    `sd.RawInputStream(...)` is `Pa_OpenStream`, and start() is `Pa_StartStream`. On the
+    wake gate's dead-stream rebuild that open deadlocked inside CoreAudio the same way the
+    stop once had - the just-dropped stream's detached release thread holding the device's
+    HAL mutex while the fresh open waited on it - and because the open ran on the loop
+    thread it froze the whole daemon for eleven hours: no logs, no scheduler, no answer to
+    the wake word. A `sample` of the resident showed `__psynch_mutexwait` under
+    `Pa_OpenStream` on the uvloop thread while a `voice-mic-release` thread sat under
+    `AudioOutputUnitStop`. v0.1.45 moved the stop off the loop; this is the open.
+
+    The open runs on a worker thread now, so an open that never returns costs one parked
+    thread, not the loop. Proof: a heartbeat keeps ticking on the loop while the stream's
+    open is wedged forever - under the old code the loop never turned again and this test
+    hangs instead of passing."""
+    never_returns = threading.Event()
+
+    class WedgingStream(FakeStream):
+        def start(self) -> None:
+            never_returns.wait()  # a deadlocked Pa_StartStream, until the test frees it
+            super().start()
+
+    class WedgingBackend(FakeSoundDevice):
+        def RawInputStream(self, **kwargs: Any) -> FakeStream:  # noqa: N802
+            stream = WedgingStream(**kwargs)
+            self.inputs.append(stream)
+            return stream
+
+    backend = WedgingBackend()
+    io = SoundDeviceAudio(backend=backend)
+    blocks = io.record()
+    opening = asyncio.create_task(anext(blocks))  # drives the generator into the wedged open
+
+    # The loop must keep turning while the open is parked. Under the bug the open ran
+    # inline on the loop thread, so the loop froze here and this timeout could never fire.
+    beats = 0
+    try:
+        async with asyncio.timeout(5):
+            while beats < 10:
+                await asyncio.sleep(0)
+                beats += 1
+    finally:
+        never_returns.set()  # free the parked thread so it does not outlive the test
+    assert beats == 10, "the event loop was frozen while the microphone stream opened"
+
+    # Freed, the open completes and the stream is an ordinary, closable microphone.
+    (stream,) = backend.inputs
+
+    async def push() -> None:
+        await asyncio.sleep(0)
+        stream.feed(b"\x00\x00")
+
+    pusher = asyncio.create_task(push())
+    async with asyncio.timeout(5):
+        assert await opening == b"\x00\x00"
+    await pusher
+    await blocks.aclose()
+    await released(stream)
+    assert stream.closed
+
+
+async def test_an_open_wedged_when_the_generator_is_closed_still_releases_the_stream() -> None:
+    """The mic-leak failure path, not the freeze one.
+
+    Moving the open off the loop introduced a new cancellation point: the wake gate's
+    45s dead-stream watchdog returns while the open is still in flight (daemon/voice/
+    wake.py's timeout -> return -> the generator is closed), and the open then completes
+    on its own thread and hands back a live, started stream that nothing in the closed
+    generator will ever read. It must still be stopped and closed, or the microphone
+    light stays on with mic_hold already released - the exact leak apple_audio.py met
+    when its tap install sat outside the try. `record` releases it from `deliver` when
+    the late stream arrives to a cancelled future."""
+    never_returns = threading.Event()
+
+    class WedgingStream(FakeStream):
+        def start(self) -> None:
+            never_returns.wait()  # the open is wedged until the test frees it
+            super().start()
+
+    class WedgingBackend(FakeSoundDevice):
+        def RawInputStream(self, **kwargs: Any) -> FakeStream:  # noqa: N802
+            stream = WedgingStream(**kwargs)
+            self.inputs.append(stream)
+            return stream
+
+    backend = WedgingBackend()
+    io = SoundDeviceAudio(backend=backend)
+    blocks = io.record()
+
+    # The watchdog, in miniature: drive the open, give up on it, and close the
+    # generator - all while the open is still wedged on its worker thread.
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(0.2):
+            await anext(blocks)
+    with contextlib.suppress(Exception):
+        await blocks.aclose()
+
+    # The open thread constructed the stream before parking in start(), and it has had
+    # the whole timeout above to do it - so it is already on the backend.
+    (stream,) = backend.inputs
+    assert not stream.active, "the open should still be wedged, not yet started"
+
+    # The HAL frees: the open completes and hands back a live stream no one will read.
+    never_returns.set()
+    await released(stream)  # it must be stopped and closed, not leaked
+    assert stream.closed, "the microphone stream leaked when the open outran the close"
+    assert not stream.active
 
 
 async def test_play_queues_at_the_output_rate(backend: FakeSoundDevice) -> None:

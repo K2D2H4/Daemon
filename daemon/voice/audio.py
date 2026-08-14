@@ -179,43 +179,79 @@ class SoundDeviceAudio:
         # stopped. The device itself lingers for about a second afterwards either
         # way (see WAKE_REARM_SETTLE_SECONDS in daemon/app.py), which the probe
         # reads as a brief, self-healing busy rather than as ours.
+        def release_off_loop(stream: Any) -> None:
+            # Stop and close on a detached daemon thread. `stream.stop()` is
+            # `Pa_StopStream` -> CoreAudio `AudioOutputUnitStop` -> a HAL mutex, and
+            # that mutex deadlocked once on the wake->voice handover - the session's
+            # macOS VoiceProcessing unit and this PortAudio stream contending the same
+            # device. On the loop thread it took the whole daemon with it (a `sample`
+            # showed `__psynch_mutexwait` under `AudioOutputUnitStop`). A private thread
+            # rather than `to_thread` so a wedged release parks one thread instead of
+            # burning a pool worker that playback needs. The thread holds `stream`, so
+            # it is not collected mid-release.
+            threading.Thread(
+                target=_release_input_stream,
+                args=(stream,),
+                name="voice-mic-release",
+                daemon=True,
+            ).start()
+
         with mic_hold.hold():
-            stream = sd.RawInputStream(
-                samplerate=self.sample_rate,
-                channels=CHANNELS,
-                dtype=DTYPE,
-                blocksize=self._block_frames,
-                callback=on_block,
-            )
-            stream.start()
+            # The open runs off the loop on its own thread, for the same reason the
+            # release does. `sd.RawInputStream(...)` is `Pa_OpenStream` and `start()`
+            # is `Pa_StartStream`, both of which can wedge on a CoreAudio HAL mutex -
+            # the one the wake gate's dead-stream rebuild deadlocked on, contending the
+            # detached stop of the stream it had just dropped. On the loop thread that
+            # froze the whole daemon for eleven hours: no logs, no scheduler, no wake, a
+            # `sample` showing `__psynch_mutexwait` under `Pa_OpenStream` on the uvloop
+            # thread. A private thread rather than `to_thread` because this open shares
+            # the stop's wedge-forever risk and must not exhaust the pool playback runs
+            # on. v0.1.45 moved the stop; this is the open it missed.
+            opened: asyncio.Future[Any] = loop.create_future()
+
+            def deliver(stream: Any) -> None:
+                # On the loop. If the generator was already closed while the open was
+                # still running - the wake gate's 45s dead-stream watchdog returns and
+                # `aclose()`s us mid-open - then nobody will ever read this stream, and
+                # the `finally` below could not release it because it did not exist yet.
+                # So release it here instead of leaving a hot microphone with `mic_hold`
+                # already let go. This is the leak daemon/voice/apple_audio.py avoids by
+                # keeping its tap on `self`; a local `stream` cannot be reached that way.
+                if opened.cancelled():
+                    release_off_loop(stream)
+                else:
+                    opened.set_result(stream)
+
+            def open_stream() -> None:
+                try:
+                    stream = sd.RawInputStream(
+                        samplerate=self.sample_rate,
+                        channels=CHANNELS,
+                        dtype=DTYPE,
+                        blocksize=self._block_frames,
+                        callback=on_block,
+                    )
+                    stream.start()
+                except Exception as exc:  # handed to the awaiter, like any open failure
+                    loop.call_soon_threadsafe(opened.set_exception, exc)
+                else:
+                    loop.call_soon_threadsafe(deliver, stream)
+
+            threading.Thread(target=open_stream, name="voice-mic-open", daemon=True).start()
             try:
+                await opened
                 while True:
                     yield await blocks.get()
             finally:
                 # Reached on cancellation and on the consumer breaking out. An open
-                # input stream that nobody reads is a microphone light left on.
-                #
-                # Off the event loop, and not an oversight. `stream.stop()` is
-                # `Pa_StopStream` -> CoreAudio `AudioOutputUnitStop` -> a HAL mutex,
-                # and that mutex deadlocked once on the wake->voice handover - the
-                # session's macOS VoiceProcessing unit and this PortAudio stream
-                # contending the same device. Because it ran on the loop thread it took
-                # the whole daemon with it: no logs, no scheduler, no wake, only a
-                # `sample` of the process to show `__psynch_mutexwait` under
-                # `AudioOutputUnitStop`. It cannot move to `to_thread` either: this
-                # finally is reached through `aclose()` on a cancelled task, where a
-                # fresh await is cancelled before it starts (see
-                # daemon/voice/apple_audio.py, which met the same wall). So the release
-                # runs on a plain daemon thread that needs no await and cannot wedge the
-                # loop - if PortAudio hangs again, one detached thread parks instead of
-                # the process. The closure holds `stream`, so it is not collected
-                # mid-release.
-                threading.Thread(
-                    target=_release_input_stream,
-                    args=(stream,),
-                    name="voice-mic-release",
-                    daemon=True,
-                ).start()
+                # input stream that nobody reads is a microphone light left on. Three
+                # states: the open never finished (cancel the future, and `deliver`
+                # releases the stream when it finally arrives); it finished with a live
+                # stream (release it); or it failed (nothing to release).
+                if not opened.done():
+                    opened.cancel()
+                elif not opened.cancelled() and opened.exception() is None:
+                    release_off_loop(opened.result())
 
     async def play(self, chunk: bytes) -> None:
         """Queue a chunk. Returns immediately.
