@@ -1,7 +1,12 @@
 import asyncio
 
 from daemon.channels.base import OutboundMessage
-from daemon.delegation import CaptureChannel, DelegationWorker, deliver_result
+from daemon.delegation import (
+    CaptureChannel,
+    DelegationWorker,
+    build_run_request,
+    deliver_result,
+)
 from daemon.memory.store import Store
 
 
@@ -117,3 +122,24 @@ async def test_drain_once_returns_false_when_the_queue_is_empty(db):
     store = Store(db)
     worker = DelegationWorker(store, None, None, wake=asyncio.Event())
     assert await worker.drain_once() is False
+
+
+async def test_build_run_request_runs_the_text_loop_and_returns_the_reply(monkeypatch):
+    captured = {}
+
+    class _FakeLoop:
+        def __init__(self, channel, gateway, companion, **kw):
+            captured["channel"] = channel
+            self._channel = channel
+
+        async def handle(self, inbound):
+            captured["inbound"] = inbound
+            await self._channel.send(type("M", (), {"text": "만들었어요"})())
+
+    monkeypatch.setattr("daemon.delegation.ConversationLoop", _FakeLoop)
+    run = build_run_request(gateway=object(), companion_factory=lambda: object())
+    reply = await run("노션에 페이지 만들어줘")
+    assert reply == "만들었어요"
+    assert captured["inbound"].text == "노션에 페이지 만들어줘"
+    assert captured["inbound"].authored_by_sender is True
+    assert captured["channel"].name == "delegate"

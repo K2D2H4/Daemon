@@ -14,6 +14,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from daemon.channels.base import InboundMessage, OutboundMessage
+from daemon.clock import now as clock_now
+from daemon.loop import ConversationLoop
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,33 @@ class CaptureChannel:
     async def listen(self) -> AsyncIterator[InboundMessage]:
         return
         yield  # pragma: no cover - makes this an async generator; never driven
+
+
+def build_run_request(
+    *, gateway: Any, companion_factory: Callable[[], Any], owner_id: str = "owner"
+) -> Callable[[str], Awaitable[str]]:
+    """A `run_request` that runs one task through the real text ConversationLoop.
+
+    A fresh CaptureChannel and companion per call: the loop records and answers as
+    the text path does, and the captured reply is what gets delivered. Origin is the
+    owner (`authored_by_sender=True`) - the request came from the owner by voice.
+    """
+
+    async def run_request(request: str) -> str:
+        capture = CaptureChannel()
+        loop = ConversationLoop(capture, gateway, companion_factory())
+        await loop.handle(
+            InboundMessage(
+                text=request,
+                sender_id=owner_id,
+                received_at=clock_now(),
+                channel="delegate",
+                authored_by_sender=True,
+            )
+        )
+        return capture.reply or ""
+
+    return run_request
 
 
 class DelegationWorker:
