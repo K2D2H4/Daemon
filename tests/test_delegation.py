@@ -1,6 +1,10 @@
 import asyncio
 
+from conftest import FakeProvider
+from test_loop import FakeMemory, gateway_for
+
 from daemon.channels.base import OutboundMessage
+from daemon.companion import Companion
 from daemon.delegation import (
     EMPTY_REPLY_MESSAGE,
     FAILURE_PREFIX,
@@ -9,7 +13,11 @@ from daemon.delegation import (
     build_run_request,
     deliver_result,
 )
+from daemon.llm.base import ToolCall, ToolSpec
 from daemon.memory.store import Store
+from daemon.tools.base import Registry
+from daemon.tools.policy import ToolPolicy
+from daemon.tools.runner import ToolRunner
 
 
 class _FakeReading:
@@ -205,3 +213,98 @@ async def test_build_run_request_runs_the_text_loop_and_returns_the_reply(monkey
     assert captured["inbound"].text == "노션에 페이지 만들어줘"
     assert captured["inbound"].authored_by_sender is True
     assert captured["channel"].name == "delegate"
+
+
+# --- end-to-end: the assembled backend chain -------------------------------------
+#
+# The wired path the unit tests above fake seam-by-seam, run for real once: enqueue ->
+# worker claims -> build_run_request -> CaptureChannel + the real ConversationLoop ->
+# Companion offers the owner turn its full tool set -> the model asks for a nested
+# write tool (the kind voice cannot call) -> ToolRunner runs it -> the reply is
+# captured -> the task is marked done -> it is delivered. Fakes stop at the network
+# edge only: the LLM decision (FakeProvider) and the write tool's leaf effect. Revert
+# the worker's mark/deliver or the build_run_request wiring and this fails - not a
+# tautology.
+
+
+class _RecordingCreateTool:
+    """Stands in for a real nested-schema write tool (like notion-create-pages): the
+    text path can call it where the voice model could not. Records that it ran."""
+
+    risk = "guarded"
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.spec = ToolSpec(
+            name="create_page",
+            description="Create a page under a parent (nested schema).",
+            parameters={
+                "type": "object",
+                "properties": {"parent": {"type": "object"}, "pages": {"type": "array"}},
+            },
+        )
+
+    def preview(self, arguments):
+        return "create_page(...)"
+
+    async def run(self, arguments):
+        self.calls.append(dict(arguments))
+        return "created 1 page"
+
+
+async def test_end_to_end_a_delegated_task_runs_the_real_text_loop_and_reports(db, data_dir):
+    store = Store(db)
+    create_tool = _RecordingCreateTool()
+    registry = Registry()
+    registry.register(create_tool)
+    tools = ToolRunner(registry, ToolPolicy(store, mode="full"), store)
+
+    reply = "노션에 '내일 준비물' 페이지 만들어서 저장했어."
+    provider = FakeProvider(
+        reply=reply,
+        scripted_calls=[
+            [
+                ToolCall(
+                    id="1",
+                    name="create_page",
+                    arguments={"parent": {"page_id": "x"}, "pages": [{"title": "내일 준비물"}]},
+                )
+            ]
+        ],
+    )
+
+    def companion_factory():
+        return Companion(FakeMemory(), data_dir=data_dir, tools=tools)
+
+    run_request = build_run_request(
+        gateway=gateway_for(provider), companion_factory=companion_factory
+    )
+    delivered: list[tuple[str, int]] = []
+
+    async def deliver(text, row):
+        delivered.append((text, row["id"]))
+
+    worker = DelegationWorker(store, run_request, deliver, wake=asyncio.Event())
+
+    tid = store.enqueue_task(
+        request="노션에 '내일 준비물' 하위 페이지 만들어줘",
+        origin="owner",
+        channel="voice",
+        sender_id=None,
+    )
+    ran = await worker.drain_once()
+
+    assert ran is True
+    # the assembled text loop actually ran the nested write tool the voice model cannot call
+    assert len(create_tool.calls) == 1
+    # the delegated turn was offered the full tool set (origin=owner, surface="text")
+    assert any(
+        spec.name == "create_page" for offered in provider.offered_tools for spec in offered
+    )
+    # the row went queued -> done with the real reply, and it was delivered
+    row = store.conn.execute(
+        "SELECT status, result FROM delegated_tasks WHERE id=?", (tid,)
+    ).fetchone()
+    assert row["status"] == "done"
+    assert row["result"] == reply
+    assert delivered == [(reply, tid)]
