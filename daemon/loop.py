@@ -66,12 +66,34 @@ INCOMPLETE_NOTICE = (
     "I went back and forth on that one and couldn't wrap it up cleanly. Could you try "
     "again, or ask it a little differently?"
 )
-"""Sent when a turn ends with no answer text at all - the model kept asking for
-tools until the round cap and then, even with none on offer, returned another
-(often hallucinated) tool call instead of prose. The channel refuses an empty
-message, so without this the whole turn is silence the owner reads as being
-ignored, and they have to poke it again to get anything (measured on
-gemini-3.6-flash: a 'next week's weather' turn that no tool could satisfy)."""
+"""Last resort, only when a limited-out turn ran *nothing* worth reporting: the model
+kept asking for tools until the cap and then, even with none on offer, returned
+another (often hallucinated) tool call instead of prose. The channel refuses an
+empty message, so without this the whole turn is silence the owner reads as being
+ignored. When real work *did* run, `LIMIT_PROGRESS_NOTICE` goes out instead - this
+bare version stranded the owner on top of a plist that had actually been written
+(measured on gemini-3.6-flash: the 'build me a scheduler' turn)."""
+
+SALVAGE_INSTRUCTION = (
+    "You were working on the user's request and reached your step limit before you "
+    "could finish. Do not call any tools now. Reply to the user in plain prose: say "
+    "what you got done and what is still left, then offer to continue.{steps}"
+)
+"""The trimmed re-ask. The escape call that carries the whole tool transcript primes
+the model to emit yet another tool call instead of summarising (measured: that is why
+the owner got the generic notice on top of finished work). Re-asking with only the
+request and a short list of what ran - no transcript, no tools - is what actually
+gets prose back."""
+
+LIMIT_PROGRESS_NOTICE = (
+    "I hit my step limit before I could wrap that up. The last thing I got done was "
+    "{last}. Want me to keep going from there?"
+)
+"""The deterministic floor when even the trimmed re-ask stays silent: built from what
+actually ran, so the owner always gets how far it got and a next step rather than a
+dead end. Narrating a tool this way is the one place the loop does - reserved for the
+turn that produced no prose at all, where a bare apology on top of real work is worse
+than the clutter."""
 
 APPROVAL_REQUEST = (
     "That needs your say-so:\n\n{preview}\n\n"
@@ -104,6 +126,15 @@ def _round_signature(tool_calls: tuple[ToolCall, ...]) -> tuple[tuple[str, str],
             for call in tool_calls
         )
     )
+
+
+def _call_label(call: ToolCall) -> str:
+    """A one-line, human-facing tag for a call that ran: the tool plus its most telling
+    argument (a path or a command). Used only to tell the owner how far a limited-out
+    turn got - the full record is the `tool_calls` audit."""
+    arg = call.arguments.get("path") or call.arguments.get("command") or ""
+    arg = str(arg).strip().splitlines()[0][:80] if arg else ""
+    return f"`{call.name}` {arg}".strip()
 
 
 class ConversationLoop:
@@ -229,7 +260,14 @@ class ConversationLoop:
             completion = await self._gateway.complete(Task.CHAT_TEXT, messages)
             return completion.text, Outcome()
 
+        # Captured before the loop mutates `messages`: the salvage re-ask needs the
+        # owner's own words, and by the end the list is mostly tool turns.
+        user_request = next(
+            (m.content for m in reversed(messages) if m.role == "user"), ""
+        )
+
         outcome = Outcome()
+        did: list[str] = []
         completion = await self._gateway.complete(Task.CHAT_TEXT, messages, tools=specs)
 
         rounds = 0
@@ -266,17 +304,16 @@ class ConversationLoop:
                     # that emptiness rather than returning it. The `not
                     # completion.text.strip()` check below already forgives that
                     # emptiness when it comes back as an empty completion; this call
-                    # is the one place it can arrive as a raise instead, because it
-                    # is the only call made with no tools on offer. A first-call or
-                    # mid-loop ProviderError is a genuine failure on an ordinary turn
-                    # and must still reach run()'s FAILURE_NOTICE - only this last
-                    # call, already past the round cap and just trying to summarise,
-                    # degrades to the same notice as empty text.
+                    # is one place it can arrive as a raise instead, because it is
+                    # made with no tools on offer. A first-call or mid-loop
+                    # ProviderError is a genuine failure on an ordinary turn and must
+                    # still reach run()'s FAILURE_NOTICE - only this last call, past
+                    # the cap and just trying to summarise, degrades to the salvage.
                     logger.warning(
-                        "%s, and the escape call raised; sending the incomplete notice",
+                        "%s, and the escape call raised; salvaging a progress note",
                         reason,
                     )
-                    return INCOMPLETE_NOTICE, outcome
+                    return await self._finish_without_prose(user_request, did), outcome
                 break
             rounds += 1
 
@@ -284,6 +321,14 @@ class ConversationLoop:
                 completion.tool_calls, origin=origin, channel=channel, sender_id=sender_id
             )
             outcome.approvals.extend(round_outcome.approvals)
+            # What actually ran, for the salvage note if this turn never gives prose.
+            # Only calls that succeeded: "how far I got" should not list a failure.
+            by_id = {call.id: call for call in completion.tool_calls}
+            did.extend(
+                _call_label(by_id[result.call_id])
+                for result in round_outcome.results
+                if result.ok and result.call_id in by_id
+            )
 
             messages.append(
                 Message(
@@ -316,13 +361,44 @@ class ConversationLoop:
         if not completion.text.strip():
             # No answer text - the model spent the round cap on tool calls and then
             # returned another one instead of prose, even with no tools offered. The
-            # channel refuses an empty message, so returning "" is silence; say
-            # something the owner can act on instead.
+            # channel refuses an empty message, so returning "" is silence; salvage a
+            # reply from what ran instead.
             logger.warning(
-                "turn produced no answer text after tools; sending the incomplete notice"
+                "turn produced no answer text after tools; salvaging a progress note"
             )
-            return INCOMPLETE_NOTICE, outcome
+            return await self._finish_without_prose(user_request, did), outcome
         return completion.text, outcome
+
+    async def _finish_without_prose(self, user_request: str, did: list[str]) -> str:
+        """A reply for a turn that ran tools but never gave prose.
+
+        First a trimmed re-ask - just the request and a short list of what ran, no
+        tool transcript and no tools on offer - because the transcript is what primes
+        the model to emit yet another tool call instead of summarising. If even that
+        stays silent, a deterministic note built from what ran, so the owner always
+        gets how far it got and a next step rather than a dead end.
+        """
+        steps = "; ".join(did[-8:])
+        instruction = SALVAGE_INSTRUCTION.format(
+            steps=f" Steps you completed: {steps}." if steps else ""
+        )
+        try:
+            completion = await self._gateway.complete(
+                Task.CHAT_TEXT,
+                [
+                    Message(role="system", content=instruction),
+                    Message(role="user", content=user_request),
+                ],
+            )
+        except ProviderError:
+            # The re-ask is best-effort: a provider that fails it still owes the owner
+            # the deterministic note below, not run()'s generic failure.
+            completion = None
+        if completion is not None and completion.text.strip():
+            return completion.text
+        if did:
+            return LIMIT_PROGRESS_NOTICE.format(last=did[-1])
+        return INCOMPLETE_NOTICE
 
     async def _ask_approvals(self, outcome: Outcome, recipient_id: str | None) -> None:
         """Send one approval request per parked call, after the reply.
