@@ -183,8 +183,15 @@ unparseable stored timestamp drops that one line, not the block.
 - **The observed case as a regression test.** Friday 16:40-commitment thread + Tuesday
   09:28 "벨라" through `_assemble`, asserting a session boundary lands between them and
   the commitment renders expired.
-- `commitments` false-positive guards: `_EVENT_CANCELLED` in the same message, a past
-  tense with `_TENSE_NEUTRAL`, and a non-owner-origin utterance — each yields nothing.
+- `commitments` false-positive guards: `EVENT_CANCELLED` in the same message, a past
+  tense with `TENSE_NEUTRAL`, and a non-owner-origin utterance — each yields nothing.
+  **Each guard needs a control assertion showing the same sentence WITHOUT the
+  guard-tripping word does produce a commitment, and each must be verified by removing
+  the guard and confirming its test fails.** These guards overlap, and the overlap hid a
+  hole: the natural cancellation phrasing ("오늘 회의 취소됐어") is filtered by the
+  past-tense guard instead, so `EVENT_CANCELLED` could be deleted outright with every
+  test still passing. Without a control, an empty result cannot be told apart from a
+  sentence that parsed as nothing.
 - Injection: a message containing a boundary marker and event words produces a block
   containing no substring of it.
 - **Proactivity must not move.** The existing `candidates` suite passes unchanged after
