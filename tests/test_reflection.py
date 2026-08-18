@@ -1198,3 +1198,21 @@ async def test_a_tool_fact_that_repeats_a_known_one_is_dropped(
 
     assert curated.read(data_dir).count("발표는 목요일이다") == 1
     assert result.tool_facts == 0
+
+
+async def test_forcing_a_day_replaces_the_artifact_rather_than_appending(
+    data_dir: Path, store: Store
+) -> None:
+    """Found by reading a real one: `daemon reflect --force` on a day that already
+    had an artifact left two `# <date> 성찰` blocks in one file, the old conclusion
+    above the new one. The artifact is what a human reads to check the pass, so two
+    contradictory versions of a night is the one thing it must not hold - and the
+    stale half reads as current because it comes first.
+    """
+    record(store, "연희동으로 이사했어")
+
+    await pass_for(data_dir, store).run(DAY)
+    await pass_for(data_dir, store).run(DAY, force=True)
+
+    text = artifact_path(data_dir, DAY).read_text(encoding="utf-8")
+    assert text.count(f"# {DAY} 성찰") == 1

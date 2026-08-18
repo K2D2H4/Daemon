@@ -35,6 +35,15 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   none in these runs, and the blast radius is bounded by design (`origin='untrusted'`, cannot
   retire, cannot become a rule, shown under its own artifact heading) - but if one member of
   that allowlist is dropped, drop this one first.
+- **Reading a real artifact found a defect two suites of green tests did not.**
+  `_write_artifact` used `open_private_append`, so `daemon reflect --force` on a day that
+  already had one left two `# <date> 성찰` blocks in a single file - the superseded
+  conclusion above the current one, and the stale half reads as current because it comes
+  first. Invisible to every unit test, because they each wrote a day once. It is
+  `write_private_replace` now, whose docstring already listed the curated tier and entity
+  notes as files that are rewritten rather than appended; the artifact was simply missing
+  from that list. Same route as the duplicate-fact finding above: the counts looked fine
+  both times.
 - **Running reflection for real found two defects unit tests did not.** Entity notes were
   stamped with the day of the *run*, so a months-long catch-up reads as all-today; and two
   facts sharing a supersession key retired the wrong half (`data/memory/core.md` kept the 3).

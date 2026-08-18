@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import sqlite3
 from dataclasses import dataclass, field, replace
@@ -42,7 +41,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from daemon.clock import now as clock_now
-from daemon.fs import open_private_append, secure_dir
+from daemon.fs import secure_dir, write_private_replace
 from daemon.llm.base import Message, ProviderError
 from daemon.llm.gateway import LLMGateway
 from daemon.memory import entities as entity_notes
@@ -556,11 +555,21 @@ def render_artifact(
 
 
 def _write_artifact(path: Path, text: str) -> None:
+    """Replace, never append.
+
+    It used to append, which is invisible until something rewrites a day: `--force`
+    on a day that already had an artifact left two `# <date> 성찰` blocks in one
+    file, the superseded conclusion sitting *above* the current one. This file is
+    what a human reads to check the pass, so it reading as two contradictory
+    nights - stale half first - defeats the only job it has.
+
+    `write_private_replace` rather than a plain truncate for the reason its own
+    docstring gives about entity notes: a reader must see the old artifact or the
+    new one, never a half-written one, and losing the previous content to a crash
+    mid-write is worse than not rewriting at all.
+    """
     secure_dir(path.parent)
-    with open_private_append(path) as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
+    write_private_replace(path, text)
 
 
 # --- the pass ---------------------------------------------------------------
