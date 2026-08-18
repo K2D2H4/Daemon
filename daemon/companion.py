@@ -260,6 +260,7 @@ class Companion:
         history: Sequence[LoggedMessage] = (),
         already: frozenset[str] | set[str] = frozenset(),
         origin: str = "owner",
+        now: datetime | None = None,
     ) -> tuple[str, ...]:
         """Everything to put in front of the model this turn, in order.
 
@@ -279,8 +280,14 @@ class Companion:
         `already` is the recent window's contents: it carries searched hits verbatim
         and in their real position, so repeating one as "recalled" would make the
         model read one event as two.
+
+        `now` defaults to a fresh `clock.now()`, but a caller that also computes
+        `timesense.session_breaks` for the same turn (`ConversationLoop._assemble`)
+        must pass its own moment instead. Two separate reads inside one turn can
+        straddle a minute - and, across local midnight, a date - which is how the
+        window's break line once named tomorrow while this block still named today.
         """
-        moment = clock.now()
+        moment = clock.now() if now is None else now
         items = await self.search(query) if self.has_recall else []
         blocks = [
             timesense.now_block(moment),
@@ -291,7 +298,7 @@ class Companion:
             timesense.commitments([*history, *items], moment),
         ]
         if self.has_recall:
-            blocks.append(self.recall_block(items, already=already))
+            blocks.append(self.recall_block(items, already=already, now=moment))
         return tuple(block for block in blocks if block)
 
     def _tool_rules(self, *, origin: str) -> str:
@@ -318,6 +325,7 @@ class Companion:
         items: list[RecalledItem],
         *,
         already: frozenset[str] | set[str] = frozenset(),
+        now: datetime | None = None,
     ) -> str:
         """Recalled memory as prompt text, under a nonce nobody could have guessed.
 
@@ -325,8 +333,13 @@ class Companion:
         weeks ago must not be able to close the block it arrives in, and a test that
         pinned the nonce would be testing the test. `render_recall` takes one
         explicitly for the cases that do need a fixed value.
+
+        `now` is threaded through rather than left to `render_recall`'s own default:
+        `context()` passes the one moment it already read, so a memory timestamped
+        today does not read as yesterday's because this call happened to land a
+        minute later.
         """
-        return render_recall(items, secrets.token_hex(4), already=already)
+        return render_recall(items, secrets.token_hex(4), already=already, now=now)
 
     def recall_key(self, items: list[RecalledItem]) -> str:
         """The same memories under a fixed nonce, for telling two payloads apart.

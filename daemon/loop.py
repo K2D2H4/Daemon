@@ -529,18 +529,25 @@ class ConversationLoop:
         that turned out to matter. Which blocks there are, and in what order, is
         `Companion.context`; this decides that each becomes a system turn ahead of
         the conversation.
+
+        The clock is read exactly once, here, and threaded into both
+        `Companion.context` and `timesense.session_breaks` below. Two separate reads
+        used to straddle a minute - and, near local midnight, a date - so one prompt
+        named today in `[현재 시각]` and tomorrow in `[대화 단절]`.
         """
         history = await self._companion.recent(limit=self._context_turns)
+        moment = clock.now()
         blocks = await self._companion.context(
             inbound.text,
             history=history,
             already={item.content for item in history},
             origin=origin,
+            now=moment,
         )
         messages = [Message(role="system", content=block) for block in blocks]
         turns = [Message(role=item.role, content=item.content) for item in history]
         # Descending, so an earlier insertion does not shift a later index.
-        for index, line in reversed(timesense.session_breaks(history, clock.now())):
+        for index, line in reversed(timesense.session_breaks(history, moment)):
             turns.insert(index, Message(role="system", content=line))
         messages.extend(turns)
 

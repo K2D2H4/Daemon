@@ -367,6 +367,69 @@ async def test_the_reported_case_carries_all_three_time_blocks_at_once(
     )
 
 
+async def test_one_assembled_turn_reads_the_clock_once(
+    data_dir: Path, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch, seoul: None
+) -> None:
+    """`daemon/timesense.py`'s module docstring says `now` is always a parameter
+    partly because two reads of the clock inside one turn can straddle a minute -
+    reproduced live across local midnight: one prompt carried `[현재 시각] ... 8월
+    18일 화요일 오후 11시 59분` beside `[대화 단절] ... 오늘 8월 19일 수요일`, two
+    different dates in one prompt, the exact bug class this branch exists to stop.
+
+    The fake clock starts one minute before local midnight and advances two minutes
+    on every call. Before the fix, `_assemble` read `clock.now()` once inside
+    `Companion.context` for `[현재 시각]`, again inside `render_recall` (the default
+    it fell back to when `recall_block` did not pass one on), and a third time for
+    `timesense.session_breaks` - three reads, and the second and third land after
+    midnight while the first does not. After the fix there is exactly one read,
+    threaded through all three, so all three name the same day.
+    """
+    calls = 0
+
+    def advancing_clock() -> datetime:
+        nonlocal calls
+        # 2026-08-18 14:59 UTC = 2026-08-18 23:59 KST, one minute before midnight.
+        moment = datetime(2026, 8, 18, 14, 59, tzinfo=UTC) + timedelta(minutes=2 * calls)
+        calls += 1
+        return moment
+
+    monkeypatch.setattr(clock, "now", advancing_clock)
+
+    memory = FakeMemory()
+    memory.records.extend(
+        [
+            logged("예전 대화입니다", datetime(2026, 8, 14, 8, 0, tzinfo=UTC)),
+            logged("네 알겠습니다", datetime(2026, 8, 14, 8, 1, tzinfo=UTC), "assistant"),
+        ]
+    )
+    bare_greeting = InboundMessage(
+        text="벨라",
+        sender_id="42",
+        received_at=datetime(2026, 8, 18, 14, 30, tzinfo=UTC),  # 23:30 KST, same day
+        channel="fake",
+    )
+
+    await ConversationLoop(
+        FakeChannel([bare_greeting]),
+        gateway_for(fake_provider),
+        Companion(
+            memory,
+            data_dir=data_dir,
+            recall=FakeRecall([recalled("자정 근처에 남긴 기억", day=18)]),
+        ),
+    ).run()
+
+    rendered = [m.content for m in fake_provider.calls[0]]
+    now_block = next(text for text in rendered if text.startswith("[현재 시각]"))
+    assert "8월 18일 화요일" in now_block, now_block
+
+    break_line = next(text for text in rendered if text.startswith("[대화 단절]"))
+    assert "오늘 8월 18일 화요일" in break_line, break_line
+
+    recall_block = next(text for text in rendered if text.startswith(RECALL_PREFIX))
+    assert "- 오늘 " in recall_block, recall_block
+
+
 async def test_three_sessions_produce_two_breaks_in_the_right_slots(
     data_dir: Path, fake_provider: FakeProvider
 ) -> None:
