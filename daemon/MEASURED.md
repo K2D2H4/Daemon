@@ -70,8 +70,13 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   is honest on these turns either way (the owner did make a sound), so rule 10 was never
   what would have caught it.
 
-  Residual, stated because the number is small: only 12 voice tool calls fall after the fix,
-  so "zero" here is weak evidence rather than a clean bill of health.
+  **Do not read this as "voice tool calls are safe now".** `CALLED_BY_NAME` covers only the
+  case where *the recognizer decided the segment is the name and nothing else*
+  (`_opening_text`, `daemon/voice/conversation.py`). The utterance that actually fired the
+  namesake web search - "그냥 영어로" - was not wake noise but an ambiguous mid-conversation
+  fragment, which that fix does not touch. A model reaching for a tool on a fragment is still
+  open, and only 12 voice tool calls fall after the fix, so the data cannot separate the two
+  cases either.
 - **Running reflection for real found two defects unit tests did not.** Entity notes were
   stamped with the day of the *run*, so a months-long catch-up reads as all-today; and two
   facts sharing a supersession key retired the wrong half (`data/memory/core.md` kept the 3).
