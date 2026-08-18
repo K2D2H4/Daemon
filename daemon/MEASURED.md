@@ -264,3 +264,53 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   never showed the model. Reworded to name both dates and the gap directly instead of
   pointing at a position (`daemon/timesense.py::_break_line`), and pinned against the actual
   `gemini` payload builder in `tests/test_providers.py` so this cannot regress silently.
+- **The proactive path reaches a labelable row, and it took an isolated data dir to
+  find out (2026-08-18).** `proactive_utterances` had been empty since the daemon
+  became able to speak first in v0.1.46, so nothing had ever confirmed the half of
+  the pipeline *after* the judge. Driven against live `gemini` on a copy of the
+  owner's data dir, with one substitution — a capturing channel in place of Telegram,
+  so nothing was sent — one armed `open_loop` candidate produced:
+  ```
+  kind=open_loop  route=telegram  label=None
+  text=아까 말했던 그 회의는 무사히 끝났어요? 피 터지는 전쟁은 아니었길 바라는데.
+  gate=ok - telegram: DAEMON_VOICE_ENABLED is off
+  ```
+  The row carries its `gate_snapshot`, and the outbound message carries
+  `labelable=True` with the `utterance_id`. A second tick in the same run was
+  refused by the 30-minute global cooldown, which is the gate working. Not verified
+  here: the Telegram render and the button press itself.
+- **The judge's refusals are deterministic per reason *shape*, not noisy
+  (2026-08-18).** 20 live calls per reason, using the reason strings the owner's own
+  history produced:
+
+  | reason | outcome |
+  |---|---|
+  | `open_loop` (08-14 '오늘 회의') | **20/20 spoke** |
+  | `silence` ("마지막 대화가 12시간 전…") | **20/20 nothing worth saying** |
+  | `association` at `min_age_days=7` (two candidates) | **20/20 and 20/20 nothing worth saying** |
+
+  With the PR's own 6/6, `open_loop` is 26/26. The `silence` column explains the
+  production tally exactly — 159 of 163 logged declines were `silence`
+  (`nothing worth saying`), and the remaining 4 were the `open_loop` truncation
+  above, all before v0.1.54. **A generator whose reason is nothing but elapsed time
+  cannot produce speech**, so the 288 ticks a day that generate one are spending a
+  model call to be refused. That is PLAN 6.2's asymmetric default working, and it is
+  also the whole of type C's contribution.
+- **Lowering `ASSOCIATION_MIN_AGE_DAYS` was proposed and the measurement killed it
+  (2026-08-18).** At floors 7/10/14 days against 884 embedded messages, type E
+  surfaced 3/2/0 candidates. What it surfaced at 7 days was the owner's own
+  command history: `'오늘 날짜가 어떻게됨?'` (score 0.795), `'오늘 날짜좀 알려줄래?'`
+  (0.766), `'이내용들 옵시디언 위키에도 좀 넣어줄래?'` (0.708) — matched against a
+  query built from the last three owner utterances, which were
+  `'우리가 생성했던 옵시디언 배치 기억나?'` and two about a job that did not run. The
+  similarity is real and the association is worthless, and the judge said so 20/20
+  on both. So E's floor is not what stops E; **this install's conversation is almost
+  entirely tool commands**, and E quotes owner messages. The constant was left at 30.
+- **Type B is starved by the same fact, and its lexicon is not the problem
+  (2026-08-18).** 463 owner utterances, **0** matching `_EMOTIONS`. Widening the scan
+  to 30 emotion words that are deliberately *not* in the lexicon (피곤·귀찮·실망·후회·
+  부담·최악·망했…) finds **3 hits in 579 lines**. The owner talks to this daemon in
+  imperatives — "오늘 서울시 날씨좀 알려줘", "notion 메인 화면 띄워 줘", "파일좀 열어줘".
+  So of the five generators, exactly one (A) can currently produce a reason the judge
+  will speak on, which is the shape PLAN 6.2 warns about: a competent assistant
+  rather than a companion. That is not a tuning gap.
