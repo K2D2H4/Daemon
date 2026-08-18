@@ -262,6 +262,15 @@ block at the top versus immediately before the final user turn — and both arms
 which settles open question 1 no better than not asking it. Details and the caution about
 batch-to-batch variance are in `daemon/MEASURED.md`.
 
+**Post-fix (same day).** The final whole-branch review found why: on `gemini`, `anthropic`
+and `openai` every system message is concatenated into one top-level field and dropped from
+the turn array, so decision 2's inline placement does not survive and the line's original
+wording pointed at a position the model could not see. The line is now worded to be true in
+both placements, and gemini's hoisting is pinned by a test. Re-measured: **1 of 20**, against
+5 of 26 before — Fisher's exact p = 0.21, so this is *not* a demonstrated reduction in the
+rate. The reword earns its place because the old line was provably false on the configured
+provider, not because the number moved.
+
 **What this means for the decisions above.** Decisions 1-3 and 5 are delivered and hold.
 Decision 4's block is present and correct, but the *outcome* it exists for — the daemon
 never describing a past commitment as pending — is not reliably achieved by putting the

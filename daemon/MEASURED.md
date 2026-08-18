@@ -210,6 +210,22 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   failures are all the same shape: the window's last assistant turn is an enthusiastic promise
   about the reminder, and the model continues it. Anyone tuning this needs n well above 10 per
   arm and should measure against that shape specifically.
+- **The reason that A/B settled nothing: on every hosted provider there is no such thing as
+  block position (2026-08-18).** the three files under `daemon/llm/providers/` for gemini, anthropic and openai each do
+  `"\n\n".join(m.content for m in messages if m.role == "system")` into one top-level field
+  and drop those messages from the turn array. So `[대화 단절]`, spliced into the window at the
+  index where the conversation broke, arrives concatenated with the persona and the tool rules
+  — and its original wording, "위는 8월 14일 금요일, 아래는 …", pointed at a position the model
+  could not see. Feeding the reported case's message list to gemini's `_contents` returns
+  `[user, model, user]` with the line absent. Only `ollama` and `openai_compatible` keep system
+  turns in place. Two consequences worth keeping: a `FakeProvider` that receives the raw
+  `list[Message]` cannot see this class of defect, and any future reasoning about where a
+  system block sits is meaningless unless the provider is one of those two.
+- **Rewording that line to be position-independent measured 1/20, against 5/26 before — and
+  that is NOT a demonstrated improvement (2026-08-18).** Fisher's exact on 5/26 vs 1/20 gives
+  p = 0.21. The reword is worth having because the old line was *provably false* on the
+  configured provider, not because the failure rate is proven lower. Anyone claiming this fixed
+  the rate needs a much larger n; see the batch instability above.
 - **"Inline placement is the whole point" was true for two providers out of five
   (2026-08-18).** `docs/superpowers/specs/2026-08-18-time-awareness-design.md`'s decision 2
   said the `[대화 단절]` line's position states the fact so the model does no counting -
