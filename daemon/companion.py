@@ -32,7 +32,7 @@ import logging
 import re
 import secrets
 from collections.abc import Callable, Sequence
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from daemon import clock, timesense
@@ -132,6 +132,14 @@ survives, and a single long message must not crowd out the rest of it."""
 _IDENTITY_NONCE = "same-memories"
 """The nonce `Companion.recall_key` renders under. **Never sent** - it is a fixed
 string, so anything planted in a recorded message could close a block wearing it."""
+
+_IDENTITY_NOW = datetime(2099, 1, 1, tzinfo=UTC)
+"""The `now` `recall_key` renders against. Never sent, and deliberately far in the
+future: `timesense.relative` is a function of *both* timestamps, so rendering an
+identity key against the live clock would make an unchanged memory set produce a
+different key the moment the local date turned over - and the voice path would
+re-seed facts it had already sent. Far enough ahead that every item lands in the
+stable absolute form."""
 
 ResolveId = Callable[[str], int | None]
 """Returns the id of the message just recorded, or None if the newest recorded
@@ -324,7 +332,7 @@ class Companion:
         the model on every partial transcript would hand it the same facts over and
         over.
         """
-        return render_recall(items, _IDENTITY_NONCE)
+        return render_recall(items, _IDENTITY_NONCE, now=_IDENTITY_NOW)
 
     async def search(self, query: str) -> list[RecalledItem]:
         """Lane 1: what is worth putting back in front of the model.
@@ -502,7 +510,11 @@ class Companion:
 
 
 def render_recall(
-    items: list[RecalledItem], nonce: str, *, already: frozenset[str] | set[str] = frozenset()
+    items: list[RecalledItem],
+    nonce: str,
+    *,
+    already: frozenset[str] | set[str] = frozenset(),
+    now: datetime | None = None,
 ) -> str:
     """Recalled memory as prompt text: up to two blocks, or an empty string.
 
@@ -514,11 +526,16 @@ def render_recall(
     something was said is part of what it means. Curated facts are not, because a
     standing fact has no useful "when" and a date invites the model to treat it as a
     stale quotation rather than something it knows.
+
+    The rendering is relative *and* absolute (`timesense.relative`): an ISO instant
+    made the model do UTC-to-local arithmetic it gets wrong, and a bare "지난주
+    금요일" collides the moment two hits land on the same weekday.
     """
     from daemon.memory.recall import CURATED_ROLE
 
+    moment = clock.now() if now is None else now
     searched = [
-        f"- {clock.to_iso(item.ts)} {_label(item)}: {_one_line(item.content)}"
+        f"- {timesense.relative(item.ts, moment)} {_label(item)}: {_one_line(item.content)}"
         for item in items
         if item.role != CURATED_ROLE and item.content not in already
     ]

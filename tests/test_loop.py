@@ -514,10 +514,16 @@ async def test_the_recall_block_sits_before_the_live_conversation(
 
 
 async def test_one_recalled_item_stays_one_line(
-    data_dir: Path, fake_provider: FakeProvider
+    data_dir: Path, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch, seoul: None
 ) -> None:
     # Multi-line content would blur the boundary between items, and the boundary
     # is the only thing telling the model where a quotation ends.
+    #
+    # Migrated off the ISO instant `clock.to_iso` used to produce: recall now
+    # renders `timesense.relative`, which needs both ends of the gap, so - per
+    # tests/CLAUDE.md's rule for a time-dependent test - the clock is pinned here
+    # too, not just the recalled item's own timestamp.
+    monkeypatch.setattr(clock, "now", lambda: datetime(2026, 8, 3, 9, 12, tzinfo=UTC))
     await ConversationLoop(
         FakeChannel([inbound("hi")]),
         gateway_for(fake_provider),
@@ -530,7 +536,7 @@ async def test_one_recalled_item_stays_one_line(
 
     (block,) = [m for m in fake_provider.calls[0] if m.content.startswith(RECALL_PREFIX)]
     items = [line for line in block.content.splitlines() if line.startswith("- ")]
-    assert items == ["- 2026-08-02T09:12:00.000Z user: line one line two line three"]
+    assert items == ["- 어제 오후 6시 12분 user: line one line two line three"]
 
 
 async def test_recall_does_not_repeat_the_recent_window(
