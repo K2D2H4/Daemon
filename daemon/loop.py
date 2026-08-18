@@ -533,6 +533,7 @@ class ConversationLoop:
         history = await self._companion.recent(limit=self._context_turns)
         blocks = await self._companion.context(
             inbound.text,
+            history=history,
             already={item.content for item in history},
             origin=origin,
         )

@@ -271,6 +271,27 @@ async def test_a_failing_search_costs_the_memory_and_not_the_turn(data_dir: Path
     assert without_time(await companion.context("발표 언제였지?")) == ()
 
 
+async def test_context_reports_an_expired_commitment_from_the_window(data_dir: Path) -> None:
+    """The block only annotates what the model can see, so the window has to reach it."""
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+    window = [
+        LoggedMessage(
+            ts=datetime(2026, 8, 14, 7, 32, tzinfo=UTC),
+            role="user",
+            content="오늘 오후 4시40분에 회의있어 5분전에 알려줘",
+            origin="owner",
+            session_kind="interactive",
+            modality="text",
+            channel="telegram",
+        )
+    ]
+
+    blocks = await companion.context("벨라", history=window)
+
+    assert any(block.startswith("[약속 상태]") for block in blocks)
+    assert any("대기 중인 일이 아닙니다" in block for block in blocks)
+
+
 async def test_the_persona_is_re_read_every_time(data_dir: Path) -> None:
     """`seed.md` is human-owned and an edit has to land on the next turn with no
     restart (docs/PLAN.md 5.1). Caching it is the obvious optimisation."""

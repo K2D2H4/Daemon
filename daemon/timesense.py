@@ -298,3 +298,63 @@ def due_at(said_at: datetime, day_offset: int, stated_hour: int | None) -> datet
     if stated_hour is not None:
         hour = max(FOLLOWUP_HOUR, min(23, stated_hour + EVENT_LAG_HOURS))
     return datetime.combine(target, time(hour=hour)).astimezone().astimezone(UTC)
+
+
+def commitments(messages: Sequence[Timed], now: datetime) -> str:
+    """Which commitments in the visible context are still alive, and which are past.
+
+    **Scans only what is already in front of the model** - the recent window plus the
+    recalled items - and never the database. Two consequences, both wanted: the block
+    can only annotate text the model can actually see, and the turn costs no extra
+    query. A live commitment older than the prompt window is therefore invisible
+    here, which is correct: raising one *on time* is proactivity's job and it already
+    does it.
+
+    Passive by decision. The block says what is alive and what is past; it does not
+    ask the daemon to bring anything up. `OPEN_LOOP_TTL_HOURS`' comment - "사흘 늦은
+    건 백로그를 처리하는 기계다" - is a measured decision that stands.
+
+    Nothing from the message reaches the output: `surface` and `event` are lexicon
+    entries and every time is computed, the same discipline
+    `daemon/proactivity/candidates.py` states for its `reason` field.
+    """
+    lines: list[str] = []
+    seen: set[tuple[str, str, datetime]] = set()
+    for item in messages:
+        # Only the owner's own words. `origin` is a column precisely so this is
+        # decidable: relayed text is not the owner saying they have a meeting.
+        if item.role != "user" or item.origin != "owner":
+            continue
+        text = item.content
+        if contains_any(text, EVENT_CANCELLED):
+            continue
+        marker = day_marker(text)
+        event = first_of(text, EVENTS)
+        if marker is None or event is None:
+            continue
+        surface, offset = marker
+        if surface in TENSE_NEUTRAL and contains_any(text, PAST_MARKERS):
+            continue
+        due = due_at(item.ts, offset, stated_hour(text))
+        key = (surface, event, due)
+        if key in seen:
+            continue
+        seen.add(key)
+        said = relative(item.ts, now, with_gap=False)
+        when = relative(due, now, with_gap=False)
+        state = (
+            "이미 지났습니다. 대기 중인 일이 아닙니다."
+            if due <= now
+            else "아직 오지 않았습니다."
+        )
+        lines.append(f"- {said}에 말한 '{surface} {event}'의 시각({when})은 {state}")
+    if not lines:
+        return ""
+    return "\n".join(
+        [
+            "[약속 상태] 대화에 나온 약속들이 지금 어떤 상태인지입니다. "
+            "이미 지난 것을 아직 대기 중인 일처럼 말하지 마십시오.",
+            "",
+            *lines,
+        ]
+    )

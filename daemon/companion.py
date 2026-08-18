@@ -257,17 +257,18 @@ class Companion:
         self,
         query: str,
         *,
+        history: Sequence[LoggedMessage] = (),
         already: frozenset[str] | set[str] = frozenset(),
         origin: str = "owner",
     ) -> tuple[str, ...]:
         """Everything to put in front of the model this turn, in order.
 
-        What time it is, then who it is, then what it may touch, then what it is
-        reasoning over: the current-time block, the persona, the tool rules if this
-        turn may use tools, and recalled memory rendered to its nonce boundary. The
-        time block goes first because it is a fact about the world rather than an
-        instruction, so it should not sit between the persona and the tool rules
-        that qualify it.
+        Who it is, when it is, what it may touch, which of the commitments in view are
+        still alive, and what it is reasoning over: the current-time block, the
+        persona, the tool rules if this turn may use tools, the commitments block, and
+        recalled memory rendered to its nonce boundary. The time block goes first
+        because it is a fact about the world rather than an instruction, so it should
+        not sit between the persona and the tool rules that qualify it.
 
         Blocks rather than one joined string, and that is not cosmetic. The text path
         sends each as its own `Message(role="system")` - the persona *is* the system
@@ -280,13 +281,17 @@ class Companion:
         model read one event as two.
         """
         moment = clock.now()
+        items = await self.search(query) if self.has_recall else []
         blocks = [
             timesense.now_block(moment),
             await self.persona(),
             self._tool_rules(origin=origin),
+            # Over the window *and* the recall hits: a commitment can arrive either
+            # way, and this block exists to annotate whatever the model can see.
+            timesense.commitments([*history, *items], moment),
         ]
         if self.has_recall:
-            blocks.append(self.recall_block(await self.search(query), already=already))
+            blocks.append(self.recall_block(items, already=already))
         return tuple(block for block in blocks if block)
 
     def _tool_rules(self, *, origin: str) -> str:
