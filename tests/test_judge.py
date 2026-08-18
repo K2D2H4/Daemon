@@ -22,7 +22,13 @@ from conftest import FakeProvider
 from daemon.config import Route
 from daemon.llm.gateway import LLMGateway
 from daemon.proactivity.base import Candidate
-from daemon.proactivity.judge import MAX_CHARS, SYSTEM, Judge
+from daemon.proactivity.judge import (
+    MAX_CHARS,
+    MAX_OUTPUT_TOKENS,
+    SYSTEM,
+    Judge,
+    _read_reply,
+)
 from daemon.tasks import Task
 
 SEED = "너는 반말을 쓰고, 말수가 적다. 걱정을 길게 늘어놓지 않는다."
@@ -359,3 +365,51 @@ async def test_an_unrouted_task_is_not_swallowed(data_dir: Path) -> None:
 
     with pytest.raises(ConfigError):
         await judge.decide(OPEN_LOOP)
+
+
+# --- a reply the token limit cut in half (v0.1.54) ----------------------------
+# The daemon went days without ever speaking first, and the log said only
+# `did not return a JSON object` - which reads as the model misbehaving. It was
+# not: `gemini-3.6-flash` spends thinking tokens out of the same output budget,
+# so a 300-token cap ran out mid-sentence and left `{"say": "어제 그 미팅은 잘`.
+# Every provider already reports why it stopped; the judge just never read it.
+
+
+def test_a_truncated_reply_says_it_was_truncated() -> None:
+    """The diagnostic that was missing. Naming the token limit is the difference
+    between "the model is being odd" and "our cap is too small" - and the second
+    is a one-line fix nobody made for days because the log never said it."""
+    utterance = _read_reply(
+        '{"say": "어제 그 미팅은 잘',
+        model="gemini-3.6-flash",
+        stop_reason="MAX_TOKENS",
+    )
+
+    assert not utterance
+    assert "cut off" in utterance.why_not
+    assert "MAX_OUTPUT_TOKENS" in utterance.why_not, "say which knob to turn"
+
+
+@pytest.mark.parametrize("reason", ["MAX_TOKENS", "max_tokens", "length", "incomplete"])
+def test_every_provider_spelling_of_truncation_is_recognised(reason: str) -> None:
+    """gemini says MAX_TOKENS, anthropic max_tokens, openai length or incomplete.
+    A spelling this misses degrades to the old unhelpful message, so all four are
+    pinned rather than assumed."""
+    assert "cut off" in _read_reply("{'say", model="m", stop_reason=reason).why_not
+
+
+def test_prose_without_truncation_still_reads_as_prose() -> None:
+    """The other direction: a model that answered in words rather than JSON has
+    not been cut off, and calling that truncation would send the next reader to
+    the wrong knob."""
+    utterance = _read_reply("지금은 할 말이 없어요", model="m", stop_reason="STOP")
+
+    assert not utterance
+    assert "did not return a JSON object" in utterance.why_not
+
+
+def test_the_token_budget_leaves_room_for_a_thinking_model() -> None:
+    """MAX_OUTPUT_TOKENS was 300, sized for the JSON plus 120 characters of
+    Korean. That arithmetic was right for a model that only answers, and wrong
+    for one that thinks first out of the same allowance."""
+    assert MAX_OUTPUT_TOKENS >= 1000
