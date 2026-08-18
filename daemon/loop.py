@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 
-from daemon import clock
+from daemon import clock, timesense
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
 from daemon.llm.base import Message, ProviderError, ToolCall
@@ -126,6 +127,20 @@ def _round_signature(tool_calls: tuple[ToolCall, ...]) -> tuple[tuple[str, str],
             for call in tool_calls
         )
     )
+
+
+def _session_breaks_or_empty(
+    history: list[LoggedMessage], moment: datetime
+) -> list[tuple[int, str]]:
+    """`timesense.session_breaks`, wrapped so a raise costs the break lines and not
+    the turn - the same never-fail contract as `Companion.context`'s own time
+    helpers (`daemon/companion.py`), applied here because this call sits in
+    `_assemble`, outside `Companion`."""
+    try:
+        return timesense.session_breaks(history, moment)
+    except Exception:
+        logger.exception("timesense: could not compute session breaks")
+        return []
 
 
 def _call_label(call: ToolCall) -> str:
@@ -529,15 +544,27 @@ class ConversationLoop:
         that turned out to matter. Which blocks there are, and in what order, is
         `Companion.context`; this decides that each becomes a system turn ahead of
         the conversation.
+
+        The clock is read exactly once, here, and threaded into both
+        `Companion.context` and `timesense.session_breaks` below. Two separate reads
+        used to straddle a minute - and, near local midnight, a date - so one prompt
+        named today in `[현재 시각]` and tomorrow in `[대화 단절]`.
         """
         history = await self._companion.recent(limit=self._context_turns)
+        moment = clock.now()
         blocks = await self._companion.context(
             inbound.text,
+            history=history,
             already={item.content for item in history},
             origin=origin,
+            now=moment,
         )
         messages = [Message(role="system", content=block) for block in blocks]
-        messages.extend(Message(role=item.role, content=item.content) for item in history)
+        turns = [Message(role=item.role, content=item.content) for item in history]
+        # Descending, so an earlier insertion does not shift a later index.
+        for index, line in reversed(_session_breaks_or_empty(history, moment)):
+            turns.insert(index, Message(role="system", content=line))
+        messages.extend(turns)
 
         # The user turn above was recorded first, so whether it is already in
         # `recent()` depends on the writer's mirror timing. Append only if absent

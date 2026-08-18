@@ -217,4 +217,50 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   `was cut off at the token limit (stop_reason=MAX_TOKENS); raise
   MAX_OUTPUT_TOKENS`. The lesson is not the number: it is that two failures with
   different fixes must not share a message.
-
+- **The time-awareness blocks fix the reported defect most of the time, not every time
+  (2026-08-18).** Driven against live `gemini` with an isolated `DAEMON_DATA_DIR`, replaying
+  the exact reported case — a Friday thread that arranged a 16:40 reminder, four days of
+  silence, then a bare "벨라" — the assembled prompt carries all three blocks correctly
+  (`[현재 시각]`, `[약속 상태]` saying the meeting's time has passed, `[대화 단절]` between the
+  finished thread and today). The model still answered "오후 4시 35분에 회의 알림 잊지 않고
+  챙겨드릴 테니" in **5 of 26 runs (~19%)**, and the rate is unstable across batches: 3/10 in
+  one batch, 0/10 in another with the same code. So a single batch cannot tell you whether a
+  prompt change helped. **Moving the `[약속 상태]` block from the top of the prompt to just
+  before the final user turn — the recency hypothesis, and `docs/superpowers/specs/2026-08-18-time-awareness-design.md`'s
+  open question 1 — produced 0/10 in both arms and settled nothing at that sample size.** The
+  failures are all the same shape: the window's last assistant turn is an enthusiastic promise
+  about the reminder, and the model continues it. Anyone tuning this needs n well above 10 per
+  arm and should measure against that shape specifically.
+- **The reason that A/B settled nothing: on every hosted provider there is no such thing as
+  block position (2026-08-18).** The three provider files under `daemon/llm/providers/` -
+  gemini, anthropic and openai - each do
+  `"\n\n".join(m.content for m in messages if m.role == "system")` into one top-level field
+  and drop those messages from the turn array. So `[대화 단절]`, spliced into the window at the
+  index where the conversation broke, arrives concatenated with the persona and the tool rules
+  — and its original wording, "위는 8월 14일 금요일, 아래는 …", pointed at a position the model
+  could not see. Feeding the reported case's message list to gemini's `_contents` returns
+  `[user, model, user]` with the line absent. Only `ollama` and `openai_compatible` keep system
+  turns in place. Two consequences worth keeping: a `FakeProvider` that receives the raw
+  `list[Message]` cannot see this class of defect, and any future reasoning about where a
+  system block sits is meaningless unless the provider is one of those two.
+- **Rewording that line to be position-independent measured 1/20, against 5/26 before — and
+  that is NOT a demonstrated improvement (2026-08-18).** Fisher's exact on 5/26 vs 1/20 gives
+  p = 0.21. The reword is worth having because the old line was *provably false* on the
+  configured provider, not because the failure rate is proven lower. Anyone claiming this fixed
+  the rate needs a much larger n; see the batch instability above.
+- **"Inline placement is the whole point" was true for two providers out of five
+  (2026-08-18).** `docs/superpowers/specs/2026-08-18-time-awareness-design.md`'s decision 2
+  said the `[대화 단절]` line's position states the fact so the model does no counting -
+  written without checking what a hosted provider does with a `role="system"` message
+  planted mid-list. Fed the reported case's message list to each provider's payload
+  builder: `gemini._contents`, `anthropic._turns` and `openai._input_items` all drop every
+  system message from the turn array and `complete()` hoists the joined text into a
+  top-level field (`systemInstruction`, `system`, `instructions`) instead - confirmed by
+  running each function directly and checking the break line is absent from the array and
+  present in the hoisted field. Only `ollama` and `openai_compatible` leave it where it was
+  spliced. So on `gemini` - this owner's configured provider - the line "위는 8월 14일
+  금요일, 아래는 4일 뒤인 오늘 8월 18일 화요일입니다. 위쪽은 이미 끝난 대화입니다." landed in
+  the system prompt next to the persona and tool rules, referring to a 위/아래 that provider
+  never showed the model. Reworded to name both dates and the gap directly instead of
+  pointing at a position (`daemon/timesense.py::_break_line`), and pinned against the actual
+  `gemini` payload builder in `tests/test_providers.py` so this cannot regress silently.

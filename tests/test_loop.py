@@ -11,13 +11,14 @@ import math
 import os
 import sqlite3
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import FakeProvider
 
+from daemon import clock, timesense
 from daemon.app import create_app
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
@@ -167,10 +168,27 @@ class FlakyProvider:
 
 
 def inbound(text: str) -> InboundMessage:
+    # Live clock, not the suite's pinned date: the assistant's reply is stamped
+    # from `clock.now()` (daemon/loop.py), and now that `_assemble` reads real
+    # gaps between timestamps (`timesense.session_breaks`), a user turn frozen at
+    # an old date would read as a multi-day-old thread relative to its own reply.
     return InboundMessage(
         text=text,
         sender_id="42",
-        received_at=datetime(2026, 8, 3, 7, 14, tzinfo=UTC),
+        received_at=clock.now(),
+        channel="fake",
+    )
+
+
+def logged(text: str, ts: datetime, role: str = "user") -> LoggedMessage:
+    """A message already in memory, at a timestamp the caller chooses."""
+    return LoggedMessage(
+        ts=ts,
+        role=role,  # type: ignore[arg-type]
+        content=text,
+        origin="owner" if role == "user" else "agent",
+        session_kind="interactive",
+        modality="text",
         channel="fake",
     )
 
@@ -220,7 +238,7 @@ async def test_the_user_turn_is_not_duplicated_in_the_prompt(
     ).run()
 
     prompt = fake_provider.calls[0]
-    assert prompt == [Message(role="user", content="hello")]
+    assert [m for m in prompt if m.role != "system"] == [Message(role="user", content="hello")]
 
 
 async def test_history_is_carried_into_the_next_turn(
@@ -234,11 +252,232 @@ async def test_history_is_carried_into_the_next_turn(
         Companion(memory, data_dir=data_dir),
     ).run()
 
-    assert fake_provider.calls[1] == [
+    assert fake_provider.calls[1][-3:] == [
         Message(role="user", content="first"),
         Message(role="assistant", content="ok"),
         Message(role="user", content="second"),
     ]
+
+
+async def test_a_greeting_after_a_gap_of_days_is_not_a_continuation(
+    data_dir: Path, fake_provider: FakeProvider
+) -> None:
+    """The reported defect, through the real assembly.
+
+    A Friday thread arranged a 16:40 reminder; the owner said nothing over the
+    weekend; on Tuesday morning they wrote a bare "벨라" and the daemon answered
+    "오후 4시 40분 회의 5분 전 알림 잘 챙겨드리려고 옆에서 대기 중이었습니다".
+    Nothing in the assembled context said that thread was over.
+
+    Seeded relative to the live clock rather than to a pinned date, because the loop
+    stamps the reply from `clock.now()` - pinning absolute dates here would make this
+    pass only on the day it was written, the gotcha `tests/CLAUDE.md` records. The
+    inbound greeting is built directly (not through the shared `inbound()` helper,
+    whose `received_at` is fixed) for the same reason: seeded four real days back,
+    the fixed date would sit *before* "earlier" instead of after it, inverting the
+    very ordering this test means to exercise. The exact rendering is pinned in
+    `tests/test_timesense.py`, where `now` is a parameter; what this asserts is
+    **position**, which is the thing assembly owns and the unit test cannot see.
+
+    Also asserts the `[약속 상태]` block, and that it reads the meeting as past -
+    `_assemble` passes `history=history` into `Companion.context` for exactly this,
+    and deleting that keyword argument left the whole suite green until this
+    assertion existed (verified: removing it fails this test, restoring it passes).
+    """
+    memory = FakeMemory()
+    earlier = clock.now() - timedelta(days=4)
+    memory.records.extend(
+        [
+            logged("오늘 오후 4시40분에 회의있어 5분전에 알려줘", earlier),
+            logged(
+                "알겠습니다! 4시 35분에 알려드릴게요.", earlier + timedelta(minutes=1), "assistant"
+            ),
+        ]
+    )
+    bare_greeting = InboundMessage(
+        text="벨라", sender_id="42", received_at=clock.now(), channel="fake"
+    )
+
+    await ConversationLoop(
+        FakeChannel([bare_greeting]),
+        gateway_for(fake_provider),
+        Companion(memory, data_dir=data_dir),
+    ).run()
+
+    rendered = [m.content for m in fake_provider.calls[0]]
+    breaks = [i for i, text in enumerate(rendered) if text.startswith("[대화 단절]")]
+    assert len(breaks) == 1, "the finished thread must be marked as finished"
+
+    thread = next(i for i, text in enumerate(rendered) if "4시40분" in text)
+    greeting = next(i for i, text in enumerate(rendered) if text == "벨라")
+    assert thread < breaks[0] < greeting
+
+    commitment_blocks = [text for text in rendered if text.startswith("[약속 상태]")]
+    assert commitment_blocks, "no [약속 상태] block reached the model"
+    assert "이미 지났습니다" in commitment_blocks[0], "the expired meeting must not read as pending"
+
+
+async def test_the_reported_case_carries_all_three_time_blocks_at_once(
+    data_dir: Path, fake_provider: FakeProvider
+) -> None:
+    """The branch's headline behaviour, pinned all at once.
+
+    `test_a_greeting_after_a_gap_of_days_is_not_a_continuation` above pins the break
+    line and the commitment block; `test_context_leads_with_the_current_time`
+    (`tests/test_companion.py`) pins the current-time block. Nothing before this
+    drove one real assembled turn and asserted all three land together - which is
+    exactly the coverage gap that let `history=history` disappear from `_assemble`
+    (silently dropping `[약속 상태]`) and `commitments(...)` disappear from
+    `Companion.time_block` (silently dropping it from voice) with 2775 tests green.
+    This is the reported case itself: a Friday thread that arranged a 16:40 meeting
+    reminder, four days of silence, then a bare "벨라".
+    """
+    memory = FakeMemory()
+    earlier = clock.now() - timedelta(days=4)
+    memory.records.extend(
+        [
+            logged("오늘 오후 4시40분에 회의있어 5분전에 알려줘", earlier),
+            logged(
+                "알겠습니다! 4시 35분에 알려드릴게요.", earlier + timedelta(minutes=1), "assistant"
+            ),
+        ]
+    )
+    bare_greeting = InboundMessage(
+        text="벨라", sender_id="42", received_at=clock.now(), channel="fake"
+    )
+
+    await ConversationLoop(
+        FakeChannel([bare_greeting]),
+        gateway_for(fake_provider),
+        Companion(memory, data_dir=data_dir),
+    ).run()
+
+    rendered = [m.content for m in fake_provider.calls[0]]
+    assert any(text.startswith("[현재 시각]") for text in rendered), "no current-time block"
+    commitment_blocks = [text for text in rendered if text.startswith("[약속 상태]")]
+    assert commitment_blocks, "no [약속 상태] block reached the model"
+
+    breaks = [i for i, text in enumerate(rendered) if text.startswith("[대화 단절]")]
+    assert len(breaks) == 1, "no break, or more than one"
+
+    thread = next(i for i, text in enumerate(rendered) if "4시40분" in text)
+    greeting = next(i for i, text in enumerate(rendered) if text == "벨라")
+    assert thread < breaks[0] < greeting, (
+        "the break line must sit between the finished thread and the greeting"
+    )
+
+
+async def test_one_assembled_turn_reads_the_clock_once(
+    data_dir: Path, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch, seoul: None
+) -> None:
+    """`daemon/timesense.py`'s module docstring says `now` is always a parameter
+    partly because two reads of the clock inside one turn can straddle a minute -
+    reproduced live across local midnight: one prompt carried `[현재 시각] ... 8월
+    18일 화요일 오후 11시 59분` beside `[대화 단절] ... 오늘 8월 19일 수요일`, two
+    different dates in one prompt, the exact bug class this branch exists to stop.
+
+    The fake clock starts one minute before local midnight and advances two minutes
+    on every call. Before the fix, `_assemble` read `clock.now()` once inside
+    `Companion.context` for `[현재 시각]`, again inside `render_recall` (the default
+    it fell back to when `recall_block` did not pass one on), and a third time for
+    `timesense.session_breaks` - three reads, and the second and third land after
+    midnight while the first does not. After the fix there is exactly one read,
+    threaded through all three, so all three name the same day.
+    """
+    calls = 0
+
+    def advancing_clock() -> datetime:
+        nonlocal calls
+        # 2026-08-18 14:59 UTC = 2026-08-18 23:59 KST, one minute before midnight.
+        moment = datetime(2026, 8, 18, 14, 59, tzinfo=UTC) + timedelta(minutes=2 * calls)
+        calls += 1
+        return moment
+
+    monkeypatch.setattr(clock, "now", advancing_clock)
+
+    memory = FakeMemory()
+    memory.records.extend(
+        [
+            logged("예전 대화입니다", datetime(2026, 8, 14, 8, 0, tzinfo=UTC)),
+            logged("네 알겠습니다", datetime(2026, 8, 14, 8, 1, tzinfo=UTC), "assistant"),
+        ]
+    )
+    bare_greeting = InboundMessage(
+        text="벨라",
+        sender_id="42",
+        received_at=datetime(2026, 8, 18, 14, 30, tzinfo=UTC),  # 23:30 KST, same day
+        channel="fake",
+    )
+
+    await ConversationLoop(
+        FakeChannel([bare_greeting]),
+        gateway_for(fake_provider),
+        Companion(
+            memory,
+            data_dir=data_dir,
+            recall=FakeRecall([recalled("자정 근처에 남긴 기억", day=18)]),
+        ),
+    ).run()
+
+    rendered = [m.content for m in fake_provider.calls[0]]
+    now_block = next(text for text in rendered if text.startswith("[현재 시각]"))
+    assert "8월 18일 화요일" in now_block, now_block
+
+    break_line = next(text for text in rendered if text.startswith("[대화 단절]"))
+    assert "오늘 8월 18일 화요일" in break_line, break_line
+
+    recall_block = next(text for text in rendered if text.startswith(RECALL_PREFIX))
+    assert "- 오늘 " in recall_block, recall_block
+
+
+async def test_three_sessions_produce_two_breaks_in_the_right_slots(
+    data_dir: Path, fake_provider: FakeProvider
+) -> None:
+    """A single break cannot catch an index-shift bug: after the first splice,
+    every later `session_breaks` index is only correct if insertion went from the
+    back of the list forward (`daemon/loop.py`'s `_assemble`, `reversed(...)`).
+    Forward order would shift every later index by one per prior insertion, so
+    with two breaks the second line would land one slot early. Three sessions -
+    six days ago, three days ago, today - force exactly that second index to
+    exist and be checked.
+    """
+    memory = FakeMemory()
+    first_session = clock.now() - timedelta(days=6)
+    second_session = clock.now() - timedelta(days=3)
+    memory.records.extend(
+        [
+            logged("첫 번째 세션입니다", first_session),
+            logged("첫 번째 세션 답장입니다", first_session + timedelta(minutes=1), "assistant"),
+            logged("두 번째 세션입니다", second_session),
+            logged(
+                "두 번째 세션 답장입니다", second_session + timedelta(minutes=1), "assistant"
+            ),
+        ]
+    )
+    bare_greeting = InboundMessage(
+        text="벨라", sender_id="42", received_at=clock.now(), channel="fake"
+    )
+
+    await ConversationLoop(
+        FakeChannel([bare_greeting]),
+        gateway_for(fake_provider),
+        Companion(memory, data_dir=data_dir),
+    ).run()
+
+    rendered = [m.content for m in fake_provider.calls[0]]
+    breaks = [i for i, text in enumerate(rendered) if text.startswith("[대화 단절]")]
+    assert len(breaks) == 2, "three sessions must produce exactly two breaks"
+
+    first = next(i for i, text in enumerate(rendered) if text == "첫 번째 세션입니다")
+    second_start = next(i for i, text in enumerate(rendered) if text == "두 번째 세션입니다")
+    second_reply = next(
+        i for i, text in enumerate(rendered) if text == "두 번째 세션 답장입니다"
+    )
+    greeting = next(i for i, text in enumerate(rendered) if text == "벨라")
+    # second_reply must fall strictly before the second break: a forward-order
+    # splice shifts the second break one slot early, landing it between the
+    # second session's own two messages instead of after both of them.
+    assert first < breaks[0] < second_start < second_reply < breaks[1] < greeting
 
 
 async def test_persona_seed_becomes_the_system_turn(
@@ -252,9 +491,8 @@ async def test_persona_seed_becomes_the_system_turn(
         Companion(FakeMemory(), data_dir=data_dir),
     ).run()
 
-    assert fake_provider.calls[0][0] == Message(
-        role="system", content="You disagree when you disagree."
-    )
+    seed_turn = Message(role="system", content="You disagree when you disagree.")
+    assert seed_turn in fake_provider.calls[0]
 
 
 async def test_an_edit_to_the_seed_lands_on_the_very_next_turn(
@@ -288,20 +526,35 @@ async def test_an_edit_to_the_seed_lands_on_the_very_next_turn(
         Companion(FakeMemory(), data_dir=data_dir),
     ).run()
 
-    systems = [call[0].content for call in fake_provider.calls]
+    systems = [
+        next(
+            m.content
+            for m in call
+            if m.role == "system" and not m.content.startswith("[현재 시각]")
+        )
+        for call in fake_provider.calls
+    ]
     assert systems == ["I say more than the minimum.", "I keep it short."]
 
 
-async def test_missing_seed_means_no_system_turn(
+async def test_missing_seed_means_no_persona_system_turn(
     data_dir: Path, fake_provider: FakeProvider
 ) -> None:
+    """An absent seed must add no system message of its own. The current-time block
+    is unconditional and is not the persona, so it is excluded by name - the original
+    assertion ("no system turns at all") stopped being able to say this."""
     await ConversationLoop(
         FakeChannel([inbound("hello")]),
         gateway_for(fake_provider),
         Companion(FakeMemory(), data_dir=data_dir),
     ).run()
 
-    assert all(m.role != "system" for m in fake_provider.calls[0])
+    system = [
+        m
+        for m in fake_provider.calls[0]
+        if m.role == "system" and not m.content.startswith("[현재 시각]")
+    ]
+    assert system == []
 
 
 async def test_voice_inbound_is_recorded_as_a_voice_session(data_dir: Path) -> None:
@@ -379,14 +632,20 @@ async def test_the_recall_block_sits_before_the_live_conversation(
     ).run()
 
     roles = [m.role for m in fake_provider.calls[1]]
-    assert roles == ["system", "system", "user", "assistant", "user"]
+    assert roles == ["system", "system", "system", "user", "assistant", "user"]
 
 
 async def test_one_recalled_item_stays_one_line(
-    data_dir: Path, fake_provider: FakeProvider
+    data_dir: Path, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch, seoul: None
 ) -> None:
     # Multi-line content would blur the boundary between items, and the boundary
     # is the only thing telling the model where a quotation ends.
+    #
+    # Migrated off the ISO instant `clock.to_iso` used to produce: recall now
+    # renders `timesense.relative`, which needs both ends of the gap, so - per
+    # tests/CLAUDE.md's rule for a time-dependent test - the clock is pinned here
+    # too, not just the recalled item's own timestamp.
+    monkeypatch.setattr(clock, "now", lambda: datetime(2026, 8, 3, 9, 12, tzinfo=UTC))
     await ConversationLoop(
         FakeChannel([inbound("hi")]),
         gateway_for(fake_provider),
@@ -399,7 +658,7 @@ async def test_one_recalled_item_stays_one_line(
 
     (block,) = [m for m in fake_provider.calls[0] if m.content.startswith(RECALL_PREFIX)]
     items = [line for line in block.content.splitlines() if line.startswith("- ")]
-    assert items == ["- 2026-08-02T09:12:00.000Z user: line one line two line three"]
+    assert items == ["- 어제 오후 6시 12분 user: line one line two line three"]
 
 
 async def test_recall_does_not_repeat_the_recent_window(
@@ -416,16 +675,43 @@ async def test_recall_does_not_repeat_the_recent_window(
     assert all(not m.content.startswith(RECALL_PREFIX) for m in fake_provider.calls[0])
 
 
-async def test_without_recall_the_prompt_is_exactly_what_m1a_built(
+async def test_without_recall_the_prompt_carries_no_recalled_memory(
     data_dir: Path, fake_provider: FakeProvider
 ) -> None:
+    """Was "exactly what M1a built" until the current-time block became
+    unconditional. The claim that matters is unchanged: recall=None contributes
+    nothing, and the conversation is the one live turn."""
     await ConversationLoop(
         FakeChannel([inbound("hello")]),
         gateway_for(fake_provider),
         Companion(FakeMemory(), data_dir=data_dir, recall=None),
     ).run()
 
-    assert fake_provider.calls[0] == [Message(role="user", content="hello")]
+    prompt = fake_provider.calls[0]
+    assert [m for m in prompt if m.role != "system"] == [Message(role="user", content="hello")]
+    assert all(not m.content.startswith(RECALL_PREFIX) for m in prompt)
+
+
+async def test_a_raising_session_breaks_does_not_kill_the_turn(
+    data_dir: Path, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec's Error handling section, applied to the one time helper that lives
+    outside `Companion`: `_send_time` wraps `now_block`/`commitments` on the voice
+    path, and `Companion.context` wraps them for text, but `session_breaks` is
+    spliced into `_assemble` directly and had no guard of its own - a raise there
+    used to kill the whole turn."""
+
+    def boom(history: object, moment: object) -> list[tuple[int, str]]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(timesense, "session_breaks", boom)
+    channel = FakeChannel([inbound("hello")])
+
+    await ConversationLoop(
+        channel, gateway_for(fake_provider), Companion(FakeMemory(), data_dir=data_dir)
+    ).run()
+
+    assert [m.text for m in channel.sent] == ["ok"]
 
 
 async def test_a_failing_search_costs_recall_not_the_turn(

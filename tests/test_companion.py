@@ -12,16 +12,17 @@ the other, which is what happened to `recall.index()` and voice.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from test_loop import FakeMemory, FakeRecall, Ids, recalled
 
-from daemon import clock
+from daemon import clock, timesense
 from daemon.companion import TOOL_CONTRACT, Companion, google_account_hint, render_recall
 from daemon.llm.base import ToolSpec
-from daemon.memory.base import LoggedMessage
+from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.tools.schema import DELEGATE_TOOL_NAME
 
 
@@ -35,6 +36,16 @@ def said(text: str, role: str = "user") -> LoggedMessage:
         modality="text",
         channel="fake",
     )
+
+
+def without_time(blocks: tuple[str, ...]) -> tuple[str, ...]:
+    """The blocks other than the current-time one, which is now unconditional.
+
+    These assertions predate it and are about what the *other* layers contribute -
+    that a relayed turn is told nothing about tools, that an empty registry is not a
+    tool layer. Dropping the time block keeps each of them about its own subject.
+    """
+    return tuple(block for block in blocks if not block.startswith("[현재 시각]"))
 
 
 class FakeTools:
@@ -89,9 +100,12 @@ _DELEGATE_SPEC = ToolSpec(
 # --- what goes in front of the model ----------------------------------------
 
 
-async def test_the_blocks_are_who_it_is_then_what_it_may_touch_then_what_it_recalls(
+async def test_the_blocks_are_when_it_is_who_it_is_what_it_may_touch_then_what_it_recalls(
     data_dir: Path,
 ) -> None:
+    """The time block leads because it is a fact about the world rather than an
+    instruction, so it should not sit between the persona and the tool rules that
+    qualify it."""
     (data_dir / "persona" / "seed.md").write_text("You disagree when you disagree.\n")
     companion = Companion(
         FakeMemory(),
@@ -102,10 +116,21 @@ async def test_the_blocks_are_who_it_is_then_what_it_may_touch_then_what_it_reca
 
     blocks = await companion.context("발표 언제였지?")
 
-    assert blocks[0] == "You disagree when you disagree."
-    assert blocks[1] == TOOL_CONTRACT
-    assert blocks[2].startswith("[recalled-memory:")
-    assert "발표는 목요일 3시야" in blocks[2]
+    assert blocks[0].startswith("[현재 시각] 지금은 ")
+    assert blocks[1] == "You disagree when you disagree."
+    assert blocks[2] == TOOL_CONTRACT
+    assert blocks[3].startswith("[recalled-memory:")
+    assert "발표는 목요일 3시야" in blocks[3]
+
+
+async def test_context_leads_with_the_current_time(data_dir: Path) -> None:
+    """Without this the model has no way to know what day it is, and answered a
+    Tuesday greeting by continuing the previous Friday's thread."""
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+
+    blocks = await companion.context("뭐 하고 있었어?")
+
+    assert blocks[0].startswith("[현재 시각] 지금은 ")
 
 
 async def test_nothing_to_say_is_no_blocks_at_all(data_dir: Path) -> None:
@@ -113,7 +138,7 @@ async def test_nothing_to_say_is_no_blocks_at_all(data_dir: Path) -> None:
     turn, so an empty one would be an empty system message."""
     companion = Companion(FakeMemory(), data_dir=data_dir)
 
-    assert await companion.context("hello") == ()
+    assert without_time(await companion.context("hello")) == ()
 
 
 async def test_a_relayed_turn_is_told_nothing_about_tools(data_dir: Path) -> None:
@@ -121,15 +146,15 @@ async def test_a_relayed_turn_is_told_nothing_about_tools(data_dir: Path) -> Non
     hundred tokens about a capability the model does not have this turn."""
     companion = Companion(FakeMemory(), data_dir=data_dir, tools=FakeTools("read_file"))
 
-    assert await companion.context("이거 봐봐", origin="untrusted") == ()
-    assert await companion.context("이거 봐봐", origin="owner") == (TOOL_CONTRACT,)
+    assert without_time(await companion.context("이거 봐봐", origin="untrusted")) == ()
+    assert without_time(await companion.context("이거 봐봐", origin="owner")) == (TOOL_CONTRACT,)
 
 
 async def test_an_empty_registry_is_not_a_tool_layer(data_dir: Path) -> None:
     companion = Companion(FakeMemory(), data_dir=data_dir, tools=FakeTools())
 
     assert companion.specs(origin="owner") == ()
-    assert await companion.context("hello") == ()
+    assert without_time(await companion.context("hello")) == ()
 
 
 def test_voice_surface_drops_nested_tools_but_keeps_flat_and_delegate(
@@ -203,7 +228,7 @@ async def test_tool_rules_carry_the_google_account_when_one_is_authenticated(
         FakeMemory(), data_dir=data_dir, tools=FakeTools("google__list_calendars")
     )
 
-    (rules,) = await companion.context("오늘 일정 뭐야?", origin="owner")
+    (rules,) = without_time(await companion.context("오늘 일정 뭐야?", origin="owner"))
 
     assert rules.startswith(TOOL_CONTRACT)
     assert "owner@gmail.com" in rules
@@ -223,7 +248,7 @@ async def test_a_non_owner_turn_never_carries_the_google_account(
         FakeMemory(), data_dir=data_dir, tools=FakeTools("google__list_calendars")
     )
 
-    assert await companion.context("이거 봐봐", origin="untrusted") == ()
+    assert without_time(await companion.context("이거 봐봐", origin="untrusted")) == ()
 
 
 async def test_recall_the_window_already_carries_is_not_repeated(data_dir: Path) -> None:
@@ -231,7 +256,7 @@ async def test_recall_the_window_already_carries_is_not_repeated(data_dir: Path)
         FakeMemory(), data_dir=data_dir, recall=FakeRecall([recalled("hello")])
     )
 
-    assert await companion.context("hello", already={"hello"}) == ()
+    assert without_time(await companion.context("hello", already={"hello"})) == ()
 
 
 async def test_a_failing_search_costs_the_memory_and_not_the_turn(data_dir: Path) -> None:
@@ -243,7 +268,65 @@ async def test_a_failing_search_costs_the_memory_and_not_the_turn(data_dir: Path
     )
 
     assert await companion.search("발표 언제였지?") == []
-    assert await companion.context("발표 언제였지?") == ()
+    assert without_time(await companion.context("발표 언제였지?")) == ()
+
+
+async def test_context_reports_an_expired_commitment_from_the_window(data_dir: Path) -> None:
+    """The block only annotates what the model can see, so the window has to reach it."""
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+    window = [
+        LoggedMessage(
+            ts=datetime(2026, 8, 14, 7, 32, tzinfo=UTC),
+            role="user",
+            content="오늘 오후 4시40분에 회의있어 5분전에 알려줘",
+            origin="owner",
+            session_kind="interactive",
+            modality="text",
+            channel="telegram",
+        )
+    ]
+
+    blocks = await companion.context("벨라", history=window)
+
+    assert any(block.startswith("[약속 상태]") for block in blocks)
+    assert any("대기 중인 일이 아닙니다" in block for block in blocks)
+
+
+async def test_a_raising_time_block_costs_the_time_not_the_turn(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec's Error handling section: "Never fail a turn... each helper is wrapped
+    at its injection point," the same shape `_send_continuity`
+    (`daemon/voice/conversation.py`) already uses on the voice path. `now_block`
+    raising inside `context()` must drop only the current-time block."""
+
+    def boom(moment: datetime) -> str:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(timesense, "now_block", boom)
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+
+    blocks = await companion.context("hello")
+
+    assert not any(block.startswith("[현재 시각]") for block in blocks)
+
+
+async def test_a_raising_commitments_block_costs_the_annotation_not_the_turn(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same contract, the other helper `context()` calls directly. Narrow: only the
+    commitments block should be lost, not the time block next to it."""
+
+    def boom(messages: object, moment: datetime) -> str:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(timesense, "commitments", boom)
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+
+    blocks = await companion.context("hello", history=[said("오늘 회의 있어")])
+
+    assert not any(block.startswith("[약속 상태]") for block in blocks)
+    assert any(block.startswith("[현재 시각]") for block in blocks)
 
 
 async def test_the_persona_is_re_read_every_time(data_dir: Path) -> None:
@@ -276,6 +359,35 @@ def test_the_key_is_stable_where_the_block_is_not(data_dir: Path) -> None:
     assert companion.recall_block(items) != companion.recall_block(items)
     # And the key is never what goes on the wire.
     assert companion.recall_key(items) not in companion.recall_block(items)
+
+
+def test_recall_key_does_not_move_with_the_clock(data_dir: Path, seoul: None) -> None:
+    """Two payloads carrying identical memories must compare equal, or the voice
+    path re-seeds the same facts every time the local date turns over.
+
+    `recall_key(items) == recall_key(items)` alone would pass even against the live
+    clock, since both calls land in the same instant - it is not what would catch a
+    regression back to `render_recall(items, _IDENTITY_NONCE)` with no fixed `now`.
+    So this pins the actual rendering: `_IDENTITY_NOW` is 2099-01-01, a ~72-year gap
+    from this item that renders in `timesense.relative`'s far-date absolute branch.
+    The live clock in 2026 would render "지난주 금요일 ... (4일 전)" instead - a
+    different string every day the suite runs - so this exact phrase can only appear
+    if `recall_key` rendered against the fixed instant.
+    """
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+    item = RecalledItem(
+        content="회의 있어",
+        ts=datetime(2026, 8, 14, 7, 32, tzinfo=UTC),
+        role="user",
+        score=1.0,
+        reason="keyword",
+        origin="owner",
+    )
+
+    key = companion.recall_key([item])
+
+    assert "8월 14일 금요일 오후 4시 32분 (26438일 전)" in key
+    assert key == companion.recall_key([item])
 
 
 # --- writing it down --------------------------------------------------------
@@ -414,13 +526,36 @@ def test_a_curated_fact_carries_no_timestamp() -> None:
     assert "2026-08" not in block
 
 
-def test_a_searched_message_keeps_its_timestamp_and_its_own_block() -> None:
-    block = render_recall([recalled("어제 뭐 먹었지")], "n")
+def test_a_searched_message_keeps_its_timestamp_and_its_own_block(seoul: None) -> None:
+    """Migrated from pinning the ISO instant `clock.to_iso` used to produce: that
+    shape is gone, but the property it stood for - a searched hit keeps when it was
+    said - still has to hold, now in the words a person uses rather than a UTC
+    stamp the model had to convert itself."""
+    item = recalled("어제 뭐 먹었지")
+    block = render_recall([item], "n", now=datetime(2026, 8, 3, 9, 12, tzinfo=UTC))
 
     assert "recalled-memory:n" in block
     assert "known-about-user" not in block
-    # When it was said is part of what it means, so a searched hit keeps its stamp.
-    assert "2026-08-02T09:12:00.000Z user: 어제 뭐 먹었지" in block
+    assert "어제 오후 6시 12분 user: 어제 뭐 먹었지" in block
+    assert clock.to_iso(item.ts) not in block
+
+
+def test_recall_renders_time_the_way_a_person_says_it(seoul: None) -> None:
+    """`2026-08-14T07:32:00.000Z` requires knowing what "now" is and doing UTC->KST
+    arithmetic - both things this model does badly."""
+    item = RecalledItem(
+        content="오늘 오후 4시40분에 회의있어",
+        ts=datetime(2026, 8, 14, 7, 32, tzinfo=UTC),
+        role="user",
+        score=1.0,
+        reason="keyword",
+        origin="owner",
+    )
+
+    block = render_recall([item], "nonce", now=datetime(2026, 8, 18, 1, 0, tzinfo=UTC))
+
+    assert "지난주 금요일 오후 4시 32분 (4일 전)" in block
+    assert "2026-08-14T07:32" not in block
 
 
 def test_both_kinds_get_their_own_block() -> None:
@@ -515,3 +650,13 @@ async def test_the_continuity_block_says_the_owner_outranks_the_transcript(
     assert "mishears" in block, "the block must admit the transcript can be wrong"
     assert "they are right and this record is wrong" in block
     assert "never insist they said it" in block
+
+
+async def test_time_block_stands_alone_for_the_voice_path(data_dir: Path) -> None:
+    """`continuity_block` is empty when nothing is fresh, and a session opening after
+    a quiet night is the one that most needs to know what day it is."""
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+
+    block = await companion.time_block()
+
+    assert block.startswith("[현재 시각] 지금은 ")

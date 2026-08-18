@@ -14,12 +14,13 @@ in `app.py`, which owns every concrete-implementation import here.
 | `setup.py` | the onboarding wizard: PC control, provider, its model(s) and background toggle, keys, persona seed, pairing, then the residency finish — offer `daemon install` and confirm the resident woke up via `service.status()` + `/health` |
 | `wake_cli.py` | `daemon wake`: measure what the recognizer returns for the owner's phrase, save it as `DAEMON_WAKE_ALIASES`, then run the gate and print what fires. Writes `.env` through `setup.py`'s writer |
 | `config.py` | settings and the two routing axes, `DAEMON_PROVIDER` + `DAEMON_PROACTIVE_JUDGE_LOCAL` — `Settings.routing` is computed from them, not looked up in a table |
-| `companion.py` | **what both endpoints can do, in one place**: `context` (persona + tool rules + the recall block), `record` + `index_recorded`, `specs` / `run_tools`. Add a capability here, not twice |
+| `companion.py` | **what both endpoints can do, in one place**: `context` (the time block, persona, tool rules, commitments, then recall — time leads because it is a fact about the world rather than an instruction, and commitments trail the tool rules they don't qualify), `record` + `index_recorded`, `specs` / `run_tools`. Add a capability here, not twice |
 | `loop.py` | the text transport: record → context → complete → record → send. Owns the tool loop's shape, `/approve`, and the wire |
 | `reflection.py` | the 04:00 pass: one local day → curated facts, entity notes, observations |
 | `tasks.py` | the `Task` enum. **Frozen** — it is the LLM routing key |
 | `tui.py` · `service.py` | terminal presentation, CJK-aware widths, plain text when not a tty · the LaunchAgent / systemd user unit, which holds no secrets |
 | `fs.py` · `clock.py` · `mic_hold.py` | 0700 dirs, 0600 files, and the two durable writes — append, and atomic replace · the one timestamp helper, so nobody scatters `datetime.now()` · whether *this process* holds the microphone, a reentrant counter the wake listener and a voice session both increment. Top-level rather than inside `voice/` so `proactivity/presence.py` can subtract our own hold from the CoreAudio probe without importing the voice layer — a text-only install has no PortAudio and still has to answer presence (docs/adr/0013) |
+| `timesense.py` | how the daemon *speaks* about time — the current instant, relative phrasing, where a conversation broke, which commitments in view are past. `clock.py` reads the clock; this renders it. Holds the extraction primitives `proactivity/candidates.py` imports back, so both paths read one judgement instead of two |
 | `channels/` | `channels/base.py` (frozen) · `channels/telegram.py` · `channels/pairing.py` |
 | `llm/` | `llm/base.py` (frozen) · `llm/gateway.py` · `llm/providers/` (5) · `llm/embedders/` |
 | `memory/` | `memory/schema.sql` (frozen) · `store` · `log` · `writer` · `recall` · `curated` · `entities` · `reindex` |

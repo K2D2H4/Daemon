@@ -1079,7 +1079,9 @@ async def test_recall_reaches_the_model_as_context_and_not_as_a_prompt() -> None
     await run(conv)
 
     assert session.contexts, "recall never reached the session; the prefetch was for nothing"
-    assert _item().content in session.contexts[0]
+    # contexts[0] is the unconditional time block sent at session open; recall
+    # follows it later, at the turn boundary.
+    assert _item().content in session.contexts[-1]
     assert session.texts == [], "recall was sent as a prompt"
     assert events.index("context") < events.index("play"), (
         "the memory arrived after the model had already answered, which is the next "
@@ -1104,7 +1106,9 @@ async def test_what_is_put_in_front_of_the_model_says_what_it_is() -> None:
     conv = conversation(session, recall=FakeRecall(relayed))
     await run(conv)
 
-    (block,) = session.contexts
+    # contexts[0] is the unconditional time block; exactly one recall block
+    # follows it - the arity is still the claim, just about the block under test.
+    (block,) = [text for text in session.contexts if "recalled-memory:" in text]
     assert "recalled-memory:" in block, "no boundary; a memory can pose as an instruction"
     assert "end-recalled-memory:" in block
     assert "not the user's own words" in block, "relayed text is posing as the owner's"
@@ -1118,7 +1122,9 @@ async def test_the_same_memories_are_not_seeded_twice() -> None:
     conv = conversation(session, recall=FakeRecall(_item()))
     await run(conv)
 
-    assert len(session.contexts) == 1
+    # Alongside the unconditional time block, sent once regardless of recall.
+    recall_sends = [text for text in session.contexts if "recalled-memory:" in text]
+    assert len(recall_sends) == 1
 
 
 async def test_nothing_is_put_in_front_of_the_model_when_there_is_nothing_to_say() -> None:
@@ -1126,7 +1132,9 @@ async def test_nothing_is_put_in_front_of_the_model_when_there_is_nothing_to_say
     conv = conversation(session, recall=FakeRecall())  # searches, finds nothing
     await run(conv)
 
-    assert session.contexts == []
+    # The time block still goes over unconditionally; recall specifically found
+    # nothing to add.
+    assert not any("recalled-memory:" in text for text in session.contexts)
 
 
 async def test_a_syllable_is_not_worth_an_embedder_call() -> None:
@@ -1292,9 +1300,15 @@ async def test_the_conversation_and_the_real_session_agree_about_a_turn() -> Non
     # nobody ever finished saying - and went back as context rather than as a
     # prompt: `clientContent` with `turnComplete: false`.
     assert recall.queries == ["치과 예약", "치과 예약 언제였지"]
-    (seeded,) = socket.frames("clientContent")
+    # Two clientContent frames now: the unconditional time block at session open,
+    # then recall at the turn boundary - filter to the one carrying the memory and
+    # unpack a one-tuple, so "exactly one" is still asserted, just about that block.
+    (seeded,) = [
+        frame
+        for frame in socket.frames("clientContent")
+        if _item().content in frame["turns"][0]["parts"][0]["text"]
+    ]
     assert seeded["turnComplete"] is False
-    assert _item().content in seeded["turns"][0]["parts"][0]["text"]
     assert not any("text" in frame for frame in socket.frames("realtimeInput")), (
         "recall reached the model as a prompt; the daemon will read it aloud"
     )
@@ -1607,8 +1621,9 @@ async def test_held_recall_is_sent_at_the_turn_boundary() -> None:
     conv = conversation(session, recall=recall)
     await run(conv)
 
-    assert len(session.contexts) == 1, "the held recall never reached the model"
-    assert "치과" in session.contexts[0]
+    # Alongside the unconditional time block, sent once at the turn boundary.
+    recall_sends = [text for text in session.contexts if "치과" in text]
+    assert len(recall_sends) == 1, "the held recall never reached the model"
     assert session.sent_while_generating == []
 
 
@@ -1626,7 +1641,10 @@ async def test_the_same_turn_is_not_seeded_twice() -> None:
     conv = conversation(session, recall=recall)
     await run(conv)
 
-    assert len(session.contexts) <= 1, "the same turn was seeded more than once"
+    # The unconditional time block is one more context; recall itself must still
+    # go over at most once.
+    recall_sends = [text for text in session.contexts if "치과" in text]
+    assert len(recall_sends) <= 1, "the same turn was seeded more than once"
     assert session.sent_while_generating == []
 
 
@@ -2165,6 +2183,68 @@ async def test_the_recent_conversation_rides_in_before_the_first_turn() -> None:
     assert continuity[0] not in session.sent_while_generating, (
         "sent before any generation - mid-generation clientContent kills the answer"
     )
+
+
+async def test_the_session_learns_the_date_before_the_conversation_tail() -> None:
+    """Order matters: the tail is read *in* the present, so the present goes first.
+
+    Both go over at open - the one point where nothing is generating, and
+    mid-generation `clientContent` kills the answer.
+    """
+    session = FakeSession(Says("user", "이어서 하자"), b"\x01", Turn())
+    memory = FakeMemory()
+    memory.records.extend(
+        [
+            _spoke("면접 준비 도와줘", minutes_ago=3),
+            _spoke("좋아요, 어디 회사부터?", "assistant", minutes_ago=2),
+        ]
+    )
+
+    await run(conversation(session, FakeAudio(), memory))
+
+    assert session.contexts[0].startswith("[현재 시각] ")
+    tail = next(i for i, text in enumerate(session.contexts) if "recent-conversation" in text)
+    assert tail > 0, "the date is established before the tail that is read against it"
+    assert session.contexts[0] not in session.sent_while_generating, (
+        "sent before any generation - mid-generation clientContent kills the answer"
+    )
+
+
+async def test_a_past_commitment_reaches_the_session_over_send_context() -> None:
+    """`Companion.time_block` is the only way `[약속 상태]` can reach a voice
+    session - its history lives server-side, so there is no `list[Message]` for the
+    text path's `_assemble` to splice a block into, and this `send_context` call is
+    the whole handoff. Modelled on
+    `test_the_session_learns_the_date_before_the_conversation_tail`: the seeded
+    message is well outside the 120-minute continuity window, so the only new
+    content in `session.contexts[0]` beyond `[현재 시각]` is the commitment block
+    itself (verified by mutation: deleting the `timesense.commitments(...)` call
+    from `time_block` fails this assertion; restoring it passes).
+    """
+    session = FakeSession(Says("user", "안녕"), b"\x01", Turn())
+    memory = FakeMemory()
+    memory.records.append(_spoke("오늘 오후 2시에 면접 있어", minutes_ago=60 * 24 * 2))
+
+    await run(conversation(session, FakeAudio(), memory))
+
+    assert session.contexts[0].startswith("[현재 시각] ")
+    assert "[약속 상태]" in session.contexts[0]
+    assert "이미 지났습니다" in session.contexts[0]
+    assert not any("recent-conversation" in text for text in session.contexts), (
+        "the seeded message is two days old - well outside the continuity window"
+    )
+
+
+async def test_a_quiet_stretch_still_tells_the_session_what_day_it_is() -> None:
+    """The complement of `test_a_quiet_stretch_means_no_continuity_block_at_all`: no
+    tail is correct after two hours of silence, but a session opening after a quiet
+    night is exactly the one that most needs the date."""
+    session = FakeSession(Says("user", "안녕"), b"\x01", Turn())
+
+    await run(conversation(session, FakeAudio(), FakeMemory()))
+
+    assert session.contexts[0].startswith("[현재 시각] ")
+    assert not any("recent-conversation" in text for text in session.contexts)
 
 
 async def test_a_quiet_stretch_means_no_continuity_block_at_all() -> None:

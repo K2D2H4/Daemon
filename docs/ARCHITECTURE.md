@@ -104,8 +104,11 @@ flowchart LR
 ```
 
 The two conversation endpoints are transports, and everything they both need is
-`daemon/companion.py`: the persona, the tool rules, the recall block with its
-injection boundary, and one message written to markdown, mirrored, and embedded.
+`daemon/companion.py`: the current-time block, the persona, the tool rules, which of
+the commitments in view are past, the recall block with its injection boundary, and
+one message written to markdown, mirrored, and embedded. The time block leads
+because it is a fact about the world rather than an instruction; commitments trail
+the tool rules they don't qualify.
 They are not one pipeline, and that is deliberate — text assembles a fresh prompt
 per request while voice is a stream whose history the server holds and where a
 message sent mid-generation kills the answer. Sharing the capability is free;

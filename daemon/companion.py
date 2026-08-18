@@ -32,10 +32,10 @@ import logging
 import re
 import secrets
 from collections.abc import Callable, Sequence
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from daemon import clock
+from daemon import clock, timesense
 from daemon.llm.base import ToolCall, ToolSpec
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
 from daemon.persona import loader as persona
@@ -132,6 +132,14 @@ survives, and a single long message must not crowd out the rest of it."""
 _IDENTITY_NONCE = "same-memories"
 """The nonce `Companion.recall_key` renders under. **Never sent** - it is a fixed
 string, so anything planted in a recorded message could close a block wearing it."""
+
+_IDENTITY_NOW = datetime(2099, 1, 1, tzinfo=UTC)
+"""The `now` `recall_key` renders against. Never sent, and deliberately far in the
+future: `timesense.relative` is a function of *both* timestamps, so rendering an
+identity key against the live clock would make an unchanged memory set produce a
+different key the moment the local date turned over - and the voice path would
+re-seed facts it had already sent. Far enough ahead that every item lands in the
+stable absolute form."""
 
 ResolveId = Callable[[str], int | None]
 """Returns the id of the message just recorded, or None if the newest recorded
@@ -249,14 +257,19 @@ class Companion:
         self,
         query: str,
         *,
+        history: Sequence[LoggedMessage] = (),
         already: frozenset[str] | set[str] = frozenset(),
         origin: str = "owner",
+        now: datetime | None = None,
     ) -> tuple[str, ...]:
         """Everything to put in front of the model this turn, in order.
 
-        Who it is, then what it may touch, then what it is reasoning over: the
-        persona, the tool rules if this turn may use tools, and recalled memory
-        rendered to its nonce boundary.
+        Who it is, when it is, what it may touch, which of the commitments in view are
+        still alive, and what it is reasoning over: the current-time block, the
+        persona, the tool rules if this turn may use tools, the commitments block, and
+        recalled memory rendered to its nonce boundary. The time block goes first
+        because it is a fact about the world rather than an instruction, so it should
+        not sit between the persona and the tool rules that qualify it.
 
         Blocks rather than one joined string, and that is not cosmetic. The text path
         sends each as its own `Message(role="system")` - the persona *is* the system
@@ -267,10 +280,25 @@ class Companion:
         `already` is the recent window's contents: it carries searched hits verbatim
         and in their real position, so repeating one as "recalled" would make the
         model read one event as two.
+
+        `now` defaults to a fresh `clock.now()`, but a caller that also computes
+        `timesense.session_breaks` for the same turn (`ConversationLoop._assemble`)
+        must pass its own moment instead. Two separate reads inside one turn can
+        straddle a minute - and, across local midnight, a date - which is how the
+        window's break line once named tomorrow while this block still named today.
         """
-        blocks = [await self.persona(), self._tool_rules(origin=origin)]
+        moment = clock.now() if now is None else now
+        items = await self.search(query) if self.has_recall else []
+        blocks = [
+            _time_block_or_empty(moment),
+            await self.persona(),
+            self._tool_rules(origin=origin),
+            # Over the window *and* the recall hits: a commitment can arrive either
+            # way, and this block exists to annotate whatever the model can see.
+            _commitments_or_empty([*history, *items], moment),
+        ]
         if self.has_recall:
-            blocks.append(self.recall_block(await self.search(query), already=already))
+            blocks.append(self.recall_block(items, already=already, now=moment))
         return tuple(block for block in blocks if block)
 
     def _tool_rules(self, *, origin: str) -> str:
@@ -297,6 +325,7 @@ class Companion:
         items: list[RecalledItem],
         *,
         already: frozenset[str] | set[str] = frozenset(),
+        now: datetime | None = None,
     ) -> str:
         """Recalled memory as prompt text, under a nonce nobody could have guessed.
 
@@ -304,8 +333,13 @@ class Companion:
         weeks ago must not be able to close the block it arrives in, and a test that
         pinned the nonce would be testing the test. `render_recall` takes one
         explicitly for the cases that do need a fixed value.
+
+        `now` is threaded through rather than left to `render_recall`'s own default:
+        `context()` passes the one moment it already read, so a memory timestamped
+        today does not read as yesterday's because this call happened to land a
+        minute later.
         """
-        return render_recall(items, secrets.token_hex(4), already=already)
+        return render_recall(items, secrets.token_hex(4), already=already, now=now)
 
     def recall_key(self, items: list[RecalledItem]) -> str:
         """The same memories under a fixed nonce, for telling two payloads apart.
@@ -316,7 +350,7 @@ class Companion:
         the model on every partial transcript would hand it the same facts over and
         over.
         """
-        return render_recall(items, _IDENTITY_NONCE)
+        return render_recall(items, _IDENTITY_NONCE, now=_IDENTITY_NOW)
 
     async def search(self, query: str) -> list[RecalledItem]:
         """Lane 1: what is worth putting back in front of the model.
@@ -418,6 +452,20 @@ class Companion:
             return ""
         return render_continuity(fresh, secrets.token_hex(4))
 
+    async def time_block(self, *, limit: int = CONTINUITY_MESSAGES) -> str:
+        """When it is, and which commitments in recent view are already past.
+
+        For the voice path, which has no `list[Message]` to carry these in - its
+        history lives server-side - so they go over `send_context` as their own
+        block. Unconditional, unlike `continuity_block`: that one is empty when
+        nothing is fresh, and a session opening after a quiet night is precisely the
+        one that most needs to be told what day it is.
+        """
+        moment = clock.now()
+        history = await self._memory.recent(limit=limit)
+        parts = [timesense.now_block(moment), timesense.commitments(history, moment)]
+        return "\n\n".join(part for part in parts if part)
+
     async def seen(self, channel: str, external_id: str) -> bool:
         """Has this channel message already been recorded? The markdown is
         append-only, so a duplicate has to be caught before the write."""
@@ -494,7 +542,11 @@ class Companion:
 
 
 def render_recall(
-    items: list[RecalledItem], nonce: str, *, already: frozenset[str] | set[str] = frozenset()
+    items: list[RecalledItem],
+    nonce: str,
+    *,
+    already: frozenset[str] | set[str] = frozenset(),
+    now: datetime | None = None,
 ) -> str:
     """Recalled memory as prompt text: up to two blocks, or an empty string.
 
@@ -506,11 +558,16 @@ def render_recall(
     something was said is part of what it means. Curated facts are not, because a
     standing fact has no useful "when" and a date invites the model to treat it as a
     stale quotation rather than something it knows.
+
+    The rendering is relative *and* absolute (`timesense.relative`): an ISO instant
+    made the model do UTC-to-local arithmetic it gets wrong, and a bare "지난주
+    금요일" collides the moment two hits land on the same weekday.
     """
     from daemon.memory.recall import CURATED_ROLE
 
+    moment = clock.now() if now is None else now
     searched = [
-        f"- {clock.to_iso(item.ts)} {_label(item)}: {_one_line(item.content)}"
+        f"- {timesense.relative(item.ts, moment)} {_label(item)}: {_one_line(item.content)}"
         for item in items
         if item.role != CURATED_ROLE and item.content not in already
     ]
@@ -574,6 +631,31 @@ def render_continuity(items: list[LoggedMessage], nonce: str) -> str:
         f"- {clock.to_iso(item.ts)} {item.role}: {_one_line(item.content)}" for item in items
     ]
     return "\n".join([header, "", *lines, "", f"[end-recent-conversation:{nonce}]"])
+
+
+def _time_block_or_empty(moment: datetime) -> str:
+    """`timesense.now_block`, wrapped so a raise costs the time block and not the
+    turn. Spec's Error handling section: "Never fail a turn... each helper is
+    wrapped at its injection point" - the same shape `_send_continuity`
+    (`daemon/voice/conversation.py`) already uses on the voice path.
+    """
+    try:
+        return timesense.now_block(moment)
+    except Exception:
+        logger.exception("timesense: could not render the current-time block")
+        return ""
+
+
+def _commitments_or_empty(
+    messages: Sequence[LoggedMessage | RecalledItem], moment: datetime
+) -> str:
+    """`timesense.commitments`, wrapped the same way: the annotation is worth
+    losing, the turn is not."""
+    try:
+        return timesense.commitments(messages, moment)
+    except Exception:
+        logger.exception("timesense: could not render the commitments block")
+        return ""
 
 
 def _label(item: RecalledItem) -> str:

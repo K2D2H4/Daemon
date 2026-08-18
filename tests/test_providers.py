@@ -11,11 +11,12 @@ import base64
 import json
 import logging
 from collections.abc import Callable
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 
-from daemon import tui
+from daemon import timesense, tui
 from daemon.llm.base import (
     ImageBlock,
     Message,
@@ -738,6 +739,58 @@ async def test_gemini_puts_the_system_turn_in_system_instruction() -> None:
     assert completion.model == "gemini-2.5-flash"
     assert (completion.input_tokens, completion.output_tokens) == (5, 2)
     assert completion.meta["stop_reason"] == "STOP"
+
+
+class _Line:
+    """The two fields `timesense.session_breaks` reads, without a database - the
+    same shape `tests/test_timesense.py` defines for the same reason."""
+
+    def __init__(self, ts: datetime) -> None:
+        self.ts, self.content, self.role, self.origin = ts, "", "user", "owner"
+
+
+async def test_gemini_hoists_a_spliced_break_line_out_of_the_conversation_turns() -> None:
+    """`daemon/loop.py`'s `_assemble` splices `[대화 단절]` into the message list as
+    a `Message(role="system")` at the index where the conversation broke, and
+    `timesense.session_breaks`'s docstring says that placement stays meaningful only
+    for `ollama` and `openai_compatible`. This provider hoists every `role="system"`
+    message into `systemInstruction` and `_contents` drops it from the turn array
+    entirely, so the spliced line arrives with no conversation on either side of it -
+    which is exactly why `_break_line`'s wording had to stop depending on where it
+    sits. Pinned here so a future change cannot silently reintroduce a version that
+    only reads right at its inline position, on `gemini` - this owner's configured
+    provider - where that position never survives.
+    """
+    before = datetime(2026, 8, 14, 8, 24, tzinfo=UTC)  # Fri 17:24 KST
+    after = datetime(2026, 8, 18, 0, 28, tzinfo=UTC)  # Tue 09:28 KST
+    now = datetime(2026, 8, 18, 1, 0, tzinfo=UTC)  # Tue 10:00 KST
+    (break_line,) = [
+        line for _, line in timesense.session_breaks([_Line(before), _Line(after)], now)
+    ]
+    assert break_line.startswith("[대화 단절]")  # sanity: this is the line under test
+
+    messages = [
+        Message(role="system", content="seed"),
+        Message(role="user", content="오늘 오후 4시40분에 회의있어"),
+        Message(role="assistant", content="알겠습니다!"),
+        Message(role="system", content=break_line),
+        Message(role="user", content="벨라"),
+    ]
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=GEMINI_OK)
+
+    async with mock_client(handler) as client:
+        provider = GeminiProvider(SECRET, client=client)
+        await provider.complete(messages, model="gemini-2.5-flash")
+
+    body = json.loads(seen[0].content)
+    assert break_line in body["systemInstruction"]["parts"][0]["text"]
+    assert not any(
+        "대화 단절" in json.dumps(content, ensure_ascii=False) for content in body["contents"]
+    ), "the break line must not survive into the turn array `contents` sends"
 
 
 async def test_gemini_sanitizes_a_tool_schema_it_would_otherwise_reject() -> None:

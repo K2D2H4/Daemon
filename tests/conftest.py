@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
@@ -104,6 +105,24 @@ def data_dir(tmp_path: Path) -> Path:
     for sub in ("memory/log", "memory/entities", "persona"):
         (tmp_path / sub).mkdir(parents=True, exist_ok=True)
     return tmp_path
+
+
+@pytest.fixture
+def seoul(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Pin the machine's local zone to Asia/Seoul.
+
+    The single definition. `test_timesense.py` and `test_candidates.py` each wrap
+    this in their own autouse `_seoul` fixture that just requests it, for any test
+    whose assertion is a Korean phrase built from a local-time conversion
+    (`daemon/timesense.py`). CI (`ubuntu-latest`) sets no timezone, so a string like
+    "오후 4시" that reads right on a KST machine would name the wrong hour there
+    without this.
+    """
+    monkeypatch.setenv("TZ", "Asia/Seoul")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
 
 
 class FakeProvider:

@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import time as time_module
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
@@ -52,13 +51,9 @@ load-bearing for the pattern-time cases below."""
 
 
 @pytest.fixture(autouse=True)
-def seoul(monkeypatch: pytest.MonkeyPatch) -> object:
-    """Pin the machine's local zone. The product is Korean; so is its calendar."""
-    monkeypatch.setenv("TZ", "Asia/Seoul")
-    time_module.tzset()
-    yield
-    monkeypatch.undo()
-    time_module.tzset()
+def _seoul(seoul: None) -> None:
+    """Every case in this file reasons about the owner's local day or hour, so the
+    zone is pinned for all of them. The fixture itself lives in `conftest.py`."""
 
 
 # --- the reader, and the writes the tests need --------------------------------
