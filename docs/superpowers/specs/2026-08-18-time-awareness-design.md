@@ -157,8 +157,13 @@ and an event word yields one line, `due` in the past → expired, in the future 
   (`daemon/proactivity/candidates.py`) — moved to `timesense.py` and imported back.
   The conversation path asks a **different predicate** of the same primitives:
   proactivity asks "is `now` inside `[due, due + TTL]`", this asks "is `due` past".
-- `_is_owner_utterance` (`candidates.py:630`) — reused unchanged. Only the owner's own
-  words can create a commitment; relayed text cannot.
+- `_is_owner_utterance` (`candidates.py:630`) — **corrected after review:** not reused
+  unchanged. `commitments` inlined the same check on a `Timed` instead of calling it,
+  because `_is_owner_utterance` takes a `sqlite3.Row` and the two shapes do not unify
+  without a wrapper. The predicate itself moved to `timesense.is_owner_utterance(role,
+  origin)`, taking the two plain fields rather than either container; `candidates.
+  _is_owner_utterance(row)` is now a one-line adapter that calls it. Only the owner's
+  own words can create a commitment; relayed text cannot.
 - `clock.now` / `clock.to_iso` / `clock.parse_iso` — unchanged. One new display-only
   helper, `clock.local()`.
 - `Companion.continuity_block` / `send_context` — the existing voice block channel

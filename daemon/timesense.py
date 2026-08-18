@@ -65,8 +65,7 @@ def now_block(now: datetime) -> str:
     here = clock.local(now)
     kind = "주말" if here.weekday() >= 5 else "평일"
     return (
-        f"[현재 시각] 지금은 {here.year}년 {here.month}월 {here.day}일 "
-        f"{WEEKDAYS[here.weekday()]}요일 {_clock_face(here)}입니다. "
+        f"[현재 시각] 지금은 {here.year}년 {_day_face(here)} {_clock_face(here)}입니다. "
         f"{kind} {_day_part(here.hour)}입니다."
     )
 
@@ -113,16 +112,30 @@ def relative(ts: datetime, now: datetime, *, with_gap: bool = True) -> str:
 
 
 def _day_part(hour: int) -> str:
+    """`hour` is always a `datetime.hour` (0-23), and `_DAY_PARTS`' last bound is
+    24 - exclusive, and above every legal hour - so the loop below always returns
+    before falling off the end. No fallback after it: one would be unreachable and
+    untested, which hides a real bug (a caller passing something out of range)
+    behind a value that looks like an ordinary answer."""
     for bound, name in _DAY_PARTS:
         if hour < bound:
             return name
-    return "밤"
+    raise AssertionError(f"hour {hour!r} is not in 0-23")
 
 
 def _clock_face(here: datetime) -> str:
     """Local wall time in Korean. The minute is dropped when it is zero, because
-    "오전 10시 0분" is not something anyone says."""
-    meridiem = "오전" if here.hour < 12 else "오후"
+    "오전 10시 0분" is not something anyone says.
+
+    The midnight hour reads "밤 12시", not "오전 12시" - a Korean speaker does not
+    call 00:30 morning, and `now_block`'s day-part clause calls the same hour "새벽"
+    in the very next sentence. "오전 12시" next to "새벽" is two different answers
+    to "what part of the day is it" in one sentence.
+    """
+    if here.hour == 0:
+        meridiem = "밤"
+    else:
+        meridiem = "오전" if here.hour < 12 else "오후"
     twelve = here.hour % 12 or 12
     if here.minute == 0:
         return f"{meridiem} {twelve}시"
@@ -142,9 +155,23 @@ without anyone having slept. The `voice` path's 120-minute freshness cutoff answ
 different question - whether to hand a tail over at all - and is left alone.
 """
 
+SESSION_BREAK_CAP = 3
+"""Most `[대화 단절]` lines carried into one prompt.
+
+`context_turns` defaults to 20, and a window spanning 20 distinct days produces 19
+break lines - on `gemini`, `anthropic` and `openai`, which hoist every system
+message into one field, the system instruction would then be almost entirely
+near-identical break lines. Keeps the *most recent* boundaries: they border the
+stretch of conversation the model is actually being asked about, while an older one
+sits inside a stretch nobody is asking it to reason over. Safe to drop from the
+front rather than reword: each line already names its own two dates and the gap
+between them, so a surviving line says nothing about how many others were cut.
+"""
+
 
 def session_breaks(history: Sequence[Timed], now: datetime) -> list[tuple[int, str]]:
-    """Where the conversation window broke, as `(index, line)` in ascending order.
+    """Where the conversation window broke, as `(index, line)` in ascending order,
+    capped at `SESSION_BREAK_CAP`.
 
     The line belongs **before** `history[index]`, and `_assemble` splices it in at
     that position - which is still worth doing: on `ollama` and `openai_compatible`
@@ -156,16 +183,19 @@ def session_breaks(history: Sequence[Timed], now: datetime) -> list[tuple[int, s
     the line is read. `_break_line`'s wording does not depend on surviving that -
     see its own docstring for why.
     """
+    # Localised once per message, not once per adjacent pair: each `history[i].ts`
+    # would otherwise be converted twice - once as `after` at index i, again as
+    # `before` at index i+1.
+    local_ts = [clock.local(item.ts) for item in history]
     breaks: list[tuple[int, str]] = []
     for index in range(1, len(history)):
-        before = clock.local(history[index - 1].ts)
-        after = clock.local(history[index].ts)
+        before, after = local_ts[index - 1], local_ts[index]
         if before.date() == after.date():
             continue
         if (after - before).total_seconds() / 3600.0 < BREAK_MIN_HOURS:
             continue
         breaks.append((index, _break_line(before, after, now)))
-    return breaks
+    return breaks[-SESSION_BREAK_CAP:]
 
 
 def _break_line(before: datetime, after: datetime, now: datetime) -> str:
@@ -254,12 +284,34 @@ EVENTS = (
     "견적", "심사", "발표평가", "학회", "졸업식", "입학식", "회식", "정기점검",
 )
 
-EVENT_CANCELLED = (
+_EVENT_CANCELLED_ALWAYS: tuple[str, ...] = (
     # Said in the same message, these mean the thing is not happening. A missed
     # cancellation is the expensive false positive here: asking how a cancelled
-    # exam went says plainly that nobody was listening.
-    "취소", "연기", "미뤄", "없어졌", "안 하", "안 가", "없어", "없다", "없음",
+    # exam went says plainly that nobody was listening. No other common use of
+    # these forms exists in an event context, so `open_loop_candidates` and
+    # `commitments` both treat them as cancellation wherever they sit in the text.
+    "취소", "연기", "미뤄", "없어졌", "안 하", "안 가",
 )
+
+_EVENT_CANCELLED_IF_ATTACHED: tuple[str, ...] = ("없어", "없다", "없음")
+"""The rest of what `open_loop_candidates` treats as cancellation - and also three
+of the commonest words in Korean: "시간 없어", "돈이 없어" say nothing about an
+event's fate. `open_loop_candidates` accepts that cost anywhere in the message (its
+own comment on `EVENT_CANCELLED` below explains why: a missed cancellation there is
+one unasked question). `commitments` cannot accept it the same way - a missed
+cancellation there is the daemon reporting a dead commitment as pending, the exact
+defect this module exists to prevent - so it only counts one of these words as
+cancellation when it sits within `_CANCELLED_ATTACH_CHARS` of the event word itself.
+See `_commitment_cancelled`.
+"""
+
+EVENT_CANCELLED = _EVENT_CANCELLED_ALWAYS + _EVENT_CANCELLED_IF_ATTACHED
+"""The full lexicon, unchanged: `open_loop_candidates` (`daemon/proactivity/
+candidates.py`) still checks it flat, anywhere in the message, and that behaviour
+is pinned by its own suite. `commitments` below does not call
+`contains_any(text, EVENT_CANCELLED)` - it reads the two halves above separately
+through `_commitment_cancelled`, because the second half is only unambiguous near
+the event it is said about, and "회의 있는데 시간 없어" has a live meeting in it."""
 
 HOUR_RE = re.compile(r"(오전|오후|아침|저녁|밤)?\s*(\d{1,2})\s*시(?!간)")
 """`(?!간)` because "2시간 뒤에" is a duration, and matching `2시` inside it would
@@ -318,6 +370,70 @@ def due_at(said_at: datetime, day_offset: int, stated_hour: int | None) -> datet
     return datetime.combine(target, time(hour=hour)).astimezone().astimezone(UTC)
 
 
+def is_owner_utterance(role: str, origin: str) -> bool:
+    """Only what the owner themselves said, in their own words.
+
+    `origin` is a column precisely so this is decidable (non-negotiable 3): relayed
+    text - a forward, an inline-bot result - is not the user telling us they have a
+    meeting, and treating it as such would let a third party schedule the daemon's
+    attention.
+
+    Shared by `commitments` below and `candidates._is_owner_utterance`
+    (`daemon/proactivity/candidates.py`), which differ only in what they hold the
+    two fields in - a `sqlite3.Row` there, a `Timed` here - so the predicate takes
+    the two plain strings rather than either shape.
+    """
+    return role == "user" and origin == "owner"
+
+
+_CANCELLED_ATTACH_CHARS = 6
+"""How close a `_EVENT_CANCELLED_IF_ATTACHED` word has to sit after the event word
+for `_commitment_cancelled` to read it as describing that event, rather than some
+other noun later in the same sentence.
+
+Wide enough to cross a particle and a space - "회의가 없어" (2 chars between),
+"회의는 없어" (2 chars) - narrow enough to miss a whole clause away - "회의 있는데
+시간 없어" is 8 chars from the end of "회의" to the start of "없어". No tokeniser:
+Korean particles attach with no space to rely on, so this is a character count
+across the raw string, not a word count.
+"""
+
+
+def _commitment_cancelled(text: str, event: str) -> bool:
+    """Whether `text` says `event` is not happening - `commitments`'s narrower
+    reading of `EVENT_CANCELLED` (see that name's own docstring for why the two
+    consumers need different readings of the same lexicon).
+
+    `_EVENT_CANCELLED_ALWAYS` fires anywhere in the message, same as
+    `open_loop_candidates`. `_EVENT_CANCELLED_IF_ATTACHED` only fires within
+    `_CANCELLED_ATTACH_CHARS` *after* the event word - forward only, because
+    Korean's SOV order puts the object before the predicate that negates it
+    ("회의 없어", never "없어 회의").
+    """
+    if contains_any(text, _EVENT_CANCELLED_ALWAYS):
+        return True
+    start = text.find(event)
+    if start == -1:
+        return False
+    window = text[start + len(event) : start + len(event) + _CANCELLED_ATTACH_CHARS]
+    return contains_any(window, _EVENT_CANCELLED_IF_ATTACHED)
+
+
+COMMITMENT_LOOKBACK_DAYS = 14
+"""How far back a message may sit and still be checked for a commitment.
+
+`commitments` scans the recent window plus whatever recall returned - and recall
+can surface a hit from any point in the archive. `open_loop_candidates`'s own
+`OPEN_LOOP_LOOKBACK_DAYS = 7` (`daemon/proactivity/candidates.py`) bounds a
+background *scan*, not what recall may hand this function, so without a bound here
+a query that pulls a handful of old 회의/약속/발표 mentions fills the block with
+irrelevancies from months back - verified: a 120-day-old message reached the
+prompt this way. This block's job is to annotate commitments the *current*
+conversation might raise, which is days old at most, so double
+`OPEN_LOOP_LOOKBACK_DAYS` is comfortable headroom without reopening the archive.
+"""
+
+
 def commitments(messages: Sequence[Timed], now: datetime) -> str:
     """Which commitments in the visible context are still alive, and which are past.
 
@@ -335,20 +451,25 @@ def commitments(messages: Sequence[Timed], now: datetime) -> str:
     Nothing from the message reaches the output: `surface` and `event` are lexicon
     entries and every time is computed, the same discipline
     `daemon/proactivity/candidates.py` states for its `reason` field.
+
+    Bounded to the last `COMMITMENT_LOOKBACK_DAYS` days: recall may hand this a hit
+    from anywhere in the archive, and this block's job is to annotate the current
+    conversation, not resurrect one from months back.
     """
+    cutoff = now - timedelta(days=COMMITMENT_LOOKBACK_DAYS)
     lines: list[str] = []
     seen: set[tuple[str, str, datetime]] = set()
     for item in messages:
-        # Only the owner's own words. `origin` is a column precisely so this is
-        # decidable: relayed text is not the owner saying they have a meeting.
-        if item.role != "user" or item.origin != "owner":
+        if item.ts < cutoff:
+            continue
+        if not is_owner_utterance(item.role, item.origin):
             continue
         text = item.content
-        if contains_any(text, EVENT_CANCELLED):
-            continue
         marker = day_marker(text)
         event = first_of(text, EVENTS)
         if marker is None or event is None:
+            continue
+        if _commitment_cancelled(text, event):
             continue
         surface, offset = marker
         if surface in TENSE_NEUTRAL and contains_any(text, PAST_MARKERS):

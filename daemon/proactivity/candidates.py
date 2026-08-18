@@ -132,6 +132,7 @@ from daemon.timesense import (
     day_marker,
     due_at,
     first_of,
+    is_owner_utterance,
     stated_hour,
 )
 
@@ -581,12 +582,12 @@ def dedup_key(candidate: Candidate) -> str:
 def _is_owner_utterance(row: sqlite3.Row) -> bool:
     """Only what the owner themselves said, in their own words.
 
-    `origin` is a column precisely so this is decidable (non-negotiable 3):
-    relayed text - a forward, an inline-bot result - is not the user telling us
-    they have a presentation tomorrow, and treating it as such would let a third
-    party schedule the daemon's attention.
+    A thin adapter over `timesense.is_owner_utterance`, shared with
+    `timesense.commitments`: the two callers hold the same two fields in
+    different shapes - a `sqlite3.Row` here, a `Timed` there - so the predicate
+    itself takes the plain strings and each caller does its own field access.
     """
-    return row["role"] == "user" and row["origin"] == "owner"
+    return is_owner_utterance(row["role"], row["origin"])
 
 
 def _emotion(text: str) -> str | None:
