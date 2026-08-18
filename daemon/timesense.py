@@ -23,8 +23,9 @@ makes every case in `tests/test_timesense.py` pinnable.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Protocol
 
 from daemon import clock
@@ -174,3 +175,126 @@ def _break_line(before: datetime, after: datetime, now: datetime) -> str:
 
 def _day_face(here: datetime) -> str:
     return f"{here.month}월 {here.day}일 {WEEKDAYS[here.weekday()]}요일"
+
+
+# --- what the owner said would happen ----------------------------------------
+#
+# These came from `daemon/proactivity/candidates.py`, which still imports them. Two
+# callers now ask *different questions of the same primitives*: proactivity asks "is
+# `now` inside [due, due + TTL]" to decide whether to raise something, and
+# `commitments` asks "is `due` in the past" to decide whether a thing the owner can
+# see is still alive. They must not drift apart - the defect that started this was
+# the conversation path not being able to see a judgement proactivity had already
+# made correctly.
+
+FOLLOWUP_HOUR = 20
+"""Local hour an open loop with no stated time becomes due. PLAN 6.1's own example
+is "내일 발표" -> the next evening: late enough that the thing has happened."""
+
+EVENT_LAG_HOURS = 2
+"""How long after a *stated* time to ask how it went. Without this, "내일 밤 10시
+발표" gets asked about at 20:00 - two hours before it happens."""
+
+DAY_OFFSETS: tuple[tuple[str, int], ...] = (
+    # Longest first: "내일모레" contains "내일", and means the day after tomorrow.
+    ("내일모레", 2),
+    ("모레", 2),
+    ("내일", 1),
+    ("오늘", 0),
+    ("이따", 0),
+)
+"""Only markers whose futurity is *lexical*. "다음주"/"주말"/"금요일" were left out
+on purpose: resolving them to a date is a guess (is 금요일 said on Friday today or
+in seven days?), and a wrong due time makes the daemon ask how something went
+before it happened, which reads as broken rather than early."""
+
+TENSE_NEUTRAL = frozenset({"오늘", "이따"})
+"""These say *when* without saying *not yet*, so "오늘 발표 했어" would otherwise
+become a candidate to ask about a presentation already reported on. They alone get
+the past-tense guard; 내일/모레 do not need it and applying it there would throw
+away the common "내일 발표 있어, 오늘 준비 많이 했어"."""
+
+PAST_MARKERS = (
+    # Korean past tense contracts into a syllable rather than adding one, so this
+    # is a list of contracted forms and not a suffix rule: 하였어->했어, 되었어->
+    # 됐어, 보았어->봤어. Not exhaustive, and it does not need to be - a missed
+    # past tense costs one unnecessary candidate, and the gate still has to pass it.
+    "했", "었", "았", "였", "됐", "갔", "왔", "봤",
+)
+
+EVENTS = (
+    # Things with a moment and an outcome, so that "how did it go" is a real
+    # question afterwards. Deliberately excludes words whose commonest use is not
+    # an event: 경기 is most often the economy, 시간 is never an appointment.
+    "발표", "시험", "면접", "인터뷰", "회의", "미팅", "세미나", "워크샵", "강연",
+    "병원", "진료", "검진", "검사", "수술", "치과", "상담",
+    "약속", "소개팅", "데이트", "결혼식", "장례",
+    "마감", "데드라인", "제출", "과제", "제안서", "계약", "등록",
+    "이사", "출장", "여행", "이직",
+    "리허설", "오디션", "촬영", "공연", "시합", "대회", "면허",
+    "발표회", "상견례", "면허시험", "자격증", "건강검진", "예방접종",
+    "견적", "심사", "발표평가", "학회", "졸업식", "입학식", "회식", "정기점검",
+)
+
+EVENT_CANCELLED = (
+    # Said in the same message, these mean the thing is not happening. A missed
+    # cancellation is the expensive false positive here: asking how a cancelled
+    # exam went says plainly that nobody was listening.
+    "취소", "연기", "미뤄", "없어졌", "안 하", "안 가", "없어", "없다", "없음",
+)
+
+HOUR_RE = re.compile(r"(오전|오후|아침|저녁|밤)?\s*(\d{1,2})\s*시(?!간)")
+"""`(?!간)` because "2시간 뒤에" is a duration, and matching `2시` inside it would
+schedule the follow-up at 02:00."""
+
+
+def contains_any(text: str, needles: Sequence[str]) -> bool:
+    return any(needle in text for needle in needles)
+
+
+def first_of(text: str, needles: Sequence[str]) -> str | None:
+    """The first of `needles` present, in `needles` order rather than text order,
+    so the caller controls precedence."""
+    for needle in needles:
+        if needle in text:
+            return needle
+    return None
+
+
+def day_marker(text: str) -> tuple[str, int] | None:
+    for surface, offset in DAY_OFFSETS:
+        if surface in text:
+            return surface, offset
+    return None
+
+
+def stated_hour(text: str) -> int | None:
+    """The hour the user named, in 24h local, or `None` if they named none."""
+    match = HOUR_RE.search(text)
+    if match is None:
+        return None
+    meridiem, digits = match.group(1), int(match.group(2))
+    if digits > 23:
+        return None
+    if meridiem in ("오후", "저녁", "밤"):
+        return digits + 12 if digits < 12 else digits
+    if meridiem in ("오전", "아침"):
+        return digits
+    # No meridiem: a bare single-digit hour before 8 is the afternoon one. "3시
+    # 발표" is 15:00, and reading it as 03:00 would put the follow-up before dawn.
+    return digits + 12 if digits < 8 else digits
+
+
+def due_at(said_at: datetime, day_offset: int, stated_hour: int | None) -> datetime:
+    """When the follow-up becomes due, as UTC.
+
+    Built in local time and converted, because the offset is a number of *days* on
+    the user's calendar: "내일" said at 23:30 KST is a different UTC date already.
+    A naive datetime's `.astimezone()` resolves it with the offset in force on that
+    date, which is the only form of this that stays correct across a DST boundary.
+    """
+    target = clock.local(said_at).date() + timedelta(days=day_offset)
+    hour = FOLLOWUP_HOUR
+    if stated_hour is not None:
+        hour = max(FOLLOWUP_HOUR, min(23, stated_hour + EVENT_LAG_HOURS))
+    return datetime.combine(target, time(hour=hour)).astimezone().astimezone(UTC)
