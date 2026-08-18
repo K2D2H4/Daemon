@@ -146,10 +146,15 @@ different question - whether to hand a tail over at all - and is left alone.
 def session_breaks(history: Sequence[Timed], now: datetime) -> list[tuple[int, str]]:
     """Where the conversation window broke, as `(index, line)` in ascending order.
 
-    The line belongs **before** `history[index]`, and the position is the whole
-    point: a block that described the break in prose ("the first eight lines are
-    from Friday") would make the model count, and not being able to do that kind of
-    arithmetic is why this module exists.
+    The line belongs **before** `history[index]`, and `_assemble` splices it in at
+    that position - which is still worth doing: on `ollama` and `openai_compatible`
+    the line stays exactly there, and the model reads the break with no counting.
+    But `gemini`, `anthropic` and `openai` hoist every `role="system"` message out
+    of the turn array and concatenate it into a top-level field before the model
+    ever sees it (verified against each provider's payload builder, pinned in
+    `tests/test_providers.py`), so on those three the position is gone by the time
+    the line is read. `_break_line`'s wording does not depend on surviving that -
+    see its own docstring for why.
     """
     breaks: list[tuple[int, str]] = []
     for index in range(1, len(history)):
@@ -164,12 +169,25 @@ def session_breaks(history: Sequence[Timed], now: datetime) -> list[tuple[int, s
 
 
 def _break_line(before: datetime, after: datetime, now: datetime) -> str:
+    """The `[대화 단절]` line, worded to be true whether or not its position survives.
+
+    An earlier version read "위는 ..., 아래는 ... 위쪽은 이미 끝난 대화입니다" -
+    correct only at its spliced position, and false the moment a hosted provider
+    (`gemini`, `anthropic`, `openai`) hoists it into a top-level system field
+    alongside the persona and tool rules, where there is no 위 and no 아래. So this
+    names both dates and the gap between them directly, and says outright which one
+    is finished, instead of pointing at where it sits in a list the model may not
+    even see as a list. True read inline, at the boundary, and true read hoisted,
+    next to every other system line.
+    """
     gap = (after.date() - before.date()).days
     today = "오늘 " if after.date() == clock.local(now).date() else ""
+    before_day = _day_face(before)
+    after_day = f"{today}{_day_face(after)}"
     return (
-        "[대화 단절] 여기서 대화가 끊겼습니다. "
-        f"위는 {_day_face(before)}, 아래는 {gap}일 뒤인 {today}{_day_face(after)}입니다. "
-        "위쪽은 이미 끝난 대화입니다."
+        "[대화 단절] "
+        f"{before_day} 대화와 {gap}일 뒤인 {after_day} 대화 사이에 시간이 비었습니다. "
+        f"{before_day} 대화는 이미 끝난 대화입니다."
     )
 
 

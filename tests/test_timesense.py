@@ -114,8 +114,8 @@ def test_session_break_lands_between_a_finished_thread_and_today() -> None:
     breaks = timesense.session_breaks(history, NOW)
     assert [index for index, _ in breaks] == [2]
     assert breaks[0][1] == (
-        "[대화 단절] 여기서 대화가 끊겼습니다. 위는 8월 14일 금요일, 아래는 4일 뒤인 "
-        "오늘 8월 18일 화요일입니다. 위쪽은 이미 끝난 대화입니다."
+        "[대화 단절] 8월 14일 금요일 대화와 4일 뒤인 오늘 8월 18일 화요일 대화 사이에 "
+        "시간이 비었습니다. 8월 14일 금요일 대화는 이미 끝난 대화입니다."
     )
 
 

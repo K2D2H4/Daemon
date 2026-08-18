@@ -65,7 +65,16 @@ exists to the one path that lacks it".
    makes "이 시간까지 안 자고 계시네요" possible.
 2. **A session boundary is drawn when the local date changes *and* the gap is ≥6
    hours.** A three-hour afternoon gap is still one conversation; sleeping is not.
-   The marker is placed inline, at the boundary, so the model never counts lines.
+   The marker is placed inline, at the boundary, so the model never counts lines -
+   true on `ollama` and `openai_compatible`, which keep the message where it was
+   spliced. **Corrected after implementation:** `gemini`, `anthropic` and `openai`
+   hoist every `role="system"` message out of the turn array and concatenate it
+   into a top-level field before the model sees it (verified against each
+   provider's payload builder), so on those three the position is gone and a line
+   that said "위는 ..., 아래는 ..." arrived somewhere with no 위 and no 아래. The
+   line's wording therefore cannot lean on its position: it names both dates and
+   the gap directly and says outright which side is finished, so it reads true
+   whether it lands inline or hoisted. See `daemon/MEASURED.md`.
 3. **Recall timestamps render relative *and* absolute.** `지난주 금요일 오후 4시 32분
    (4일 전)`. Relative alone is ambiguous when two hits land on the same weekday.
 4. **The commitment block reports both live and expired commitments.** Expired:
@@ -125,8 +134,11 @@ daemon/proactivity/candidates.py  imports the moved primitives     (no behaviour
 **`session_breaks(history, now)`** — returns the indices in the history window where
 the previous message's local date differs from the next one's *and* the gap is ≥6
 hours, with the line to insert there. `_assemble` splices them in as
-`Message(role="system")`. Inline placement is the whole point of decision 2: the
-boundary's position states the fact, so the model does no counting and no arithmetic.
+`Message(role="system")`, which is still the point on `ollama`/`openai_compatible`:
+the boundary's position states the fact with no counting or arithmetic. **Corrected
+after implementation:** three of the five providers hoist every system turn out of
+the array before the position can be read (see decision 2), so the line's own
+wording has to state the fact instead of relying on where it sits.
 
 **`relative(ts, now)`** — 오늘 / 어제 / 그저께 for the nearest three days; `이번주
 X요일` inside the current ISO week; `지난주 X요일` for the one before; `M월 D일`

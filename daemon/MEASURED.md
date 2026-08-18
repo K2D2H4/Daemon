@@ -210,3 +210,19 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   failures are all the same shape: the window's last assistant turn is an enthusiastic promise
   about the reminder, and the model continues it. Anyone tuning this needs n well above 10 per
   arm and should measure against that shape specifically.
+- **"Inline placement is the whole point" was true for two providers out of five
+  (2026-08-18).** `docs/superpowers/specs/2026-08-18-time-awareness-design.md`'s decision 2
+  said the `[대화 단절]` line's position states the fact so the model does no counting -
+  written without checking what a hosted provider does with a `role="system"` message
+  planted mid-list. Fed the reported case's message list to each provider's payload
+  builder: `gemini._contents`, `anthropic._turns` and `openai._input_items` all drop every
+  system message from the turn array and `complete()` hoists the joined text into a
+  top-level field (`systemInstruction`, `system`, `instructions`) instead - confirmed by
+  running each function directly and checking the break line is absent from the array and
+  present in the hoisted field. Only `ollama` and `openai_compatible` leave it where it was
+  spliced. So on `gemini` - this owner's configured provider - the line "위는 8월 14일
+  금요일, 아래는 4일 뒤인 오늘 8월 18일 화요일입니다. 위쪽은 이미 끝난 대화입니다." landed in
+  the system prompt next to the persona and tool rules, referring to a 위/아래 that provider
+  never showed the model. Reworded to name both dates and the gap directly instead of
+  pointing at a position (`daemon/timesense.py::_break_line`), and pinned against the actual
+  `gemini` payload builder in `tests/test_providers.py` so this cannot regress silently.
