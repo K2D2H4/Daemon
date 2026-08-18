@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 from conftest import FakeProvider
 
-from daemon import clock
+from daemon import clock, timesense
 from daemon.app import create_app
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
@@ -690,6 +690,28 @@ async def test_without_recall_the_prompt_carries_no_recalled_memory(
     prompt = fake_provider.calls[0]
     assert [m for m in prompt if m.role != "system"] == [Message(role="user", content="hello")]
     assert all(not m.content.startswith(RECALL_PREFIX) for m in prompt)
+
+
+async def test_a_raising_session_breaks_does_not_kill_the_turn(
+    data_dir: Path, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec's Error handling section, applied to the one time helper that lives
+    outside `Companion`: `_send_time` wraps `now_block`/`commitments` on the voice
+    path, and `Companion.context` wraps them for text, but `session_breaks` is
+    spliced into `_assemble` directly and had no guard of its own - a raise there
+    used to kill the whole turn."""
+
+    def boom(history: object, moment: object) -> list[tuple[int, str]]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(timesense, "session_breaks", boom)
+    channel = FakeChannel([inbound("hello")])
+
+    await ConversationLoop(
+        channel, gateway_for(fake_provider), Companion(FakeMemory(), data_dir=data_dir)
+    ).run()
+
+    assert [m.text for m in channel.sent] == ["ok"]
 
 
 async def test_a_failing_search_costs_recall_not_the_turn(

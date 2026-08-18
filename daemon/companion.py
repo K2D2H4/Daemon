@@ -290,12 +290,12 @@ class Companion:
         moment = clock.now() if now is None else now
         items = await self.search(query) if self.has_recall else []
         blocks = [
-            timesense.now_block(moment),
+            _time_block_or_empty(moment),
             await self.persona(),
             self._tool_rules(origin=origin),
             # Over the window *and* the recall hits: a commitment can arrive either
             # way, and this block exists to annotate whatever the model can see.
-            timesense.commitments([*history, *items], moment),
+            _commitments_or_empty([*history, *items], moment),
         ]
         if self.has_recall:
             blocks.append(self.recall_block(items, already=already, now=moment))
@@ -631,6 +631,31 @@ def render_continuity(items: list[LoggedMessage], nonce: str) -> str:
         f"- {clock.to_iso(item.ts)} {item.role}: {_one_line(item.content)}" for item in items
     ]
     return "\n".join([header, "", *lines, "", f"[end-recent-conversation:{nonce}]"])
+
+
+def _time_block_or_empty(moment: datetime) -> str:
+    """`timesense.now_block`, wrapped so a raise costs the time block and not the
+    turn. Spec's Error handling section: "Never fail a turn... each helper is
+    wrapped at its injection point" - the same shape `_send_continuity`
+    (`daemon/voice/conversation.py`) already uses on the voice path.
+    """
+    try:
+        return timesense.now_block(moment)
+    except Exception:
+        logger.exception("timesense: could not render the current-time block")
+        return ""
+
+
+def _commitments_or_empty(
+    messages: Sequence[LoggedMessage | RecalledItem], moment: datetime
+) -> str:
+    """`timesense.commitments`, wrapped the same way: the annotation is worth
+    losing, the turn is not."""
+    try:
+        return timesense.commitments(messages, moment)
+    except Exception:
+        logger.exception("timesense: could not render the commitments block")
+        return ""
 
 
 def _label(item: RecalledItem) -> str:

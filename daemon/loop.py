@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 
 from daemon import clock, timesense
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
@@ -126,6 +127,20 @@ def _round_signature(tool_calls: tuple[ToolCall, ...]) -> tuple[tuple[str, str],
             for call in tool_calls
         )
     )
+
+
+def _session_breaks_or_empty(
+    history: list[LoggedMessage], moment: datetime
+) -> list[tuple[int, str]]:
+    """`timesense.session_breaks`, wrapped so a raise costs the break lines and not
+    the turn - the same never-fail contract as `Companion.context`'s own time
+    helpers (`daemon/companion.py`), applied here because this call sits in
+    `_assemble`, outside `Companion`."""
+    try:
+        return timesense.session_breaks(history, moment)
+    except Exception:
+        logger.exception("timesense: could not compute session breaks")
+        return []
 
 
 def _call_label(call: ToolCall) -> str:
@@ -547,7 +562,7 @@ class ConversationLoop:
         messages = [Message(role="system", content=block) for block in blocks]
         turns = [Message(role=item.role, content=item.content) for item in history]
         # Descending, so an earlier insertion does not shift a later index.
-        for index, line in reversed(timesense.session_breaks(history, moment)):
+        for index, line in reversed(_session_breaks_or_empty(history, moment)):
             turns.insert(index, Message(role="system", content=line))
         messages.extend(turns)
 

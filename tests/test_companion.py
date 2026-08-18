@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 from test_loop import FakeMemory, FakeRecall, Ids, recalled
 
-from daemon import clock
+from daemon import clock, timesense
 from daemon.companion import TOOL_CONTRACT, Companion, google_account_hint, render_recall
 from daemon.llm.base import ToolSpec
 from daemon.memory.base import LoggedMessage, RecalledItem
@@ -290,6 +290,43 @@ async def test_context_reports_an_expired_commitment_from_the_window(data_dir: P
 
     assert any(block.startswith("[약속 상태]") for block in blocks)
     assert any("대기 중인 일이 아닙니다" in block for block in blocks)
+
+
+async def test_a_raising_time_block_costs_the_time_not_the_turn(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec's Error handling section: "Never fail a turn... each helper is wrapped
+    at its injection point," the same shape `_send_continuity`
+    (`daemon/voice/conversation.py`) already uses on the voice path. `now_block`
+    raising inside `context()` must drop only the current-time block."""
+
+    def boom(moment: datetime) -> str:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(timesense, "now_block", boom)
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+
+    blocks = await companion.context("hello")
+
+    assert not any(block.startswith("[현재 시각]") for block in blocks)
+
+
+async def test_a_raising_commitments_block_costs_the_annotation_not_the_turn(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same contract, the other helper `context()` calls directly. Narrow: only the
+    commitments block should be lost, not the time block next to it."""
+
+    def boom(messages: object, moment: datetime) -> str:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(timesense, "commitments", boom)
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+
+    blocks = await companion.context("hello", history=[said("오늘 회의 있어")])
+
+    assert not any(block.startswith("[약속 상태]") for block in blocks)
+    assert any(block.startswith("[현재 시각]") for block in blocks)
 
 
 async def test_the_persona_is_re_read_every_time(data_dir: Path) -> None:
