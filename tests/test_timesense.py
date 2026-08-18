@@ -9,8 +9,6 @@ always passed in rather than read from the clock.
 
 from __future__ import annotations
 
-import time as time_module
-from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import pytest
@@ -22,13 +20,9 @@ FRIDAY = datetime(2026, 8, 14, 7, 32, 0, tzinfo=UTC)  # 2026-08-14 16:32 KST, Fr
 
 
 @pytest.fixture(autouse=True)
-def seoul(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Pin the machine's local zone. The product is Korean; so is its calendar."""
-    monkeypatch.setenv("TZ", "Asia/Seoul")
-    time_module.tzset()
-    yield
-    monkeypatch.undo()
-    time_module.tzset()
+def _seoul(seoul: None) -> None:
+    """Every case in this file reasons about the owner's local day or hour, so the
+    zone is pinned for all of them. The fixture itself lives in `conftest.py`."""
 
 
 def test_now_block_names_the_date_weekday_and_part_of_day() -> None:
