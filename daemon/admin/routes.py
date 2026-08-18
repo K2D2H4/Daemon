@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -209,6 +210,39 @@ _PROBES: dict[str, tuple[str, str, str]] = {
     "gemini": ("gemini_api_key", "gemini_model", "DAEMON_GEMINI_MODEL"),
 }
 
+# Substrings marking a model the account can reach but nobody picks as a *chat*
+# model: image, audio, embedding and tool specialties. A key's `/models` lists them
+# all - Gemini alone returns image/tts/robotics/deep-research/computer-use variants
+# that all pass its `generateContent` filter - and a picker of every capability is a
+# wall the owner scrolls past when the one question here is "which model answers".
+# Substrings, not a fixed id set, so a newly released `-image`/`-tts` variant is
+# excluded on arrival; the tradeoff is that it drifts as vendors coin new families.
+#
+# Two markers deliberately drop ids that *are* chat-capable, because this picker
+# configures the ordinary text path and those aren't the mainstream answer: `vision`
+# (the legacy `gpt-4-vision-preview` shape; today's flagships fold vision in without
+# the suffix) and `audio` (`gpt-4o-audio-preview`). `search` is intentionally absent
+# - a grounded-search chat variant is still a chat model, so it is not hidden.
+#
+# Applied ONLY here (the admin picker), not to the wizard: `_chat_only` is imported
+# nowhere in `daemon/setup.py`. The wizard's own defence is weaker than it looks and
+# left as-is on purpose - `setup._newest_first` sinks non-chat ids by real date for
+# OpenAI/Anthropic, but `DAEMON_GEMINI_MODEL` is not date-ordered (it sorts by a
+# version parsed from the id), so a Gemini specialty preview sharing the flagship's
+# version can still surface in the wizard's folded menu. Narrowing that is a separate
+# change against `setup`'s deliberate no-hide-list stance, not this admin-only fix.
+_NOT_CHAT_MARKERS: tuple[str, ...] = (
+    "image", "dall-e", "vision", "tts", "audio", "speech", "whisper",
+    "transcribe", "embed", "moderation", "guard", "rerank", "lyria", "nano-banana",
+    "robotics", "computer-use", "deep-research", "antigravity", "realtime", "-live",
+    "veo", "sora",
+)
+
+
+def _chat_only(ids: Iterable[str]) -> list[str]:
+    """Drop the non-chat specialties (`_NOT_CHAT_MARKERS`) from a probed model list."""
+    return [m for m in ids if not any(mark in m.lower() for mark in _NOT_CHAT_MARKERS)]
+
 
 async def _live_model_lists(settings: Any) -> dict[str, list[str]]:
     """The chat-three providers' live model ids, keyed by provider, for the admin
@@ -245,7 +279,7 @@ async def _live_model_lists(settings: Any) -> dict[str, list[str]]:
                 verdict = await asyncio.to_thread(check_openai, key, model)
             else:
                 verdict = await asyncio.to_thread(check_anthropic, key, model)
-            return name, list(verdict.models.get(env_key, ()))
+            return name, _chat_only(verdict.models.get(env_key, ()))
         except Exception:  # noqa: BLE001 - a bad key or a down provider, never our problem
             return name, []
 

@@ -1041,6 +1041,51 @@ async def test_live_model_lists_fall_back_to_empty_when_a_probe_raises(
     assert lists.get("gemini") == [], "failure must fall back to empty, never raise"
 
 
+def test_chat_only_drops_specialties_and_keeps_chat_ids() -> None:
+    """The blocklist itself, without the probe scaffolding - so a marker regression
+    fails here plainly. Includes the two deliberate drops of chat-capable ids
+    (vision/audio) so their exclusion is explicit, not accidental."""
+    from daemon.admin.routes import _chat_only
+
+    assert _chat_only(
+        (
+            "gemini-3.6-flash", "gpt-5.2", "claude-opus-5",  # mainstream chat - kept
+            "gemini-3-pro-image", "dall-e-3", "text-embedding-3-large",  # dropped
+            "whisper-1", "gpt-4o-realtime-preview", "gemini-robotics-er-2",  # dropped
+            "gpt-4-vision-preview", "gpt-4o-audio-preview",  # deliberate drops
+        )
+    ) == ["gemini-3.6-flash", "gpt-5.2", "claude-opus-5"]
+    # An empty probe stays empty; order is preserved.
+    assert _chat_only(()) == []
+    assert _chat_only(("b-flash", "a-flash")) == ["b-flash", "a-flash"]
+
+
+async def test_live_model_lists_keep_only_chat_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The account's `/models` returns image/tts/robotics/embedding specialties
+    alongside the chat families; the admin datalist keeps only the chat ones so the
+    dropdown is not a wall of every capability the key can touch."""
+    from daemon.admin import routes
+    from daemon.setup import Verdict
+
+    mixed = (
+        "gemini-3.6-flash", "gemini-3.1-pro-preview",  # chat - kept
+        "gemini-3-pro-image", "gemini-3.1-flash-tts-preview",  # image/tts - dropped
+        "gemini-robotics-er-2-preview", "deep-research-pro-preview",  # dropped
+        "lyria-3-pro-preview", "nano-banana-pro-preview",  # dropped
+    )
+
+    def fake(*_a: object, **_k: object) -> Verdict:
+        return Verdict(ok=True, detail="ok", models={"DAEMON_GEMINI_MODEL": mixed})
+
+    monkeypatch.setattr(routes, "check_gemini", fake)
+    lists = await routes._live_model_lists(
+        _settings(tmp_path, provider="gemini", gemini_model="g", gemini_api_key="k")
+    )
+    assert lists["gemini"] == ["gemini-3.6-flash", "gemini-3.1-pro-preview"]
+
+
 async def test_live_model_lists_skip_providers_without_a_key(tmp_path: Path) -> None:
     from daemon.admin import routes
 

@@ -196,6 +196,27 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   needing 14 distinct days. Worth writing down because "the generator produces
   nothing" and "the generator is broken" look identical from outside, and this one
   is the former.
+- **A thinking model bills its thinking out of `max_output_tokens`, and that kept
+  the daemon silent for days (2026-08-15).** `daemon/proactivity/judge.py` capped the proactive reply
+  at 300 tokens, sized as "the JSON plus 120 characters of Korean, with room to
+  spare". Correct for a model that only answers. `gemini-3.6-flash` reasons first
+  and `candidatesTokenCount` bills both, so the budget ran out mid-sentence:
+  ```
+  run 1: parsed=False len=19  '{"say": "어제 그 미팅은 잘'
+  run 2: parsed=True  len=46  '{"say": "오늘 미팅은 무사히 끝났어요? ..."}'
+  ```
+  1 failure in 5 on a synthetic reason, and **4 in 4** against the reasons the
+  owner's own history produced - so every `open_loop` candidate, the kind that
+  measurably does have something to say, died on JSON parsing. At 1500 tokens:
+  6 of 6, every one `stop_reason=STOP`.
+- **The log said the wrong thing about it, which is why it survived.** A truncated
+  reply and a model answering in prose both arrive as "no JSON", and the judge
+  reported both as `did not return a JSON object` - which reads as the model
+  misbehaving, not as our own cap being too small. All four providers already
+  report `stop_reason` in `Completion.meta`; nothing read it. They now say
+  `was cut off at the token limit (stop_reason=MAX_TOKENS); raise
+  MAX_OUTPUT_TOKENS`. The lesson is not the number: it is that two failures with
+  different fixes must not share a message.
 - **The time-awareness blocks fix the reported defect most of the time, not every time
   (2026-08-18).** Driven against live `gemini` with an isolated `DAEMON_DATA_DIR`, replaying
   the exact reported case — a Friday thread that arranged a 16:40 reminder, four days of
@@ -211,7 +232,8 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   about the reminder, and the model continues it. Anyone tuning this needs n well above 10 per
   arm and should measure against that shape specifically.
 - **The reason that A/B settled nothing: on every hosted provider there is no such thing as
-  block position (2026-08-18).** the three files under `daemon/llm/providers/` for gemini, anthropic and openai each do
+  block position (2026-08-18).** The three provider files under `daemon/llm/providers/` -
+  gemini, anthropic and openai - each do
   `"\n\n".join(m.content for m in messages if m.role == "system")` into one top-level field
   and drop those messages from the turn array. So `[대화 단절]`, spliced into the window at the
   index where the conversation broke, arrives concatenated with the persona and the tool rules

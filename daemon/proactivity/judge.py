@@ -96,9 +96,21 @@ MAX_REASON_CHARS = 500
 only means a future generator that grows one - or, against the stated assumption,
 puts user text in it - cannot turn a 5-minute tick into a large prompt."""
 
-MAX_OUTPUT_TOKENS = 300
-"""Enough for the JSON plus a line at `MAX_CHARS` of Korean, with room to spare.
-A hard brake at the provider matters here because this runs 288 times a day."""
+MAX_OUTPUT_TOKENS = 1500
+"""Ceiling on the reply, and it is mostly headroom for thinking rather than for
+prose. It was 300, sized as "the JSON plus a line at `MAX_CHARS` of Korean, with
+room to spare" - correct arithmetic for a model that only answers, and wrong for
+one that reasons first, because `candidatesTokenCount` bills the thinking out of
+this same allowance (see daemon/llm/providers/gemini.py).
+
+What that cost: the daemon went days without speaking first. Every `open_loop`
+candidate - the kind that measurably *does* have something to say - came back as
+`{"say": "어제 그 미팅은 잘` and was declined for not being JSON. Reproduced live
+at 1 failure in 5 calls on `gemini-3.6-flash`, and 4 in 4 against the reasons the
+owner's own history generated.
+
+The utterance itself is still bounded by `MAX_CHARS`, so this buys the model room
+to think and buys the product nothing to say at greater length."""
 
 SYSTEM = """유저가 말을 걸지 않았는데 네가 먼저 한 마디 건네려는 순간이다.
 
@@ -194,7 +206,11 @@ class Judge:
             logger.info("judge: model unavailable (%s); staying silent", exc)
             return Utterance(why_not=f"model unavailable: {exc}")
 
-        utterance = _read_reply(completion.text, model=completion.model)
+        utterance = _read_reply(
+            completion.text,
+            model=completion.model,
+            stop_reason=completion.meta.get("stop_reason", ""),
+        )
         if not utterance:
             logger.info("judge: declined %s (%s)", candidate.kind, utterance.why_not)
         return utterance
@@ -219,7 +235,7 @@ def _reason_block(candidate: Candidate) -> str:
     return f"이유 ({candidate.kind}): {reason}"
 
 
-def _read_reply(text: str, *, model: str) -> Utterance:
+def _read_reply(text: str, *, model: str, stop_reason: str = "") -> Utterance:
     """A model reply as an `Utterance`.
 
     Every path out of here that is not one clean short line is a decline, and each
@@ -228,6 +244,19 @@ def _read_reply(text: str, *, model: str) -> Utterance:
     """
     raw = extract_json(text)
     if raw is None:
+        if _truncated(stop_reason):
+            # Distinguished from prose on purpose. Both arrive as "no JSON", but
+            # one is the model declining in words and the other is our own cap
+            # cutting a good sentence in half - and only the second is fixed by
+            # changing a number here. Reporting them the same way is what let a
+            # 300-token ceiling keep the daemon silent for days while the log
+            # looked like ordinary model noise.
+            return Utterance(
+                why_not=(
+                    f"{model} was cut off at the token limit (stop_reason="
+                    f"{stop_reason}); raise MAX_OUTPUT_TOKENS"
+                )
+            )
         # Prose instead of JSON is usually the refusal itself. Delivering it would
         # turn a decision not to speak into an apology out of the speaker.
         return Utterance(why_not=f"{model} did not return a JSON object")
@@ -241,6 +270,18 @@ def _read_reply(text: str, *, model: str) -> Utterance:
     if len(line) > MAX_CHARS:
         return Utterance(why_not=f"{len(line)} characters, over the {MAX_CHARS} limit")
     return Utterance(text=line)
+
+
+_TRUNCATED = ("max_tokens", "length", "incomplete")
+"""How the four providers spell "I ran out of room": gemini `MAX_TOKENS`,
+anthropic `max_tokens`, openai `length` or `incomplete`. Matched case-folded and
+by substring, because this is a diagnostic - a spelling it misses costs a worse
+message, never a wrong decision."""
+
+
+def _truncated(stop_reason: str) -> bool:
+    folded = stop_reason.casefold()
+    return any(marker in folded for marker in _TRUNCATED)
 
 
 _MARKDOWN = str.maketrans("", "", "*`#")
