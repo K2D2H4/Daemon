@@ -47,20 +47,31 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   chars, 08-10: 3443 -> 1308) while the second call still fires on every one of them - the
   volume was noise and the fact contribution was zero. The tool itself is untouched: the
   allowlist governs only whether an output may become a *permanent* fact.
-- **The daemon runs tools on wake-word misrecognitions, and voice is twice as exposed as
-  text.** Measured over the live history: of the executed tool calls whose nearest preceding
-  user turn was 6 characters or shorter, voice is **13/73 (17.8%)** against text's **20/224
-  (8.9%)**. The voice ones are largely the recognizer mangling the wake alias 벨라 -
-  `open_path` after "Allah", "Oops.", "el la"; `read_page` after "¿Ah?"; `see_screen` and
-  `start_screen_share` after "Bella." / "Ella." - though not all of them are noise ("응." ->
-  `notion__notion-fetch` is an ordinary yes). Blast radius in what actually ran was low: the
-  single `run_command` was `icalbuddy -eventsToday events`, read-only, and it failed.
+- **The daemon used to run tools on wake-word misrecognitions. `CALLED_BY_NAME` (v0.1.36,
+  2026-08-10) already fixed it, and measuring across that date is the only way to see so.**
+  Over the whole live history, executed tool calls whose nearest preceding user turn is 6
+  characters or shorter look alarming - voice 13/73 (17.8%) against text's 20/224 (8.9%), the
+  voice ones largely the recognizer mangling the wake alias 벨라: `open_path` after "Allah",
+  "Oops.", "el la"; `read_page` after "¿Ah?"; `see_screen` and `start_screen_share` after
+  "Bella." / "Ella.". Split at the day the fix landed, it is a different picture:
 
-  The mechanism is the part worth keeping. CONTRACTS rule 10 stops a *forwarded* message from
-  reaching a tool, and these turns pass it honestly - `origin='owner'`, because the owner did
-  make a sound. What the gate does not cover is **the recognizer inventing an utterance the
-  owner never made**, and with `tools_mode=full` the default is to run it without asking.
-  Utterance length is not the fix: "응." is two characters and legitimate.
+  | | text | voice |
+  |---|---|---|
+  | on/before 2026-08-10 | 20/141 (14.2%) | 12/61 (19.7%) |
+  | after 2026-08-10 | **0/83** | **1/12**, and that one is "응." → a Notion fetch, an ordinary yes |
+
+  Not one wake-noise tool call after the fix. What actually ran before it was harmless
+  anyway - the single `run_command` was a read-only `icalbuddy` query that failed.
+
+  **The reusable part is the near-miss.** This was written up here as a live defect worth
+  opening an investigation into, on a whole-history aggregate, when the fix had already
+  shipped inside the measured window. A log that spans a release measures two different
+  programs. Date the fix first, then split the data on it - and note that `origin='owner'`
+  is honest on these turns either way (the owner did make a sound), so rule 10 was never
+  what would have caught it.
+
+  Residual, stated because the number is small: only 12 voice tool calls fall after the fix,
+  so "zero" here is weak evidence rather than a clean bill of health.
 - **Running reflection for real found two defects unit tests did not.** Entity notes were
   stamped with the day of the *run*, so a months-long catch-up reads as all-today; and two
   facts sharing a supersession key retired the wrong half (`data/memory/core.md` kept the 3).
