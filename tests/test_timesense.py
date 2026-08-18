@@ -100,3 +100,58 @@ def test_relative_crosses_the_year_boundary_without_claiming_last_week() -> None
     now = datetime(2027, 1, 5, 1, 0, tzinfo=UTC)          # Tue 10:00 KST
     last_week = datetime(2026, 12, 29, 1, 0, tzinfo=UTC)  # Tue 10:00 KST, one week back
     assert timesense.relative(last_week, now) == "지난주 화요일 오전 10시 (7일 전)"
+
+
+class _Line:
+    """The two fields `session_breaks` reads, without a database."""
+
+    def __init__(self, ts: datetime, content: str = "", role: str = "user") -> None:
+        self.ts, self.content, self.role, self.origin = ts, content, role, "owner"
+
+
+def test_session_break_lands_between_a_finished_thread_and_today() -> None:
+    """The observed defect: Friday 17:24 sat on the line above Tuesday 09:28, so the
+    model read one unbroken conversation and resumed a four-day-old thread."""
+    history = [
+        _Line(FRIDAY),
+        _Line(datetime(2026, 8, 14, 8, 24, tzinfo=UTC)),          # Fri 17:24 KST
+        _Line(datetime(2026, 8, 18, 0, 28, tzinfo=UTC)),          # Tue 09:28 KST
+    ]
+    breaks = timesense.session_breaks(history, NOW)
+    assert [index for index, _ in breaks] == [2]
+    assert breaks[0][1] == (
+        "[대화 단절] 여기서 대화가 끊겼습니다. 위는 8월 14일 금요일, 아래는 4일 뒤인 "
+        "오늘 8월 18일 화요일입니다. 위쪽은 이미 끝난 대화입니다."
+    )
+
+
+def test_a_long_same_day_gap_is_still_one_conversation() -> None:
+    """A five-hour afternoon gap is not a new conversation; only sleeping is."""
+    history = [
+        _Line(datetime(2026, 8, 18, 0, 0, tzinfo=UTC)),           # Tue 09:00 KST
+        _Line(datetime(2026, 8, 18, 5, 30, tzinfo=UTC)),          # Tue 14:30 KST
+    ]
+    assert timesense.session_breaks(history, NOW) == []
+
+
+def test_a_short_gap_across_midnight_is_still_one_conversation() -> None:
+    """Talking at 23:30 and again at 01:30 crosses the date but nobody slept."""
+    history = [
+        _Line(datetime(2026, 8, 17, 14, 30, tzinfo=UTC)),         # Mon 23:30 KST
+        _Line(datetime(2026, 8, 17, 16, 30, tzinfo=UTC)),         # Tue 01:30 KST
+    ]
+    assert timesense.session_breaks(history, NOW) == []
+
+
+def test_two_breaks_are_reported_in_ascending_order() -> None:
+    history = [
+        _Line(datetime(2026, 8, 14, 7, 0, tzinfo=UTC)),
+        _Line(datetime(2026, 8, 16, 7, 0, tzinfo=UTC)),
+        _Line(datetime(2026, 8, 18, 0, 28, tzinfo=UTC)),
+    ]
+    assert [index for index, _ in timesense.session_breaks(history, NOW)] == [1, 2]
+
+
+def test_an_empty_or_single_message_window_has_no_breaks() -> None:
+    assert timesense.session_breaks([], NOW) == []
+    assert timesense.session_breaks([_Line(NOW)], NOW) == []

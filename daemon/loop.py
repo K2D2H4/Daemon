@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 
-from daemon import clock
+from daemon import clock, timesense
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
 from daemon.llm.base import Message, ProviderError, ToolCall
@@ -537,7 +537,11 @@ class ConversationLoop:
             origin=origin,
         )
         messages = [Message(role="system", content=block) for block in blocks]
-        messages.extend(Message(role=item.role, content=item.content) for item in history)
+        turns = [Message(role=item.role, content=item.content) for item in history]
+        # Descending, so an earlier insertion does not shift a later index.
+        for index, line in reversed(timesense.session_breaks(history, clock.now())):
+            turns.insert(index, Message(role="system", content=line))
+        messages.extend(turns)
 
         # The user turn above was recorded first, so whether it is already in
         # `recent()` depends on the writer's mirror timing. Append only if absent

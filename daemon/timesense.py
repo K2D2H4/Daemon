@@ -23,6 +23,7 @@ makes every case in `tests/test_timesense.py` pinnable.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 from typing import Protocol
 
@@ -129,3 +130,47 @@ def _clock_face(here: datetime) -> str:
 
 def _monday(day: date) -> date:
     return day - timedelta(days=day.weekday())
+
+
+BREAK_MIN_HOURS = 6.0
+"""A gap this long *and* a change of local date is a new conversation.
+
+Both conditions, because either alone is wrong in a way the owner would notice: a
+five-hour afternoon gap is still one thread, and 23:30 to 01:30 changes the date
+without anyone having slept. The `voice` path's 120-minute freshness cutoff answers a
+different question - whether to hand a tail over at all - and is left alone.
+"""
+
+
+def session_breaks(history: Sequence[Timed], now: datetime) -> list[tuple[int, str]]:
+    """Where the conversation window broke, as `(index, line)` in ascending order.
+
+    The line belongs **before** `history[index]`, and the position is the whole
+    point: a block that described the break in prose ("the first eight lines are
+    from Friday") would make the model count, and not being able to do that kind of
+    arithmetic is why this module exists.
+    """
+    breaks: list[tuple[int, str]] = []
+    for index in range(1, len(history)):
+        before = clock.local(history[index - 1].ts)
+        after = clock.local(history[index].ts)
+        if before.date() == after.date():
+            continue
+        if (after - before).total_seconds() / 3600.0 < BREAK_MIN_HOURS:
+            continue
+        breaks.append((index, _break_line(before, after, now)))
+    return breaks
+
+
+def _break_line(before: datetime, after: datetime, now: datetime) -> str:
+    gap = (after.date() - before.date()).days
+    today = "오늘 " if after.date() == clock.local(now).date() else ""
+    return (
+        "[대화 단절] 여기서 대화가 끊겼습니다. "
+        f"위는 {_day_face(before)}, 아래는 {gap}일 뒤인 {today}{_day_face(after)}입니다. "
+        "위쪽은 이미 끝난 대화입니다."
+    )
+
+
+def _day_face(here: datetime) -> str:
+    return f"{here.month}월 {here.day}일 {WEEKDAYS[here.weekday()]}요일"

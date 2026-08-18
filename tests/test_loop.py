@@ -11,13 +11,14 @@ import math
 import os
 import sqlite3
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import FakeProvider
 
+from daemon import clock
 from daemon.app import create_app
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
@@ -167,10 +168,27 @@ class FlakyProvider:
 
 
 def inbound(text: str) -> InboundMessage:
+    # Live clock, not the suite's pinned date: the assistant's reply is stamped
+    # from `clock.now()` (daemon/loop.py), and now that `_assemble` reads real
+    # gaps between timestamps (`timesense.session_breaks`), a user turn frozen at
+    # an old date would read as a multi-day-old thread relative to its own reply.
     return InboundMessage(
         text=text,
         sender_id="42",
-        received_at=datetime(2026, 8, 3, 7, 14, tzinfo=UTC),
+        received_at=clock.now(),
+        channel="fake",
+    )
+
+
+def logged(text: str, ts: datetime, role: str = "user") -> LoggedMessage:
+    """A message already in memory, at a timestamp the caller chooses."""
+    return LoggedMessage(
+        ts=ts,
+        role=role,  # type: ignore[arg-type]
+        content=text,
+        origin="owner" if role == "user" else "agent",
+        session_kind="interactive",
+        modality="text",
         channel="fake",
     )
 
@@ -239,6 +257,55 @@ async def test_history_is_carried_into_the_next_turn(
         Message(role="assistant", content="ok"),
         Message(role="user", content="second"),
     ]
+
+
+async def test_a_greeting_after_a_gap_of_days_is_not_a_continuation(
+    data_dir: Path, fake_provider: FakeProvider
+) -> None:
+    """The reported defect, through the real assembly.
+
+    A Friday thread arranged a 16:40 reminder; the owner said nothing over the
+    weekend; on Tuesday morning they wrote a bare "벨라" and the daemon answered
+    "오후 4시 40분 회의 5분 전 알림 잘 챙겨드리려고 옆에서 대기 중이었습니다".
+    Nothing in the assembled context said that thread was over.
+
+    Seeded relative to the live clock rather than to a pinned date, because the loop
+    stamps the reply from `clock.now()` - pinning absolute dates here would make this
+    pass only on the day it was written, the gotcha `tests/CLAUDE.md` records. The
+    inbound greeting is built directly (not through the shared `inbound()` helper,
+    whose `received_at` is fixed) for the same reason: seeded four real days back,
+    the fixed date would sit *before* "earlier" instead of after it, inverting the
+    very ordering this test means to exercise. The exact rendering is pinned in
+    `tests/test_timesense.py`, where `now` is a parameter; what this asserts is
+    **position**, which is the thing assembly owns and the unit test cannot see.
+    """
+    memory = FakeMemory()
+    earlier = clock.now() - timedelta(days=4)
+    memory.records.extend(
+        [
+            logged("오늘 오후 4시40분에 회의있어 5분전에 알려줘", earlier),
+            logged(
+                "알겠습니다! 4시 35분에 알려드릴게요.", earlier + timedelta(minutes=1), "assistant"
+            ),
+        ]
+    )
+    bare_greeting = InboundMessage(
+        text="벨라", sender_id="42", received_at=clock.now(), channel="fake"
+    )
+
+    await ConversationLoop(
+        FakeChannel([bare_greeting]),
+        gateway_for(fake_provider),
+        Companion(memory, data_dir=data_dir),
+    ).run()
+
+    rendered = [m.content for m in fake_provider.calls[0]]
+    breaks = [i for i, text in enumerate(rendered) if text.startswith("[대화 단절]")]
+    assert len(breaks) == 1, "the finished thread must be marked as finished"
+
+    thread = next(i for i, text in enumerate(rendered) if "4시40분" in text)
+    greeting = next(i for i, text in enumerate(rendered) if text == "벨라")
+    assert thread < breaks[0] < greeting
 
 
 async def test_persona_seed_becomes_the_system_turn(
