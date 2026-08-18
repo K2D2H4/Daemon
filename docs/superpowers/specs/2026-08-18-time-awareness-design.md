@@ -218,6 +218,16 @@ scans only what is already in front of the model. A live commitment from thirty
 messages back appears only if recall surfaces it — and raising it on time is
 proactivity's job, which already does it.
 
+**`origin == "owner"` is not forgery-proof after a reindex.** `candidates.py`'s module
+docstring records this: `daemon reindex` re-derives `origin` from `role` alone, because
+the markdown it rebuilds from carries no provenance, so a forward stored as
+`role='user'` comes back `origin='owner'`. `MemoryRecall.associate` handles it by also
+excluding `reindexed` rows; `commitments` cannot, because neither `LoggedMessage` nor
+`RecalledItem` carries the column. The exposure is bounded by the invariant above — the
+block quotes no message text — so the worst case is a phantom "아직 오지 않았습니다"
+line derived from a forwarded message after a rebuild, which falls inside the
+false-positive cost decision 4 already accepts.
+
 **Decision 4's false positives are now visible.** An event word plus a day marker in a
 sentence that was not a commitment produces a stray "아직 오지 않았습니다". The
 lexicon is conservative and `_EVENT_CANCELLED` catches the expensive direction, but the
