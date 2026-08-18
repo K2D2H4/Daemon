@@ -35,7 +35,7 @@ from collections.abc import Callable, Sequence
 from datetime import timedelta
 from pathlib import Path
 
-from daemon import clock
+from daemon import clock, timesense
 from daemon.llm.base import ToolCall, ToolSpec
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
 from daemon.persona import loader as persona
@@ -254,9 +254,12 @@ class Companion:
     ) -> tuple[str, ...]:
         """Everything to put in front of the model this turn, in order.
 
-        Who it is, then what it may touch, then what it is reasoning over: the
-        persona, the tool rules if this turn may use tools, and recalled memory
-        rendered to its nonce boundary.
+        What time it is, then who it is, then what it may touch, then what it is
+        reasoning over: the current-time block, the persona, the tool rules if this
+        turn may use tools, and recalled memory rendered to its nonce boundary. The
+        time block goes first because it is a fact about the world rather than an
+        instruction, so it should not sit between the persona and the tool rules
+        that qualify it.
 
         Blocks rather than one joined string, and that is not cosmetic. The text path
         sends each as its own `Message(role="system")` - the persona *is* the system
@@ -268,7 +271,12 @@ class Companion:
         and in their real position, so repeating one as "recalled" would make the
         model read one event as two.
         """
-        blocks = [await self.persona(), self._tool_rules(origin=origin)]
+        moment = clock.now()
+        blocks = [
+            timesense.now_block(moment),
+            await self.persona(),
+            self._tool_rules(origin=origin),
+        ]
         if self.has_recall:
             blocks.append(self.recall_block(await self.search(query), already=already))
         return tuple(block for block in blocks if block)

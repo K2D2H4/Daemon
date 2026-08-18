@@ -425,7 +425,7 @@ and in `context`, replace the `blocks` construction:
 One `moment` for the whole turn, reused by Task 6 — two reads of the clock inside one
 assembly can straddle a minute and disagree with each other.
 
-- [ ] **Step 4: Migrate the twelve assertions this breaks**
+- [ ] **Step 4: Migrate the fifteen assertions this breaks**
 
 This is the widest-reaching step in the plan and every site is known. `context()` used
 to return `()` for a bare companion; it now always returns at least the time block, so
@@ -476,6 +476,44 @@ so `assert await companion.context("hello") == ()` becomes
   test's subject is the *order*, and it still holds.
 - line 342 / 400 / 416 / 622 — these select by `RECALL_PREFIX` and are unaffected.
   Confirm they still pass rather than editing them.
+
+**Four more the first version of this plan missed** — all positional-indexing sites,
+found by running the suite rather than by grepping for `== ()`. The count is fifteen
+tests, not twelve sites; measure before you migrate:
+
+- `test_the_blocks_are_who_it_is_then_what_it_may_touch_then_what_it_recalls`
+  (test_companion.py) — its subject is the block *order*, so extend it rather than
+  escape it. Rename to `..._are_when_it_is_who_it_is_...` and assert four positions:
+  `blocks[0].startswith("[현재 시각] 지금은 ")`, then persona, `TOOL_CONTRACT`, and the
+  recall block at 1/2/3. This makes the test stronger than it was.
+- `test_tool_rules_carry_the_google_account_when_one_is_authenticated`
+  (test_companion.py) — the arity-1 unpack `(rules,) = ...` *is* the claim. Keep it:
+  `(rules,) = without_time(await companion.context("오늘 일정 뭐야?", origin="owner"))`.
+- `test_the_user_turn_is_not_duplicated_in_the_prompt` (test_loop.py) — narrow to the
+  conversation: `assert [m for m in prompt if m.role != "system"] == [Message(role="user",
+  content="hello")]`.
+- `test_an_edit_to_the_seed_lands_on_the_very_next_turn` (test_loop.py) — **load-bearing;
+  read its docstring first.** It records that caching the seed after the first read
+  passed the entire suite. It reads `call[0].content` positionally as the persona; select
+  the persona by *excluding* the time block instead, so the no-caching claim keeps its
+  full strength:
+
+```python
+    systems = [
+        next(
+            m.content
+            for m in call
+            if m.role == "system" and not m.content.startswith("[현재 시각]")
+        )
+        for call in fake_provider.calls
+    ]
+    assert systems == ["I say more than the minimum.", "I keep it short."]
+```
+
+**The sanity check that applies to all fifteen:** would the migrated assertion still
+fail if the time block had been inserted in the *wrong* place — last instead of first,
+or into the conversation instead of as a system block? If it would pass either way, it
+has been weakened.
 
 **Two whose premise changes — rewrite, do not patch:**
 

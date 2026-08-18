@@ -220,7 +220,7 @@ async def test_the_user_turn_is_not_duplicated_in_the_prompt(
     ).run()
 
     prompt = fake_provider.calls[0]
-    assert prompt == [Message(role="user", content="hello")]
+    assert [m for m in prompt if m.role != "system"] == [Message(role="user", content="hello")]
 
 
 async def test_history_is_carried_into_the_next_turn(
@@ -234,7 +234,7 @@ async def test_history_is_carried_into_the_next_turn(
         Companion(memory, data_dir=data_dir),
     ).run()
 
-    assert fake_provider.calls[1] == [
+    assert fake_provider.calls[1][-3:] == [
         Message(role="user", content="first"),
         Message(role="assistant", content="ok"),
         Message(role="user", content="second"),
@@ -252,9 +252,8 @@ async def test_persona_seed_becomes_the_system_turn(
         Companion(FakeMemory(), data_dir=data_dir),
     ).run()
 
-    assert fake_provider.calls[0][0] == Message(
-        role="system", content="You disagree when you disagree."
-    )
+    seed_turn = Message(role="system", content="You disagree when you disagree.")
+    assert seed_turn in fake_provider.calls[0]
 
 
 async def test_an_edit_to_the_seed_lands_on_the_very_next_turn(
@@ -288,20 +287,35 @@ async def test_an_edit_to_the_seed_lands_on_the_very_next_turn(
         Companion(FakeMemory(), data_dir=data_dir),
     ).run()
 
-    systems = [call[0].content for call in fake_provider.calls]
+    systems = [
+        next(
+            m.content
+            for m in call
+            if m.role == "system" and not m.content.startswith("[현재 시각]")
+        )
+        for call in fake_provider.calls
+    ]
     assert systems == ["I say more than the minimum.", "I keep it short."]
 
 
-async def test_missing_seed_means_no_system_turn(
+async def test_missing_seed_means_no_persona_system_turn(
     data_dir: Path, fake_provider: FakeProvider
 ) -> None:
+    """An absent seed must add no system message of its own. The current-time block
+    is unconditional and is not the persona, so it is excluded by name - the original
+    assertion ("no system turns at all") stopped being able to say this."""
     await ConversationLoop(
         FakeChannel([inbound("hello")]),
         gateway_for(fake_provider),
         Companion(FakeMemory(), data_dir=data_dir),
     ).run()
 
-    assert all(m.role != "system" for m in fake_provider.calls[0])
+    system = [
+        m
+        for m in fake_provider.calls[0]
+        if m.role == "system" and not m.content.startswith("[현재 시각]")
+    ]
+    assert system == []
 
 
 async def test_voice_inbound_is_recorded_as_a_voice_session(data_dir: Path) -> None:
@@ -379,7 +393,7 @@ async def test_the_recall_block_sits_before_the_live_conversation(
     ).run()
 
     roles = [m.role for m in fake_provider.calls[1]]
-    assert roles == ["system", "system", "user", "assistant", "user"]
+    assert roles == ["system", "system", "system", "user", "assistant", "user"]
 
 
 async def test_one_recalled_item_stays_one_line(
@@ -416,16 +430,21 @@ async def test_recall_does_not_repeat_the_recent_window(
     assert all(not m.content.startswith(RECALL_PREFIX) for m in fake_provider.calls[0])
 
 
-async def test_without_recall_the_prompt_is_exactly_what_m1a_built(
+async def test_without_recall_the_prompt_carries_no_recalled_memory(
     data_dir: Path, fake_provider: FakeProvider
 ) -> None:
+    """Was "exactly what M1a built" until the current-time block became
+    unconditional. The claim that matters is unchanged: recall=None contributes
+    nothing, and the conversation is the one live turn."""
     await ConversationLoop(
         FakeChannel([inbound("hello")]),
         gateway_for(fake_provider),
         Companion(FakeMemory(), data_dir=data_dir, recall=None),
     ).run()
 
-    assert fake_provider.calls[0] == [Message(role="user", content="hello")]
+    prompt = fake_provider.calls[0]
+    assert [m for m in prompt if m.role != "system"] == [Message(role="user", content="hello")]
+    assert all(not m.content.startswith(RECALL_PREFIX) for m in prompt)
 
 
 async def test_a_failing_search_costs_recall_not_the_turn(

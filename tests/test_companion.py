@@ -37,6 +37,16 @@ def said(text: str, role: str = "user") -> LoggedMessage:
     )
 
 
+def without_time(blocks: tuple[str, ...]) -> tuple[str, ...]:
+    """The blocks other than the current-time one, which is now unconditional.
+
+    These assertions predate it and are about what the *other* layers contribute -
+    that a relayed turn is told nothing about tools, that an empty registry is not a
+    tool layer. Dropping the time block keeps each of them about its own subject.
+    """
+    return tuple(block for block in blocks if not block.startswith("[현재 시각]"))
+
+
 class FakeTools:
     """The slice of `ToolRunner` the companion touches. The real runner is driven by
     `tests/test_tool_loop.py`; what is asserted here is only which turns get offered
@@ -89,9 +99,12 @@ _DELEGATE_SPEC = ToolSpec(
 # --- what goes in front of the model ----------------------------------------
 
 
-async def test_the_blocks_are_who_it_is_then_what_it_may_touch_then_what_it_recalls(
+async def test_the_blocks_are_when_it_is_who_it_is_what_it_may_touch_then_what_it_recalls(
     data_dir: Path,
 ) -> None:
+    """The time block leads because it is a fact about the world rather than an
+    instruction, so it should not sit between the persona and the tool rules that
+    qualify it."""
     (data_dir / "persona" / "seed.md").write_text("You disagree when you disagree.\n")
     companion = Companion(
         FakeMemory(),
@@ -102,10 +115,21 @@ async def test_the_blocks_are_who_it_is_then_what_it_may_touch_then_what_it_reca
 
     blocks = await companion.context("발표 언제였지?")
 
-    assert blocks[0] == "You disagree when you disagree."
-    assert blocks[1] == TOOL_CONTRACT
-    assert blocks[2].startswith("[recalled-memory:")
-    assert "발표는 목요일 3시야" in blocks[2]
+    assert blocks[0].startswith("[현재 시각] 지금은 ")
+    assert blocks[1] == "You disagree when you disagree."
+    assert blocks[2] == TOOL_CONTRACT
+    assert blocks[3].startswith("[recalled-memory:")
+    assert "발표는 목요일 3시야" in blocks[3]
+
+
+async def test_context_leads_with_the_current_time(data_dir: Path) -> None:
+    """Without this the model has no way to know what day it is, and answered a
+    Tuesday greeting by continuing the previous Friday's thread."""
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+
+    blocks = await companion.context("뭐 하고 있었어?")
+
+    assert blocks[0].startswith("[현재 시각] 지금은 ")
 
 
 async def test_nothing_to_say_is_no_blocks_at_all(data_dir: Path) -> None:
@@ -113,7 +137,7 @@ async def test_nothing_to_say_is_no_blocks_at_all(data_dir: Path) -> None:
     turn, so an empty one would be an empty system message."""
     companion = Companion(FakeMemory(), data_dir=data_dir)
 
-    assert await companion.context("hello") == ()
+    assert without_time(await companion.context("hello")) == ()
 
 
 async def test_a_relayed_turn_is_told_nothing_about_tools(data_dir: Path) -> None:
@@ -121,15 +145,15 @@ async def test_a_relayed_turn_is_told_nothing_about_tools(data_dir: Path) -> Non
     hundred tokens about a capability the model does not have this turn."""
     companion = Companion(FakeMemory(), data_dir=data_dir, tools=FakeTools("read_file"))
 
-    assert await companion.context("이거 봐봐", origin="untrusted") == ()
-    assert await companion.context("이거 봐봐", origin="owner") == (TOOL_CONTRACT,)
+    assert without_time(await companion.context("이거 봐봐", origin="untrusted")) == ()
+    assert without_time(await companion.context("이거 봐봐", origin="owner")) == (TOOL_CONTRACT,)
 
 
 async def test_an_empty_registry_is_not_a_tool_layer(data_dir: Path) -> None:
     companion = Companion(FakeMemory(), data_dir=data_dir, tools=FakeTools())
 
     assert companion.specs(origin="owner") == ()
-    assert await companion.context("hello") == ()
+    assert without_time(await companion.context("hello")) == ()
 
 
 def test_voice_surface_drops_nested_tools_but_keeps_flat_and_delegate(
@@ -203,7 +227,7 @@ async def test_tool_rules_carry_the_google_account_when_one_is_authenticated(
         FakeMemory(), data_dir=data_dir, tools=FakeTools("google__list_calendars")
     )
 
-    (rules,) = await companion.context("오늘 일정 뭐야?", origin="owner")
+    (rules,) = without_time(await companion.context("오늘 일정 뭐야?", origin="owner"))
 
     assert rules.startswith(TOOL_CONTRACT)
     assert "owner@gmail.com" in rules
@@ -223,7 +247,7 @@ async def test_a_non_owner_turn_never_carries_the_google_account(
         FakeMemory(), data_dir=data_dir, tools=FakeTools("google__list_calendars")
     )
 
-    assert await companion.context("이거 봐봐", origin="untrusted") == ()
+    assert without_time(await companion.context("이거 봐봐", origin="untrusted")) == ()
 
 
 async def test_recall_the_window_already_carries_is_not_repeated(data_dir: Path) -> None:
@@ -231,7 +255,7 @@ async def test_recall_the_window_already_carries_is_not_repeated(data_dir: Path)
         FakeMemory(), data_dir=data_dir, recall=FakeRecall([recalled("hello")])
     )
 
-    assert await companion.context("hello", already={"hello"}) == ()
+    assert without_time(await companion.context("hello", already={"hello"})) == ()
 
 
 async def test_a_failing_search_costs_the_memory_and_not_the_turn(data_dir: Path) -> None:
@@ -243,7 +267,7 @@ async def test_a_failing_search_costs_the_memory_and_not_the_turn(data_dir: Path
     )
 
     assert await companion.search("발표 언제였지?") == []
-    assert await companion.context("발표 언제였지?") == ()
+    assert without_time(await companion.context("발표 언제였지?")) == ()
 
 
 async def test_the_persona_is_re_read_every_time(data_dir: Path) -> None:
