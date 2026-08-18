@@ -1216,3 +1216,28 @@ async def test_forcing_a_day_replaces_the_artifact_rather_than_appending(
 
     text = artifact_path(data_dir, DAY).read_text(encoding="utf-8")
     assert text.count(f"# {DAY} 성찰") == 1
+
+
+def test_a_web_search_result_never_becomes_a_remembered_fact(
+    store: Store, seoul: None
+) -> None:
+    """`tavily__tavily_search` is deliberately not in `CONTENT_TOOLS`, and this is
+    the shape of the reason (measured, 2026-08-10): opening a local file failed, so
+    the model searched the web with the same words - the owner's own name - and got
+    back **a different 김대현's** CV. Web search answers "find this for me now"; it
+    is not a source for what is permanently true about the person, and the distance
+    from one to the other turned out to be a single failed `open_path`.
+    """
+    tool_call(store, "tavily__tavily_search", '{"results": [{"title": "김대현 | 이력서"}]}')
+
+    assert _tool_digest(store.tool_calls_for_day(DAY)) == ""
+
+
+def test_a_web_search_still_counts_as_something_the_person_did(
+    store: Store, seoul: None
+) -> None:
+    """Excluded from the digest is not excluded from the day. What the owner reached
+    for is about the owner even when what came back is about a stranger."""
+    tool_call(store, "tavily__tavily_search", '{"results": []}')
+
+    assert "tavily__tavily_search" in _tool_usage(store.tool_calls_for_day(DAY))

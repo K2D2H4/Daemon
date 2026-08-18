@@ -27,23 +27,20 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   idea, because it was handed the day's material and nothing else. Giving it the curated tier
   read-only took it to 0 new facts on all four days - the honest number. The value shows on a
   day the daemon reads something the owner never mentions; this history has none.
-- **The weakest member of `CONTENT_TOOLS` is `tavily__tavily_search`, and it is weak in the
-  dangerous direction.** On 2026-08-10 its excerpts were a search for the owner's name that
-  returned **a different 김대현's resume** (cv.hatemogi.com - Rust/Scala/Clojure, against an
-  owner who is an AI/LLM engineer), plus "AI latest news Korean". A namesake's CV is exactly
-  the shape of material that becomes a confident, wrong, always-injected fact. It produced
-  none in these runs, and the blast radius is bounded by design (`origin='untrusted'`, cannot
-  retire, cannot become a rule, shown under its own artifact heading) - but if one member of
-  that allowlist is dropped, drop this one first.
-- **Reading a real artifact found a defect two suites of green tests did not.**
-  `_write_artifact` used `open_private_append`, so `daemon reflect --force` on a day that
-  already had one left two `# <date> 성찰` blocks in a single file - the superseded
-  conclusion above the current one, and the stale half reads as current because it comes
-  first. Invisible to every unit test, because they each wrote a day once. It is
-  `write_private_replace` now, whose docstring already listed the curated tier and entity
-  notes as files that are rewritten rather than appended; the artifact was simply missing
-  from that list. Same route as the duplicate-fact finding above: the counts looked fine
-  both times.
+- **Web search was in `CONTENT_TOOLS` until it was measured, and one failed `open_path` is
+  why it is not.** On 2026-08-10 the owner asked about their own resume; `open_path` on
+  `~/Downloads/대현 Kim resume english.pdf` failed on a wrong filename, and the model fell
+  back to searching the web with the same words - the owner's own name - which returned **a
+  different 김대현's CV** (cv.hatemogi.com: Rust/Scala/Clojure, against an owner who is an
+  AI/LLM engineer). That is the entire distance between "check my resume" and a confident,
+  wrong, always-injected fact about a stranger. Dropping `tavily__tavily_search` from the
+  allowlist cut the digest by roughly 60% on the days that had it (2026-08-09: 2788 -> 1080
+  chars, 08-10: 3443 -> 1308) while the second call still fires on every one of them - so
+  the volume it contributed was noise, and the facts it contributed were zero. The tool
+  itself is untouched: the allowlist governs only whether an output may become a *permanent*
+  fact, not whether the tool runs or whether its result reaches that turn's reply.
+- **The fallback itself is a separate open question**: a failed local read should probably
+  not become a web search for the same string, and nothing currently stops it.
 - **Running reflection for real found two defects unit tests did not.** Entity notes were
   stamped with the day of the *run*, so a months-long catch-up reads as all-today; and two
   facts sharing a supersession key retired the wrong half (`data/memory/core.md` kept the 3).

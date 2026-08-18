@@ -75,7 +75,6 @@ CONTENT_TOOLS = frozenset(
     {
         "read_page",
         "fetch_page",
-        "tavily__tavily_search",
         "notion__notion-fetch",
         "notion__notion-search",
         "notion__notion-list-private-pages",
@@ -93,9 +92,21 @@ decided to let it".
 What is missing and why: `read_file`, `run_command`, `list_dir`, `system_state`,
 `see_screen`, `write_file`, `open_path`, `list_tabs` read the machine's state or
 report what we did to it. They are not material to remember - every `read_file`
-excerpt in the live history was a plist or a Python script. They still count
-towards the usage summary, which is the half of a tool call that *is* about the
-person.
+excerpt in the live history was a plist or a Python script.
+
+**`tavily__tavily_search` is missing for a sharper reason, and it was in this set
+until it was measured.** Web search answers "find this for me now"; its results
+are about whatever was asked, not about the owner. On 2026-08-10 an `open_path`
+of a local resume failed on a wrong filename, so the model searched the web with
+the same words - the owner's own name - and got back **a different 김대현's** CV
+(Rust/Scala/Clojure, against an owner who is an AI/LLM engineer). One failed
+local open is the whole distance between "check my resume" and a confident,
+wrong, always-injected fact about a stranger. It yielded no useful fact in the
+measured history and one hazardous one.
+
+Everything excluded here still counts towards the usage summary, which is the
+half of a tool call that *is* about the person: what the owner reached for is
+about the owner even when what came back is about somebody else.
 """
 
 SYSTEM = """너는 하루치 대화를 정리하는 역할이다. 아래 규칙을 지켜 JSON만 출력한다.

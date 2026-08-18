@@ -169,10 +169,11 @@ def _tool_usage(rows: list[sqlite3.Row]) -> str
 
 ```
 read_page  fetch_page                          유저가 보고 있는 것 (§10.5)
-tavily__tavily_search                          웹 검색
 notion__notion-fetch  notion__notion-search  notion__notion-list-private-pages
 google__get_events  google__list_calendars     "발표는 목요일"이 실제로 사는 곳
 ```
+
+`tavily__tavily_search`는 처음에 넣었다가 실측 후 뺐다 — 아래 후속 (1).
 
 빠진 것과 이유: `read_file`·`run_command`·`list_dir`·`system_state`·`see_screen`·
 `write_file`·`open_path`·`list_tabs`는 기계의 상태이거나 우리가 한 행동이지 기억할
@@ -271,12 +272,31 @@ Notion JD에서 이름·이메일·직무를 정확히 뽑았다. **그 셋이 �
 
 ### 실측이 남긴 후속 두 개
 
-**(1) `tavily__tavily_search`는 `CONTENT_TOOLS` 중 가장 약하고, 약한 방향이 나쁘다.**
-2026-08-10의 발췌는 소유자 이름 검색이 **동명이인의 이력서**(cv.hatemogi.com — Rust·
-Scala·Clojure, 소유자는 AI/LLM 엔지니어)를 물어온 것과 "AI latest news Korean"이었다.
-동명이인 CV는 확신에 찬 틀린 사실이 매 턴 주입되는 정확한 모양이다. 이번 실행에서는
-하나도 만들지 않았고 폭발 반경은 설계상 막혀 있지만(`untrusted`, retire 불가, 규칙 승격
-불가, 아티팩트에서 별도 표기), **저 목록에서 하나를 뺀다면 이것부터다.**
+**(1) `tavily__tavily_search`를 `CONTENT_TOOLS`에서 뺐다 — 실측이 초기 목록을 고쳤다.**
+
+이유가 "웹은 신뢰할 수 없다"는 일반론이 아니라 이 기계에서 실제로 지나간 경로다.
+2026-08-10 01:45, 소유자가 자기 이력서를 물었다:
+
+```
+open_path  ~/Downloads/대현 Kim resume english.pdf   → 실패 (파일명이 틀림)
+tavily     "김대현 resume english"                    ← 실패하자 같은 단어로 웹에 물음
+```
+
+돌아온 것이 **동명이인의 이력서**(cv.hatemogi.com — Rust·Scala·Clojure, 소유자는 AI/LLM
+엔지니어)였다. **로컬 열기 실패 하나가 "내 이력서 확인해줘"와 "낯선 사람에 대한 확신에
+찬 틀린 사실이 매 턴 주입된다" 사이의 거리 전부다.**
+
+뺀 뒤 실측: 그 날들의 다이제스트가 60% 가까이 줄었고(08-09 2788→1080자, 08-10
+3443→1308자) 두 번째 호출은 4일 모두 여전히 뛴다. **부피는 잡음이었고 사실 기여는
+0이었다.** 웹서치는 "지금 이거 찾아줘"에 답하는 도구지 "이 사람에 대해 영구히 참인 것"의
+출처가 아니다.
+
+**툴 자체는 그대로다.** 이 목록은 출력이 *영구 사실*이 될 수 있는지만 정한다 — 웹서치는
+평소처럼 돌고, 결과는 그 턴의 답변에 정상적으로 들어가고, 사용 요약에도 남는다(소유자가
+무엇을 찾으려 했는지는 돌아온 것이 남의 이야기여도 소유자에 대한 정보다).
+
+**별도로 열어 두는 것**: 로컬 읽기 실패가 같은 문자열의 웹서치로 폴백하는 모델 거동
+자체는 대화 루프 쪽 문제이고 지금 아무것도 막지 않는다. 이 설계의 범위 밖이다.
 
 **(2) ~~`daemon reflect --force`가 아티팩트를 덮어쓰지 않고 append한다.~~** **해소.**
 이 작업의 결함이 아니었다 — 변경 전 코드에서도 같은 파일에 `# 2026-08-10 성찰` 헤더가
