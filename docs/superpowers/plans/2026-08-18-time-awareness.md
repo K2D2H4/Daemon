@@ -1629,7 +1629,36 @@ python3 -m pytest -q && python3 -m ruff check . && python3 scripts/check_docs.py
 ```
 Expected: all pass.
 
-- [ ] **Step 3: Document the module**
+- [ ] **Step 3: Consolidate the three `seoul` fixtures**
+
+Task 4 added a non-autouse `seoul` timezone-pinning fixture to `tests/conftest.py`;
+`tests/test_timesense.py` and `tests/test_candidates.py` each already had an autouse one
+of their own. Three identical definitions is the parallel-fixture duplication
+`tests/CLAUDE.md` warns against. It was deferred to here on purpose: consolidating means
+editing `tests/test_candidates.py`, and that file passing **unchanged** is Task 5's
+entire guarantee that relocating the extraction primitives changed no behaviour. With
+Task 5 reviewed and green, the edit is now safe.
+
+Keep the `conftest.py` definition as the single one, and in each of the two modules
+replace the local fixture with a thin autouse wrapper that requests it, so the autouse
+behaviour those files rely on is preserved:
+
+```python
+@pytest.fixture(autouse=True)
+def _seoul(seoul: None) -> None:
+    """Every case in this file reasons about the owner's local day or hour, so the
+    zone is pinned for all of them. The fixture itself lives in `conftest.py`."""
+```
+
+Delete the now-unused `import time as time_module` / `import time` and the
+`monkeypatch`/`tzset` bodies from both modules — those are orphans your change created.
+
+Run `python3 -m pytest tests/test_timesense.py tests/test_candidates.py -q` and confirm
+the same pass count as before the edit. If any case changes result, the wrapper is not
+reproducing the autouse behaviour — revert and leave all three definitions in place
+rather than shipping a suite whose timezone pinning is subtly different.
+
+- [ ] **Step 4: Document the module**
 
 Add a row to `daemon/CLAUDE.md`'s module table:
 
@@ -1640,14 +1669,14 @@ Add a row to `daemon/CLAUDE.md`'s module table:
 Check whether `docs/ARCHITECTURE.md` enumerates `daemon/*.py`; if it does, add
 `timesense.py` there too. Then re-run `python3 scripts/check_docs.py`.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add tests/test_reachable.py daemon/CLAUDE.md docs/ARCHITECTURE.md
 git commit -m "docs: place timesense in the module map, and close the gates"
 ```
 
-- [ ] **Step 5: Verify against the real thing — required, not optional**
+- [ ] **Step 6: Verify against the real thing — required, not optional**
 
 Green unit tests are not evidence here; the defect was in what the model *reads*, and
 only the assembled prompt on a live resident shows that. Per `evals/CLAUDE.md` and this
