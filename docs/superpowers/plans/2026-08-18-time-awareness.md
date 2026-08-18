@@ -117,14 +117,23 @@ def test_now_block_says_weekend_on_a_saturday() -> None:
 
 
 @pytest.mark.parametrize(
-    ("hour_kst", "part"),
-    [(3, "새벽"), (7, "아침"), (10, "오전"), (13, "점심"), (16, "오후"), (20, "저녁"), (23, "밤")],
+    ("utc_hour", "expected"),
+    [
+        (18, "평일 새벽입니다."),   # 03:00 KST, 2026-08-18
+        (22, "평일 아침입니다."),   # 07:00 KST, 2026-08-18
+        (1, "평일 오전입니다."),    # 10:00 KST, 2026-08-17
+        (4, "평일 점심입니다."),    # 13:00 KST, 2026-08-17
+        (7, "평일 오후입니다."),    # 16:00 KST, 2026-08-17
+        (11, "평일 저녁입니다."),   # 20:00 KST, 2026-08-17
+        (14, "평일 밤입니다."),     # 23:00 KST, 2026-08-17
+    ],
 )
-def test_day_parts_at_each_bucket(hour_kst: int, part: str) -> None:
-    """The buckets are what makes "이 시간까지 안 자고 계시네요" possible, so each
-    one is pinned at an hour inside it."""
-    moment = datetime(2026, 8, 18, (hour_kst - 9) % 24, 0, 0, tzinfo=UTC)
-    assert f"평일 {part}입니다." in timesense.now_block(moment) or part in ("새벽",)
+def test_day_parts_at_each_bucket(utc_hour: int, expected: str) -> None:
+    """The buckets are what make "이 시간까지 안 자고 계시네요" possible, so each is
+    pinned at an hour inside it. 2026-08-17 is a Monday and the two late-UTC cases
+    land on Tuesday the 18th, so every case is 평일."""
+    moment = datetime(2026, 8, 17, utc_hour, 0, 0, tzinfo=UTC)
+    assert timesense.now_block(moment).endswith(expected)
 
 
 def test_relative_names_last_week_with_the_gap() -> None:
@@ -144,8 +153,10 @@ def test_relative_uses_the_self_pinning_words_for_the_nearest_days() -> None:
 
 def test_relative_separates_this_week_from_last_week_on_the_same_weekday() -> None:
     """The reason absolute dates stay in the string: two hits can both be 금요일."""
-    this_week = datetime(2026, 8, 17, 1, 0, tzinfo=UTC)   # Mon 10:00 KST, same ISO week
-    assert timesense.relative(this_week, NOW) == "이번주 월요일 오전 10시 (1일 전)"
+    # Friday of the same ISO week - deliberately ahead of NOW, because NOW is a
+    # Tuesday and every *past* day in its ISO week is caught by 오늘/어제 first.
+    this_week = datetime(2026, 8, 21, 1, 0, tzinfo=UTC)   # Fri 10:00 KST, same ISO week
+    assert timesense.relative(this_week, NOW) == "이번주 금요일 오전 10시 (3일 후)"
     older = datetime(2026, 8, 7, 7, 32, tzinfo=UTC)       # Fri 16:32 KST, two weeks back
     assert timesense.relative(older, NOW) == "8월 7일 금요일 오후 4시 32분 (11일 전)"
 
@@ -338,32 +349,8 @@ def _monday(day: date) -> date:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_timesense.py -v`
-Expected: PASS, all cases.
-
-Then fix the one loose assertion the parametrised bucket test carries — replace its
-body so it pins the whole string rather than a substring with an escape hatch:
-
-```python
-@pytest.mark.parametrize(
-    ("utc_hour", "expected"),
-    [
-        (18, "평일 새벽입니다."),   # 03:00 KST next day
-        (22, "평일 아침입니다."),   # 07:00 KST next day
-        (1, "평일 오전입니다."),    # 10:00 KST
-        (4, "평일 점심입니다."),    # 13:00 KST
-        (7, "평일 오후입니다."),    # 16:00 KST
-        (11, "평일 저녁입니다."),   # 20:00 KST
-        (14, "평일 밤입니다."),     # 23:00 KST
-    ],
-)
-def test_day_parts_at_each_bucket(utc_hour: int, expected: str) -> None:
-    """The buckets are what make "이 시간까지 안 자고 계시네요" possible, so each is
-    pinned at an hour inside it. 2026-08-17 is a Monday, so every case is 평일."""
-    moment = datetime(2026, 8, 17, utc_hour, 0, 0, tzinfo=UTC)
-    assert timesense.now_block(moment).endswith(expected)
-```
-
-Run again: `python3 -m pytest tests/test_timesense.py -v` — Expected: PASS.
+Expected: PASS, all cases. Every assertion pins a whole string — if one needs
+loosening to pass, the implementation is wrong, not the assertion.
 
 - [ ] **Step 6: Lint and commit**
 
