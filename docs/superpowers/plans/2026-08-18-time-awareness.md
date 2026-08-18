@@ -867,14 +867,27 @@ async def test_two_gaps_put_two_break_lines_in_the_right_places(
 
     first = next(i for i, text in enumerate(rendered) if text == "첫 대화야")
     second = next(i for i, text in enumerate(rendered) if text == "그 뒤에 한 얘기")
+    # The LAST message of the middle session, and it is the anchor that matters.
+    # Anchoring only on each session's first message passes under a forward splice
+    # too: the misplaced second line lands *inside* the middle session, still after
+    # its opening message. Verified by mutation - see the note below.
+    second_reply = next(i for i, text in enumerate(rendered) if text == "그것도 기억할게요.")
     greeting = next(i for i, text in enumerate(rendered) if text == "벨라")
-    assert first < breaks[0] < second < breaks[1] < greeting
+    assert first < breaks[0] < second < second_reply < breaks[1] < greeting
 ```
 
 **The bar this test has to clear:** with `reversed()` changed to forward order it must
 FAIL. Apply that mutation, run the test, confirm the failure, revert, confirm it passes
 — and record the evidence. A splice-ordering test that passes either way is the defect
 it was written to prevent.
+
+**Where the obvious version of this test goes wrong.** A forward splice inserts the
+earlier line first, which pushes the later one one slot too early — so the second break
+lands *between* the middle session's two messages rather than before the greeting. An
+assertion anchored on each session's *first* message cannot see that: the misplaced line
+is still after the middle session's opening. It has to be anchored on that session's
+*last* message. Both the plan and the first implementation attempt got this wrong before
+mutation testing caught it.
 
 - [ ] **Step 9: Run the tests to verify they pass**
 
