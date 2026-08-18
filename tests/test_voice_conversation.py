@@ -2210,6 +2210,31 @@ async def test_the_session_learns_the_date_before_the_conversation_tail() -> Non
     )
 
 
+async def test_a_past_commitment_reaches_the_session_over_send_context() -> None:
+    """`Companion.time_block` is the only way `[약속 상태]` can reach a voice
+    session - its history lives server-side, so there is no `list[Message]` for the
+    text path's `_assemble` to splice a block into, and this `send_context` call is
+    the whole handoff. Modelled on
+    `test_the_session_learns_the_date_before_the_conversation_tail`: the seeded
+    message is well outside the 120-minute continuity window, so the only new
+    content in `session.contexts[0]` beyond `[현재 시각]` is the commitment block
+    itself (verified by mutation: deleting the `timesense.commitments(...)` call
+    from `time_block` fails this assertion; restoring it passes).
+    """
+    session = FakeSession(Says("user", "안녕"), b"\x01", Turn())
+    memory = FakeMemory()
+    memory.records.append(_spoke("오늘 오후 2시에 면접 있어", minutes_ago=60 * 24 * 2))
+
+    await run(conversation(session, FakeAudio(), memory))
+
+    assert session.contexts[0].startswith("[현재 시각] ")
+    assert "[약속 상태]" in session.contexts[0]
+    assert "이미 지났습니다" in session.contexts[0]
+    assert not any("recent-conversation" in text for text in session.contexts), (
+        "the seeded message is two days old - well outside the continuity window"
+    )
+
+
 async def test_a_quiet_stretch_still_tells_the_session_what_day_it_is() -> None:
     """The complement of `test_a_quiet_stretch_means_no_continuity_block_at_all`: no
     tail is correct after two hours of silence, but a session opening after a quiet

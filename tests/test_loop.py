@@ -278,6 +278,11 @@ async def test_a_greeting_after_a_gap_of_days_is_not_a_continuation(
     very ordering this test means to exercise. The exact rendering is pinned in
     `tests/test_timesense.py`, where `now` is a parameter; what this asserts is
     **position**, which is the thing assembly owns and the unit test cannot see.
+
+    Also asserts the `[약속 상태]` block, and that it reads the meeting as past -
+    `_assemble` passes `history=history` into `Companion.context` for exactly this,
+    and deleting that keyword argument left the whole suite green until this
+    assertion existed (verified: removing it fails this test, restoring it passes).
     """
     memory = FakeMemory()
     earlier = clock.now() - timedelta(days=4)
@@ -306,6 +311,60 @@ async def test_a_greeting_after_a_gap_of_days_is_not_a_continuation(
     thread = next(i for i, text in enumerate(rendered) if "4시40분" in text)
     greeting = next(i for i, text in enumerate(rendered) if text == "벨라")
     assert thread < breaks[0] < greeting
+
+    commitment_blocks = [text for text in rendered if text.startswith("[약속 상태]")]
+    assert commitment_blocks, "no [약속 상태] block reached the model"
+    assert "이미 지났습니다" in commitment_blocks[0], "the expired meeting must not read as pending"
+
+
+async def test_the_reported_case_carries_all_three_time_blocks_at_once(
+    data_dir: Path, fake_provider: FakeProvider
+) -> None:
+    """The branch's headline behaviour, pinned all at once.
+
+    `test_a_greeting_after_a_gap_of_days_is_not_a_continuation` above pins the break
+    line and the commitment block; `test_context_leads_with_the_current_time`
+    (`tests/test_companion.py`) pins the current-time block. Nothing before this
+    drove one real assembled turn and asserted all three land together - which is
+    exactly the coverage gap that let `history=history` disappear from `_assemble`
+    (silently dropping `[약속 상태]`) and `commitments(...)` disappear from
+    `Companion.time_block` (silently dropping it from voice) with 2775 tests green.
+    This is the reported case itself: a Friday thread that arranged a 16:40 meeting
+    reminder, four days of silence, then a bare "벨라".
+    """
+    memory = FakeMemory()
+    earlier = clock.now() - timedelta(days=4)
+    memory.records.extend(
+        [
+            logged("오늘 오후 4시40분에 회의있어 5분전에 알려줘", earlier),
+            logged(
+                "알겠습니다! 4시 35분에 알려드릴게요.", earlier + timedelta(minutes=1), "assistant"
+            ),
+        ]
+    )
+    bare_greeting = InboundMessage(
+        text="벨라", sender_id="42", received_at=clock.now(), channel="fake"
+    )
+
+    await ConversationLoop(
+        FakeChannel([bare_greeting]),
+        gateway_for(fake_provider),
+        Companion(memory, data_dir=data_dir),
+    ).run()
+
+    rendered = [m.content for m in fake_provider.calls[0]]
+    assert any(text.startswith("[현재 시각]") for text in rendered), "no current-time block"
+    commitment_blocks = [text for text in rendered if text.startswith("[약속 상태]")]
+    assert commitment_blocks, "no [약속 상태] block reached the model"
+
+    breaks = [i for i, text in enumerate(rendered) if text.startswith("[대화 단절]")]
+    assert len(breaks) == 1, "no break, or more than one"
+
+    thread = next(i for i, text in enumerate(rendered) if "4시40분" in text)
+    greeting = next(i for i, text in enumerate(rendered) if text == "벨라")
+    assert thread < breaks[0] < greeting, (
+        "the break line must sit between the finished thread and the greeting"
+    )
 
 
 async def test_three_sessions_produce_two_breaks_in_the_right_slots(
