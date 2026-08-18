@@ -308,6 +308,56 @@ async def test_a_greeting_after_a_gap_of_days_is_not_a_continuation(
     assert thread < breaks[0] < greeting
 
 
+async def test_three_sessions_produce_two_breaks_in_the_right_slots(
+    data_dir: Path, fake_provider: FakeProvider
+) -> None:
+    """A single break cannot catch an index-shift bug: after the first splice,
+    every later `session_breaks` index is only correct if insertion went from the
+    back of the list forward (`daemon/loop.py`'s `_assemble`, `reversed(...)`).
+    Forward order would shift every later index by one per prior insertion, so
+    with two breaks the second line would land one slot early. Three sessions -
+    six days ago, three days ago, today - force exactly that second index to
+    exist and be checked.
+    """
+    memory = FakeMemory()
+    first_session = clock.now() - timedelta(days=6)
+    second_session = clock.now() - timedelta(days=3)
+    memory.records.extend(
+        [
+            logged("첫 번째 세션입니다", first_session),
+            logged("첫 번째 세션 답장입니다", first_session + timedelta(minutes=1), "assistant"),
+            logged("두 번째 세션입니다", second_session),
+            logged(
+                "두 번째 세션 답장입니다", second_session + timedelta(minutes=1), "assistant"
+            ),
+        ]
+    )
+    bare_greeting = InboundMessage(
+        text="벨라", sender_id="42", received_at=clock.now(), channel="fake"
+    )
+
+    await ConversationLoop(
+        FakeChannel([bare_greeting]),
+        gateway_for(fake_provider),
+        Companion(memory, data_dir=data_dir),
+    ).run()
+
+    rendered = [m.content for m in fake_provider.calls[0]]
+    breaks = [i for i, text in enumerate(rendered) if text.startswith("[대화 단절]")]
+    assert len(breaks) == 2, "three sessions must produce exactly two breaks"
+
+    first = next(i for i, text in enumerate(rendered) if text == "첫 번째 세션입니다")
+    second_start = next(i for i, text in enumerate(rendered) if text == "두 번째 세션입니다")
+    second_reply = next(
+        i for i, text in enumerate(rendered) if text == "두 번째 세션 답장입니다"
+    )
+    greeting = next(i for i, text in enumerate(rendered) if text == "벨라")
+    # second_reply must fall strictly before the second break: a forward-order
+    # splice shifts the second break one slot early, landing it between the
+    # second session's own two messages instead of after both of them.
+    assert first < breaks[0] < second_start < second_reply < breaks[1] < greeting
+
+
 async def test_persona_seed_becomes_the_system_turn(
     data_dir: Path, fake_provider: FakeProvider
 ) -> None:

@@ -819,12 +819,69 @@ with:
 Check whether `daemon/loop.py` already imports `clock`; add it to the same import if
 not.
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [ ] **Step 8: Cover the splice direction — the unit tests cannot**
+
+`test_two_breaks_are_reported_in_ascending_order` asserts what `session_breaks`
+*returns*; it never reaches the splice. And a single-break integration test cannot
+expose an index shift, because there is no later index left to invalidate. So the
+`reversed()` above is untested by everything written so far — verified by mutating it
+to forward order, at which point the whole suite still passed.
+
+Add a second integration test in `tests/test_loop.py` driving the real assembly over a
+window spanning THREE sessions, so two lines are spliced. Seed relative to the live
+clock, as the previous test does, and assert the full interleaving by position:
+
+```python
+async def test_two_gaps_put_two_break_lines_in_the_right_places(
+    data_dir: Path, fake_provider: FakeProvider
+) -> None:
+    """Two breaks, because one cannot catch an index shift.
+
+    `session_breaks` returns ascending indices and `_assemble` inserts in reverse for
+    that reason. With a single break there is no later index to invalidate, so a
+    forward-order splice passes every other test in this suite.
+    """
+    memory = FakeMemory()
+    oldest = clock.now() - timedelta(days=6)
+    middle = clock.now() - timedelta(days=3)
+    memory.records.extend(
+        [
+            logged("첫 대화야", oldest),
+            logged("네, 기억할게요.", oldest + timedelta(minutes=1), "assistant"),
+            logged("그 뒤에 한 얘기", middle),
+            logged("그것도 기억할게요.", middle + timedelta(minutes=1), "assistant"),
+        ]
+    )
+
+    await ConversationLoop(
+        FakeChannel([InboundMessage(
+            text="벨라", sender_id="42", received_at=clock.now(), channel="fake",
+        )]),
+        gateway_for(fake_provider),
+        Companion(memory, data_dir=data_dir),
+    ).run()
+
+    rendered = [m.content for m in fake_provider.calls[0]]
+    breaks = [i for i, text in enumerate(rendered) if text.startswith("[대화 단절]")]
+    assert len(breaks) == 2
+
+    first = next(i for i, text in enumerate(rendered) if text == "첫 대화야")
+    second = next(i for i, text in enumerate(rendered) if text == "그 뒤에 한 얘기")
+    greeting = next(i for i, text in enumerate(rendered) if text == "벨라")
+    assert first < breaks[0] < second < breaks[1] < greeting
+```
+
+**The bar this test has to clear:** with `reversed()` changed to forward order it must
+FAIL. Apply that mutation, run the test, confirm the failure, revert, confirm it passes
+— and record the evidence. A splice-ordering test that passes either way is the defect
+it was written to prevent.
+
+- [ ] **Step 9: Run the tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_loop.py tests/test_timesense.py -q`
 Expected: PASS.
 
-- [ ] **Step 9: Lint and commit**
+- [ ] **Step 10: Lint and commit**
 
 ```bash
 python3 -m ruff check . && python3 -m pytest tests/test_loop.py tests/test_timesense.py -q
