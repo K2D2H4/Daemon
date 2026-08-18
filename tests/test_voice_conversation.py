@@ -1106,8 +1106,9 @@ async def test_what_is_put_in_front_of_the_model_says_what_it_is() -> None:
     conv = conversation(session, recall=FakeRecall(relayed))
     await run(conv)
 
-    # session.contexts[0] is the unconditional time block sent at session open.
-    block = session.contexts[-1]
+    # contexts[0] is the unconditional time block; exactly one recall block
+    # follows it - the arity is still the claim, just about the block under test.
+    (block,) = [text for text in session.contexts if "recalled-memory:" in text]
     assert "recalled-memory:" in block, "no boundary; a memory can pose as an instruction"
     assert "end-recalled-memory:" in block
     assert "not the user's own words" in block, "relayed text is posing as the owner's"
@@ -1300,12 +1301,13 @@ async def test_the_conversation_and_the_real_session_agree_about_a_turn() -> Non
     # prompt: `clientContent` with `turnComplete: false`.
     assert recall.queries == ["치과 예약", "치과 예약 언제였지"]
     # Two clientContent frames now: the unconditional time block at session open,
-    # then recall at the turn boundary - find the one that carries the memory.
-    seeded = next(
+    # then recall at the turn boundary - filter to the one carrying the memory and
+    # unpack a one-tuple, so "exactly one" is still asserted, just about that block.
+    (seeded,) = [
         frame
         for frame in socket.frames("clientContent")
         if _item().content in frame["turns"][0]["parts"][0]["text"]
-    )
+    ]
     assert seeded["turnComplete"] is False
     assert not any("text" in frame for frame in socket.frames("realtimeInput")), (
         "recall reached the model as a prompt; the daemon will read it aloud"
