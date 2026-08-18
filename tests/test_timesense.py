@@ -184,7 +184,19 @@ def test_no_commitments_renders_nothing() -> None:
 
 
 def test_a_cancelled_event_is_not_a_commitment() -> None:
+    """"오늘 회의 취소됐어" alone proves nothing: "됐" is a `PAST_MARKERS` suffix and
+    "오늘" is `TENSE_NEUTRAL`, so the past-tense guard filters it before
+    `EVENT_CANCELLED` is ever reached - it would read empty even with the
+    cancellation guard deleted outright. `내일`/`모레` are not tense-neutral and
+    carry no past-tense suffix, so the two cases below can only be stopped by
+    `EVENT_CANCELLED`. The control assertions - the same sentence minus the
+    cancellation word - show a commitment *is* recognised there, so the empty
+    result above them is the guard firing and not a marker or event miss."""
     assert timesense.commitments([_said("오늘 회의 취소됐어")], NOW) == ""
+    assert timesense.commitments([_said("내일 회의 취소")], NOW) == ""
+    assert timesense.commitments([_said("모레 발표 연기")], NOW) == ""
+    assert timesense.commitments([_said("내일 회의 있어")], NOW) != ""
+    assert timesense.commitments([_said("모레 발표 있어")], NOW) != ""
 
 
 def test_a_past_tense_neutral_marker_is_not_a_commitment() -> None:
