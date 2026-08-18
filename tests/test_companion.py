@@ -613,3 +613,13 @@ async def test_the_continuity_block_says_the_owner_outranks_the_transcript(
     assert "mishears" in block, "the block must admit the transcript can be wrong"
     assert "they are right and this record is wrong" in block
     assert "never insist they said it" in block
+
+
+async def test_time_block_stands_alone_for_the_voice_path(data_dir: Path) -> None:
+    """`continuity_block` is empty when nothing is fresh, and a session opening after
+    a quiet night is the one that most needs to know what day it is."""
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+
+    block = await companion.time_block()
+
+    assert block.startswith("[현재 시각] 지금은 ")

@@ -439,6 +439,20 @@ class Companion:
             return ""
         return render_continuity(fresh, secrets.token_hex(4))
 
+    async def time_block(self, *, limit: int = CONTINUITY_MESSAGES) -> str:
+        """When it is, and which commitments in recent view are already past.
+
+        For the voice path, which has no `list[Message]` to carry these in - its
+        history lives server-side - so they go over `send_context` as their own
+        block. Unconditional, unlike `continuity_block`: that one is empty when
+        nothing is fresh, and a session opening after a quiet night is precisely the
+        one that most needs to be told what day it is.
+        """
+        moment = clock.now()
+        history = await self._memory.recent(limit=limit)
+        parts = [timesense.now_block(moment), timesense.commitments(history, moment)]
+        return "\n\n".join(part for part in parts if part)
+
     async def seen(self, channel: str, external_id: str) -> bool:
         """Has this channel message already been recorded? The markdown is
         append-only, so a duplicate has to be caught before the write."""

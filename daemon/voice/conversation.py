@@ -362,7 +362,9 @@ class VoiceConversation:
                 # word interrupted, so a fresh session does not greet an amnesiac's
                 # greeting. Safe to send here and only here - nothing is generating
                 # yet, and `send_context` mid-generation kills the answer (measured,
-                # module docstring).
+                # module docstring). The date goes first: the tail is read *in* the
+                # present, so the present has to already be established.
+                await self._send_time(session)
                 await self._send_continuity(session)
                 # Before the microphone, so the utterance that opened the session is
                 # the first thing the model hears rather than racing live audio for
@@ -416,6 +418,24 @@ class VoiceConversation:
                 self._opening_answer_until = loop.time() + OPENING_ANSWER_HOLD_SECONDS
         except Exception:
             logger.exception("voice: could not hand over the utterance that opened the session")
+
+    async def _send_time(self, session: VoiceSession) -> None:
+        """Tell the model what day it is before anything else reaches it.
+
+        Same never-fails contract as `_send_continuity`: the time lost costs one
+        wrong "아까", raising would cost the turn.
+        """
+        try:
+            block = await self._companion.time_block()
+        except Exception:
+            logger.exception("voice: could not assemble the current time")
+            return
+        if not block:
+            return
+        try:
+            await session.send_context(block)
+        except Exception:
+            logger.exception("voice: could not hand over the current time")
 
     async def _send_continuity(self, session: VoiceSession) -> None:
         """Hand over the conversation this wake word is continuing, if it is fresh.
