@@ -14,7 +14,7 @@ in `app.py`, which owns every concrete-implementation import here.
 | `setup.py` | the onboarding wizard: PC control, provider, its model(s) and background toggle, keys, persona seed, pairing, then the residency finish — offer `daemon install` and confirm the resident woke up via `service.status()` + `/health` |
 | `wake_cli.py` | `daemon wake`: measure what the recognizer returns for the owner's phrase, save it as `DAEMON_WAKE_ALIASES`, then run the gate and print what fires. Writes `.env` through `setup.py`'s writer |
 | `config.py` | settings and the two routing axes, `DAEMON_PROVIDER` + `DAEMON_PROACTIVE_JUDGE_LOCAL` — `Settings.routing` is computed from them, not looked up in a table |
-| `companion.py` | **what both endpoints can do, in one place**: `context` (persona + tool rules + the recall block), `record` + `index_recorded`, `specs` / `run_tools`. Add a capability here, not twice |
+| `companion.py` | **what both endpoints can do, in one place**: `context` (the time block, persona, tool rules, commitments, then recall — time leads because it is a fact about the world rather than an instruction, and commitments trail the tool rules they don't qualify), `record` + `index_recorded`, `specs` / `run_tools`. Add a capability here, not twice |
 | `loop.py` | the text transport: record → context → complete → record → send. Owns the tool loop's shape, `/approve`, and the wire |
 | `reflection.py` | the 04:00 pass: one local day → curated facts, entity notes, observations |
 | `tasks.py` | the `Task` enum. **Frozen** — it is the LLM routing key |

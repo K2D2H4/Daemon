@@ -111,11 +111,12 @@ def data_dir(tmp_path: Path) -> Path:
 def seoul(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Pin the machine's local zone to Asia/Seoul.
 
-    Mirrors the autouse fixture of the same name in `test_timesense.py`, for any
-    other test whose assertion is a Korean phrase built from a local-time
-    conversion (`daemon/timesense.py`). CI (`ubuntu-latest`) sets no timezone, so a
-    string like "오후 4시" that reads right on a KST machine would name the wrong
-    hour there without this.
+    The single definition. `test_timesense.py` and `test_candidates.py` each wrap
+    this in their own autouse `_seoul` fixture that just requests it, for any test
+    whose assertion is a Korean phrase built from a local-time conversion
+    (`daemon/timesense.py`). CI (`ubuntu-latest`) sets no timezone, so a string like
+    "오후 4시" that reads right on a KST machine would name the wrong hour there
+    without this.
     """
     monkeypatch.setenv("TZ", "Asia/Seoul")
     time.tzset()
