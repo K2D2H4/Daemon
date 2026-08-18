@@ -4,6 +4,37 @@ Every line here is something this project believed until it ran it. Read it befo
 optimising, before trusting a documented probe, and before repeating a measurement
 that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
 
+- **Reflection's starvation was two problems and only one of them was the tool results.**
+  Measured on the live database (2026-08-18: 890 messages, 7 observations, 1 persona rule,
+  307 tool calls). Re-running the *unchanged* pass over five real days - 664 messages - with
+  the hosted model produced **0 facts and 0 observations**. So the input was not the only
+  thing missing; the conversation call was returning empty on days that had plenty to say.
+  Feeding it a **usage summary** - which tools ran, roughly when, how often, and whether they
+  were refused, with no output text at all - fixed the yield: 2026-08-10, 20 runs per arm,
+  **0.85 -> 1.75 observations per run, p = 0.0012** (two-sided permutation test, 200k
+  shuffles). The number that matters for M4 is not the mean: **nights that produced zero
+  observations went from 9/20 to 1/20**.
+- **One run of a reflection pass tells you nothing about a reflection pass.** The first
+  measurement of the above was a single run per arm, 0 -> 2, and it looked convincing.
+  Twenty runs put the pre-change arm at 0.85 with 9 zeros - so "0 observations" was a coin
+  flip that had come up tails, not a fixed property of the day. Any A/B on this pass needs
+  a p-value; the pass is a model call and the model is not deterministic.
+- **The tool-content path works, is accurate, and on this history added nothing** - which is
+  a result, not a failure. Reading 2026-08-09..13's calendar and Notion output, the second
+  call correctly extracted the owner's birthday (off a `google__get_events` "Happy birthday!"
+  entry), their name and email, and their job title (off a Notion JD). **All three were
+  already in `memory_entries`**, learned from the same day's conversation. Its prompt had no
+  idea, because it was handed the day's material and nothing else. Giving it the curated tier
+  read-only took it to 0 new facts on all four days - the honest number. The value shows on a
+  day the daemon reads something the owner never mentions; this history has none.
+- **The weakest member of `CONTENT_TOOLS` is `tavily__tavily_search`, and it is weak in the
+  dangerous direction.** On 2026-08-10 its excerpts were a search for the owner's name that
+  returned **a different 김대현's resume** (cv.hatemogi.com - Rust/Scala/Clojure, against an
+  owner who is an AI/LLM engineer), plus "AI latest news Korean". A namesake's CV is exactly
+  the shape of material that becomes a confident, wrong, always-injected fact. It produced
+  none in these runs, and the blast radius is bounded by design (`origin='untrusted'`, cannot
+  retire, cannot become a rule, shown under its own artifact heading) - but if one member of
+  that allowlist is dropped, drop this one first.
 - **Running reflection for real found two defects unit tests did not.** Entity notes were
   stamped with the day of the *run*, so a months-long catch-up reads as all-today; and two
   facts sharing a supersession key retired the wrong half (`data/memory/core.md` kept the 3).

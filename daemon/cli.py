@@ -1179,7 +1179,12 @@ async def _reflect(settings: Settings, *, date: str | None, force: bool) -> int:
             + (f" - {result.detail}" if result.detail else "")
             + (
                 f" ({result.messages_read} message(s) -> {result.facts} fact(s), "
-                f"{result.entities} entity(ies), {result.observations} observation(s))"
+                f"{result.entities} entity(ies), {result.observations} observation(s)"
+                # Always, including the zero. Which of the two paths did the work
+                # is what this feature is judged by, and a clause that appears only
+                # when it is non-zero cannot tell "the second call found nothing"
+                # apart from "there was no second call".
+                f", {result.tool_facts} from tool(s))"
                 if result.status == "written"
                 else ""
             )

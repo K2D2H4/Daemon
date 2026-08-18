@@ -144,10 +144,16 @@ class FakeProvider:
         reply: str = "ok",
         *,
         fail: bool = False,
+        replies: Sequence[str] | None = None,
         scripted_calls: Sequence[Sequence[ToolCall]] | None = None,
     ) -> None:
         self.reply = reply
         self.fail = fail
+        # One reply per completion, in order, falling back to `reply` once spent.
+        # Needed by any pass that makes more than one call for different reasons -
+        # reflection's conversation call and its tool-content call, which must be
+        # answerable differently to tell them apart at all.
+        self._replies = list(replies or ())
         self.calls: list[list[Message]] = []
         self.models: list[str] = []
         self.offered_tools: list[tuple[ToolSpec, ...]] = []
@@ -172,10 +178,11 @@ class FakeProvider:
         # deliberately tool-free call - the loop's round-limit escape hatch - with a
         # tool call, and the escape hatch would look broken when it was not.
         asked = self._script.pop(0) if (self._script and tools) else ()
+        answer = self._replies.pop(0) if self._replies else self.reply
         return Completion(
             # Empty text alongside tool calls, the way a real provider answers a
             # tool-use turn.
-            text="" if asked else self.reply,
+            text="" if asked else answer,
             model=model,
             input_tokens=1,
             output_tokens=1,

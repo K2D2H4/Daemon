@@ -18,14 +18,14 @@ import json
 import logging
 import sqlite3
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 
 from daemon.fs import secure_dir, secure_file
 from daemon.memory.base import LoggedMessage
-from daemon.memory.log import from_iso, utc_iso
+from daemon.memory.log import from_iso, local_date, utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +330,28 @@ class Store:
         return self.conn.execute(
             "SELECT * FROM tool_calls ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
+
+    def tool_calls_for_day(self, date: str) -> list[sqlite3.Row]:
+        """One local day's tool calls, oldest first - reflection's second input.
+
+        `tool_calls` carries no `log_file`, only a UTC `ts`, so the local day has
+        to be recovered rather than looked up. A `BETWEEN` over `ts` would be
+        wrong by up to a day in either direction: 23:00Z is already tomorrow
+        morning in Seoul. So the SQL window is deliberately loose - a day either
+        side, which covers every real offset - and `local_date` decides
+        membership, the same function that named the log file this day's messages
+        went into.
+
+        Refused and failed calls come back too. What to do with them is the
+        caller's question: they carry no output to remember but they are part of
+        what the day looked like.
+        """
+        day = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=UTC)
+        rows = self.conn.execute(
+            "SELECT * FROM tool_calls WHERE ts >= ? AND ts < ? ORDER BY ts ASC, id ASC",
+            (utc_iso(day - timedelta(days=1)), utc_iso(day + timedelta(days=2))),
+        ).fetchall()
+        return [row for row in rows if local_date(from_iso(row["ts"])) == date]
 
     def create_tool_approval(
         self,
