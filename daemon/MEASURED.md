@@ -27,20 +27,40 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   idea, because it was handed the day's material and nothing else. Giving it the curated tier
   read-only took it to 0 new facts on all four days - the honest number. The value shows on a
   day the daemon reads something the owner never mentions; this history has none.
-- **Web search was in `CONTENT_TOOLS` until it was measured, and one failed `open_path` is
-  why it is not.** On 2026-08-10 the owner asked about their own resume; `open_path` on
-  `~/Downloads/대현 Kim resume english.pdf` failed on a wrong filename, and the model fell
-  back to searching the web with the same words - the owner's own name - which returned **a
-  different 김대현's CV** (cv.hatemogi.com: Rust/Scala/Clojure, against an owner who is an
-  AI/LLM engineer). That is the entire distance between "check my resume" and a confident,
-  wrong, always-injected fact about a stranger. Dropping `tavily__tavily_search` from the
-  allowlist cut the digest by roughly 60% on the days that had it (2026-08-09: 2788 -> 1080
-  chars, 08-10: 3443 -> 1308) while the second call still fires on every one of them - so
-  the volume it contributed was noise, and the facts it contributed were zero. The tool
-  itself is untouched: the allowlist governs only whether an output may become a *permanent*
-  fact, not whether the tool runs or whether its result reaches that turn's reply.
-- **The fallback itself is a separate open question**: a failed local read should probably
-  not become a web search for the same string, and nothing currently stops it.
+- **Web search was in `CONTENT_TOOLS` until it was measured, and a two-word fragment is why
+  it is not.** On 2026-08-10 01:45, in a voice session, `tavily__tavily_search` ran the query
+  "김대현 resume english" - the owner's own name - and got back **a different 김대현's CV**
+  (cv.hatemogi.com: Rust/Scala/Clojure, against an owner who is an AI/LLM engineer). The
+  owner had not asked for a web search. The user turn immediately before it was
+  **"그냥 영어로"**.
+
+  **Correction, and the way it was got wrong is the point.** This was first written up here
+  as "an `open_path` failed, so the model fell back to searching the web with the same
+  words". That was inferred from the *order of the tool_calls rows* - a failed open at
+  01:45:19, a search at 01:45:57 - and it did not survive reading the conversation those
+  rows sat in: the user asked for Chrome in between, and the utterance before the search was
+  a fragment about the filename being in English. Tool rows record what the machine did, not
+  why; reconstructing intent from them alone produces a confident story with nothing holding
+  it up. Read the messages beside them.
+
+  Dropping it cut the digest by roughly 60% on the days that had it (2026-08-09: 2788 -> 1080
+  chars, 08-10: 3443 -> 1308) while the second call still fires on every one of them - the
+  volume was noise and the fact contribution was zero. The tool itself is untouched: the
+  allowlist governs only whether an output may become a *permanent* fact.
+- **The daemon runs tools on wake-word misrecognitions, and voice is twice as exposed as
+  text.** Measured over the live history: of the executed tool calls whose nearest preceding
+  user turn was 6 characters or shorter, voice is **13/73 (17.8%)** against text's **20/224
+  (8.9%)**. The voice ones are largely the recognizer mangling the wake alias 벨라 -
+  `open_path` after "Allah", "Oops.", "el la"; `read_page` after "¿Ah?"; `see_screen` and
+  `start_screen_share` after "Bella." / "Ella." - though not all of them are noise ("응." ->
+  `notion__notion-fetch` is an ordinary yes). Blast radius in what actually ran was low: the
+  single `run_command` was `icalbuddy -eventsToday events`, read-only, and it failed.
+
+  The mechanism is the part worth keeping. CONTRACTS rule 10 stops a *forwarded* message from
+  reaching a tool, and these turns pass it honestly - `origin='owner'`, because the owner did
+  make a sound. What the gate does not cover is **the recognizer inventing an utterance the
+  owner never made**, and with `tools_mode=full` the default is to run it without asking.
+  Utterance length is not the fix: "응." is two characters and legitimate.
 - **Running reflection for real found two defects unit tests did not.** Entity notes were
   stamped with the day of the *run*, so a months-long catch-up reads as all-today; and two
   facts sharing a supersession key retired the wrong half (`data/memory/core.md` kept the 3).
