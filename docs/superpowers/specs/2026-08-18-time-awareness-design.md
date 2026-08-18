@@ -241,6 +241,22 @@ lexicon is conservative and `_EVENT_CANCELLED` catches the expensive direction, 
 boundary cannot be set correctly without measurement. If it reads as noise in use, the
 fallback is decision 4(가) — expired only.
 
+## Measured outcome (2026-08-18, after implementation)
+
+Live against `gemini` with an isolated data directory, replaying the reported case: the
+assembled prompt carries all three blocks correctly, and the model still treats the
+expired commitment as live in **5 of 26 runs (~19%)**. Block order was A/B'd — commitment
+block at the top versus immediately before the final user turn — and both arms gave 0/10,
+which settles open question 1 no better than not asking it. Details and the caution about
+batch-to-batch variance are in `daemon/MEASURED.md`.
+
+**What this means for the decisions above.** Decisions 1-3 and 5 are delivered and hold.
+Decision 4's block is present and correct, but the *outcome* it exists for — the daemon
+never describing a past commitment as pending — is not reliably achieved by putting the
+fact in the prompt. The remaining failures all have one shape: the window's last assistant
+turn is an enthusiastic promise about the reminder, and the model continues it. Closing the
+gap is prompt-effectiveness work, needs n well above 10 per arm, and is not in this spec.
+
 ## Open questions for planning
 
 1. Where the now block sits in the block order — `context()` returns persona, tools,

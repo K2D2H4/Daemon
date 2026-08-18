@@ -196,4 +196,17 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   needing 14 distinct days. Worth writing down because "the generator produces
   nothing" and "the generator is broken" look identical from outside, and this one
   is the former.
-
+- **The time-awareness blocks fix the reported defect most of the time, not every time
+  (2026-08-18).** Driven against live `gemini` with an isolated `DAEMON_DATA_DIR`, replaying
+  the exact reported case — a Friday thread that arranged a 16:40 reminder, four days of
+  silence, then a bare "벨라" — the assembled prompt carries all three blocks correctly
+  (`[현재 시각]`, `[약속 상태]` saying the meeting's time has passed, `[대화 단절]` between the
+  finished thread and today). The model still answered "오후 4시 35분에 회의 알림 잊지 않고
+  챙겨드릴 테니" in **5 of 26 runs (~19%)**, and the rate is unstable across batches: 3/10 in
+  one batch, 0/10 in another with the same code. So a single batch cannot tell you whether a
+  prompt change helped. **Moving the `[약속 상태]` block from the top of the prompt to just
+  before the final user turn — the recency hypothesis, and `docs/superpowers/specs/2026-08-18-time-awareness-design.md`'s
+  open question 1 — produced 0/10 in both arms and settled nothing at that sample size.** The
+  failures are all the same shape: the window's last assistant turn is an enthusiastic promise
+  about the reminder, and the model continues it. Anyone tuning this needs n well above 10 per
+  arm and should measure against that shape specifically.
