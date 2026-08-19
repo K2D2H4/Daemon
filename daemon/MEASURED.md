@@ -413,3 +413,38 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   about *tone*, not about echo: `재미난` in 8 of 17 assistant turns that day, and a
   filler word the daemon coined while apologising ("담백하게 가볼까요?") reused as a new
   tic 35 minutes later. An audio defect surfaced as a personality defect.
+- **`realtimeInput.text` silently fails to generate a third of the time, and one
+  trial said it was fine (2026-08-19).** The owner's report was "she stopped
+  answering". `first audio` in the session report was bimodal - 1.41 s and 1.40 s
+  in two morning sessions, then 22.74 s, 13.73 s, 12.34 s - and bimodal is the
+  shape of a turn that either starts or does not, not of a model getting slower.
+
+  Everything cheap was ruled out first, and each one cost a hypothesis:
+  `evals/m0_voice_spike.py` put the provider at **setup 0.57 s, first audio 560 ms**;
+  replaying the resident's exact opening sequence (time block, then the continuity
+  tail, then `CALLED_BY_NAME`) against a live session came back at **1.10-1.13 s
+  whatever was sent**, so context assembly was not it; 932 rows against a 12-row
+  window ruled out the database; admin polls kept landing every 15 s through the
+  stall, so the event loop was never blocked; and the installed build was byte-identical
+  to the worktree in `_forward_microphone`, so the opening mic hold was really running.
+
+  The distribution is what named it. 30 trials per arm, the resident's own opening:
+
+  | frame | median | never answered |
+  |---|---|---|
+  | `realtimeInput.text` | 0.69 s | **10/30** |
+  | `clientContent` + `turnComplete: true` | 0.66 s | **0/30** |
+
+  Fisher exact p = 0.0008, identical medians. Turn end on the realtime stream is
+  "derived from user activity", so whether generation starts is the server's
+  activity detector's call; closing the turn explicitly takes that call away from it.
+
+  **The reusable part is how the wrong answer got written down.** The spike listed
+  this as one of six things only a live key could settle, ran it once, saw audio,
+  and recorded it as settled. One trial cannot see a 1-in-3 failure - and the
+  entry read as measured, so nothing revisited it. The same trap caught the
+  investigation twice more on the way here: a first pass blamed
+  `OPENING_ANSWER_HOLD_SECONDS = 6.0` on one plausible reading of the timings, and
+  a second blamed the persona system instruction on a single 51.55 s outlier that
+  the very next trial contradicted at 0.80 s. Anything that fails part of the time
+  needs a denominator before it needs a fix.
