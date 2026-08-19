@@ -15,10 +15,19 @@ settled that way, and each one fails at a different moment:
   3. **A wrong key must be permanent.** Close code 1008-for-bad-key is inference
      from SDK source and community reports. If it is classified as transient, a
      revoked key means retrying forever instead of dying loudly.
-  4. **A text turn must actually generate.** `realtimeInput.text` is the
+  4. **A text turn must actually generate.** `realtimeInput.text` was the
      proactive path. Turn end is "derived from user activity" for the realtime
      stream, and whether a bare text message starts generation or needs
      `activityEnd` is not stated anywhere.
+
+     **This spike answered that with one successful trial, and one trial was not
+     enough (settled 2026-08-19).** Re-measured at 30 trials per arm against the
+     resident's real opening, `realtimeInput.text` never generated at all in
+     **10 of 30** runs - median 0.69 s when it did, nothing whatsoever when it did
+     not. `clientContent` with `turnComplete: true` was 0/30 at the same median
+     (Fisher exact p = 0.0008), so `daemon/voice/gemini_live.py` sends that
+     instead. A single trial cannot see a 1-in-3 failure, and this one shipped a
+     daemon that ignored its own name a third of the time.
   5. **Korean transcript deltas.** Gemini streams transcription as increments
      with no partial/final flag; we accumulate and join with "". Whether that is
      right for Korean needs an eyeball on real output.

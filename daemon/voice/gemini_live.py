@@ -568,18 +568,43 @@ class GeminiLiveSession:
     async def send_text(self, text: str) -> None:
         """Give the model something to say without any user audio.
 
-        Note the honest limitation: the realtime text stream is a *prompt*, not a
-        verbatim TTS instruction, so the model answers this text rather than
-        reading it out. Proactive utterances that must come out word for word go
-        to the local speaker instead (docs/PLAN.md 6.3), which is also the path
-        that never leaves the machine.
+        Note the honest limitation: this is a *prompt*, not a verbatim TTS
+        instruction, so the model answers this text rather than reading it out.
+        Proactive utterances that must come out word for word go to the local
+        speaker instead (docs/PLAN.md 6.3), which is also the path that never
+        leaves the machine.
+
+        **`turnComplete: true` is what makes the answer arrive at all.** This used
+        to be `realtimeInput.text`, whose turn-end is "derived from user activity"
+        - i.e. left to the server's activity detection, which a third of the time
+        never decides the turn is over. Measured live on
+        `gemini-3.1-flash-live-preview`, 30 trials per arm against the resident's
+        real opening: `realtimeInput.text` never answered **10/30** times (median
+        0.69 s when it did), `clientContent` with `turnComplete: true` **0/30**
+        (median 0.66 s). Fisher exact p = 0.0008, same median - closing the turn is
+        free and is the difference between speaking and going silent.
+
+        `evals/m0_voice_spike` listed this as one of the six things only a live key
+        could settle, and closed it on one successful trial. One trial cannot see a
+        1-in-3 failure; what the owner saw was a daemon that ignored its own name.
+
+        The frame is now the same one `send_context` uses, and `turnComplete` is
+        the whole difference between them: false seeds history silently, true asks
+        for an answer. That is the distinction the two methods exist to draw.
         """
         if not text.strip():
             # An empty proactive utterance is not rare, and spending a
             # per-minute-billed session on one is worse than skipping it.
             logger.warning("gemini-live: refusing to send empty text")
             return
-        await self._send({"realtimeInput": {"text": text}})
+        await self._send(
+            {
+                "clientContent": {
+                    "turns": [{"role": "user", "parts": [{"text": text}]}],
+                    "turnComplete": True,
+                }
+            }
+        )
 
     async def send_tool_response(self, results: Sequence[ToolResult]) -> None:
         """Answer this turn's tool calls, all of them in one message.

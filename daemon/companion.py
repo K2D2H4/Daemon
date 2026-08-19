@@ -39,6 +39,7 @@ from daemon import clock, timesense
 from daemon.llm.base import ToolCall, ToolSpec
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
 from daemon.persona import loader as persona
+from daemon.persona import tics
 from daemon.tools.base import ToolResult
 from daemon.tools.mcp import NAME_SEPARATOR, google_authenticated_email
 from daemon.tools.policy import Claimed, Command
@@ -299,6 +300,11 @@ class Companion:
         ]
         if self.has_recall:
             blocks.append(self.recall_block(items, already=already, now=moment))
+        # Last, and that is the point: it is an instruction about the sentence being
+        # written right now, and the block nearest the turn is the one a model
+        # actually applies. Everything above it describes the world; this one
+        # describes what to avoid doing to it.
+        blocks.append(_tics_or_empty(history))
         return tuple(block for block in blocks if block)
 
     def _tool_rules(self, *, origin: str) -> str:
@@ -451,6 +457,28 @@ class Companion:
         if not fresh:
             return ""
         return render_continuity(fresh, secrets.token_hex(4))
+
+    async def tics_block(
+        self,
+        *,
+        limit: int = CONTINUITY_MESSAGES,
+        window_minutes: int = CONTINUITY_WINDOW_MINUTES,
+    ) -> str:
+        """What the daemon has been repeating, as prompt text - or "" if nothing.
+
+        For the voice path, which has no `list[Message]` to carry it in; the text
+        path gets the same block out of `context`, off the window it already holds.
+
+        The freshness cutoff is `continuity_block`'s, and it has to be: that method
+        sends nothing at all when the tail is stale, so past the cutoff the model
+        has no replies of its own in front of it. Telling it that these phrases
+        "keep coming back in your own recent replies" would then be a claim about
+        turns it cannot see, naming words it has not said since - on every session
+        opened after a quiet night.
+        """
+        history = await self._memory.recent(limit=limit)
+        cutoff = clock.now() - timedelta(minutes=window_minutes)
+        return _tics_or_empty([item for item in history if item.ts >= cutoff])
 
     async def time_block(self, *, limit: int = CONTINUITY_MESSAGES) -> str:
         """When it is, and which commitments in recent view are already past.
@@ -631,6 +659,24 @@ def render_continuity(items: list[LoggedMessage], nonce: str) -> str:
         f"- {clock.to_iso(item.ts)} {item.role}: {_one_line(item.content)}" for item in items
     ]
     return "\n".join([header, "", *lines, "", f"[end-recent-conversation:{nonce}]"])
+
+
+def _tics_or_empty(history: Sequence[LoggedMessage]) -> str:
+    """`tics.block` over the window, wrapped so a raise costs the block and not the
+    turn - the same shape `_time_block_or_empty` and `_commitments_or_empty` keep.
+
+    Built from the window the model is about to be shown rather than from a fresh
+    read: what it copies from is exactly what it can see, so anything outside that
+    window is not what it is imitating.
+    """
+    try:
+        return tics.block(
+            [item.content for item in history if item.role == "assistant"],
+            heard=[item.content for item in history if item.role == "user"],
+        )
+    except Exception:
+        logger.exception("companion: could not work out the recent verbal tics")
+        return ""
 
 
 def _time_block_or_empty(moment: datetime) -> str:

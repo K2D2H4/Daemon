@@ -708,8 +708,14 @@ async def test_send_text_speaks_without_any_user_audio() -> None:
         await live.send_text("자기 전에 물 한 잔 마셔")
         received = await drain(live)
 
-    assert connection.messages("realtimeInput") == [{"text": "자기 전에 물 한 잔 마셔"}]
-    assert not any("audio" in m for m in connection.messages("realtimeInput"))
+    assert connection.messages("clientContent") == [
+        {
+            "turns": [{"role": "user", "parts": [{"text": "자기 전에 물 한 잔 마셔"}]}],
+            "turnComplete": True,
+        }
+    ]
+    # The point of the path: an answer with no user audio behind it.
+    assert connection.messages("realtimeInput") == []
     assert received == [b"\xaa"]
 
 
@@ -736,15 +742,22 @@ async def test_send_context_seeds_history_without_asking_for_an_answer() -> None
 
 
 async def test_recall_and_a_prompt_do_not_travel_the_same_way() -> None:
-    """Both are text and only one is a request. If they arrived as the same message
-    the daemon would narrate a memory the user never asked about."""
+    """Both are text and only one is a request. If they arrived the same way the
+    daemon would narrate a memory the user never asked about.
+
+    They now share a frame, so `turnComplete` carries the whole distinction: false
+    seeds history and asks for nothing, true asks for an answer. That is a
+    stronger contract than "different message types", not a weaker one - it is the
+    field the server actually reads to decide whether to generate."""
     connection = FakeConnection(SETUP_COMPLETE)
     async with session(connection) as live:
         await live.send_context("어제 치과 얘기를 했다")
         await live.send_text("자기 전에 물 한 잔 마셔")
 
-    assert len(connection.messages("clientContent")) == 1
-    assert connection.messages("realtimeInput") == [{"text": "자기 전에 물 한 잔 마셔"}]
+    recall, prompt = connection.messages("clientContent")
+    assert recall["turnComplete"] is False
+    assert prompt["turnComplete"] is True
+    assert connection.messages("realtimeInput") == []
 
 
 async def test_empty_audio_text_and_context_are_not_sent() -> None:
@@ -769,7 +782,8 @@ async def test_korean_text_round_trips_through_a_turn() -> None:
         await live.send_text(korean)
         received = await drain(live)
 
-    assert connection.messages("realtimeInput")[0]["text"] == korean
+    (client,) = connection.messages("clientContent")
+    assert client["turns"][0]["parts"][0]["text"] == korean
     assert received == [Transcript(text=korean, role="assistant", final=True)]
 
 
@@ -1571,3 +1585,39 @@ async def test_answering_a_closed_session_raises_the_normalised_error() -> None:
             )
     finally:
         await live.close()
+
+
+async def test_a_prompt_closes_its_turn_so_generation_actually_starts() -> None:
+    """`realtimeInput.text` leaves turn-end to the server's activity detection, and
+    a third of the time it never decides the turn is over - so the model is handed
+    a prompt and simply never answers it.
+
+    Measured live against `gemini-3.1-flash-live-preview`, 30 trials per arm, the
+    resident's own opening (persona, time block, continuity tail, `CALLED_BY_NAME`):
+
+    | frame | median | never answered |
+    |---|---|---|
+    | `realtimeInput.text` | 0.69 s | **10/30** |
+    | `clientContent` + `turnComplete: true` | 0.66 s | **0/30** |
+
+    Fisher exact p = 0.0008, and the medians are the same - closing the turn costs
+    nothing and is the difference between answering and not. `evals/m0_voice_spike`
+    had flagged this exact question as unsettled ("whether a bare text message
+    starts generation or needs `activityEnd` is not stated anywhere") and closed it
+    on a single successful trial; one trial cannot see a 1-in-3 failure.
+
+    What the owner saw was the daemon going quiet after being called by name. The
+    silent third is also why `first audio` was bimodal - 1.4 s when the turn
+    started, 12-22 s when it did not and something else eventually restarted it.
+    """
+    connection = FakeConnection(SETUP_COMPLETE, audio_frame(b"\xaa"))
+    async with session(connection) as live:
+        await live.send_text("자기 전에 물 한 잔 마셔")
+        received = await drain(live)
+
+    (client,) = connection.messages("clientContent")
+    assert client["turnComplete"] is True, (
+        "a prompt that does not close its turn is one the server may never answer"
+    )
+    assert client["turns"] == [{"role": "user", "parts": [{"text": "자기 전에 물 한 잔 마셔"}]}]
+    assert received == [b"\xaa"]

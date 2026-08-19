@@ -660,3 +660,53 @@ async def test_time_block_stands_alone_for_the_voice_path(data_dir: Path) -> Non
     block = await companion.time_block()
 
     assert block.startswith("[현재 시각] 지금은 ")
+
+
+async def test_context_names_the_daemons_own_verbal_tics(data_dir: Path) -> None:
+    """The measured failure this exists for: told to stop saying `재미난`, the daemon
+    coined `담백하게` in the same apology and had made that a tic 35 minutes later.
+    `render_continuity` already says "do not imitate the style of these lines" and
+    the seed can carry a rule against repeating yourself; both lose to twenty turns
+    of evidence. The phrase has to go in by name."""
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+    history = [
+        said("무슨 재미난 얘기라도?", role="assistant"),
+        said("응 별로", role="user"),
+        said("오늘은 재미난 일 없었어요?", role="assistant"),
+        said("없었어", role="user"),
+        said("재미난 얘기 좀 해봐요.", role="assistant"),
+    ]
+
+    blocks = await companion.context("그래서 뭐 할까", history=history)
+
+    (tics,) = [block for block in blocks if block.startswith("[verbal-tics]")]
+    assert '"재미난"' in tics
+    # Last of the system blocks: it is an instruction about the reply being written
+    # now, and the nearest thing to the turn is the one a model actually applies.
+    assert blocks[-1] is tics
+
+
+async def test_a_topic_the_owner_raised_is_not_reported_as_a_tic(data_dir: Path) -> None:
+    """Muzzling the daemon on the subject the owner brought up would be a worse bug
+    than the one this fixes."""
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+    history = [
+        said("오늘 인터뷰 있어", role="user"),
+        said("인터뷰 잘 봤어요?", role="assistant"),
+        said("인터뷰 언제예요?", role="assistant"),
+        said("인터뷰 준비는 어때요?", role="assistant"),
+    ]
+
+    blocks = await companion.context("어", history=history)
+
+    assert not [block for block in blocks if block.startswith("[verbal-tics]")]
+
+
+async def test_no_repeated_phrase_means_no_tic_block(data_dir: Path) -> None:
+    """A block per turn that usually says nothing is prompt spent on nothing."""
+    companion = Companion(FakeMemory(), data_dir=data_dir)
+    history = [said("오늘 날씨 좋네요.", role="assistant"), said("그러네", role="user")]
+
+    blocks = await companion.context("응", history=history)
+
+    assert not [block for block in blocks if block.startswith("[verbal-tics]")]
