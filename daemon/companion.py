@@ -458,15 +458,27 @@ class Companion:
             return ""
         return render_continuity(fresh, secrets.token_hex(4))
 
-    async def tics_block(self, *, limit: int = CONTINUITY_MESSAGES) -> str:
+    async def tics_block(
+        self,
+        *,
+        limit: int = CONTINUITY_MESSAGES,
+        window_minutes: int = CONTINUITY_WINDOW_MINUTES,
+    ) -> str:
         """What the daemon has been repeating, as prompt text - or "" if nothing.
 
         For the voice path, which has no `list[Message]` to carry it in; the text
         path gets the same block out of `context`, off the window it already holds.
-        Same window either way, because the habit is only worth naming for the
-        turns the model can actually see itself in.
+
+        The freshness cutoff is `continuity_block`'s, and it has to be: that method
+        sends nothing at all when the tail is stale, so past the cutoff the model
+        has no replies of its own in front of it. Telling it that these phrases
+        "keep coming back in your own recent replies" would then be a claim about
+        turns it cannot see, naming words it has not said since - on every session
+        opened after a quiet night.
         """
-        return _tics_or_empty(await self._memory.recent(limit=limit))
+        history = await self._memory.recent(limit=limit)
+        cutoff = clock.now() - timedelta(minutes=window_minutes)
+        return _tics_or_empty([item for item in history if item.ts >= cutoff])
 
     async def time_block(self, *, limit: int = CONTINUITY_MESSAGES) -> str:
         """When it is, and which commitments in recent view are already past.

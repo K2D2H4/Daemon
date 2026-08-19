@@ -2608,3 +2608,55 @@ async def test_a_session_with_no_habit_to_report_sends_no_tic_block() -> None:
     await run(conversation(session, FakeAudio(), memory))
 
     assert not [text for text in session.contexts if text.startswith("[verbal-tics]")]
+
+
+async def test_discarded_playback_does_not_keep_the_microphone_shut() -> None:
+    """A barge-in empties the speaker, so the audio it dropped must stop counting
+    as time the daemon is still speaking.
+
+    `_barge_in` calls `stop_playback()`, which discards everything queued - but
+    `_playback_until` was computed from what *arrived*, and the model generates
+    faster than real time. Left standing, the half-duplex gate then holds the
+    microphone for the whole length of an answer nobody will ever hear: a 28 s
+    reply cut off at 1 s leaves the room muted for 27 s of a 30 s idle budget, and
+    the session dies reporting "nothing heard for 30s" while the owner is talking.
+    """
+    from daemon.voice.conversation import PLAYBACK_BYTES_PER_FRAME
+
+    audio = FakeAudio()
+    session = FakeSession()
+    conv = conversation(session, audio, barge_in=False)
+    loop = asyncio.get_running_loop()
+
+    conv._on_audio(loop.time(), audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME * 28)
+    assert conv._playback_until > loop.time() + 20, "precondition: 28s queued"
+
+    await conv._barge_in(session)
+
+    async def mic() -> Any:
+        yield b"the owner talking into a speaker that was already silenced"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent, "the speaker was emptied, so the room is the owner's again"
+
+
+async def test_a_stale_conversation_reports_no_tics_either() -> None:
+    """`continuity_block` drops anything outside its 120-minute window, so after a
+    long gap the session is sent no tail at all. The tic list has to follow it: a
+    block saying "these keep coming back in your own recent replies" is a claim
+    about turns the model cannot see, naming phrases from days ago, and it would
+    ride on every session opened after a quiet night."""
+    session = FakeSession(Says("user", "어"), b"\x01", Turn())
+    memory = FakeMemory()
+    memory.records.extend(
+        _spoke("무슨 재미난 얘기라도?", "assistant", minutes_ago=60 * 24 * 3 + at)
+        for at in range(3)
+    )
+
+    await run(conversation(session, FakeAudio(), memory))
+
+    assert not [text for text in session.contexts if "recent-conversation" in text], (
+        "precondition: the tail is stale, so none of it was sent"
+    )
+    assert not [text for text in session.contexts if text.startswith("[verbal-tics]")]

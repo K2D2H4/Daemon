@@ -16,7 +16,9 @@ discriminator, and it is what keeps this from muzzling the conversation: if the
 owner has been talking about an interview all afternoon, `인터뷰` three times is
 the conversation working. Only the daemon's own verbal habits qualify - and the
 same rule is what lets this block skip a nonce fence, because anything the owner
-said is excluded by construction and cannot be quoted back through here.
+said is excluded by construction and cannot be quoted back through here - see
+`_is_the_owners` for why that exclusion is a per-word prefix test rather than the
+whole-phrase match it started as.
 
 The floors are measured rather than chosen. Anything shorter than `MIN_CHARS` is
 a function word - the real log's candidates, ranked by any order at all, open with
@@ -49,6 +51,11 @@ PHRASE_WORDS = (1, 2, 3)
 일이라도` is three; both are the same habit, and `verbal_tics` keeps the shortest
 form that covers it."""
 
+MIN_OWNER_PREFIX = 2
+"""Characters an owner's word needs before it may exclude a phrase as theirs. One
+character is a syllable rather than a word, and letting it match by prefix would
+put most of the language out of reach of the detector."""
+
 _WORD = re.compile(r"[0-9A-Za-z가-힣]+")
 """Words, with punctuation and particles-as-typed left out. Deliberately not a
 Korean morphological analyser: a tic is recognised as the literal string that
@@ -65,6 +72,35 @@ def _phrases(text: str, size: int) -> set[str]:
     return {" ".join(words[at : at + size]) for at in range(len(words) - size + 1)}
 
 
+def _is_the_owners(phrase: str, owner_words: set[str]) -> bool:
+    """Does any word of `phrase` come from something the owner said?
+
+    A word counts as the owner's when it starts with one of theirs, and that
+    prefix rule is doing two jobs a whole-token match got wrong.
+
+    **Korean inflects.** 은/는/이/가/을/를 attach to almost every noun, so the
+    owner's `인터뷰` and the daemon's `인터뷰는` are different strings; matching
+    whole tokens missed the second one and reported the owner's own subject as a
+    tic, which is the single outcome this filter exists to prevent.
+
+    **And a phrase is more than its n-gram.** The exclusion used to test the whole
+    phrase against the owner's phrases, so padding theirs with one more word
+    walked past it: `비밀번호는 hunter2` was excluded and `비밀번호는 hunter2 맞죠`
+    was not. Testing word by word is what makes the module docstring's claim -
+    that the owner's text cannot be quoted back through this block - actually true,
+    and that claim is the reason this block needs no nonce fence.
+
+    `MIN_OWNER_PREFIX` keeps the rule from swallowing everything: a one-character
+    owner word is a syllable, and treating it as a prefix would exclude most of the
+    language.
+    """
+    for word in _WORD.findall(phrase):
+        for owned in owner_words:
+            if len(owned) >= MIN_OWNER_PREFIX and word.startswith(owned):
+                return True
+    return False
+
+
 def verbal_tics(said: Sequence[str], *, heard: Sequence[str]) -> list[str]:
     """The daemon's own repeated phrases, most repeated first.
 
@@ -76,9 +112,7 @@ def verbal_tics(said: Sequence[str], *, heard: Sequence[str]) -> list[str]:
     A phrase already covered by a shorter one that was kept is dropped, so one
     habit takes one slot rather than three.
     """
-    owner_said = {
-        phrase for text in heard for size in PHRASE_WORDS for phrase in _phrases(text, size)
-    }
+    owner_words = {word for text in heard for word in _WORD.findall(text)}
     turns: Counter[str] = Counter()
     for size in PHRASE_WORDS:
         for text in said:
@@ -88,7 +122,7 @@ def verbal_tics(said: Sequence[str], *, heard: Sequence[str]) -> list[str]:
         phrase: count
         for phrase, count in turns.items()
         if count >= MIN_TURNS
-        and phrase not in owner_said
+        and not _is_the_owners(phrase, owner_words)
         and len(phrase.replace(" ", "")) >= MIN_CHARS
     }
     # Most repeated first - that is what "this is a tic" means here. Ties go to the

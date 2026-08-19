@@ -890,6 +890,13 @@ class VoiceConversation:
         self._generating = False
         await session.interrupt()
         await self._audio.stop_playback()
+        # The queue is gone, so the time it would have taken to play is not time the
+        # daemon is still speaking. `_playback_until` was computed from what
+        # *arrived*, and the model generates faster than real time, so leaving it
+        # standing holds the half-duplex microphone (and delays the idle budget) for
+        # the full length of an answer nobody will hear - up to the whole 30s budget
+        # for a reply cut off in its first second.
+        self._playback_until = 0.0
 
     # --- tools ---------------------------------------------------------------
 

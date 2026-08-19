@@ -82,3 +82,37 @@ def test_the_block_is_bounded() -> None:
     found = tics.verbal_tics(said, heard=[])
 
     assert 0 < len(found) <= tics.MAX_PHRASES
+
+
+def test_a_longer_phrase_wrapped_around_the_owners_words_is_still_excluded() -> None:
+    """The exclusion was per-n-gram, so padding the owner's words with one more
+    word walked straight past it: `heard=["비밀번호는 hunter2"]` against a daemon
+    that echoed `비밀번호는 hunter2 맞죠?` three times produced `hunter2 맞죠`, and
+    the owner's own text went into the prompt inside a block whose whole claim is
+    that it cannot carry any."""
+    heard = ["비밀번호는 hunter2"]
+    said = ["비밀번호는 hunter2 맞죠?"] * 3
+
+    assert "hunter2" not in " ".join(tics.verbal_tics(said, heard=heard))
+    assert "hunter2" not in tics.block(said, heard=heard)
+
+
+def test_a_particle_does_not_smuggle_the_topic_past_the_filter() -> None:
+    """Korean attaches 은/는/이/가/을/를 to almost every noun, so `인터뷰` and
+    `인터뷰는` are different strings and whole-token matching missed the second
+    one entirely - handing back a daemon forbidden to name the subject the owner
+    raised, which is the one thing this filter exists to prevent."""
+    heard = ["오늘 인터뷰 있어"]
+    said = ["인터뷰는 어땠어요?", "인터뷰는 몇 시예요?", "인터뷰는 준비 다 됐어요?"]
+
+    assert tics.verbal_tics(said, heard=heard) == []
+
+
+def test_a_real_tic_survives_the_wider_exclusion() -> None:
+    """The exclusion is now a prefix rule, so it has to be shown not to swallow the
+    thing it is filtering for: the owner mentioning 얘기 must not make 재미난
+    unreportable."""
+    heard = ["무슨 얘기 하려고?"]
+    said = ["재미난 얘기 있어요?", "재미난 일은요?", "재미난 소식이라도?"]
+
+    assert "재미난" in tics.verbal_tics(said, heard=heard)
