@@ -187,8 +187,10 @@ def reflection_seam(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeProvid
     only the model is a fake.
     """
 
-    def install(reply: str = REPLY, *, fail: bool = False) -> FakeProvider:
-        provider = FakeProvider(reply, fail=fail)
+    def install(
+        reply: str = REPLY, *, fail: bool = False, replies: list[str] | None = None
+    ) -> FakeProvider:
+        provider = FakeProvider(reply, fail=fail, replies=replies)
 
         async def build(settings: Settings) -> tuple[Reflection, Any]:
             store = Store.open(settings.data_dir / daemon_app.DB_FILENAME)
@@ -1063,7 +1065,7 @@ def test_reflect_with_no_date_catches_up_and_reports_each_day(
     assert cli.main(["reflect"]) == 0
 
     out = capsys.readouterr().out
-    counts = "(1 message(s) -> 1 fact(s), 1 entity(ies), 1 observation(s))"
+    counts = "(1 message(s) -> 1 fact(s), 1 entity(ies), 1 observation(s), 0 from tool(s))"
     assert f"2026-08-01: written {counts}" in out
     assert f"2026-08-02: written {counts}" in out
 
@@ -1764,3 +1766,46 @@ def test_update_that_cannot_load_the_config_still_reports_success(
     cli._restart_after_update()
 
     assert "the code is updated" in capsys.readouterr().out
+
+
+def _tool_read(data_dir: Path, excerpt: str) -> None:
+    """One successful `read_page` on the same local day `_logged_day` writes."""
+    store = Store.open(data_dir / daemon_app.DB_FILENAME)
+    try:
+        store.record_tool_call(
+            tool="read_page",
+            arguments="{}",
+            preview="read_page ...",
+            verdict="allow",
+            mode="full",
+            reason="",
+            origin="owner",
+            channel="telegram",
+            sender_id="1",
+            ran=True,
+            ok=True,
+            output_excerpt=excerpt,
+            now=NOW,
+        )
+    finally:
+        store.close()
+
+
+def test_reflect_says_how_much_came_off_a_tool_rather_than_the_conversation(
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CONTRACTS rule 12's shape: a capability reported nowhere is the silent state
+    this project keeps being bitten by. Folding tool facts into the fact count
+    would hide which of the two paths did the night's work - the one thing this
+    feature can be judged by."""
+    _logged_day(data_dir, "2026-08-03")
+    _tool_read(data_dir, "사내 공지: 발표는 목요일이다")
+    nothing = json.dumps({"facts": [], "entities": [], "observations": []})
+    from_tools = json.dumps({"facts": [{"body": "발표는 목요일이다", "importance": 7}]})
+    reflection_seam(replies=[nothing, from_tools])
+
+    assert cli.main(["reflect", "--date", "2026-08-03", "--force"]) == 0
+
+    assert "1 from tool(s)" in capsys.readouterr().out

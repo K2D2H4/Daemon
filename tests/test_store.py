@@ -190,3 +190,43 @@ def test_pending_reports_queued_and_running_left_by_a_restart(
     pending = store.pending_tasks()
     assert [r["id"] for r in pending] == [a, b]
     assert {r["status"] for r in pending} == {"running", "queued"}
+
+
+# --- tool calls, by the local day ------------------------------------------
+
+
+def _tool_call(store: Store, tool: str, ts: datetime, *, ok: bool = True) -> None:
+    store.record_tool_call(
+        tool=tool,
+        arguments="{}",
+        preview=f"{tool} ...",
+        verdict="allow",
+        mode="full",
+        reason="",
+        origin="owner",
+        channel="telegram",
+        sender_id="1",
+        ran=True,
+        ok=ok,
+        output_excerpt="발표는 목요일",
+        now=ts,
+    )
+
+
+def test_a_tool_call_belongs_to_the_local_day_not_the_utc_one(
+    db: sqlite3.Connection, seoul: None
+) -> None:
+    """`tool_calls` carries only a UTC `ts`, and reflection reads days that were
+    split locally. 23:00Z is already tomorrow morning in Seoul, so a BETWEEN over
+    `ts` would hand that call to the wrong night - the same nine-hour shift
+    `messages_for_day` refuses by filtering on `log_file` instead.
+    """
+    store = Store(db)
+    _tool_call(store, "read_page", datetime(2026, 8, 3, 23, 0, tzinfo=UTC))
+    _tool_call(store, "fetch_page", datetime(2026, 8, 3, 1, 0, tzinfo=UTC))
+
+    third = [row["tool"] for row in store.tool_calls_for_day("2026-08-03")]
+    fourth = [row["tool"] for row in store.tool_calls_for_day("2026-08-04")]
+
+    assert third == ["fetch_page"]
+    assert fourth == ["read_page"]
