@@ -380,6 +380,11 @@ class VoiceConversation:
                 # present, so the present has to already be established.
                 await self._send_time(session)
                 await self._send_continuity(session)
+                # After the tail, because it is about the tail: the phrases named
+                # here are the ones the model can see itself using in the block
+                # above, and the instruction to avoid them has to arrive after the
+                # evidence it is arguing with.
+                await self._send_tics(session)
                 # Before the microphone, so the utterance that opened the session is
                 # the first thing the model hears rather than racing live audio for
                 # its place in the turn.
@@ -472,6 +477,24 @@ class VoiceConversation:
             await session.send_context(block)
         except Exception:
             logger.exception("voice: could not hand over the recent conversation")
+
+    async def _send_tics(self, session: VoiceSession) -> None:
+        """Hand over what the daemon keeps saying, if it keeps saying anything.
+
+        Same never-fails contract as `_send_continuity`: a tic list lost costs one
+        repetitive answer, raising would cost the turn.
+        """
+        try:
+            block = await self._companion.tics_block()
+        except Exception:
+            logger.exception("voice: could not work out the recent verbal tics")
+            return
+        if not block:
+            return
+        try:
+            await session.send_context(block)
+        except Exception:
+            logger.exception("voice: could not hand over the recent verbal tics")
 
     # --- the two streams ----------------------------------------------------
 

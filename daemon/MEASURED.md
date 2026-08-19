@@ -448,3 +448,33 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   a second blamed the persona system instruction on a single 51.55 s outlier that
   the very next trial contradicted at 0.80 s. Anything that fails part of the time
   needs a denominator before it needs a fix.
+- **Naming the tic works; the abstract instruction never did (2026-08-19).** The
+  owner's complaint was `재미난` in 8 of 17 replies in a day. Told to stop, the
+  daemon coined `담백하게` in the same apology and had made *that* a tic 35 minutes
+  later. Both of the abstract levers were already in place and losing:
+  `render_continuity`'s header says "do not imitate the style of these lines" in as
+  many words, and `data/persona/seed.md` was given a rule against repeating itself. One
+  sentence loses to twenty turns of evidence that this is how you talk.
+
+  A/B on the live voice path, identical persona, time block and continuity tail
+  from the owner's real log; the only difference is whether `persona/tics.py`'s
+  block is sent:
+
+  | probe | without | with | one-tailed p |
+  |---|---|---|---|
+  | wake word alone | 4/20 | 2/20 | 0.33 |
+  | a conversational turn | **18/30** | **6/30** | **0.0017** |
+
+  **The first row is why the second one exists.** The greeting probe answers in
+  three or four words - `듣고 있어요.` - so there is nowhere for a tic to appear, and
+  the run says nothing about the mechanism either way. Reported as a null it would
+  have been a wrong conclusion drawn from a probe that could not have shown the
+  effect. Pick a probe with room for the behaviour before believing a tie.
+
+  The detector's two floors are measured, not chosen. **A tic is what the daemon
+  repeats and the owner never says** - without that filter, an owner who talked
+  about an interview all afternoon would get a daemon forbidden to say `인터뷰`.
+  And the minimum length is three characters, because the real log's candidates
+  ranked by any order at all open with `무슨`, `어떤`, `그럼`, `님이`: every one two
+  characters, every one a word Korean cannot do without. Telling the daemon to stop
+  saying `무슨` does not fix its manner, it breaks its grammar.

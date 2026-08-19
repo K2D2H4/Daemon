@@ -2573,3 +2573,38 @@ async def test_barge_in_still_hears_the_room_during_playback() -> None:
     await conv._forward_microphone(session, mic())
 
     assert session.sent == [b"over-playback"]
+
+
+async def test_the_session_is_told_what_it_keeps_saying() -> None:
+    """Voice is where the owner noticed it: a wake word, and the same opener again.
+
+    The tic list rides in with the tail it was computed from, before any generation
+    - `send_context` mid-generation kills the answer, which is the rule the whole
+    session-start sequence is built around."""
+    session = FakeSession(Says("user", "어"), b"\x01", Turn())
+    memory = FakeMemory()
+    memory.records.extend(
+        [
+            _spoke("무슨 재미난 얘기라도?", "assistant", minutes_ago=9),
+            _spoke("아니", minutes_ago=8),
+            _spoke("오늘은 재미난 일 없었어요?", "assistant", minutes_ago=7),
+            _spoke("없어", minutes_ago=6),
+            _spoke("재미난 얘기 좀 해봐요.", "assistant", minutes_ago=5),
+        ]
+    )
+
+    await run(conversation(session, FakeAudio(), memory))
+
+    (tics,) = [text for text in session.contexts if text.startswith("[verbal-tics]")]
+    assert '"재미난"' in tics
+    assert tics not in session.sent_while_generating
+
+
+async def test_a_session_with_no_habit_to_report_sends_no_tic_block() -> None:
+    session = FakeSession(Says("user", "어"), b"\x01", Turn())
+    memory = FakeMemory()
+    memory.records.extend([_spoke("그건 몰랐네요.", "assistant", minutes_ago=2)])
+
+    await run(conversation(session, FakeAudio(), memory))
+
+    assert not [text for text in session.contexts if text.startswith("[verbal-tics]")]
