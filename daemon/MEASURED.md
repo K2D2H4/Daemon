@@ -478,3 +478,39 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   ranked by any order at all open with `무슨`, `어떤`, `그럼`, `님이`: every one two
   characters, every one a word Korean cannot do without. Telling the daemon to stop
   saying `무슨` does not fix its manner, it breaks its grammar.
+- **An optional scalar is not nesting, and treating it as one hid most of the tool
+  set from voice (2026-08-19).** The owner asked his daemon to find an email. It
+  listed Gmail labels, then invented a `gmail search "from:..."` shell command and
+  ran it twice - `run_command ok=False` both times - and told him "메일을 검색하는
+  도구에 문제가 생겼어요". The audit table has no `search_gmail_messages` row at
+  all, because the tool was never offered.
+
+  `is_flat_schema` refused any property carrying `anyOf`. That is what FastMCP and
+  pydantic emit for **every defaulted argument**: `Optional[str]` becomes
+  `anyOf: [{"type": "string"}, {"type": "null"}]`. `search_gmail_messages` is
+  `query`/`user_google_email`/`page_size`/`include_headers` - all scalar - plus one
+  `page_token=None`, and that single argument hid the whole tool.
+
+  | server | tools | reached voice before | after |
+  |---|---|---|---|
+  | google | 27 | 9 | **17** |
+  | git | 12 | 8 | **11** |
+  | time | 2 | 2 | 2 |
+
+  **The wall itself is real and was re-measured before being moved.** 20 trials per
+  arm against the live model, offered `search_gmail_messages` with its real schema:
+  the audio model emitted a correct call with both required arguments **20/20**,
+  and **20/20** again with the `anyOf` folded to a plain type. The nesting the
+  original measurement found is still refused - `send_gmail_message`'s `to` is
+  `anyOf: [string, array, null]`, one address or a list, and it stays on the
+  delegate path with every `*_batch` and every array argument.
+
+  **What made this invisible for so long is that the failure was articulate.** A
+  tool that is not offered produces a model that explains, plausibly, why the tool
+  did not work - and then reaches for a shell. `daemon/tools/schema.py`'s gate had
+  a test suite that agreed with it, because the tests were written from the same
+  belief as the code. It took reading an actual MCP server's schemas to see it.
+
+  **Still open:** `delegate_task` is the designed escape hatch for what stays
+  nested, and it has been called **0 times in the whole history**. Voice hits the
+  wall and confabulates instead of delegating.
