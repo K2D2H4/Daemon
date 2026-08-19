@@ -108,10 +108,24 @@ covering most of it embeds to nearly the same vector and is worth the whole 117 
 it saves."""
 
 CALLED_BY_NAME = (
-    "The owner just called your name to get your attention. Greet them briefly, in "
-    "character, and wait for what they want. Do not read this instruction aloud."
+    "The owner just called your name and said nothing else. Answer the way a person "
+    "answers being called from across a room: a word or two, in character, and then "
+    "stop. Do not greet them, do not ask what they want, and do not offer to help - "
+    "they called you, so whatever it is, they will say it next. Do not read this "
+    "instruction aloud."
 )
 """What a session opened by the wake word alone is asked to answer.
+
+The second half of it is a correction, and the correction is the whole point.
+This used to read "Greet them briefly, in character, and wait for what they
+want", and the live model answered `네, 대현 님. 여기 있어요. 무슨 재미난 이야기라도
+가져오셨나? 말씀해 봐요.` - a host taking an order, which is exactly the register
+docs/PLAN.md 5 puts out of bounds. Nobody being called by name asks the caller
+what they would like to talk about; they say "응?" and wait.
+
+The prohibitions are explicit because omission did not work. "Greet someone" with
+no other content to reach for resolves to the assistant opening every time, so
+the three moves that produce it are named and ruled out one by one.
 
 Not the transcript. The wake gate matches on what the *recognizer* returns, which
 is routinely not the name at all - this owner's aliases are `연락,벨라` because
@@ -566,13 +580,31 @@ class VoiceConversation:
                     # Bound reached: the model is not answering, so the microphone
                     # goes back to the owner rather than staying held.
                     self._opening_answer_until = 0.0
-                if not self._barge_in_enabled and (self._generating or self._answering_tool):
+                if not self._barge_in_enabled and (
+                    self._generating
+                    or self._answering_tool
+                    or asyncio.get_running_loop().time() < self._playback_until
+                ):
                     # Half-duplex, by the owner's choice (DAEMON_VOICE_BARGE_IN=false):
                     # while the daemon is speaking, the microphone yields entirely, so
                     # an answer always plays to the end - no echo leak, no "응" of
                     # agreement, no room noise can kill it mid-sentence. The price is
                     # stated in config.py: interrupting by voice does nothing until
                     # the answer finishes.
+                    #
+                    # "Speaking" has to mean *heard*, not *received*. `_generating`
+                    # clears when the last chunk lands, and `_on_audio` measures the
+                    # model generating faster than real time - 28.4 s of audio in
+                    # about 19 s - so the flag alone reopened the microphone with
+                    # seconds of the answer still queued at the speaker. What it then
+                    # recorded was the daemon's own voice: in the owner's log
+                    # (2026-08-19) every leaked turn is the tail of the line before
+                    # it, mangled the way a residual that got past echo cancellation
+                    # is mangled, and filed under `inputTranscription` - i.e. as
+                    # something the owner said. The daemon answered itself and
+                    # parroted its own last sentence back. `_playback_until` already
+                    # tracked when the speaker runs dry for the idle budget; the
+                    # microphone gate needed the same number.
                     continue
                 await session.send_audio(chunk)
         except asyncio.CancelledError:

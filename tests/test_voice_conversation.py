@@ -2510,3 +2510,66 @@ async def test_an_audio_opening_does_not_hold_the_microphone() -> None:
     await conv._forward_microphone(session, mic())
 
     assert session.sent == [b"pcm", b"more"]
+
+
+async def test_half_duplex_holds_the_microphone_until_the_speaker_runs_dry() -> None:
+    """`_generating` clears when the last audio chunk *arrives*, not when it is
+    *heard*, so half-duplex used to reopen the microphone while the speaker was
+    still working through the backlog - and the room it then recorded was the
+    daemon's own voice.
+
+    Measured in the owner's log (2026-08-19): every leaked turn is the *tail* of
+    the line before it. "당연하죠! 저도 응원하고 있을게요. 잘하고 오세요!" came back as
+    a user turn reading "원할 때 있을게요. 잘하고 오세요." - the opening clause missing
+    because the microphone opened partway through playback, and the rest mangled
+    because what leaks past echo cancellation is a distorted residual. The daemon
+    then answered itself, and the reply parroted its own last sentence.
+
+    The gap is not small: `_on_audio` records 28.4 s of audio landing in about
+    19 s. `_playback_until` already knows when the speaker runs dry - it was only
+    ever read by the idle budget.
+    """
+    from daemon.voice.conversation import PLAYBACK_BYTES_PER_FRAME
+
+    audio = FakeAudio()
+    session = FakeSession()
+    conv = conversation(session, audio, barge_in=False)
+    loop = asyncio.get_running_loop()
+    # One second of playback, arriving now: heard until now + 1.
+    one_second = audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME
+
+    async def mic() -> Any:
+        yield b"m1"  # idle listening: forwarded
+        conv._generating = True
+        conv._on_audio(loop.time(), one_second)
+        yield b"m2"  # the answer is arriving: held
+        conv._generating = False  # last chunk received - the speaker is not done
+        yield b"m3"  # still playing: held, and this is the fix
+        conv._playback_until = loop.time() - 1.0  # the speaker has run dry
+        yield b"m4"  # the room is the owner's again: forwarded
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"m1", b"m4"], (
+        "a chunk crossed while the speaker was still playing - that chunk is the "
+        "daemon's own voice, and it lands in memory as something the owner said"
+    )
+
+
+async def test_barge_in_still_hears_the_room_during_playback() -> None:
+    """The drain hold is half-duplex only. With barge-in on (the default), the
+    microphone streams throughout - being able to cut the daemon off mid-answer is
+    that mode's whole contract, and it does not end when the socket goes quiet."""
+    audio = FakeAudio()
+    session = FakeSession()
+    conv = conversation(session, audio)
+    loop = asyncio.get_running_loop()
+
+    async def mic() -> Any:
+        conv._generating = False
+        conv._playback_until = loop.time() + 30.0
+        yield b"over-playback"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"over-playback"]

@@ -1064,3 +1064,29 @@ def test_the_wake_word_travels_as_meaning_not_as_the_transcript() -> None:
     assert "Do not read this instruction aloud" in CALLED_BY_NAME
     for artifact in ("연락", "벨라", "루시"):
         assert artifact not in CALLED_BY_NAME, "a transcript artifact reached the model"
+
+
+def test_being_called_by_name_does_not_ask_for_the_owners_business() -> None:
+    """A name is not a service window.
+
+    The instruction used to end "Greet them briefly, in character, and wait for
+    what they want", and what the live model did with it was `네, 대현 님. 여기
+    있어요. 무슨 재미난 이야기라도 가져오셨나? 말씀해 봐요.` - a host taking an
+    order. That is the one register docs/PLAN.md 5 says this product must not
+    have, and it is the line the owner quoted back as the thing that made the
+    daemon sound fake.
+
+    Omitting the solicitation is not enough, which is why this asserts on what the
+    text forbids rather than on what it leaves out: a model told to greet someone,
+    with nothing else to go on, reaches for "what can I do for you?" by itself.
+    """
+    from daemon.voice.conversation import CALLED_BY_NAME
+
+    lowered = CALLED_BY_NAME.lower()
+    for prohibition in ("do not greet", "do not ask", "do not offer"):
+        assert prohibition in lowered, (
+            f"the opening does not rule out {prohibition!r}; leaving the move "
+            "unmentioned is what produced the host register in the first place"
+        )
+    for solicitation in ("wait for what they want", "how can i help", "what they need"):
+        assert solicitation not in lowered

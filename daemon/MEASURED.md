@@ -387,3 +387,29 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   So of the five generators, exactly one (A) can currently produce a reason the judge
   will speak on, which is the shape PLAN 6.2 warns about: a competent assistant
   rather than a companion. That is not a tuning gap.
+- **Half-duplex was leaking the daemon's own voice into memory as the owner's words,
+  and the tell is that every leak is a *tail* (2026-08-19).** `DAEMON_VOICE_BARGE_IN=
+  false` was set and `apple audio: ... echo cancellation on` was in the log, yet
+  `data/memory/log/2026-08-19.md` has user turns nobody said. They are not whole sentences. Against
+  the assistant line before them:
+
+  | spoken | filed as the owner |
+  |---|---|
+  | "당연하죠! **저도 응원하고 있을게요. 잘하고 오세요!**" | "원할 때 있을게요. 잘하고 오세요." |
+  | "…알고 계시죠? **테크니컬 인터뷰니까 …오시면 돼요. 화이팅!**" | "테크니컬 인터뷰니까 …오세요. 파이팅!" |
+
+  The opening clause is missing every time, and the rest is mangled the way a residual
+  that got past echo cancellation is mangled — one leak came back as Spanish. So the
+  microphone was not open for the whole answer; it opened *partway through* it. The
+  gate was `self._generating`, which clears when the last audio chunk **arrives**, and
+  `_on_audio` already measured the model generating faster than real time (28.4 s of
+  audio in ~19 s). Seconds of answer were still queued at the speaker with the room
+  live. `_playback_until` had tracked the drain all along for the idle budget; the
+  microphone gate now reads it too.
+
+  **The cost was not the stray rows.** They land under `inputTranscription`, i.e. as
+  the owner, so the recent window fed the daemon its own last sentence as something to
+  answer — and it answered by parroting. The owner's complaint that arrived first was
+  about *tone*, not about echo: `재미난` in 8 of 17 assistant turns that day, and a
+  filler word the daemon coined while apologising ("담백하게 가볼까요?") reused as a new
+  tic 35 minutes later. An audio defect surfaced as a personality defect.
