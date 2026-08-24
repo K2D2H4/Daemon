@@ -619,6 +619,28 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   both) - the leak Task 1 targeted is rarer on this transcript than the incident
   implied - and `observations` was a near-wash, 28/30 old vs 27/30 new
   (p=0.82).
+- **A second independent run of the same committed code reversed arm 1's
+  direction, so "correct direction, not significant" overstates it.** The
+  controller re-ran `evals/graded_persona_spike.py` at n=30 against the same key
+  and the same fixed history: **undated 13/30 → dated 19/30** — the dated arm came
+  out *shorter* more often, the opposite of the run recorded above (17/30 → 13/30).
+  Same code, same n, opposite sign. One run's direction was a coin flip, and the
+  honest statement is not "a 4-point gap that needs a bigger n" but **"no effect
+  detectable at n=30, and the sign does not replicate"**.
+
+  The classifier makes this predictable in hindsight and the record should carry
+  why. Arm 1 scores each reply against the median of **both arms pooled**, so the
+  two counts are structurally near-complementary (13+19=32, 17+13=30 — both ≈ n).
+  Each run therefore resolves to roughly one coin flip about which arm lands on
+  the short side, and a Fisher exact over two non-independent counts overstates
+  whatever it finds. Measuring the two length *distributions* against each other -
+  a rank test, no shared threshold - is what this arm needs before its number
+  means anything.
+
+  This is the third time in this file that one observation nearly became a
+  finding. It is the second run that is cheap; it is believing the first one that
+  is expensive.
+
 - **Two probe designs had to fail first before arm 1 and arm 2 could measure
   anything.** Round 1 (a synthetic one-line seed, no history) pinned both arms at
   a floor or a ceiling (0/30→0/30, 30/30→30/30) - not negative results, just no
