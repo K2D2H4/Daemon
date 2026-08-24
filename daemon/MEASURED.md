@@ -581,8 +581,8 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   to the 1120 the Telegram path gets - sent **after** the `toolResponse`. Order is the
   contract in both directions: sent *before* it, the `clientContent` cancels the
   pending call and the session goes silent, 4/4 at every gap. Measured through the
-  product's own code, **0/12 → 12/12**; restating the question in the image turn does
-  not help. **Three wrong numbers were reported for this fix before the right one, and
+  product's own code, **0/20 → 19/20** (two runs, 12/12 then 7/8); restating the
+  question in the image turn does not help. **Three wrong numbers were reported for this fix before the right one, and
   every one of them was a measurement bug rather than a behaviour** - the reason this
   file exists. (a) `Transcript.role` is `"assistant"`, and reading it as the wire's
   `"model"` scored five empty transcripts as five wrong answers. (b) Scoring the

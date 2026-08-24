@@ -413,15 +413,21 @@ class OpenAIRealtimeSession:
             )
             self._warned_no_video = True
 
-    async def send_image(self, jpeg: bytes, note: str) -> None:
+    async def send_images(self, jpegs: Sequence[bytes], note: str) -> None:
         """No-op, for the same reason `send_frame` is: no image input on this
         provider. Shares that method's warn-once flag rather than adding a second
-        one - the owner-facing fact is one fact ("this provider cannot see"), and
-        `see_screen` is not offered here anyway (`VIDEO_CAPABLE_VOICE_PROVIDERS`).
+        one - the owner-facing fact is one fact ("this provider cannot see").
+
+        `see_screen` *is* offered here (only the live-share tools are gated by
+        `VIDEO_CAPABLE_VOICE_PROVIDERS`), so this path is reachable: the capture
+        happens, the pixels are dropped, and what saves the turn is
+        `conversation.SCREENSHOT_FOLLOWS` telling the model to say it cannot see an
+        image rather than describe one. Silence here would be the old bug back.
         """
         if not self._warned_no_video:
             logger.warning(
-                "openai-realtime: images are unsupported on OpenAI realtime; the image is dropped"
+                "openai-realtime: images are unsupported on OpenAI realtime; %d image(s) dropped",
+                len(jpegs),
             )
             self._warned_no_video = True
 

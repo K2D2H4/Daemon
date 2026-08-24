@@ -32,9 +32,14 @@ gets - sent *after* the `toolResponse`. Order is not a detail: sent before it, a
 every gap). The interrupt that makes `clientContent` dangerous for recall is wanted
 here: it cuts off the answer the model was about to invent from a caption alone.
 
-Measured 2026-08-24 through the product's own code, 12 trials an arm:
-**0/12 against 12/12**. Restating the question in the image turn does not help - the
-model answers the question it is already holding.
+Measured 2026-08-24 through the product's own code, two runs of 12 and 8 trials an
+arm: **0/20 against 19/20**. Restating the question in the image turn does not help -
+the model answers the question it is already holding. Quote the pooled number, not
+the 12/12 the first run happened to give.
+
+With `all_displays`, every captured monitor is one part of that single turn - four
+of four two-display trials read both codes, and `_deliver_images` explains why a
+turn per image would not.
 
 **What is left is not accuracy.** In 5 of those 12 turns the model spoke an invented
 answer before the correction, because a `toolResponse` starts generation server-side
@@ -49,6 +54,11 @@ size, so "read it" is a fact and not an impression.
 
     python3 -m evals.screen_frame_arrival_spike              # 4 trials an arm
     python3 -m evals.screen_frame_arrival_spike --trials 15
+
+**`_deliver_images` is called unbound, with `None` for `self`**, so this measures
+the product's own handover rather than a copy of it. That works because the method
+uses no instance state, and its docstring says so - if it ever needs `self`, fix
+this call in the same change.
 
 **Read `Trial.after_image` before changing the scoring.** The image turn interrupts
 the answer the model composed from the caption alone, so a reader that scores the

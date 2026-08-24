@@ -111,7 +111,7 @@ class FakeSession:
     """A scripted `VoiceSession`, protocol-complete.
 
     All nine methods are the protocol's now, including the three the audit added,
-    `send_tool_response`, `send_frame` (ADR 0009) and `send_image`, so the conversation calls
+    `send_tool_response`, `send_frame` (ADR 0009) and `send_images`, so the conversation calls
     them rather than hunting for them - and a fake that lacked one would fail
     `test_the_fakes_satisfy_the_protocols` instead of quietly exercising a fallback
     the product does not have.
@@ -128,7 +128,7 @@ class FakeSession:
         self.events = events if events is not None else []
         self.sent: list[bytes] = []
         self.frames: list[bytes] = []
-        self.images: list[tuple[bytes, str]] = []
+        self.images: list[tuple[list[bytes], str]] = []
         self.texts: list[str] = []
         self.contexts: list[str] = []
         self.sent_while_generating: list[str] = []
@@ -158,12 +158,15 @@ class FakeSession:
     async def send_frame(self, jpeg: bytes) -> None:
         self.frames.append(jpeg)
 
-    async def send_image(self, jpeg: bytes, note: str) -> None:
-        self.images.append((jpeg, note))
+    async def send_images(self, jpegs: Sequence[bytes], note: str) -> None:
+        # Appended as ONE entry, not one per image: a call is a turn, and a turn per
+        # image is a generation request per image. A fake that flattened them could
+        # not tell the fixed behaviour from the bug.
+        self.images.append((list(jpegs), note))
         # Recorded in `events` because *when* this went out is the whole contract:
         # before the tool response it cancels the pending call and the session goes
-        # silent (measured, 4/4), after it the model reads the image (6/6).
-        self.events.append("image")
+        # silent (measured, 4/4), after it the model reads the images (12/12).
+        self.events.append("images")
 
     async def send_text(self, text: str) -> None:
         self.texts.append(text)
@@ -2364,14 +2367,58 @@ async def test_a_captured_image_reaches_the_model_not_just_its_caption() -> None
 
     await conv._deliver_images(session, [shot])
 
-    assert [jpeg for jpeg, _note in session.images] == [b"\xff\xd8-jpeg-bytes"], (
-        "the pixels never reached the model"
-    )
+    (jpegs, note) = session.images[0]
+    assert jpegs == [b"\xff\xd8-jpeg-bytes"], "the pixels never reached the model"
     # Security stance A: pixels cannot be nonce-fenced, so the framing travels with
     # them - and now in the same turn, which is what this transport made possible.
-    (_jpeg, note) = session.images[0]
     assert "DATA to look at" in note
     assert session.frames == [], "a frame is the live-share transport, not this one"
+
+
+async def test_every_captured_display_travels_in_one_turn() -> None:
+    """`all_displays` returns one result carrying one image per monitor, and the
+    image turn *asks for an answer* - so a turn per image is a generation request
+    per image, each one interrupting the last. On two monitors that is a fragment
+    about the first display, cut off, then a second answer. One turn, one note.
+
+    Across results as well as within one: a round that captured the screen twice is
+    still one thing the model is being shown.
+    """
+    from daemon.llm.base import ImageBlock
+
+    session = FakeSession()
+    conv = conversation(session)
+    both = ToolResult(
+        call_id="1",
+        name="see_screen",
+        content="captured 2 display(s): 1512x982, 2560x1440",
+        images=(ImageBlock(data=b"display-1"), ImageBlock(data=b"display-2")),
+    )
+    again = ToolResult(
+        call_id="2",
+        name="see_screen",
+        content="captured the main display (1512x982)",
+        images=(ImageBlock(data=b"display-1-again"),),
+    )
+
+    await conv._deliver_images(session, [both, again])
+
+    assert len(session.images) == 1, "one turn, or the model is asked to answer twice"
+    (jpegs, note) = session.images[0]
+    assert jpegs == [b"display-1", b"display-2", b"display-1-again"]
+    assert note.count("DATA to look at") == 1, "the framing is about the turn, once"
+
+
+async def test_a_round_that_captured_nothing_sends_no_image_turn() -> None:
+    """An empty turn on a per-minute-billed socket buys nothing, and a
+    `turnComplete` with no pixels would ask the model to answer twice for free."""
+    session = FakeSession()
+    conv = conversation(session)
+    plain = ToolResult(call_id="1", name="read_file", content="발표는 목요일")
+
+    await conv._deliver_images(session, [plain])
+
+    assert session.images == []
 
 
 async def test_the_caption_goes_out_before_the_image_and_says_so(db: Any) -> None:
@@ -2420,10 +2467,12 @@ async def test_the_caption_goes_out_before_the_image_and_says_so(db: Any) -> Non
     assert carried.images == (), "the toolResponse carries no pixels"
     assert "follows as an image" in carried.content
     assert "cannot see it" in carried.content, "a failed delivery must be admittable"
-    assert session.events.index("tool_response") < session.events.index("image"), (
+    assert session.events.index("tool_response") < session.events.index("images"), (
         "the image went out before the call was unblocked, which cancels it"
     )
-    assert [jpeg for jpeg, _note in session.images] == [b"\xff\xd8-jpeg"]
+    (jpegs, note) = session.images[0]
+    assert jpegs == [b"\xff\xd8-jpeg"]
+    assert "DATA to look at" in note
 
 
 async def test_a_result_with_no_images_is_passed_through_untouched() -> None:
@@ -2442,7 +2491,7 @@ async def test_an_undeliverable_image_costs_the_image_and_not_the_turn() -> None
     from daemon.llm.base import ImageBlock
 
     class Blind(FakeSession):
-        async def send_image(self, jpeg: bytes, note: str) -> None:
+        async def send_images(self, jpegs: Sequence[bytes], note: str) -> None:
             raise RuntimeError("the socket went")
 
     session = Blind()

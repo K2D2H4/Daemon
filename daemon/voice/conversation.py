@@ -990,25 +990,42 @@ class VoiceConversation:
         gap tried, and the model answered "what number is on my screen" with digits
         that were never there, 4 times out of 4.
 
-        So the pixels now go as a `clientContent` image part (1092 tokens against
+        So the pixels now go as `clientContent` image parts (1092 tokens against
         60) and they go *after* `send_tool_response` - sent before it, they cancel
         the pending call and the session says nothing at all. In the measured order
-        a 24px six-digit code reads 12/12 against the old order's 0/12.
-        `VoiceSession.send_image` holds the numbers, and
-        `SCREENSHOT_FOLLOWS` holds the one defect this ordering leaves behind.
+        a 24px six-digit code reads 19/20 across two runs (12/12 then 7/8),
+        against the old order's 0/20.
+        `VoiceSession.send_images` holds the numbers, and `SCREENSHOT_FOLLOWS`
+        holds the one defect this ordering leaves behind.
+
+        **One turn for every image in the round, which is why this collects before
+        it sends.** The image turn asks for an answer, so a turn per image is a
+        generation request per image and each one interrupts the last -
+        `all_displays` on two monitors would mean the owner hears a fragment about
+        the first display, cut off, then a second answer. Across `results` as well
+        as within one: a round that captured the screen twice is still one thing
+        the model is being shown.
 
         Never fails the turn: the caption has already gone out by the time this
         runs, and it already tells the model to say so rather than describe a
         screen it cannot see, so a delivery failure costs honesty and not the turn.
+
+        **Uses no instance state, and `evals/screen_frame_arrival_spike.py` relies
+        on that** - it calls this unbound, with `None` for `self`, so the spike
+        measures the product's own handover rather than a copy of it. Reaching for
+        `self` here is allowed but not free: fix the spike in the same change, or
+        the next person to run the regression measurement gets an `AttributeError`
+        from inside this file with nothing pointing at the edit that caused it.
         """
         from daemon.tools.screen import screen_note
 
-        for result in results:
-            for image in result.images:
-                try:
-                    await session.send_image(image.data, screen_note("the owner's screen"))
-                except Exception:
-                    logger.exception("voice: could not hand over a captured image")
+        jpegs = [image.data for result in results for image in result.images]
+        if not jpegs:
+            return
+        try:
+            await session.send_images(jpegs, screen_note("the owner's screen"))
+        except Exception:
+            logger.exception("voice: could not hand over %d captured image(s)", len(jpegs))
 
 
 def _caption_only(results: Sequence[ToolResult]) -> Sequence[ToolResult]:

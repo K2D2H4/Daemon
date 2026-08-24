@@ -540,24 +540,30 @@ class GeminiLiveSession:
             }
         )
 
-    async def send_image(self, jpeg: bytes, note: str) -> None:
-        """One JPEG as a `clientContent` image part, with its framing in the same
-        turn. See `daemon.voice.base.VoiceSession.send_image` for the two
-        measurements that fix both the transport and its position in the exchange.
+    async def send_images(self, jpegs: Sequence[bytes], note: str) -> None:
+        """The captured JPEGs as `clientContent` image parts, one turn, with their
+        framing in the same turn. See `daemon.voice.base.VoiceSession.send_images`
+        for the measurements that fix the transport, its position in the exchange,
+        and why every image belongs in a single turn.
 
         `turnComplete: true`, unlike `send_context`: the point is for the model to
         answer the question it is already holding, now that it can see. The
         interrupt that makes `clientContent` dangerous for recall is what makes it
-        right here - it replaces an answer composed from a caption alone.
+        right here - it replaces an answer composed from a caption alone. It is
+        also why one turn rather than one per image: a second turn would interrupt
+        the answer the first one asked for.
         """
-        if not jpeg:
-            return
         parts: list[dict[str, Any]] = [
             {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(jpeg).decode()}}
+            for jpeg in jpegs
+            if jpeg
         ]
+        if not parts:
+            return
         if note.strip():
             # Never an empty text part: a part carrying nothing is a field on the
-            # wire for no gain, and this file has been closed 1007 for less.
+            # wire for no gain, and this file has been closed 1007 for less. Once
+            # for the turn, not once per image - the framing is about the turn.
             parts.append({"text": note})
         await self._send(
             {"clientContent": {"turns": [{"role": "user", "parts": parts}], "turnComplete": True}}

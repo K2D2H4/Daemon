@@ -50,6 +50,17 @@ FROZEN means: do not edit without flagging it first.
 `VoiceSession` now has `send_frame` - both additive, both for screen sharing,
 justified in [docs/adr/0009-images-in-the-message-contract.md](adr/0009-images-in-the-message-contract.md).
 
+`VoiceSession` also has **`send_images`**, additive and for the same feature, and it
+exists because `send_frame` turned out not to be enough: a `realtimeInput.video`
+frame written inside a tool round never reaches the model at all, so `see_screen`
+described screens it had never received. `send_images` is the `clientContent`
+image-part transport that does arrive, and it must be called *after* the
+`toolResponse` - before it, the pending call is cancelled and the session goes
+silent. Both directions measured; the numbers are in
+`daemon/voice/base.py:VoiceSession.send_images` and `daemon/MEASURED.md`, and
+`evals/screen_frame_arrival_spike.py` reproduces them. `send_frame` stays: it is the
+live-share pump's transport, which has no tool round in it.
+
 ## Non-negotiables
 
 1. **Markdown is the source of truth. SQLite is a rebuildable index.**
