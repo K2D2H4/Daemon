@@ -103,20 +103,23 @@ def test_retired_persona_rules_carries_when_and_why(store: Store) -> None:
     kept = store.insert_persona_rule(
         body="살아있는 규칙", created_at=_dt(9), evidence=[], supersession_key=None
     )
+    # Inserted (and so id-ordered) before `gone`, but retired *later* below.
+    retired_earlier = store.insert_persona_rule(
+        body="먼저 은퇴할 규칙", created_at=_dt(10), evidence=[], supersession_key=None
+    )
     gone = store.insert_persona_rule(
-        body="은퇴할 규칙", created_at=_dt(10), evidence=[], supersession_key=None
+        body="은퇴할 규칙", created_at=_dt(11), evidence=[], supersession_key=None
     )
-    older_retiree = store.insert_persona_rule(
-        body="더 먼저 은퇴할 규칙", created_at=_dt(11), evidence=[], supersession_key=None
-    )
+    # `retired_earlier` has the lower id but the earlier `retired_at`; `gone` has
+    # the higher id but the later `retired_at`. So the correct `retired_at DESC`
+    # order - [gone, retired_earlier] - is the *reverse* of sqlite's natural
+    # rowid scan order. That makes a missing or reversed ORDER BY visible: either
+    # one would return [retired_earlier, gone] instead.
+    assert store.retire_persona_rule(retired_earlier, when=_dt(20), why="중복")
     assert store.retire_persona_rule(gone, when=_dt(24), why="사용자가 지우라고 했다")
-    # Retired *earlier* than `gone`, so a correct ORDER BY retired_at DESC still
-    # puts `gone` first - the only thing that distinguishes DESC from ASC or from
-    # no ORDER BY at all with more than one row in the result.
-    assert store.retire_persona_rule(older_retiree, when=_dt(20), why="중복")
 
     rows = store.retired_persona_rules(50)
-    assert [int(r["id"]) for r in rows] == [gone, older_retiree]
+    assert [int(r["id"]) for r in rows] == [gone, retired_earlier]
     assert rows[0]["retired_why"] == "사용자가 지우라고 했다"
     assert rows[0]["retired_at"] == "2026-08-24T12:00:00Z"
     assert {int(r["id"]) for r in store.active_persona_rules()} == {kept}
