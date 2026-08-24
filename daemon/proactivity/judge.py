@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Protocol
 
 from daemon.llm.base import Message, ProviderError
 from daemon.llm.gateway import LLMGateway
@@ -150,10 +151,29 @@ JSON만 출력한다.
     -> {"say": "예전에 교토 국수집 얘기했던 거 생각나네. 또 가고 싶어?"}"""
 
 
+class LearnedRulesLike(Protocol):
+    """Just the half of `daemon/persona/rules.LearnedRules` the prompt needs.
+
+    A protocol rather than the class so this module keeps out of the store's
+    import graph, matching `daemon/companion.py`'s reasoning for the same shape:
+    the text and voice surfaces already depend on this narrow interface, not on
+    `Store`, and the surface with the least context to carry the voice should not
+    be the one exception.
+    """
+
+    def annotations(self) -> dict[str, tuple[str, int]]: ...
+
+
 class Judge:
     """The one model call. Constructed per run; holds nothing between decisions."""
 
-    def __init__(self, gateway: LLMGateway, data_dir: Path) -> None:
+    def __init__(
+        self,
+        gateway: LLMGateway,
+        data_dir: Path,
+        *,
+        rules: LearnedRulesLike | None = None,
+    ) -> None:
         self._gateway = gateway
         # M4's learned rules are included as of 2026-08-11. This block used to
         # say the call was left "for whoever makes it on purpose"; this is that.
@@ -175,6 +195,7 @@ class Judge:
         # call per tick, and a decline rests the candidate instead of leaving
         # it due).
         self._data_dir = Path(data_dir)
+        self._rules = rules
 
     async def decide(self, candidate: Candidate) -> Utterance:
         """What to say about `candidate`, or a falsy `Utterance` and why not.
@@ -224,10 +245,22 @@ class Judge:
         learned.md would pass a single check and speak first in nobody's voice.
         The seed is the anchor (PLAN 5.1); learned rules are what accumulated on
         top of it and cannot stand in for it.
+
+        The mirror read is guarded the same way `Companion.persona` guards it: a
+        raise here must cost only the dates, never the persona itself. An
+        unguarded raise would propagate out of `decide` uncaught (there is no
+        `try` around the call to this method there) and silence proactivity
+        entirely - a worse outcome than the undated rules this exists to date.
         """
         if not (await read_file(seed_path(self._data_dir))).strip():
             return ""
-        return await load_persona(self._data_dir)
+        annotations = None
+        if self._rules is not None:
+            try:
+                annotations = self._rules.annotations()
+            except Exception:
+                logger.exception("judge: could not date the learned rules")
+        return await load_persona(self._data_dir, annotations=annotations)
 
 
 def _reason_block(candidate: Candidate) -> str:

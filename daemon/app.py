@@ -42,6 +42,7 @@ from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
 from daemon.memory.base import MemoryWriter, Recall
 from daemon.persona.evolve import PersonaEvolution
+from daemon.persona.rules import LearnedRules
 from daemon.proactivity.tick import ProactiveTick
 from daemon.reflection import Reflection
 from daemon.tasks import Task
@@ -364,6 +365,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 recall_limit=settings.recall_limit,
                 resolve_id=resolve_id,
                 tools=tools,
+                rules=LearnedRules(settings.data_dir, store) if store is not None else None,
             ),
             max_tool_rounds=settings.tools_max_rounds,
         )
@@ -397,6 +399,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     recall_limit=settings.recall_limit,
                     resolve_id=resolve_id,
                     tools=tools,
+                    rules=LearnedRules(settings.data_dir, store) if store is not None else None,
                 )
 
             run_request = build_run_request(
@@ -851,7 +854,11 @@ async def build_proactive_tick(
         gateway = LLMGateway(
             providers, settings.routing_table(), fallback=settings.fallback_route()
         )
-        judge = Judge(gateway, data_dir=settings.data_dir)
+        judge = Judge(
+            gateway,
+            data_dir=settings.data_dir,
+            rules=LearnedRules(settings.data_dir, store) if store is not None else None,
+        )
 
         channel = None
         try:
@@ -1307,6 +1314,7 @@ async def run_voice(
             # the words the owner was most likely to ask about later.
             resolve_id=_id_resolver(writer),
             tools=tools,
+            rules=LearnedRules(settings.data_dir, store) if store is not None else None,
         )
         # Seed and learned rules both, same as the text path, and through the same
         # `Companion.persona` -> `load_persona`: a conversation surface is a

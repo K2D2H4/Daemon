@@ -11,6 +11,7 @@ the other, which is what happened to `recall.index()` and voice.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -710,3 +711,63 @@ async def test_no_repeated_phrase_means_no_tic_block(data_dir: Path) -> None:
     blocks = await companion.context("응", history=history)
 
     assert not [block for block in blocks if block.startswith("[verbal-tics]")]
+
+
+async def test_the_persona_block_is_dated_when_rules_are_wired(
+    db: Any, data_dir: Path
+) -> None:
+    from datetime import UTC, datetime
+
+    from daemon.memory.store import Store
+    from daemon.persona.rules import LearnedRules, Proposal
+
+    (data_dir / "persona").mkdir(parents=True, exist_ok=True)
+    (data_dir / "persona" / "seed.md").write_text("나는 벨라다.\n", encoding="utf-8")
+    rules = LearnedRules(data_dir, Store(db))
+    await rules.add(
+        [Proposal(body="변명을 싫어한다", evidence=(1, 2, 3))],
+        now=datetime(2026, 8, 9, 15, 0, tzinfo=UTC),
+    )
+    companion = Companion(FakeMemory(), data_dir=data_dir, rules=rules)
+
+    assert "2026-08-09 (관찰 3건) 변명을 싫어한다" in await companion.persona()
+
+
+async def test_a_companion_with_no_rules_wired_still_has_a_persona(
+    data_dir: Path,
+) -> None:
+    """The two fake channel/memory setups in `app.py` carry no store, and neither
+    do most tests. Voice and text must both keep working there - the same
+    degrade-not-crash shape `tools` and delegation already have."""
+    (data_dir / "persona").mkdir(parents=True, exist_ok=True)
+    (data_dir / "persona" / "seed.md").write_text("나는 벨라다.\n", encoding="utf-8")
+    (data_dir / "persona" / "learned.md").write_text(
+        "# learned\n\n- 변명을 싫어한다\n", encoding="utf-8"
+    )
+
+    block = await Companion(FakeMemory(), data_dir=data_dir).persona()
+
+    assert "나는 벨라다." in block
+    assert "- 변명을 싫어한다" in block
+
+
+async def test_an_unreadable_mirror_costs_the_dates_not_the_persona(
+    data_dir: Path,
+) -> None:
+    """Reading the mirror is one more thing that can fail on a turn that must not
+    fail. A raise here would take the seed down with it."""
+
+    class Broken:
+        def annotations(self) -> dict[str, tuple[str, int]]:
+            raise sqlite3.OperationalError("no such table: persona_rules")
+
+    (data_dir / "persona").mkdir(parents=True, exist_ok=True)
+    (data_dir / "persona" / "seed.md").write_text("나는 벨라다.\n", encoding="utf-8")
+    (data_dir / "persona" / "learned.md").write_text(
+        "# learned\n\n- 변명을 싫어한다\n", encoding="utf-8"
+    )
+
+    block = await Companion(FakeMemory(), data_dir=data_dir, rules=Broken()).persona()
+
+    assert "나는 벨라다." in block
+    assert "- 변명을 싫어한다" in block
