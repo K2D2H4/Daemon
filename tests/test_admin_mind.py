@@ -54,7 +54,7 @@ def test_recent_entries_includes_retired_and_active_entries_does_not(store: Stor
     keep = _fact(store, "활성 사실", importance=9)
     old = _fact(store, "낡은 사실", importance=5, key="k")
     # A new fact on the same key retires `old`.
-    _fact(store, "새 사실", importance=6, key="k")
+    new = _fact(store, "새 사실", importance=6, key="k")
 
     active_ids = {int(r["id"]) for r in store.active_entries(50)}
     recent = store.recent_entries(50)
@@ -67,6 +67,9 @@ def test_recent_entries_includes_retired_and_active_entries_does_not(store: Stor
     by_id = {int(r["id"]): r for r in recent}
     assert by_id[old]["status"] == "retired"
     assert by_id[keep]["status"] == "active"
+    # Most important first (importances 9, 6, 5) - the docstring's promise, not
+    # just insertion or id order.
+    assert [int(r["id"]) for r in recent] == [keep, new, old]
 
 
 def test_recent_observations_includes_consumed_ones(store: Store) -> None:
@@ -103,10 +106,17 @@ def test_retired_persona_rules_carries_when_and_why(store: Store) -> None:
     gone = store.insert_persona_rule(
         body="은퇴할 규칙", created_at=_dt(10), evidence=[], supersession_key=None
     )
+    older_retiree = store.insert_persona_rule(
+        body="더 먼저 은퇴할 규칙", created_at=_dt(11), evidence=[], supersession_key=None
+    )
     assert store.retire_persona_rule(gone, when=_dt(24), why="사용자가 지우라고 했다")
+    # Retired *earlier* than `gone`, so a correct ORDER BY retired_at DESC still
+    # puts `gone` first - the only thing that distinguishes DESC from ASC or from
+    # no ORDER BY at all with more than one row in the result.
+    assert store.retire_persona_rule(older_retiree, when=_dt(20), why="중복")
 
     rows = store.retired_persona_rules(50)
-    assert [int(r["id"]) for r in rows] == [gone]
+    assert [int(r["id"]) for r in rows] == [gone, older_retiree]
     assert rows[0]["retired_why"] == "사용자가 지우라고 했다"
     assert rows[0]["retired_at"] == "2026-08-24T12:00:00Z"
     assert {int(r["id"]) for r in store.active_persona_rules()} == {kept}
