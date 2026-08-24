@@ -1003,6 +1003,48 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
         store.close()
 
 
+def test_send_message_is_registered_only_where_it_can_deliver(tmp_path: Path) -> None:
+    """`send_message` exists so a spoken turn can put a link in writing - and only
+    the resident's voice runtime passes it a channel to do that through.
+
+    Both halves matter. Absent on the text path, where the reply already reaches the
+    channel and a send tool would only send a second copy. Absent with no channel at
+    all (a standalone `daemon voice`, a channel that failed to build), because a tool
+    that cannot deliver is worse than a missing one: the audio model reports the send
+    either way, and this is the confabulation the tool was added to stop.
+    """
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN=TOKEN,
+        DAEMON_TOOLS_ENABLED=True,
+        DAEMON_TOOLS_ROOTS=str(tmp_path),
+    )
+
+    from daemon.app import _build_tools
+
+    class _Sender:
+        name = "telegram"
+
+        async def send(self, message: Any) -> None: ...
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        text_runner, _bridge, _status = asyncio.run(_build_tools(settings, store))
+        assert text_runner is not None
+        assert "send_message" not in [spec.name for spec in text_runner.specs()]
+
+        voice_runner, _bridge, _status = asyncio.run(
+            _build_tools(settings, store, channel=_Sender())
+        )
+        assert voice_runner is not None
+        assert "send_message" in [spec.name for spec in voice_runner.specs()]
+    finally:
+        store.close()
+
+
 def test_the_tool_mode_can_be_pinned_past_the_setting(tmp_path: Path) -> None:
     """`_build_tools`'s `mode` override has to beat `DAEMON_TOOLS_MODE` rather than be
     it under another name - the seam `daemon voice` uses to degrade `ask` to
