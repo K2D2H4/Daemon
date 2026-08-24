@@ -1069,12 +1069,19 @@ async function loadMemory(){
     $('#memory-summary').textContent=
       `${m.facts_active} fact(s) always injected · ${m.entities_total} entity note(s) · `
       +`${m.reflections_total} day(s) reflected`
-      +(m.pending_days.length?` · ${m.pending_days.length} day(s) waiting`:'')
+      // `pending_days` includes today, which `Reflect now` can never clear -
+      // `Reflection.catch_up` drops it unconditionally. Left unexplained, the
+      // count and the button read as contradicting each other on the (common)
+      // day where today is the only entry.
+      +(m.pending_days.length?` · ${m.pending_days.length} day(s) waiting`
+        +' (today is reflected after midnight; `daemon reflect --date` forces it)':'')
       +' · loads when you open this view';
-    $('#fact-count').textContent=`${m.facts_active} active · ${m.facts_retired} retired`;
+    $('#fact-count').textContent=`${m.facts_active} active · ${m.facts_retired} retired`
+      +(m.facts_list_truncated?' · not all facts shown':'');
     $('#fact-list').innerHTML=m.facts.length?m.facts.map(factRow).join('')
       :'<p class="empty">Nothing curated yet. Facts land here after a reflection pass.</p>';
     $('#entity-count').textContent=`${m.entities_total}`
+      +(m.entities_list_truncated?' · not all entities shown':'')
       +(m.entities_bodies_truncated?' · some notes not loaded':'');
     $('#entity-list').innerHTML=m.entities.length?m.entities.map(entityRow).join('')
       :'<p class="empty">No entity notes yet.</p>';
@@ -1111,17 +1118,26 @@ async function loadPersona(){
       ['UNCONSUMED',String(a.unconsumed)],
       ['LAST RULE',a.last_rule_at?stamp(a.last_rule_at):'never'],
     ].map(([k,v])=>`<span class="k">${k}</span><span class="v">${esc(v)}</span>`).join('');
+    // `lines` is null, not 0, for a file the budget never got to - see
+    // mind.py's `_file_view`. Omitting the clause instead of printing
+    // "null line(s)" is the fix; `truncated` names the reason.
     $('#anchor-files').innerHTML=
-      disclose(`seed.md · ${a.seed.lines} line(s) — yours, code never writes this`,
+      disclose(`seed.md${a.seed.lines==null?'':` · ${a.seed.lines} line(s)`}`
+               +' — yours, code never writes this'
+               +(a.seed.truncated?' · not loaded (budget)':''),
                a.seed.text,a.seed.file)
-     +disclose(`learned.md · ${a.learned.lines} line(s) — hers`,
+     +disclose(`learned.md${a.learned.lines==null?'':` · ${a.learned.lines} line(s)`}`
+               +' — hers'
+               +(a.learned.truncated?' · not loaded (budget)':''),
                a.learned.text,a.learned.file);
-    $('#rule-count').textContent=`${p.rules_active} active · ${p.rules_retired} retired`;
+    $('#rule-count').textContent=`${p.rules_active} active · ${p.rules_retired} retired`
+      +(p.rules_list_truncated?' · not all retired rules shown':'');
     $('#rule-list').innerHTML=p.rules.length?p.rules.map(ruleRow).join('')
       :'<p class="empty">She has not concluded anything yet. Rules need '
        +`${a.min_observations} observation(s) and a weekly pass.</p>`;
     $('#obs-count').textContent=
-      `${p.observations_total} · ${p.observations_consumed} consumed`;
+      `${p.observations_total} · ${p.observations_consumed} consumed`
+      +(p.observations_list_truncated?' · not all observations shown':'');
     $('#obs-list').innerHTML=p.observations.length?p.observations.map(obsRow).join('')
       :'<p class="empty">No observations yet.</p>';
     $('#diary-list').innerHTML=p.diaries.length
