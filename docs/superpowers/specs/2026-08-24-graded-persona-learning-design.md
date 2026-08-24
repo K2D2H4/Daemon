@@ -109,18 +109,31 @@ tendency, and the standing-demand form (`~를 요구한다`) is ruled out by nam
 same lesson as `CALLED_BY_NAME`, where omitting the unwanted move was not enough
 and it had to be forbidden explicitly.
 
-**The rendering.** Each bullet in `learned.md` carries the date it was formed and
-how many observations stand behind it:
+**The rendering.** The learned block the model sees carries, per rule, the date it
+was formed and how many observations stand behind it:
 
 ```
 - 2026-08-09 (관찰 3건) 시스템 오류를 인정할 때 변명을 싫어한다
 - 2026-08-23 (관찰 3건) 용건 위주의 빠른 응답을 선호했다
 ```
 
-**Absolute dates, never relative ones.** A relative phrase written into a file is
-a lie by the following week; a date is not, and `[현재 시각]` is already in every
-prompt, so the model computes recency itself. Markdown stays the source of truth,
-`persona_rules` needs no new column, and `loader.py` keeps reading the file alone.
+**Absolute dates, never relative ones.** A relative phrase is a lie by the
+following week; a date is not, and `[현재 시각]` is already in every prompt, so the
+model computes recency itself.
+
+**The annotation is assembled at prompt time from the sqlite columns, and never
+written to `learned.md`.** This is not a preference. docs/CONTRACTS.md
+non-negotiable 3 is *"Provenance is columns, never prose - never encode
+origin/importance/dates as markdown comments that a model could write or
+mangle"*, and `daemon/persona/rules.py` states the threat it guards:
+
+> A model that could write its own `created_at` could **backdate a rule to look
+> established**
+
+That is exactly the lever this design pulls. A rule's weight comes from its date,
+so a model able to write the date into prose could manufacture its own authority -
+and would have every incentive to, since the block tells it that older single
+observations count for less. The file keeps carrying bodies alone.
 
 `LEARNED_PREFIX` is rewritten to match: these are dated observations to be weighed
 by recency and repetition, not rules to be obeyed.
@@ -133,35 +146,32 @@ and a decay pass. (B) may deliver most of the effect for none of the cost, and
 until (B) is measured there is no way to know. The open question that governs (C)
 — how long a single remark should keep mattering — is left unanswered on purpose.
 
-### Hazard the implementer will hit
+### Where the annotation is assembled, and why not in the obvious place
 
-Annotating the bullets **silently stops the weekly pass**, and the error it
-produces sends you the wrong way. `evolve.py`'s gate 4 compares the file against
-the mirror verbatim:
+`learned.md` is unchanged, so `evolve.py`'s gate 4 - which compares the file's
+bullets against `persona_rules.body` verbatim - keeps working untouched. An
+earlier draft of this design annotated the file and would have made every rule
+read as orphaned, silently stopping the weekly pass behind the misleading advice
+`run daemon reindex`. Conforming to non-negotiable 3 removes that hazard as a side
+effect; it is recorded here so nobody reintroduces it as a simplification.
 
-```python
-orphaned = diverged_bodies(rule_bodies(learned_text), (row["body"] for row in active_rows))
-```
+The cost lands instead on the prompt path, which has no rule rows today:
 
-A bullet rendered as `- 2026-08-09 (관찰 3건) …` matches no `persona_rules.body`,
-so **every** rule reads as orphaned, the pass returns
-`skipped="learned.md has N rule(s) the mirror does not know about"` — and its
-advice, `run daemon reindex`, does not repair this and never will. Persona
-evolution would be dead with a plausible explanation on the console, which is this
-repo's signature defect.
+| | has | needs |
+|---|---|---|
+| `persona/loader.py:load_persona` | `data_dir` | the file, as now |
+| `Companion` | `MemoryWriter`, `data_dir`, `recall`, `resolve_id`, `tools` | **a way to read `persona_rules`** |
 
-So the annotated line and the stored body must be separable, and the two readers
-want different halves:
+`Companion` has no `Store`. The dependency is added where the repo already
+assembles implementations - `daemon/app.py`, which holds the `Store` - and is
+optional: with nothing supplied, `load_persona` returns exactly today's plain
+bodies. That keeps every existing test and both endpoints working while the new
+path is added, and means a mirror that is missing or diverged degrades to the
+current behaviour rather than to no persona at all.
 
-| reader | wants |
-|---|---|
-| gate 4 / `diverged_bodies` | the clean body, to compare against the mirror |
-| `load_persona` → the prompt | the annotated line, dates and counts included |
-
-One parser, two accessors — not one function whose result is right for whichever
-caller was written first. `tests/test_persona_rules.py` and `tests/test_persona_evolve.py` must cover the round-trip:
-render → read back → the body still equals what the mirror holds, and the weekly
-pass still runs against a freshly rendered file.
+One reader stays one reader: the annotation is an argument to `load_persona`, not
+a second assembler living next to it, so `LEARNED_PREFIX` and the seed-then-rules
+ordering are not duplicated.
 
 ## Measurement
 
