@@ -601,3 +601,56 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   `clientContent` + `inline_data` closes this model with 1007 did not reproduce on a
   correctly-shaped raw payload; it was the library's bug, not the API's, which is again
   the whole reason to ask the socket. `evals/screen_frame_arrival_spike.py`.
+- **Dating a learned rule held the real preference and nudged the stale one down,
+  but neither reached significance at n=30 — and the manner-remark leak into
+  `facts` did not reproduce on the real incident day at all.** Measured against a
+  real key, three arms, `evals/graded_persona_spike.py`, real `data/persona/seed.md`
+  plus a fixed slice of the real 2026-08-19 incident (`messages` rows 935-944 via
+  `daemon.companion.render_continuity`) behind synthetic STALE/REAL rules so their
+  dates and observation counts stay controllable. **Arm 2, the one that can fail
+  this change** (a run where the stale correction fades *and* the real preference
+  fades with it is a regression reported as a success): undated 30/30 → dated
+  **28/30**, p=1.0, well above the 80%-of-baseline floor - **held**. Arm 1 (does
+  the stale one-off stop dominating): undated 17/30 → dated **13/30**, p=0.22 -
+  correct direction, not significant at this n; the same 4-point gap would need
+  roughly n≈150 per arm to clear p<0.05 by this test's own math. Arm 3 (does the
+  manner remark move from `facts` to `observations` under reflection, old prompt
+  vs new, over the real messy day): `facts` never carried it either way (0/30
+  both) - the leak Task 1 targeted is rarer on this transcript than the incident
+  implied - and `observations` was a near-wash, 28/30 old vs 27/30 new
+  (p=0.82).
+- **Two probe designs had to fail first before arm 1 and arm 2 could measure
+  anything.** Round 1 (a synthetic one-line seed, no history) pinned both arms at
+  a floor or a ceiling (0/30→0/30, 30/30→30/30) - not negative results, just no
+  room for the behaviour to appear. Round 2 found the real cause was two different
+  things, both in the probe: arm 1's judge demanded a reply clear four clauses at
+  once (no jokes, no affection, no self-disclosure, no question back) to count as
+  "terse", and this persona never clears all four together even while visibly
+  shortening under the stale rule, so the judge said no unconditionally -
+  replaced with reply length against the pooled median, since 담백하게/용건 위주
+  asks for fewer words, not a register switch. Arm 2's probe named a bare tool
+  failure with nobody else to blame, so "own it, no excuses" had nothing to
+  compete against and both arms complied 30/30 regardless of dating - reworded to
+  add a real stake (a missed meeting) so the persona's own instinct to soften bad
+  news had something to pull against the rule's demand. A tie is a statement
+  about the probe's power, not the mechanism, and both these were probe power
+  problems, not the absence of an effect.
+- **A hand audit of all 180 printed records found 2 confirmed mismatches, both in
+  arm 3 under the new prompt, and both the same cause.** `daemon/reflection.py`'s
+  model sometimes returns `observations` as a bare list of strings instead of
+  `{"body": ..., "confidence": ...}` objects. Two "new"-prompt trials did exactly
+  that, and both strings plainly contained the trigger words (`"...담백한 대화를
+  선호한다."`) - a human reading the raw text calls both clear hits, but
+  `_hits()` requires `isinstance(item, dict)` before it reads a body, matching
+  `daemon/reflection.py::_items()`'s own behaviour in production (it drops a
+  non-dict entry with a "was not an object" note, never partially reads it, never
+  crashes). So both were correctly scored against what the real pipeline would
+  actually persist, and incorrectly scored against what the model was plainly
+  trying to say. Correcting for this moves arm 3's `new` observations count from
+  27/30 to 29/30 against `old`'s 28/30 - a wash either way, but it means
+  `daemon/reflection.py` silently drops an entire array's worth of signal on any
+  night the model picks the wrong JSON shape, with nothing surfaced beyond a
+  `problems` string nobody reads. Not scoped to this task; worth a follow-up.
+  Arm 1's classifier (reply length) was audited by recomputing the pooled median
+  independently from the logged lengths: 0/60 mismatches, because there was no
+  judge in the loop to misfire.
