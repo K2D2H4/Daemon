@@ -1112,6 +1112,30 @@ def test_reflect_with_nothing_to_do_says_so(
     assert "nothing to reflect on" in capsys.readouterr().out
 
 
+def test_reflect_names_the_escape_hatch_when_only_today_is_pending(
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`catch_up()` drops today unconditionally (still being written to), so a
+    day with only today's log also returns no results - the same empty list as
+    the "nothing logged at all" case above. The old message ("no day has a log
+    without a reflection already") was false on exactly this common day; the
+    fix names why today does not count and how to force it anyway.
+    """
+    from daemon import clock
+    from daemon.memory import log
+
+    reflection_seam()
+    _logged_day(data_dir, log.local_date(clock.now()))
+
+    assert cli.main(["reflect"]) == 0
+    out = capsys.readouterr().out
+    assert "nothing to reflect on" in out
+    assert "no day has a log without a reflection already" not in out
+    assert "daemon reflect --date" in out
+
+
 @pytest.mark.parametrize(
     ("reply", "fail", "status"),
     [("죄송해요, 잘 모르겠어요", False, "unparseable"), ("", True, "unavailable")],
