@@ -18,6 +18,7 @@ Host that is not loopback, which is what defeats DNS-rebinding.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -483,3 +484,67 @@ def test_f_no_route_writes_the_seed() -> None:
     assert {path for path, _ in persona_writes} <= {
         "/admin/api/persona/forget", "/admin/api/persona/evolve"
     }
+
+
+def test_e_the_app_exposes_the_catchup_lock(tmp_path: Path) -> None:
+    """Without this the two run-now endpoints cannot take the lock the crons take,
+    and a click during the 04:00 cron double-writes the append-only artifact
+    (daemon/app.py:232-237)."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK):
+        assert isinstance(app.state.catchup_lock, asyncio.Lock)
+
+
+@pytest.mark.asyncio
+async def test_run_reflection_now_raises_where_the_tick_swallows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The tick logs and returns None so APScheduler carries on. The endpoint
+    needs the failure, or the browser reports success for a pass that never ran."""
+    from daemon import app as app_mod
+
+    async def boom(settings):
+        raise RuntimeError("no provider")
+
+    monkeypatch.setattr(app_mod, "build_reflection", boom)
+
+    with pytest.raises(RuntimeError, match="no provider"):
+        await app_mod.run_reflection_now(_settings(tmp_path), None)
+
+    # The tick still swallows it - that contract does not change. It must not
+    # raise, and it must say so at ERROR rather than going silent.
+    with caplog.at_level("ERROR"):
+        await app_mod._reflect_tick(_settings(tmp_path), None)
+    assert "reflection tick failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_reflection_now_holds_the_lock_while_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from daemon import app as app_mod
+
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowReflection:
+        async def catch_up(self):
+            held.set()
+            await release.wait()
+            return []
+
+    async def build(settings):
+        async def close() -> None:
+            return None
+
+        return SlowReflection(), close
+
+    monkeypatch.setattr(app_mod, "build_reflection", build)
+    lock = asyncio.Lock()
+    task = asyncio.create_task(app_mod.run_reflection_now(_settings(tmp_path), lock))
+    await held.wait()
+
+    assert lock.locked()
+    release.set()
+    assert await task == []
+    assert not lock.locked()
