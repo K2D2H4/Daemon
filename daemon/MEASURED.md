@@ -541,3 +541,21 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   (`Store.owner_id`) rather than inheriting the bug; the two older callers still have
   it, and fixing them turns proactive Telegram messages back **on** at roughly that
   rate, which is the owner's call and not a refactor.
+- **The 397 was a retry storm, not suppressed volume: the brakes had never once
+  engaged (2026-08-24).** The entry above predicted that fixing the two older callers
+  turns proactive Telegram messages back on "at roughly that rate". Measured against
+  the resident's own database before shipping the fix: **`proactive_utterances` holds
+  zero rows, and always has** (`MIN(spoken_at)`/`MAX(spoken_at)` are both NULL).
+  `ProactiveDelivery.deliver` inserts the utterance, and when nothing reaches the user
+  it calls `delete_utterance` and leaves the candidate live to try again - correct for
+  a dead network, but it means a delivery that can *never* succeed erases its own
+  evidence. Both rate limits read that table: `_budget_block` through
+  `utterances_since()`, `_cooldown_block` through `last_utterance_at()`. An empty table
+  means neither has ever fired on this install, which is why one day shows **167
+  attempts against a daily budget of 8**. So 397/week is the signature of an
+  unthrottled retry loop, not the volume the owner would receive. Post-fix the ceiling
+  is `proactive_daily_budget` **8/day** (~56/week), with a 30-minute cooldown and
+  23:00-09:00 quiet hours - and those three knobs start working for the first time,
+  because a delivered utterance finally survives to be counted. The same emptiness
+  explains the stalled label clock (PLAN 8.1): **zero labelable messages have ever been
+  delivered**, so there was never anything to label.

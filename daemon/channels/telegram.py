@@ -136,6 +136,8 @@ class LabelStore(Protocol):
 
     def is_allowed(self, channel: str, sender_id: str) -> bool: ...
 
+    def owner_id(self, channel: str) -> str | None: ...
+
     def label_utterance(self, utterance_id: str, label: str, *, now: datetime) -> bool: ...
 
 
@@ -408,19 +410,19 @@ class TelegramChannel:
         # A reply goes only to whoever asked. Falling back to the whole allowlist
         # would mean adding someone so they *can* talk to Daemon also signs them
         # up to receive every answer to the owner and every proactive utterance.
-        # An unaddressed message (proactivity, before any inbound exists) still
-        # goes to the allowlist, which for the intended single-user install is
-        # exactly the owner.
+        # An unaddressed message (proactivity, before any inbound exists) goes to
+        # the allowlist, and failing that to the approved owner - see `_owner_target`.
         if message.recipient_id is not None:
             targets: list[int] = [int(message.recipient_id)]
         else:
-            targets = sorted(self._allowed)
+            targets = sorted(self._allowed) or self._owner_target()
         if not targets:
-            # Reachable only under dm_policy='pairing' before anyone is approved,
-            # and only for an unaddressed message. Raised rather than logged: an
-            # utterance that goes nowhere looks identical to one that was never
-            # generated, and only the caller knows what to undo. Nothing has been
-            # sent at this point, so there is nothing to half-abandon.
+            # Only for an unaddressed message, and only when nobody can be named:
+            # under dm_policy='pairing' before anyone is approved, or when the owner
+            # lookup itself failed (`_owner_target` logs and returns empty). Raised
+            # rather than logged: an utterance that goes nowhere looks identical to
+            # one that was never generated, and only the caller knows what to undo.
+            # Nothing has been sent at this point, so there is nothing to half-abandon.
             raise TelegramNoRecipient("no configured recipient for an unaddressed message")
         failed: list[TelegramError] = []
         for chat_id in targets:
@@ -741,6 +743,29 @@ class TelegramChannel:
             logger.warning("telegram: callback query from id=%d has no id", sender_id)
             return None
         return _LabelPress(query_id=query_id, sender_id=str(sender_id), data=callback.get("data"))
+
+    def _owner_target(self) -> list[int]:
+        """The approved owner, for a message that names no recipient.
+
+        Under `dm_policy='pairing'` the configured allowlist is normally empty - the
+        approved owner lives in `channel_pairing` instead, the same rows `_may_label`
+        reads for the inbound direction. Outbound never got the same treatment, so
+        every unaddressed message raised `TelegramNoRecipient` on a paired install and
+        both callers swallowed it (proactivity/delivery.py, delegation.py).
+
+        A configured allowlist still wins in `send`, so an `allowlist` install is
+        unchanged and this can only ever add a recipient where there were none.
+        """
+        if self._pairing is None or self._labels is None:
+            return []
+        try:
+            owner = self._labels.owner_id(self.name)
+            return [int(owner)] if owner is not None else []
+        except Exception:
+            # Fail closed, exactly as `_may_label` does: a storage error must not
+            # invent a recipient. `send` still raises, so the caller hears about it.
+            logger.exception("telegram: could not resolve the owner of an unaddressed message")
+            return []
 
     def _may_label(self, sender_id: int) -> bool:
         """Whether this id is one Daemon listens to.

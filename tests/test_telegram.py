@@ -1350,3 +1350,75 @@ async def test_identify_asks_once_even_when_it_raises_oddly() -> None:
         assert calls[0] == 1
     finally:
         await ch.close()
+
+
+async def test_an_unaddressed_message_goes_to_the_paired_owner(
+    db: sqlite3.Connection,
+) -> None:
+    """Proactivity (M3) and the delegation report both send with recipient_id=None,
+    which channels/base.py documents as "goes to the configured owner". Under
+    dm_policy='pairing' the static allowlist is empty and the owner lives in
+    `channel_pairing`, so reading only the allowlist lost every one of them - 397 in
+    the resident's log between 2026-08-14 and 2026-08-20, each swallowed by its caller.
+    """
+    store = Store(db)
+    store.create_pairing(
+        "telegram", str(OWNER), code="OWNERCOD", created_at=OWNER_AT, expires_at=OWNER_AT
+    )
+    store.approve_pairing("telegram", str(OWNER), approved_at=OWNER_AT)
+
+    api = FakeAPI()
+    await paired(api, store).send(OutboundMessage(text="thinking of you"))
+
+    assert [p["chat_id"] for p in api.payloads("sendMessage")] == [OWNER]
+
+
+async def test_an_unaddressed_message_prefers_a_configured_allowlist(
+    db: sqlite3.Connection,
+) -> None:
+    """The owner lookup is a fallback, not a replacement: an install that names ids
+    in the env keeps addressing exactly those, so turning this on cannot re-route an
+    existing allowlist install to a single paired id."""
+    store = Store(db)
+    store.create_pairing(
+        "telegram", str(OWNER), code="OWNERCOD", created_at=OWNER_AT, expires_at=OWNER_AT
+    )
+    store.approve_pairing("telegram", str(OWNER), approved_at=OWNER_AT)
+
+    api = FakeAPI()
+    await paired(api, store, allowed=(STRANGER,)).send(OutboundMessage(text="hi"))
+
+    assert [p["chat_id"] for p in api.payloads("sendMessage")] == [STRANGER]
+
+
+async def test_an_unaddressed_message_raises_when_the_owner_lookup_fails(
+    db: sqlite3.Connection,
+) -> None:
+    """Fail closed, exactly as `_may_label` does: a storage error must not be allowed
+    to invent a recipient, and the caller must still hear that nothing was sent."""
+    store = Store(db)
+
+    class Broken:
+        def is_allowed(self, channel: str, sender_id: str) -> bool:
+            return False
+
+        def owner_id(self, channel: str) -> str | None:
+            raise sqlite3.OperationalError("database is locked")
+
+        def label_utterance(self, utterance_id: str, label: str, *, now: Any) -> bool:
+            return False
+
+    api = FakeAPI()
+    ch = TelegramChannel(
+        TOKEN,
+        (),
+        dm_policy="pairing",
+        pairing=Pairing(store, "telegram"),
+        client=api.client(),
+        poll_timeout=0,
+        labels=Broken(),
+    )
+    with pytest.raises(TelegramNoRecipient, match="no configured recipient"):
+        await ch.send(OutboundMessage(text="thinking of you"))
+
+    assert api.payloads("sendMessage") == []
