@@ -185,6 +185,21 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def owner_id(self, channel: str) -> str | None:
+        """The approved owner's sender id, or None if nobody has been approved.
+
+        `has_owner` answers whether onboarding happened; this answers who it happened
+        with, which is what an *unaddressed* message needs. Under `dm_policy=pairing`
+        the channel's own allowlist only ever holds the configured env ids - empty on
+        a paired install - so a caller with nobody to name had nobody to send to.
+        """
+        row = self.conn.execute(
+            "SELECT sender_id FROM channel_pairing "
+            "WHERE channel = ? AND is_owner = 1 AND state = 'approved' LIMIT 1",
+            (channel,),
+        ).fetchone()
+        return str(row[0]) if row else None
+
     def create_pairing(
         self,
         channel: str,

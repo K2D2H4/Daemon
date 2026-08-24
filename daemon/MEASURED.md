@@ -514,3 +514,30 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   **Still open:** `delegate_task` is the designed escape hatch for what stays
   nested, and it has been called **0 times in the whole history**. Voice hits the
   wall and confabulates instead of delegating.
+- **"텔레그램으로 보내줘" had no tool behind it, and the model stalled politely rather
+  than lying (2026-08-24).** Telegram is a door the daemon answers, not a place it can
+  address: the only senders are the loop replying to whoever wrote, the proactive
+  delivery, and the delegation report. Asked by voice to send a link, the model had
+  nothing to call. The expectation, from
+  [voice_write_nudge_spike.py](../evals/voice_write_nudge_spike.py), was a
+  confabulated "보냈어". **Measured (`evals/voice_send_message_spike.py`,
+  `gemini-3.1-flash-live-preview`, 80/81 tools, N=4 per arm, Korean TTS over the live
+  audio path): it never faked the send. It asked a clarifying question every single
+  run** - "어떤 링크를 말씀하시는 건가요?", once "텔레그램 정보가 필요해요, 아이디를
+  알려주시면". So a missing capability does not always produce a lie; here it produced
+  an unanswerable question, which reads to the owner as "못 하네" and is why this went
+  unreported as a bug for so long. With a flat `send_message(text)` offered:
+  **0/4 -> 4/4 called, 4/4 carrying the real content in `text`.**
+- **`recipient_id=None` reached nobody, and 397 proactive utterances were dropped
+  saying so (2026-08-24).** `channels/base.py` documents None as "no request to
+  answer, so the channel delivers it to its configured owner". `TelegramChannel.send`
+  implements that as `sorted(self._allowed)`, and `_allowed` is only ever the
+  constructor's env list. Under `dm_policy=pairing` - this install - that list is
+  **empty** and the approved owner lives in `channel_pairing` instead, so every
+  unaddressed send raised `TelegramNoRecipient`. Counted in the resident's own log:
+  **397 × "proactive: channel refused the utterance" between 2026-08-14 and
+  2026-08-20**, plus the delegation reports, all swallowed by their callers'
+  `except`/`logger` and therefore silent. `send_message` names the owner explicitly
+  (`Store.owner_id`) rather than inheriting the bug; the two older callers still have
+  it, and fixing them turns proactive Telegram messages back **on** at roughly that
+  rate, which is the owner's call and not a refactor.

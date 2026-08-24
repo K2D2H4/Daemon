@@ -336,6 +336,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                         memory,
                         recall,
                         delegate_wake=app.state.delegate_wake,
+                        channel=channel,
                     )
                 except Exception as exc:
                     # The wake round falls back to building its own per call -
@@ -1140,6 +1141,7 @@ async def _build_voice_runtime(
     recall: Any,
     *,
     delegate_wake: asyncio.Event | None = None,
+    channel: Any = None,
 ) -> VoiceRuntime:
     """The voice half of the tool layer, built once at startup.
 
@@ -1177,6 +1179,7 @@ async def _build_voice_runtime(
         mode=voice_mode,
         screen_share=screen_share,
         delegate_wake=delegate_wake,
+        channel=channel,
     )
     return VoiceRuntime(
         store=store, writer=writer, recall=recall, tools=tools, mcp=mcp, screen_share=screen_share
@@ -1916,6 +1919,7 @@ async def _build_tools(
     mode: str | None = None,
     screen_share: Any = None,
     delegate_wake: asyncio.Event | None = None,
+    channel: Any = None,
 ) -> tuple[Any, Any, str]:
     """Assemble the tool layer. Returns (runner, mcp bridge, status).
 
@@ -1943,6 +1947,13 @@ async def _build_tools(
     path and `run_voice`'s own call pass) means `delegate_task` is never
     registered: it is a voice-only tool, since it exists for work the native-audio
     model cannot do itself.
+
+    `channel` is the same voice-only story, for `send_message`: on the text path the
+    reply already reaches the channel, so a send tool there would only produce a
+    second copy of it. `None` - the text path, a standalone `run_voice`, or a
+    channel that failed to build - means the tool is not registered at all, because
+    a tool that cannot deliver is worse than a missing one: the audio model reports
+    the send either way.
     """
     if not settings.tools_enabled:
         return None, None, "off (DAEMON_TOOLS_ENABLED)"
@@ -1987,6 +1998,21 @@ async def _build_tools(
                     request=request, origin="owner", channel="voice", sender_id=None
                 ),
                 notify=delegate_wake.set,
+            )
+        )
+
+    if channel is not None:
+        # Voice-only, same as `delegate_task` above: this is how a spoken turn puts
+        # a link or a name in writing where the owner can keep it.
+        from daemon.tools.message import SendMessage
+
+        registry.register(
+            SendMessage(
+                channel,
+                # The paired owner, read per call rather than captured at boot: an
+                # install can be paired after the daemon starts, and a tool holding
+                # the boot-time answer would stay unable to address anyone.
+                recipient=lambda: store.owner_id(channel.name),
             )
         )
 

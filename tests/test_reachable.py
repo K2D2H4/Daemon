@@ -188,6 +188,11 @@ WIRED_CLASSES = (
     # exists for method calls rather than classes.
     "DelegateTask",
     "DelegationWorker",
+
+    # The voice path's one way to put text on the owner's channel
+    # (`_build_tools`, when `channel` is passed - which only the resident's voice
+    # runtime does).
+    "SendMessage",
 )
 
 

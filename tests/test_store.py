@@ -230,3 +230,31 @@ def test_a_tool_call_belongs_to_the_local_day_not_the_utc_one(
 
     assert third == ["fetch_page"]
     assert fourth == ["read_page"]
+
+
+def test_owner_id_names_the_approved_owner(tmp_path):
+    """Who an unaddressed message is *for*. `has_owner` answers whether onboarding
+    happened; nothing answered who it happened with, so a paired install had an owner
+    it could not address."""
+    from datetime import timedelta
+
+    from daemon.clock import now
+    from daemon.memory.store import Store
+
+    stamp = now()
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        assert store.owner_id("telegram") is None
+        store.create_pairing(
+            channel="telegram",
+            sender_id="8675309",
+            code="ABCD",
+            created_at=stamp,
+            expires_at=stamp + timedelta(hours=1),
+        )
+        assert store.owner_id("telegram") is None, "pending is not approved"
+        store.approve_pairing(channel="telegram", sender_id="8675309", approved_at=now())
+        assert store.owner_id("telegram") == "8675309"
+        assert store.owner_id("slack") is None, "another channel's owner is not this one's"
+    finally:
+        store.close()
