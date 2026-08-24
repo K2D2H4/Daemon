@@ -1241,3 +1241,33 @@ def test_a_web_search_still_counts_as_something_the_person_did(
     tool_call(store, "tavily__tavily_search", '{"results": []}')
 
     assert "tavily__tavily_search" in _tool_usage(store.tool_calls_for_day(DAY))
+
+
+def test_the_facts_bucket_refuses_manner_and_names_where_it_goes() -> None:
+    """The leak this whole plan exists for. On 2026-08-19 the owner said once that
+    he was tired of being asked `무슨 재미난 얘기 있어요?`, and reflection wrote
+
+        - 사용자가 AI 비서에게 반복적인 질문(...)을 자제하고 담백하게 대화해 줄 것을 요청함
+
+    into `core.md` as a *fact*, beside his dog's name and his birthday. `core.md`
+    is injected whole on every turn, has no cap, no decay and no retraction, so
+    one remark became a standing order.
+
+    The prompt already had the right bucket - `observations` is "대화 내용이 아니라
+    대화 방식에 대한 것" and feeds M4's rated path (weekly, >=5 observations, <=3
+    new, <=20 active, `daemon persona forget`). The model simply filed it in the
+    wrong one. So the boundary is stated, and stated as a prohibition on `facts`
+    rather than only as a description of `observations`: the description was
+    already there and lost.
+    """
+    from daemon.reflection import SYSTEM
+
+    facts_rule = SYSTEM.split("- entities:")[0]
+    assert "말투" in facts_rule and "observations" in facts_rule, (
+        "the facts bucket must name manner and say where it goes instead"
+    )
+    for banned in ("자제", "요청", "선호"):
+        assert banned in facts_rule, (
+            f"{banned!r} is the shape the misfiled line took; the prompt has to "
+            "name the kind, not hope the model generalises"
+        )
