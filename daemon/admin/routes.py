@@ -12,6 +12,11 @@ Endpoints (docs/design/2026-08-07-m5-admin-web-design.md, "JSON API"):
     GET   /admin/api/activity     the merged decision log (proactivity, tools, reflection)
     GET   /admin/api/proactive/today   today's rounds, budget and timeline marks
     GET   /admin/api/tools/log    tool calls and refusals with their policy decision
+    GET   /admin/api/memory       curated facts, entity notes, the reflection history
+    GET   /admin/api/persona      the anchor, learned rules with evidence, diaries
+    POST  /admin/api/persona/forget  {id, why} -> {retired, id}; 409 on a diverged file
+    POST  /admin/api/reflect      {} -> {results: [...]}; runs under the shared catch-up lock
+    POST  /admin/api/persona/evolve  {force} -> {date, skipped, ...}; same lock
 
     --- Phase 2, all behind DAEMON_MCP_ENABLED (409 with guidance when off) ---
     GET    /admin/api/mcp/catalog          the trusted catalog (no commands/urls)
@@ -448,7 +453,12 @@ async def persona(request: Request) -> JSONResponse:
 @router.post("/api/persona/forget")
 async def persona_forget(request: Request) -> JSONResponse:
     """Retire one learned rule. The browser's `daemon persona forget`."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "body must be an object"}, status_code=400)
     try:
         rule_id = int(body.get("id"))
     except (TypeError, ValueError):
@@ -462,7 +472,14 @@ async def persona_forget(request: Request) -> JSONResponse:
     settings = request.app.state.settings
     with open_store(settings) as store:
         try:
-            retired = await LearnedRules(settings.data_dir, store).retire(rule_id, why=why)
+            # Same lock reflect_now/persona_evolve take: `retire` snapshots the
+            # active rows, then awaits a file read and a threaded write, and
+            # nothing in `diverged_bodies` catches a mirror row that outran the
+            # snapshot - only the other direction (file has an orphan the mirror
+            # doesn't). Without this lock, a weekly `add()` finishing inside that
+            # window would have its new bullets silently dropped by this rewrite.
+            async with request.app.state.catchup_lock:
+                retired = await LearnedRules(settings.data_dir, store).retire(rule_id, why=why)
         except LearnedFileDiverged as diverged:
             # 409, and the exception's own words. This is a refusal with a fix -
             # the file holds bullets the mirror does not know, and rewriting it
@@ -509,7 +526,12 @@ async def reflect_now(request: Request) -> JSONResponse:
 async def persona_evolve(request: Request) -> JSONResponse:
     """Run the weekly persona pass now - the only way to see it without waiting
     for Monday 05:00. Same lock, same reason as `reflect_now`."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "body must be an object"}, status_code=400)
     force = bool(body.get("force"))
     settings = request.app.state.settings
     try:

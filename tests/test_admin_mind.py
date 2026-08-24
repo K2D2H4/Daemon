@@ -693,10 +693,13 @@ def test_d_forget_refuses_a_diverged_file_with_the_reason(tmp_path: Path) -> Non
     app = create_app(_settings(tmp_path))
     with TestClient(app, base_url=LOOPBACK) as client:
         r = client.post("/admin/api/persona/forget", json={"id": rule, "why": "지워"})
+        persona = client.get("/admin/api/persona").json()
 
     assert r.status_code == 409
     assert "손으로 적은 줄" in r.json()["detail"]
-    # And nothing was written: the rule is still active and the file untouched.
+    # And nothing was written: the mirror row is still active and the file untouched.
+    active_ids = {rule["id"] for rule in persona["rules"] if rule["status"] == "active"}
+    assert rule in active_ids
     text = (tmp_path / "persona" / "learned.md").read_text(encoding="utf-8")
     assert "손으로 적은 줄" in text
     assert "미러가 아는 규칙" in text
@@ -747,12 +750,7 @@ def test_forget_rejects_an_empty_why_and_an_unknown_id(tmp_path: Path) -> None:
 def test_e_the_run_now_endpoints_take_the_shared_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Both buttons must serialise against the cron and the boot task.
-
-    Plain `def`, not `@pytest.mark.asyncio`: `TestClient` runs its own event-loop
-    portal, and nesting that inside a loop pytest-asyncio already has running
-    raises. The assertion (`seen == [lock, lock]`) needs nothing async.
-    """
+    """Both buttons must serialise against the cron and the boot task."""
     from daemon.admin import routes as routes_mod
 
     seen: list[object] = []
@@ -824,3 +822,148 @@ def test_a_failed_pass_is_a_502_not_a_silent_ok(
 
     assert r.status_code == 502
     assert "provider unreachable" in r.json()["detail"]
+
+
+def test_forget_rejects_a_malformed_body(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        r = client.post("/admin/api/persona/forget", content=b"not json")
+
+    assert r.status_code == 400
+    assert r.json()["detail"] == "body must be valid JSON"
+
+
+def test_forget_rejects_a_non_object_body(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        r = client.post("/admin/api/persona/forget", json=[1, 2, 3])
+
+    assert r.status_code == 400
+    assert r.json()["detail"] == "body must be an object"
+
+
+def test_evolve_rejects_a_malformed_body(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        r = client.post("/admin/api/persona/evolve", content=b"not json")
+
+    assert r.status_code == 400
+    assert r.json()["detail"] == "body must be valid JSON"
+
+
+def test_evolve_rejects_a_non_object_body(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        r = client.post("/admin/api/persona/evolve", json=[1, 2, 3])
+
+    assert r.status_code == 400
+    assert r.json()["detail"] == "body must be an object"
+
+
+def test_forget_holds_the_catchup_lock_while_it_retires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`LearnedRules.retire` snapshots the active rows, then awaits a file read
+    and a threaded write - and `diverged_bodies` only catches a file-side orphan
+    (a bullet the mirror does not know), never the reverse. So a weekly `add()`
+    that finishes inside that window would have its new bullets silently
+    dropped by this rewrite, with nothing to detect it. This proves the retire
+    call actually runs with `catchup_lock` held, the same lock
+    reflect_now/persona_evolve take."""
+    from daemon.admin import routes as routes_mod
+    from daemon.app import DB_FILENAME
+
+    store = Store.open(tmp_path / DB_FILENAME)
+    rule = store.insert_persona_rule(
+        body="규칙", created_at=_dt(9), evidence=[], supersession_key=None
+    )
+    store.close()
+    _write(tmp_path / "persona" / "learned.md", "# learned\n\n- 규칙\n")
+
+    app = create_app(_settings(tmp_path))
+    seen_locked: list[bool] = []
+    real_retire = routes_mod.LearnedRules.retire
+
+    async def spying_retire(self, rule_id, *, why, now=None):
+        # Records whether the lock is held *during* the call, then defers to
+        # the real implementation so the request still succeeds normally.
+        seen_locked.append(app.state.catchup_lock.locked())
+        return await real_retire(self, rule_id, why=why, now=now)
+
+    monkeypatch.setattr(routes_mod.LearnedRules, "retire", spying_retire)
+
+    with TestClient(app, base_url=LOOPBACK) as client:
+        r = client.post("/admin/api/persona/forget", json={"id": rule, "why": "이유"})
+
+    assert r.status_code == 200, r.text
+    assert seen_locked == [True]
+
+
+def test_evolve_reports_a_failed_pass_as_502(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Symmetric to `test_a_failed_pass_is_a_502_not_a_silent_ok` on the other
+    'run now' route - a raising `run_persona_evolution_now` must not read as a
+    silent success either."""
+    from daemon.admin import routes as routes_mod
+
+    async def boom(settings, lock, *, force=False):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(routes_mod, "run_persona_evolution_now", boom)
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        r = client.post("/admin/api/persona/evolve", json={})
+
+    assert r.status_code == 502
+    assert "model unavailable" in r.json()["detail"]
+
+
+def test_the_run_now_routes_serialise_every_field_of_the_real_dataclasses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every other test in this file feeds a fake result object carrying only
+    the fields the route happens to read - a field rename on the real `Result`
+    (daemon.reflection) or `EvolutionResult` (daemon.persona.evolve) would pass
+    every one of them and only surface at runtime. This constructs the actual
+    dataclasses and pins the route's serialisation to them."""
+    from daemon.admin import routes as routes_mod
+    from daemon.persona.evolve import EvolutionResult
+    from daemon.reflection import Result
+
+    real_result = Result(
+        date="2026-08-24", status="written", messages_read=41,
+        facts=2, entities=1, observations=1, tool_facts=0,
+        detail="", problems=["헤아릴 수 없음"],
+    )
+    real_evolution = EvolutionResult(
+        date="2026-08-24", observations_read=9, proposed=3, added=2,
+        retired=1, skipped="", problems=("증거 부족",),
+    )
+
+    async def fake_reflect(settings, lock):
+        return [real_result]
+
+    async def fake_evolve(settings, lock, *, force=False):
+        return real_evolution
+
+    monkeypatch.setattr(routes_mod, "run_reflection_now", fake_reflect)
+    monkeypatch.setattr(routes_mod, "run_persona_evolution_now", fake_evolve)
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        reflect = client.post("/admin/api/reflect", json={})
+        evolve = client.post("/admin/api/persona/evolve", json={})
+
+    assert reflect.json()["results"] == [
+        {
+            "date": "2026-08-24", "status": "written", "messages_read": 41,
+            "facts": 2, "entities": 1, "observations": 1,
+            "problems": ["헤아릴 수 없음"],
+        }
+    ]
+    assert evolve.json() == {
+        "date": "2026-08-24", "skipped": "", "observations_read": 9,
+        "proposed": 3, "added": 2, "retired": 1, "problems": ["증거 부족"],
+    }
