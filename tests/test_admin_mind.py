@@ -240,3 +240,52 @@ def test_a_missing_note_file_is_a_null_body_not_a_crash(
 
     assert payload["entities"][0]["name"] == "벨라"
     assert payload["entities"][0]["body"] is None
+
+
+def test_a_second_reflection_run_for_the_same_date_wins(
+    tmp_path: Path, store: Store
+) -> None:
+    """`recent_reflection_runs` is id DESC (store.py:1513); `memory_payload`
+    reverses it before folding into a dict so the *last-inserted* (newest) row
+    for a date overwrites the first, rather than the other way around."""
+    _write(tmp_path / "memory" / "reflections" / "2026-08-19.md", "# 2026-08-19\n")
+    store.record_reflection_run(
+        now=_dt(19, 10), date="2026-08-19", status="written",
+        messages_read=10, facts=1, entities=1, observations=1, detail="first pass",
+    )
+    store.record_reflection_run(
+        now=_dt(19, 20), date="2026-08-19", status="skipped",
+        messages_read=99, facts=9, entities=9, observations=9, detail="second pass",
+    )
+
+    payload = memory_payload(store, tmp_path)
+
+    assert len(payload["reflections"]) == 1
+    row = payload["reflections"][0]
+    assert row["status"] == "skipped"
+    assert row["messages_read"] == 99
+    assert row["facts"] == 9
+    assert row["entities"] == 9
+    assert row["observations"] == 9
+    assert row["detail"] == "second pass"
+
+
+def test_the_body_budget_is_shared_and_entities_go_first(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`BodyBudget`'s own docstring says one budget is shared across every
+    section. Give the entity note and the reflection artifact bodies that
+    cannot both fit under one small `MAX_BODY_BYTES`, and confirm exactly one
+    survives - the entity's, because `memory_payload` spends the shared budget
+    on entities before it reaches reflections."""
+    monkeypatch.setattr(mind, "MAX_BODY_BYTES", 20)
+    _write(tmp_path / "memory" / "entities" / "E.md", "E" * 15)
+    _write(tmp_path / "memory" / "reflections" / "2026-08-19.md", "R" * 15)
+    store.upsert_entity(name="E", kind=None, file="memory/entities/E.md", now=_dt(19))
+
+    payload = memory_payload(store, tmp_path)
+
+    assert payload["entities"][0]["body"] == "E" * 15
+    assert payload["entities_bodies_truncated"] is False
+    assert payload["reflections"][0]["body"] is None
+    assert payload["reflections_bodies_truncated"] is True
