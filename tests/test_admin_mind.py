@@ -22,11 +22,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 import daemon.admin.mind as mind
 from daemon.admin.mind import memory_payload, persona_payload
+from daemon.app import create_app
 from daemon.config import Settings
 from daemon.memory.store import Store
+
+# `TestClient` defaults to `Host: testserver`; the router refuses any Host that
+# is not loopback (`test_admin.py`'s reasoning applies here unchanged).
+LOOPBACK = "http://127.0.0.1"
 
 
 def _dt(day: int, hour: int = 12) -> datetime:
@@ -435,3 +441,45 @@ def test_the_persona_body_budget_is_shared_across_diary_seed_and_learned(
     assert payload["diaries"][0]["body"] == "D" * 10
     assert payload["anchor"]["seed"]["text"] == "S" * 10
     assert payload["anchor"]["learned"]["text"] is None
+
+
+def test_the_read_endpoints_serve_the_payloads_over_loopback(tmp_path: Path) -> None:
+    _write(tmp_path / "memory" / "reflections" / "2026-08-19.md", "# 성찰\n")
+    _write(tmp_path / "persona" / "seed.md", "# seed\n")
+    # 7, not the field's own default of 20 - a non-default value here proves the
+    # route threads `request.app.state.settings` through to `persona_payload`,
+    # rather than a fresh `Settings()` that would coincidentally also read 20.
+    app = create_app(_settings(tmp_path, persona_max_active_rules=7))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        memory = client.get("/admin/api/memory")
+        persona = client.get("/admin/api/persona")
+
+    assert memory.status_code == 200
+    assert [r["date"] for r in memory.json()["reflections"]] == ["2026-08-19"]
+    assert persona.status_code == 200
+    assert persona.json()["anchor"]["max_active"] == 7
+
+
+def test_f_no_route_writes_the_seed() -> None:
+    """CONTRACTS non-negotiable 5. Asserted on the router, not on a code review:
+    a later hand could add a PATCH and every other test would stay green."""
+    from daemon.admin import routes
+
+    seed_routes = [
+        (route.path, sorted(getattr(route, "methods", set())))
+        for route in routes.router.routes
+        if "seed" in route.path
+    ]
+    assert seed_routes == []
+
+    persona_writes = [
+        (route.path, sorted(getattr(route, "methods", set())))
+        for route in routes.router.routes
+        if route.path.startswith("/admin/api/persona")
+        and set(getattr(route, "methods", set())) - {"GET", "HEAD"}
+    ]
+    # Only `forget` and `evolve` write anything under /persona, and neither
+    # touches seed.md - see Task 6.
+    assert {path for path, _ in persona_writes} <= {
+        "/admin/api/persona/forget", "/admin/api/persona/evolve"
+    }

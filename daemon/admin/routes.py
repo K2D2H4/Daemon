@@ -54,6 +54,7 @@ from daemon.admin.activity import (
     tool_log_payload,
 )
 from daemon.admin.mcp_oauth import OAuthError, complete_oauth_flow, start_oauth_flow
+from daemon.admin.mind import memory_payload, persona_payload
 from daemon.admin.restart import is_supervised, schedule_exit
 from daemon.admin.settings_io import (
     PatchError,
@@ -405,6 +406,30 @@ async def tools_log(request: Request, limit: int = 60) -> JSONResponse:
     settings = request.app.state.settings
     with open_store(settings) as store:
         payload = tool_log_payload(store, limit=clamp_limit(limit))
+    return JSONResponse(payload)
+
+
+# --- Memory and Persona: what she knows, and what she worked out -------------
+# The read half. Not on the 15-second poll the browser runs for health/activity:
+# these change once a day and carry ~12 KB of markdown, so `index.html` loads them
+# on tab entry, on an explicit refresh, and after a write.
+
+
+@router.get("/api/memory")
+async def memory(request: Request) -> JSONResponse:
+    """Curated facts, entity notes, and the reflection history with its artifacts."""
+    settings = request.app.state.settings
+    with open_store(settings) as store:
+        payload = memory_payload(store, settings.data_dir)
+    return JSONResponse(payload)
+
+
+@router.get("/api/persona")
+async def persona(request: Request) -> JSONResponse:
+    """The anchor readout, learned rules with their evidence, observations, diaries."""
+    settings = request.app.state.settings
+    with open_store(settings) as store:
+        payload = persona_payload(store, settings.data_dir, settings)
     return JSONResponse(payload)
 
 
