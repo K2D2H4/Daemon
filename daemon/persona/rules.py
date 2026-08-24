@@ -32,6 +32,7 @@ last".
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from collections.abc import Iterable
@@ -161,6 +162,34 @@ class LearnedRules:
         """The active rules, oldest first - what gets injected and what
         `daemon persona` shows."""
         return self._store.active_persona_rules()
+
+    def annotations(self) -> dict[str, tuple[str, int]]:
+        """Each active rule's body mapped to `(formed date, observation count)`.
+
+        The half of a rule that `learned.md` deliberately does not carry (see the
+        module docstring) and that the prompt needs anyway. Assembled here, on
+        every turn, from the columns - never written to the file, because a model
+        that could write its own `created_at` could backdate a rule to look
+        established, and a prompt that weights rules by date hands it a reason to.
+
+        Keyed by body because that is already the join between file and mirror:
+        `diverged_bodies` compares the same two sides the same way. A body with no
+        row gets no annotation and is rendered plain, which is what today's prompt
+        does for every rule.
+        """
+        out: dict[str, tuple[str, int]] = {}
+        for row in self.active():
+            try:
+                evidence = json.loads(row["evidence"])
+                count = len(evidence) if isinstance(evidence, list) else 1
+            except (TypeError, ValueError):
+                # A rule that cannot report its count still has a date worth
+                # having. Counting it as one understates it, which is the safe
+                # direction: this block exists to make old single remarks weigh
+                # less, never to inflate one.
+                count = 1
+            out[row["body"]] = (str(row["created_at"])[:10], max(count, 1))
+        return out
 
     async def add(
         self, proposals: list[Proposal], *, now: datetime | None = None
