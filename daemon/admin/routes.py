@@ -62,10 +62,16 @@ from daemon.admin.settings_io import (
     current_settings_payload,
     write_env_secret,
 )
-from daemon.app import health_payload, open_store
+from daemon.app import (
+    health_payload,
+    open_store,
+    run_persona_evolution_now,
+    run_reflection_now,
+)
 from daemon.config import GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES, VOICE_PROVIDERS
 from daemon.llm.base import Message, ProviderError
 from daemon.mcp_catalog import CATALOG, lookup
+from daemon.persona.rules import LearnedFileDiverged, LearnedRules
 from daemon.setup import check_anthropic, check_gemini, check_openai
 from daemon.tasks import Task
 from daemon.tools.mcp import (
@@ -431,6 +437,98 @@ async def persona(request: Request) -> JSONResponse:
     with open_store(settings) as store:
         payload = persona_payload(store, settings.data_dir, settings)
     return JSONResponse(payload)
+
+
+# The write half: three handles, each calling a function the CLI already calls.
+# Nothing here adds a rule or edits one - `persona/learned.md` is AI-owned
+# (docs/CONTRACTS.md non-negotiable 5) and retiring is the one thing a human was
+# ever able to ask for (`daemon persona forget`). No route writes `seed.md`.
+
+
+@router.post("/api/persona/forget")
+async def persona_forget(request: Request) -> JSONResponse:
+    """Retire one learned rule. The browser's `daemon persona forget`."""
+    body = await request.json()
+    try:
+        rule_id = int(body.get("id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="id must be a rule id") from None
+    why = str(body.get("why") or "").strip()
+    if not why:
+        # Required for the same reason the CLI requires it: a rule that vanished
+        # with no reason is indistinguishable from one that vanished by accident.
+        raise HTTPException(status_code=400, detail="why is required")
+
+    settings = request.app.state.settings
+    with open_store(settings) as store:
+        try:
+            retired = await LearnedRules(settings.data_dir, store).retire(rule_id, why=why)
+        except LearnedFileDiverged as diverged:
+            # 409, and the exception's own words. This is a refusal with a fix -
+            # the file holds bullets the mirror does not know, and rewriting it
+            # would drop them (daemon/cli.py:1237-1239). A generic failure here
+            # reads as a broken button.
+            raise HTTPException(status_code=409, detail=str(diverged)) from None
+    if not retired:
+        raise HTTPException(status_code=404, detail=f"no active rule with id {rule_id}")
+    return JSONResponse({"retired": True, "id": rule_id})
+
+
+@router.post("/api/reflect")
+async def reflect_now(request: Request) -> JSONResponse:
+    """Run the reflection pass over every unreflected day, now.
+
+    Takes `app.state.catchup_lock` - the same lock the 04:00 cron and the boot
+    catch-up take. Two `run(date)` for one day double-write its append-only
+    artifact and its observations (daemon/app.py:232-237).
+    """
+    settings = request.app.state.settings
+    try:
+        results = await run_reflection_now(settings, request.app.state.catchup_lock)
+    except Exception as exc:  # noqa: BLE001 - a person is waiting for the answer
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+    return JSONResponse(
+        {
+            "results": [
+                {
+                    "date": r.date,
+                    "status": r.status,
+                    "messages_read": r.messages_read,
+                    "facts": r.facts,
+                    "entities": r.entities,
+                    "observations": r.observations,
+                    "problems": list(r.problems),
+                }
+                for r in results
+            ]
+        }
+    )
+
+
+@router.post("/api/persona/evolve")
+async def persona_evolve(request: Request) -> JSONResponse:
+    """Run the weekly persona pass now - the only way to see it without waiting
+    for Monday 05:00. Same lock, same reason as `reflect_now`."""
+    body = await request.json()
+    force = bool(body.get("force"))
+    settings = request.app.state.settings
+    try:
+        result = await run_persona_evolution_now(
+            settings, request.app.state.catchup_lock, force=force
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+    return JSONResponse(
+        {
+            "date": result.date,
+            "skipped": result.skipped,
+            "observations_read": result.observations_read,
+            "proposed": result.proposed,
+            "added": result.added,
+            "retired": result.retired,
+            "problems": list(result.problems),
+        }
+    )
 
 
 # --- MCP (Phase 2), all behind DAEMON_MCP_ENABLED ----------------------------
