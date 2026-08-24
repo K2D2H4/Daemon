@@ -24,7 +24,8 @@ from pathlib import Path
 import pytest
 
 import daemon.admin.mind as mind
-from daemon.admin.mind import memory_payload
+from daemon.admin.mind import memory_payload, persona_payload
+from daemon.config import Settings
 from daemon.memory.store import Store
 
 
@@ -289,3 +290,118 @@ def test_the_body_budget_is_shared_and_entities_go_first(
     assert payload["entities_bodies_truncated"] is False
     assert payload["reflections"][0]["body"] is None
     assert payload["reflections_bodies_truncated"] is True
+
+
+def _settings(tmp_path: Path, **kw: object) -> Settings:
+    return Settings(_env_file=None, provider="ollama", data_dir=tmp_path, **kw)
+
+
+def test_the_anchor_reads_the_caps_and_both_files(tmp_path: Path, store: Store) -> None:
+    _write(tmp_path / "persona" / "seed.md", "# seed\n\n- 너는 벨라다.\n")
+    _write(tmp_path / "persona" / "learned.md", "# learned\n\n- 규칙 하나.\n")
+    store.insert_persona_rule(
+        body="규칙 하나.", created_at=_dt(9), evidence=[], supersession_key=None
+    )
+    store.insert_observation(
+        body="아직 안 쓰인 관찰", observed_from="2026-08-20/2026-08-20",
+        confidence=0.7, now=_dt(20),
+    )
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+    anchor = payload["anchor"]
+
+    assert anchor["active"] == 1
+    assert anchor["max_active"] == 20            # Settings default
+    assert anchor["max_new_per_cycle"] == 3
+    assert anchor["min_observations"] == 5
+    assert anchor["unconsumed"] == 1
+    assert anchor["last_rule_at"] == "2026-08-09T12:00:00Z"
+    assert anchor["seed"]["lines"] == 3
+    assert anchor["seed"]["file"] == "persona/seed.md"
+    assert "너는 벨라다" in anchor["seed"]["text"]
+    assert anchor["learned"]["lines"] == 3
+
+
+def test_a_rule_carries_its_evidence_as_sentences(tmp_path: Path, store: Store) -> None:
+    """`evidence` is a list of observation ids. A screen showing '3 observations'
+    and not which three is the blindness this tab exists to fix."""
+    first = store.insert_observation(
+        body="솔직하게 인정하는 소통을 선호한다.",
+        observed_from="2026-08-06/2026-08-06", confidence=0.85, now=_dt(6),
+    )
+    second = store.insert_observation(
+        body="오답을 꼼꼼하게 검증한다.",
+        observed_from="2026-08-07/2026-08-07", confidence=0.8, now=_dt(7),
+    )
+    rule = store.insert_persona_rule(
+        body="변명 없이 인정하라.", created_at=_dt(9),
+        evidence=[first, second], supersession_key=None,
+    )
+    store.consume_observations([first, second], rule)
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+    got = payload["rules"][0]
+
+    assert got["id"] == rule
+    assert got["status"] == "active"
+    assert [e["id"] for e in got["evidence"]] == [first, second]
+    assert got["evidence"][0]["body"] == "솔직하게 인정하는 소통을 선호한다."
+    assert got["evidence"][0]["confidence"] == 0.85
+    assert payload["observations_total"] == 2
+    assert payload["observations_consumed"] == 2
+
+
+def test_b_a_retired_rule_stays_with_its_reason(tmp_path: Path, store: Store) -> None:
+    """learned.md is rewritten whole, so a vanished rule leaves no trace there."""
+    gone = store.insert_persona_rule(
+        body="틀린 규칙", created_at=_dt(10), evidence=[], supersession_key=None
+    )
+    store.retire_persona_rule(gone, when=_dt(24), why="사용자가 아니라고 했다")
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+
+    assert payload["rules_active"] == 0
+    assert payload["rules_retired"] == 1
+    retired = [r for r in payload["rules"] if r["status"] == "retired"][0]
+    assert retired["retired_why"] == "사용자가 아니라고 했다"
+    assert retired["retired_at"] == "2026-08-24T12:00:00Z"
+
+
+def test_an_evidence_id_with_no_observation_row_is_skipped(
+    tmp_path: Path, store: Store
+) -> None:
+    """`evidence` is model-supplied json. A stale id must not 500 the tab."""
+    store.insert_persona_rule(
+        body="근거가 사라진 규칙", created_at=_dt(9),
+        evidence=[4242], supersession_key=None,
+    )
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+
+    assert payload["rules"][0]["evidence"] == []
+
+
+def test_c_the_diary_cap_drops_bodies_not_entries(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mind, "MAX_DIARY_BODIES", 1)
+    _write(tmp_path / "persona" / "diary" / "2026-08-10.md", "10\n")
+    _write(tmp_path / "persona" / "diary" / "2026-08-24.md", "24\n")
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+
+    assert [d["date"] for d in payload["diaries"]] == ["2026-08-24", "2026-08-10"]
+    assert payload["diaries"][0]["body"] == "24\n"
+    assert payload["diaries"][1]["body"] is None
+    assert payload["diaries_bodies_truncated"] is True
+
+
+def test_missing_seed_and_learned_are_null_not_a_crash(
+    tmp_path: Path, store: Store
+) -> None:
+    """A fresh install before the first evolution has neither file."""
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+
+    assert payload["anchor"]["seed"]["text"] is None
+    assert payload["anchor"]["seed"]["lines"] == 0
+    assert payload["anchor"]["learned"]["text"] is None
