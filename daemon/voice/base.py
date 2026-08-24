@@ -112,6 +112,51 @@ class VoiceSession(Protocol):
         during a live screen share. Added by ADR 0009."""
         ...
 
+    async def send_images(self, jpegs: Sequence[bytes], note: str) -> None:
+        """The JPEGs a tool captured, as ONE turn the model is meant to read, with
+        the framing that says so.
+
+        Not `send_frame`. A frame is realtime video input, and on
+        `gemini-3.1-flash-live-preview` a frame written inside a tool round never
+        enters the prompt at all: measured against the raw socket by
+        `usageMetadata.promptTokensDetails`, which lists an `IMAGE` entry for a
+        picture that arrived and nothing for one that did not. In a tool round it
+        listed nothing at every gap tried, and the model answered a "what is on my
+        screen" question with confidently invented digits - the owner's report.
+        The same JPEG as a `clientContent` image part is priced as an *image*
+        (1092 tokens against 60) and read correctly.
+
+        **Order is the whole contract, and both halves are measured.** The image
+        turn must go out *after* the `toolResponse` that unblocked the call, never
+        before: a `clientContent` arriving while a call is still pending cancels it
+        and the session goes silent (4/4, every gap). Sent after, in the measured
+        order, `evals/screen_frame_arrival_spike.py` reads a 24px six-digit code
+        **19/20 across two runs (12/12 then 7/8) against the old order's 0/20**. The pooled
+        number rather than the best run: the first was 12/12 and quoting only that
+        would be the same overstatement this whole investigation kept making.
+
+        The interrupt `clientContent` is documented for is wanted here - it cuts
+        off the answer the model was about to invent from a caption alone. What it
+        does not do is stop that answer being *spoken*: in 5 of 12 turns the owner
+        hears the invented number before the correction (5 of 12, then 1 of 8).
+        That residue is in
+        `conversation.SCREENSHOT_FOLLOWS`, which also records the wording that
+        failed to fix it.
+
+        **Plural, and that is the reason it is plural.** `see_screen` with
+        `all_displays` returns one result carrying one image per monitor, and the
+        turn asks for an answer - so a call per image is a *generation request* per
+        image, each one interrupting the last. Two monitors would mean the owner
+        hears a fragment about the first display, cut off, then a second answer.
+        Every JPEG belongs in one turn.
+
+        `note` is `daemon.tools.screen.screen_note`'s framing, once for the turn
+        rather than once per image, and it travels with the pixels rather than in
+        the caption - this is the first transport where an image and its framing
+        *can* share a turn.
+        """
+        ...
+
     async def send_context(self, text: str) -> None:
         """Put text in front of the model without asking it to respond.
 

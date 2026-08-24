@@ -16,6 +16,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `m1c_text_tools_spike.py` | whether our provider survives a real Gemini 3 tool round-trip — the `thoughtSignature` contract |
 | `openai_compatible_spike.py` | whether a real OpenAI-compatible endpoint answers `/models`, a Korean turn, and a tool round-trip |
 | `openai_compatible_loop_spike.py` | whether the *assembled* app survives a real turn on that endpoint — loop, recall, tool policy, audit table |
+| `screen_frame_arrival_spike.py` | why voice answered "what's on my screen" from nothing — a `realtimeInput.video` frame never arrives inside a tool round, and the fix is the image part *after* the tool response (0/20 → 19/20) |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py

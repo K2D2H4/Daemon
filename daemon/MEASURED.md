@@ -559,3 +559,45 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   because a delivered utterance finally survives to be counted. The same emptiness
   explains the stalled label clock (PLAN 8.1): **zero labelable messages have ever been
   delivered**, so there was never anything to label.
+- **Voice was answering "what's on my screen" from nothing, and the frame was the
+  wrong transport rather than the wrong resolution (2026-08-24).** The owner's report
+  was that Telegram answers screen questions accurately and voice answers them
+  *plausibly*. `_deliver_images` had already fixed the version where voice sent the
+  caption and no pixels; this was the layer under it. A `realtimeInput.video` frame
+  sent between a `toolCall` and its `toolResponse` **never reaches the model at all** -
+  read off `usageMetadata.promptTokensDetails`, which lists an `IMAGE` entry for a
+  picture the prompt holds and nothing for one it does not. In a tool round it listed
+  nothing at every gap tried, and the model named digits that were never on screen
+  **25 times out of 25**. Outside a tool round the same frame does arrive (60 tokens,
+  and it read a 24px code correctly) but needs **~1s** before the next client message -
+  at 0.0/0.2/0.5s it silently does not land, which is why the live-share pump is fine
+  and `see_screen` was not. Two fixes failed first, and both are worth keeping.
+  (1) `mediaResolution: MEDIA_RESOLUTION_HIGH` raises a frame from 60 tokens to 522 and
+  raises its *ingest* cost from ~1s to ~3s, so at a 1.0s gap the frame stopped arriving
+  entirely - **a sharper frame that lands after the answer is worth less than a coarse
+  one that lands before it**, and a field the socket accepts can still be a regression.
+  (2) Widening the gap: 0.0s and 1.5s both scored 0/4. What worked is the JPEG as a
+  `clientContent` image part - priced as an *image*, **1092 tokens against 60**, next
+  to the 1120 the Telegram path gets - sent **after** the `toolResponse`. Order is the
+  contract in both directions: sent *before* it, the `clientContent` cancels the
+  pending call and the session goes silent, 4/4 at every gap. Measured through the
+  product's own code, **0/20 → 19/20** (two runs, 12/12 then 7/8); restating the
+  question in the image turn does not help. **Three wrong numbers were reported for this fix before the right one, and
+  every one of them was a measurement bug rather than a behaviour** - the reason this
+  file exists. (a) `Transcript.role` is `"assistant"`, and reading it as the wire's
+  `"model"` scored five empty transcripts as five wrong answers. (b) Scoring the
+  *first* transcript after the image scores the answer the image turn exists to
+  interrupt: the real sequence is `[interrupted] -> "6423입니다" -> "114170입니다"`, the
+  invention then the correction, so stopping at the first read the invention. That
+  reported 2/10, then 8/15, against an actual 12/12 - and it was believable, because
+  "a real but weak improvement" is exactly what a half-working transport looks like.
+  **A plausible partial result is the dangerous one; only the raw socket disagreeing
+  with the harness (5/6 against 2/10) exposed it.** What is left after all that is one
+  genuine defect and it is not accuracy: the owner *hears* the invented answer before
+  the correction in **5 of 12 turns**, because a `toolResponse` starts generation
+  server-side. Telling the model to wait for the image changed that to 5 of 12, the
+  same count to the trial, so the wording was dropped rather than kept as decoration -
+  the lever is playback on our side, not a prompt. A published GitHub issue claiming
+  `clientContent` + `inline_data` closes this model with 1007 did not reproduce on a
+  correctly-shaped raw payload; it was the library's bug, not the API's, which is again
+  the whole reason to ask the socket. `evals/screen_frame_arrival_spike.py`.
