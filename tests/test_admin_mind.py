@@ -307,13 +307,21 @@ def test_the_anchor_reads_the_caps_and_both_files(tmp_path: Path, store: Store) 
         confidence=0.7, now=_dt(20),
     )
 
-    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+    settings = _settings(
+        tmp_path,
+        persona_max_active_rules=12,
+        persona_max_new_per_cycle=4,
+        persona_min_observations=9,
+    )
+    payload = persona_payload(store, tmp_path, settings)
     anchor = payload["anchor"]
 
     assert anchor["active"] == 1
-    assert anchor["max_active"] == 20            # Settings default
-    assert anchor["max_new_per_cycle"] == 3
-    assert anchor["min_observations"] == 5
+    # Distinct, non-default values, so the test cannot pass against a
+    # hardcoded 20/3/5 - it must actually be reading `settings`.
+    assert anchor["max_active"] == 12
+    assert anchor["max_new_per_cycle"] == 4
+    assert anchor["min_observations"] == 9
     assert anchor["unconsumed"] == 1
     assert anchor["last_rule_at"] == "2026-08-09T12:00:00Z"
     assert anchor["seed"]["lines"] == 3
@@ -404,4 +412,26 @@ def test_missing_seed_and_learned_are_null_not_a_crash(
 
     assert payload["anchor"]["seed"]["text"] is None
     assert payload["anchor"]["seed"]["lines"] == 0
+    assert payload["anchor"]["learned"]["text"] is None
+
+
+def test_the_persona_body_budget_is_shared_across_diary_seed_and_learned(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`persona_payload` threads one `BodyBudget` through the whole payload
+    (`BodyBudget`'s own docstring). It is spent in the order the code actually
+    reads: the diary bodies first (`_bodies` runs before the return dict is
+    built), then `seed.md`, then `learned.md`. Size the three bodies so the
+    diary and the seed both fit but nothing is left for `learned.md`, and
+    confirm the starvation lands there rather than each file getting its own
+    budget."""
+    monkeypatch.setattr(mind, "MAX_BODY_BYTES", 25)
+    _write(tmp_path / "persona" / "diary" / "2026-08-10.md", "D" * 10)
+    _write(tmp_path / "persona" / "seed.md", "S" * 10)
+    _write(tmp_path / "persona" / "learned.md", "L" * 10)
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+
+    assert payload["diaries"][0]["body"] == "D" * 10
+    assert payload["anchor"]["seed"]["text"] == "S" * 10
     assert payload["anchor"]["learned"]["text"] is None
