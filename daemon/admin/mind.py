@@ -15,9 +15,11 @@ an entity name from the URL and joins it onto a path. There is no such endpoint
 here, so there is no traversal bug to get wrong.
 
 It does grow: roughly 800 bytes a day of reflections. `MAX_BODY_BYTES` and the
-three count caps bound it, and they bound **bodies only** - the list is always
-complete. A capped list would silently shorten history, which is the failure this
-whole tab exists to fix.
+three per-kind body caps below bound that growth, and they bound **bodies
+only** - a body dropped for either reason reports `bodies_truncated`. The list
+ceilings below are a separate backstop, on the corpus itself rather than on
+bytes; a section that outgrows one reports `list_truncated` instead. Either way
+the drop is named, never silent - the failure this whole tab exists to fix.
 
 ## The reflection list is keyed on the files, not on `reflection_runs`
 
@@ -266,6 +268,15 @@ def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[st
     anchor's claim is not "seed.md is untouched", it is "change is slow"
     (docs/PLAN.md 5.1) - and that is only legible as a rate. The files follow
     because the ownership claim needs the evidence to be actually there.
+
+    One deliberate asymmetry, matching `memory_payload`'s `facts_active`/
+    `facts_retired`/`entities_total`: `observations_total`/
+    `observations_consumed` here are `COUNT(*)` reads, true against the table
+    regardless of any cap. `rules_retired` is not - it stays `len(retired)`,
+    the length of the same `MAX_RULES`-capped list rendered beside it, so it
+    can never be false about what is actually on screen; `rules_list_truncated`
+    carries whether more exist. Do not make this one table-true too - that
+    would turn a label into a claim about rows nobody can see.
     """
     from daemon.persona.evolve import DIARY_SUBDIR
 
@@ -355,7 +366,11 @@ def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[st
             "max_active": settings.persona_max_active_rules,
             "max_new_per_cycle": settings.persona_max_new_per_cycle,
             "min_observations": settings.persona_min_observations,
-            "unconsumed": sum(1 for obs in observations if obs["consumed_by"] is None),
+            # `observations_total - observations_consumed`, not a sum over
+            # `observations` - that list is the same MAX_OBSERVATIONS-capped
+            # window as the other counts above, and the anchor sits right next
+            # to `observations_list_truncated`, which admits the cap out loud.
+            "unconsumed": observations_total - observations_consumed,
             "last_rule_at": store.last_persona_rule_created_at(),
             # Read, never written - docs/CONTRACTS.md non-negotiable 5.
             "seed": _file_view(data_dir, "persona/seed.md", budget),

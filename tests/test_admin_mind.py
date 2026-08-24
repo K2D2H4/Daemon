@@ -379,6 +379,32 @@ def test_the_anchor_reads_the_caps_and_both_files(tmp_path: Path, store: Store) 
     assert anchor["learned"]["lines"] == 3
 
 
+def test_anchor_unconsumed_reads_the_table_not_the_window(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`anchor.unconsumed` used to sum over the MAX_OBSERVATIONS-capped window -
+    the same bug class as `observations_total`/`observations_consumed`, and it
+    sits right next to `observations_list_truncated`, which already admits the
+    cap is in effect. `observations_total - observations_consumed` is table
+    truth regardless of the window."""
+    monkeypatch.setattr(mind, "MAX_OBSERVATIONS", 1)
+    store.insert_observation(
+        body="첫", observed_from="2026-08-01/2026-08-01", confidence=0.5, now=_dt(1),
+    )
+    store.insert_observation(
+        body="둘째", observed_from="2026-08-02/2026-08-02", confidence=0.5, now=_dt(2),
+    )
+    store.insert_observation(  # newest - the one row the window keeps
+        body="셋째", observed_from="2026-08-20/2026-08-20", confidence=0.5, now=_dt(20),
+    )
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+
+    assert len(payload["observations"]) == 1          # window, still capped
+    assert payload["observations_list_truncated"] is True
+    assert payload["anchor"]["unconsumed"] == 3        # table truth, not 1
+
+
 def test_a_rule_carries_its_evidence_as_sentences(tmp_path: Path, store: Store) -> None:
     """`evidence` is a list of observation ids. A screen showing '3 observations'
     and not which three is the blindness this tab exists to fix."""
