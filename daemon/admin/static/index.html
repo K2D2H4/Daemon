@@ -1038,7 +1038,13 @@ async function loadToolLog(){
 // Not on the 15s poll: these change once a day and carry ~12KB of markdown.
 // Bodies arrive inlined, so `disclose` never fetches - it only unhides.
 function disclose(label,body,file){
-  if(body==null)return `<p class="cap muted">${esc(file)} — body not loaded (over the cap)</p>`;
+  // `body==null` covers two different reasons (missing note file, or cut by the
+  // budget/count cap) that the payload does not distinguish per-item - see
+  // mind.py's `_read`/`_bodies`. Naming a specific reason here would be a guess,
+  // so this says only what is true in both cases, and keeps the label (name,
+  // mentions, links, or date/counts) instead of dropping it - a bare file path
+  // for '벨라' told you nothing else about the row.
+  if(body==null)return `<p class="cap muted">${esc(label)} — ${esc(file)} (no body loaded)</p>`;
   return `<details><summary class="cap">${esc(label)}</summary><pre class="well">${esc(body)}</pre></details>`;
 }
 function factRow(f){
@@ -1149,7 +1155,11 @@ $('#reflect-btn').addEventListener('click',()=>runPass(
   r=>r.results.length
     ?r.results.map(x=>`${x.date}: ${x.status} (${x.messages_read} msg → ${x.facts} fact(s), `
        +`${x.entities} entity(ies), ${x.observations} obs)`).join(' · ')
-    :'Nothing to reflect on: every day with a log already has a reflection.')
+    // `catch_up()` (reflection.py) drops today from its backlog unconditionally,
+    // so an empty result never means today got reflected - only that every day
+    // *before* today already has one. Saying "every day with a log" here would
+    // be false on the (common) day where today itself is still pending.
+    :'Nothing to reflect on: every day before today already has a reflection.')
   .then(loadMemory));
 $('#evolve-btn').addEventListener('click',()=>runPass(
   '#evolve-btn','#persona-note','/admin/api/persona/evolve',
