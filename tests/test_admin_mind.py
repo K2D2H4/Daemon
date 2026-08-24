@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+import daemon.admin.mind as mind
+from daemon.admin.mind import memory_payload
 from daemon.memory.store import Store
 
 
@@ -123,3 +125,118 @@ def test_retired_persona_rules_carries_when_and_why(store: Store) -> None:
     assert rows[0]["retired_why"] == "사용자가 지우라고 했다"
     assert rows[0]["retired_at"] == "2026-08-24T12:00:00Z"
     assert {int(r["id"]) for r in store.active_persona_rules()} == {kept}
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_a_a_day_with_an_artifact_and_no_row_is_still_listed(
+    tmp_path: Path, store: Store
+) -> None:
+    """reflection_runs arrived in M5; the artifacts predate it. Measured on the
+    real install: 5 rows, 9 artifacts. Keyed on the table, four days vanish."""
+    _write(tmp_path / "memory" / "reflections" / "2026-08-14.md", "# 2026-08-14 성찰\n")
+    _write(tmp_path / "memory" / "reflections" / "2026-08-19.md", "# 2026-08-19 성찰\n")
+    store.record_reflection_run(
+        now=_dt(19, 19), date="2026-08-19", status="written",
+        messages_read=72, facts=1, entities=2, observations=2, detail="",
+    )   # `now=`, not `ts=` - verified against store.py:1471
+
+    payload = memory_payload(store, tmp_path)
+    dates = [r["date"] for r in payload["reflections"]]
+
+    assert dates == ["2026-08-19", "2026-08-14"]        # newest first
+    assert payload["reflections_total"] == 2
+    assert payload["reflections_recorded"] == 1
+    recorded, only_file = payload["reflections"]
+    assert recorded["status"] == "written"
+    assert recorded["messages_read"] == 72
+    assert only_file["status"] is None                   # artifact only
+    assert only_file["body"] == "# 2026-08-14 성찰\n"
+
+
+def test_b_retired_facts_are_kept_and_counted_apart(tmp_path: Path, store: Store) -> None:
+    _fact(store, "활성", importance=9, key="k")
+    _fact(store, "대체", importance=8, key="k")          # retires the first
+
+    payload = memory_payload(store, tmp_path)
+
+    assert payload["facts_active"] == 1
+    assert payload["facts_retired"] == 1
+    assert {f["status"] for f in payload["facts"]} == {"active", "retired"}
+    # importance DESC: the active one leads.
+    assert payload["facts"][0]["body"] == "활성"
+
+
+def test_c_the_body_cap_drops_bodies_not_list_entries(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mind, "MAX_REFLECTION_BODIES", 2)
+    for day in (10, 11, 13, 14):
+        _write(tmp_path / "memory" / "reflections" / f"2026-08-{day}.md", f"day {day}\n")
+
+    payload = memory_payload(store, tmp_path)
+
+    assert [r["date"] for r in payload["reflections"]] == [
+        "2026-08-14", "2026-08-13", "2026-08-11", "2026-08-10"
+    ]
+    assert payload["reflections_bodies_truncated"] is True
+    assert payload["reflections"][0]["body"] == "day 14\n"
+    assert payload["reflections"][1]["body"] == "day 13\n"
+    assert payload["reflections"][2]["body"] is None     # listed, no body
+    assert payload["reflections"][2]["file"] == "memory/reflections/2026-08-11.md"
+
+
+def test_c_the_byte_budget_also_only_drops_bodies(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mind, "MAX_BODY_BYTES", 40)
+    for day in (10, 11, 13):
+        _write(tmp_path / "memory" / "reflections" / f"2026-08-{day}.md", "x" * 30)
+
+    payload = memory_payload(store, tmp_path)
+
+    assert len(payload["reflections"]) == 3
+    assert payload["reflections_bodies_truncated"] is True
+    assert sum(1 for r in payload["reflections"] if r["body"] is not None) == 1
+
+
+def test_entities_carry_their_note_and_links(tmp_path: Path, store: Store) -> None:
+    _write(tmp_path / "memory" / "entities" / "UJET.cx.md", "# UJET.cx\n\n회사.\n")
+    _write(tmp_path / "memory" / "entities" / "Schubert Chin.md", "# Schubert Chin\n")
+    a = store.upsert_entity(
+        name="UJET.cx", kind="company", file="memory/entities/UJET.cx.md", now=_dt(19)
+    )
+    b = store.upsert_entity(
+        name="Schubert Chin", kind="person",
+        file="memory/entities/Schubert Chin.md", now=_dt(19),
+    )
+    store.set_mention_count(a, 3)
+    store.set_mention_count(b, 2)
+    store.link_entities(a, b)
+
+    payload = memory_payload(store, tmp_path)
+    first = payload["entities"][0]
+
+    assert first["name"] == "UJET.cx"                    # mention_count DESC
+    assert first["kind"] == "company"
+    assert first["mentions"] == 3
+    assert first["links"] == ["Schubert Chin"]
+    assert first["body"] == "# UJET.cx\n\n회사.\n"
+    assert payload["entities_total"] == 2
+
+
+def test_a_missing_note_file_is_a_null_body_not_a_crash(
+    tmp_path: Path, store: Store
+) -> None:
+    """The real install has an entities row ('벨라') whose note file is absent."""
+    store.upsert_entity(
+        name="벨라", kind=None, file="memory/entities/벨라.md", now=_dt(19)
+    )
+
+    payload = memory_payload(store, tmp_path)
+
+    assert payload["entities"][0]["name"] == "벨라"
+    assert payload["entities"][0]["body"] is None
