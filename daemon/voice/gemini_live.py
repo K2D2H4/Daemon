@@ -514,9 +514,18 @@ class GeminiLiveSession:
         `realtimeInput.video` mirrors the named `realtimeInput.audio` field
         `send_audio` uses above, both part of the same `BidiGenerateContentRealtimeInput`
         message - not the older `mediaChunks` list form. Grounded in that
-        symmetry rather than confirmed against the live socket: this repo's
-        "socket wins over docs" rule (see `send_context` below) still applies,
-        and that confirmation is pending a run with a real API key.
+        symmetry rather than confirmed against the live socket - and since
+        measured against it, which retires the "pending confirmation" this
+        docstring used to carry and adds a limit that only the socket could say.
+
+        **This works only outside a tool round.** Measured by
+        `usageMetadata.promptTokensDetails`, which lists an `IMAGE` entry for a
+        picture the prompt actually holds: a frame sent on its own arrives (60
+        tokens, and it read a 24px code correctly) but needs ~1s before the next
+        client message, and a frame sent between a `toolCall` and its
+        `toolResponse` never arrives at all, at any gap tried. That is why the
+        `see_screen` path uses `send_image` below and this stays what its name
+        says - the live-share pump's transport, which has no tool round in it.
         """
         if not jpeg:
             return
@@ -529,6 +538,29 @@ class GeminiLiveSession:
                     }
                 }
             }
+        )
+
+    async def send_image(self, jpeg: bytes, note: str) -> None:
+        """One JPEG as a `clientContent` image part, with its framing in the same
+        turn. See `daemon.voice.base.VoiceSession.send_image` for the two
+        measurements that fix both the transport and its position in the exchange.
+
+        `turnComplete: true`, unlike `send_context`: the point is for the model to
+        answer the question it is already holding, now that it can see. The
+        interrupt that makes `clientContent` dangerous for recall is what makes it
+        right here - it replaces an answer composed from a caption alone.
+        """
+        if not jpeg:
+            return
+        parts: list[dict[str, Any]] = [
+            {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(jpeg).decode()}}
+        ]
+        if note.strip():
+            # Never an empty text part: a part carrying nothing is a field on the
+            # wire for no gain, and this file has been closed 1007 for less.
+            parts.append({"text": note})
+        await self._send(
+            {"clientContent": {"turns": [{"role": "user", "parts": parts}], "turnComplete": True}}
         )
 
     async def send_context(self, text: str) -> None:

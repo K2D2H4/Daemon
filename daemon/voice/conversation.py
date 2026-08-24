@@ -107,6 +107,32 @@ the first third of an utterance is a different query and gets thrown away;
 covering most of it embeds to nearly the same vector and is worth the whole 117 ms
 it saves."""
 
+SCREENSHOT_FOLLOWS = (
+    "The screenshot itself follows as an image. If no image arrives, say you cannot "
+    "see it rather than describing the screen."
+)
+"""What the `toolResponse` says in place of the pixels, which arrive just after it.
+
+Honesty about failure is the whole job. `_deliver_images` runs *after* this goes
+out, so a delivery failure can no longer downgrade the caption the way the old
+order could - the caption has to be written as though the image might not arrive,
+and a model told to admit it can answer "I cannot see it" instead of inventing a
+screen.
+
+**What this cannot do is stop the model answering early, and that was measured
+rather than assumed.** A `toolResponse` starts generation immediately (a blocking
+call produces nothing before the response and 13.69s of audio after it), so the
+model begins answering from the caption and the image turn then interrupts it. The
+answer that survives is right, but the owner *hears* the invented one first - "6423
+입니다", cut off, then "114170입니다" - in **5 of 12 turns**. Adding "Do not answer
+from this caption - wait for the image" to this string changed that to **5 of 12**:
+the same count, to the trial. So the wording is not the lever and it was dropped
+rather than kept as decoration; the model is not choosing to answer early, the
+socket is starting it. The lever, if this is worth fixing, is on our side of the
+speaker - holding playback until the interrupt has had its chance - and that is a
+change to the audio path, not to a prompt.
+"""
+
 CALLED_BY_NAME = (
     "The owner just called your name and said nothing else. Answer the way a person "
     "answers being called from across a room: a word or two, in character, and then "
@@ -936,68 +962,82 @@ class VoiceConversation:
         # (`daemon tools log`); the runner also logs each run at INFO. A spoken turn
         # has no reply line to fold a notice into, and reading raw commands aloud is
         # exactly the clutter this removal is about.
-        results = await self._deliver_images(session, outcome.results)
-        await session.send_tool_response(results)
+        # Response first, THEN the pixels. Both halves are measured (see
+        # `VoiceSession.send_image`): a `clientContent` image arriving while the
+        # call is still pending cancels it and the session goes silent, and the
+        # `realtimeInput.video` frame this used to send before the response never
+        # entered the prompt at all. So the call is unblocked first and the image
+        # follows as its own turn, which is also the turn that carries its framing.
+        await session.send_tool_response(_caption_only(outcome.results))
+        await self._deliver_images(session, outcome.results)
 
     async def _deliver_images(
         self, session: VoiceSession, results: Sequence[ToolResult]
-    ) -> Sequence[ToolResult]:
-        """Put what a tool captured in front of the model, not just its caption.
+    ) -> None:
+        """Put what a tool captured in front of the model, after its caption.
 
-        `see_screen` returns a caption *and* pixels (`ToolResult.images`). The text
-        loop attaches the pixels as their own user turn (daemon/loop.py); voice
-        dropped them on the floor and sent only the caption - "captured 1
-        display(s)" - so the model was asked what is on screen while being shown
-        nothing, and did what a model does with a question it cannot answer: it
-        invented one. The owner's screen held a photo of food and the daemon called
-        it a picture of a dog, confidently, while the text path described the same
-        screen correctly.
+        `see_screen` returns a caption *and* pixels (`ToolResult.images`). Two
+        earlier versions of this got the pixels wrong in two different ways, and
+        both are worth stating because both produced the same owner-facing
+        symptom - a confident description of a screen the model could not see.
 
-        Frames go over `realtime_input.video`, the channel the live share already
-        uses, and they go *before* the tool response so the image is in history when
-        the model composes its answer. Verified against the live socket rather than
-        inferred: a probe image carrying the digits 7392 came back read aloud
-        correctly, which is also what retires the "pending confirmation" note this
-        transport used to carry.
+        First it sent only the caption ("captured 1 display(s)") and dropped the
+        pixels: the owner's screen held a photo of food and the daemon called it a
+        picture of a dog. Then it sent them over `realtimeInput.video` before the
+        tool response, which looked verified because a frame *does* arrive that way
+        outside a tool round. Inside one it never arrives: measured on the raw
+        socket, `usageMetadata.promptTokensDetails` listed no `IMAGE` entry at any
+        gap tried, and the model answered "what number is on my screen" with digits
+        that were never there, 4 times out of 4.
 
-        Never fails the turn: an image that cannot be delivered downgrades the
-        caption to say so, which is the one honest thing to tell a model that is
-        about to be asked what it can see.
+        So the pixels now go as a `clientContent` image part (1092 tokens against
+        60) and they go *after* `send_tool_response` - sent before it, they cancel
+        the pending call and the session says nothing at all. In the measured order
+        a 24px six-digit code reads 12/12 against the old order's 0/12.
+        `VoiceSession.send_image` holds the numbers, and
+        `SCREENSHOT_FOLLOWS` holds the one defect this ordering leaves behind.
+
+        Never fails the turn: the caption has already gone out by the time this
+        runs, and it already tells the model to say so rather than describe a
+        screen it cannot see, so a delivery failure costs honesty and not the turn.
         """
-        from dataclasses import replace
-
         from daemon.tools.screen import screen_note
 
-        delivered: list[ToolResult] = []
         for result in results:
-            if not result.images:
-                delivered.append(result)
-                continue
-            sent = 0
             for image in result.images:
                 try:
-                    await session.send_frame(image.data)
-                    sent += 1
+                    await session.send_image(image.data, screen_note("the owner's screen"))
                 except Exception:
                     logger.exception("voice: could not hand over a captured image")
-            if not sent:
-                delivered.append(
-                    replace(
-                        result,
-                        content=(
-                            f"{result.content}\n\nThe image could not be delivered, so "
-                            "you cannot see it. Say that rather than describing it."
-                        ),
-                    )
-                )
-                continue
-            # The untrusted-data framing rides in the caption, because a frame
-            # carries no text of its own - same stance as the text path, which puts
-            # `screen_note` on the turn holding the image (security stance A).
-            delivered.append(
-                replace(result, content=f"{result.content}\n\n{screen_note('the screen')}")
+
+
+def _caption_only(results: Sequence[ToolResult]) -> Sequence[ToolResult]:
+    """The tool results as the `toolResponse` should carry them: no pixels, and a
+    caption that says what is coming.
+
+    The instruction is the honest half. `_deliver_images` runs *after* this goes
+    out, so a failure there can no longer downgrade the caption the way it used to
+    - the caption has to be written as though the image might not arrive. A model
+    told "an image follows, and say so if you cannot see one" answers a failed
+    delivery with "I cannot see it", which is the one useful thing to say. The
+    version of this that asserted only "captured the main display" is what the
+    model filled in for itself.
+    """
+    from dataclasses import replace
+
+    carried: list[ToolResult] = []
+    for result in results:
+        if not result.images:
+            carried.append(result)
+            continue
+        carried.append(
+            replace(
+                result,
+                images=(),
+                content=f"{result.content}\n\n{SCREENSHOT_FOLLOWS}",
             )
-        return delivered
+        )
+    return carried
 
 
 def _covers(prepared: str, said: str) -> bool:

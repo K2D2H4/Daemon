@@ -112,6 +112,39 @@ class VoiceSession(Protocol):
         during a live screen share. Added by ADR 0009."""
         ...
 
+    async def send_image(self, jpeg: bytes, note: str) -> None:
+        """One JPEG the model is meant to *read*, with the framing that says so.
+
+        Not `send_frame`. A frame is realtime video input, and on
+        `gemini-3.1-flash-live-preview` a frame written inside a tool round never
+        enters the prompt at all: measured against the raw socket by
+        `usageMetadata.promptTokensDetails`, which lists an `IMAGE` entry for a
+        picture that arrived and nothing for one that did not. In a tool round it
+        listed nothing at every gap tried, and the model answered a "what is on my
+        screen" question with confidently invented digits - the owner's report.
+        The same JPEG as a `clientContent` image part is priced as an *image*
+        (1092 tokens against 60) and read correctly.
+
+        **Order is the whole contract, and both halves are measured.** The image
+        turn must go out *after* the `toolResponse` that unblocked the call, never
+        before: a `clientContent` arriving while a call is still pending cancels it
+        and the session goes silent (4/4, every gap). Sent after, in the measured
+        order, `evals/screen_frame_arrival_spike.py` reads a 24px six-digit code
+        **12/12 against the old order's 0/12**.
+
+        The interrupt `clientContent` is documented for is wanted here - it cuts
+        off the answer the model was about to invent from a caption alone. What it
+        does not do is stop that answer being *spoken*: in 5 of 12 turns the owner
+        hears the invented number before the correction. That residue is in
+        `conversation.SCREENSHOT_FOLLOWS`, which also records the wording that
+        failed to fix it.
+
+        `note` is `daemon.tools.screen.screen_note`'s framing, and it travels in
+        the same turn as the pixels rather than in the caption, because this is the
+        first transport where an image and its framing *can* share a turn.
+        """
+        ...
+
     async def send_context(self, text: str) -> None:
         """Put text in front of the model without asking it to respond.
 

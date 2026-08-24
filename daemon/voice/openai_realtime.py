@@ -413,6 +413,18 @@ class OpenAIRealtimeSession:
             )
             self._warned_no_video = True
 
+    async def send_image(self, jpeg: bytes, note: str) -> None:
+        """No-op, for the same reason `send_frame` is: no image input on this
+        provider. Shares that method's warn-once flag rather than adding a second
+        one - the owner-facing fact is one fact ("this provider cannot see"), and
+        `see_screen` is not offered here anyway (`VIDEO_CAPABLE_VOICE_PROVIDERS`).
+        """
+        if not self._warned_no_video:
+            logger.warning(
+                "openai-realtime: images are unsupported on OpenAI realtime; the image is dropped"
+            )
+            self._warned_no_video = True
+
     async def send_context(self, text: str) -> None:
         """Put text in the model's history without asking it to answer.
 
