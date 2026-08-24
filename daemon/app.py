@@ -1033,7 +1033,11 @@ async def run_persona_evolution_now(
     settings: Settings, lock: asyncio.Lock | None, *, force: bool = False
 ) -> EvolutionResult:
     """Run the weekly pass now, and raise if it could not. Same split as
-    `run_reflection_now`, same reason."""
+    `run_reflection_now`, same reason.
+
+    `lock` is `app.state.catchup_lock` here too: two `run()` in one week would
+    both write the week's diary and re-consume observations.
+    """
     evolution, close = await build_persona_evolution(settings)
     try:
         async with lock if lock is not None else nullcontext():

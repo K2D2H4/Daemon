@@ -489,10 +489,18 @@ def test_f_no_route_writes_the_seed() -> None:
 def test_e_the_app_exposes_the_catchup_lock(tmp_path: Path) -> None:
     """Without this the two run-now endpoints cannot take the lock the crons take,
     and a click during the 04:00 cron double-writes the append-only artifact
-    (daemon/app.py:232-237)."""
+    (daemon/app.py:232-237). A type check alone is not enough - a fresh, unshared
+    `asyncio.Lock()` would pass `isinstance` while serialising nothing against the
+    crons, so this asserts identity against the exact lock object each scheduled
+    job was handed."""
     app = create_app(_settings(tmp_path))
     with TestClient(app, base_url=LOOPBACK):
-        assert isinstance(app.state.catchup_lock, asyncio.Lock)
+        lock = app.state.catchup_lock
+        assert isinstance(lock, asyncio.Lock)
+        reflect_job = app.state.scheduler.get_job("reflection")
+        persona_job = app.state.scheduler.get_job("persona-evolution")
+        assert reflect_job.args[1] is lock
+        assert persona_job.args[1] is lock
 
 
 @pytest.mark.asyncio
@@ -526,6 +534,7 @@ async def test_run_reflection_now_holds_the_lock_while_it_runs(
 
     held = asyncio.Event()
     release = asyncio.Event()
+    closed = False
 
     class SlowReflection:
         async def catch_up(self):
@@ -535,7 +544,8 @@ async def test_run_reflection_now_holds_the_lock_while_it_runs(
 
     async def build(settings):
         async def close() -> None:
-            return None
+            nonlocal closed
+            closed = True
 
         return SlowReflection(), close
 
@@ -545,6 +555,120 @@ async def test_run_reflection_now_holds_the_lock_while_it_runs(
     await held.wait()
 
     assert lock.locked()
+    # The gateway/store is still open while the work runs - `close()` fires only
+    # once the pass is done, in the `finally`.
+    assert not closed
     release.set()
     assert await task == []
     assert not lock.locked()
+    assert closed
+
+
+@pytest.mark.asyncio
+async def test_run_reflection_now_closes_the_gateway_even_when_the_work_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`close()` sits in a `finally` precisely so a pass that blows up mid-way
+    does not leak the provider connection. A deleted `finally` still passes
+    every other test in this file, so this is the one that catches it."""
+    from daemon import app as app_mod
+
+    closed = False
+
+    class BoomingReflection:
+        async def catch_up(self):
+            raise RuntimeError("model unavailable")
+
+    async def build(settings):
+        async def close() -> None:
+            nonlocal closed
+            closed = True
+
+        return BoomingReflection(), close
+
+    monkeypatch.setattr(app_mod, "build_reflection", build)
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        await app_mod.run_reflection_now(_settings(tmp_path), None)
+
+    assert closed
+
+
+@pytest.mark.asyncio
+async def test_run_persona_evolution_now_raises_where_the_tick_swallows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Mirrors the reflection case on the other 'run now' endpoint: a raising
+    APScheduler job silently un-schedules the weekly persona pass, which is
+    exactly what `_persona_tick`'s swallow exists to prevent."""
+    from daemon import app as app_mod
+
+    async def boom(settings):
+        raise RuntimeError("no provider")
+
+    monkeypatch.setattr(app_mod, "build_persona_evolution", boom)
+
+    with pytest.raises(RuntimeError, match="no provider"):
+        await app_mod.run_persona_evolution_now(_settings(tmp_path), None)
+
+    # The tick still swallows it - that contract does not change for persona
+    # either.
+    with caplog.at_level("ERROR"):
+        await app_mod._persona_tick(_settings(tmp_path), None)
+    assert "persona evolution tick failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_persona_evolution_now_holds_the_lock_while_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same proof as the reflection helper, for the second 'run now' endpoint -
+    the file's own header claims both take the same lock, but only reflection
+    was ever tested. Also exercises `force=`, which `run_reflection_now` has no
+    equivalent of."""
+    from daemon import app as app_mod
+    from daemon.persona.evolve import EvolutionResult
+
+    held = asyncio.Event()
+    release = asyncio.Event()
+    closed = False
+    seen_force: bool | None = None
+
+    class SlowEvolution:
+        async def run(self, *, now=None, force: bool = False) -> EvolutionResult:
+            nonlocal seen_force
+            seen_force = force
+            held.set()
+            await release.wait()
+            return EvolutionResult(
+                date="2026-08-24",
+                observations_read=0,
+                proposed=0,
+                added=0,
+                retired=0,
+                skipped="",
+                problems=(),
+            )
+
+    async def build(settings):
+        async def close() -> None:
+            nonlocal closed
+            closed = True
+
+        return SlowEvolution(), close
+
+    monkeypatch.setattr(app_mod, "build_persona_evolution", build)
+    lock = asyncio.Lock()
+    task = asyncio.create_task(
+        app_mod.run_persona_evolution_now(_settings(tmp_path), lock, force=True)
+    )
+    await held.wait()
+
+    assert lock.locked()
+    assert not closed
+    release.set()
+    result = await task
+    assert result.date == "2026-08-24"
+    assert not lock.locked()
+    assert closed
+    assert seen_force is True
