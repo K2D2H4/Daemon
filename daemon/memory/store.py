@@ -954,6 +954,12 @@ class Store:
         ).fetchone()
         return int(row["n"])
 
+    def count_retired_entries(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_entries WHERE status = 'retired'"
+        ).fetchone()
+        return int(row["n"])
+
     # --- M2: entity notes ---------------------------------------------------
 
     def upsert_entity(self, *, name: str, kind: str | None, file: str, now: datetime) -> int:
@@ -996,6 +1002,10 @@ class Store:
             "SELECT * FROM entities ORDER BY mention_count DESC, name ASC LIMIT ?",
             (limit,),
         ).fetchall()
+
+    def count_entities(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM entities").fetchone()
+        return int(row["n"])
 
     def link_entities(self, src_id: int, dst_id: int) -> None:
         """Record that two entities appeared together. Undirected in meaning, so
@@ -1058,6 +1068,12 @@ class Store:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()
         return int(row["n"])
 
+    def count_consumed_observations(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM observations WHERE consumed_by IS NOT NULL"
+        ).fetchone()
+        return int(row["n"])
+
     def recent_observations(self, limit: int = 200) -> list[sqlite3.Row]:
         """Every observation, newest first, with whichever rule consumed it.
 
@@ -1069,6 +1085,20 @@ class Store:
             "SELECT * FROM observations ORDER BY created_at DESC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()
+
+    def observations_by_ids(self, ids: Sequence[int]) -> dict[int, sqlite3.Row]:
+        """Rows for a set of observation ids, keyed by id - the same shape as
+        `messages_by_ids`. A persona rule's evidence names ids from whenever the
+        rule was created, which can predate `recent_observations`' own display
+        cap; resolving evidence against this instead of that capped list is what
+        keeps old evidence from reading as a row that no longer exists."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM observations WHERE id IN ({placeholders})", tuple(ids)
+        ).fetchall()
+        return {int(row["id"]): row for row in rows}
 
     # --- M4: persona rules ---------------------------------------------------
     # Body lives in persona/learned.md (docs/CONTRACTS.md non-negotiable 5);

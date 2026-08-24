@@ -83,13 +83,18 @@ def test_recent_entries_includes_retired_and_active_entries_does_not(store: Stor
 
 
 def test_recent_observations_includes_consumed_ones(store: Store) -> None:
-    pending = store.insert_observation(
-        body="아직 안 쓰인 관찰", observed_from="2026-08-20/2026-08-20",
-        confidence=0.7, now=_dt(20),
-    )
+    # Inserted (and so id-ordered) before `pending`, but with an *earlier*
+    # `created_at` below - so the correct `created_at DESC` order, [pending,
+    # used], is the reverse of sqlite's natural rowid scan order. That makes a
+    # missing or reversed ORDER BY visible: either one would return
+    # [used, pending] instead.
     used = store.insert_observation(
         body="규칙이 먹은 관찰", observed_from="2026-08-19/2026-08-19",
         confidence=0.8, now=_dt(19),
+    )
+    pending = store.insert_observation(
+        body="아직 안 쓰인 관찰", observed_from="2026-08-20/2026-08-20",
+        confidence=0.7, now=_dt(20),
     )
     rule = store.insert_persona_rule(
         body="규칙", created_at=_dt(19), evidence=[used], supersession_key=None
@@ -178,6 +183,26 @@ def test_b_retired_facts_are_kept_and_counted_apart(tmp_path: Path, store: Store
     assert payload["facts"][0]["body"] == "활성"
 
 
+def test_fact_counts_and_list_truncated_read_the_table_not_the_window(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`facts_active`/`facts_retired` used to sum over the MAX_FACTS-capped
+    window (`fact_rows`), so a corpus past the cap under-reported both while
+    the list looked complete. COUNT(*) fixes the totals; `facts_list_truncated`
+    is the honest flag once the fetched rows fall short of them."""
+    monkeypatch.setattr(mind, "MAX_FACTS", 2)
+    _fact(store, "하나", importance=5)
+    _fact(store, "둘", importance=4)
+    _fact(store, "셋", importance=3)
+
+    payload = memory_payload(store, tmp_path)
+
+    assert len(payload["facts"]) == 2                 # window, still capped
+    assert payload["facts_active"] == 3                # table truth
+    assert payload["facts_retired"] == 0
+    assert payload["facts_list_truncated"] is True
+
+
 def test_c_the_body_cap_drops_bodies_not_list_entries(
     tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -234,6 +259,23 @@ def test_entities_carry_their_note_and_links(tmp_path: Path, store: Store) -> No
     assert first["links"] == ["Schubert Chin"]
     assert first["body"] == "# UJET.cx\n\n회사.\n"
     assert payload["entities_total"] == 2
+    assert payload["entities_list_truncated"] is False
+
+
+def test_entities_total_and_list_truncated_read_the_table_not_the_window(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same bug as facts, on `entities_total`: it used to be `len(entities)`,
+    the MAX_ENTITIES-capped list, not a table count."""
+    monkeypatch.setattr(mind, "MAX_ENTITIES", 1)
+    store.upsert_entity(name="A", kind=None, file="memory/entities/A.md", now=_dt(19))
+    store.upsert_entity(name="B", kind=None, file="memory/entities/B.md", now=_dt(19))
+
+    payload = memory_payload(store, tmp_path)
+
+    assert len(payload["entities"]) == 1
+    assert payload["entities_total"] == 2
+    assert payload["entities_list_truncated"] is True
 
 
 def test_a_missing_note_file_is_a_null_body_not_a_crash(
@@ -396,6 +438,80 @@ def test_an_evidence_id_with_no_observation_row_is_skipped(
     assert payload["rules"][0]["evidence"] == []
 
 
+def test_rule_evidence_resolves_past_the_capped_observation_window(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`observations` (the list this payload also returns) is capped at
+    MAX_OBSERVATIONS. A rule's evidence used to be looked up in that same
+    capped list, so an old id that fell out of the window rendered as if the
+    row had been deleted - the worst of the silent-ceiling bugs, since it made
+    an affirmatively false claim about a row still in the table. Evidence must
+    resolve against the table directly, by id."""
+    monkeypatch.setattr(mind, "MAX_OBSERVATIONS", 1)
+    old = store.insert_observation(
+        body="오래된 관찰", observed_from="2026-08-01/2026-08-01",
+        confidence=0.6, now=_dt(1),
+    )
+    store.insert_observation(  # newer - the one row the cap keeps
+        body="최근 관찰", observed_from="2026-08-20/2026-08-20",
+        confidence=0.6, now=_dt(20),
+    )
+    rule = store.insert_persona_rule(
+        body="오래된 근거로 만든 규칙", created_at=_dt(9),
+        evidence=[old], supersession_key=None,
+    )
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+
+    assert len(payload["observations"]) == 1          # `old` fell out of the window
+    got = payload["rules"][0]
+    assert got["id"] == rule
+    assert [e["id"] for e in got["evidence"]] == [old]
+    assert got["evidence"][0]["body"] == "오래된 관찰"
+
+
+def test_observation_counts_and_list_truncated_read_the_table_not_the_window(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mind, "MAX_OBSERVATIONS", 1)
+    first = store.insert_observation(
+        body="첫", observed_from="2026-08-06/2026-08-06", confidence=0.5, now=_dt(6),
+    )
+    store.insert_observation(
+        body="둘째", observed_from="2026-08-07/2026-08-07", confidence=0.5, now=_dt(7),
+    )
+    rule = store.insert_persona_rule(
+        body="규칙", created_at=_dt(9), evidence=[first], supersession_key=None
+    )
+    store.consume_observations([first], rule)
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+
+    assert len(payload["observations"]) == 1          # window, still capped
+    assert payload["observations_total"] == 2          # table truth
+    assert payload["observations_consumed"] == 1
+    assert payload["observations_list_truncated"] is True
+
+
+def test_rules_list_truncated_when_retired_rules_exceed_the_cap(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mind, "MAX_RULES", 1)
+    first = store.insert_persona_rule(
+        body="첫 규칙", created_at=_dt(9), evidence=[], supersession_key=None
+    )
+    second = store.insert_persona_rule(
+        body="둘째 규칙", created_at=_dt(10), evidence=[], supersession_key=None
+    )
+    store.retire_persona_rule(first, when=_dt(11), why="이유1")
+    store.retire_persona_rule(second, when=_dt(12), why="이유2")
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+
+    assert payload["rules_retired"] == 1               # capped display
+    assert payload["rules_list_truncated"] is True
+
+
 def test_c_the_diary_cap_drops_bodies_not_entries(
     tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -418,7 +534,10 @@ def test_missing_seed_and_learned_are_null_not_a_crash(
     payload = persona_payload(store, tmp_path, _settings(tmp_path))
 
     assert payload["anchor"]["seed"]["text"] is None
-    assert payload["anchor"]["seed"]["lines"] == 0
+    # A missing file has no lines to report either - `0` would claim an empty
+    # file that never existed.
+    assert payload["anchor"]["seed"]["lines"] is None
+    assert payload["anchor"]["seed"]["truncated"] is False   # absent, not cut
     assert payload["anchor"]["learned"]["text"] is None
 
 
@@ -431,7 +550,10 @@ def test_the_persona_body_budget_is_shared_across_diary_seed_and_learned(
     built), then `seed.md`, then `learned.md`. Size the three bodies so the
     diary and the seed both fit but nothing is left for `learned.md`, and
     confirm the starvation lands there rather than each file getting its own
-    budget."""
+    budget. Also proves `learned.md`'s `lines`/`truncated` tell the starved
+    case (a file that exists but lost to the budget) apart from a missing
+    file: `lines` is `None`, not the fabricated `0` a file that was never read
+    used to report, and `truncated` is `True` only for the file that was cut."""
     monkeypatch.setattr(mind, "MAX_BODY_BYTES", 25)
     _write(tmp_path / "persona" / "diary" / "2026-08-10.md", "D" * 10)
     _write(tmp_path / "persona" / "seed.md", "S" * 10)
@@ -441,7 +563,10 @@ def test_the_persona_body_budget_is_shared_across_diary_seed_and_learned(
 
     assert payload["diaries"][0]["body"] == "D" * 10
     assert payload["anchor"]["seed"]["text"] == "S" * 10
+    assert payload["anchor"]["seed"]["truncated"] is False
     assert payload["anchor"]["learned"]["text"] is None
+    assert payload["anchor"]["learned"]["lines"] is None
+    assert payload["anchor"]["learned"]["truncated"] is True
 
 
 def test_the_read_endpoints_serve_the_payloads_over_loopback(tmp_path: Path) -> None:

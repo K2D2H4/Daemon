@@ -146,6 +146,12 @@ def memory_payload(store: Store, data_dir: Path) -> dict[str, Any]:
         }
         for row in fact_rows
     ]
+    # COUNT(*)-backed, not derived from `fact_rows` - MAX_FACTS is a display
+    # cap, and a total read off the truncated window would quietly shrink once
+    # the real corpus grows past it.
+    facts_active = store.count_entries()
+    facts_retired = store.count_retired_entries()
+    facts_list_truncated = len(fact_rows) < facts_active + facts_retired
 
     entity_rows = store.entities(MAX_ENTITIES)
     entity_paths = [
@@ -165,6 +171,8 @@ def memory_payload(store: Store, data_dir: Path) -> dict[str, Any]:
         }
         for row in entity_rows
     ]
+    entities_total = store.count_entities()
+    entities_list_truncated = len(entity_rows) < entities_total
 
     # The files are the axis - see the module docstring.
     reflect_dir = data_dir / reflection_mod.REFLECTIONS_SUBDIR
@@ -204,10 +212,12 @@ def memory_payload(store: Store, data_dir: Path) -> dict[str, Any]:
 
     return {
         "facts": facts,
-        "facts_active": sum(1 for f in facts if f["status"] == "active"),
-        "facts_retired": sum(1 for f in facts if f["status"] == "retired"),
+        "facts_active": facts_active,
+        "facts_retired": facts_retired,
+        "facts_list_truncated": facts_list_truncated,
         "entities": entities,
-        "entities_total": len(entities),
+        "entities_total": entities_total,
+        "entities_list_truncated": entities_list_truncated,
         "entities_bodies_truncated": entities_cut,
         "reflections": reflections,
         "reflections_total": len(reflections),
@@ -223,12 +233,18 @@ def memory_payload(store: Store, data_dir: Path) -> dict[str, Any]:
 
 
 def _file_view(data_dir: Path, rel: str, budget: BodyBudget) -> dict[str, Any]:
+    """One markdown file against the shared budget - `lines` is `None`, not `0`,
+    whenever there is no text to count, so an unread file cannot read as an
+    empty one. `truncated` is true only when the file exists but lost to the
+    budget: seed.md and learned.md are last in line for it, since the diaries
+    ahead of them in `persona_payload` are spent first."""
     text = _read(data_dir / rel)
     kept = None if text is None else budget.take(text)
     return {
         "text": kept,
-        "lines": 0 if kept is None else len(kept.splitlines()),
+        "lines": None if kept is None else len(kept.splitlines()),
         "file": rel,
+        "truncated": text is not None and kept is None,
     }
 
 
@@ -267,19 +283,40 @@ def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[st
         }
         for row in observation_rows
     ]
-    by_id = {obs["id"]: obs for obs in observations}
+    # COUNT(*)-backed, not `len(observations)` - MAX_OBSERVATIONS is a display
+    # cap on the list above, not on the table.
+    observations_total = store.count_observations()
+    observations_consumed = store.count_consumed_observations()
+    observations_list_truncated = len(observation_rows) < observations_total
+
+    active_rows = store.active_persona_rules()
+    # Fetch one past the cap so a capped retired list can say so without a
+    # separate COUNT(*) - `retired_persona_rules` has no unbounded caller to
+    # protect from this extra row the way `recent_observations` does.
+    retired_page = store.retired_persona_rules(MAX_RULES + 1)
+    rules_list_truncated = len(retired_page) > MAX_RULES
+    retired_rows = retired_page[:MAX_RULES]
+
+    # Evidence resolves against the table directly, by id - not against
+    # `observations` above. That list is capped at MAX_OBSERVATIONS, and a
+    # rule's evidence can point past it once the log outgrows the cap; looking
+    # it up there would render a real row as if it had been deleted.
+    evidence_ids: set[int] = set()
+    for row in (*active_rows, *retired_rows):
+        evidence_ids.update(_evidence(row["evidence"]))
+    evidence_by_id = store.observations_by_ids(sorted(evidence_ids))
 
     def one_rule(row: Any, status: str) -> dict[str, Any]:
         evidence = [
             {
-                "id": by_id[oid]["id"],
-                "body": by_id[oid]["body"],
-                "confidence": by_id[oid]["confidence"],
+                "id": int(evidence_by_id[oid]["id"]),
+                "body": evidence_by_id[oid]["body"],
+                "confidence": float(evidence_by_id[oid]["confidence"]),
             }
             # A stale id is skipped, not raised on: `evidence` is model-supplied
             # json and an observation it names may predate a rebuild.
             for oid in _evidence(row["evidence"])
-            if oid in by_id
+            if oid in evidence_by_id
         ]
         return {
             "id": int(row["id"]),
@@ -291,8 +328,8 @@ def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[st
             "evidence": evidence,
         }
 
-    active = [one_rule(row, "active") for row in store.active_persona_rules()]
-    retired = [one_rule(row, "retired") for row in store.retired_persona_rules(MAX_RULES)]
+    active = [one_rule(row, "active") for row in active_rows]
+    retired = [one_rule(row, "retired") for row in retired_rows]
 
     diary_dir = data_dir / DIARY_SUBDIR
     diary_days = sorted(
@@ -327,11 +364,11 @@ def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[st
         "rules": active + retired,
         "rules_active": len(active),
         "rules_retired": len(retired),
+        "rules_list_truncated": rules_list_truncated,
         "observations": observations,
-        "observations_total": len(observations),
-        "observations_consumed": sum(
-            1 for obs in observations if obs["consumed_by"] is not None
-        ),
+        "observations_total": observations_total,
+        "observations_consumed": observations_consumed,
+        "observations_list_truncated": observations_list_truncated,
         "diaries": diaries,
         "diaries_total": len(diaries),
         "diaries_bodies_truncated": diaries_cut,
