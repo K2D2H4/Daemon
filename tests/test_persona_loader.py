@@ -76,3 +76,19 @@ async def test_an_unreadable_seed_is_swallowed_not_raised(data_dir: Path) -> Non
     path.mkdir()
 
     assert await load_persona(data_dir) == ""
+
+
+def test_a_rule_line_carries_its_date_and_how_often_it_was_seen() -> None:
+    """A rule with no date is read at full weight forever, which is what made one
+    remark on 2026-08-19 still be governing the daemon five days later. The date
+    is absolute rather than relative because the model is already told
+    `[현재 시각]` on every turn and can do the subtraction, while a stored "어제"
+    is a lie by the following week."""
+    from daemon.persona.loader import rule_line
+
+    assert rule_line("변명을 싫어한다", formed="2026-08-09", observations=3) == (
+        "2026-08-09 (관찰 3건) 변명을 싫어한다"
+    )
+    assert rule_line("짧은 답을 선호했다", formed="2026-08-23", observations=1) == (
+        "2026-08-23 (관찰 1건) 짧은 답을 선호했다"
+    )

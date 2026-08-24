@@ -94,6 +94,22 @@ def rule_bodies(text: str) -> list[str]:
     return bodies
 
 
+def rule_line(body: str, *, formed: str, observations: int) -> str:
+    """One learned rule as the model should read it: what was noticed, when, and
+    how often.
+
+    The date makes the difference between a tendency and a standing order. An
+    undated rule is read at full weight forever - which is how one remark on
+    2026-08-19 was still governing the daemon five days later - while a dated one
+    can be weighed against `[현재 시각]`, which every prompt already carries.
+
+    Absolute, never relative: "어제" written down once is wrong by the following
+    week, and this string is rebuilt on every turn precisely so it never has to be
+    stored.
+    """
+    return f"{formed} (관찰 {observations}건) {body}"
+
+
 async def load_persona(data_dir: Path) -> str:
     """The persona system message: seed verbatim, then the learned rules under a
     header that marks them as separate from the anchor.
