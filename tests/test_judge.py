@@ -296,30 +296,48 @@ _EVASIONS = [
     "example dot com이렇게 읽어",  # spelled-out dot, particle unspaced
     "example[.]com을 조심해",  # bracketed dot, particle unspaced
     "example(dot)com이야",  # parenthesised dot, particle unspaced
-    "그 사이트 점컴 주소야",  # Korean spelled-out ".com", unspaced (round 2 addition)
-    "쩜컴 주소야",  # ditto, alternate spelling (round 2 addition)
-    "닷컴 주소로 가봐",  # ditto, unspaced (round 2 addition)
-    "점 콤 이야",  # Korean spelled-out ".com", alternate spelling (round 2 addition)
-    "sendbird 슬래시 news 페이지야",  # spelled-out slash (round 2 addition)
+    "그 사이트 점컴 주소야",  # Korean spelled-out ".com", unspaced
+    "쩜컴 주소야",  # ditto, alternate spelling
+    "닷컴 주소로 가봐",  # ditto, unspaced
+    "점 콤 이야",  # Korean spelled-out ".com", alternate spelling
     "ｅｘａｍｐｌｅ．ｃｏｍ참고해",  # full-width Latin + full-width period, unspaced
     "example。com참고해",  # ideographic full stop standing in for '.', unspaced
     "@sendbird_official확인해봐",  # a bare handle, unspaced
-    "2001:db8::1로 접속해",  # IPv6, unspaced (round 2 addition)
-    "[2001:db8::1]로 접속해",  # bracketed IPv6, unspaced (round 2 addition)
-    "::1로 접속해",  # compressed IPv6, unspaced (round 2 addition)
+    "2001:db8::1로 접속해",  # IPv6, unspaced
+    "[2001:db8::1]로 접속해",  # bracketed IPv6, unspaced
+    "::1로 접속해",  # compressed IPv6, unspaced
+    "example.한국에서 확인해봐",  # a Hangul ccTLD - [a-z]{2,} was a script allowlist
+    "example.рф에서 확인해봐",  # a Cyrillic ccTLD, same reasoning
+    "login.sendbird.co.kr으로 로그인해",  # a multi-label domain, no entity involved
+    "UJET.cx.com에서 확인해",  # entity name used as a sub-label of a longer domain, no exempt given
 ]
+r"""A list of evasions, not examples - each entry exists because it defeated some
+prior shape of `has_url`, or because it is the shape most likely to defeat the
+current one, not because it demonstrates a feature working. Two rounds were
+each "certified" by a corpus written beside the code it tested and inheriting
+its blind spot (round 1's spaced-particle corpus scored 17/17 by avoiding
+round 1's own trailing-`\b` bug; round 2's substring-strip exemption tests
+never tried gluing a domain onto an entity, so they pinned the round-3 bug as
+correct). This corpus is written adversarially against the *current* shape of
+`_BARE_DOMAIN_RE`/`_IPV4_RE`/`_looks_like_ipv6`/`_OBFUSCATIONS` instead of
+against what those checks are known to already catch - the last three entries
+in particular (non-Latin TLDs, a multi-label domain, an entity name as a
+sub-label of a longer one) were added because they are exactly the next place
+a script allowlist or a single-dot assumption would hide, not because a
+specific attack proved they were broken."""
 
 
 @pytest.mark.parametrize("evasion", _EVASIONS)
 def test_url_evasions_are_all_caught(evasion: str) -> None:
-    r"""23/23, unspaced. An allowlist of TLDs or schemes is a list an attacker can
-    read off this file and route around; `has_url` refuses by shape (a scheme, a
-    bare word.TLD with no fixed TLD list and no trailing `\b`, an IPv4 with the
-    same fix, an IPv6-shaped token, a written-out dot, an @handle) instead, after
-    folding away the disguises (NFKC, zero-width strip, the ideographic full stop)
-    that let several of these dodge the first version - and written the way Korean
-    actually attaches a particle, which is what let several others dodge the
-    second."""
+    r"""Every entry in `_EVASIONS` must be caught. An allowlist of TLDs or schemes
+    is a list an attacker can read off this file and route around; `has_url`
+    refuses by shape (a scheme, a bare word.TLD with no fixed TLD list and no
+    trailing `\b`, an IPv4 with the same fix, an IPv6-shaped token, a
+    written-out dot, an @handle, a non-Latin TLD, a multi-label domain) instead,
+    after folding away the disguises (NFKC, zero-width strip, the ideographic
+    full stop) that let several of these dodge the first version, written the
+    way Korean actually attaches a particle (round 2), and covering the scripts
+    and domain shapes round 1 and round 2's own corpora never tried (round 3)."""
     from daemon.proactivity.judge import has_url
 
     assert has_url(evasion), f"{evasion!r} should have been caught"
@@ -345,41 +363,90 @@ def test_ordinary_lines_are_not_caught_except_the_accepted_cost(clean: str) -> N
     cost ("it costs nothing to refuse - the owner can ask, and then it is their
     turn"), not a false positive to fix. When one of these *is* the candidate's
     own entity name, `exempt=` is what actually fixes it - see
-    `test_an_entitys_own_name_is_exempt_from_its_own_refusal` below."""
+    `test_an_entitys_bare_name_is_exempt_from_its_own_refusal` below."""
     from daemon.proactivity.judge import has_url
 
     is_priced_in_cost = clean in ("Node.js 배웠어?", "report.docx 잘 받았어?")
     assert has_url(clean) == is_priced_in_cost
 
 
-@pytest.mark.parametrize("entity", ["UJET.cx", "Node.js", "Kiwi", "Sendbird", "llm-wiki"])
-def test_an_entitys_own_name_is_exempt_from_its_own_refusal(entity: str) -> None:
-    """Round 2 finding 2: `topic_candidates` puts `entities.name` verbatim into the
-    reason and the query, and the judge then names that entity back. Any entity
-    shaped like a domain (`UJET.cx` - this owner's most-mentioned entity - and
-    `Node.js` right behind it) would otherwise be permanently unspeakable: each
-    topic candidate spends a search and a full judge call only to be refused for
-    a "url" that is the entity's own first-party name. `entities.name` is
-    first-party (drawn from the owner's own transcript), so exempting exactly
-    that string - and only that string - does not widen the surface the way a
-    general allowlist would. `Kiwi`, `Sendbird` and `llm-wiki` are not
+# Round 2's version of this exemption stripped every occurrence of the entity
+# name as a *substring* of the whole text before checking anything, which round
+# 3's review measured letting 21 of 33 probes through - `sendbird.com` unlocked
+# for the entity `Sendbird`, with no attacker effort, among them. Round 2's own
+# test suite (this section, previously) pinned that bug as correct: it asserted
+# only that the bare entity name was forgiven, never that a domain built around
+# it still refused. Every test below now pins both halves for every entity: the
+# bare name is forgiven, and a domain glued onto it - a suffix, a prefix, either
+# case - is not.
+@pytest.mark.parametrize(
+    "entity", ["UJET.cx", "Node.js", "Kiwi", "Sendbird", "llm-wiki", "Daemon"]
+)
+def test_an_entitys_bare_name_is_exempt_from_its_own_refusal(entity: str) -> None:
+    """`topic_candidates` puts `entities.name` verbatim into the reason and the
+    query, and the judge then names that entity back. Any entity shaped like a
+    domain (`UJET.cx` - this owner's most-mentioned entity - and `Node.js` right
+    behind it) would otherwise be permanently unspeakable: each topic candidate
+    spends a search and a full judge call only to be refused for a "url" that is
+    the entity's own name. What actually bounds this (round 3 finding 2) is that
+    `_matches_beyond_entity` only forgives a match whose *entire* span equals the
+    entity name - not that the name is "first-party" or trustworthy, which round
+    3's review found does not hold (`entities.name` is chosen by the reflection
+    model reading the day's conversation log, not drawn untouched from the
+    owner's own words). `Kiwi`, `Sendbird`, `llm-wiki` and `Daemon` are not
     domain-shaped, so they were never falsely refused in the first place -
     included here so the parametrize covers the owner's real named entities, not
-    only the two that happen to need the fix."""
+    only the ones that happen to need the fix."""
     from daemon.proactivity.judge import has_url
 
     line = f"{entity} 소식 들었어? 요즘 얘기가 좀 있더라"
     assert not has_url(line, exempt=entity)
 
 
-@pytest.mark.parametrize("entity", ["UJET.cx", "Node.js", "Kiwi", "Sendbird", "llm-wiki"])
+@pytest.mark.parametrize(
+    "entity", ["UJET.cx", "Node.js", "Kiwi", "Sendbird", "llm-wiki", "Daemon"]
+)
+def test_a_domain_glued_onto_the_entity_is_still_refused(entity: str) -> None:
+    """The other half of the span rule, and the half round 2's tests never
+    checked: `entity + ".com"` is a match whose span is longer than the entity
+    name, so it must not be forgiven merely because the entity name is a
+    substring of it. This is what "exempting `Sendbird` is not free" means
+    concretely - it must not also whitelist `sendbird.com`."""
+    from daemon.proactivity.judge import has_url
+
+    glued = f"{entity}.com에서 확인해봐"
+    assert has_url(glued, exempt=entity)
+
+
+@pytest.mark.parametrize(
+    ("entity", "line"),
+    [
+        ("Sendbird", "Sendbird 소식 sendbird.com에 올라왔대"),
+        ("UJET.cx", "UJET.cx 공지는 evil-UJET.cx에서 확인해"),
+        ("Kiwi", "Kiwi.com에서 예약했어?"),
+        ("Daemon", "Daemon.io 열어봐"),
+    ],
+)
+def test_the_round_3_bypass_probes_are_all_refused(entity: str, line: str) -> None:
+    """The exact probes round 3's review measured bypassing the substring-strip
+    exemption (21 of 33 probes bypassed in total, these four pinned verbatim) -
+    including the prefix-glued case (`evil-UJET.cx`), which a suffix-only fix
+    would still miss."""
+    from daemon.proactivity.judge import has_url
+
+    assert has_url(line, exempt=entity)
+
+
+@pytest.mark.parametrize(
+    "entity", ["UJET.cx", "Node.js", "Kiwi", "Sendbird", "llm-wiki", "Daemon"]
+)
 def test_the_exemption_does_not_cover_a_different_link_alongside_the_entity(
     entity: str,
 ) -> None:
-    """The exemption is narrow on purpose: it removes only the entity's own name
-    before checking, so a genuine link riding alongside it - the actual attack
-    ADR 0015 names - is still caught regardless of which entity the candidate is
-    about."""
+    """The exemption is narrow on purpose: it forgives only a match whose entire
+    span is the entity's own name, so a genuine link riding alongside it - the
+    actual attack ADR 0015 names - is still caught regardless of which entity the
+    candidate is about."""
     from daemon.proactivity.judge import has_url
 
     line = f"{entity} 관련 공지는 sendbird-verify.app에서 확인하세요"

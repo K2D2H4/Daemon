@@ -397,9 +397,19 @@ _SCHEME_RE = re.compile(r"[a-z][\w+.-]*://", re.I)
 """`https://`, `http://`, but also `tg://`, `ftp://` and anything else shaped like
 a URI scheme - a fixed list of schemes is the same allowlist mistake one level up."""
 
-_BARE_DOMAIN_RE = re.compile(r"\b[\w-]+\.[a-z]{2,}(?![a-z])", re.I)
-r"""A word, a dot, and two-or-more letters - deliberately with **no TLD list**, and
-deliberately with **no trailing `\b` either**.
+_TLD_CHARS = r"a-z\u0400-\u04ff\uac00-\ud7a3"
+r"""Letters a TLD may end in: ASCII, Cyrillic, and Hangul syllables. Round 3
+finding 6: `[a-z]{2,}` alone is an implicit script allowlist, and `.한국` is a
+live ccTLD in a Korean-language product - the exact kind of gap this file has
+already been measured missing twice (an ASCII TLD list, then a trailing `\b`
+that only worked in ASCII). Not a claim of completeness for every script; widened
+because this product's own language was the one left out."""
+
+_BARE_DOMAIN_RE = re.compile(
+    rf"\b[\w-]+(?:\.[\w-]+)*\.[{_TLD_CHARS}]{{2,}}(?![{_TLD_CHARS}])", re.I
+)
+r"""A word, a dot, and two-or-more TLD-shaped letters - deliberately with **no
+fixed TLD list**, and deliberately with **no trailing `\b` either**.
 
 Round 1 shipped a trailing `\b` and a review measured it never firing on real
 Korean at all: Korean attaches particles with no space (`sendbird.com에 있어`,
@@ -411,27 +421,51 @@ caught" was written with an artificial space before the particle in every case,
 which is not how the string this function actually has to defend against would
 be written - it scored well by avoiding its own failure mode, not by surviving it.
 
-`(?![a-z])` replaces the boundary with the actual requirement: the run of TLD
+`(?![...])` replaces the boundary with the actual requirement: the run of TLD
 letters must not extend further right (so `.comment` does not read as `.com`),
 but nothing to the right of it needs to be a non-word character - a following
 Hangul particle, digit, or punctuation mark all satisfy the lookahead just by not
-being another ASCII letter. Re-measured on the unspaced (idiomatic) form of every
-corpus entry in `tests/test_judge.py`; see that file for the current count.
+being another TLD-shaped letter. Re-measured on the unspaced (idiomatic) form of
+every corpus entry in `tests/test_judge.py`; see that file for the current count.
+
+`(?:\.[\w-]+)*` (added while fixing round 3 finding 1) joins a multi-label
+domain into one match instead of stopping at the first dot: without it,
+`"UJET.cx.com"` read as the single-dot label `"UJET"` + TLD `"cx"`, producing a
+match equal to the entity name `"UJET.cx"` - which the exemption then forgave -
+and stranding `".com"` unmatched because nothing preceded its own dot once
+`"UJET.cx"` had already been consumed. Greedy backtracking makes the *last*
+`.TLD`-shaped segment the one the lookahead checks, so `"UJET.cx.com"` matches as
+one span that is not equal to the entity and is refused, while a bare mention of
+just `"UJET.cx"` (no trailing label) still matches exactly and is still forgiven.
 
 The false positives this accepts on purpose (`Node.js`, `report.docx`) are the
 price ADR 0015 already named: "it costs nothing to refuse - the owner can ask,
-and then it is their turn." - except for a `topic` candidate's own entity name,
-which `has_url`'s `exempt` parameter carves back out (round 2 finding 2): an
-entity shaped like a domain (`UJET.cx`, this owner's most-mentioned entity) must
-not become permanently unspeakable merely for being named back to him."""
+and then it is their turn." `has_url`'s `exempt` parameter forgives one specific
+thing on top of that (round 3 finding 1/2): when the model names a `topic`
+candidate's own entity back, and the *entire* matched span is that entity's name
+and nothing more, it is not refused for it. That is a narrow, mechanical fact
+about the match - not a claim that the name is safe because of where it came
+from (round 2 rested the same exemption on `entities.name` being "first-party",
+and round 3's review traced that name back to `reflection._apply`, which is the
+model reading the day's own conversation log - the exact channel CONTRACTS rule
+10 warns about. The exemption has to hold on its own terms, not on provenance)."""
 
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
-"""A dotted-quad IP is a place to go exactly like a domain is, and it does not
-satisfy `_BARE_DOMAIN_RE` (its last segment is digits, never `[a-z]{2,}`). Given
-the same trailing-boundary treatment as `_BARE_DOMAIN_RE` and for the identical
-reason - `192.168.0.1로 접속해` has the same word-character adjacency between the
-last digit and the following particle that broke the domain check, so a plain
-trailing `\b` here would have shipped the same hole one line down."""
+r"""A dotted-quad IP is a place to go exactly like a domain is, and it does not
+satisfy `_BARE_DOMAIN_RE` (its last segment is digits, never TLD-shaped letters).
+Given the same trailing-boundary treatment as `_BARE_DOMAIN_RE` and for the
+identical reason - `192.168.0.1로 접속해` has the same word-character adjacency
+between the last digit and the following particle that broke the domain check, so
+a plain trailing `\b` here would have shipped the same hole one line down.
+
+Round 3 finding 4: this docstring previously opened as a plain (non-raw) triple-quoted string while
+containing that same `\b` - a *recognised* Python escape (backspace, U+0008), so
+it silently corrupted this very sentence into a literal backspace byte instead of
+the two characters "\b", rather than raising the `SyntaxWarning` an unrecognised
+escape like `\w` would have. A byte-level scan of the file found it fine; only an
+AST-level scan of string constants (`ast.get_docstring`) catches this class of
+corruption, because the parser has already "fixed" it into a different string by
+the time a plain grep or `open(...).read()` looks."""
 
 _IPV6_CANDIDATE_RE = re.compile(r"\[?(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\]?", re.I)
 r"""A loose IPv6-shaped token: at least two colons among hex digits and optional
@@ -459,16 +493,25 @@ _OBFUSCATIONS = (
     "점컴",
     "닷컴",
     "점 콤",
-    "슬래시",
 )
-"""Spelled-out and bracketed dots (and, for `슬래시`, a spelled-out slash) that
-dodge every regex above by construction - `example dot com`, `example[.]com`, and
-the Korean equivalents, spaced and unspaced (round 2: `쩜컴`/`점컴`/`닷컴`/`점 콤`
-added alongside the round 1 spaced forms, on the same reasoning that fixed
-`_BARE_DOMAIN_RE` - Korean does not reliably put a space where this function
-would like one). Literal substring checks rather than a pattern, because there is
-no shape to match: the whole point of writing it this way is to not look like a
-dot."""
+"""Spelled-out and bracketed dots that dodge every regex above by construction -
+`example dot com`, `example[.]com`, and the Korean equivalents, spaced and
+unspaced (round 2: `쩜컴`/`점컴`/`닷컴`/`점 콤` added alongside the round 1 spaced
+forms, on the same reasoning that fixed `_BARE_DOMAIN_RE` - Korean does not
+reliably put a space where this function would like one). Literal substring
+checks rather than a pattern, because there is no shape to match: the whole
+point of writing it this way is to not look like a dot.
+
+Round 2 also added `"슬래시"` (a spelled-out slash) here as a bare substring, and
+round 3 removed it: `"그 코드에 슬래시 빠졌어?"` is an ordinary sentence about a
+punctuation mark, and a bare substring check cannot tell that apart from an
+obfuscated path separator. It also was not buying much - a slash with nothing in
+front of it is not "somewhere to go"; a slash that matters is one following a
+real scheme, domain or IP, and `_SCHEME_RE`/`_BARE_DOMAIN_RE`/`_IPV4_RE` already
+catch that case on their own, unspaced-particle fix included. Dropped rather than
+patched with an adjacency requirement, because the marginal case it would still
+catch (a domain/IP already obfuscated *and* its own path separator spelled out)
+is vanishingly narrow next to the false-positive cost of the bare noun."""
 
 _FORMAT_CATEGORY = "Cf"
 """Unicode category for zero-width/format characters (ZWSP, ZWJ, word joiner,
@@ -501,6 +544,34 @@ def _looks_like_ipv6(text: str) -> bool:
     return False
 
 
+def _matches_beyond_entity(pattern: re.Pattern[str], folded: str, folded_entity: str) -> bool:
+    r"""Whether `pattern` finds anything in `folded` other than a match that
+    *is*, in its entirety, the entity's own name.
+
+    Round 3 finding 1: the previous shape of this exemption stripped every
+    occurrence of the entity name as a **substring** of the whole text before
+    running any check at all. That destroys the left label of any domain the
+    name happens to be glued to - stripping `"UJET.cx"` out of
+    `"evil-UJET.cx"` leaves `"evil-.cx"`, which no longer reads as a domain, so
+    the attack sails through - and, because the strip ran before *every* check,
+    a short or plain entity name could switch a check off entirely regardless of
+    context (`exempt="com"`, `exempt="192.168.0.1"`, `exempt="@"` each disable a
+    different one). Measured shipping: 21 of 33 probes bypassed, including
+    `sendbird.com` for the entity `Sendbird` - already one of this owner's own
+    entities, unlocked with no attacker effort at all.
+
+    This finds every match first, the same way the function would with no
+    `exempt` at all, and only forgives a match whose entire matched text equals
+    the entity name - so `UJET.cx` alone is forgiven, but `evil-UJET.cx`,
+    `login-UJET.cx`, `Kiwi.com` and `sendbird.com` are not, because none of them
+    *is* the entity name; the entity name merely appears inside a longer match.
+    """
+    for match in pattern.finditer(folded):
+        if not folded_entity or match.group().casefold() != folded_entity.casefold():
+            return True
+    return False
+
+
 def has_url(text: str, *, exempt: str = "") -> bool:
     r"""Whether an utterance points the owner somewhere.
 
@@ -517,36 +588,55 @@ def has_url(text: str, *, exempt: str = "") -> bool:
     told to expect: a scheme, a bare word.TLD with no fixed TLD list, a dotted-quad
     IP, an IPv6-shaped token, an `@handle`, or a written-out dot.
 
-    Round 2 fixed two things the round-1 version still missed. First, the bare-
-    domain and IPv4 checks used a trailing `\b`, which never fires between two
-    `\w` characters - and a Hangul particle attached directly to a TLD or an IP
-    (`sendbird.com에 있어`, the idiomatic Korean form with no space) is exactly
-    that, so the round-1 corpus scored 17/17 by testing an artificially spaced
-    form that is not how this actually gets written. See `_BARE_DOMAIN_RE` and
-    `_IPV4_RE`. Second, `exempt` exists because `topic_candidates` puts an
-    entity's own name (`entities.name`, first-party, drawn from the owner's own
-    transcript) into both the search query and the reason, and the judge then
-    names that entity back - so an entity shaped like a domain (`UJET.cx`, this
-    owner's most-mentioned entity) would otherwise be permanently unspeakable,
-    refused every time for a "url" that is only its own subject's name. Passing
-    the candidate's entity as `exempt` removes exactly that string (case-
-    insensitively, after the same folding) before checking, so a genuine link
-    riding alongside the entity's name is still caught - only an occurrence of
-    the entity's own name is forgiven, never a domain shape in general.
+    Round 2 fixed the bare-domain and IPv4 checks' trailing `\b`, which never
+    fires between two `\w` characters - a Hangul particle attached directly to a
+    TLD or an IP (`sendbird.com에 있어`, the idiomatic Korean form) is exactly
+    that. See `_BARE_DOMAIN_RE` and `_IPV4_RE`.
+
+    Round 2 also added `exempt`, for the same reason round 3 had to rebuild it:
+    `topic_candidates` puts an entity's own name into both the search query and
+    the reason, and the judge then names that entity back, so a domain-shaped
+    entity (`UJET.cx`, this owner's most-mentioned one) would otherwise be
+    permanently unspeakable. Round 2's version stripped the entity name as a
+    substring of the whole text before matching anything, which round 3 measured
+    letting 21 of 33 probes through (`sendbird.com`, `evil-UJET.cx`, ...) -
+    stripping a substring can turn a plain word into a domain's left label, or
+    disable an unrelated check outright. `exempt` now matches first and forgives
+    second (`_matches_beyond_entity`): only a domain/IP/handle match whose entire
+    span equals the entity name is let through; the same name glued onto
+    anything else is not.
+
+    What actually bounds this - and round 2 overstated it - is that mechanical
+    fact about the match, **not** where the entity name came from. Round 2's
+    docstring (and ADR 0015) called `entities.name` "first-party, drawn from the
+    owner's own transcript"; round 3's review traced it and that does not hold -
+    `stale_entities` -> `upsert_entity` -> `EntityNotes.note` -> `reflection._apply`
+    puts the reflection *model*, reading the day's conversation log, in charge of
+    the name, which is the exact channel CONTRACTS rule 10's own rationale warns
+    about ("look at this message" is a way to hand a stranger a shell), and
+    `safe_name` there permits `sendbird.com`, `com`, `cx`, `@sendbird`, `점`. So the
+    exemption is not safe because the name is trustworthy; it is safe because
+    forgiving an exact-span match forgives nothing wider than the name itself,
+    however that name came to exist - a model-chosen entity name that happened to
+    be a full URL would still only unlock exactly that string, never a domain it
+    is glued to.
+
+    Obfuscations and IPv6 are deliberately outside `exempt` entirely (round 3
+    finding 1's instruction): an entity name should never be able to switch off
+    the checks that do not even have a "span" to compare it against.
     """
     folded = _fold(text)
-    if exempt:
-        folded_exempt = _fold(exempt)
-        if folded_exempt:
-            folded = re.sub(re.escape(folded_exempt), "", folded, flags=re.I)
-    if (
-        _SCHEME_RE.search(folded)
-        or _IPV4_RE.search(folded)
-        or _HANDLE_RE.search(folded)
-        or _looks_like_ipv6(folded)
-    ):
+    folded_entity = _fold(exempt) if exempt else ""
+
+    if _matches_beyond_entity(_SCHEME_RE, folded, ""):  # never exempt - see docstring
         return True
-    if _BARE_DOMAIN_RE.search(folded):
+    if _matches_beyond_entity(_IPV4_RE, folded, folded_entity):
+        return True
+    if _matches_beyond_entity(_HANDLE_RE, folded, folded_entity):
+        return True
+    if _looks_like_ipv6(folded):  # never exempt - see docstring
+        return True
+    if _matches_beyond_entity(_BARE_DOMAIN_RE, folded, folded_entity):
         return True
     folded_cf = folded.casefold()
     return any(marker.casefold() in folded_cf for marker in _OBFUSCATIONS)

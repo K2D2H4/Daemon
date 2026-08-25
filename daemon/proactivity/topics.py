@@ -37,11 +37,15 @@ logger = logging.getLogger(__name__)
 MAX_TITLES = 3
 MAX_TITLE_CHARS = 80
 MAX_ENTITY_CHARS = 80
-"""Same bound as `MAX_TITLE_CHARS`, and for the same reason: `entity` reaches
-`render` from `entities.name`, which is first-party rather than a search result,
-but the header interpolates it directly into the fence exactly like a title, so
-round 2 finding 4 asks for the same defensive cap and marker-stripping rather than
-trusting the source to stay short and clean forever."""
+"""Same bound as `MAX_TITLE_CHARS`. `entity` reaches `render` from
+`entities.name`, and round 2 called that "first-party" as if it made the value
+safe to interpolate unguarded - round 3's review traced the column back to
+`reflection._apply`, which lets the reflection *model* (reading the day's own
+conversation log) choose the name, so it is not first-party in the sense that
+claim needed. The cap and marker-stripping here do not rest on trusting the
+source at all; they are the same defensive treatment a title already gets,
+applied uniformly because there was no reason for `entity` to be the one piece
+of interpolated text left unguarded."""
 SERVER = "tavily"
 TOOL = "tavily_search"
 
@@ -118,10 +122,11 @@ def render(entity: str, titles: list[str], nonce: str) -> str:
     text and this is the one module whose entire input is exactly that.
 
     `entity` gets the same marker-stripping and length cap as a title (round 2
-    finding 4): it is first-party (`entities.name`), not a search result, but it
-    is interpolated into the header exactly like a title is, and there was no
-    reason for the one piece of literal-string interpolation in this function to
-    be the one piece left unguarded.
+    finding 4, and see `MAX_ENTITY_CHARS` on why "first-party" was never the
+    reason - it is interpolated into the header exactly like a title is, and
+    there was no reason for the one piece of literal-string interpolation in
+    this function to be the one piece left unguarded, regardless of where the
+    value came from.
     """
     if not titles:
         return ""
