@@ -69,6 +69,7 @@ from daemon import clock
 # position to start from: the wire has no role that means "reference material", so
 # the block arrives as a *user* turn.
 from daemon.companion import Companion
+from daemon.face import FaceBus, SpeechClock
 from daemon.llm.base import ToolCall
 from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.tools.base import ToolResult
@@ -248,6 +249,7 @@ class VoiceConversation:
         screen_share: ScreenShareController | None = None,
         screen_pump_factory: Callable[[VoiceSession], ScreenSharePump] | None = None,
         barge_in: bool = True,
+        face: FaceBus | None = None,
     ) -> None:
         self._session = session
         self._audio = audio
@@ -361,6 +363,22 @@ class VoiceConversation:
         """The last block put in front of the model, so a prefetch that is reused
         rather than redone does not seed the same memories twice."""
 
+        self._face = face
+        self._speech = (
+            None
+            if face is None
+            else SpeechClock(
+                face,
+                sample_rate=self._audio.playback_sample_rate,
+                bytes_per_frame=PLAYBACK_BYTES_PER_FRAME,
+            )
+        )
+        """`None` for a text-only install, which is what keeps this whole feature
+        free for one: nothing below constructs a clock, starts a timer or calls the
+        bus unless a caller handed one in. `playback_sample_rate`, not the
+        microphone's rate - what this clocks is when the *speaker* finishes what it
+        was handed, the same rate `_on_audio` already turns into seconds."""
+
     @property
     def stats(self) -> VoiceStats:
         """What this conversation did. Safe to read before, during and after
@@ -423,12 +441,28 @@ class VoiceConversation:
                     self._forward_microphone(session, microphone), name="voice-microphone"
                 )
                 watch = asyncio.create_task(self._watch_partials(session), name="voice-prefetch")
+                # Only when there is a bus to publish to (`face` is `None` for a
+                # text-only install) - starting a timer nobody reads would be a cost
+                # this feature is supposed to be free of.
+                face_pump = (
+                    None
+                    if self._speech is None
+                    else asyncio.create_task(self._face_pump(), name="voice-face-pump")
+                )
                 try:
                     await self._receive(session)
                 finally:
-                    for task in (pump, watch):
+                    tasks = (pump, watch) if face_pump is None else (pump, watch, face_pump)
+                    for task in tasks:
                         task.cancel()
-                    await asyncio.gather(pump, watch, return_exceptions=True)
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    if self._speech is not None:
+                        # Playback stops the instant the conversation does, but
+                        # cancelling the timer only stops *future* ticks - it does not
+                        # undo whatever `speaking`/`level` the last one published. A
+                        # conversation that ends mid-answer needs one more nudge past
+                        # `_until`, or the face is left talking to an empty room.
+                        self._speech.pump(float("inf"))
                     await _aclose(microphone)
                     await self._cancel_speculative()
                     # Reached on cancellation too, which is the point: the transcript
@@ -571,7 +605,15 @@ class VoiceConversation:
                 produced = True
                 if isinstance(item, bytes):
                     self._generating = True
-                    self._on_audio(loop.time(), len(item))
+                    at = loop.time()
+                    self._on_audio(at, len(item))
+                    if self._speech is not None:
+                        # Pumped here, not only on the timer task: this is what makes
+                        # the rising edge synchronous - `speaking` turns on in the
+                        # same await as the chunk itself, with no timer in between.
+                        # `_face_pump` only ever has to notice the falling edge.
+                        self._speech.fed(item, at)
+                        self._speech.pump(at)
                     await self._audio.play(item)
                 elif isinstance(item, Interrupted):
                     await self._barge_in(session)
@@ -655,6 +697,11 @@ class VoiceConversation:
                     # tracked when the speaker runs dry for the idle budget; the
                     # microphone gate needed the same number.
                     continue
+                if self._face is not None:
+                    # Reached this line without being dropped by any gate above, so
+                    # this is the room's own sound going to the model - the daemon's
+                    # turn to listen rather than answer.
+                    self._face.set_activity("listening")
                 await session.send_audio(chunk)
         except asyncio.CancelledError:
             raise
@@ -685,6 +732,26 @@ class VoiceConversation:
         # queued - not `at + seconds`, which would forget the backlog.
         self._playback_until = max(self._playback_until, at) + seconds
 
+    async def _face_pump(self) -> None:
+        """The falling edge, and the level while it lasts.
+
+        The rising edge is handled synchronously where the audio arrives (above),
+        so this task only ever has to notice that playback has finished - a
+        computed instant (`SpeechClock._until`), not a guess. 25Hz: fast enough
+        that the mouth does not visibly step, and cheap enough to run for the life
+        of the conversation.
+
+        `loop.time()`, not `daemon.clock.now()`: `_speech.fed()` above is stamped
+        with `loop.time()`, the same monotonic clock `_playback_until` already uses
+        for barge-in - comparing that against a wall clock would put every tick
+        arbitrarily far in the future and end `speaking` on the first one.
+        """
+        assert self._speech is not None
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(0.04)
+            self._speech.pump(loop.time())
+
     # --- transcripts --------------------------------------------------------
 
     async def _on_transcript(self, session: VoiceSession, transcript: Transcript) -> None:
@@ -697,6 +764,11 @@ class VoiceConversation:
         # also the signal that this turn's audio is done.
         self._generating = False
         if transcript.role == "user":
+            if self._face is not None:
+                # The owner's utterance just settled - the request is now fully
+                # made, and whatever answer is coming has not arrived yet. The same
+                # settling that lets recall start is what tells the face to wait.
+                self._face.set_activity("thinking")
             await self._settle_recall(session, transcript.text)
         await self._record(transcript)
 

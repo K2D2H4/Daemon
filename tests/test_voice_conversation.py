@@ -38,6 +38,7 @@ from daemon.voice import conversation as conversation_module
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 from daemon.voice.conversation import VoiceConversation
 from daemon.voice.gemini_live import GeminiLiveSession
+from tests.test_face import RecordingBus
 
 POLL = 0.005
 """How often a test that has to wait for another task looks again. Only the
@@ -2775,3 +2776,72 @@ async def test_a_stale_conversation_reports_no_tics_either() -> None:
         "precondition: the tail is stale, so none of it was sent"
     )
     assert not [text for text in session.contexts if text.startswith("[verbal-tics]")]
+
+
+# --- the voice path publishes to the face -------------------------------------
+#
+# `SpeechClock` itself - the boundary, the backlog, the level timing - is tested
+# against a fake clock in tests/test_face.py with no session at all. What is left
+# here is the wiring: does a real turn feed it, pump it on arrival, and tear its
+# timer down with the conversation?
+
+
+async def test_playing_audio_turns_the_face_to_speaking_immediately() -> None:
+    """The rising edge is synchronous: no timer stands between the first chunk and
+    the mouth. Only the falling edge waits, and `test_face.py` already pins where
+    it lands."""
+    bus = RecordingBus()
+    audio = FakeAudio()
+    conv = conversation(FakeSession(b"\x00" * 48_000, Turn()), audio, face=bus)
+    await conv.run()
+
+    assert "speaking" in bus.activities
+    assert audio.played, "sanity: the harness really did play something"
+
+
+async def test_listening_is_published_while_the_owner_talks() -> None:
+    """Driven through `_forward_microphone` directly, like the other gating tests
+    below (`test_an_audio_opening_does_not_hold_the_microphone` and neighbours) -
+    not through `conv.run()`.
+
+    A `FakeSession(Turn())` run through `conv.run()` never gives the microphone
+    task a turn at all: with nothing in the script that awaits (no `Says`, no
+    audio), the receive loop is a pure synchronous handoff from one `_one_turn`
+    call to the next, and a task merely `create_task`-scheduled never gets a step
+    in before the conversation ends and cancels it (see the comment on
+    `test_model_audio_reaches_the_speaker_and_the_microphone_the_session`, which
+    names a `Says` step as what makes that pump task runnable at all). The mic
+    gating tests already avoid that race by calling `_forward_microphone` on its
+    own, so this follows them rather than inventing a second way to reach the same
+    code.
+    """
+    bus = RecordingBus()
+    session = FakeSession()
+    conv = conversation(session, face=bus)
+
+    async def mic() -> Any:
+        yield b"\x00" * 640
+
+    await conv._forward_microphone(session, mic())
+
+    assert "listening" in bus.activities
+
+
+async def test_the_conversation_ending_leaves_the_face_idle() -> None:
+    """A conversation that ends mid-answer must not leave a talking face behind:
+    the timer task is cancelled with it and idle is the last word - not merely
+    "whatever `speaking`/`level` the last pump happened to leave on the bus"."""
+    bus = RecordingBus()
+    conv = conversation(FakeSession(b"\x00" * 48_000, Turn()), FakeAudio(), face=bus)
+    await conv.run()
+
+    assert bus.state.activity == "idle"
+
+
+async def test_no_bus_means_no_behaviour_change() -> None:
+    """`face=None` is the default and must be a no-op - a text-only install runs
+    this same code path."""
+    audio = FakeAudio()
+    await conversation(FakeSession(b"\x00" * 48_000, Turn()), audio).run()
+
+    assert audio.played
