@@ -117,8 +117,8 @@ Every rule is a setting, and these are the shipped defaults:
 |---|---|---|
 | `DAEMON_PROACTIVE_ENABLED` | `false` | it says nothing until you turn this on |
 | `DAEMON_PROACTIVE_QUIET_HOURS` | `23:00-09:00` | local time, never interrupted |
-| `DAEMON_PROACTIVE_COOLDOWN_MINUTES` | `30` | minimum gap between two things it says |
-| `DAEMON_PROACTIVE_DAILY_BUDGET` | `8` | most it will ever say in one day, of any kind |
+| `DAEMON_PROACTIVE_COOLDOWN_MINUTES` | `90` | minimum gap between two things it says |
+| `DAEMON_PROACTIVE_DAILY_BUDGET` | `5` | most it will ever say in one day, of any kind |
 | per-kind ceiling | 1–3 | each kind also has its own daily cap on top of the total, so the cheap-to-generate ones cannot spend the whole budget by themselves |
 | 👎 on a message | 6h / 24h / day | rests that one kind for 6h; two in 24h rests it for 24h; three in one day stops everything until tomorrow |
 

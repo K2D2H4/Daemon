@@ -1003,6 +1003,63 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
         store.close()
 
 
+def test_proactive_speak_wires_the_bridge_for_topic_search_by_default(
+    tmp_path: Path,
+) -> None:
+    """`build_proactive_tick(..., speak=True)` is where `Judge` gets the MCP
+    bridge `topic` search needs (ADR 0015). Tools on and `full` - the product
+    default - means the bridge reaches the judge."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is not None
+    finally:
+        asyncio.run(closing())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"DAEMON_TOOLS_ENABLED": False},
+        {"DAEMON_TOOLS_MODE": "off"},
+    ],
+    ids=["tools_enabled=false", "tools_mode=off"],
+)
+def test_proactive_speak_withholds_the_bridge_when_tools_are_off(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    """Task 4's tools-off decision, made in `daemon/app.py` next to
+    `Judge(...)`: the topic search bridge calls `MCPBridge.call` directly and
+    bypasses `tools/policy.py` entirely (ADR 0015), so `tools_mode` alone would
+    not naturally stop it - `_build_tools` does not gate the bridge on mode, only
+    on `tools_enabled`. `build_proactive_tick` closes that gap itself, so an
+    owner who turned tools off either way gets no proactive network reach
+    either."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        **overrides,
+    )
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is None
+    finally:
+        asyncio.run(closing())
+
+
 def test_send_message_is_registered_only_where_it_can_deliver(tmp_path: Path) -> None:
     """`send_message` exists so a spoken turn can put a link in writing - and only
     the resident's voice runtime passes it a channel to do that through.
