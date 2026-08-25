@@ -46,3 +46,21 @@ def test_reduced_motion_is_honoured():
 @pytest.mark.parametrize("stem", ["idle1", "idle2", "idle3", "flourish_arms"])
 def test_the_page_knows_the_clip_vocabulary(stem):
     assert stem in PAGE
+
+
+def test_speaking_falls_back_to_idle_when_both_speaking_clips_are_missing():
+    # Static-text guard, not a behavioural harness: this suite is pure Python and CI
+    # installs no JS runtime (.github/workflows/ci.yml has no node step), so actually
+    # running clipFor() with a missing-clip manifest is out of reach without adding a
+    # dependency the project does not otherwise carry (see task-3-report.md). This
+    # pins the code shape instead - spec 3.7's chain is speaking_loud -> speaking_soft
+    # -> idle, and the speaking branch must reach the same idle fallback every other
+    # activity already uses (FOR_ACTIVITY[act]) rather than returning null and leaving
+    # whatever clip was already on screen.
+    start = PAGE.index('if (act === "speaking")')
+    end = PAGE.index("\n  }\n", start)
+    branch = PAGE[start:end]
+    assert "FOR_ACTIVITY[act]" in branch, (
+        "speaking must fall through to FOR_ACTIVITY[act] (-> idle1) when neither "
+        "speaking clip exists, per spec 3.7's ...-> idle"
+    )

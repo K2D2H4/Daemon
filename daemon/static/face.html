@@ -86,7 +86,12 @@ function clipFor(act) {
   }
   if (act === "speaking") {
     const loud = loudSince && performance.now() - loudSince > LOUD_HOLD_MS;
-    return first(loud ? ["speaking_loud", "speaking_soft"] : ["speaking_soft"]) || first(["speaking_loud"]);
+    // spec 3.7: speaking_loud -> speaking_soft -> idle. The first two links are
+    // this branch's own ordering; reusing FOR_ACTIVITY[act] for the last link keeps
+    // the same shape every other activity already uses to reach idle.
+    return first(loud ? ["speaking_loud", "speaking_soft"] : ["speaking_soft"])
+      || first(["speaking_loud"])
+      || first(FOR_ACTIVITY[act]);
   }
   return first(FOR_ACTIVITY[act]);
 }
