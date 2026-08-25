@@ -38,11 +38,11 @@ def store(db: sqlite3.Connection) -> Store:
     return Store(db)
 
 
-def runner(store: Store, roots: Path, **kw: Any) -> ToolRunner:
+def runner(store: Store, roots: Path, *, face: Any = None, **kw: Any) -> ToolRunner:
     registry = Registry()
     for tool in builtin_tools(roots=[roots]):
         registry.register(tool)
-    return ToolRunner(registry, ToolPolicy(store, **kw), store)
+    return ToolRunner(registry, ToolPolicy(store, **kw), store, face=face)
 
 
 def inbound(text: str, *, authored: bool = True) -> InboundMessage:
@@ -872,11 +872,7 @@ async def test_running_a_tool_shows_working_then_restores_what_was_there(
     (tmp_path / "notes.md").write_text("test")
     bus = RecordingBus()
     bus.set_activity("thinking")
-
-    registry = Registry()
-    for tool in builtin_tools(roots=[tmp_path]):
-        registry.register(tool)
-    tools = ToolRunner(registry, ToolPolicy(store, mode="ask"), store, face=bus)
+    tools = runner(store, tmp_path, mode="ask", face=bus)
 
     await tools.execute(
         [read_file_call(tmp_path / "notes.md")],
@@ -892,14 +888,10 @@ async def test_a_failing_tool_still_restores_the_activity(
 
     bus = RecordingBus()
     bus.set_activity("thinking")
-
-    registry = Registry()
-    for tool in builtin_tools(roots=[tmp_path]):
-        registry.register(tool)
-    tools = ToolRunner(registry, ToolPolicy(store, mode="ask"), store, face=bus)
+    tools = runner(store, tmp_path, mode="ask", face=bus)
 
     await tools.execute(
-        [read_file_call(tmp_path / "/nope/nope")],
+        [read_file_call(Path("/nope/nope"))],
         TurnContext(origin="owner", channel="fake", sender_id=OWNER),
     )
     assert bus.state.activity == "thinking"

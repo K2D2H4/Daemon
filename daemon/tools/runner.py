@@ -113,8 +113,6 @@ class ToolRunner:
         """
         if self._face is None:
             return await self._execute(calls, context)
-        # Restore rather than assume idle: this runs inside a turn that was already
-        # `thinking`, and dropping to idle mid-reply reads as the daemon giving up.
         before = self._face.state.activity
         self._face.set_activity("working")
         try:
