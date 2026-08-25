@@ -109,7 +109,7 @@ the other three generators are unaffected.
 | kind | material | search |
 |---|---|---|
 | `topic` | `entities.name` + `entities.updated_at` | **yes — the only one** |
-| `calendar` | event times from the Google MCP server | no |
+| `calendar` | event times from the Google MCP server | reads the Google server — the same kind of external call under a different name; see the plan's Scope |
 | `weather` | a condition code, only when it changes the day (rain, snow, cold) | no |
 | `diary` | last night's reflection | no |
 
