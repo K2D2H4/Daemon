@@ -747,8 +747,17 @@ def _face() -> int:
         ["open", "-na", "Google Chrome", "--args", f"--app={url}", "--window-size=420,630"],
         ["open", url],
     ):
-        if subprocess.run(argv, capture_output=True).returncode == 0:
-            return OK
+        try:
+            if subprocess.run(argv, capture_output=True).returncode == 0:
+                return OK
+        except OSError:
+            # `open` is macOS-only (docs/PLAN.md's Linux/Windows residency
+            # targets have no such binary), and a missing executable raises
+            # FileNotFoundError rather than returning a nonzero exit - the same
+            # shape `_install` guards around `codesign`. Try the next argv
+            # instead of letting this escape as a raw traceback (module
+            # docstring).
+            continue
     print(url)
     return OK
 

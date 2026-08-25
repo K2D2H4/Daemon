@@ -739,6 +739,24 @@ def test_face_prints_the_url_when_it_cannot_open_a_browser(
     assert "127.0.0.1:8787/face" in capsys.readouterr().out
 
 
+def test_face_prints_the_url_when_open_is_not_on_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`open` is macOS-only; a real headless box - the phrase the other face test
+    already uses - has no such binary at all, and `subprocess.run` raises
+    `FileNotFoundError` for a missing executable rather than returning a nonzero
+    `CompletedProcess`. The other test's stand-in covers "the command ran and
+    failed"; this covers "the command does not exist", which is the shape the
+    docstring's "headless box" claim actually depends on."""
+
+    def missing(*a: object, **k: object) -> None:
+        raise FileNotFoundError("open")
+
+    monkeypatch.setattr("daemon.cli.subprocess.run", missing)
+    assert cli.main(["face"]) == 0
+    assert "127.0.0.1:8787/face" in capsys.readouterr().out
+
+
 def test_a_broken_config_stops_a_command_that_needs_it(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
