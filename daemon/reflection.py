@@ -112,6 +112,13 @@ about the owner even when what came back is about somebody else.
 SYSTEM = """너는 하루치 대화를 정리하는 역할이다. 아래 규칙을 지켜 JSON만 출력한다.
 
 - facts: 앞으로 계속 기억할 가치가 있는 사실. 그날의 잡담은 넣지 않는다.
+  **이 사람의 삶과 세계에 대한 것만 넣는다** (이름, 가족, 사는 곳, 일, 일정,
+  가진 것). 나를 어떻게 대해 달라는 말 - 말투, 호칭, 태도, 무엇을 하지 말라거나
+  더 해 달라는 요청·선호·자제 요구 - 는 사실이 아니다. 그런 것은 facts 가 아니라
+  observations 에 넣는다. 한 문장이 '~해 달라고 요청함', '~를 선호함',
+  '~를 자제해 달라고 함' 으로 끝나고 그 요청·선호·자제의 대상이 나(비서)라면
+  그건 observations 다. 대상이 일·주거·일정처럼 이 사람의 삶 쪽이면
+  (예: '재택근무를 선호함') 그대로 facts 다.
   importance 는 1~10. key 는 나중에 바뀔 수 있는 사실에만 넣는다
   (예: 사는 곳, 직장, 관계). 같은 key 는 이전 사실을 대체한다.
   updates 는 이미 기억하고 있는 사실을 고쳐 쓰는 경우에만, 그 번호를 적는다.
@@ -294,7 +301,7 @@ def _clean(raw: dict[str, object]) -> tuple[Conclusion, list[str]]:
         )
 
     observations = []
-    for item in _items(raw, "observations", problems)[:MAX_OBSERVATIONS]:
+    for item in _items(raw, "observations", problems, recover_bare_string=True)[:MAX_OBSERVATIONS]:
         body = _text(item, "body")
         if not body:
             problems.append("an observation with no body")
@@ -373,7 +380,33 @@ def _clean_tool_facts(raw: dict[str, object], problems: list[str]) -> tuple[Fact
     return tuple(facts)
 
 
-def _items(raw: dict[str, object], key: str, problems: list[str]) -> list[dict[str, object]]:
+def _items(
+    raw: dict[str, object], key: str, problems: list[str], *, recover_bare_string: bool = False
+) -> list[dict[str, object]]:
+    """The list at `raw[key]`, optionally tolerant of an entry that is a bare string.
+
+    `recover_bare_string` defaults off: a bare string is dropped and reported,
+    which is what every one of `facts`, `entities` and `observations` did before
+    64ed650. Pass it `True` only for the key the recovery was actually measured
+    against.
+
+    Found by hand-auditing the graded-persona-learning spike's raw output
+    (daemon/MEASURED.md): on 2 of 60 records the model returned `observations`
+    as a plain list of strings instead of `{"body": ..., "confidence": ...}`
+    objects, and every one hit the `else` branch below - the whole array's
+    persona signal silently discarded for that night, with nothing surfacing
+    beyond one generic "was not an object" line. That is why `observations`
+    recovers a bare string as `{"body": item}`, with every other field left to
+    the schema's own default.
+
+    Nothing measured says `facts` or `entities` ever arrive this way, and for
+    `entities` recovering would be actively harmful: a bare-string junk entry
+    would survive into the list, consume one of the `MAX_ENTITIES` slots ahead
+    of the slice, and only then get rejected in the entities loop for having no
+    `name`/`note` - so a genuine entity later in an oversized array could be
+    truncated away by junk that used to be dropped for free before the slice.
+    Keeping the tolerance scoped to `observations` is what avoids that.
+    """
     value = raw.get(key)
     if value is None:
         return []
@@ -384,6 +417,8 @@ def _items(raw: dict[str, object], key: str, problems: list[str]) -> list[dict[s
     for item in value:
         if isinstance(item, dict):
             out.append(item)
+        elif recover_bare_string and isinstance(item, str):
+            out.append({"body": item})
         else:
             problems.append(f"an entry in {key} was not an object")
     return out

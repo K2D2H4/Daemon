@@ -601,3 +601,66 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   `clientContent` + `inline_data` closes this model with 1007 did not reproduce on a
   correctly-shaped raw payload; it was the library's bug, not the API's, which is again
   the whole reason to ask the socket. `evals/screen_frame_arrival_spike.py`.
+- **Dating a learned rule by its age and observation count was reverted: three
+  independent measurements against the live model found no detectable effect,
+  and the one run that looked significant did not replicate.** The idea
+  (`daemon/persona/loader.py::rule_line`, `e34785d`/`d53be62`/`f7593fc`/
+  `22255b9`/`586d804`, all reverted) was that a rule formed from a single
+  terse-QA exchange should carry less weight in the prompt than one built
+  from many repeated observations, so a stale one-off correction fades while
+  a real, repeatedly-confirmed preference holds. It looked right in the first
+  hand-audited three-arm run (the spike script, n=30 each, removed here but
+  recoverable from `ee2801a`): the stale rule's dominance trended down
+  (17/30 → 13/30) while the real preference held - **30/30 → 28/30, and it
+  never dropped below that in this run or any later one, so the mechanism was
+  never a regression to weigh against. It was inert, not harmful.**
+
+  **Two defects in the probe had to be found before arm 1's number meant
+  anything.** First, its judge demanded a reply clear four clauses at once (no
+  jokes, no affection, no self-disclosure, no question back) to count as
+  "terse", and this persona never clears all four together even while
+  visibly shortening - so it answered "no" unconditionally regardless of
+  which arm was dated. Replacing that with reply length against the two arms'
+  *pooled* median fixed the floor/ceiling problem but created a second one:
+  the two hit-counts became structurally near-complementary (they sum to
+  about n), so a Fisher exact over them was scoring roughly one coin flip
+  about which arm landed on the short side, not a real difference - caught
+  only because an identical second n=30 run reversed the sign (13/30 → 19/30
+  against the first run's 17/30 → 13/30). `ee2801a` replaced it with the two
+  reply-length distributions compared directly: median and mean per arm, a
+  rank-sum test, and a two-sided permutation p-value over 20000 shuffles.
+  That is the metric every number below used.
+
+  With the corrected metric: n=30, the dated arm was shorter (p=0.40); n=60,
+  it was longer (p=0.00065); a second n=60 replication came back shorter
+  again (p=0.34). Pooled, 120 vs 120, the medians are identical at **99.0**
+  (p=0.107). No effect survives pooling, and the single run that cleared
+  conventional significance did not replicate - it was noise a large enough
+  one-off sample can produce, not a real effect too small to see at n=30.
+
+  **Arm 3 (does a manner remark leak from `facts` into `observations` under
+  reflection's old prompt) never reproduced on the real 2026-08-19 incident
+  day: `facts` 0/30 under both the old and new prompt.** So `70c6a37`'s
+  `facts`/`observations` boundary closes a path rarer than the incident that
+  prompted it implied - and it stays anyway, being one paragraph of prompt
+  wording whose cost was not measured: `facts` was 0/30 under both prompts,
+  so the run had no positive `facts` control to weigh a cost against, unlike
+  the dating mechanism it shipped alongside and which this entry retires.
+
+  **A real defect the same hand audit turned up: on 2 of 60 records, the
+  model returned `observations` as a bare list of strings instead of
+  `{"body": ..., "confidence": ...}` objects.** No test caught this - it
+  surfaced only from reading the spike's raw replies by hand - and
+  `reflection.py::_items` treated every such entry as "not an object" and
+  dropped it, discarding that whole night's persona signal silently. Fixed by
+  making `_items` recover a bare string as `body`, falling back to the
+  schema's own defaults for everything else. The `facts`/`observations`
+  boundary above routes more content into `observations`, so this parsing gap
+  gets more consequential, not less.
+
+  **What a retry would need first, if anyone repeats this.** The spike runs
+  all of one arm and then all of the other, so arm is confounded with
+  whatever drifted between the two blocks - model routing, load, anything
+  else that changes over the run's wall-clock span. Every number above
+  inherits that confound. Interleaving the two arms trial-by-trial, not a
+  larger n, is what a retry needs before its p-value means anything either.
