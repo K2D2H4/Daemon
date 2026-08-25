@@ -116,7 +116,9 @@ SYSTEM = """너는 하루치 대화를 정리하는 역할이다. 아래 규칙�
   가진 것). 나를 어떻게 대해 달라는 말 - 말투, 호칭, 태도, 무엇을 하지 말라거나
   더 해 달라는 요청·선호·자제 요구 - 는 사실이 아니다. 그런 것은 facts 가 아니라
   observations 에 넣는다. 한 문장이 '~해 달라고 요청함', '~를 선호함',
-  '~를 자제해 달라고 함' 으로 끝난다면 그건 observations 다.
+  '~를 자제해 달라고 함' 으로 끝나고 그 요청·선호·자제의 대상이 나(비서)라면
+  그건 observations 다. 대상이 일·주거·일정처럼 이 사람의 삶 쪽이면
+  (예: '재택근무를 선호함') 그대로 facts 다.
   importance 는 1~10. key 는 나중에 바뀔 수 있는 사실에만 넣는다
   (예: 사는 곳, 직장, 관계). 같은 key 는 이전 사실을 대체한다.
   updates 는 이미 기억하고 있는 사실을 고쳐 쓰는 경우에만, 그 번호를 적는다.
@@ -379,6 +381,17 @@ def _clean_tool_facts(raw: dict[str, object], problems: list[str]) -> tuple[Fact
 
 
 def _items(raw: dict[str, object], key: str, problems: list[str]) -> list[dict[str, object]]:
+    """The list at `raw[key]`, tolerant of an entry that is a bare string.
+
+    Found by hand-auditing the graded-persona-learning spike's raw output
+    (daemon/MEASURED.md): on 2 of 60 records the model returned `observations`
+    as a plain list of strings instead of `{"body": ..., "confidence": ...}`
+    objects, and every one hit the `else` branch below - the whole array's
+    persona signal silently discarded for that night, with nothing surfacing
+    beyond one generic "was not an object" line. A string recovers as the
+    body, with every other field left to the schema's own default; anything
+    that is neither a dict nor a string is still dropped and reported.
+    """
     value = raw.get(key)
     if value is None:
         return []
@@ -389,6 +402,8 @@ def _items(raw: dict[str, object], key: str, problems: list[str]) -> list[dict[s
     for item in value:
         if isinstance(item, dict):
             out.append(item)
+        elif isinstance(item, str):
+            out.append({"body": item})
         else:
             problems.append(f"an entry in {key} was not an object")
     return out

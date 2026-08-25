@@ -643,8 +643,20 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   day: `facts` 0/30 under both the old and new prompt.** So `70c6a37`'s
   `facts`/`observations` boundary closes a path rarer than the incident that
   prompted it implied - and it stays anyway, being one paragraph of prompt
-  wording with no measured cost, unlike the dating mechanism it shipped
-  alongside and which this entry retires.
+  wording whose cost was not measured: `facts` was 0/30 under both prompts,
+  so the run had no positive `facts` control to weigh a cost against, unlike
+  the dating mechanism it shipped alongside and which this entry retires.
+
+  **A real defect the same hand audit turned up: on 2 of 60 records, the
+  model returned `observations` as a bare list of strings instead of
+  `{"body": ..., "confidence": ...}` objects.** No test caught this - it
+  surfaced only from reading the spike's raw replies by hand - and
+  `reflection.py::_items` treated every such entry as "not an object" and
+  dropped it, discarding that whole night's persona signal silently. Fixed by
+  making `_items` recover a bare string as `body`, falling back to the
+  schema's own defaults for everything else. The `facts`/`observations`
+  boundary above routes more content into `observations`, so this parsing gap
+  gets more consequential, not less.
 
   **What a retry would need first, if anyone repeats this.** The spike runs
   all of one arm and then all of the other, so arm is confounded with

@@ -324,6 +324,33 @@ async def test_a_list_that_is_not_a_list_is_a_reported_problem(
     assert any("was not a list" in problem for problem in result.problems)
 
 
+async def test_a_bare_string_observation_is_recovered_not_dropped(
+    data_dir: Path, store: Store
+) -> None:
+    """The Task 7 hand audit of the spike's raw output found this on 2 of 60
+    records: the model returned `observations` as a bare list of strings
+    instead of `{"body": ..., "confidence": ...}` objects, and every string
+    hit `_items`'s "not an object" branch, so the whole array's persona
+    signal was silently discarded for that night - a defect no test had
+    caught, only found by reading raw replies by hand (daemon/MEASURED.md).
+    Change (A) routes more into `observations`, so this path only gets more
+    consequential. A string must recover as the body, with confidence
+    falling back to the schema's own default, rather than being dropped.
+    """
+    record(store, "무슨 말")
+    reply = json.dumps(
+        {"observations": ["아침에는 말을 걸지 않는 게 낫다"]}, ensure_ascii=False
+    )
+
+    result = await pass_for(data_dir, store, reply).run(DAY)
+
+    assert result.observations == 1
+    assert not result.problems
+    rows = store.unconsumed_observations()
+    assert [row["body"] for row in rows] == ["아침에는 말을 걸지 않는 게 낫다"]
+    assert rows[0]["confidence"] == pytest.approx(0.5)
+
+
 async def test_an_empty_conclusion_is_still_a_written_day(
     data_dir: Path, store: Store
 ) -> None:
@@ -1271,3 +1298,34 @@ def test_the_facts_bucket_refuses_manner_and_names_where_it_goes() -> None:
             f"{banned!r} is the shape the misfiled line took; the prompt has to "
             "name the kind, not hope the model generalises"
         )
+
+
+def test_the_ending_test_does_not_swallow_every_preference() -> None:
+    """The clause's closing sentence used to be a bare surface-form test: any
+    Korean 개조식 sentence ending in '~를 선호함' counted as `observations`, with
+    no reference back to the clause's own "나를 어떻게 대해 달라는 말" scoping.
+    That collides with `facts`'s own allowed list two lines above (일, 일정) -
+    '재택근무를 선호함' and '아침 회의를 선호함' are genuine life-facts that end
+    exactly that way. Routed to `observations` they never reach `core.md`, and
+    M4's evolve prompt ("이 사람을 어떻게 대하면 좋은지에 대한 관찰") does not turn a
+    work-from-home preference into a persona rule either - so it would simply be
+    lost. A daemon that quietly stops remembering where its owner works is a
+    worse failure than the manner-leak this clause was written to close.
+
+    So the ending test must be conditioned on the target being the daemon
+    itself, and a life-side preference phrased the same way must be named as
+    staying a fact.
+    """
+    from daemon.reflection import SYSTEM
+
+    facts_rule = SYSTEM.split("- entities:")[0]
+    ending = facts_rule[facts_rule.index("한 문장이") :]
+    assert "나(비서)" in ending, (
+        "the '~를 선호함' ending test must be conditioned on the target being "
+        "the daemon, not just the surface form - otherwise it claims every "
+        "preference sentence for observations"
+    )
+    assert "재택근무를 선호함" in facts_rule, (
+        "a work-from-home preference must be named as staying a fact - the "
+        "concrete case the un-scoped clause would have lost"
+    )
