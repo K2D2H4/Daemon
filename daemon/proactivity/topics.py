@@ -23,6 +23,29 @@ search reply is a JSON object with a `results` list, each item carrying at least
 `title`, `url` and `content` - which is what `search_titles` parses below. This
 was not confirmed with a live network call (no API key in this environment, and
 the constraint against tests touching the network extends to verification here).
+
+## The query used to ask "what is this", never "what happened"
+
+Task 5's n=30 spike (`evals/proactive_topic_spike.py`, 2026-08-25) measured
+`concrete_fact` at 1/30 in *both* arms and `declined` at 27/30 (no search) vs
+29/30 (with search) - a search that changed almost nothing. The raw output
+named why: a bare entity-name query returns encyclopedia entries, not news.
+`Kiwi` (the owner's dog) returned `['Kiwi - Wikipedia', 'Kiwi | San Diego Zoo
+Animals & Plants', 'Kiwi | Britannica']` - the bird, not the dog, and nothing
+in any of those titles is news a daemon could raise. `Emil Kowalski` returned
+`['Emil Kowalski', 'Emil Kowalski (@emilkowalski) / X']` - profile pages, not
+events.
+
+The live `tavily_search` input schema (fetched via a real `McpBridge` connect,
+not assumed) answers the two obvious levers by name: `topic` is
+`{"const": "general", "default": "general"}` - this server does not expose a
+`"news"` topic, so passing one would violate its own schema - but `time_range`
+is a real enum (`day` | `week` | `month` | `year`, default `null`, "The time
+range back from the current date to include in the search results"). That is
+the recency lever this deployment actually offers, so `search_titles` below
+sets it rather than reshaping the query string: an evergreen Wikipedia or
+Britannica page has no publish date inside a `month`-wide window and drops out
+on its own, without this module having to guess at query phrasing.
 """
 
 from __future__ import annotations
@@ -48,6 +71,16 @@ applied uniformly because there was no reason for `entity` to be the one piece
 of interpolated text left unguarded."""
 SERVER = "tavily"
 TOOL = "tavily_search"
+TIME_RANGE = "month"
+"""The one query-shaping lever this server's schema actually exposes (see the
+module docstring's "what is this vs what happened" section) - a constant this
+module writes, never a value read from a search result or model output, so
+ADR 0015's "first-party argument" framing still holds with it in the call.
+`"month"` rather than `"week"`: `TOPIC_QUIET_DAYS` (`candidates.py`) already
+requires 7 days of silence before an entity is even eligible, so a window
+narrower than that would refuse to surface anything that happened in the first
+week of the quiet period, and `"year"` is wide enough to let evergreen content
+back in - the exact failure this constant exists to close."""
 
 
 class Bridge(Protocol):
@@ -76,9 +109,18 @@ async def search_titles(bridge: Bridge, entity: str) -> list[str]:
     stops speaking for a reason nobody can see, which is this project's signature
     defect. An empty list drops the candidate, which is the correct outcome - a
     topic with nothing behind it is an empty opener.
+
+    `time_range=TIME_RANGE` is the only addition beyond the entity name itself
+    (see `TIME_RANGE`'s docstring): it does not change what the query *says*,
+    only which window of the web it is allowed to answer from, which is what
+    this server's schema actually offers in place of a `"news"` topic.
     """
     try:
-        raw = await bridge.call(SERVER, TOOL, {"query": entity, "max_results": MAX_TITLES})
+        raw = await bridge.call(
+            SERVER,
+            TOOL,
+            {"query": entity, "max_results": MAX_TITLES, "time_range": TIME_RANGE},
+        )
     except Exception:
         logger.exception("topics: search failed for %r", entity)
         return []

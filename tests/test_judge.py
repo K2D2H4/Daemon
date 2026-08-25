@@ -525,8 +525,41 @@ async def test_a_topic_candidates_search_titles_reach_the_prompt(data_dir: Path)
 
     assert utterance.text == "Sendbird 소식 들었어?"
     assert len(provider.calls) == 1
-    assert "Sendbird raises Series C" in system_text(provider)
-    assert bridge.calls == [("tavily", "tavily_search", {"query": "Sendbird", "max_results": 3})]
+    assert bridge.calls == [
+        (
+            "tavily",
+            "tavily_search",
+            {"query": "Sendbird", "max_results": 3, "time_range": "month"},
+        )
+    ]
+
+
+async def test_the_search_titles_land_in_the_same_turn_the_judge_is_told_to_judge(
+    data_dir: Path,
+) -> None:
+    """Task 5, cause 2: the n=30 spike measured `declined` at 27/30 with no search
+    and 29/30 with one - almost no change - because the titles used to arrive as a
+    *separate* system message while `judge.SYSTEM` instructs the model to judge
+    whether '이유' (the reason - the user turn) carries content. A reason built from
+    only an entity name and an elapsed-day count never does, by rule 1's own text,
+    so the titles sitting in a block the model was never told to treat as part of
+    '이유' bought nothing. Fixed by folding the rendered titles into the same user
+    message as `_reason_block`, so the material the judge needs is literally inside
+    the thing it is asked to evaluate - not by loosening `has_url`, the nonce fence,
+    the marker stripping or any cap in `topics.py`."""
+    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
+    provider = FakeProvider('{"say": "Sendbird 소식 들었어?"}')
+    gateway = LLMGateway(
+        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
+    )
+    bridge = _FakeBridge('{"results": [{"title": "Sendbird raises Series C"}]}')
+    judge = Judge(gateway, data_dir, bridge=bridge)
+
+    await judge.decide(TOPIC)
+
+    assert "Sendbird raises Series C" in user_text(provider)
+    assert "Sendbird raises Series C" not in system_text(provider)
+    assert "이유 (topic)" in user_text(provider)
 
 
 async def test_a_topic_reply_naming_a_non_pointer_entity_is_not_declined(

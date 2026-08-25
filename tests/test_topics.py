@@ -128,7 +128,15 @@ async def test_search_titles_calls_tavily_with_the_entity_as_the_query() -> None
 
     assert titles == ["Sendbird raises Series C"]
     assert bridge.calls == [
-        (topics.SERVER, topics.TOOL, {"query": "Sendbird", "max_results": topics.MAX_TITLES})
+        (
+            topics.SERVER,
+            topics.TOOL,
+            {
+                "query": "Sendbird",
+                "max_results": topics.MAX_TITLES,
+                "time_range": topics.TIME_RANGE,
+            },
+        )
     ]
 
 
