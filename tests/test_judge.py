@@ -258,6 +258,168 @@ async def test_a_null_say_declines(data_dir: Path) -> None:
     assert "say" in utterance.why_not
 
 
+def test_a_line_with_a_link_is_declined() -> None:
+    """ADR 0015's load-bearing defence. Every other measure reduces what gets into
+    the prompt; this one bounds what gets out. The vector worth fearing is not
+    exfiltration - a proactive line goes to the paired owner or the local speaker -
+    it is this daemon's trusted voice telling its owner where to go."""
+    from daemon.proactivity.judge import has_url
+
+    assert has_url("자세한 건 https://example.com 에 있어")
+    assert has_url("example.com/news 봤어?")
+    assert has_url("여기 www.example.com 참고해")
+    assert not has_url("Sendbird 소식 봤어? 시리즈 C 받았대")
+
+
+async def test_a_reply_containing_a_url_is_declined_end_to_end(data_dir: Path) -> None:
+    """`has_url` is exercised for real through `decide`, not only as a bare
+    function - the same choke point every proactive reply already passes through
+    (JSON-only, then `MAX_CHARS`) so this is one more filter on that path, not a
+    separate one somebody could route around."""
+    judge, _ = judge_for(
+        data_dir, json.dumps({"say": "Sendbird 소식 https://sendbird.com 에 있어"})
+    )
+
+    utterance = await judge.decide(OPEN_LOOP)
+
+    assert not utterance
+    assert "url" in utterance.why_not.casefold()
+
+
+async def test_the_judge_is_offered_no_tools(data_dir: Path) -> None:
+    """ADR 0015 splits non-negotiable 10 so that *code* may search on a proactive
+    turn. The model still may not, and this is the assertion that keeps the split
+    from quietly closing."""
+    judge, provider = judge_for(data_dir, '{"say": "시험 어땠어?"}')
+
+    await judge.decide(OPEN_LOOP)
+
+    assert provider.offered_tools[0] == ()
+
+
+# --- the search a `topic` candidate triggers (ADR 0015) ----------------------
+
+
+class _FakeBridge:
+    """Stands in for `daemon.tools.mcp.MCPBridge` - no network, no API key."""
+
+    def __init__(self, reply: str = "", *, fail: bool = False) -> None:
+        self.reply = reply
+        self.fail = fail
+        self.calls: list[tuple[str, str, dict]] = []
+
+    async def call(self, server: str, name: str, arguments: dict) -> str:
+        self.calls.append((server, name, arguments))
+        if self.fail:
+            raise RuntimeError("the fake bridge was told to fail")
+        return self.reply
+
+
+TOPIC = Candidate(
+    kind="topic", reason="Sendbird 얘기를 나눈 지 오래됐다.", payload={"entity": "Sendbird"}
+)
+
+
+async def test_a_topic_candidate_with_no_bridge_is_dropped_before_the_model(
+    data_dir: Path,
+) -> None:
+    """No bridge wired (every fake-injection path, and any install with no MCP
+    configured) is the same degrade path as an empty search: dropped, not spoken
+    with nothing behind it, and the model is never even asked."""
+    judge, provider = judge_for(data_dir)
+
+    utterance = await judge.decide(TOPIC)
+
+    assert not utterance
+    assert provider.calls == []
+
+
+async def test_a_topic_candidate_with_an_empty_search_is_dropped(data_dir: Path) -> None:
+    """A failed, empty or disabled search drops the candidate - it never becomes an
+    utterance with nothing behind it (four content-free topic openers a day is
+    what the owner asked to have removed)."""
+    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
+    provider = FakeProvider('{"say": "Sendbird 소식 들었어?"}')
+    gateway = LLMGateway(
+        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
+    )
+    bridge = _FakeBridge('{"results": []}')
+    judge = Judge(gateway, data_dir, bridge=bridge)
+
+    utterance = await judge.decide(TOPIC)
+
+    assert not utterance
+    assert provider.calls == []
+
+
+async def test_a_topic_candidates_search_titles_reach_the_prompt(data_dir: Path) -> None:
+    """The one search a gate-passed `topic` candidate earns: the titles are fenced
+    and handed to the same single model call, not a second one."""
+    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
+    provider = FakeProvider('{"say": "Sendbird 소식 들었어?"}')
+    gateway = LLMGateway(
+        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
+    )
+    bridge = _FakeBridge('{"results": [{"title": "Sendbird raises Series C"}]}')
+    judge = Judge(gateway, data_dir, bridge=bridge)
+
+    utterance = await judge.decide(TOPIC)
+
+    assert utterance.text == "Sendbird 소식 들었어?"
+    assert len(provider.calls) == 1
+    assert "Sendbird raises Series C" in system_text(provider)
+    assert bridge.calls == [("tavily", "tavily_search", {"query": "Sendbird", "max_results": 3})]
+
+
+async def test_a_failed_search_drops_the_candidate_rather_than_raising(data_dir: Path) -> None:
+    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
+    provider = FakeProvider('{"say": "Sendbird 소식 들었어?"}')
+    gateway = LLMGateway(
+        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
+    )
+    judge = Judge(gateway, data_dir, bridge=_FakeBridge(fail=True))
+
+    utterance = await judge.decide(TOPIC)
+
+    assert not utterance
+    assert provider.calls == []
+
+
+async def test_only_one_search_per_candidate_never_per_tick(data_dir: Path) -> None:
+    """Non-negotiable 7's shape: deterministic generation, deterministic gate, then
+    exactly one expensive step. Two `decide` calls on the same candidate must be
+    two searches, never a cached or shared one that would blur that count - but a
+    single `decide` must never search twice for it either."""
+    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
+    provider = FakeProvider('{"say": "Sendbird 소식 들었어?"}')
+    gateway = LLMGateway(
+        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
+    )
+    bridge = _FakeBridge('{"results": [{"title": "Sendbird raises Series C"}]}')
+    judge = Judge(gateway, data_dir, bridge=bridge)
+
+    await judge.decide(TOPIC)
+
+    assert len(bridge.calls) == 1
+
+
+async def test_a_non_topic_candidate_never_touches_the_bridge(data_dir: Path) -> None:
+    """The bridge is `topic`-only. Every other kind must behave exactly as before
+    ADR 0015, whether or not a bridge happens to be wired."""
+    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
+    provider = FakeProvider()
+    gateway = LLMGateway(
+        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
+    )
+    bridge = _FakeBridge(fail=True)
+    judge = Judge(gateway, data_dir, bridge=bridge)
+
+    await judge.decide(OPEN_LOOP)
+
+    assert len(provider.calls) == 1
+    assert bridge.calls == []
+
+
 async def test_prose_instead_of_json_declines_rather_than_being_spoken(
     data_dir: Path,
 ) -> None:

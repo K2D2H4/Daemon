@@ -60,6 +60,15 @@ weeks ago. That is an assumption about another module, so it is not relied on
 alone - the reason is length-bounded and framed as a record rather than as an
 instruction.
 
+ADR 0015 adds one more block, and only for a `kind="topic"` candidate: deterministic
+code (`proactivity/topics.py`) issues one read-only search whose query is
+`candidate.payload["entity"]` - itself read from `entities.name`, never from web
+text or a prior model reply - and the result titles are fenced under a nonce and
+handed to the prompt as reference material. The model still chooses nothing about
+the search: it did not decide to search, did not decide the query, and is offered
+zero tools either way (`test_the_judge_is_offered_no_tools`). What it can do with
+those titles is bounded on the way out, not the way in - `has_url` below.
+
 The seed is required, not optional. The text loop degrades to no persona because
 somebody asked it a question and deserves an answer; nobody asked for this, and
 PLAN 5 is explicit that a generic-assistant voice is the one thing this product
@@ -70,11 +79,14 @@ silent degradation is this project's signature defect.
 from __future__ import annotations
 
 import logging
+import re
+import secrets
 from pathlib import Path
 
 from daemon.llm.base import Message, ProviderError
 from daemon.llm.gateway import LLMGateway
 from daemon.persona.loader import load_persona, read_file, seed_path
+from daemon.proactivity import topics
 from daemon.proactivity.base import Candidate, Utterance
 from daemon.reflection import extract_json
 from daemon.tasks import Task
@@ -153,8 +165,18 @@ JSON만 출력한다.
 class Judge:
     """The one model call. Constructed per run; holds nothing between decisions."""
 
-    def __init__(self, gateway: LLMGateway, data_dir: Path) -> None:
+    def __init__(
+        self, gateway: LLMGateway, data_dir: Path, *, bridge: topics.Bridge | None = None
+    ) -> None:
         self._gateway = gateway
+        # ADR 0015: deterministic code, not the model, may issue one read-only
+        # search for a `topic` candidate - `bridge` is that code's only route to
+        # the network. `None` is the honest default: every caller that does not
+        # wire an MCP bridge (every fake-injection test, and any install with no
+        # MCP configured) gets the pre-existing four generators unchanged, and a
+        # `topic` candidate is simply dropped rather than spoken with nothing
+        # behind it.
+        self._bridge = bridge
         # M4's learned rules are included as of 2026-08-11. This block used to
         # say the call was left "for whoever makes it on purpose"; this is that.
         #
@@ -191,14 +213,30 @@ class Judge:
             )
             return Utterance(why_not=f"no persona seed under {self._data_dir}")
 
+        topic_block = ""
+        if candidate.kind == "topic":
+            topic_block = await self._topic_block(candidate)
+            if not topic_block:
+                # No bridge, no entity, or a search that found nothing - dropped
+                # here, before the one model call is spent. A `topic` line with
+                # nothing behind it is the content-free opener ADR 0015 exists to
+                # avoid, not something the judge should be asked to paper over.
+                return Utterance(why_not="topic candidate had no search result to offer")
+
         messages = [
             Message(role="system", content=persona),
             Message(role="system", content=SYSTEM),
-            Message(role="user", content=_reason_block(candidate)),
         ]
+        if topic_block:
+            messages.append(Message(role="system", content=topic_block))
+        messages.append(Message(role="user", content=_reason_block(candidate)))
         try:
             # One call. No retry: a second attempt at "is there something to say"
-            # is the open question PLAN 6.2 warns about, asked twice.
+            # is the open question PLAN 6.2 warns about, asked twice. This is also
+            # the one call that may follow a search - never a second one for the
+            # search itself, so non-negotiable 7's shape (deterministic generation,
+            # deterministic gate, exactly one expensive step) still holds with
+            # `topic` in the mix.
             completion = await self._gateway.complete(
                 Task.PROACTIVE_JUDGE, messages, max_output_tokens=MAX_OUTPUT_TOKENS
             )
@@ -211,9 +249,37 @@ class Judge:
             model=completion.model,
             stop_reason=completion.meta.get("stop_reason", ""),
         )
+        if utterance and has_url(utterance.text):
+            # ADR 0015's load-bearing defence. Every bound on what the search
+            # brought in (title count, title length, the reference-not-instruction
+            # framing) only reduces what gets *in*; this is what bounds what gets
+            # *out*, because the failure that matters is this daemon's trusted
+            # voice telling its owner where to go on a line nobody asked for.
+            utterance = Utterance(why_not=f"reply contained a url: {utterance.text!r}")
         if not utterance:
             logger.info("judge: declined %s (%s)", candidate.kind, utterance.why_not)
         return utterance
+
+    async def _topic_block(self, candidate: Candidate) -> str:
+        """The search result for a `topic` candidate, rendered for the prompt - or
+        "" for anything that should drop the candidate instead.
+
+        One search, for this one candidate, only after it reached the judge (which
+        only happens after the gate already passed it) - never per tick, never
+        speculative. The query is `candidate.payload["entity"]`, read straight out
+        of `entities.name` upstream (`candidates.topic_candidates`); nothing derived
+        from the web ever becomes a query.
+        """
+        if self._bridge is None:
+            return ""
+        entity = candidate.payload.get("entity")
+        if not isinstance(entity, str) or not entity.strip():
+            logger.warning("judge: topic candidate carried no entity name; dropping it")
+            return ""
+        titles = await topics.search_titles(self._bridge, entity)
+        if not titles:
+            return ""
+        return topics.render(entity, titles, secrets.token_hex(4))
 
     async def _persona(self) -> str:
         """The persona system message, or "" when there is no seed.
@@ -308,3 +374,19 @@ def _clean_line(raw: str) -> str:
         if len(line) > 1 and line.startswith(opener) and line.endswith(closer):
             return line[1:-1].strip()
     return line
+
+
+_URL_RE = re.compile(r"(https?://|www\.|\b[\w-]+\.(?:com|net|org|io|co|kr|ai|dev)\b)", re.I)
+
+
+def has_url(text: str) -> bool:
+    """Whether an utterance points the owner somewhere.
+
+    ADR 0015's load-bearing defence, and it lives on the output because that is the
+    one choke point every proactive line already passes through: the reply is
+    already refused unless it is `{"say": ...}` and already capped at `MAX_CHARS`.
+    A daemon that reads a link out of its speaker is the failure that matters, and
+    it costs nothing to refuse - the owner can ask, and then it is their turn and
+    the ordinary tool path applies.
+    """
+    return bool(_URL_RE.search(text))
