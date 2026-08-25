@@ -1,0 +1,404 @@
+"""What the daemon knows and what it worked out - the Memory and Persona tabs.
+
+Two read-only payloads over five tables (`memory_entries`, `entities`,
+`entity_links`, `observations`, `persona_rules`, `reflection_runs`) and the
+markdown those tables mirror. Same rules as `daemon/admin/activity.py`: no
+writes, no model calls, no side effects.
+
+## Bodies are inlined, and that is a security decision
+
+The markdown is returned *inside* the payload rather than through a
+`/api/memory/reflection/{date}` endpoint. Measured on the real install the whole
+corpus is 11.6 KB (entities 1.7, reflections 7.7, diaries 2.2), so the saving from
+lazy-loading would be nothing - and the endpoint that would do it takes a date or
+an entity name from the URL and joins it onto a path. There is no such endpoint
+here, so there is no traversal bug to get wrong.
+
+It does grow: roughly 800 bytes a day of reflections. `MAX_BODY_BYTES` and the
+three per-kind body caps below bound that growth, and they bound **bodies
+only** - a body dropped for either reason reports `bodies_truncated`. The list
+ceilings below are a separate backstop, on the corpus itself rather than on
+bytes; a section that outgrows one reports `list_truncated` instead. Either way
+the drop is named, never silent - the failure this whole tab exists to fix.
+
+## The reflection list is keyed on the files, not on `reflection_runs`
+
+`reflection_runs` arrived with M5; the artifacts predate it. Measured 2026-08-25:
+6 rows against 11 artifacts, and the gap does not close on its own - the table
+only started counting from when it landed, so every install carries some number
+of file-only days permanently. Keyed on the table, that history disappears from
+the only screen that shows it. So the day is the file, and the row is the extra
+detail a day may or may not have.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from daemon.config import Settings
+from daemon.memory.store import Store
+
+MAX_FACTS = 200
+MAX_ENTITIES = 500
+MAX_OBSERVATIONS = 300
+MAX_RULES = 100
+"""List ceilings, so a hand-edited limit cannot make the admin read an unbounded
+table into memory. Measured 2026-08-25, the real corpus was low tens per table
+(facts 11, entities 12, observations 11, rules 3) - two orders of magnitude below
+these on purpose: a backstop, not the body caps below."""
+
+MAX_REFLECTION_BODIES = 14
+MAX_DIARY_BODIES = 8
+MAX_ENTITY_BODIES = 60
+MAX_BODY_BYTES = 64 * 1024
+"""Body caps. Read the module docstring first: these drop *bodies*, never list
+entries, and whichever section they bite reports `bodies_truncated`."""
+
+
+class BodyBudget:
+    """One byte budget shared by every section of one payload.
+
+    Per-section budgets would let a long entity corpus and a long reflection
+    corpus each stay under its own ceiling while the response is twice the size
+    anyone signed off on.
+    """
+
+    def __init__(self, total: int) -> None:
+        self.left = total
+
+    def take(self, text: str) -> str | None:
+        cost = len(text.encode("utf-8"))
+        if cost > self.left:
+            return None
+        self.left -= cost
+        return text
+
+
+def _read(path: Path) -> str | None:
+    """A note's text, or None when the file is not there.
+
+    None rather than an exception: the real install has an `entities` row
+    ('벨라') whose note file is absent, and a missing note must render as a
+    missing note rather than 500 the whole tab.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _bodies(
+    items: list[tuple[str, Path]], *, limit: int, budget: BodyBudget
+) -> tuple[dict[str, str], bool]:
+    """Bodies for the first `limit` items that fit the budget, plus whether
+    anything was left without one. `items` is already in display order."""
+    bodies: dict[str, str] = {}
+    truncated = False
+    for index, (key, path) in enumerate(items):
+        if index >= limit:
+            truncated = True
+            continue
+        text = _read(path)
+        if text is None:
+            continue
+        kept = budget.take(text)
+        if kept is None:
+            truncated = True
+            continue
+        bodies[key] = kept
+    return bodies, truncated
+
+
+def _triggers(raw: str) -> list[str]:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return [str(item) for item in parsed] if isinstance(parsed, list) else []
+
+
+def _rel(data_dir: Path, path: Path) -> str:
+    """The path as the markdown contract names it, for the 'no body' case. Relative
+    so the response never carries the owner's home directory."""
+    try:
+        return path.relative_to(data_dir).as_posix()
+    except ValueError:
+        return path.name
+
+
+# --- Memory -----------------------------------------------------------------
+
+
+def memory_payload(store: Store, data_dir: Path) -> dict[str, Any]:
+    """Curated facts, entity notes and the reflection history."""
+    from daemon import reflection as reflection_mod
+
+    budget = BodyBudget(MAX_BODY_BYTES)
+
+    fact_rows = store.recent_entries(MAX_FACTS)
+    facts = [
+        {
+            "id": int(row["id"]),
+            "body": row["body"],
+            "importance": int(row["importance"]),
+            "triggers": _triggers(row["trigger_phrases"]),
+            "key": row["supersession_key"],
+            "status": row["status"],
+            "updated_at": row["updated_at"],
+        }
+        for row in fact_rows
+    ]
+    # COUNT(*)-backed, not derived from `fact_rows` - MAX_FACTS is a display
+    # cap, and a total read off the truncated window would quietly shrink once
+    # the real corpus grows past it.
+    facts_active = store.count_entries()
+    facts_retired = store.count_retired_entries()
+    facts_list_truncated = len(fact_rows) < facts_active + facts_retired
+
+    entity_rows = store.entities(MAX_ENTITIES)
+    entity_paths = [
+        (row["name"], data_dir / row["file"]) for row in entity_rows
+    ]
+    entity_bodies, entities_cut = _bodies(
+        entity_paths, limit=MAX_ENTITY_BODIES, budget=budget
+    )
+    entities = [
+        {
+            "name": row["name"],
+            "kind": row["kind"],
+            "mentions": int(row["mention_count"]),
+            "links": [link["name"] for link in store.links_for(int(row["id"]))],
+            "body": entity_bodies.get(row["name"]),
+            "file": row["file"],
+        }
+        for row in entity_rows
+    ]
+    entities_total = store.count_entities()
+    entities_list_truncated = len(entity_rows) < entities_total
+
+    # The files are the axis - see the module docstring.
+    reflect_dir = data_dir / reflection_mod.REFLECTIONS_SUBDIR
+    days = sorted(
+        (path.stem for path in reflect_dir.glob("*.md")) if reflect_dir.exists() else (),
+        reverse=True,
+    )
+    # Resolved by the exact days being rendered, not a row-count window - see
+    # `reflection_runs_by_dates`'s docstring. `days` is already the whole glob,
+    # so this never drops a day the way looking it up in a capped list would.
+    runs = store.reflection_runs_by_dates(days)
+    reflect_paths = [
+        (day, reflection_mod.artifact_path(data_dir, day)) for day in days
+    ]
+    reflect_bodies, reflect_cut = _bodies(
+        reflect_paths, limit=MAX_REFLECTION_BODIES, budget=budget
+    )
+    reflections = []
+    for day, path in reflect_paths:
+        row = runs.get(day)
+        reflections.append(
+            {
+                "date": day,
+                "status": row["status"] if row is not None else None,
+                "ts": row["ts"] if row is not None else None,
+                "messages_read": int(row["messages_read"]) if row is not None else None,
+                "facts": int(row["facts"]) if row is not None else None,
+                "entities": int(row["entities"]) if row is not None else None,
+                "observations": int(row["observations"]) if row is not None else None,
+                "detail": row["detail"] if row is not None else "",
+                "body": reflect_bodies.get(day),
+                "file": _rel(data_dir, path),
+            }
+        )
+
+    return {
+        "facts": facts,
+        "facts_active": facts_active,
+        "facts_retired": facts_retired,
+        "facts_list_truncated": facts_list_truncated,
+        "entities": entities,
+        "entities_total": entities_total,
+        "entities_list_truncated": entities_list_truncated,
+        "entities_bodies_truncated": entities_cut,
+        "reflections": reflections,
+        "reflections_total": len(reflections),
+        "reflections_recorded": sum(
+            1 for r in reflections if r["status"] is not None
+        ),
+        "reflections_bodies_truncated": reflect_cut,
+        "pending_days": reflection_mod.pending_days(data_dir),
+    }
+
+
+# --- Persona ----------------------------------------------------------------
+
+
+def _file_view(data_dir: Path, rel: str, budget: BodyBudget) -> dict[str, Any]:
+    """One markdown file against the shared budget - `lines` is `None`, not `0`,
+    whenever there is no text to count, so an unread file cannot read as an
+    empty one. `truncated` is true only when the file exists but lost to the
+    budget: seed.md and learned.md are last in line for it, since the diaries
+    ahead of them in `persona_payload` are spent first."""
+    text = _read(data_dir / rel)
+    kept = None if text is None else budget.take(text)
+    return {
+        "text": kept,
+        "lines": None if kept is None else len(kept.splitlines()),
+        "file": rel,
+        "truncated": text is not None and kept is None,
+    }
+
+
+def _evidence(raw: str) -> list[int]:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    # `bool` is an `int` subclass, so `isinstance(item, int)` alone lets a
+    # model-emitted `true`/`false` through and `int(True)` silently becomes
+    # evidence id 1. This module treats model output as hostile; reject it.
+    return [
+        int(item)
+        for item in parsed
+        if isinstance(item, int) and not isinstance(item, bool)
+    ]
+
+
+def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[str, Any]:
+    """The anchor readout, the learned rules with their evidence, every
+    observation, and the evolution diaries.
+
+    The anchor leads with numbers rather than with the two files because the
+    anchor's claim is not "seed.md is untouched", it is "change is slow"
+    (docs/PLAN.md 5.1) - and that is only legible as a rate. The files follow
+    because the ownership claim needs the evidence to be actually there.
+
+    One deliberate asymmetry, matching `memory_payload`'s `facts_active`/
+    `facts_retired`/`entities_total`: `observations_total`/
+    `observations_consumed` here are `COUNT(*)` reads, true against the table
+    regardless of any cap. `rules_retired` is not - it stays `len(retired)`,
+    the length of the same `MAX_RULES`-capped list rendered beside it, so it
+    can never be false about what is actually on screen; `rules_list_truncated`
+    carries whether more exist. Do not make this one table-true too - that
+    would turn a label into a claim about rows nobody can see.
+    """
+    from daemon.persona.evolve import DIARY_SUBDIR
+
+    budget = BodyBudget(MAX_BODY_BYTES)
+
+    observation_rows = store.recent_observations(MAX_OBSERVATIONS)
+    observations = [
+        {
+            "id": int(row["id"]),
+            "body": row["body"],
+            "confidence": float(row["confidence"]),
+            "consumed_by": None if row["consumed_by"] is None else int(row["consumed_by"]),
+            "observed_from": row["observed_from"],
+            "created_at": row["created_at"],
+        }
+        for row in observation_rows
+    ]
+    # COUNT(*)-backed, not `len(observations)` - MAX_OBSERVATIONS is a display
+    # cap on the list above, not on the table.
+    observations_total = store.count_observations()
+    observations_consumed = store.count_consumed_observations()
+    observations_list_truncated = len(observation_rows) < observations_total
+
+    active_rows = store.active_persona_rules()
+    # Fetch one past the cap so a capped retired list can say so without a
+    # separate COUNT(*) - `retired_persona_rules` has no unbounded caller to
+    # protect from this extra row the way `recent_observations` does.
+    retired_page = store.retired_persona_rules(MAX_RULES + 1)
+    rules_list_truncated = len(retired_page) > MAX_RULES
+    retired_rows = retired_page[:MAX_RULES]
+
+    # Evidence resolves against the table directly, by id - not against
+    # `observations` above. That list is capped at MAX_OBSERVATIONS, and a
+    # rule's evidence can point past it once the log outgrows the cap; looking
+    # it up there would render a real row as if it had been deleted.
+    evidence_ids: set[int] = set()
+    for row in (*active_rows, *retired_rows):
+        evidence_ids.update(_evidence(row["evidence"]))
+    evidence_by_id = store.observations_by_ids(sorted(evidence_ids))
+
+    def one_rule(row: Any, status: str) -> dict[str, Any]:
+        cited = _evidence(row["evidence"])
+        evidence = [
+            {
+                "id": int(evidence_by_id[oid]["id"]),
+                "body": evidence_by_id[oid]["body"],
+                "confidence": float(evidence_by_id[oid]["confidence"]),
+            }
+            # A stale id is skipped, not raised on: `evidence` is model-supplied
+            # json and an observation it names may predate a rebuild.
+            for oid in cited
+            if oid in evidence_by_id
+        ]
+        return {
+            "id": int(row["id"]),
+            "body": row["body"],
+            "created_at": row["created_at"],
+            "status": status,
+            "retired_at": row["retired_at"],
+            "retired_why": row["retired_why"],
+            "evidence": evidence,
+            # `rebuild()` (persona/rules.py) inserts a restored rule with
+            # `evidence='[]'` when learned.md never recorded any - that is not
+            # the same fact as every cited id having lost its row, and an empty
+            # `evidence` list alone cannot tell the two apart. `cited` is the
+            # count the rule itself claims, before resolution.
+            "evidence_cited": len(cited),
+        }
+
+    active = [one_rule(row, "active") for row in active_rows]
+    retired = [one_rule(row, "retired") for row in retired_rows]
+
+    diary_dir = data_dir / DIARY_SUBDIR
+    diary_days = sorted(
+        (path.stem for path in diary_dir.glob("*.md")) if diary_dir.exists() else (),
+        reverse=True,
+    )
+    diary_paths = [(day, diary_dir / f"{day}.md") for day in diary_days]
+    diary_bodies, diaries_cut = _bodies(
+        diary_paths, limit=MAX_DIARY_BODIES, budget=budget
+    )
+    diaries = [
+        {
+            "date": day,
+            "body": diary_bodies.get(day),
+            "file": _rel(data_dir, path),
+        }
+        for day, path in diary_paths
+    ]
+
+    return {
+        "anchor": {
+            "active": store.count_active_persona_rules(),
+            "max_active": settings.persona_max_active_rules,
+            "max_new_per_cycle": settings.persona_max_new_per_cycle,
+            "min_observations": settings.persona_min_observations,
+            # `observations_total - observations_consumed`, not a sum over
+            # `observations` - that list is the same MAX_OBSERVATIONS-capped
+            # window as the other counts above, and the anchor sits right next
+            # to `observations_list_truncated`, which admits the cap out loud.
+            "unconsumed": observations_total - observations_consumed,
+            "last_rule_at": store.last_persona_rule_created_at(),
+            # Read, never written - docs/CONTRACTS.md non-negotiable 5.
+            "seed": _file_view(data_dir, "persona/seed.md", budget),
+            "learned": _file_view(data_dir, "persona/learned.md", budget),
+        },
+        "rules": active + retired,
+        "rules_active": len(active),
+        "rules_retired": len(retired),
+        "rules_list_truncated": rules_list_truncated,
+        "observations": observations,
+        "observations_total": observations_total,
+        "observations_consumed": observations_consumed,
+        "observations_list_truncated": observations_list_truncated,
+        "diaries": diaries,
+        "diaries_total": len(diaries),
+        "diaries_bodies_truncated": diaries_cut,
+    }

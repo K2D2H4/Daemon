@@ -41,9 +41,9 @@ from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
 from daemon.memory.base import MemoryWriter, Recall
-from daemon.persona.evolve import PersonaEvolution
+from daemon.persona.evolve import EvolutionResult, PersonaEvolution
 from daemon.proactivity.tick import ProactiveTick
-from daemon.reflection import Reflection
+from daemon.reflection import Reflection, Result
 from daemon.tasks import Task
 
 if TYPE_CHECKING:  # the wake gate, used only in the signatures below
@@ -236,6 +236,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # corrupting the M4 log clock (docs/PLAN.md 8.1). Whoever acquires it second finds
     # the day's artifact/diary already written and skips.
     catchup_lock = asyncio.Lock()
+    # Exposed so the admin's "run now" buttons take the very same lock. Without
+    # this they would be a third writer beside the cron and the boot task, and the
+    # comment above says what two `run(date)` for one day costs.
+    app.state.catchup_lock = catchup_lock
     # Local time, not UTC: "overnight" is a fact about the person asleep next to
     # the machine, and a UTC 04:00 lands mid-afternoon in KST. The 5-minute
     # proactivity tick (M3) lands here too.
@@ -1003,29 +1007,59 @@ async def _proactive_tick(settings: Settings) -> None:
     )
 
 
+async def run_reflection_now(
+    settings: Settings, lock: asyncio.Lock | None
+) -> list[Result]:
+    """Reflect on every unreflected day, and *raise* if it could not.
+
+    The opposite contract from `_reflect_tick`, on purpose. A scheduled job that
+    raises inside APScheduler stops being scheduled, so the tick swallows. A
+    button press has a person waiting for the answer, and swallowing there would
+    report success for a pass that never reached the model.
+
+    `lock` is `app.state.catchup_lock`: the same one the cron and the boot task
+    take, because this is a third writer of the same append-only artifact.
+    """
+    reflection_pass, close = await build_reflection(settings)
+    try:
+        async with lock if lock is not None else nullcontext():
+            return await reflection_pass.catch_up()
+    finally:
+        with suppress(Exception):
+            await close()
+
+
+async def run_persona_evolution_now(
+    settings: Settings, lock: asyncio.Lock | None, *, force: bool = False
+) -> EvolutionResult:
+    """Run the weekly pass now, and raise if it could not. Same split as
+    `run_reflection_now`, same reason.
+
+    `lock` is `app.state.catchup_lock` here too: two `run()` in one week would
+    both write the week's diary and re-consume observations.
+    """
+    evolution, close = await build_persona_evolution(settings)
+    try:
+        async with lock if lock is not None else nullcontext():
+            return await evolution.run(force=force)
+    finally:
+        with suppress(Exception):
+            await close()
+
+
 async def _reflect_tick(settings: Settings, lock: asyncio.Lock | None = None) -> None:
     """The scheduled pass. Catches everything: a job that raises inside
     APScheduler is logged once and then the schedule carries on, which reads as a
     working reflection loop that has silently done nothing for a month.
 
-    `lock`, when passed, serialises the actual `catch_up` against the boot task
-    (`_boot_catchup`) running the same pass: both walk the unreflected days, and two
-    `run(date)` for one day double-write its append-only artifact and observations.
-    A lock-less call (`lock=None`) still works via `nullcontext`."""
+    The work itself is `run_reflection_now`, which raises - the admin's button
+    needs the failure. This wrapper is the swallowing half.
+    """
     try:
-        reflection, close = await build_reflection(settings)
+        results = await run_reflection_now(settings, lock)
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
-        logger.error("reflection tick could not start: %s", exc)
-        return
-    try:
-        async with lock if lock is not None else nullcontext():
-            results = await reflection.catch_up()
-    except Exception as exc:  # noqa: BLE001
         logger.error("reflection tick failed: %s", exc)
         return
-    finally:
-        with suppress(Exception):
-            await close()
     for result in results:
         logger.info(
             "reflection %s: %s (%d message(s) -> %d fact(s), %d entity(ies), %d observation(s))%s",
@@ -1041,34 +1075,17 @@ async def _reflect_tick(settings: Settings, lock: asyncio.Lock | None = None) ->
 
 async def _persona_tick(settings: Settings, lock: asyncio.Lock | None = None) -> None:
     """The weekly persona-evolution pass. Catches everything, same reason as
-    reflection and the proactive tick: a job that raises inside APScheduler is
-    logged once and then the schedule carries on, which reads as a working
-    weekly pass that has silently done nothing for months.
+    reflection and the proactive tick.
 
     Logged at INFO even when the pass was skipped, because "not enough
     observations yet" and "already ran this week" both have to be visible
-    without opening sqlite - the same reasoning as the reflection tick's log
-    line.
-
-    `lock`, when passed, serialises the actual `run` against the boot task the
-    same way the reflection tick does: two `run()` in one week would both write
-    the week's diary and re-consume observations. A lock-less call (`lock=None`)
-    still works via `nullcontext`.
+    without opening sqlite.
     """
     try:
-        evolution, close = await build_persona_evolution(settings)
+        result = await run_persona_evolution_now(settings, lock)
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
-        logger.error("persona evolution tick could not start: %s", exc)
-        return
-    try:
-        async with lock if lock is not None else nullcontext():
-            result = await evolution.run()
-    except Exception as exc:  # noqa: BLE001
         logger.error("persona evolution tick failed: %s", exc)
         return
-    finally:
-        with suppress(Exception):
-            await close()
 
     logger.info(
         "persona evolve %s: %s (%d observation(s) read -> %d proposed, %d added, "

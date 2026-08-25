@@ -934,9 +934,29 @@ class Store:
             (limit,),
         ).fetchall()
 
+    def recent_entries(self, limit: int = 100) -> list[sqlite3.Row]:
+        """Every curated fact, retired ones included, most important first.
+
+        `active_entries` is what gets injected and deliberately hides the retired
+        rows. This is the admin's read: a fact that was superseded is the evidence
+        that supersession works, and dropping it makes a wrong fact look like it
+        was never there.
+        """
+        return self.conn.execute(
+            "SELECT * FROM memory_entries "
+            "ORDER BY importance DESC, updated_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
     def count_entries(self) -> int:
         row = self.conn.execute(
             "SELECT COUNT(*) AS n FROM memory_entries WHERE status = 'active'"
+        ).fetchone()
+        return int(row["n"])
+
+    def count_retired_entries(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_entries WHERE status = 'retired'"
         ).fetchone()
         return int(row["n"])
 
@@ -982,6 +1002,10 @@ class Store:
             "SELECT * FROM entities ORDER BY mention_count DESC, name ASC LIMIT ?",
             (limit,),
         ).fetchall()
+
+    def count_entities(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM entities").fetchone()
+        return int(row["n"])
 
     def link_entities(self, src_id: int, dst_id: int) -> None:
         """Record that two entities appeared together. Undirected in meaning, so
@@ -1044,6 +1068,38 @@ class Store:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()
         return int(row["n"])
 
+    def count_consumed_observations(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM observations WHERE consumed_by IS NOT NULL"
+        ).fetchone()
+        return int(row["n"])
+
+    def recent_observations(self, limit: int = 200) -> list[sqlite3.Row]:
+        """Every observation, newest first, with whichever rule consumed it.
+
+        The opposite order from `unconsumed_observations`: that one feeds M4 and
+        wants the oldest evidence first, this one is read top-down as "the most
+        recent thing she noticed about me".
+        """
+        return self.conn.execute(
+            "SELECT * FROM observations ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def observations_by_ids(self, ids: Sequence[int]) -> dict[int, sqlite3.Row]:
+        """Rows for a set of observation ids, keyed by id - the same shape as
+        `messages_by_ids`. A persona rule's evidence names ids from whenever the
+        rule was created, which can predate `recent_observations`' own display
+        cap; resolving evidence against this instead of that capped list is what
+        keeps old evidence from reading as a row that no longer exists."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM observations WHERE id IN ({placeholders})", tuple(ids)
+        ).fetchall()
+        return {int(row["id"]): row for row in rows}
+
     # --- M4: persona rules ---------------------------------------------------
     # Body lives in persona/learned.md (docs/CONTRACTS.md non-negotiable 5);
     # these columns are the metadata a model must not be able to forge in prose
@@ -1094,6 +1150,19 @@ class Store:
             "SELECT COUNT(*) AS n FROM persona_rules WHERE status = 'active'"
         ).fetchone()
         return int(row["n"])
+
+    def retired_persona_rules(self, limit: int = 50) -> list[sqlite3.Row]:
+        """Retired rules, most recently retired first - with `retired_why`.
+
+        `learned.md` is rewritten whole on every change, so a rule that vanished
+        leaves no trace in the file. This is the only place "what did she stop
+        believing, and why" can be read.
+        """
+        return self.conn.execute(
+            "SELECT * FROM persona_rules WHERE status = 'retired' "
+            "ORDER BY retired_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
 
     def persona_rules_created_since(self, ts: str) -> int:
         """How many rules (any status) were created at or after `ts` - the
@@ -1514,6 +1583,25 @@ class Store:
         return self.conn.execute(
             "SELECT * FROM reflection_runs ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
+
+    def reflection_runs_by_dates(self, dates: Sequence[str]) -> dict[str, sqlite3.Row]:
+        """Reflection-run rows for a set of dates, keyed by date - the same
+        shape as `observations_by_ids`. The admin Memory tab's day list comes
+        from the reflection artifacts on disk, which outlive any row-count
+        window on this table; resolving by the exact dates being rendered
+        instead of `recent_reflection_runs`'s capped window is what keeps an
+        old day from reading as artifact-only when its row is still here.
+        Ordered by id ASC so a date with two passes (a re-run) has its later
+        row win the dict assignment, not its first."""
+        if not dates:
+            return {}
+        placeholders = ",".join("?" * len(dates))
+        rows = self.conn.execute(
+            f"SELECT * FROM reflection_runs WHERE date IN ({placeholders}) "
+            "ORDER BY id ASC",
+            tuple(dates),
+        ).fetchall()
+        return {row["date"]: row for row in rows}
 
     # --- M2: what reflection reads ------------------------------------------
 

@@ -1171,7 +1171,15 @@ async def _reflect(settings: Settings, *, date: str | None, force: bool) -> int:
         await closing()
 
     if not results:
-        print("nothing to reflect on: no day has a log without a reflection already.")
+        # True whether nothing is pending at all or only today is: `catch_up`
+        # (daemon/reflection.py) drops today from its backlog unconditionally,
+        # since that day is still being written to. Naming the escape hatch
+        # here is what tells the two cases apart.
+        print(
+            "nothing to reflect on: every day before today already has a reflection - "
+            "today's log reflects after midnight, or run `daemon reflect --date "
+            "<date>` to force it now."
+        )
         return OK
     for result in results:
         print(
