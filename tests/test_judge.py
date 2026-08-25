@@ -271,6 +271,70 @@ def test_a_line_with_a_link_is_declined() -> None:
     assert not has_url("Sendbird 소식 봤어? 시리즈 C 받았대")
 
 
+# Round 1 review measured the first `has_url` (an allowlist of `http(s)://`,
+# `www.` and eight ASCII TLDs) against 40 crafted evasions and found 17 passed.
+# This is that evasion corpus, not a set of examples - every entry here is a
+# string designed to defeat a naive link check while still reading, to a person,
+# as a pointer to go somewhere. `has_url` was rewritten to refuse by shape
+# instead of matching a fixed allowlist, and every one of these must be caught.
+_EVASIONS = [
+    "sendbird.app 에서 확인해봐",  # a TLD outside the old fixed list
+    "t.me/joinchat/abc 들어와",  # a Telegram invite link, no scheme
+    "bit.ly/xk3 여기 봐봐",  # a shortener, 2-letter TLD outside the old list
+    "192.168.0.1 로 접속해",  # a bare IPv4, no domain shape at all
+    "news.xyz 사이트야",  # a TLD outside the old list
+    "news.info 사이트에 자세히 나와있어",  # ditto
+    "news.me 링크로 가봐",  # ditto
+    "news.jp 도메인이야",  # ditto
+    "tg://resolve?domain=abc 로 열어",  # a non-http(s) scheme
+    "example dot com 이렇게 읽어",  # spelled-out dot
+    "example[.]com 을 조심해",  # bracketed dot
+    "example(dot)com 이야",  # parenthesised dot
+    "그 사이트 점 com 이야",  # Korean spelled-out dot
+    "닷 컴 주소로 가봐",  # Korean spelled-out ".com"
+    "ｅｘａｍｐｌｅ．ｃｏｍ 참고해",  # full-width Latin + full-width period
+    "example。com 참고해",  # ideographic full stop standing in for '.'
+    "@sendbird_official 확인해봐",  # a bare handle, no scheme or domain
+]
+
+
+@pytest.mark.parametrize("evasion", _EVASIONS)
+def test_url_evasions_are_all_caught(evasion: str) -> None:
+    """17/17 from the round-1 review corpus. An allowlist of TLDs or schemes is a
+    list an attacker can read off this file and route around; `has_url` refuses by
+    shape (a scheme, a bare word.TLD with no fixed TLD list, an IPv4, a written-out
+    dot, an @handle) instead, after folding away the disguises (NFKC, zero-width
+    strip, the ideographic full stop) that let several of these dodge the first
+    version."""
+    from daemon.proactivity.judge import has_url
+
+    assert has_url(evasion), f"{evasion!r} should have been caught"
+
+
+@pytest.mark.parametrize(
+    "clean",
+    [
+        "시험 어땠어?",
+        "발표 결과는 어땠어?",
+        "지금 좀 힘들어?",
+        "예전에 교토 국수집 얘기했던 거 생각나네. 또 가고 싶어?",
+        "Sendbird 소식 봤어? 시리즈 C 받았대",
+        "Node.js 배웠어?",
+        "report.docx 잘 받았어?",
+    ],
+)
+def test_ordinary_lines_are_not_caught_except_the_accepted_cost(clean: str) -> None:
+    """0 false positives against this file's own example proactive lines - except
+    the two ADR 0015 already prices in. `has_url` matching *any* word.TLD shape
+    with no TLD allowlist means `Node.js` and a bare `report.docx` are refused
+    too; that is the accepted cost ("it costs nothing to refuse - the owner can
+    ask, and then it is their turn"), not a false positive to fix."""
+    from daemon.proactivity.judge import has_url
+
+    is_priced_in_cost = clean in ("Node.js 배웠어?", "report.docx 잘 받았어?")
+    assert has_url(clean) == is_priced_in_cost
+
+
 async def test_a_reply_containing_a_url_is_declined_end_to_end(data_dir: Path) -> None:
     """`has_url` is exercised for real through `decide`, not only as a bare
     function - the same choke point every proactive reply already passes through

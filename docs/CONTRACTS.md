@@ -110,6 +110,24 @@ live-share pump's transport, which has no tool round in it.
     second endpoint getting tools cannot get them ungated. If you find yourself
     needing an exception, stop and flag it.
 
+    **Split 2026-08-25** (docs/adr/0015-code-may-search-where-the-model-may-not.md):
+    the model still may not choose or run a tool on a non-owner turn - that half is
+    unchanged. What changed is that **deterministic code**, never the model, may
+    issue exactly one read-only search on the proactive path, for a `topic`
+    candidate that already passed the gate (`daemon/proactivity/judge.py` calling
+    `daemon/proactivity/topics.py:search_titles`). The model is offered zero tools
+    either way - `tests/test_judge.py::test_the_judge_is_offered_no_tools` fails if
+    that ever stops being true - and it does not choose the query: the query is
+    `entities.name`, read by code, never web text or a prior model reply. This path
+    calls `daemon/tools/mcp.py:MCPBridge.call` directly, **bypassing
+    `tools/policy.py:decide` entirely** - it is not subject to `mode=off`, the
+    allowlist, or a standing grant, because it never goes through `ToolRunner` or
+    the policy at all. That is not an oversight to close here: whether the bridge
+    is even passed to the judge when the owner has tools switched off is a decision
+    the wiring task (not this rule) makes explicitly, and it must be made in the
+    open, not discovered later by someone assuming `mode=off` covers every call to
+    the machine.
+
 11. **The tool policy makes no model calls.** Same rule as recall Lane 1 and for a
     different reason: a gate that asks a model whether to open the gate is not a
     gate. OpenClaw's `auto` mode (an LLM reviewer for edge cases) was deliberately
