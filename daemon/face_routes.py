@@ -101,15 +101,16 @@ async def manifest(request: Request) -> dict[str, Any]:
 async def stream(request: Request) -> StreamingResponse:
     """Server-sent events: the current state (snapshot on open), then all future
     events. Coalesces state changes but queues one-shots. Emits a keepalive comment
-    every 20s so sleeping clients don't close the connection."""
+    every N seconds so sleeping clients don't close the connection."""
     bus: FaceBus = request.app.state.face
+    keepalive = getattr(request.app.state, 'keepalive_seconds', KEEPALIVE_SECONDS)
 
     async def events() -> AsyncIterator[bytes]:
         agen = bus.subscribe()
         try:
             while True:
                 try:
-                    event = await asyncio.wait_for(agen.__anext__(), KEEPALIVE_SECONDS)
+                    event = await asyncio.wait_for(agen.__anext__(), keepalive)
                 except TimeoutError:
                     yield b":\n\n"
                     continue

@@ -70,9 +70,27 @@ def test_clip_bytes_are_served_and_unknown_names_are_refused(app):
     assert client.get("/face/clips/..%2F..%2Fdaemon.sqlite3").status_code == 404
 
 
+def test_manifest_lists_available_clips(app):
+    settings = app.state.settings
+    r = TestClient(app).get("/face/manifest")
+    assert r.status_code == 200
+    assert r.json() == {"clips": []}
+    _clip(settings, "idle1")
+    _clip(settings, "speaking_soft")
+    r = TestClient(app).get("/face/manifest")
+    assert r.json() == {"clips": ["idle1", "speaking_soft"]}
+
+
 async def test_the_stream_opens_with_a_snapshot(app):
-    """Stream must open with a snapshot, not wait for the first event."""
+    """Stream must open with a snapshot, not wait for the first event.
+
+    Override keepalive to be fast: httpx.ASGITransport buffers the first response
+    chunk until a subsequent chunk arrives (the keepalive), so production's 20s
+    default becomes a test stall. Tests must set this small to exercise the
+    snapshot path without blocking.
+    """
     app.state.face.set_activity("thinking")
+    app.state.keepalive_seconds = 0.1
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://face") as client:
         async with client.stream("GET", "/face/stream") as r:
@@ -89,7 +107,11 @@ async def test_the_stream_opens_with_a_snapshot(app):
 
 
 async def test_the_stream_carries_a_one_shot(app):
-    """Published one-shots appear on the stream as separate events."""
+    """Published one-shots appear on the stream as separate events.
+
+    Override keepalive to be fast: see test_the_stream_opens_with_a_snapshot.
+    """
+    app.state.keepalive_seconds = 0.1
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://face") as client:
         async with client.stream("GET", "/face/stream") as r:
