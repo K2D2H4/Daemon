@@ -484,7 +484,7 @@ class Settings(BaseSettings):
     )
     """Per-kind ceilings for one local day. Replaces the single open_loop cap.
 
-    They sum to 9 against a daily budget of 8 on purpose: these are ceilings, not
+    They sum to 9 against a daily budget of 5 on purpose: these are ceilings, not
     allocations, and the total is what binds. The shape is PLAN 6.2's - the cheap
     kind to generate (open_loop) eats the budget on equal terms and turns a
     companion into a reminder app, and the Her feeling comes from the kinds with

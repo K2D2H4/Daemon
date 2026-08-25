@@ -195,7 +195,7 @@ class ProactiveTick:
                 # One judge call per tick, whatever it decided. The gate counts the
                 # daily budget from rows already stored, so a second call in the
                 # same tick would read the same pre-tick count and a delivery would
-                # overshoot it - and PLAN 6.2's budget of three (now eight) is the
+                # overshoot it - and PLAN 6.2's budget of three (now five) is the
                 # brake the whole design leans on. That covers a second *delivery*,
                 # but a decline is a model call too - with `proactive_judge_local=False`,
                 # PROACTIVE_JUDGE is hosted and paid for - and a tick with several
