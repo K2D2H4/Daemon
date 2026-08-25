@@ -83,22 +83,57 @@ def test_speaking_falls_back_to_idle_when_both_speaking_clips_are_missing():
     )
 
 
-def test_idle_return_can_wait_for_the_outgoing_clip_to_finish():
-    # spec 3.2: only a return to idle may wait - up to IDLE_WAIT_MS - for the
+def test_the_wait_is_bounded_and_generalised_beyond_idle():
+    # spec 3.2: idle/listening/thinking/working may wait - up to WAIT_MS - for the
     # outgoing clip to reach its own loop end (its neutral pose) instead of cutting
     # it mid-gesture. Scoped to toActivity()'s own body, comments stripped, so a
-    # mention of IDLE_WAIT_MS elsewhere (its own top-level declaration) or in prose
-    # can't stand in for the mechanism actually living here.
+    # mention of WAIT_MS elsewhere (its own top-level declaration) or in prose can't
+    # stand in for the mechanism actually living here.
     start = PAGE.index("function toActivity(act) {")
     end = PAGE.index("\n}\n", start)
     body = _without_line_comments(PAGE[start:end])
-    assert 'act === "idle"' in body, (
-        "the wait must be conditioned on returning to idle specifically"
+    assert "WAIT_ACTIVITIES" in body, (
+        "the wait must be conditioned on the activity being wait-eligible, not "
+        "hardcoded to idle alone"
     )
-    assert "IDLE_WAIT_MS" in body, "the wait must be bounded, not open-ended"
+    assert "WAIT_MS" in body, "the wait must be bounded, not open-ended"
     assert "showing.loop = false" in body, (
         "letting the outgoing clip reach its own end relies on disabling its loop "
         "so it fires `ended` instead of seeking back to 0"
+    )
+
+    # The pool itself, scoped to its own declaration, must actually name the three
+    # activities the wait was extended to - not just idle, which is where it began.
+    start = PAGE.index("WAIT_ACTIVITIES = new Set([")
+    end = PAGE.index("]", start)
+    pool = _without_line_comments(PAGE[start:end])
+    for act in ("listening", "thinking", "working"):
+        assert f'"{act}"' in pool, f"{act} should be wait-eligible per the generalised spec 3.2"
+
+
+def test_a_one_shot_can_only_be_cut_by_speaking():
+    # spec 3.6: an in-flight one-shot runs to completion unless the activity
+    # changes to speaking (the mouth cannot lag the audio) - idle, listening,
+    # thinking and working have no such claim and must be held, not dropped or
+    # applied mid-gesture. Scoped to toActivity()'s own body, comments stripped.
+    start = PAGE.index("function toActivity(act) {")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert "oneShotUntil" in body and 'act !== "speaking"' in body, (
+        "blocking a switch must be conditioned on a one-shot being in flight AND "
+        "the target activity not being speaking"
+    )
+    assert "queuedActivity = act" in body, (
+        "a blocked activity change must be remembered, not silently dropped"
+    )
+
+    # And advance() must actually apply the queued activity once the one-shot
+    # finishes, not just leave the state declared and unread.
+    start = PAGE.index("function advance() {")
+    end = PAGE.index("\n}\n", start)
+    adv_body = _without_line_comments(PAGE[start:end])
+    assert "queuedActivity" in adv_body and "toActivity(" in adv_body, (
+        "advance() must apply a queued activity once the one-shot actually ends"
     )
 
 
