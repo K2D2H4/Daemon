@@ -1686,14 +1686,78 @@ async def test_a_turn_drives_the_face_and_leaves_no_tag_in_the_markdown(
                 if channel.sent:
                     break
 
-        bus = app.state.face
-        assert bus.activities == ["thinking", "speaking", "idle"]
-        assert bus.shots == ["amused"]
-        assert channel.sent == ["그래서"], "the mood tag must not reach the wire either"
+            # Asserted *inside* the block, before teardown starts cancelling
+            # `loop_task`: `handle()`'s own `finally` (daemon/loop.py:284-288) is
+            # what sets the face back to idle, and there is a real `await` between
+            # `channel.send()` (:276) and that `finally` running - closing the
+            # `async with` before this point would race a cancellation against it.
+            bus = app.state.face
+            assert bus.activities == ["thinking", "speaking", "idle"]
+            assert bus.shots == ["amused"]
+            assert channel.sent == ["그래서"], "the mood tag must not reach the wire either"
 
-        log_files = list((tmp_path / "memory").rglob("*.md"))
-        text = "\n".join(p.read_text(encoding="utf-8") for p in log_files)
-        assert "그래서" in text, "the source of truth does not have the reply"
-        assert "mood:" not in text, "a tag in the log is read back to the model by recall"
+            log_files = list((tmp_path / "memory").rglob("*.md"))
+            text = "\n".join(p.read_text(encoding="utf-8") for p in log_files)
+            assert "그래서" in text, "the source of truth does not have the reply"
+            assert "mood:" not in text, "a tag in the log is read back to the model by recall"
     finally:
+        store.close()
+
+
+# --- the second of the three wiring sites: the tool layer's own face ---------
+
+
+async def test_a_tool_call_flips_the_face_to_working_and_back(tmp_path: Path) -> None:
+    """The second of the three sites Task 7 wired: `ToolRunner`'s own `face=`,
+    threaded through `_build_tools` (`daemon/app.py`, `ToolRunner(registry, policy,
+    store, face=face)`) exactly the way the real lifespan calls it
+    (`face=app.state.face` at the `_build_tools(settings, io.store, face=...)`
+    call site).
+
+    Covered directly against `_build_tools` itself, the same way the neighbouring
+    `test_switching_the_browser_on_adds_three_tools` above it covers the rest of
+    that function's assembly - no lifespan, no channel, because `_build_tools`
+    takes only `settings` and a bare `store`. `ToolRunner.execute`
+    (`daemon/tools/runner.py`) sets `working` before running a call and restores
+    whatever activity it found beforehand once the call is done, so a real tool
+    call through the real assembly has to produce exactly that pair - if
+    `face=face` were ever dropped from the `ToolRunner(...)` call `_build_tools`
+    makes, `bus.activities` would stay empty and this would fail for that reason.
+    """
+    from daemon.app import _build_tools
+    from daemon.tools.runner import TurnContext
+    from tests.test_face import RecordingBus
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN=TOKEN,
+        DAEMON_TOOLS_ENABLED=True,
+        DAEMON_TOOLS_ROOTS=str(tmp_path),
+    )
+    target = tmp_path / "notes.md"
+    target.write_text("발표는 목요일", encoding="utf-8")
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    bus = RecordingBus()
+    runner = None
+    try:
+        runner, _bridge, _status = await _build_tools(settings, store, face=bus)
+        assert runner is not None
+
+        await runner.execute(
+            [ToolCall(id="1", name="read_file", arguments={"path": str(target)})],
+            TurnContext(origin="owner", channel="telegram", sender_id=str(OWNER)),
+        )
+
+        assert bus.activities == ["working", "idle"], (
+            "a tool call must flip the face to `working` and back to what it was "
+            "before - `face=` was probably dropped from the `ToolRunner(...)` call "
+            "`_build_tools` makes"
+        )
+    finally:
+        if runner is not None:
+            await runner.aclose()
         store.close()
