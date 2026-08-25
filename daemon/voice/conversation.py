@@ -697,10 +697,26 @@ class VoiceConversation:
                     # tracked when the speaker runs dry for the idle budget; the
                     # microphone gate needed the same number.
                     continue
-                if self._face is not None:
+                if self._face is not None and not (
+                    asyncio.get_running_loop().time() < self._playback_until
+                    or self._face.state.activity == "thinking"
+                ):
                     # Reached this line without being dropped by any gate above, so
                     # this is the room's own sound going to the model - the daemon's
-                    # turn to listen rather than answer.
+                    # turn to listen rather than answer. But with barge-in on (the
+                    # default) the chunk crosses *while the daemon is speaking* too -
+                    # that is intended, it is what makes barge-in possible - so
+                    # publishing `listening` unconditionally here would republish it
+                    # over `speaking` on every chunk of a live answer. `speaking` is
+                    # checked against the clock rather than read back from the bus,
+                    # because it is authoritative here the same way it already is
+                    # for the half-duplex gate above. `working` never reaches this
+                    # line at all: the tool-floor gate earlier in this loop already
+                    # drops every chunk while a call is pending, so there is nothing
+                    # to guard against. `thinking` has no clock of its own - the
+                    # bus's last word is the only signal there is, and reading it
+                    # back is exactly what `ToolRunner.execute` already does to
+                    # restore it (daemon/tools/runner.py), not a new pattern.
                     self._face.set_activity("listening")
                 await session.send_audio(chunk)
         except asyncio.CancelledError:
@@ -995,6 +1011,24 @@ class VoiceConversation:
         # the full length of an answer nobody will hear - up to the whole 30s budget
         # for a reply cut off in its first second.
         self._playback_until = 0.0
+        if self._speech is not None:
+            # `_playback_until` above is what the half-duplex gate and the idle
+            # budget read; the face reads a separate clock (`SpeechClock._until`)
+            # that resetting `_playback_until` does not touch. A bare `pump(inf)`
+            # here only forces idle *this instant* - `_until` itself would still
+            # hold the pre-barge-in backlog, and `_face_pump`'s next real tick
+            # would find `now < _until` true again and resurrect `speaking` from a
+            # clock that no longer corresponds to anything queued. The speaker's
+            # buffer was just emptied, so nothing is pending any more than it is
+            # after a fresh session opens - rebuilding is what actually says that,
+            # rather than a pump whose effect the very next tick could undo.
+            assert self._face is not None  # invariant from __init__: paired with _speech
+            self._speech = SpeechClock(
+                self._face,
+                sample_rate=self._audio.playback_sample_rate,
+                bytes_per_frame=PLAYBACK_BYTES_PER_FRAME,
+            )
+            self._speech.pump(asyncio.get_running_loop().time())
 
     # --- tools ---------------------------------------------------------------
 
