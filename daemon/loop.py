@@ -252,19 +252,14 @@ class ConversationLoop:
                 messages, origin=origin, channel=inbound.channel, sender_id=inbound.sender_id
             )
 
-            # The strip happens here, before both exits: `record` below writes to
-            # the markdown log that recall replays back into later prompts, and
-            # `send` puts it on the wire. A tag surviving either would be read
-            # back to the model next turn as something it said, laundering an
-            # instruction into the personality that `data/persona/seed.md` being
-            # human-owned exists to prevent (daemon/face.py: split_mood).
-            text, mood = split_mood(text)
-            if self._face is not None:
-                if mood is not None:
-                    # Before the activity flips to speaking, not after: a face
-                    # moves just ahead of the words it is reacting to.
-                    self._face.one_shot(mood)
-                self._face.set_activity("speaking")
+            # The strip happens here, before either of the two ways this text can
+            # escape (`record` below, and `_approve`'s own record/say below it):
+            # both write to the markdown log recall replays into later prompts, or
+            # put a tag on the wire. Either would be read back to the model next
+            # turn as something it said, laundering an instruction into the
+            # personality that `data/persona/seed.md` being human-owned exists to
+            # prevent (daemon/face.py: split_mood).
+            text = self._speak(text)
 
             await self._companion.record(
                 LoggedMessage(
@@ -291,6 +286,26 @@ class ConversationLoop:
                 # Without this, one failed turn leaves the face stuck on
                 # "thinking" for the rest of the process's life.
                 self._face.set_activity("idle")
+
+    def _speak(self, text: str) -> str:
+        """Strip a leading mood tag off a reply and, if a face is attached,
+        publish it before the text is used anywhere.
+
+        Both places a reply can leave this object - the ordinary turn's
+        `record`/`send` in `handle`, and the approval-resume turn's own
+        `record`/`say` in `_approve` - go through here first, so there is one
+        strip point rather than two copies of the same three lines to keep in
+        sync (and one place to trust that the tag never reaches the log or the
+        wire either way).
+        """
+        text, mood = split_mood(text)
+        if self._face is not None:
+            if mood is not None:
+                # Before the activity flips to speaking, not after: a face
+                # moves just ahead of the words it is reacting to.
+                self._face.one_shot(mood)
+            self._face.set_activity("speaking")
+        return text
 
     async def _answer(
         self, messages: list[Message], *, origin: str, channel: str, sender_id: str | None
@@ -509,7 +524,9 @@ class ConversationLoop:
             claimed.preview, result.content, said=inbound.text
         )
         completion = await self._gateway.complete(Task.CHAT_TEXT, messages)
-        text = completion.text
+        # A genuine model-generated reply, same as the ordinary turn's - so it
+        # goes through the same strip point before either `record` or `say`.
+        text = self._speak(completion.text)
 
         await self._companion.record(
             LoggedMessage(

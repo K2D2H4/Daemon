@@ -29,6 +29,7 @@ from daemon.loop import FAILURE_NOTICE, ConversationLoop
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
 from daemon.tasks import Task
 from daemon.tools.base import ToolResult
+from daemon.tools.policy import Claimed
 from daemon.tools.runner import Outcome
 from tests.test_face import RecordingBus
 
@@ -1102,6 +1103,48 @@ async def test_a_turn_that_raises_still_returns_the_face_to_idle(data_dir: Path)
     ).run()
 
     assert bus.state.activity == "idle"
+
+
+class ApprovingCompanion(Companion):
+    """Fakes a granted `/approve` directly - the same one-method-override style
+    `FakeImageToolCompanion` above uses for `run_tools` - so `_approve`'s own
+    reply path can be driven for real without wiring a `ToolRunner`/`ToolPolicy`
+    /`Store` just to manufacture one pending approval."""
+
+    def claim(self, command: Any, *, sender_id: str) -> Claimed | None:
+        return Claimed(
+            tool="run_command",
+            arguments={"command": "echo hi"},
+            preview="`run_command` echo hi",
+            denied=False,
+            fingerprint="x",
+        )
+
+    async def resume(
+        self, claimed: Any, *, origin: str, channel: str, sender_id: str | None
+    ) -> ToolResult:
+        return ToolResult(call_id="1", name="run_command", content="hi\n")
+
+
+async def test_the_approval_resume_reply_also_gets_its_mood_tag_stripped(
+    data_dir: Path,
+) -> None:
+    """`_approve` makes its own model call (`daemon/loop.py`) once the owner's
+    `/approve CODE` resumes a parked tool - a second, genuine escape route for a
+    mood tag, independent of the ordinary reply path above. Same rule, same
+    strip point (`_speak`)."""
+    provider = FakeProvider(replies=["[mood:amused] 다 됐어"])
+    memory = FakeMemory()
+    channel = FakeChannel([inbound("/approve A3F2K9QT")])
+    bus = RecordingBus()
+    companion = ApprovingCompanion(memory, data_dir=data_dir, tools=object())
+
+    await ConversationLoop(channel, gateway_for(provider), companion, face=bus).run()
+
+    assert bus.shots == ["amused"]
+    # Same two exits as the ordinary turn: the wire and the markdown log.
+    assert [m.text for m in channel.sent] == ["다 됐어"]
+    assert [m.content for m in memory.records if m.role == "assistant"] == ["다 됐어"]
 
 
 # --- the M1a gate -----------------------------------------------------------
