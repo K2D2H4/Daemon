@@ -145,10 +145,17 @@ class Store:
             # For a file that does have the table: the kind CHECK names its kinds,
             # so widening it is a table rebuild - `ALTER TABLE ... ADD CONSTRAINT`
             # does not exist in SQLite. Copying first and renaming last means a
-            # crash mid-migration leaves the original table intact, which is the
-            # same ordering non-negotiable 1 requires of the markdown and the
-            # mirror.
-            self.conn.executescript(
+            # crash mid-migration leaves the original table intact - but only
+            # because these four statements run inside one explicit transaction.
+            # `executescript` does NOT give that: it issues its own implicit COMMIT
+            # before the script starts and each statement lands as it runs, so a
+            # crash between DROP and RENAME would leave no proactive_candidates at
+            # all and an orphaned _v8 copy nothing ever reads again - the silent
+            # degradation non-negotiable 1 exists to rule out. Explicit BEGIN and
+            # per-statement execute() is what actually makes the ordering matter:
+            # a failure anywhere in the loop rolls every statement back, so the
+            # original table is either fully replaced or not touched at all.
+            statements = (
                 """
                 CREATE TABLE proactive_candidates_v8 (
                     id            INTEGER PRIMARY KEY,
@@ -168,15 +175,26 @@ class Store:
                     fire_budget   INTEGER NOT NULL DEFAULT 1,
                     cooldown_secs INTEGER NOT NULL DEFAULT 86400,
                     last_fired_at TEXT
-                );
+                ) STRICT
+                """,
+                """
                 INSERT INTO proactive_candidates_v8
                     SELECT id, kind, reason, payload, created_at, due_at, expires_at,
                            state, fire_count, fire_budget, cooldown_secs, last_fired_at
-                    FROM proactive_candidates;
-                DROP TABLE proactive_candidates;
-                ALTER TABLE proactive_candidates_v8 RENAME TO proactive_candidates;
-                """
+                    FROM proactive_candidates
+                """,
+                "DROP TABLE proactive_candidates",
+                "ALTER TABLE proactive_candidates_v8 RENAME TO proactive_candidates",
             )
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in statements:
+                    self.conn.execute(statement)
+            except BaseException:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
         self.conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),
