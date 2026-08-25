@@ -601,78 +601,54 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   `clientContent` + `inline_data` closes this model with 1007 did not reproduce on a
   correctly-shaped raw payload; it was the library's bug, not the API's, which is again
   the whole reason to ask the socket. `evals/screen_frame_arrival_spike.py`.
-- **Dating a learned rule held the real preference and nudged the stale one down,
-  but neither reached significance at n=30 — and the manner-remark leak into
-  `facts` did not reproduce on the real incident day at all.** Measured against a
-  real key, three arms, `evals/graded_persona_spike.py`, real `data/persona/seed.md`
-  plus a fixed slice of the real 2026-08-19 incident (`messages` rows 935-944 via
-  `daemon.companion.render_continuity`) behind synthetic STALE/REAL rules so their
-  dates and observation counts stay controllable. **Arm 2, the one that can fail
-  this change** (a run where the stale correction fades *and* the real preference
-  fades with it is a regression reported as a success): undated 30/30 → dated
-  **28/30**, p=1.0, well above the 80%-of-baseline floor - **held**. Arm 1 (does
-  the stale one-off stop dominating): undated 17/30 → dated **13/30**, p=0.22 -
-  correct direction, not significant at this n; the same 4-point gap would need
-  roughly n≈150 per arm to clear p<0.05 by this test's own math. Arm 3 (does the
-  manner remark move from `facts` to `observations` under reflection, old prompt
-  vs new, over the real messy day): `facts` never carried it either way (0/30
-  both) - the leak Task 1 targeted is rarer on this transcript than the incident
-  implied - and `observations` was a near-wash, 28/30 old vs 27/30 new
-  (p=0.82).
-- **A second independent run of the same committed code reversed arm 1's
-  direction, so "correct direction, not significant" overstates it.** The
-  controller re-ran `evals/graded_persona_spike.py` at n=30 against the same key
-  and the same fixed history: **undated 13/30 → dated 19/30** — the dated arm came
-  out *shorter* more often, the opposite of the run recorded above (17/30 → 13/30).
-  Same code, same n, opposite sign. One run's direction was a coin flip, and the
-  honest statement is not "a 4-point gap that needs a bigger n" but **"no effect
-  detectable at n=30, and the sign does not replicate"**.
+- **Dating a learned rule by its age and observation count was reverted: three
+  independent measurements against the live model found no detectable effect,
+  and the one run that looked significant did not replicate.** The idea
+  (`daemon/persona/loader.py::rule_line`, `e34785d`/`d53be62`/`f7593fc`/
+  `22255b9`/`586d804`, all reverted) was that a rule formed from a single
+  terse-QA exchange should carry less weight in the prompt than one built
+  from many repeated observations, so a stale one-off correction fades while
+  a real, repeatedly-confirmed preference holds. It looked right in the first
+  hand-audited three-arm run (the spike script, n=30 each, removed here but
+  recoverable from `ee2801a`): the stale rule's dominance trended down
+  (17/30 → 13/30) while the real preference held - **30/30 → 28/30, and it
+  never dropped below that in this run or any later one, so the mechanism was
+  never a regression to weigh against. It was inert, not harmful.**
 
-  The classifier makes this predictable in hindsight and the record should carry
-  why. Arm 1 scores each reply against the median of **both arms pooled**, so the
-  two counts are structurally near-complementary (13+19=32, 17+13=30 — both ≈ n).
-  Each run therefore resolves to roughly one coin flip about which arm lands on
-  the short side, and a Fisher exact over two non-independent counts overstates
-  whatever it finds. Measuring the two length *distributions* against each other -
-  a rank test, no shared threshold - is what this arm needs before its number
-  means anything.
+  **Two defects in the probe had to be found before arm 1's number meant
+  anything.** First, its judge demanded a reply clear four clauses at once (no
+  jokes, no affection, no self-disclosure, no question back) to count as
+  "terse", and this persona never clears all four together even while
+  visibly shortening - so it answered "no" unconditionally regardless of
+  which arm was dated. Replacing that with reply length against the two arms'
+  *pooled* median fixed the floor/ceiling problem but created a second one:
+  the two hit-counts became structurally near-complementary (they sum to
+  about n), so a Fisher exact over them was scoring roughly one coin flip
+  about which arm landed on the short side, not a real difference - caught
+  only because an identical second n=30 run reversed the sign (13/30 → 19/30
+  against the first run's 17/30 → 13/30). `ee2801a` replaced it with the two
+  reply-length distributions compared directly: median and mean per arm, a
+  rank-sum test, and a two-sided permutation p-value over 20000 shuffles.
+  That is the metric every number below used.
 
-  This is the third time in this file that one observation nearly became a
-  finding. It is the second run that is cheap; it is believing the first one that
-  is expensive.
+  With the corrected metric: n=30, the dated arm was shorter (p=0.40); n=60,
+  it was longer (p=0.00065); a second n=60 replication came back shorter
+  again (p=0.34). Pooled, 120 vs 120, the medians are identical at **99.0**
+  (p=0.107). No effect survives pooling, and the single run that cleared
+  conventional significance did not replicate - it was noise a large enough
+  one-off sample can produce, not a real effect too small to see at n=30.
 
-- **Two probe designs had to fail first before arm 1 and arm 2 could measure
-  anything.** Round 1 (a synthetic one-line seed, no history) pinned both arms at
-  a floor or a ceiling (0/30→0/30, 30/30→30/30) - not negative results, just no
-  room for the behaviour to appear. Round 2 found the real cause was two different
-  things, both in the probe: arm 1's judge demanded a reply clear four clauses at
-  once (no jokes, no affection, no self-disclosure, no question back) to count as
-  "terse", and this persona never clears all four together even while visibly
-  shortening under the stale rule, so the judge said no unconditionally -
-  replaced with reply length against the pooled median, since 담백하게/용건 위주
-  asks for fewer words, not a register switch. Arm 2's probe named a bare tool
-  failure with nobody else to blame, so "own it, no excuses" had nothing to
-  compete against and both arms complied 30/30 regardless of dating - reworded to
-  add a real stake (a missed meeting) so the persona's own instinct to soften bad
-  news had something to pull against the rule's demand. A tie is a statement
-  about the probe's power, not the mechanism, and both these were probe power
-  problems, not the absence of an effect.
-- **A hand audit of all 180 printed records found 2 confirmed mismatches, both in
-  arm 3 under the new prompt, and both the same cause.** `daemon/reflection.py`'s
-  model sometimes returns `observations` as a bare list of strings instead of
-  `{"body": ..., "confidence": ...}` objects. Two "new"-prompt trials did exactly
-  that, and both strings plainly contained the trigger words (`"...담백한 대화를
-  선호한다."`) - a human reading the raw text calls both clear hits, but
-  `_hits()` requires `isinstance(item, dict)` before it reads a body, matching
-  `daemon/reflection.py::_items()`'s own behaviour in production (it drops a
-  non-dict entry with a "was not an object" note, never partially reads it, never
-  crashes). So both were correctly scored against what the real pipeline would
-  actually persist, and incorrectly scored against what the model was plainly
-  trying to say. Correcting for this moves arm 3's `new` observations count from
-  27/30 to 29/30 against `old`'s 28/30 - a wash either way, but it means
-  `daemon/reflection.py` silently drops an entire array's worth of signal on any
-  night the model picks the wrong JSON shape, with nothing surfaced beyond a
-  `problems` string nobody reads. Not scoped to this task; worth a follow-up.
-  Arm 1's classifier (reply length) was audited by recomputing the pooled median
-  independently from the logged lengths: 0/60 mismatches, because there was no
-  judge in the loop to misfire.
+  **Arm 3 (does a manner remark leak from `facts` into `observations` under
+  reflection's old prompt) never reproduced on the real 2026-08-19 incident
+  day: `facts` 0/30 under both the old and new prompt.** So `70c6a37`'s
+  `facts`/`observations` boundary closes a path rarer than the incident that
+  prompted it implied - and it stays anyway, being one paragraph of prompt
+  wording with no measured cost, unlike the dating mechanism it shipped
+  alongside and which this entry retires.
+
+  **What a retry would need first, if anyone repeats this.** The spike runs
+  all of one arm and then all of the other, so arm is confounded with
+  whatever drifted between the two blocks - model routing, load, anything
+  else that changes over the run's wall-clock span. Every number above
+  inherits that confound. Interleaving the two arms trial-by-trial, not a
+  larger n, is what a retry needs before its p-value means anything either.

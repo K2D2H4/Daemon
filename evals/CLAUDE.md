@@ -17,7 +17,6 @@ automated. This is that one, plus the spike that needed a real key.
 | `openai_compatible_spike.py` | whether a real OpenAI-compatible endpoint answers `/models`, a Korean turn, and a tool round-trip |
 | `openai_compatible_loop_spike.py` | whether the *assembled* app survives a real turn on that endpoint — loop, recall, tool policy, audit table |
 | `screen_frame_arrival_spike.py` | why voice answered "what's on my screen" from nothing — a `realtimeInput.video` frame never arrives inside a tool round, and the fix is the image part *after* the tool response (0/20 → 19/20) |
-| `graded_persona_spike.py` | whether dating a learned rule made the daemon calmer without making it deafer — three arms against a real key, n=30: stale rule dominance trended down but not significantly (17/30 → 13/30, p=0.22), the real repeatedly-observed preference held (30/30 → 28/30, well above the 80% floor), and the manner-remark misfiling into `facts` did not reproduce on the real incident day under either prompt (0/30 both) |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py
