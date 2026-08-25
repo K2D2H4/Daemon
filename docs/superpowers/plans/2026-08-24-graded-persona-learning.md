@@ -1,5 +1,9 @@
 # Graded persona learning — implementation plan
 
+> **Outcome:** Task 1 shipped. Tasks 2-6 (the dating mechanism) were built, measured and
+> reverted — three runs found no effect and the one significant run did not replicate.
+> `daemon/MEASURED.md` carries the result. Task 8 was never run.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stop a single remark from becoming a permanent personality change, without making the daemon ignore what it has genuinely learned.

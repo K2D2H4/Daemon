@@ -1,5 +1,9 @@
 # Graded persona learning — design
 
+- Status: **(A) shipped. (B) built, measured three times, and reverted — no detectable effect.**
+  The numbers and the two metric defects found on the way are in `daemon/MEASURED.md`;
+  the spike is recoverable from commit `ee2801a`. Read that entry before re-proposing (B).
+
 - Date: 2026-08-24
 - Status: approved for planning
 - Branch of origin: `claude/bella-natural-speech-0e4522`
