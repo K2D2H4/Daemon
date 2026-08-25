@@ -37,8 +37,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
 
-CandidateKind = Literal["open_loop", "emotional", "silence", "pattern_time", "association"]
-"""The five in `daemon/memory/schema.sql`. Type A-E of PLAN 6.1, in the same order."""
+CandidateKind = Literal[
+    "open_loop", "emotional", "silence", "pattern_time", "association", "topic"
+]
+"""The five in `daemon/memory/schema.sql` - PLAN 6.1's types A-E, in the same
+order - plus `topic`, added after 572 judge calls produced 0 utterances and only
+`open_loop` ever fired at all (docs/adr/0015). Its generator is a later task;
+this only makes room for the kind."""
 
 Delivery = Literal["local_speaker", "telegram", "both"]
 """Where an utterance went. Matches `proactive_utterances.route`."""

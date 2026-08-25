@@ -30,7 +30,7 @@ from daemon.memory.log import from_iso, local_date, utc_iso
 logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _INSERT_MESSAGE = """
 INSERT INTO messages
@@ -129,6 +129,54 @@ class Store:
             # The index over external_id is left to schema.sql, which runs next
             # now that the column exists.
         # v3 to v7 add only new tables, which schema.sql creates on its own.
+        has_candidates = (
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'proactive_candidates'"
+            ).fetchone()
+            is not None
+        )
+        if found < 8 and has_candidates:
+            # A file older than M3 has no proactive_candidates table at all, and
+            # schema.sql's CREATE TABLE IF NOT EXISTS creates it fresh - already
+            # with 'topic' allowed - right after this method returns, so there is
+            # nothing here to rebuild.
+            #
+            # For a file that does have the table: the kind CHECK names its kinds,
+            # so widening it is a table rebuild - `ALTER TABLE ... ADD CONSTRAINT`
+            # does not exist in SQLite. Copying first and renaming last means a
+            # crash mid-migration leaves the original table intact, which is the
+            # same ordering non-negotiable 1 requires of the markdown and the
+            # mirror.
+            self.conn.executescript(
+                """
+                CREATE TABLE proactive_candidates_v8 (
+                    id            INTEGER PRIMARY KEY,
+                    kind          TEXT    NOT NULL CHECK (kind IN (
+                                      'open_loop', 'emotional', 'silence',
+                                      'pattern_time', 'association', 'topic'
+                                  )),
+                    reason        TEXT    NOT NULL,
+                    payload       TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
+                    created_at    TEXT    NOT NULL,
+                    due_at        TEXT,
+                    expires_at    TEXT,
+                    state         TEXT    NOT NULL DEFAULT 'pending' CHECK (state IN (
+                                      'pending', 'armed', 'fired', 'done', 'cancelled', 'expired'
+                                  )),
+                    fire_count    INTEGER NOT NULL DEFAULT 0,
+                    fire_budget   INTEGER NOT NULL DEFAULT 1,
+                    cooldown_secs INTEGER NOT NULL DEFAULT 86400,
+                    last_fired_at TEXT
+                );
+                INSERT INTO proactive_candidates_v8
+                    SELECT id, kind, reason, payload, created_at, due_at, expires_at,
+                           state, fire_count, fire_budget, cooldown_secs, last_fired_at
+                    FROM proactive_candidates;
+                DROP TABLE proactive_candidates;
+                ALTER TABLE proactive_candidates_v8 RENAME TO proactive_candidates;
+                """
+            )
         self.conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),

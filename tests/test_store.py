@@ -258,3 +258,58 @@ def test_owner_id_names_the_approved_owner(tmp_path):
         assert store.owner_id("slack") is None, "another channel's owner is not this one's"
     finally:
         store.close()
+
+
+def test_a_v7_database_gains_the_topic_kind_without_losing_its_candidates(
+    tmp_path: Path,
+) -> None:
+    """The CHECK on `proactive_candidates.kind` lists its kinds by name, and SQLite
+    cannot alter a CHECK in place - the table has to be rebuilt. A rebuild that
+    forgets to copy is indistinguishable from a working migration until someone
+    looks for a candidate that is no longer there, so this asserts the old row
+    survives, not merely that the new kind inserts."""
+    path = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL);
+        INSERT INTO schema_version (version, applied_at) VALUES (7, '2026-08-01T00:00:00Z');
+        CREATE TABLE proactive_candidates (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN
+                ('open_loop','emotional','silence','pattern_time','association')),
+            reason TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
+            created_at TEXT NOT NULL,
+            due_at TEXT, expires_at TEXT,
+            state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN (
+                'pending', 'armed', 'fired', 'done', 'cancelled', 'expired'
+            )),
+            fire_count INTEGER NOT NULL DEFAULT 0,
+            fire_budget INTEGER NOT NULL DEFAULT 1,
+            cooldown_secs INTEGER NOT NULL DEFAULT 86400,
+            last_fired_at TEXT
+        );
+        INSERT INTO proactive_candidates (kind, reason, created_at)
+            VALUES ('open_loop', '08월 01일에 시험 이야기를 했다', '2026-08-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store.open(path)
+    assert store.schema_version() == SCHEMA_VERSION
+
+    kept = store.conn.execute(
+        "SELECT kind, reason FROM proactive_candidates"
+    ).fetchall()
+    assert [(r["kind"], r["reason"]) for r in kept] == [
+        ("open_loop", "08월 01일에 시험 이야기를 했다")
+    ], "the rebuild dropped the rows it was supposed to carry over"
+
+    store.conn.execute(
+        "INSERT INTO proactive_candidates (kind, reason, created_at) VALUES (?, ?, ?)",
+        ("topic", "Sendbird 이야기를 한 지 12일 됐다", "2026-08-25T00:00:00Z"),
+    )
+    store.conn.commit()
