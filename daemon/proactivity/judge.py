@@ -429,27 +429,33 @@ _TLD_CHARS = r"a-z"
 r"""Letters a TLD may end in: ASCII only, deliberately reverted after round 4.
 
 Round 3 widened this to include Cyrillic and Hangul so `.한국` (a live ccTLD in a
-Korean-language product) would be caught. Round 4 measured what that widening
-actually did to the *exemption* it sits next to: the TLD run is greedy, so once
-Hangul counts as a TLD letter, `[TLD]{2,}` swallows the following Korean particle
-into the match itself - `"UJET.cx에서"` reads as one span, `_matches_beyond_entity`
-compares it against the bare entity `"UJET.cx"`, they are not equal, and a bare
-mention of the owner's own domain-shaped entity is refused. Measured: 7 of 12
-natural unspaced lines about this owner's two domain-shaped entities silenced,
-while the spaced form (`"UJET.cx 소식 들었어?"` - the one every round-2/3 test
-used) still worked, which is round 2's finding in mirror image. The same
-widening also matched ordinary Korean prose with no domain in it at all
-(`"응.그래서 어떻게 됐어?"`, two sentences joined by a bare period with no space).
+Korean-language product) would be caught. Round 4 measured two effects of that
+widening. The first no longer applies: round 4 reasoned that a greedy Hangul-
+widened TLD run would swallow a trailing Korean particle and break the `exempt`
+parameter's span comparison against a bare domain-shaped entity, silencing
+natural mentions of the owner's own domains. Round 5 showed `exempt` was dead
+code the whole time - `has_url(exempt)` was already `True` for every entity that
+could need forgiving, before the widening ever entered the picture - and
+re-running round 4's own corpus with and without the Hangul widening confirms
+it: `UJET.cx` and `Node.js` are refused 12/12 both ways. The widening cost
+nothing on that leg because there was nothing left to cost.
 
-The two cases are not symmetric and this is not repaired here on purpose: the
-Latin TLD space is open-ended (matching by shape - any 2+ letters - is the right
-call, per round 1), but the non-Latin TLD set is small and enumerable, so doing
-it correctly means a curated list of real ccTLDs plus the same lookahead
-discipline, not a bare script range - and a fourth round of fixing this file is
-the wrong place to introduce that kind of new mechanism. `.한국` and other non-Latin
-TLDs are therefore a recorded gap, not a silent one: they pass `has_url`
-unmatched by `_BARE_DOMAIN_RE` (unless caught some other way, e.g. as part of a
-larger match)."""
+The second effect is real and stands on its own: the same widening matched
+ordinary Korean prose with no domain in it at all. `"응.그래서 어떻게 됐어?"` (two
+sentences joined by a bare period, no space) went from not matching to matching
+once Hangul counted as a TLD letter - a plain conversational sentence starting
+to read as a pointer.
+
+That is why this stays ASCII-only: the Latin TLD space is open-ended (matching
+by shape - any 2+ letters - is the right call, per round 1), but the non-Latin
+TLD set is small and enumerable, so doing it correctly means a curated list of
+real ccTLDs plus the same lookahead discipline, not a bare script range - and a
+fourth round of fixing this file is the wrong place to introduce that kind of
+new mechanism. `.한국` and other non-Latin TLDs are therefore a recorded gap, not
+a silent one: they pass `has_url` unmatched by `_BARE_DOMAIN_RE` (unless caught
+some other way, e.g. as part of a larger match). Reopening it means
+re-checking that ordinary Korean prose like the example above does not start
+reading as a domain - that is the real cost, not entity silencing."""
 
 _BARE_DOMAIN_RE = re.compile(
     rf"\b[\w-]+(?:\.[\w-]+)*\.[{_TLD_CHARS}]{{2,}}(?![{_TLD_CHARS}])", re.I
@@ -482,7 +488,7 @@ and stranding `".com"` unmatched because nothing preceded its own dot once
 `"UJET.cx"` had already been consumed. Greedy backtracking makes the *last*
 `.TLD`-shaped segment the one the lookahead checks, so `"UJET.cx.com"` matches as
 one span that is not equal to the entity and is refused, while a bare mention of
-just `"UJET.cx"` (no trailing label) still matches exactly and is still forgiven.
+just `"UJET.cx"` (no trailing label) still matched exactly and was still forgiven.
 
 The false positives this accepts on purpose (`Node.js`, `report.docx`, and a
 `topic` candidate's own domain-shaped entity name) are the price ADR 0015
@@ -619,7 +625,8 @@ def has_url(text: str) -> bool:
     that is itself a pointer (round 4).
 
     Round 5's re-review found the whole mechanism was never reachable: every
-    pattern below anchors on a word character and carries only a *trailing*
+    pattern below opens on a literal prefix (`@`, `[`) or a plain `\b`, never a
+    lookbehind reaching outside the match, and carries only a *trailing*
     lookahead or nothing at all, which means a pattern that matches a string
     inside a larger text always matches that same string in isolation too. So
     `has_url(exempt)` - the self-pointer check round 4 added - was `True` for
@@ -640,8 +647,9 @@ def has_url(text: str) -> bool:
     turn does not exist in `daemon/memory/schema.sql` and would not settle the
     question even if it did (`entities.name` is chosen by the reflection model
     reading a whole day's log, not tied to one turn). The one real separator is
-    the owner's own hand - see `daemon/proactivity/topics.py`'s module docstring
-    and ADR 0015's "what would overturn this" for the remedy this leaves them.
+    the owner's own hand - see ADR 0015's note (added after five rounds of
+    hardening `has_url`, under "What would overturn this") for the remedy this
+    leaves them.
 
     A `topic` candidate whose own entity name reads as a pointer is now dropped
     in `Judge.decide`, before the search or the model call runs at all (this

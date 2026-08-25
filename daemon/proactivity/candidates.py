@@ -577,7 +577,10 @@ def topic_candidates(reader: CandidateReader, now: datetime) -> list[Candidate]:
     `open_loop` needs the owner to mention a dated event in chat and he speaks to
     this daemon in imperatives about tools (3 matches in 75 utterances over 7 days).
 
-    The reason carries the entity's name and the size of the gap, both first-party.
+    The reason carries the entity's name and the size of the gap - neither
+    first-party: `entities.name` is chosen by the reflection model reading the
+    day's conversation log, not something this generator originates (see
+    `daemon/proactivity/topics.py`'s `MAX_ENTITY_CHARS` docstring).
     What the daemon will actually *say* about it needs material this generator does
     not have; that arrives after the gate (ADR 0015), and a candidate whose search
     finds nothing is dropped rather than spoken.

@@ -375,9 +375,10 @@ def test_a_non_latin_tld_is_a_known_gap(evasion: str) -> None:
     from daemon.proactivity.judge import has_url
 
     assert not has_url(evasion), (
-        f"{evasion!r} is now caught - if `_TLD_CHARS` was widened again, re-verify "
-        "against the round-4 regression (bare Korean-particle-attached mentions of "
-        "a domain-shaped entity) before keeping the change, and update this test"
+        f"{evasion!r} is now caught - if `_TLD_CHARS` was widened again, "
+        "re-verify that ordinary Korean prose with an unspaced period (e.g. "
+        '"응.그래서 어떻게 됐어?") does not start reading as a domain before '
+        "keeping the change, and update this test"
     )
 
 

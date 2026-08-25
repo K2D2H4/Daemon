@@ -123,12 +123,16 @@ live-share pump's transport, which has no tool round in it.
     task's own review corrected an earlier draft of this sentence that implied it
     was: `daemon/reflection.py` writes the column from the reflection model's own reading
     of the day's conversation log, so it **is** a prior model reply, one level
-    removed. What actually bounds the risk is that `daemon/proactivity/judge.py:has_url`
-    runs on the entity name itself before any search or model call, and a `topic`
-    candidate whose entity reads as a pointer is dropped right there - not an
-    assumption that the query is trustworthy because code read it out of a column,
-    and (round 5, after three rounds tried and failed to build a safe exemption for
-    it) not a carve-out that lets a domain-shaped entity be spoken anyway. This path
+    removed. What actually bounds the risk is `daemon/proactivity/judge.py:has_url`
+    running twice: once on the entity name itself, before any search or model
+    call, dropping a `topic` candidate whose entity reads as a pointer right
+    there (round 5, after three rounds tried and failed to build a safe
+    exemption for it); and once on the model's reply, the output check ADR 0015
+    names as its load-bearing defence, because that is the choke point between
+    attacker-controlled search results and something the owner hears. Neither is
+    an assumption that the query is trustworthy because code read it out of a
+    column, and neither is a carve-out that lets a domain-shaped entity be
+    spoken anyway. This path
     calls `daemon/tools/mcp.py:MCPBridge.call` directly, **bypassing
     `tools/policy.py:decide` entirely** - it is not subject to `mode=off`, the
     allowlist, or a standing grant, because it never goes through `ToolRunner` or

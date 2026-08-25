@@ -62,9 +62,9 @@ output — rather than by trusting the fence around the input:
    `daemon/reflection.py` writes it from a model reading the day's conversation
    log -
    so this defence is about the query being chosen deterministically at call
-   time, not about the string being guaranteed harmless. Defence 4 and
-   `daemon/proactivity/judge.py:has_url`'s exemption handling are what carry
-   that weight instead.)
+   time, not about the string being guaranteed harmless. Defence 4 (the URL
+   refusal on the output) and `Judge.decide`'s early drop of a pointer-shaped
+   entity are what carry that weight instead.)
 2. Results reduce to **titles**, at most 3, each capped at 80 characters.
 3. Fenced under a nonce, marked reference material and never an instruction.
 4. **A URL in the utterance is a decline.** The vector worth fearing is not
