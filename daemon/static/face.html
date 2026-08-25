@@ -1,3 +1,203 @@
 <!doctype html>
+<meta charset="utf-8">
 <title>face</title>
-<p>placeholder, replaced in Task 3
+<!--
+  Self-contained, offline, one file - the same posture as the admin shell. It talks to
+  three routes on its own origin and loads nothing else.
+
+  Three details here are the whole difference between "alive" and "wrong", and all
+  three were learned by getting them wrong first:
+
+  1. PRIMING. Every clip is play-then-paused once on load so a decoded frame exists.
+     Without it the first switch to a cold clip flashes the page background.
+  2. SINGLE-SIDED CROSSFADE. Only the incoming element's opacity animates, on top,
+     while the outgoing one stays fully opaque underneath until the fade finishes.
+     Fading both at once leaves a moment where neither is opaque, the background shows
+     through, and the brightness dips - which reads worse than a hard cut.
+  3. NO rAF TIMEKEEPING. <video> playback is native and survives a backgrounded
+     window; requestAnimationFrame does not. rAF only nudges playbackRate, so being
+     throttled makes it update less often rather than drift.
+-->
+<style>
+  :root { --bg: #19191B; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; opacity: 0; transition: opacity 180ms linear;
+  }
+  #hint {
+    position: fixed; inset: 0; display: grid; place-items: center; padding: 2rem;
+    color: #8a8a90; font: 13px/1.7 -apple-system, system-ui, sans-serif;
+    text-align: center;
+  }
+  #hint code { color: #d8d8dc; }
+  @media (prefers-reduced-motion: reduce) {
+    video { transition: none; }
+  }
+</style>
+
+<div id="stage"></div>
+<div id="hint" hidden></div>
+
+<script>
+"use strict";
+
+const FADE_MS = 180;          // spec §3.2 - under a cut is visible, over it ghosts
+const RATE_MIN = 0.85;        // below ~0.8 reads as slow motion
+const RATE_MAX = 1.25;        // above ~1.3 reads as fast-forward
+const ATTACK = 0.30;          // fast open
+const RELEASE = 0.06;         // slow close - real mouths are asymmetric
+const IDLES = ["idle1", "idle2", "idle3"];
+const FLOURISHES = ["flourish_arms"];
+const FLOURISH_MIN_MS = 40000, FLOURISH_MAX_MS = 120000;
+const LOUD_ENTER = 0.62, LOUD_HOLD_MS = 500;
+
+// activity -> clip, with the fallback chain from spec §3.7 applied at load time.
+const FOR_ACTIVITY = {
+  idle: IDLES,
+  listening: ["listening", "idle1"],
+  thinking: ["thinking", "idle1"],
+  working: ["working", "thinking", "idle1"],
+  speaking: ["speaking_soft", "idle1"],
+};
+
+const stage = document.getElementById("stage");
+const hint = document.getElementById("hint");
+const els = new Map();        // stem -> <video>
+let have = new Set();
+let showing = null;           // the <video> currently opaque
+let activity = "idle";
+let z = 1;
+let env = 0;                  // smoothed level
+let loudSince = 0;
+let flourishAt = 0;
+let oneShotUntil = 0;
+
+function first(list) { return (list || []).find(s => have.has(s)) || null; }
+
+function clipFor(act) {
+  if (act === "idle") {
+    const pool = IDLES.filter(s => have.has(s));
+    if (!pool.length) return null;
+    const cur = showing && showing.dataset.stem;
+    const pick = pool.filter(s => s !== cur);
+    return (pick.length ? pick : pool)[Math.floor(Math.random() * (pick.length ? pick.length : pool.length))];
+  }
+  if (act === "speaking") {
+    const loud = loudSince && performance.now() - loudSince > LOUD_HOLD_MS;
+    return first(loud ? ["speaking_loud", "speaking_soft"] : ["speaking_soft"]) || first(["speaking_loud"]);
+  }
+  return first(FOR_ACTIVITY[act]);
+}
+
+// --- PRIME: one decoded frame per clip, then hold at zero -------------------
+async function prime(stem) {
+  const v = document.createElement("video");
+  v.src = `/face/clips/${stem}`;
+  // Both the IDL property and the content attribute: some WebKit builds only
+  // honour the latter, and setting both costs nothing.
+  v.muted = true; v.playsInline = true; v.setAttribute("playsinline", "");
+  v.preload = "auto"; v.loop = false;
+  v.dataset.stem = stem;
+  stage.appendChild(v);
+  els.set(stem, v);
+  await new Promise(res => {
+    v.addEventListener("loadeddata", res, { once: true });
+    v.addEventListener("error", res, { once: true });
+  });
+  try { await v.play(); v.pause(); v.currentTime = 0; } catch { /* held at frame 0 */ }
+  v.addEventListener("ended", () => { if (v === showing) advance(); });
+}
+
+// --- SINGLE-SIDED CROSSFADE -------------------------------------------------
+function show(stem, { loop = true } = {}) {
+  const next = els.get(stem);
+  if (!next || next === showing) return;
+  const prev = showing;
+  next.loop = loop;
+  next.currentTime = 0;
+  next.style.zIndex = String(++z);       // on top, so fading in covers rather than blends
+  next.playbackRate = 1;
+  next.play().then(() => {
+    next.style.opacity = "1";
+    showing = next;
+    if (prev) setTimeout(() => {         // hidden behind an already-opaque layer
+      prev.style.opacity = "0";
+      prev.pause();
+    }, FADE_MS);
+  }).catch(() => {});
+}
+
+function advance() {
+  // A finished clip: one-shots hand back to the activity, idle reshuffles.
+  oneShotUntil = 0;
+  const stem = clipFor(activity);
+  if (stem) show(stem, { loop: activity !== "idle" });
+}
+
+function toActivity(act) {
+  activity = act;
+  oneShotUntil = 0;
+  const stem = clipFor(act);
+  if (stem) show(stem, { loop: act !== "idle" });
+  scheduleFlourish();
+}
+
+function playOneShot(stem) {
+  if (!have.has(stem)) return;           // no clip, no expression - never substitute idle
+  oneShotUntil = Infinity;
+  show(stem, { loop: false });
+}
+
+function scheduleFlourish() {
+  flourishAt = activity === "idle"
+    ? performance.now() + FLOURISH_MIN_MS + Math.random() * (FLOURISH_MAX_MS - FLOURISH_MIN_MS)
+    : 0;
+}
+
+// --- mouth: envelope -> playbackRate ---------------------------------------
+function tick() {
+  if (showing && activity === "speaking") {
+    const rate = RATE_MIN + (RATE_MAX - RATE_MIN) * env;
+    if (Math.abs(showing.playbackRate - rate) > 0.01) showing.playbackRate = rate;
+    const want = clipFor("speaking");
+    if (want && showing.dataset.stem !== want && !oneShotUntil) show(want);
+  }
+  if (flourishAt && performance.now() > flourishAt && activity === "idle") {
+    flourishAt = 0;
+    const f = FLOURISHES.filter(s => have.has(s));
+    if (f.length) playOneShot(f[Math.floor(Math.random() * f.length)]);
+  }
+  requestAnimationFrame(tick);
+}
+
+// --- wire ------------------------------------------------------------------
+async function boot() {
+  const manifest = await fetch("/face/manifest").then(r => r.json()).catch(() => ({ clips: [] }));
+  have = new Set(manifest.clips);
+  if (!have.size) {
+    hint.hidden = false;
+    hint.innerHTML =
+      "No clips yet. Put them in <code>&lt;data_dir&gt;/face/</code> " +
+      "&mdash; see <code>docs/superpowers/specs/2026-08-25-face-design.md</code> §4.";
+    return;
+  }
+  await Promise.all([...have].map(prime));
+  toActivity("idle");
+  requestAnimationFrame(tick);
+
+  const es = new EventSource("/face/stream");   // reconnects on its own
+  es.onmessage = (m) => {
+    const e = JSON.parse(m.data);
+    if (e.kind === "shot") { playOneShot(e.clip); return; }
+    if (e.activity !== activity) toActivity(e.activity);
+    const target = e.activity === "speaking" ? e.level : 0;
+    env += (target - env) * (target > env ? ATTACK : RELEASE);
+    if (e.level >= LOUD_ENTER) { if (!loudSince) loudSince = performance.now(); }
+    else loudSince = 0;
+  };
+}
+
+boot();
+</script>
