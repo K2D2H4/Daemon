@@ -65,13 +65,16 @@ code (`proactivity/topics.py`) issues one read-only search whose query is
 `candidate.payload["entity"]` - itself read from `entities.name`, never derived
 from a search result or a prior *judge* reply - plus `topics.TIME_RANGE`, a
 constant this code writes, never the model. The result titles are fenced under a
-nonce and folded into the **same user message** as the reason (`decide`'s
-`reason_text`), not a separate system block - task 5's n=30 spike measured
-`declined` barely moving (27/30 to 29/30) when the titles sat apart from the
-"이유" `SYSTEM` actually asks the model to judge for content; see `decide`'s inline
-comment for the numbers. The model still chooses nothing about the search: it did
-not decide to search, did not decide the query, and is offered zero tools either
-way (`test_the_judge_is_offered_no_tools`).
+nonce and folded into the **same user message** as the reason by `compose_reason`,
+not a separate system block - task 5's n=30 spike measured `declined` barely
+moving (27/30 to 29/30) when the titles sat apart from the "이유" `SYSTEM`
+actually asks the model to judge for content; see `compose_reason`'s docstring
+for the numbers. `compose_reason` is a module-level function rather than code
+inline in `decide` specifically so `evals/proactive_topic_spike.py` can call the
+exact composition the daemon ships instead of maintaining a second copy of it -
+see that module's docstring. The model still chooses nothing about the search:
+it did not decide to search, did not decide the query, and is offered zero tools
+either way (`test_the_judge_is_offered_no_tools`).
 `entities.name` is not itself free of model influence, though - `daemon/reflection.py`
 writes it from the reflection model's own reading of the conversation log, so the
 guarantee here is that *this* call chose nothing, not that the string it received
@@ -282,26 +285,10 @@ class Judge:
                 # avoid, not something the judge should be asked to paper over.
                 return Utterance(why_not="topic candidate had no search result to offer")
 
-        reason_text = _reason_block(candidate)
-        if topic_block:
-            # Task 5, cause 2: this used to be a separate system message. The n=30
-            # spike (evals/proactive_topic_spike.py, 2026-08-25) measured `declined`
-            # at 27/30 with no search and 29/30 with one - a search that changed
-            # almost nothing - because `SYSTEM`'s rule 1 asks whether *'이유'* (this
-            # reason, the user turn below) carries content, and a `topic` reason
-            # built from only an entity name and an elapsed-day count never does on
-            # its own. The titles sat in a block the model was never told counted as
-            # part of '이유', so they went unused. Folding the rendered block into
-            # the same user message puts the material inside the thing the judge is
-            # actually asked to evaluate - `SYSTEM`'s own `topic` examples already
-            # show this shape (reason immediately followed by `[web-titles:...]`).
-            # Nothing about the block itself changes: same nonce fence, same
-            # marker-stripping, same caps - only where it sits.
-            reason_text = f"{reason_text}\n{topic_block}"
         messages = [
             Message(role="system", content=persona),
             Message(role="system", content=SYSTEM),
-            Message(role="user", content=reason_text),
+            Message(role="user", content=compose_reason(candidate, topic_block)),
         ]
         try:
             # One call. No retry: a second attempt at "is there something to say"
@@ -371,6 +358,36 @@ class Judge:
 def _reason_block(candidate: Candidate) -> str:
     reason = " ".join(candidate.reason.split())[:MAX_REASON_CHARS]
     return f"이유 ({candidate.kind}): {reason}"
+
+
+def compose_reason(candidate: Candidate, topic_block: str = "") -> str:
+    """The single user-turn message `decide` sends: `_reason_block(candidate)`,
+    with `topic_block` (if any) folded into the **same** message rather than sent
+    as a separate one.
+
+    Task 5, cause 2. The n=30 spike (`evals/proactive_topic_spike.py`,
+    2026-08-25) measured `declined` at 27/30 with no search and 29/30 with one -
+    a search that changed almost nothing - because `SYSTEM`'s rule 1 asks whether
+    *'이유'* (this function's return value, the user turn) carries content, and a
+    `topic` reason built from only an entity name and an elapsed-day count never
+    does on its own. Before this function existed, the rendered titles arrived as
+    a *separate system message* the judge was never told counted as part of
+    '이유', so they went unused - `SYSTEM`'s own `topic` examples already showed
+    the reason immediately followed by `[web-titles:...]` in one block; the code
+    just did not match its own prompt. Nothing about the block itself changes
+    here: same nonce fence, same marker-stripping, same caps (all in
+    `topics.py`/`topics.render`) - only where it sits.
+
+    Pulled out as its own function, not left inline in `decide`, because
+    `evals/proactive_topic_spike.py` needs the *exact* composition the daemon
+    ships, not a hand-copied second version of it - see that module's docstring
+    for why a parallel copy is what let the spike measure a layout the daemon no
+    longer uses in the first place.
+    """
+    reason_text = _reason_block(candidate)
+    if topic_block:
+        reason_text = f"{reason_text}\n{topic_block}"
+    return reason_text
 
 
 def _entity_name(candidate: Candidate) -> str:

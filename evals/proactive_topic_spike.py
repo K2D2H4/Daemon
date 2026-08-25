@@ -24,9 +24,29 @@ in the prompt.
 candidate outright rather than answering without a search (see its
 docstring), so neither arm can be measured by calling `decide()` with a
 different bridge. Both arms are built here directly out of the same pieces
-`decide()` uses - `judge.SYSTEM`, `judge._reason_block`, `topics.render`,
-`gateway.complete`, `judge._read_reply`, `judge.has_url` - so what changes
-between them is exactly the one block ADR 0015 is about, and nothing else.
+`decide()` uses - `judge.SYSTEM`, `judge._reason_block`, `judge.compose_reason`,
+`topics.render`, `gateway.complete`, `judge._read_reply`, `judge.has_url` - so
+what changes between them is exactly the one block ADR 0015 is about, and
+nothing else.
+
+**Why arm B calls `compose_reason` instead of assembling the block itself.**
+The first version of this script built arm B's messages by hand:
+`[*system_msgs, Message(role="system", content=topic_block), reason_msg]` - the
+titles as their own system message, appended after `judge.SYSTEM` and before
+the reason. That was a faithful copy of `Judge.decide`'s layout *at the time*.
+Task 5's own follow-up then found that layout was the reason the n=30 run's
+`declined` barely moved (27/30 to 29/30): `judge.SYSTEM` asks the model to judge
+whether *'이유'* (the reason, the user turn) carries content, and the titles
+sitting in a separate system message were never told to count as part of it.
+`decide` was fixed to fold the titles into the same user message as the reason
+via `judge.compose_reason(candidate, topic_block)` - and this script's arm B
+**must call that same function**, not rebuild the old layout by hand, or a
+re-run here measures a message shape the daemon no longer sends and tells
+nobody anything about the fix. This is not a one-time fix so much as a standing
+rule for this file: whenever `Judge.decide`'s prompt composition changes, arm B
+changes with it automatically only because it calls the same function `decide`
+calls - a hand-copied second version of that layout is exactly the drift that
+produced the wrong measurement the first time.
 
 ## Per reply
 
@@ -319,11 +339,22 @@ async def _run_trial(gateway, persona: str, bridge, candidate) -> Trial | None:
         Message(role="system", content=persona),
         Message(role="system", content=judge_module.SYSTEM),
     ]
-    reason_msg = Message(role="user", content=judge_module._reason_block(candidate))
-
-    arm_a_messages = [*system_msgs, reason_msg]
     topic_block = topics.render(entity, titles, secrets.token_hex(4))
-    arm_b_messages = [*system_msgs, Message(role="system", content=topic_block), reason_msg]
+
+    # Arm A: the reason alone, exactly `decide` sends for a non-topic candidate.
+    # Arm B: `judge_module.compose_reason`, the same function `decide` calls for a
+    # `topic` candidate - never a hand-rebuilt copy of that layout. See the module
+    # docstring's "why arm B calls compose_reason" for why this indirection is not
+    # optional: a parallel copy is exactly what let an earlier version of this
+    # script measure a message layout `decide` had already stopped using.
+    arm_a_messages = [
+        *system_msgs,
+        Message(role="user", content=judge_module._reason_block(candidate)),
+    ]
+    arm_b_messages = [
+        *system_msgs,
+        Message(role="user", content=judge_module.compose_reason(candidate, topic_block)),
+    ]
 
     arm_a = await _judge_call(gateway, arm_a_messages, entity)
     arm_b = await _judge_call(gateway, arm_b_messages, entity)
