@@ -290,6 +290,33 @@ section.on{animation:rise .3s ease both}
 @media(max-width:900px){.trow{grid-template-columns:70px 96px minmax(0,1fr);row-gap:4px}
  .trow .o,.trow .m,.trow .d{grid-column:1/-1;text-align:left}}
 .trow.col{display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+/* A row whose whole line is the disclosure. `.trow`'s own grid has six tracks and
+   pins `.x` to a fixed 110px one with `text-overflow:ellipsis` - right for the
+   60-row Activity log, wrong for facts and observations, which are full Korean
+   sentences and exist to be read. The summary keeps the dense grid with the body
+   in the flexible track; the full text opens underneath. `summary` stays
+   `display:list-item` and the grid lives on a child, so the native disclosure
+   marker still renders - the same affordance the entity and reflection rows use. */
+.trow.det{display:block;padding:0}
+.trow.det>summary{display:grid;grid-template-columns:14px 78px minmax(0,1fr) 110px 150px;
+ gap:12px;align-items:center;padding:11px 16px;cursor:pointer;list-style:none}
+.trow.det>summary::-webkit-details-marker{display:none}
+/* The marker is drawn rather than inherited: `display:grid` on a summary drops the
+   native one, and a block child that kept it would sit on its own line above the
+   row. Same glyphs as the disclosures the entity and reflection rows get for free. */
+.trow.det>summary::before{content:'\25b8';color:var(--tm);font-size:11px}
+.trow.det[open]>summary::before{content:'\25be'}
+.trow.det>pre.well{margin:0 16px 8px}
+.trow.det>.meta{margin:0 16px 12px;font-size:11.5px;color:var(--tf)}
+@media(max-width:900px){.trow.det>summary{grid-template-columns:14px 70px minmax(0,1fr);row-gap:4px}
+ .trow.det>summary .m,.trow.det>summary .t{grid-column:1/-1}
+ /* A full-width row is not on its own enough to stop the clipping: `.trow .m`
+    above still sets nowrap/ellipsis and matches as a descendant. Release those
+    three here so the meta really does show whole - measured clipping at 375px
+    with the wiki-path fact's four trigger phrases. Only then is dropping the
+    repeat below the body honest rather than a way of hiding it twice. */
+ .trow.det>summary .m{white-space:normal;overflow:visible;text-overflow:clip}
+ .trow.det>.meta{display:none}}
 pre.well{background:var(--well);border:1px solid var(--line);border-radius:6px;
   padding:10px;margin:8px 0 0;overflow-x:auto;white-space:pre-wrap;
   font-family:var(--mono);font-size:12px;color:var(--tb)}
@@ -1047,12 +1074,26 @@ function disclose(label,body,file){
   if(body==null)return `<p class="cap muted">${esc(label)} — ${esc(file)} (no body loaded)</p>`;
   return `<details><summary class="cap">${esc(label)}</summary><pre class="well">${esc(body)}</pre></details>`;
 }
+// One fact or observation. The summary is the dense row; the disclosure holds
+// whatever the summary had to clip. `body` therefore appears twice on purpose,
+// and `meta` only repeats when the caller says it can outgrow its 110px track -
+// a fact's trigger phrases can, an observation's `pending` cannot. Both arrive
+// raw and are escaped here, so no caller has to remember to.
+function detailRow({extra='',chipClass,chip,body,meta,metaClips=false,ts}){
+  return `<details class="trow det${extra}"><summary>`
+    +`<span class="chip ${chipClass}">${esc(chip)}</span>`
+    +`<span class="x">${esc(body)}</span>`
+    +`<span class="m">${esc(meta)}</span>`
+    +`<span class="t">${stamp(ts)}</span>`
+    +`</summary><pre class="well">${esc(body)}</pre>`
+    +(metaClips&&meta?`<p class="meta">${esc(meta)}</p>`:'')
+    +`</details>`;
+}
 function factRow(f){
-  return `<div class="trow${f.status==='retired'?' muted':''}">
-    <span class="chip k-${f.status==='retired'?'refused':'reflect'}">${f.importance}</span>
-    <span class="x">${esc(f.body)}</span>
-    <span class="m">${esc(f.key||'')}${f.triggers.length?' · '+esc(f.triggers.join(', ')):''}</span>
-    <span class="t">${stamp(f.updated_at)}</span></div>`;
+  const retired=f.status==='retired';
+  return detailRow({extra:retired?' muted':'',chipClass:retired?'k-refused':'k-reflect',
+    chip:f.importance,body:f.body,ts:f.updated_at,metaClips:true,
+    meta:(f.key||'')+(f.triggers.length?' · '+f.triggers.join(', '):'')});
 }
 function entityRow(e){
   const head=`${e.name}${e.kind?' · '+e.kind:''} · ${e.mentions} mention(s)`
@@ -1112,10 +1153,8 @@ function ruleRow(r){
     <details><summary class="cap">${esc(head)}</summary>${ev}</details></div>`;
 }
 function obsRow(o){
-  return `<div class="trow"><span class="chip k-reflect">${o.confidence.toFixed(2)}</span>
-    <span class="x">${esc(o.body)}</span>
-    <span class="m">${o.consumed_by==null?'pending':'→ rule '+o.consumed_by}</span>
-    <span class="t">${stamp(o.created_at)}</span></div>`;
+  return detailRow({chipClass:'k-reflect',chip:o.confidence.toFixed(2),body:o.body,
+    ts:o.created_at,meta:o.consumed_by==null?'pending':'→ rule '+o.consumed_by});
 }
 async function loadPersona(){
   try{const p=await api('/admin/api/persona');
