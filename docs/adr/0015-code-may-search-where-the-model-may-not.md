@@ -55,7 +55,16 @@ a reason for exactly this reason.
 So the surface is defended at the choke point that already exists — the judge's
 output — rather than by trusting the fence around the input:
 
-1. Query is `entities.name` only; never web text, never model output.
+1. Query is `entities.name` only, chosen by code with no model call in
+   between - never a value derived from a search result or from the judge's
+   own reply. (Corrected 2026-08-25, round 4 of the task that built this
+   surface: `entities.name` is not itself free of model influence -
+   `daemon/reflection.py` writes it from a model reading the day's conversation
+   log -
+   so this defence is about the query being chosen deterministically at call
+   time, not about the string being guaranteed harmless. Defence 4 and
+   `daemon/proactivity/judge.py:has_url`'s exemption handling are what carry
+   that weight instead.)
 2. Results reduce to **titles**, at most 3, each capped at 80 characters.
 3. Fenced under a nonce, marked reference material and never an instruction.
 4. **A URL in the utterance is a decline.** The vector worth fearing is not

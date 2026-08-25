@@ -397,13 +397,31 @@ _SCHEME_RE = re.compile(r"[a-z][\w+.-]*://", re.I)
 """`https://`, `http://`, but also `tg://`, `ftp://` and anything else shaped like
 a URI scheme - a fixed list of schemes is the same allowlist mistake one level up."""
 
-_TLD_CHARS = r"a-z\u0400-\u04ff\uac00-\ud7a3"
-r"""Letters a TLD may end in: ASCII, Cyrillic, and Hangul syllables. Round 3
-finding 6: `[a-z]{2,}` alone is an implicit script allowlist, and `.한국` is a
-live ccTLD in a Korean-language product - the exact kind of gap this file has
-already been measured missing twice (an ASCII TLD list, then a trailing `\b`
-that only worked in ASCII). Not a claim of completeness for every script; widened
-because this product's own language was the one left out."""
+_TLD_CHARS = r"a-z"
+r"""Letters a TLD may end in: ASCII only, deliberately reverted after round 4.
+
+Round 3 widened this to include Cyrillic and Hangul so `.한국` (a live ccTLD in a
+Korean-language product) would be caught. Round 4 measured what that widening
+actually did to the *exemption* it sits next to: the TLD run is greedy, so once
+Hangul counts as a TLD letter, `[TLD]{2,}` swallows the following Korean particle
+into the match itself - `"UJET.cx에서"` reads as one span, `_matches_beyond_entity`
+compares it against the bare entity `"UJET.cx"`, they are not equal, and a bare
+mention of the owner's own domain-shaped entity is refused. Measured: 7 of 12
+natural unspaced lines about this owner's two domain-shaped entities silenced,
+while the spaced form (`"UJET.cx 소식 들었어?"` - the one every round-2/3 test
+used) still worked, which is round 2's finding in mirror image. The same
+widening also matched ordinary Korean prose with no domain in it at all
+(`"응.그래서 어떻게 됐어?"`, two sentences joined by a bare period with no space).
+
+The two cases are not symmetric and this is not repaired here on purpose: the
+Latin TLD space is open-ended (matching by shape - any 2+ letters - is the right
+call, per round 1), but the non-Latin TLD set is small and enumerable, so doing
+it correctly means a curated list of real ccTLDs plus the same lookahead
+discipline, not a bare script range - and a fourth round of fixing this file is
+the wrong place to introduce that kind of new mechanism. `.한국` and other non-Latin
+TLDs are therefore a recorded gap, not a silent one: they pass `has_url`
+unmatched by `_BARE_DOMAIN_RE` (unless caught some other way, e.g. as part of a
+larger match)."""
 
 _BARE_DOMAIN_RE = re.compile(
     rf"\b[\w-]+(?:\.[\w-]+)*\.[{_TLD_CHARS}]{{2,}}(?![{_TLD_CHARS}])", re.I
@@ -544,9 +562,29 @@ def _looks_like_ipv6(text: str) -> bool:
     return False
 
 
+_POINTER_CONTINUATION = "/\\?#:"
+r"""Characters that turn a bare host into a path, query, fragment or port -
+`/`, `\`, `?`, `#`, `:`. The fullwidth forms of all five (`／`, `＼`, `？`, `＃`,
+`：`) are not listed separately because `_fold`'s NFKC pass already collapses
+each of them to its ASCII form before `_matches_beyond_entity` ever sees the
+text, the same way it collapses `ｅｘａｍｐｌｅ` to `example`.
+
+Round 4 finding 2: forgiving a match because its *span* equals the entity name
+said nothing about what immediately follows that span. `"UJET.cx/free-macbook"`
+matches `_BARE_DOMAIN_RE` as `"UJET.cx"` alone (the path has no dot-plus-TLD
+shape, so nothing else in this module matches it), that span equals the entity,
+and round 3's fix forgave the whole line - the path rode along for free. Nothing
+here ever caught a path on its own; a path was only ever refused before because
+the host in front of it was refused, and `exempt` is exactly what turns that
+host from refused to forgiven. So a match is only actually forgiven when it is
+both span-equal to the entity **and** not immediately followed by one of these -
+otherwise it is treated as "beyond the entity" even though the matched text
+alone is not."""
+
+
 def _matches_beyond_entity(pattern: re.Pattern[str], folded: str, folded_entity: str) -> bool:
-    r"""Whether `pattern` finds anything in `folded` other than a match that
-    *is*, in its entirety, the entity's own name.
+    r"""Whether `pattern` finds anything in `folded` that is not, in its
+    entirety, the entity's own name with nothing pointer-shaped glued to it.
 
     Round 3 finding 1: the previous shape of this exemption stripped every
     occurrence of the entity name as a **substring** of the whole text before
@@ -565,9 +603,17 @@ def _matches_beyond_entity(pattern: re.Pattern[str], folded: str, folded_entity:
     the entity name - so `UJET.cx` alone is forgiven, but `evil-UJET.cx`,
     `login-UJET.cx`, `Kiwi.com` and `sendbird.com` are not, because none of them
     *is* the entity name; the entity name merely appears inside a longer match.
+
+    Round 4 finding 2 adds one more condition on top of span equality: see
+    `_POINTER_CONTINUATION`. A span-equal match followed by `/`, `\`, `?`, `#`
+    or `:` is still not forgiven, because that character is what turns a bare
+    hostname into somewhere with a path, query, fragment or port attached.
     """
     for match in pattern.finditer(folded):
         if not folded_entity or match.group().casefold() != folded_entity.casefold():
+            return True
+        end = match.end()
+        if end < len(folded) and folded[end] in _POINTER_CONTINUATION:
             return True
     return False
 
@@ -627,6 +673,17 @@ def has_url(text: str, *, exempt: str = "") -> bool:
     """
     folded = _fold(text)
     folded_entity = _fold(exempt) if exempt else ""
+    if folded_entity and has_url(exempt):
+        # Round 4 finding 3: `safe_name` permits an entity name that is itself a
+        # live pointer (`evil.com`, `203.0.113.9`, `@evil_support`,
+        # `sendbird-verify.app`). Span equality bounds how *wide* the exemption
+        # is - it never forgives more than the entity's own name - but says
+        # nothing about whether the name itself is safe to speak. It is not: an
+        # entity name that already reads as a pointer must never be granted an
+        # exemption at all, or the daemon simply speaks it, unrefused, as its own
+        # `exempt`. One check, and it recurses exactly once - `has_url(exempt)`
+        # is called with no `exempt` of its own, so this cannot loop.
+        folded_entity = ""
 
     if _matches_beyond_entity(_SCHEME_RE, folded, ""):  # never exempt - see docstring
         return True

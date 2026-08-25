@@ -117,9 +117,17 @@ live-share pump's transport, which has no tool round in it.
     candidate that already passed the gate (`daemon/proactivity/judge.py` calling
     `daemon/proactivity/topics.py:search_titles`). The model is offered zero tools
     either way - `tests/test_judge.py::test_the_judge_is_offered_no_tools` fails if
-    that ever stops being true - and it does not choose the query: the query is
-    `entities.name`, read by code, never web text or a prior model reply. This path
-    calls `daemon/tools/mcp.py:MCPBridge.call` directly, **bypassing
+    that ever stops being true - and it does not choose the query at call time: the
+    query is `entities.name`, read by code with no model call in between to pick it.
+    That is not a claim that `entities.name` is safe text, and round 4 of this
+    task's own review corrected an earlier draft of this sentence that implied it
+    was: `daemon/reflection.py` writes the column from the reflection model's own reading
+    of the day's conversation log, so it **is** a prior model reply, one level
+    removed. What actually bounds the risk is `daemon/proactivity/judge.py:has_url`'s
+    `exempt` handling - it forgives only an exact match of that name and refuses to
+    grant any exemption at all when the name itself already reads as a pointer - not
+    an assumption that the query is trustworthy because code read it out of a
+    column. This path calls `daemon/tools/mcp.py:MCPBridge.call` directly, **bypassing
     `tools/policy.py:decide` entirely** - it is not subject to `mode=off`, the
     allowlist, or a standing grant, because it never goes through `ToolRunner` or
     the policy at all. That is not an oversight to close here: whether the bridge
