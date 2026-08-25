@@ -856,3 +856,50 @@ async def test_approving_always_stops_the_asking(
         if row["ran"] and row["reason"].startswith("allowlisted")
     ]
     assert granted_runs, "the standing-granted command did not run without asking"
+
+
+# --- face activity state during tool execution ---
+
+
+async def test_running_a_tool_shows_working_then_restores_what_was_there(
+    store: Store, tmp_path: Path
+) -> None:
+    """A tool call happens *inside* a turn that is already `thinking`. Dropping to
+    idle afterwards would read as the daemon giving up mid-reply, so `execute`
+    restores what it found rather than assuming."""
+    from tests.test_face import RecordingBus
+
+    (tmp_path / "notes.md").write_text("test")
+    bus = RecordingBus()
+    bus.set_activity("thinking")
+
+    registry = Registry()
+    for tool in builtin_tools(roots=[tmp_path]):
+        registry.register(tool)
+    tools = ToolRunner(registry, ToolPolicy(store, mode="ask"), store, face=bus)
+
+    await tools.execute(
+        [read_file_call(tmp_path / "notes.md")],
+        TurnContext(origin="owner", channel="fake", sender_id=OWNER),
+    )
+    assert bus.activities == ["thinking", "working", "thinking"]
+
+
+async def test_a_failing_tool_still_restores_the_activity(
+    store: Store, tmp_path: Path
+) -> None:
+    from tests.test_face import RecordingBus
+
+    bus = RecordingBus()
+    bus.set_activity("thinking")
+
+    registry = Registry()
+    for tool in builtin_tools(roots=[tmp_path]):
+        registry.register(tool)
+    tools = ToolRunner(registry, ToolPolicy(store, mode="ask"), store, face=bus)
+
+    await tools.execute(
+        [read_file_call(tmp_path / "/nope/nope")],
+        TurnContext(origin="owner", channel="fake", sender_id=OWNER),
+    )
+    assert bus.state.activity == "thinking"
