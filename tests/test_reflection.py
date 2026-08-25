@@ -351,6 +351,38 @@ async def test_a_bare_string_observation_is_recovered_not_dropped(
     assert rows[0]["confidence"] == pytest.approx(0.5)
 
 
+async def test_a_bare_string_entity_is_dropped_not_recovered(
+    data_dir: Path, store: Store
+) -> None:
+    """64ed650 scoped the bare-string recovery to `observations` only, because
+    for `entities` recovering is actively harmful: a junk string entry would
+    survive into the list, consume one of the 12 `MAX_ENTITIES` slots ahead of
+    the slice, and only then get rejected in the entities loop for having no
+    `name`/`note` - so a genuine entity later in an oversized array could be
+    truncated away by junk that used to cost nothing before the slice existed.
+    Twelve bare strings ahead of one real entity pins that: with the old,
+    unscoped recovery the junk would fill every slot and the real entity would
+    never be seen; dropped before the slice, as facts and entities always were,
+    it survives.
+    """
+    record(store, "무슨 말")
+    junk = ["쓸모없는 문자열"] * 12
+    reply = json.dumps(
+        {
+            "entities": [
+                *junk,
+                {"name": "지현", "kind": "person", "note": "연희동 카페에서 만났다고 했다"},
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    result = await pass_for(data_dir, store, reply).run(DAY)
+
+    assert result.entities == 1
+    assert sum("was not an object" in problem for problem in result.problems) == 12
+
+
 async def test_an_empty_conclusion_is_still_a_written_day(
     data_dir: Path, store: Store
 ) -> None:

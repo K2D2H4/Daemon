@@ -301,7 +301,7 @@ def _clean(raw: dict[str, object]) -> tuple[Conclusion, list[str]]:
         )
 
     observations = []
-    for item in _items(raw, "observations", problems)[:MAX_OBSERVATIONS]:
+    for item in _items(raw, "observations", problems, recover_bare_string=True)[:MAX_OBSERVATIONS]:
         body = _text(item, "body")
         if not body:
             problems.append("an observation with no body")
@@ -380,17 +380,32 @@ def _clean_tool_facts(raw: dict[str, object], problems: list[str]) -> tuple[Fact
     return tuple(facts)
 
 
-def _items(raw: dict[str, object], key: str, problems: list[str]) -> list[dict[str, object]]:
-    """The list at `raw[key]`, tolerant of an entry that is a bare string.
+def _items(
+    raw: dict[str, object], key: str, problems: list[str], *, recover_bare_string: bool = False
+) -> list[dict[str, object]]:
+    """The list at `raw[key]`, optionally tolerant of an entry that is a bare string.
+
+    `recover_bare_string` defaults off: a bare string is dropped and reported,
+    which is what every one of `facts`, `entities` and `observations` did before
+    64ed650. Pass it `True` only for the key the recovery was actually measured
+    against.
 
     Found by hand-auditing the graded-persona-learning spike's raw output
     (daemon/MEASURED.md): on 2 of 60 records the model returned `observations`
     as a plain list of strings instead of `{"body": ..., "confidence": ...}`
     objects, and every one hit the `else` branch below - the whole array's
     persona signal silently discarded for that night, with nothing surfacing
-    beyond one generic "was not an object" line. A string recovers as the
-    body, with every other field left to the schema's own default; anything
-    that is neither a dict nor a string is still dropped and reported.
+    beyond one generic "was not an object" line. That is why `observations`
+    recovers a bare string as `{"body": item}`, with every other field left to
+    the schema's own default.
+
+    Nothing measured says `facts` or `entities` ever arrive this way, and for
+    `entities` recovering would be actively harmful: a bare-string junk entry
+    would survive into the list, consume one of the `MAX_ENTITIES` slots ahead
+    of the slice, and only then get rejected in the entities loop for having no
+    `name`/`note` - so a genuine entity later in an oversized array could be
+    truncated away by junk that used to be dropped for free before the slice.
+    Keeping the tolerance scoped to `observations` is what avoids that.
     """
     value = raw.get(key)
     if value is None:
@@ -402,7 +417,7 @@ def _items(raw: dict[str, object], key: str, problems: list[str]) -> list[dict[s
     for item in value:
         if isinstance(item, dict):
             out.append(item)
-        elif isinstance(item, str):
+        elif recover_bare_string and isinstance(item, str):
             out.append({"body": item})
         else:
             problems.append(f"an entry in {key} was not an object")
