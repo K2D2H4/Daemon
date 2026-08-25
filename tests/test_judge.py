@@ -273,39 +273,53 @@ def test_a_line_with_a_link_is_declined() -> None:
 
 # Round 1 review measured the first `has_url` (an allowlist of `http(s)://`,
 # `www.` and eight ASCII TLDs) against 40 crafted evasions and found 17 passed.
-# This is that evasion corpus, not a set of examples - every entry here is a
-# string designed to defeat a naive link check while still reading, to a person,
-# as a pointer to go somewhere. `has_url` was rewritten to refuse by shape
-# instead of matching a fixed allowlist, and every one of these must be caught.
+# Round 2 review then measured round 1's *fix* - a trailing `\b` after the TLD -
+# and found it never fires on real Korean at all: a Hangul particle attaches with
+# no space (`sendbird.com에 있어`, not `sendbird.com 에 있어`), and a Hangul
+# syllable is a `\w` character exactly like a Latin letter is, so `\b` never
+# separates them. Round 1's corpus scored 17/17 by testing an artificially spaced
+# form nobody actually writes. This is the same corpus, unspaced - the idiomatic
+# Korean form - plus the additions round 2 asked for (unspaced obfuscations,
+# IPv6). Every entry here is a string designed to defeat a naive link check while
+# still reading, to a person, as a pointer to go somewhere, and every one must be
+# caught.
 _EVASIONS = [
-    "sendbird.app 에서 확인해봐",  # a TLD outside the old fixed list
-    "t.me/joinchat/abc 들어와",  # a Telegram invite link, no scheme
-    "bit.ly/xk3 여기 봐봐",  # a shortener, 2-letter TLD outside the old list
-    "192.168.0.1 로 접속해",  # a bare IPv4, no domain shape at all
-    "news.xyz 사이트야",  # a TLD outside the old list
-    "news.info 사이트에 자세히 나와있어",  # ditto
-    "news.me 링크로 가봐",  # ditto
-    "news.jp 도메인이야",  # ditto
-    "tg://resolve?domain=abc 로 열어",  # a non-http(s) scheme
-    "example dot com 이렇게 읽어",  # spelled-out dot
-    "example[.]com 을 조심해",  # bracketed dot
-    "example(dot)com 이야",  # parenthesised dot
-    "그 사이트 점 com 이야",  # Korean spelled-out dot
-    "닷 컴 주소로 가봐",  # Korean spelled-out ".com"
-    "ｅｘａｍｐｌｅ．ｃｏｍ 참고해",  # full-width Latin + full-width period
-    "example。com 참고해",  # ideographic full stop standing in for '.'
-    "@sendbird_official 확인해봐",  # a bare handle, no scheme or domain
+    "sendbird.app에서 확인해봐",  # a TLD outside the old fixed list, particle unspaced
+    "t.me/joinchat/abc로 들어와",  # a Telegram invite link, no scheme
+    "bit.ly/xk3로 봐봐",  # a shortener, 2-letter TLD outside the old list
+    "192.168.0.1로 접속해",  # a bare IPv4, particle unspaced - same trailing-\b bug, one level over
+    "news.xyz라는 사이트야",  # a TLD outside the old list
+    "news.info에 자세히 나와있어",  # ditto
+    "news.me로 가봐",  # ditto
+    "news.jp쪽 도메인이야",  # ditto
+    "tg://resolve?domain=abc로 열어",  # a non-http(s) scheme
+    "example dot com이렇게 읽어",  # spelled-out dot, particle unspaced
+    "example[.]com을 조심해",  # bracketed dot, particle unspaced
+    "example(dot)com이야",  # parenthesised dot, particle unspaced
+    "그 사이트 점컴 주소야",  # Korean spelled-out ".com", unspaced (round 2 addition)
+    "쩜컴 주소야",  # ditto, alternate spelling (round 2 addition)
+    "닷컴 주소로 가봐",  # ditto, unspaced (round 2 addition)
+    "점 콤 이야",  # Korean spelled-out ".com", alternate spelling (round 2 addition)
+    "sendbird 슬래시 news 페이지야",  # spelled-out slash (round 2 addition)
+    "ｅｘａｍｐｌｅ．ｃｏｍ참고해",  # full-width Latin + full-width period, unspaced
+    "example。com참고해",  # ideographic full stop standing in for '.', unspaced
+    "@sendbird_official확인해봐",  # a bare handle, unspaced
+    "2001:db8::1로 접속해",  # IPv6, unspaced (round 2 addition)
+    "[2001:db8::1]로 접속해",  # bracketed IPv6, unspaced (round 2 addition)
+    "::1로 접속해",  # compressed IPv6, unspaced (round 2 addition)
 ]
 
 
 @pytest.mark.parametrize("evasion", _EVASIONS)
 def test_url_evasions_are_all_caught(evasion: str) -> None:
-    """17/17 from the round-1 review corpus. An allowlist of TLDs or schemes is a
-    list an attacker can read off this file and route around; `has_url` refuses by
-    shape (a scheme, a bare word.TLD with no fixed TLD list, an IPv4, a written-out
-    dot, an @handle) instead, after folding away the disguises (NFKC, zero-width
-    strip, the ideographic full stop) that let several of these dodge the first
-    version."""
+    r"""23/23, unspaced. An allowlist of TLDs or schemes is a list an attacker can
+    read off this file and route around; `has_url` refuses by shape (a scheme, a
+    bare word.TLD with no fixed TLD list and no trailing `\b`, an IPv4 with the
+    same fix, an IPv6-shaped token, a written-out dot, an @handle) instead, after
+    folding away the disguises (NFKC, zero-width strip, the ideographic full stop)
+    that let several of these dodge the first version - and written the way Korean
+    actually attaches a particle, which is what let several others dodge the
+    second."""
     from daemon.proactivity.judge import has_url
 
     assert has_url(evasion), f"{evasion!r} should have been caught"
@@ -325,14 +339,51 @@ def test_url_evasions_are_all_caught(evasion: str) -> None:
 )
 def test_ordinary_lines_are_not_caught_except_the_accepted_cost(clean: str) -> None:
     """0 false positives against this file's own example proactive lines - except
-    the two ADR 0015 already prices in. `has_url` matching *any* word.TLD shape
-    with no TLD allowlist means `Node.js` and a bare `report.docx` are refused
-    too; that is the accepted cost ("it costs nothing to refuse - the owner can
-    ask, and then it is their turn"), not a false positive to fix."""
+    the two ADR 0015 already prices in for a non-`topic` context. `has_url`
+    matching *any* word.TLD shape with no TLD allowlist means `Node.js` and a bare
+    `report.docx` are refused too when nothing exempts them; that is the accepted
+    cost ("it costs nothing to refuse - the owner can ask, and then it is their
+    turn"), not a false positive to fix. When one of these *is* the candidate's
+    own entity name, `exempt=` is what actually fixes it - see
+    `test_an_entitys_own_name_is_exempt_from_its_own_refusal` below."""
     from daemon.proactivity.judge import has_url
 
     is_priced_in_cost = clean in ("Node.js 배웠어?", "report.docx 잘 받았어?")
     assert has_url(clean) == is_priced_in_cost
+
+
+@pytest.mark.parametrize("entity", ["UJET.cx", "Node.js", "Kiwi", "Sendbird", "llm-wiki"])
+def test_an_entitys_own_name_is_exempt_from_its_own_refusal(entity: str) -> None:
+    """Round 2 finding 2: `topic_candidates` puts `entities.name` verbatim into the
+    reason and the query, and the judge then names that entity back. Any entity
+    shaped like a domain (`UJET.cx` - this owner's most-mentioned entity - and
+    `Node.js` right behind it) would otherwise be permanently unspeakable: each
+    topic candidate spends a search and a full judge call only to be refused for
+    a "url" that is the entity's own first-party name. `entities.name` is
+    first-party (drawn from the owner's own transcript), so exempting exactly
+    that string - and only that string - does not widen the surface the way a
+    general allowlist would. `Kiwi`, `Sendbird` and `llm-wiki` are not
+    domain-shaped, so they were never falsely refused in the first place -
+    included here so the parametrize covers the owner's real named entities, not
+    only the two that happen to need the fix."""
+    from daemon.proactivity.judge import has_url
+
+    line = f"{entity} 소식 들었어? 요즘 얘기가 좀 있더라"
+    assert not has_url(line, exempt=entity)
+
+
+@pytest.mark.parametrize("entity", ["UJET.cx", "Node.js", "Kiwi", "Sendbird", "llm-wiki"])
+def test_the_exemption_does_not_cover_a_different_link_alongside_the_entity(
+    entity: str,
+) -> None:
+    """The exemption is narrow on purpose: it removes only the entity's own name
+    before checking, so a genuine link riding alongside it - the actual attack
+    ADR 0015 names - is still caught regardless of which entity the candidate is
+    about."""
+    from daemon.proactivity.judge import has_url
+
+    line = f"{entity} 관련 공지는 sendbird-verify.app에서 확인하세요"
+    assert has_url(line, exempt=entity)
 
 
 async def test_a_reply_containing_a_url_is_declined_end_to_end(data_dir: Path) -> None:
@@ -433,6 +484,53 @@ async def test_a_topic_candidates_search_titles_reach_the_prompt(data_dir: Path)
     assert len(provider.calls) == 1
     assert "Sendbird raises Series C" in system_text(provider)
     assert bridge.calls == [("tavily", "tavily_search", {"query": "Sendbird", "max_results": 3})]
+
+
+async def test_a_topic_reply_naming_its_own_entity_is_not_declined_for_a_url(
+    data_dir: Path,
+) -> None:
+    """End-to-end version of round 2 finding 2: a `UJET.cx`-shaped entity - this
+    owner's most-mentioned one - must not be permanently silenced by the very
+    defence built to protect the owner from a link, because the only thing that
+    looks like a link here is the candidate's own first-party subject."""
+    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
+    provider = FakeProvider(json.dumps({"say": "UJET.cx 소식 들었어?"}, ensure_ascii=False))
+    gateway = LLMGateway(
+        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
+    )
+    bridge = _FakeBridge('{"results": [{"title": "UJET.cx raises new funding"}]}')
+    judge = Judge(gateway, data_dir, bridge=bridge)
+    candidate = Candidate(
+        kind="topic", reason="UJET.cx 얘기를 나눈 지 오래됐다.", payload={"entity": "UJET.cx"}
+    )
+
+    utterance = await judge.decide(candidate)
+
+    assert utterance.text == "UJET.cx 소식 들었어?"
+
+
+async def test_a_topic_reply_with_a_different_link_is_still_declined(data_dir: Path) -> None:
+    """The exemption is narrow: it does not turn off `has_url` for the whole
+    `topic` path, only for the candidate's own entity name."""
+    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
+    provider = FakeProvider(
+        json.dumps(
+            {"say": "UJET.cx 관련 공지는 sendbird-verify.app에서 확인하세요"}, ensure_ascii=False
+        )
+    )
+    gateway = LLMGateway(
+        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
+    )
+    bridge = _FakeBridge('{"results": [{"title": "UJET.cx raises new funding"}]}')
+    judge = Judge(gateway, data_dir, bridge=bridge)
+    candidate = Candidate(
+        kind="topic", reason="UJET.cx 얘기를 나눈 지 오래됐다.", payload={"entity": "UJET.cx"}
+    )
+
+    utterance = await judge.decide(candidate)
+
+    assert not utterance
+    assert "url" in utterance.why_not.casefold()
 
 
 async def test_a_failed_search_drops_the_candidate_rather_than_raising(data_dir: Path) -> None:

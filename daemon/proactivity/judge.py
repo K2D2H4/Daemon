@@ -220,8 +220,10 @@ class Judge:
             return Utterance(why_not=f"no persona seed under {self._data_dir}")
 
         topic_block = ""
+        entity = ""
         if candidate.kind == "topic":
-            topic_block = await self._topic_block(candidate)
+            entity = _entity_name(candidate)
+            topic_block = await self._topic_block(entity)
             if not topic_block:
                 # No bridge, no entity, or a search that found nothing - dropped
                 # here, before the one model call is spent. A `topic` line with
@@ -255,31 +257,32 @@ class Judge:
             model=completion.model,
             stop_reason=completion.meta.get("stop_reason", ""),
         )
-        if utterance and has_url(utterance.text):
+        if utterance and has_url(utterance.text, exempt=entity):
             # ADR 0015's load-bearing defence. Every bound on what the search
             # brought in (title count, title length, the reference-not-instruction
             # framing) only reduces what gets *in*; this is what bounds what gets
             # *out*, because the failure that matters is this daemon's trusted
             # voice telling its owner where to go on a line nobody asked for.
+            # `exempt=entity` is "" for every non-`topic` kind, so this is a no-op
+            # everywhere but the one path round 2 finding 2 was about.
             utterance = Utterance(why_not=f"reply contained a url: {utterance.text!r}")
         if not utterance:
             logger.info("judge: declined %s (%s)", candidate.kind, utterance.why_not)
         return utterance
 
-    async def _topic_block(self, candidate: Candidate) -> str:
+    async def _topic_block(self, entity: str) -> str:
         """The search result for a `topic` candidate, rendered for the prompt - or
         "" for anything that should drop the candidate instead.
 
         One search, for this one candidate, only after it reached the judge (which
         only happens after the gate already passed it) - never per tick, never
-        speculative. The query is `candidate.payload["entity"]`, read straight out
-        of `entities.name` upstream (`candidates.topic_candidates`); nothing derived
-        from the web ever becomes a query.
+        speculative. `entity` is read straight out of `entities.name` upstream
+        (`candidates.topic_candidates` via `candidate.payload["entity"]`, extracted
+        by `_entity_name`); nothing derived from the web ever becomes a query.
         """
         if self._bridge is None:
             return ""
-        entity = candidate.payload.get("entity")
-        if not isinstance(entity, str) or not entity.strip():
+        if not entity:
             logger.warning("judge: topic candidate carried no entity name; dropping it")
             return ""
         titles = await topics.search_titles(self._bridge, entity)
@@ -305,6 +308,14 @@ class Judge:
 def _reason_block(candidate: Candidate) -> str:
     reason = " ".join(candidate.reason.split())[:MAX_REASON_CHARS]
     return f"이유 ({candidate.kind}): {reason}"
+
+
+def _entity_name(candidate: Candidate) -> str:
+    """`candidate.payload["entity"]` as a clean string, or "" when it is absent,
+    the wrong type, or blank. Shared by `_topic_block` (the search query) and
+    `decide` (the `has_url` exemption) so both read the same value."""
+    entity = candidate.payload.get("entity")
+    return entity.strip() if isinstance(entity, str) else ""
 
 
 def _read_reply(text: str, *, model: str, stop_reason: str = "") -> Utterance:
@@ -386,30 +397,78 @@ _SCHEME_RE = re.compile(r"[a-z][\w+.-]*://", re.I)
 """`https://`, `http://`, but also `tg://`, `ftp://` and anything else shaped like
 a URI scheme - a fixed list of schemes is the same allowlist mistake one level up."""
 
-_BARE_DOMAIN_RE = re.compile(r"\b[\w-]+\.[a-z]{2,}\b", re.I)
-"""A word, a dot, and two-or-more letters - deliberately with **no TLD list**.
-Round 1 shipped `(?:com|net|org|io|co|kr|ai|dev)` and a review measured 17 of 40
-crafted evasions passing it, because a fixed list of TLDs is a list an attacker
-can read off this very file and route around (`.app`, `.xyz`, `.me`, `t.me/...`,
-`bit.ly/...` all passed). This matches on *shape* instead - anything that reads as
-word.TLD - and the false positives it accepts on purpose (`Node.js`, `report.docx`)
-are the price ADR 0015 already named: "it costs nothing to refuse - the owner can
-ask, and then it is their turn." """
+_BARE_DOMAIN_RE = re.compile(r"\b[\w-]+\.[a-z]{2,}(?![a-z])", re.I)
+r"""A word, a dot, and two-or-more letters - deliberately with **no TLD list**, and
+deliberately with **no trailing `\b` either**.
 
-_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+Round 1 shipped a trailing `\b` and a review measured it never firing on real
+Korean at all: Korean attaches particles with no space (`sendbird.com에 있어`,
+not `sendbird.com 에 있어`), and a Hangul syllable is a `\w` character in Python's
+`re` exactly like a Latin letter is - so "m" (end of `.com`) followed by "에" is
+two word characters in a row, `\b` does not fire between them, and the match that
+should have ended at the TLD never completes. The corpus that measured "17/17
+caught" was written with an artificial space before the particle in every case,
+which is not how the string this function actually has to defend against would
+be written - it scored well by avoiding its own failure mode, not by surviving it.
+
+`(?![a-z])` replaces the boundary with the actual requirement: the run of TLD
+letters must not extend further right (so `.comment` does not read as `.com`),
+but nothing to the right of it needs to be a non-word character - a following
+Hangul particle, digit, or punctuation mark all satisfy the lookahead just by not
+being another ASCII letter. Re-measured on the unspaced (idiomatic) form of every
+corpus entry in `tests/test_judge.py`; see that file for the current count.
+
+The false positives this accepts on purpose (`Node.js`, `report.docx`) are the
+price ADR 0015 already named: "it costs nothing to refuse - the owner can ask,
+and then it is their turn." - except for a `topic` candidate's own entity name,
+which `has_url`'s `exempt` parameter carves back out (round 2 finding 2): an
+entity shaped like a domain (`UJET.cx`, this owner's most-mentioned entity) must
+not become permanently unspeakable merely for being named back to him."""
+
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
 """A dotted-quad IP is a place to go exactly like a domain is, and it does not
-satisfy `_BARE_DOMAIN_RE` (its last segment is digits, never `[a-z]{2,}`)."""
+satisfy `_BARE_DOMAIN_RE` (its last segment is digits, never `[a-z]{2,}`). Given
+the same trailing-boundary treatment as `_BARE_DOMAIN_RE` and for the identical
+reason - `192.168.0.1로 접속해` has the same word-character adjacency between the
+last digit and the following particle that broke the domain check, so a plain
+trailing `\b` here would have shipped the same hole one line down."""
+
+_IPV6_CANDIDATE_RE = re.compile(r"\[?(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\]?", re.I)
+r"""A loose IPv6-shaped token: at least two colons among hex digits and optional
+brackets (`2001:db8::1`, `[2001:db8::1]`, `::1`). Loose on purpose - IPv6's own
+grammar (zero-compression appears at most once, groups are 1-4 hex digits, ...)
+is more than this needs - but a candidate this loose would also flag an ordinary
+clock time (`3:15:00` is a `(?:\d{0,4}:){2,7}` string), so `_looks_like_ipv6`
+below requires a `::` compression or an actual hex letter before it counts:
+digits alone are what every Korean timestamp in this product's own lines look
+like, and a fully-written-out IPv6 that never once needs `a`-`f` is vanishingly
+rare next to that."""
 
 _HANDLE_RE = re.compile(r"@\w{2,}")
 """`@handle` - a Telegram/Twitter-style mention. Not a link by itself, but it is
 the same "somewhere else to go" this function exists to refuse, and it costs
 nothing extra to catch here."""
 
-_OBFUSCATIONS = ("(dot)", "[.]", " dot ", "점 com", "닷 컴")
-"""Spelled-out and bracketed dots that dodge every regex above by construction -
-`example dot com`, `example[.]com`, and the Korean equivalents. Literal substring
-checks rather than a pattern, because there is no shape to match: the whole point
-of writing it this way is to not look like a dot."""
+_OBFUSCATIONS = (
+    "(dot)",
+    "[.]",
+    " dot ",
+    "점 com",
+    "닷 컴",
+    "쩜컴",
+    "점컴",
+    "닷컴",
+    "점 콤",
+    "슬래시",
+)
+"""Spelled-out and bracketed dots (and, for `슬래시`, a spelled-out slash) that
+dodge every regex above by construction - `example dot com`, `example[.]com`, and
+the Korean equivalents, spaced and unspaced (round 2: `쩜컴`/`점컴`/`닷컴`/`점 콤`
+added alongside the round 1 spaced forms, on the same reasoning that fixed
+`_BARE_DOMAIN_RE` - Korean does not reliably put a space where this function
+would like one). Literal substring checks rather than a pattern, because there is
+no shape to match: the whole point of writing it this way is to not look like a
+dot."""
 
 _FORMAT_CATEGORY = "Cf"
 """Unicode category for zero-width/format characters (ZWSP, ZWJ, word joiner,
@@ -432,8 +491,18 @@ def _fold(text: str) -> str:
     return "".join(ch for ch in folded if unicodedata.category(ch) != _FORMAT_CATEGORY)
 
 
-def has_url(text: str) -> bool:
-    """Whether an utterance points the owner somewhere.
+def _looks_like_ipv6(text: str) -> bool:
+    """Whether `text` contains something IPv6-shaped, without mistaking a plain
+    clock time for one. See `_IPV6_CANDIDATE_RE`."""
+    for match in _IPV6_CANDIDATE_RE.finditer(text):
+        token = match.group()
+        if "::" in token or re.search(r"[a-f]", token, re.I):
+            return True
+    return False
+
+
+def has_url(text: str, *, exempt: str = "") -> bool:
+    r"""Whether an utterance points the owner somewhere.
 
     ADR 0015's load-bearing defence, and it lives on the output because that is the
     one choke point every proactive line already passes through: the reply is
@@ -442,20 +511,40 @@ def has_url(text: str) -> bool:
     it costs nothing to refuse - the owner can ask, and then it is their turn and
     the ordinary tool path applies.
 
-    Inverted on purpose (round 1 review): the first version matched known shapes
-    (`http(s)://`, `www.`, eight ASCII TLDs) and 17 of 40 crafted evasions passed
-    it - a bare `sendbird.app`, `t.me/...`, `bit.ly/...`, a raw IPv4, `tg://...`,
-    written-out dots, and full-width Latin/period forms among them. An allowlist
-    of "what a link looks like" is a list this daemon's own source ships, so this
-    refuses anything shaped like a pointer to somewhere instead of only the shapes
-    it was told to expect: a scheme, a bare word.TLD with no fixed TLD list, a
-    dotted-quad IP, an `@handle`, or a written-out dot. Measured against the
-    evasion corpus in `tests/test_judge.py` (17/17 caught) and this file's own
-    example proactive lines (0 false positives) - though `Node.js` and a bare
-    `report.docx` are now refused too, which is the accepted cost, not a bug.
+    Inverted in round 1: the first version matched known shapes (`http(s)://`,
+    `www.`, eight ASCII TLDs) and 17 of 40 crafted evasions passed it. This refuses
+    anything shaped like a pointer to somewhere instead of only the shapes it was
+    told to expect: a scheme, a bare word.TLD with no fixed TLD list, a dotted-quad
+    IP, an IPv6-shaped token, an `@handle`, or a written-out dot.
+
+    Round 2 fixed two things the round-1 version still missed. First, the bare-
+    domain and IPv4 checks used a trailing `\b`, which never fires between two
+    `\w` characters - and a Hangul particle attached directly to a TLD or an IP
+    (`sendbird.com에 있어`, the idiomatic Korean form with no space) is exactly
+    that, so the round-1 corpus scored 17/17 by testing an artificially spaced
+    form that is not how this actually gets written. See `_BARE_DOMAIN_RE` and
+    `_IPV4_RE`. Second, `exempt` exists because `topic_candidates` puts an
+    entity's own name (`entities.name`, first-party, drawn from the owner's own
+    transcript) into both the search query and the reason, and the judge then
+    names that entity back - so an entity shaped like a domain (`UJET.cx`, this
+    owner's most-mentioned entity) would otherwise be permanently unspeakable,
+    refused every time for a "url" that is only its own subject's name. Passing
+    the candidate's entity as `exempt` removes exactly that string (case-
+    insensitively, after the same folding) before checking, so a genuine link
+    riding alongside the entity's name is still caught - only an occurrence of
+    the entity's own name is forgiven, never a domain shape in general.
     """
     folded = _fold(text)
-    if _SCHEME_RE.search(folded) or _IPV4_RE.search(folded) or _HANDLE_RE.search(folded):
+    if exempt:
+        folded_exempt = _fold(exempt)
+        if folded_exempt:
+            folded = re.sub(re.escape(folded_exempt), "", folded, flags=re.I)
+    if (
+        _SCHEME_RE.search(folded)
+        or _IPV4_RE.search(folded)
+        or _HANDLE_RE.search(folded)
+        or _looks_like_ipv6(folded)
+    ):
         return True
     if _BARE_DOMAIN_RE.search(folded):
         return True
