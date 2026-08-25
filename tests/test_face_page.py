@@ -9,6 +9,7 @@ elements at once dips to the page background, and driving animation from rAF sta
 a background window.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -80,3 +81,75 @@ def test_speaking_falls_back_to_idle_when_both_speaking_clips_are_missing():
         "speaking must fall through to FOR_ACTIVITY[act] (-> idle1) when neither "
         "speaking clip exists, per spec 3.7's ...-> idle"
     )
+
+
+def test_idle_return_can_wait_for_the_outgoing_clip_to_finish():
+    # spec 3.2: only a return to idle may wait - up to IDLE_WAIT_MS - for the
+    # outgoing clip to reach its own loop end (its neutral pose) instead of cutting
+    # it mid-gesture. Scoped to toActivity()'s own body, comments stripped, so a
+    # mention of IDLE_WAIT_MS elsewhere (its own top-level declaration) or in prose
+    # can't stand in for the mechanism actually living here.
+    start = PAGE.index("function toActivity(act) {")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert 'act === "idle"' in body, (
+        "the wait must be conditioned on returning to idle specifically"
+    )
+    assert "IDLE_WAIT_MS" in body, "the wait must be bounded, not open-ended"
+    assert "showing.loop = false" in body, (
+        "letting the outgoing clip reach its own end relies on disabling its loop "
+        "so it fires `ended` instead of seeking back to 0"
+    )
+
+
+def test_the_fade_is_split_into_a_fast_and_a_slow_duration():
+    # spec 3.2: speaking's mouth-snap and the mood one-shots keep the original fast
+    # fade, but a mismatched pose (listening/thinking/working, and the idle return)
+    # needs longer to read as deliberate rather than a cut.
+    fast = re.search(r"const FADE_MS = (\d+)", PAGE)
+    slow = re.search(r"const FADE_SLOW_MS = (\d+)", PAGE)
+    assert fast and slow, "both a fast and a slow fade constant must be declared"
+    assert int(slow.group(1)) > int(fast.group(1)), "the slow fade must actually be slower"
+
+    # The activities that get it, scoped to the pool's own declaration so a stray
+    # mention of e.g. "thinking" elsewhere on the page can't satisfy this.
+    start = PAGE.index("SLOW_FADE_ACTIVITIES = new Set([")
+    end = PAGE.index("]", start)
+    pool = _without_line_comments(PAGE[start:end])
+    for act in ("listening", "thinking", "working", "idle"):
+        assert f'"{act}"' in pool, f"{act} should get the slow fade per spec 3.2"
+
+    # And toActivity must actually consult that pool and the slow constant, not
+    # just declare them elsewhere unused.
+    start = PAGE.index("function toActivity(act) {")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert "FADE_SLOW_MS" in body and "SLOW_FADE_ACTIVITIES" in body, (
+        "toActivity must select FADE_SLOW_MS via SLOW_FADE_ACTIVITIES, not just declare them"
+    )
+
+
+def test_playback_recovers_from_an_external_pause_or_a_rejected_switch():
+    # Static-text guard only, and it stops there: this suite has no JS runtime (no
+    # node step in .github/workflows/ci.yml), so it cannot actually pause a clip or
+    # reject a play() and observe recovery - that would need a DOM/JS harness this
+    # repo does not carry. This pins that the recovery machinery exists and is wired
+    # to the two triggers that were measured live to matter, not that it works.
+    assert "ensurePlaying" in PAGE
+
+    start = PAGE.index("async function prime(stem) {")
+    end = PAGE.index("\n}\n", start)
+    prime_body = _without_line_comments(PAGE[start:end])
+    assert '"pause"' in prime_body and "ensurePlaying" in prime_body, (
+        "an unexpected pause on the showing clip must trigger recovery"
+    )
+
+    start = PAGE.index('addEventListener("visibilitychange"')
+    end = PAGE.index("});", start)
+    visibility_body = _without_line_comments(PAGE[start:end])
+    assert "ensurePlaying" in visibility_body, "becoming visible again must trigger recovery"
+
+    start = PAGE.index("function ensurePlaying() {")
+    end = PAGE.index("\n}\n", start)
+    heal_body = _without_line_comments(PAGE[start:end])
+    assert ".play()" in heal_body, "recovery must actually attempt to resume playback"
