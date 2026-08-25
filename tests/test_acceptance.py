@@ -1603,3 +1603,97 @@ def test_switching_the_browser_on_adds_three_tools(tmp_path: Path) -> None:
         asyncio.run(runner.aclose())
     finally:
         store.close()
+
+
+# --- the face: the whole chain, driven through the real entrypoint wiring ---
+
+
+async def test_a_turn_drives_the_face_and_leaves_no_tag_in_the_markdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Assembled the way the entrypoint does it - `daemon.app._lifespan`, the same
+    function `create_app`'s FastAPI hands to uvicorn, called directly here instead
+    of through `TestClient` so the turn can run on this test's own event loop - one
+    real turn, and the whole chain: the activities the page would see, the
+    one-shot, the reply, and the part unit tests structurally cannot reach - the
+    markdown on disk, which is what recall replays into later prompts.
+
+    `bus` is read off `app.state.face`, not a bus this test built and handed to a
+    hand-assembled `ConversationLoop` - so if `face=app.state.face` were ever
+    dropped from `_lifespan`'s real `ConversationLoop(...)` call, `bus.activities`
+    would stay empty and this test would fail for exactly that reason. That is the
+    property Task 7's review flagged as resting on manual review alone.
+
+    Only the model is faked (`_build_providers`, the one seam between this file's
+    real assembly and the network) and the channel is one this test drives by
+    hand, the same way `channel=_Idle()`/`memory=_Mem()` stand in for Telegram in
+    the other lifespan tests above - the tool layer and the voice runtime are both
+    assembled from a *built* `_build_io`, which a directly-injected channel/memory
+    bypasses, so this covers the text path's wiring and not those two.
+    """
+    from daemon import app as daemon_app
+    from tests.test_face import RecordingBus
+
+    provider = Provider(reply="[mood:amused] 그래서")
+    # `_lifespan` calls `_build_providers(settings)` by its bare name, so patching
+    # the module attribute reaches every call site inside app.py - including the
+    # boot-time reflection/persona catch-up this settings/data_dir also triggers.
+    monkeypatch.setattr(daemon_app, "_build_providers", lambda _settings: {"ollama": provider})
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        writer = FileMemoryWriter(tmp_path, store)
+
+        class DrivenChannel:
+            """A channel this test controls directly: one queued inbound message,
+            and every outbound one recorded - `_lifespan` builds the real
+            `ConversationLoop` around it exactly as it would around Telegram."""
+
+            name = "telegram"
+
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self.queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
+
+            async def send(self, message: Any) -> None:
+                self.sent.append(message.text)
+
+            async def listen(self) -> Any:
+                while True:
+                    yield await self.queue.get()
+
+            async def close(self) -> None:
+                return None
+
+        channel = DrivenChannel()
+        app = daemon_app.create_app(_settings(tmp_path), channel=channel, memory=writer)
+        # Overwritten before the lifespan runs, not after: `_lifespan` reads
+        # `app.state.face` exactly once, when it builds the `ConversationLoop`.
+        app.state.face = RecordingBus()
+
+        async with daemon_app._lifespan(app):
+            await channel.queue.put(
+                InboundMessage(
+                    text="오늘 뭐 했어",
+                    sender_id=str(OWNER),
+                    received_at=datetime.now(UTC),
+                    channel="telegram",
+                    external_id="1",
+                )
+            )
+            for _ in range(500):  # up to ~5s of real time, then give up and assert
+                await asyncio.sleep(0.01)
+                if channel.sent:
+                    break
+
+        bus = app.state.face
+        assert bus.activities == ["thinking", "speaking", "idle"]
+        assert bus.shots == ["amused"]
+        assert channel.sent == ["그래서"], "the mood tag must not reach the wire either"
+
+        log_files = list((tmp_path / "memory").rglob("*.md"))
+        text = "\n".join(p.read_text(encoding="utf-8") for p in log_files)
+        assert "그래서" in text, "the source of truth does not have the reply"
+        assert "mood:" not in text, "a tag in the log is read back to the model by recall"
+    finally:
+        store.close()
