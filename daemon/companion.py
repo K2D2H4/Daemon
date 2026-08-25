@@ -34,7 +34,6 @@ import secrets
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
 
 from daemon import clock, timesense
 from daemon.llm.base import ToolCall, ToolSpec
@@ -201,16 +200,6 @@ Older than this, a fresh greeting is the correct behaviour and recall is the
 right tool, so the block is simply absent."""
 
 
-class LearnedRulesLike(Protocol):
-    """Just the half of `daemon/persona/rules.LearnedRules` the prompt needs.
-
-    A protocol rather than the class so this module keeps out of the store's
-    import graph, and so a test can hand in something that raises.
-    """
-
-    def annotations(self) -> dict[str, tuple[str, int]]: ...
-
-
 class Companion:
     """One daemon's capabilities, whichever endpoint is asking.
 
@@ -227,7 +216,6 @@ class Companion:
         recall_limit: int = 6,
         resolve_id: ResolveId | None = None,
         tools: ToolRunner | None = None,
-        rules: LearnedRulesLike | None = None,
     ) -> None:
         self._memory = memory
         self._data_dir = Path(data_dir)
@@ -235,7 +223,6 @@ class Companion:
         self._recall_limit = recall_limit
         self._resolve_id = resolve_id
         self._tools = tools
-        self._rules = rules
         self._pending: list[tuple[int, str]] = []
 
     # --- what goes in front of the model ------------------------------------
@@ -264,19 +251,8 @@ class Companion:
         the next turn (docs/PLAN.md 5.1). Assembly - the human-owned seed plus M4's
         accumulated learned rules - is `daemon/persona/loader.py`'s job, so this is
         one call and stays one call.
-
-        The dates and observation counts come from the mirror rather than from
-        `learned.md`, which carries bodies alone on purpose (non-negotiable 3). A
-        mirror that cannot be read costs the annotation and nothing else: the
-        rules still go in, undated, exactly as they did before this existed.
         """
-        annotations = None
-        if self._rules is not None:
-            try:
-                annotations = self._rules.annotations()
-            except Exception:
-                logger.exception("companion: could not date the learned rules")
-        return await persona.load_persona(self._data_dir, annotations=annotations)
+        return await persona.load_persona(self._data_dir)
 
     async def context(
         self,

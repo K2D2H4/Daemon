@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Mapping
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -31,10 +30,7 @@ LEARNED_FILE = Path("persona") / "learned.md"
 
 LEARNED_PREFIX = (
     "What I've worked out about dealing with you specifically, from our own "
-    "conversations (not who I am - that part never changes). 각 줄 앞의 날짜는 "
-    "그렇게 느낀 때이고, 괄호 안은 그렇게 본 관찰의 수다. 오래됐거나 관찰이 "
-    "한두 번뿐인 것은 그때 그랬다는 뜻이지 늘 그렇다는 뜻이 아니니, 지금 "
-    "시각과 견주어 무게를 달아서 읽는다. 규칙이 아니라 관찰이다:"
+    "conversations (not who I am - that part never changes):"
 )
 """Marks the learned block as separate from the seed. The split in
 docs/CONTRACTS.md non-negotiable 5 only works as an anchor if the model can tell
@@ -98,27 +94,7 @@ def rule_bodies(text: str) -> list[str]:
     return bodies
 
 
-def rule_line(body: str, *, formed: str, observations: int) -> str:
-    """One learned rule as the model should read it: what was noticed, when, and
-    how often.
-
-    The date makes the difference between a tendency and a standing order. An
-    undated rule is read at full weight forever - which is how one remark on
-    2026-08-19 was still governing the daemon five days later - while a dated one
-    can be weighed against `[현재 시각]`, which every prompt already carries.
-
-    Absolute, never relative: "어제" written down once is wrong by the following
-    week, and this string is rebuilt on every turn precisely so it never has to be
-    stored.
-    """
-    return f"{formed} (관찰 {observations}건) {body}"
-
-
-async def load_persona(
-    data_dir: Path,
-    *,
-    annotations: Mapping[str, tuple[str, int]] | None = None,
-) -> str:
+async def load_persona(data_dir: Path) -> str:
     """The persona system message: seed verbatim, then the learned rules under a
     header that marks them as separate from the anchor.
 
@@ -130,16 +106,6 @@ async def load_persona(
     Empty when both files are empty or absent, so the caller adds no system
     message at all rather than an empty one - matching what `_read_seed` did
     before this replaced it.
-
-    `annotations` maps a rule body to `(formed, observations)` from the sqlite
-    mirror, and arrives as an argument rather than being looked up here because
-    this module only reads files: it must not import `Store` (layering, the
-    dependency list above), and the date/count it renders may not live in the
-    file it reads back (docs/CONTRACTS.md non-negotiable 3, provenance is
-    columns, never prose). A body missing from the mapping - no mirror, a
-    diverged mirror, or a rule the rows do not know about - falls back to the
-    plain bullet rather than being dropped, because a rule cannot render its
-    own date and losing it would quietly narrow the personality.
     """
     seed = await read_file(seed_path(data_dir))
     learned = await read_file(learned_path(data_dir))
@@ -149,16 +115,6 @@ async def load_persona(
         parts.append(seed)
     bodies = rule_bodies(learned)
     if bodies:
-        found = annotations or {}
-        lines = []
-        for body in bodies:
-            dated = found.get(body)
-            # Plain when the mirror cannot say - see the docstring's degrade path.
-            lines.append(
-                rule_line(body, formed=dated[0], observations=dated[1])
-                if dated
-                else body
-            )
-        rules = "\n".join(f"- {line}" for line in lines)
+        rules = "\n".join(f"- {body}" for body in bodies)
         parts.append(f"{LEARNED_PREFIX}\n{rules}")
     return "\n\n".join(parts)

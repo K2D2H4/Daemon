@@ -14,9 +14,7 @@ the prompt elicits one is a live-model question that belongs in `evals/`.
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
-from typing import Any
 
 import pytest
 from conftest import FakeProvider
@@ -415,78 +413,3 @@ def test_the_token_budget_leaves_room_for_a_thinking_model() -> None:
     Korean. That arithmetic was right for a model that only answers, and wrong
     for one that thinks first out of the same allowance."""
     assert MAX_OUTPUT_TOKENS >= 1000
-
-
-async def test_the_persona_reaching_the_judge_is_dated_when_rules_are_wired(
-    db: Any, data_dir: Path
-) -> None:
-    """Mirrors `test_companion.py`'s equivalent case: the judge builds its own
-    persona directly rather than through `Companion` (see the docstring on
-    `Judge.__init__` for why it carries learned rules at all), so it needs the
-    same wiring or it would re-create the very split that comment describes."""
-    from datetime import UTC, datetime
-
-    from daemon.memory.store import Store
-    from daemon.persona.rules import LearnedRules, Proposal
-
-    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
-    rules = LearnedRules(data_dir, Store(db))
-    await rules.add(
-        [Proposal(body="변명을 싫어한다", evidence=(1, 2, 3))],
-        now=datetime(2026, 8, 9, 15, 0, tzinfo=UTC),
-    )
-    provider = FakeProvider('{"say": "어제 발표 어떻게 됐어?"}')
-    gateway = LLMGateway(
-        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
-    )
-    judge = Judge(gateway, data_dir, rules=rules)
-
-    await judge.decide(OPEN_LOOP)
-
-    assert "2026-08-09 (관찰 3건) 변명을 싫어한다" in system_text(provider)
-
-
-async def test_a_judge_with_no_rules_wired_still_has_a_persona(data_dir: Path) -> None:
-    """The production default (`Judge(gateway, data_dir)`, no `rules`) and most
-    tests here carry no store. Undated is the same degrade this had before dates
-    existed at all - not silence."""
-    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
-    (data_dir / "persona" / "learned.md").write_text(
-        "- 변명을 싫어한다\n", encoding="utf-8"
-    )
-    judge, provider = judge_for(data_dir)
-
-    await judge.decide(OPEN_LOOP)
-
-    assert "- 변명을 싫어한다" in system_text(provider)
-
-
-async def test_an_unreadable_mirror_costs_the_dates_not_the_judges_voice(
-    data_dir: Path,
-) -> None:
-    """The case that matters most on this surface: unlike `Companion.persona`, a
-    persona that fails to build here is not merely a worse prompt - `decide`
-    returns `Utterance(why_not=...)` without calling the model at all when
-    `_persona()` comes back empty (see `no_seed_means_no_call_at_all` above). If
-    a raise from `annotations()` escaped `_persona` uncaught, it would propagate
-    out of `decide` - there is no `try` around that call - and silence
-    proactivity entirely, not just un-date one rule."""
-
-    class Broken:
-        def annotations(self) -> dict[str, tuple[str, int]]:
-            raise sqlite3.OperationalError("no such table: persona_rules")
-
-    (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
-    (data_dir / "persona" / "learned.md").write_text(
-        "- 변명을 싫어한다\n", encoding="utf-8"
-    )
-    provider = FakeProvider('{"say": "어제 발표 어떻게 됐어?"}')
-    gateway = LLMGateway(
-        {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
-    )
-    judge = Judge(gateway, data_dir, rules=Broken())
-
-    utterance = await judge.decide(OPEN_LOOP)
-
-    assert utterance
-    assert "변명을 싫어한다" in system_text(provider)

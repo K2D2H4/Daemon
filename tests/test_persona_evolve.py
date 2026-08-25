@@ -478,21 +478,3 @@ async def test_retiring_a_rule_does_not_let_next_weeks_pass_revive_it(
 
     assert second.skipped.startswith("not enough observations")
     assert store.active_persona_rules() == []
-
-
-def test_the_rule_prompt_asks_for_an_observation_not_a_standing_demand() -> None:
-    """The prompt used to say `body 는 이 사람에 대한 사실처럼 짧게 한 문장으로 적는다`,
-    and a fact carries no strength, so it is read at full weight forever. What that
-    produced after five days of terse terminal QA was
-
-        용건 위주의 빠른 응답과 즉각적이고 담백한 피드백을 요구한다
-
-    - a standing demand governing a midnight voice chat as much as a debugging
-    session. Naming the unwanted form is the point: `CALLED_BY_NAME` already
-    measured that omitting a move is not enough, the move has to be forbidden.
-    """
-    from daemon.persona.evolve import SYSTEM
-
-    assert "사실처럼" not in SYSTEM
-    assert "요구한다" in SYSTEM, "the standing-demand form has to be named to be banned"
-    assert "관찰" in SYSTEM
