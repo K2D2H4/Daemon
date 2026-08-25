@@ -349,10 +349,20 @@ def test_url_evasions_are_all_caught(evasion: str) -> None:
     assert has_url(evasion), f"{evasion!r} should have been caught"
 
 
-@pytest.mark.parametrize("evasion", ["example.한국에서 확인해봐", "example.рф에서 확인해봐"])
+@pytest.mark.parametrize(
+    "evasion",
+    [
+        "example.한국에서 확인해봐",
+        "example.рф에서 확인해봐",
+        "무료맥북.한국 에서 받아",  # a fully-Hangul label, not just a Latin one before the TLD
+        "이벤트.한국/free 여기서 받아",  # the non-Latin gap plus a path riding along with it
+    ],
+)
 def test_a_non_latin_tld_is_a_known_gap(evasion: str) -> None:
     r"""Documents the round 4 ruling rather than hiding it: `.한국` is a live
-    ccTLD in a Korean-language product and this genuinely does not catch it.
+    ccTLD in a Korean-language product and this genuinely does not catch it -
+    including a fully-Hangul label in front of the TLD, and a path riding along
+    after it, neither of which round 4's two-entry version of this test pinned.
     Round 3 widened `_TLD_CHARS` to close this and broke bare-entity
     forgiveness for every domain-shaped entity in idiomatic Korean instead (see
     `_TLD_CHARS`'s docstring) - reverted on the ruling that the Latin TLD space
@@ -385,172 +395,37 @@ def test_a_non_latin_tld_is_a_known_gap(evasion: str) -> None:
 )
 def test_ordinary_lines_are_not_caught_except_the_accepted_cost(clean: str) -> None:
     """0 false positives against this file's own example proactive lines - except
-    the two ADR 0015 already prices in for a non-`topic` context. `has_url`
-    matching *any* word.TLD shape with no TLD allowlist means `Node.js` and a bare
-    `report.docx` are refused too when nothing exempts them; that is the accepted
-    cost ("it costs nothing to refuse - the owner can ask, and then it is their
-    turn"), not a false positive to fix. When one of these *is* the candidate's
-    own entity name, `exempt=` is what actually fixes it - see
-    `test_a_non_pointer_entitys_bare_name_is_exempt_in_every_particle_form` below
-    (or, for a domain-shaped entity, why it stays refused even then)."""
+    the two ADR 0015 already prices in. `has_url` matching *any* word.TLD shape
+    with no TLD allowlist means `Node.js` and a bare `report.docx` are refused
+    too; that is the accepted cost ("it costs nothing to refuse - the owner can
+    ask, and then it is their turn"), not a false positive to fix. This includes
+    a `topic` candidate whose own entity name happens to read this way (round 5:
+    `has_url` no longer takes an `exempt` to forgive that case - `Judge.decide`
+    drops such a candidate before spending a search or a model call instead; see
+    `test_a_topic_reply_naming_a_pointer_shaped_entity_is_declined`)."""
     from daemon.proactivity.judge import has_url
 
     is_priced_in_cost = clean in ("Node.js 배웠어?", "report.docx 잘 받았어?")
     assert has_url(clean) == is_priced_in_cost
 
 
-# Round 2's version of this exemption stripped every occurrence of the entity
-# name as a *substring* of the whole text before checking anything, which round
-# 3's review measured letting 21 of 33 probes through - `sendbird.com` unlocked
-# for the entity `Sendbird`, with no attacker effort, among them. Round 2's own
-# test suite (this section, previously) pinned that bug as correct: it asserted
-# only that the bare entity name was forgiven, never that a domain built around
-# it still refused. Every test below pins both halves for every entity: the
-# bare name is forgiven (when it is safe to forgive at all - see round 4 below),
-# and a domain glued onto it - a suffix, a prefix, either case - is not.
-#
-# Round 4 finding 5: every exemption test through round 3 wrote the entity's
-# particle with a leading space (`f"{entity} 소식 ..."`) - the non-idiomatic
-# form. Two of four rounds so far were bugs that hid specifically in the
-# unspaced (idiomatic) attachment, so every test below is parametrized over the
-# particles Korean actually attaches with no space, not just one spaced example.
-_PARTICLES = (
-    "은", "는", "이", "가", "을", "를", "에", "에서", "으로", "로", "와", "과", "도", "만"
-)
-
-
-@pytest.mark.parametrize("particle", _PARTICLES)
-@pytest.mark.parametrize("entity", ["Kiwi", "Sendbird", "llm-wiki", "Daemon"])
-def test_a_non_pointer_entitys_bare_name_is_exempt_in_every_particle_form(
-    entity: str, particle: str
-) -> None:
-    """`topic_candidates` puts `entities.name` verbatim into the reason and the
-    query, and the judge then names that entity back. `Kiwi`, `Sendbird`,
-    `llm-wiki` and `Daemon` are not domain/IP/handle-shaped, so a bare mention of
-    any of them, with any Korean particle attached with no space, must be
-    forgiven - what actually bounds this (round 3 finding 2) is that
-    `_matches_beyond_entity` only forgives a match whose *entire* span equals the
-    entity name, not that the name is "first-party" or trustworthy."""
-    from daemon.proactivity.judge import has_url
-
-    line = f"{entity}{particle} 소식 들었어? 요즘 얘기가 좀 있더라"
-    assert not has_url(line, exempt=entity)
-
-
-@pytest.mark.parametrize("particle", _PARTICLES)
-@pytest.mark.parametrize("entity", ["UJET.cx", "Node.js"])
-def test_a_pointer_shaped_entitys_bare_name_is_never_exempt_in_any_particle_form(
-    entity: str, particle: str
-) -> None:
-    """Round 4 finding 3: `UJET.cx` and `Node.js` are themselves domain-shaped,
-    so `has_url(exempt, exempt="")` is true for their own name and no exemption
-    is granted at all, in any particle form - span-equality only bounds how
-    *wide* an exemption is, never whether the exempted string is itself a live
-    pointer, and speaking `UJET.cx` bare is exactly the failure ADR 0015
-    defence 4 exists to stop. This is a real behaviour change from round 3, and
-    a deliberate one: it makes this owner's most-mentioned entity permanently
-    un-nameable via this path, because its own name is a domain."""
-    from daemon.proactivity.judge import has_url
-
-    line = f"{entity}{particle} 소식 들었어? 요즘 얘기가 좀 있더라"
-    assert has_url(line, exempt=entity)
-
-
-@pytest.mark.parametrize(
-    "entity", ["evil.com", "203.0.113.9", "@evil_support", "sendbird-verify.app"]
-)
-def test_an_entity_name_that_is_itself_a_pointer_is_never_exempt(entity: str) -> None:
-    """Round 4 finding 3's named probes: `safe_name` (in `reflection.py`) permits
-    all four of these as entity names. Each was spoken verbatim as its own
-    `exempt` before this fix - the docstring's "would still only unlock exactly
-    that string" was accurate and was not reassurance, because unlocking exactly
-    that string is the failure ADR 0015 defence 4 exists to stop."""
-    from daemon.proactivity.judge import has_url
-
-    line = f"{entity} 소식 들었어? 요즘 얘기가 좀 있더라"
-    assert has_url(line, exempt=entity)
-
-
-@pytest.mark.parametrize(
-    "entity", ["UJET.cx", "Node.js", "Kiwi", "Sendbird", "llm-wiki", "Daemon"]
-)
-def test_a_domain_glued_onto_the_entity_is_still_refused(entity: str) -> None:
-    """The other half of the span rule, and the half round 2's tests never
-    checked: `entity + ".com"` is a match whose span is longer than the entity
-    name, so it must not be forgiven merely because the entity name is a
-    substring of it. This is what "exempting `Sendbird` is not free" means
-    concretely - it must not also whitelist `sendbird.com`."""
-    from daemon.proactivity.judge import has_url
-
-    glued = f"{entity}.com에서 확인해봐"
-    assert has_url(glued, exempt=entity)
-
-
-@pytest.mark.parametrize(
-    "continuation",
-    [
-        "/free-macbook 여기서 받아",
-        "?ref=evil 눌러봐",
-        "#/verify 확인해",
-        ":8443/x 접속해",
-        "／verify 확인해",
-    ],
-)
-def test_a_pointer_continuation_after_a_forgiven_span_is_still_refused(continuation: str) -> None:
-    r"""Round 4 finding 2: nothing in this module matches a path, query, fragment
-    or port on its own - `"UJET.cx/free-macbook"` matches `_BARE_DOMAIN_RE` as
-    `"UJET.cx"` alone, because the path has no dot-plus-TLD shape, and that span
-    equals the entity. Forgiving on span equality alone let the whole line
-    through with the path riding for free; the fix is that a span-equal match
-    followed by `/`, `\`, `?`, `#` or `:` (or the fullwidth solidus, which
-    `_fold`'s NFKC pass collapses to `/` before this check ever runs) is still
-    not forgiven."""
-    from daemon.proactivity.judge import has_url
-
-    assert has_url(f"UJET.cx{continuation}", exempt="UJET.cx")
-
-
-def test_a_pointer_continuation_after_a_forgiven_ipv4_is_still_refused() -> None:
-    """The same fix, for the IP form: `exempt="1.2.3.4"` must not forgive
-    `"1.2.3.4/pwn"`."""
-    from daemon.proactivity.judge import has_url
-
-    assert has_url("1.2.3.4/pwn 접속해", exempt="1.2.3.4")
-
-
-@pytest.mark.parametrize(
-    ("entity", "line"),
-    [
-        ("Sendbird", "Sendbird 소식 sendbird.com에 올라왔대"),
-        ("UJET.cx", "UJET.cx 공지는 evil-UJET.cx에서 확인해"),
-        ("Kiwi", "Kiwi.com에서 예약했어?"),
-        ("Daemon", "Daemon.io 열어봐"),
-    ],
-)
-def test_the_round_3_bypass_probes_are_all_refused(entity: str, line: str) -> None:
-    """The exact probes round 3's review measured bypassing the substring-strip
-    exemption (21 of 33 probes bypassed in total, these four pinned verbatim) -
-    including the prefix-glued case (`evil-UJET.cx`), which a suffix-only fix
-    would still miss."""
-    from daemon.proactivity.judge import has_url
-
-    assert has_url(line, exempt=entity)
-
-
-@pytest.mark.parametrize(
-    "entity", ["UJET.cx", "Node.js", "Kiwi", "Sendbird", "llm-wiki", "Daemon"]
-)
-def test_the_exemption_does_not_cover_a_different_link_alongside_the_entity(
-    entity: str,
-) -> None:
-    """The exemption is narrow on purpose: it forgives only a match whose entire
-    span is the entity's own name, so a genuine link riding alongside it - the
-    actual attack ADR 0015 names - is still caught regardless of which entity the
-    candidate is about."""
-    from daemon.proactivity.judge import has_url
-
-    line = f"{entity} 관련 공지는 sendbird-verify.app에서 확인하세요"
-    assert has_url(line, exempt=entity)
+# Rounds 2-4 built an `exempt` parameter here to forgive a `topic` candidate's
+# own entity name, and round 5 deleted it: every pattern `has_url` uses anchors
+# on a word character with only a trailing lookahead, so any pattern that
+# matches a string inside a larger text also matches that string in isolation -
+# `has_url(exempt)` was therefore always true for any entity worth forgiving,
+# which zeroed the exemption before it ever ran. Verified two ways: 39
+# hand-written entity names plus 200,000 randomised ones with zero reachable
+# forgiveness cases, and instrumentation over every round-4 test input showing
+# the forgive-span and pointer-continuation branches firing zero times. Eight
+# test functions that certified `exempt` (particle-parametrized forgiveness and
+# refusal, self-pointer entities, glued domains, pointer continuations, the
+# round-3 bypass probes, and the "exemption is narrow" check) are deleted along
+# with it - they were passing vacuously over code that had never executed. See
+# `has_url`'s docstring for why deleting was the fix rather than a fourth
+# repair, and `Judge.decide`'s handling of a pointer-shaped `topic` entity for
+# what replaced it (the candidate is dropped before any spend, not forgiven
+# after one).
 
 
 async def test_a_reply_containing_a_url_is_declined_end_to_end(data_dir: Path) -> None:
@@ -679,15 +554,15 @@ async def test_a_topic_reply_naming_a_non_pointer_entity_is_not_declined(
 async def test_a_topic_reply_naming_a_pointer_shaped_entity_is_declined(
     data_dir: Path,
 ) -> None:
-    """Round 4 finding 3, end-to-end: `UJET.cx` is domain-shaped, so it gets no
-    exemption at all (`has_url(exempt, exempt="")` is true for its own name) -
-    span-equality only bounds how *wide* an exemption is, never whether the
-    exempted string is itself a live pointer. This is a real behaviour change
-    from round 3: `UJET.cx`, this owner's most-mentioned entity, is now
-    permanently un-nameable via this path for exactly the reason its own name
-    is worth mentioning in the first place - speaking `UJET.cx` bare is the
-    failure ADR 0015 defence 4 exists to stop, whether or not it is also the
-    correct, gate-passed subject."""
+    """Round 5, end-to-end: `UJET.cx` is domain-shaped, so `has_url(entity)` is
+    true for its own name, and the candidate is dropped in `decide` before the
+    search or the model call runs at all - not forgiven and not refused after
+    the fact. `UJET.cx`, this owner's most-mentioned entity, is permanently
+    un-nameable via this path for exactly the reason its own name is worth
+    mentioning in the first place - speaking it bare is the failure ADR 0015
+    defence 4 exists to stop - but the mute is now cheap: no MCP search spent,
+    no LLM call spent, and `why_not` names the real cause and the remedy
+    instead of blaming the model for the owner's own entity name."""
     (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
     provider = FakeProvider(json.dumps({"say": "UJET.cx 소식 들었어?"}, ensure_ascii=False))
     gateway = LLMGateway(
@@ -702,15 +577,16 @@ async def test_a_topic_reply_naming_a_pointer_shaped_entity_is_declined(
     utterance = await judge.decide(candidate)
 
     assert not utterance
-    assert "url" in utterance.why_not.casefold()
+    assert "UJET.cx" in utterance.why_not
+    assert "pointer" in utterance.why_not
+    assert bridge.calls == []  # no search spent
+    assert provider.calls == []  # no model call spent
 
 
 async def test_a_topic_reply_with_a_different_link_is_still_declined(data_dir: Path) -> None:
-    """The exemption is narrow: it does not turn off `has_url` for the whole
-    `topic` path, only for the candidate's own entity name - isolated here with
-    a non-pointer entity so the decline is attributable to the *unrelated* link
-    alone, not to the entity's own shape (see the pointer-shaped-entity test
-    above for that separate reason)."""
+    """`has_url` runs on the whole reply, unconditionally - `Sendbird` (a
+    non-pointer entity, so it is not why this declines) does not stop a
+    genuine, unrelated link elsewhere in the same reply from being caught."""
     (data_dir / "persona" / "seed.md").write_text(SEED, encoding="utf-8")
     provider = FakeProvider(
         json.dumps(

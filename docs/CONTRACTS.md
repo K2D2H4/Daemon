@@ -123,11 +123,13 @@ live-share pump's transport, which has no tool round in it.
     task's own review corrected an earlier draft of this sentence that implied it
     was: `daemon/reflection.py` writes the column from the reflection model's own reading
     of the day's conversation log, so it **is** a prior model reply, one level
-    removed. What actually bounds the risk is `daemon/proactivity/judge.py:has_url`'s
-    `exempt` handling - it forgives only an exact match of that name and refuses to
-    grant any exemption at all when the name itself already reads as a pointer - not
-    an assumption that the query is trustworthy because code read it out of a
-    column. This path calls `daemon/tools/mcp.py:MCPBridge.call` directly, **bypassing
+    removed. What actually bounds the risk is that `daemon/proactivity/judge.py:has_url`
+    runs on the entity name itself before any search or model call, and a `topic`
+    candidate whose entity reads as a pointer is dropped right there - not an
+    assumption that the query is trustworthy because code read it out of a column,
+    and (round 5, after three rounds tried and failed to build a safe exemption for
+    it) not a carve-out that lets a domain-shaped entity be spoken anyway. This path
+    calls `daemon/tools/mcp.py:MCPBridge.call` directly, **bypassing
     `tools/policy.py:decide` entirely** - it is not subject to `mode=off`, the
     allowlist, or a standing grant, because it never goes through `ToolRunner` or
     the policy at all. That is not an oversight to close here: whether the bridge

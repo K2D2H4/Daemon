@@ -102,3 +102,21 @@ goes back and the three offline generators stay.
 
 Four ADRs in this file were overturned by measurement. This one names its own
 test in advance so it can be the fifth without an argument.
+
+**A separate note, added after five rounds of hardening `has_url` (2026-08-25):**
+a `topic` candidate whose own entity name reads as a pointer (`daemon/proactivity/judge.py:has_url`
+returns true for it) is dropped before the search or the model call runs — it is
+never spoken, not even as its own gate-passed subject. Three rounds tried to carve
+a safe exemption for exactly this case and none survived review: nothing in the
+data this module can see tells a legitimate domain-shaped entity (`UJET.cx`) apart
+from an attacker-chosen one (`evil.com`) — not shape, not `created_at`, not
+`mention_count` (both reachable by the same reflection pass that could plant an
+attacker's text), and turn-level provenance does not exist in
+`daemon/memory/schema.sql`. This is accepted as a real, permanent cost, not a bug
+to be revisited with more mechanism: an owner who wants `UJET.cx` speakable again
+has to rename the entity note to something that does not read as a domain, which
+is their call to make, not code's to infer. If that remedy stops being enough —
+if the owner routinely has domain-shaped entities worth naming and renaming each
+one is real friction — the next lever is an **owner-typed allowlist** (a config
+list of entity names the owner has explicitly approved as safe to speak), never
+a rule this module derives on its own from data an attacker can also write to.

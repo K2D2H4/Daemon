@@ -62,12 +62,18 @@ instruction.
 
 ADR 0015 adds one more block, and only for a `kind="topic"` candidate: deterministic
 code (`proactivity/topics.py`) issues one read-only search whose query is
-`candidate.payload["entity"]` - itself read from `entities.name`, never from web
-text or a prior model reply - and the result titles are fenced under a nonce and
-handed to the prompt as reference material. The model still chooses nothing about
-the search: it did not decide to search, did not decide the query, and is offered
-zero tools either way (`test_the_judge_is_offered_no_tools`). What it can do with
-those titles is bounded on the way out, not the way in - `has_url` below.
+`candidate.payload["entity"]` - itself read from `entities.name`, never derived
+from a search result or a prior *judge* reply - and the result titles are fenced
+under a nonce and handed to the prompt as reference material. The model still
+chooses nothing about the search: it did not decide to search, did not decide the
+query, and is offered zero tools either way (`test_the_judge_is_offered_no_tools`).
+`entities.name` is not itself free of model influence, though - `daemon/reflection.py`
+writes it from the reflection model's own reading of the conversation log, so the
+guarantee here is that *this* call chose nothing, not that the string it received
+is guaranteed harmless (see `_entity_name`'s and `has_url`'s docstrings for what
+that means for a `topic` candidate whose entity name is itself pointer-shaped).
+What the judge can do with search titles is bounded on the way out, not the way
+in - `has_url` below.
 
 The seed is required, not optional. The text loop degrades to no persona because
 somebody asked it a question and deserves an answer; nobody asked for this, and
@@ -220,13 +226,36 @@ class Judge:
             return Utterance(why_not=f"no persona seed under {self._data_dir}")
 
         topic_block = ""
-        entity = ""
         if candidate.kind == "topic":
             entity = _entity_name(candidate)
+            if not entity:
+                return Utterance(why_not="topic candidate carried no entity name")
+            if has_url(entity):
+                # Round 5: three rounds built and then deleted an exemption that
+                # would have let the judge name this entity back even though its
+                # own name reads as a pointer (`has_url` is a pure, sub-millisecond
+                # check - cheap enough to run here, before anything is spent). No
+                # rule in the data tells a legitimate domain-shaped entity apart
+                # from an attacker-chosen one (see `has_url`'s docstring), so the
+                # candidate is dropped here rather than asking the model to say a
+                # name that would then have to be refused after a search and a
+                # full LLM call already ran. See ADR 0015's "what would overturn
+                # this" for the remedy this leaves the owner.
+                logger.info(
+                    "judge: topic entity %r is itself pointer-shaped; dropping "
+                    "the candidate instead of searching for it",
+                    entity,
+                )
+                return Utterance(
+                    why_not=(
+                        f"topic entity {entity!r} is itself pointer-shaped; "
+                        "rename the entity note to speak about it"
+                    )
+                )
             topic_block = await self._topic_block(entity)
             if not topic_block:
-                # No bridge, no entity, or a search that found nothing - dropped
-                # here, before the one model call is spent. A `topic` line with
+                # No bridge, or a search that found nothing - dropped here,
+                # before the one model call is spent. A `topic` line with
                 # nothing behind it is the content-free opener ADR 0015 exists to
                 # avoid, not something the judge should be asked to paper over.
                 return Utterance(why_not="topic candidate had no search result to offer")
@@ -257,14 +286,12 @@ class Judge:
             model=completion.model,
             stop_reason=completion.meta.get("stop_reason", ""),
         )
-        if utterance and has_url(utterance.text, exempt=entity):
+        if utterance and has_url(utterance.text):
             # ADR 0015's load-bearing defence. Every bound on what the search
             # brought in (title count, title length, the reference-not-instruction
             # framing) only reduces what gets *in*; this is what bounds what gets
             # *out*, because the failure that matters is this daemon's trusted
             # voice telling its owner where to go on a line nobody asked for.
-            # `exempt=entity` is "" for every non-`topic` kind, so this is a no-op
-            # everywhere but the one path round 2 finding 2 was about.
             utterance = Utterance(why_not=f"reply contained a url: {utterance.text!r}")
         if not utterance:
             logger.info("judge: declined %s (%s)", candidate.kind, utterance.why_not)
@@ -312,8 +339,9 @@ def _reason_block(candidate: Candidate) -> str:
 
 def _entity_name(candidate: Candidate) -> str:
     """`candidate.payload["entity"]` as a clean string, or "" when it is absent,
-    the wrong type, or blank. Shared by `_topic_block` (the search query) and
-    `decide` (the `has_url` exemption) so both read the same value."""
+    the wrong type, or blank. Read once in `decide`, both for the pointer-shape
+    check that may drop the candidate and for `_topic_block`'s search query, so
+    both see the same value."""
     entity = candidate.payload.get("entity")
     return entity.strip() if isinstance(entity, str) else ""
 
@@ -456,17 +484,12 @@ and stranding `".com"` unmatched because nothing preceded its own dot once
 one span that is not equal to the entity and is refused, while a bare mention of
 just `"UJET.cx"` (no trailing label) still matches exactly and is still forgiven.
 
-The false positives this accepts on purpose (`Node.js`, `report.docx`) are the
-price ADR 0015 already named: "it costs nothing to refuse - the owner can ask,
-and then it is their turn." `has_url`'s `exempt` parameter forgives one specific
-thing on top of that (round 3 finding 1/2): when the model names a `topic`
-candidate's own entity back, and the *entire* matched span is that entity's name
-and nothing more, it is not refused for it. That is a narrow, mechanical fact
-about the match - not a claim that the name is safe because of where it came
-from (round 2 rested the same exemption on `entities.name` being "first-party",
-and round 3's review traced that name back to `reflection._apply`, which is the
-model reading the day's own conversation log - the exact channel CONTRACTS rule
-10 warns about. The exemption has to hold on its own terms, not on provenance)."""
+The false positives this accepts on purpose (`Node.js`, `report.docx`, and a
+`topic` candidate's own domain-shaped entity name) are the price ADR 0015
+already named: "it costs nothing to refuse - the owner can ask, and then it is
+their turn." Rounds 2-4 built, then deleted, an `exempt` parameter meant to
+forgive a `topic` candidate's own entity name - see `has_url`'s docstring for
+why it was removed rather than repaired a fourth time."""
 
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
 r"""A dotted-quad IP is a place to go exactly like a domain is, and it does not
@@ -562,63 +585,7 @@ def _looks_like_ipv6(text: str) -> bool:
     return False
 
 
-_POINTER_CONTINUATION = "/\\?#:"
-r"""Characters that turn a bare host into a path, query, fragment or port -
-`/`, `\`, `?`, `#`, `:`. The fullwidth forms of all five (`／`, `＼`, `？`, `＃`,
-`：`) are not listed separately because `_fold`'s NFKC pass already collapses
-each of them to its ASCII form before `_matches_beyond_entity` ever sees the
-text, the same way it collapses `ｅｘａｍｐｌｅ` to `example`.
-
-Round 4 finding 2: forgiving a match because its *span* equals the entity name
-said nothing about what immediately follows that span. `"UJET.cx/free-macbook"`
-matches `_BARE_DOMAIN_RE` as `"UJET.cx"` alone (the path has no dot-plus-TLD
-shape, so nothing else in this module matches it), that span equals the entity,
-and round 3's fix forgave the whole line - the path rode along for free. Nothing
-here ever caught a path on its own; a path was only ever refused before because
-the host in front of it was refused, and `exempt` is exactly what turns that
-host from refused to forgiven. So a match is only actually forgiven when it is
-both span-equal to the entity **and** not immediately followed by one of these -
-otherwise it is treated as "beyond the entity" even though the matched text
-alone is not."""
-
-
-def _matches_beyond_entity(pattern: re.Pattern[str], folded: str, folded_entity: str) -> bool:
-    r"""Whether `pattern` finds anything in `folded` that is not, in its
-    entirety, the entity's own name with nothing pointer-shaped glued to it.
-
-    Round 3 finding 1: the previous shape of this exemption stripped every
-    occurrence of the entity name as a **substring** of the whole text before
-    running any check at all. That destroys the left label of any domain the
-    name happens to be glued to - stripping `"UJET.cx"` out of
-    `"evil-UJET.cx"` leaves `"evil-.cx"`, which no longer reads as a domain, so
-    the attack sails through - and, because the strip ran before *every* check,
-    a short or plain entity name could switch a check off entirely regardless of
-    context (`exempt="com"`, `exempt="192.168.0.1"`, `exempt="@"` each disable a
-    different one). Measured shipping: 21 of 33 probes bypassed, including
-    `sendbird.com` for the entity `Sendbird` - already one of this owner's own
-    entities, unlocked with no attacker effort at all.
-
-    This finds every match first, the same way the function would with no
-    `exempt` at all, and only forgives a match whose entire matched text equals
-    the entity name - so `UJET.cx` alone is forgiven, but `evil-UJET.cx`,
-    `login-UJET.cx`, `Kiwi.com` and `sendbird.com` are not, because none of them
-    *is* the entity name; the entity name merely appears inside a longer match.
-
-    Round 4 finding 2 adds one more condition on top of span equality: see
-    `_POINTER_CONTINUATION`. A span-equal match followed by `/`, `\`, `?`, `#`
-    or `:` is still not forgiven, because that character is what turns a bare
-    hostname into somewhere with a path, query, fragment or port attached.
-    """
-    for match in pattern.finditer(folded):
-        if not folded_entity or match.group().casefold() != folded_entity.casefold():
-            return True
-        end = match.end()
-        if end < len(folded) and folded[end] in _POINTER_CONTINUATION:
-            return True
-    return False
-
-
-def has_url(text: str, *, exempt: str = "") -> bool:
+def has_url(text: str) -> bool:
     r"""Whether an utterance points the owner somewhere.
 
     ADR 0015's load-bearing defence, and it lives on the output because that is the
@@ -639,61 +606,58 @@ def has_url(text: str, *, exempt: str = "") -> bool:
     TLD or an IP (`sendbird.com에 있어`, the idiomatic Korean form) is exactly
     that. See `_BARE_DOMAIN_RE` and `_IPV4_RE`.
 
-    Round 2 also added `exempt`, for the same reason round 3 had to rebuild it:
-    `topic_candidates` puts an entity's own name into both the search query and
-    the reason, and the judge then names that entity back, so a domain-shaped
-    entity (`UJET.cx`, this owner's most-mentioned one) would otherwise be
-    permanently unspeakable. Round 2's version stripped the entity name as a
-    substring of the whole text before matching anything, which round 3 measured
-    letting 21 of 33 probes through (`sendbird.com`, `evil-UJET.cx`, ...) -
-    stripping a substring can turn a plain word into a domain's left label, or
-    disable an unrelated check outright. `exempt` now matches first and forgives
-    second (`_matches_beyond_entity`): only a domain/IP/handle match whose entire
-    span equals the entity name is let through; the same name glued onto
-    anything else is not.
+    ## The `exempt` parameter that used to be here, and why it is gone
 
-    What actually bounds this - and round 2 overstated it - is that mechanical
-    fact about the match, **not** where the entity name came from. Round 2's
-    docstring (and ADR 0015) called `entities.name` "first-party, drawn from the
-    owner's own transcript"; round 3's review traced it and that does not hold -
-    `stale_entities` -> `upsert_entity` -> `EntityNotes.note` -> `reflection._apply`
-    puts the reflection *model*, reading the day's conversation log, in charge of
-    the name, which is the exact channel CONTRACTS rule 10's own rationale warns
-    about ("look at this message" is a way to hand a stranger a shell), and
-    `safe_name` there permits `sendbird.com`, `com`, `cx`, `@sendbird`, `점`. So the
-    exemption is not safe because the name is trustworthy; it is safe because
-    forgiving an exact-span match forgives nothing wider than the name itself,
-    however that name came to exist - a model-chosen entity name that happened to
-    be a full URL would still only unlock exactly that string, never a domain it
-    is glued to.
+    Rounds 2-4 carried an `exempt` parameter: `topic_candidates` puts an entity's
+    own name into both the search query and the reason, and the judge then names
+    that entity back, so a domain-shaped entity (`UJET.cx`, this owner's
+    most-mentioned one) would otherwise be permanently unspeakable. Three rounds
+    tried to bound that forgiveness safely - stripping the name as a substring
+    (round 2, measured letting 21 of 33 probes through), matching first and
+    forgiving only an exact span (round 3), then also refusing a span followed by
+    a path/query/fragment/port character and refusing to exempt an entity name
+    that is itself a pointer (round 4).
 
-    Obfuscations and IPv6 are deliberately outside `exempt` entirely (round 3
-    finding 1's instruction): an entity name should never be able to switch off
-    the checks that do not even have a "span" to compare it against.
+    Round 5's re-review found the whole mechanism was never reachable: every
+    pattern below anchors on a word character and carries only a *trailing*
+    lookahead or nothing at all, which means a pattern that matches a string
+    inside a larger text always matches that same string in isolation too. So
+    `has_url(exempt)` - the self-pointer check round 4 added - was `True` for
+    every `exempt` value that could possibly need forgiving in the first place,
+    which zeroed the exemption before any span comparison ran. Verified against
+    39 hand-written entity names and 200,000 randomised ones: zero reachable
+    forgiveness cases. Three rounds of tests certifying `exempt` were passing
+    vacuously, over code that had never executed.
+
+    Deleting rather than repairing again, because the underlying question has no
+    answer in the data this module can see: nothing distinguishes a legitimate
+    domain-shaped entity from an attacker-chosen one. Shape cannot (`UJET.cx` and
+    `evil.com` are both `label.tld`, and `.cx` is a real ccTLD). `created_at`
+    cannot - it would bless every attacker domain already sitting in the log by
+    the time this code runs. `mention_count` cannot - it is incremented by the
+    same reflection pass that invented the name, so an attacker whose planted
+    text recurs in the conversation log drives its own count up. Provenance by
+    turn does not exist in `daemon/memory/schema.sql` and would not settle the
+    question even if it did (`entities.name` is chosen by the reflection model
+    reading a whole day's log, not tied to one turn). The one real separator is
+    the owner's own hand - see `daemon/proactivity/topics.py`'s module docstring
+    and ADR 0015's "what would overturn this" for the remedy this leaves them.
+
+    A `topic` candidate whose own entity name reads as a pointer is now dropped
+    in `Judge.decide`, before the search or the model call runs at all (this
+    function is a pure, sub-millisecond check, so it costs nothing to run there
+    first) - see `decide`'s handling of `_entity_name`. It is not forgiven here.
     """
     folded = _fold(text)
-    folded_entity = _fold(exempt) if exempt else ""
-    if folded_entity and has_url(exempt):
-        # Round 4 finding 3: `safe_name` permits an entity name that is itself a
-        # live pointer (`evil.com`, `203.0.113.9`, `@evil_support`,
-        # `sendbird-verify.app`). Span equality bounds how *wide* the exemption
-        # is - it never forgives more than the entity's own name - but says
-        # nothing about whether the name itself is safe to speak. It is not: an
-        # entity name that already reads as a pointer must never be granted an
-        # exemption at all, or the daemon simply speaks it, unrefused, as its own
-        # `exempt`. One check, and it recurses exactly once - `has_url(exempt)`
-        # is called with no `exempt` of its own, so this cannot loop.
-        folded_entity = ""
-
-    if _matches_beyond_entity(_SCHEME_RE, folded, ""):  # never exempt - see docstring
+    if _SCHEME_RE.search(folded):
         return True
-    if _matches_beyond_entity(_IPV4_RE, folded, folded_entity):
+    if _IPV4_RE.search(folded):
         return True
-    if _matches_beyond_entity(_HANDLE_RE, folded, folded_entity):
+    if _HANDLE_RE.search(folded):
         return True
-    if _looks_like_ipv6(folded):  # never exempt - see docstring
+    if _looks_like_ipv6(folded):
         return True
-    if _matches_beyond_entity(_BARE_DOMAIN_RE, folded, folded_entity):
+    if _BARE_DOMAIN_RE.search(folded):
         return True
     folded_cf = folded.casefold()
     return any(marker.casefold() in folded_cf for marker in _OBFUSCATIONS)
