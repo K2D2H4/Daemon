@@ -42,6 +42,7 @@ from daemon.proactivity.candidates import (
     open_loop_candidates,
     pattern_time_candidates,
     silence_candidates,
+    topic_candidates,
 )
 from daemon.proactivity.judge import MAX_REASON_CHARS
 
@@ -106,6 +107,13 @@ class SqlReader:
             tuple(keys),
         ).fetchall()
         return {row["dedup"] for row in rows}
+
+    def stale_entities(self, limit: int, quiet_since: datetime) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT name, updated_at FROM entities WHERE updated_at < ? "
+            "ORDER BY updated_at ASC LIMIT ?",
+            (utc_iso(quiet_since), limit),
+        ).fetchall()
 
 
 def store_candidate(conn: sqlite3.Connection, candidate: Candidate, *, now: datetime) -> None:
@@ -173,6 +181,12 @@ def said(
         ),
         log_file=f"memory/log/{local_date(at)}.md",
     )
+
+
+def entity_touched(store: Store, name: str, *, at: datetime) -> None:
+    """Write one entity's note through the real schema, last touched `at` - so a
+    test cannot assert an ordering the real `updated_at` column never produced."""
+    store.upsert_entity(name=name, kind=None, file=f"memory/entities/{name}.md", now=at)
 
 
 def test_the_reader_satisfies_the_protocol(reader: SqlReader) -> None:
@@ -688,6 +702,81 @@ async def test_no_recent_conversation_means_no_query(reader: SqlReader) -> None:
 
     assert await association_candidates(recall, reader, now=NOW) == []
     assert recall.queries == [], "no query should have been issued at all"
+
+
+# --- type F: topic -------------------------------------------------------------
+
+
+def test_the_quietest_topic_comes_up_first(store: Store, reader: SqlReader) -> None:
+    """Variety falls out of the ordering rather than out of a quota: pick the
+    entity gone quiet longest and the next tick necessarily picks a different one,
+    because raising it updates its own `updated_at`. The owner rejected per-kind
+    quotas as artificial and he was right - `config.py` already says the per-kind
+    numbers are ceilings and the total is what binds."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "Sendbird", at=datetime(2026, 8, 1, tzinfo=UTC))
+    entity_touched(store, "Kiwi", at=datetime(2026, 8, 24, tzinfo=UTC))
+    entity_touched(store, "llm-wiki", at=datetime(2026, 8, 10, tzinfo=UTC))
+
+    produced = topic_candidates(reader, now)
+
+    assert [c.payload["entity"] for c in produced] == ["Sendbird", "llm-wiki"]
+    assert all(c.kind == "topic" for c in produced)
+    assert "Sendbird" in produced[0].reason
+
+
+def test_a_topic_raised_recently_is_not_raised_again(store: Store, reader: SqlReader) -> None:
+    """`Kiwi` was discussed yesterday. Bringing it up again tomorrow is the
+    repetition the owner complained about in the first place."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "Kiwi", at=datetime(2026, 8, 24, tzinfo=UTC))
+
+    assert topic_candidates(reader, now) == []
+
+
+def test_the_reason_carries_the_name_and_the_gap_and_nothing_else(
+    store: Store, reader: SqlReader
+) -> None:
+    """The reason goes into the LLM prompt verbatim. Every other generator builds
+    it from lexicons, clock times and dates precisely so an unsolicited utterance
+    cannot be steered by text that arrived from somewhere else; the entity *name*
+    is first-party, but nothing else from the note may join it."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "Sendbird", at=datetime(2026, 8, 1, tzinfo=UTC))
+
+    reason = topic_candidates(reader, now)[0].reason
+
+    assert "Sendbird" in reason and "24일" in reason
+    assert len(reason) <= 200
+
+
+def test_the_limit_caps_a_quiet_week(store: Store, reader: SqlReader) -> None:
+    """A fake that ignored `limit` would still pass the ordering test above with
+    exactly three entities queued; four proves the cap is real."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "A", at=datetime(2026, 8, 1, tzinfo=UTC))
+    entity_touched(store, "B", at=datetime(2026, 8, 2, tzinfo=UTC))
+    entity_touched(store, "C", at=datetime(2026, 8, 3, tzinfo=UTC))
+    entity_touched(store, "D", at=datetime(2026, 8, 4, tzinfo=UTC))
+
+    produced = topic_candidates(reader, now)
+
+    assert [c.payload["entity"] for c in produced] == ["A", "B"]
+
+
+def test_a_topic_raised_and_touched_again_can_recur(store: Store, reader: SqlReader) -> None:
+    """Once `Sendbird` is raised, something (Task 3's speaking path, or the owner
+    replying) is expected to touch its note - after which it is eligible again once
+    a fresh seven quiet days pass. Rotation, not a lifetime ban."""
+    entity_touched(store, "Sendbird", at=datetime(2026, 8, 1, tzinfo=UTC))
+    first = topic_candidates(reader, datetime(2026, 8, 10, tzinfo=UTC))
+    assert "Sendbird" in first[0].payload["dedup"]
+
+    entity_touched(store, "Sendbird", at=datetime(2026, 8, 10, tzinfo=UTC))
+    assert topic_candidates(reader, datetime(2026, 8, 11, tzinfo=UTC)) == []
+
+    second = topic_candidates(reader, datetime(2026, 8, 20, tzinfo=UTC))
+    assert second[0].payload["dedup"] != first[0].payload["dedup"]
 
 
 # --- the tick: dedup, expiry, and the user's switch --------------------------

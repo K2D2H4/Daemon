@@ -179,6 +179,11 @@ class CandidateReader(Protocol):
         grow with the table."""
         ...
 
+    def stale_entities(self, limit: int, quiet_since: datetime) -> list[sqlite3.Row]:
+        """Entities whose note has not been touched since `quiet_since`, quietest
+        first. `name` and `updated_at` are the columns used."""
+        ...
+
 
 @runtime_checkable
 class AssociativeRecall(Protocol):
@@ -249,6 +254,17 @@ the contentless reason that makes `silence` produce 빈말 - but the reason is
 still a record being shown to a model, so it is bounded."""
 
 ASSOCIATION_TTL_HOURS = 6
+
+TOPIC_QUIET_DAYS = 7
+"""How long an entity must have gone untouched before it is worth raising.
+
+Shorter turns rotation into nagging: the owner's `Kiwi` note moves most days, and
+a daemon that asks about the dog every morning is the repetition this whole branch
+started from."""
+
+MAX_TOPIC_CANDIDATES = 2
+"""Rows one tick may add. The gate owns the daily utterance budget; this only
+keeps a quiet week from queueing eleven entities at once."""
 
 
 # --- Korean surface forms ----------------------------------------------------
@@ -525,7 +541,52 @@ async def association_candidates(
     return [c for c in found if dedup_key(c) not in spent][:MAX_PER_KIND]
 
 
-_KIND_ORDER: tuple[CandidateKind, ...] = ("open_loop", "emotional", "silence", "pattern_time")
+def topic_candidates(reader: CandidateReader, now: datetime) -> list[Candidate]:
+    """Type F: something the owner cares about that has gone quiet.
+
+    PLAN 6.2 asked for the kinds with no business to transact - the Her feeling
+    comes from those and not from the reminder app - and then only the transactional
+    ones were built. Measured 2026-08-25: 572 judge calls, 0 utterances, because
+    `open_loop` needs the owner to mention a dated event in chat and he speaks to
+    this daemon in imperatives about tools (3 matches in 75 utterances over 7 days).
+
+    The reason carries the entity's name and the size of the gap, both first-party.
+    What the daemon will actually *say* about it needs material this generator does
+    not have; that arrives after the gate (ADR 0015), and a candidate whose search
+    finds nothing is dropped rather than spoken.
+
+    `dedup` is keyed by the note's own `updated_at`, not just the name: rotation
+    happens because raising a topic is expected to touch the entity's note, which
+    changes `updated_at` and therefore the key. Without the timestamp in the key,
+    an entity would be eligible exactly once, ever, rather than once per quiet
+    stretch - which is not what "rotating by staleness" means.
+    """
+    quiet_since = now - timedelta(days=TOPIC_QUIET_DAYS)
+    found: list[Candidate] = []
+    for row in reader.stale_entities(MAX_TOPIC_CANDIDATES, quiet_since):
+        name = str(row["name"])
+        since = parse_iso(str(row["updated_at"]))
+        days = max((now - since).days, TOPIC_QUIET_DAYS)
+        found.append(
+            Candidate(
+                kind="topic",
+                reason=(
+                    f"'{name}' 이야기를 한 지 {days}일 됐다. "
+                    "유저가 관심을 두는 주제이고, 그동안 소식을 나눈 적이 없다."
+                ),
+                payload={"entity": name, "dedup": f"topic:{name}:{row['updated_at']}"},
+            )
+        )
+    return found
+
+
+_KIND_ORDER: tuple[CandidateKind, ...] = (
+    "open_loop",
+    "emotional",
+    "silence",
+    "pattern_time",
+    "topic",
+)
 """Stable output order, and **not** a priority. Which kind gets the day's budget is
 the gate's decision (`proactive_kind_budgets` exists for exactly that), and
 deciding it here by sort order would put the decision in two places."""
@@ -554,6 +615,7 @@ def generate_candidates(
         + emotional_candidates(reader, moment)
         + silence_candidates(reader, settings, moment)
         + pattern_time_candidates(reader, moment)
+        + topic_candidates(reader, moment)
     )
     if not produced:
         return []

@@ -1449,6 +1449,16 @@ class Store:
         ).fetchall()
         return [from_iso(row["ts"]) for row in rows]
 
+    def stale_entities(self, limit: int, quiet_since: datetime) -> list[sqlite3.Row]:
+        """Entities gone quiet, quietest first - what a `topic` candidate rotates
+        through. `updated_at` moves whenever reflection touches the note, so
+        raising a topic is what makes it stop being the quietest one."""
+        return self.conn.execute(
+            "SELECT name, updated_at FROM entities WHERE updated_at < ? "
+            "ORDER BY updated_at ASC LIMIT ?",
+            (utc_iso(quiet_since), limit),
+        ).fetchall()
+
     # --- M3: what was actually said -----------------------------------------
 
     def insert_utterance(
