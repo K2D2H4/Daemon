@@ -262,9 +262,36 @@ Shorter turns rotation into nagging: the owner's `Kiwi` note moves most days, an
 a daemon that asks about the dog every morning is the repetition this whole branch
 started from."""
 
-MAX_TOPIC_CANDIDATES = 2
-"""Rows one tick may add. The gate owns the daily utterance budget; this only
-keeps a quiet week from queueing eleven entities at once."""
+TOPIC_REARM_DAYS = 14
+"""How long a raised topic stays spent before it is eligible again.
+
+The obvious design - dedup by the entity's own `updated_at` - assumes raising a
+topic touches the note. It does not: nothing in the proactive path writes
+`entities.updated_at`, only `daemon/reflection.py`'s nightly pass (and only when
+it judges something new happened) and the offline `rebuild` command. A dedup key
+built from `updated_at` would go stale exactly once and then never move again,
+freezing whichever two entities were quietest at the time in permanent
+possession of the rotation - measured: this is exactly what happened before this
+constant existed. The key is built from wall-clock time instead, bucketed into
+`TOPIC_REARM_DAYS`-day windows, so rearming runs on a clock this generator
+actually controls. Longer than `TOPIC_QUIET_DAYS` on purpose - rearming the
+moment an entity requalifies as stale would be the same nagging
+`TOPIC_QUIET_DAYS` exists to stop. 14 days against roughly a dozen entities and a
+few utterances a day gives each one a turn every couple of weeks rather than
+monopolising the slot."""
+
+TOPIC_POOL_SIZE = MAX_PER_KIND * 4
+"""Stale entities read per tick - deliberately more than a tick can use.
+
+`generate_candidates` already drops spent dedup keys and caps at `MAX_PER_KIND`;
+`open_loop_candidates` relies on exactly this (it returns every row it finds and
+lets the pipeline truncate). If this generator asked SQL for only as many rows as
+it meant to keep, the same handful of quietest entities would occupy every slot
+forever and the ones behind them would never even be read out of the database -
+the bug this constant fixes. Asking for a wider pool and letting the existing
+filter narrow it means there is no separate `MAX_TOPIC_CANDIDATES` cap here:
+`MAX_PER_KIND` already is that cap, and a second number next to it would just be
+two caps claiming the same job."""
 
 
 # --- Korean surface forms ----------------------------------------------------
@@ -555,15 +582,25 @@ def topic_candidates(reader: CandidateReader, now: datetime) -> list[Candidate]:
     not have; that arrives after the gate (ADR 0015), and a candidate whose search
     finds nothing is dropped rather than spoken.
 
-    `dedup` is keyed by the note's own `updated_at`, not just the name: rotation
-    happens because raising a topic is expected to touch the entity's note, which
-    changes `updated_at` and therefore the key. Without the timestamp in the key,
-    an entity would be eligible exactly once, ever, rather than once per quiet
-    stretch - which is not what "rotating by staleness" means.
+    `dedup` is keyed by wall-clock time, bucketed into `TOPIC_REARM_DAYS`-day
+    windows - not by the note's `updated_at`. See `TOPIC_REARM_DAYS`'s docstring
+    for why: nothing in this path ever moves that column, so a dedup key built
+    from it would go stale exactly once and freeze the rotation. Every entity
+    still eligible in the same window shares one bucket value, so raising one
+    does not by itself change another's key - each entity's own dedup key does
+    not move until the window rolls over, which is what makes the key spent
+    (once inserted) for the rest of that window and free again in the next.
+
+    Reads a pool of `TOPIC_POOL_SIZE` stale entities, not just as many as one
+    tick means to keep - see that constant's docstring. `generate_candidates`
+    is what actually drops already-spent rows and caps at `MAX_PER_KIND`; this
+    function returns everything it found, quietest first, the same shape
+    `open_loop_candidates` already uses.
     """
     quiet_since = now - timedelta(days=TOPIC_QUIET_DAYS)
+    bucket = now.toordinal() // TOPIC_REARM_DAYS
     found: list[Candidate] = []
-    for row in reader.stale_entities(MAX_TOPIC_CANDIDATES, quiet_since):
+    for row in reader.stale_entities(TOPIC_POOL_SIZE, quiet_since):
         name = str(row["name"])
         since = parse_iso(str(row["updated_at"]))
         days = max((now - since).days, TOPIC_QUIET_DAYS)
@@ -574,7 +611,7 @@ def topic_candidates(reader: CandidateReader, now: datetime) -> list[Candidate]:
                     f"'{name}' 이야기를 한 지 {days}일 됐다. "
                     "유저가 관심을 두는 주제이고, 그동안 소식을 나눈 적이 없다."
                 ),
-                payload={"entity": name, "dedup": f"topic:{name}:{row['updated_at']}"},
+                payload={"entity": name, "dedup": f"topic:{name}:{bucket}"},
             )
         )
     return found

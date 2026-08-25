@@ -709,10 +709,9 @@ async def test_no_recent_conversation_means_no_query(reader: SqlReader) -> None:
 
 def test_the_quietest_topic_comes_up_first(store: Store, reader: SqlReader) -> None:
     """Variety falls out of the ordering rather than out of a quota: pick the
-    entity gone quiet longest and the next tick necessarily picks a different one,
-    because raising it updates its own `updated_at`. The owner rejected per-kind
-    quotas as artificial and he was right - `config.py` already says the per-kind
-    numbers are ceilings and the total is what binds."""
+    entity gone quiet longest. The owner rejected per-kind quotas as artificial
+    and he was right - `config.py` already says the per-kind numbers are
+    ceilings and the total is what binds."""
     now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
     entity_touched(store, "Sendbird", at=datetime(2026, 8, 1, tzinfo=UTC))
     entity_touched(store, "Kiwi", at=datetime(2026, 8, 24, tzinfo=UTC))
@@ -750,9 +749,13 @@ def test_the_reason_carries_the_name_and_the_gap_and_nothing_else(
     assert len(reason) <= 200
 
 
-def test_the_limit_caps_a_quiet_week(store: Store, reader: SqlReader) -> None:
-    """A fake that ignored `limit` would still pass the ordering test above with
-    exactly three entities queued; four proves the cap is real."""
+def test_the_pool_is_wider_than_one_ticks_cap(store: Store, reader: SqlReader) -> None:
+    """`topic_candidates` itself does not cap its output - `open_loop_candidates`
+    does not either, and for the same reason: a fake or a query that quietly
+    truncated to `MAX_PER_KIND` here would make the ordering test above pass for
+    the wrong reason (exactly two stale entities queued), so this asserts the
+    pool actually holds all four. `generate_candidates` is what caps; see the
+    tick-level tests below for that."""
     now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
     entity_touched(store, "A", at=datetime(2026, 8, 1, tzinfo=UTC))
     entity_touched(store, "B", at=datetime(2026, 8, 2, tzinfo=UTC))
@@ -761,22 +764,58 @@ def test_the_limit_caps_a_quiet_week(store: Store, reader: SqlReader) -> None:
 
     produced = topic_candidates(reader, now)
 
-    assert [c.payload["entity"] for c in produced] == ["A", "B"]
+    assert [c.payload["entity"] for c in produced] == ["A", "B", "C", "D"]
 
 
-def test_a_topic_raised_and_touched_again_can_recur(store: Store, reader: SqlReader) -> None:
-    """Once `Sendbird` is raised, something (Task 3's speaking path, or the owner
-    replying) is expected to touch its note - after which it is eligible again once
-    a fresh seven quiet days pass. Rotation, not a lifetime ban."""
-    entity_touched(store, "Sendbird", at=datetime(2026, 8, 1, tzinfo=UTC))
-    first = topic_candidates(reader, datetime(2026, 8, 10, tzinfo=UTC))
-    assert "Sendbird" in first[0].payload["dedup"]
+def test_an_untouched_topic_rearms_on_its_own_clock(
+    db: sqlite3.Connection, store: Store, reader: SqlReader
+) -> None:
+    """Measured defect this replaces: dedup keyed by `entities.updated_at` froze
+    the rotation forever, because nothing in the proactive path moves that
+    column - only nightly reflection (when it judges something new happened)
+    and `daemon rebuild` do. `raise_time` below sits exactly on a
+    `TOPIC_REARM_DAYS`-day boundary (2026-08-16's ordinal is divisible by 14) so
+    "13 days later" and "14 days later" land unambiguously either side of one
+    rearm window, with nothing else touching the note in between."""
+    raise_time = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    entity_touched(store, "Sendbird", at=raise_time - timedelta(days=10))
 
-    entity_touched(store, "Sendbird", at=datetime(2026, 8, 10, tzinfo=UTC))
-    assert topic_candidates(reader, datetime(2026, 8, 11, tzinfo=UTC)) == []
+    first = generate_candidates(reader, settings(), now=raise_time)
+    topics = [c for c in first if c.kind == "topic"]
+    assert [c.payload["entity"] for c in topics] == ["Sendbird"]
+    store_candidate(db, topics[0], now=raise_time)
 
-    second = topic_candidates(reader, datetime(2026, 8, 20, tzinfo=UTC))
-    assert second[0].payload["dedup"] != first[0].payload["dedup"]
+    before_rearm = generate_candidates(reader, settings(), now=raise_time + timedelta(days=13))
+    assert [c for c in before_rearm if c.kind == "topic"] == []
+
+    after_rearm = generate_candidates(reader, settings(), now=raise_time + timedelta(days=14))
+    after_topics = [c for c in after_rearm if c.kind == "topic"]
+    assert [c.payload["entity"] for c in after_topics] == ["Sendbird"]
+
+
+def test_entities_behind_the_cap_are_not_starved(
+    db: sqlite3.Connection, store: Store, reader: SqlReader
+) -> None:
+    """The other half of the same defect: `stale_entities` was fetched exactly
+    `MAX_PER_KIND` at a time, so once the quietest few were spent, the ones
+    behind them were never even read out of SQL. Four entities, one tick's cap
+    of three, and the fourth must still get its turn the moment the first three
+    are marked spent - not stuck behind them forever."""
+    raise_time = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    entity_touched(store, "A", at=raise_time - timedelta(days=40))
+    entity_touched(store, "B", at=raise_time - timedelta(days=30))
+    entity_touched(store, "C", at=raise_time - timedelta(days=20))
+    entity_touched(store, "D", at=raise_time - timedelta(days=10))
+
+    first = generate_candidates(reader, settings(), now=raise_time)
+    topics = [c for c in first if c.kind == "topic"]
+    assert [c.payload["entity"] for c in topics] == ["A", "B", "C"]
+    for candidate in topics:
+        store_candidate(db, candidate, now=raise_time)
+
+    later = generate_candidates(reader, settings(), now=raise_time + timedelta(hours=1))
+    later_topics = [c for c in later if c.kind == "topic"]
+    assert [c.payload["entity"] for c in later_topics] == ["D"]
 
 
 # --- the tick: dedup, expiry, and the user's switch --------------------------
