@@ -310,8 +310,12 @@ section.on{animation:rise .3s ease both}
 .trow.det>.meta{margin:0 16px 12px;font-size:11.5px;color:var(--tf)}
 @media(max-width:900px){.trow.det>summary{grid-template-columns:14px 70px minmax(0,1fr);row-gap:4px}
  .trow.det>summary .m,.trow.det>summary .t{grid-column:1/-1}
- /* The summary's meta gets its own full-width row here and no longer clips, so
-    repeating it under the body would just say the same thing twice. */
+ /* A full-width row is not on its own enough to stop the clipping: `.trow .m`
+    above still sets nowrap/ellipsis and matches as a descendant. Release those
+    three here so the meta really does show whole - measured clipping at 375px
+    with the wiki-path fact's four trigger phrases. Only then is dropping the
+    repeat below the body honest rather than a way of hiding it twice. */
+ .trow.det>summary .m{white-space:normal;overflow:visible;text-overflow:clip}
  .trow.det>.meta{display:none}}
 pre.well{background:var(--well);border:1px solid var(--line);border-radius:6px;
   padding:10px;margin:8px 0 0;overflow-x:auto;white-space:pre-wrap;
