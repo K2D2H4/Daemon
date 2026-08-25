@@ -62,6 +62,22 @@ this real day under either prompt), observations 28/30 old -> 27/30 new
 mis-scored by a JSON-shape defect in `daemon/reflection.py` unrelated to this
 task - see the report). Recorded in `daemon/MEASURED.md`.
 
+**Fix round 4 - arm 1's metric, not its data.** A second n=30 run of the exact
+same committed code reversed arm 1's sign (17/30 -> 13/30, then 13/30 ->
+19/30). The cause was the classifier, not noise in the model: arm 1 scored
+each reply as "terse" against the median of *both arms pooled*, which makes
+the two hit-counts structurally near-complementary (13+19=32, 17+13=30, both
+approx n) - each run collapses to roughly one coin flip about which arm lands
+on the short side, and a Fisher exact over two non-independent counts
+overstates whatever it reports. Arm 1 now reports the two reply-length
+*distributions* directly - n, median, mean per arm - and compares them with a
+Mann-Whitney U statistic (rank-sum, average ranks for ties) plus a two-sided
+permutation p-value (fixed seed, 20000 shuffles of the pooled lengths; no
+normal approximation, no scipy - scipy is not installed in this repo and must
+not be added). No shared threshold, no derived proportion, so the two arms
+can no longer be forced to sum to n. See `arm1()`'s docstring for the
+direction this test is checking. Recorded in `daemon/MEASURED.md`.
+
 Needs a real key in `.env` (`DAEMON_PROVIDER` plus that provider's key - this
 repo's own `.env` is `gemini`). Nothing here runs in CI and nothing here is a
 test: a test may not touch the network or a key (tests/CLAUDE.md), which is why
@@ -70,12 +86,14 @@ reads `.env` itself (pydantic-settings' own `env_file`, same as every other
 entrypoint), the gateway is built exactly the way `daemon/app.py::build_reflection`
 builds one, and nothing is written to the repo.
 
-    python3 -m evals.graded_persona_spike 30
+    python3 -m evals.graded_persona_spike 30       # all three arms, n=30 each
+    python3 -m evals.graded_persona_spike 60 arm1  # arm 1 alone, n=60
 """
 
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 import secrets
 import sqlite3
@@ -208,40 +226,100 @@ def _median(lengths: list[int]) -> float:
     return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2
 
 
-async def arm1(gateway, *, probe: str, context_block: str, n: int) -> tuple[int, int]:
-    """Arm 1's classifier: reply length against the pooled median, not an LLM
-    judge. Fix round 2 - the judge question needed every clause at once (no
-    jokes, no affection, no self-disclosure, no question back) to call a reply
-    "terse", and this playful persona never clears all four together even
-    when it visibly shortens under the stale rule, so the judge said no
-    unconditionally (0/30 -> 0/30 at n=30, still a floor). 담백하게/용건
+def _mean(lengths: list[int]) -> float:
+    return sum(lengths) / len(lengths)
+
+
+def _ranks(xs: list[int]) -> list[float]:
+    """1-based ranks of `xs`, tied values sharing the average rank of their
+    block (the standard tie-correction for a rank-sum test)."""
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    ranks = [0.0] * len(xs)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        avg_rank = (i + j) / 2 + 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _mannwhitney_u(a: list[int], b: list[int]) -> float:
+    """Mann-Whitney U for `a` against `b`, via rank-sum over the pooled values
+    (ties get the average rank, per `_ranks`) - no `scipy`, which is not
+    installed in this repo and must not be added."""
+    ranks = _ranks(a + b)
+    r_a = sum(ranks[: len(a)])
+    return r_a - len(a) * (len(a) + 1) / 2
+
+
+def _permutation_p(a: list[int], b: list[int], *, shuffles: int = 20000, seed: int = 0) -> float:
+    """Two-sided permutation p-value for the U statistic above: shuffle the
+    pooled lengths, split into groups the same sizes as `a` and `b`, and count
+    how often the resulting U is at least as far from its null center
+    (`len(a) * len(b) / 2`) as the observed one. Fixed seed so the number is
+    reproducible; a normal approximation to U's null distribution is exactly
+    the shortcut this replaces."""
+    pooled = a + b
+    n_a, n_b = len(a), len(b)
+    center = n_a * n_b / 2
+    observed = abs(_mannwhitney_u(a, b) - center)
+    rng = random.Random(seed)
+    at_least_as_extreme = 0
+    for _ in range(shuffles):
+        rng.shuffle(pooled)
+        stat = abs(_mannwhitney_u(pooled[:n_a], pooled[n_a:]) - center)
+        if stat >= observed - 1e-9:
+            at_least_as_extreme += 1
+    return at_least_as_extreme / shuffles
+
+
+async def arm1(gateway, *, probe: str, context_block: str, n: int) -> tuple[list[int], list[int]]:
+    """Arm 1's statistic: the two reply-length distributions, compared with a
+    rank test - not an LLM judge, and not a shared-threshold proportion.
+
+    Fix round 2 replaced a judge that demanded every clause at once (no
+    jokes, no affection, no self-disclosure, no question back) - this playful
+    persona never clears all four together even when it visibly shortens
+    under the stale rule, so the judge said no unconditionally. 담백하게/용건
     위주로 asks for fewer words, not a register switch, and a character count
-    measures exactly that without an opinion to refuse to give. The median is
-    computed over both arms' replies together so the split isn't a threshold
-    picked from nowhere - shorter than typical (for this probe, this run)
-    counts as a hit for "terse".
+    measures exactly that.
+
+    Fix round 4 - the round-2 fix classified each reply against the median of
+    *both arms pooled*, which makes the two hit-counts structurally
+    near-complementary (they sum to about n), so a run's "result" was
+    predominantly a coin flip about which arm landed on the short side.
+    Reporting the two length distributions and their Mann-Whitney U (see
+    `_mannwhitney_u`, `_permutation_p`) instead removes the shared threshold
+    entirely - there is no proportion left to be complementary.
+
+    Direction under test: the STALE rule tells the daemon to be terse; dating
+    it is meant to *weaken* that rule's pull. So the hypothesis is that dated
+    replies come out LONGER than undated ones. A dated arm that is shorter is
+    evidence against the hypothesis, not a weak version of it.
     """
     undated = [await reply(gateway, persona(dated=False), context_block, probe) for _ in range(n)]
     dated = [await reply(gateway, persona(dated=True), context_block, probe) for _ in range(n)]
-    median = _median([len(t) for t in undated + dated])
 
-    def score(label: str, texts: list[str]) -> int:
-        hits = 0
+    def show(label: str, texts: list[str]) -> list[int]:
+        lengths = []
         for i, text in enumerate(texts):
-            short = len(text) <= median
-            hits += short
-            # Printed beside the reply so every label can be audited by hand:
-            # MEASURED.md records a parse that mislabelled 7 of 60 records.
-            print(
-                f"   {label:<12} {i + 1:>2}: {'YES' if short else 'no ':<3} "
-                f"len={len(text):>3} {text[:100]}",
-                flush=True,
-            )
-        print(f"\n== {label}: {hits}/{n}\n", flush=True)
-        return hits
+            lengths.append(len(text))
+            # Printed beside the reply so the run can be re-analysed from its
+            # own output later: these lengths are the raw data.
+            print(f"   {label:<12} {i + 1:>2}: len={len(text):>3} {text[:100]}", flush=True)
+        print(
+            f"\n== {label}: n={len(lengths)} median={_median(lengths):.1f} "
+            f"mean={_mean(lengths):.1f}\n",
+            flush=True,
+        )
+        return lengths
 
-    a1 = score("undated", undated)
-    b1 = score("dated", dated)
+    a1 = show("undated", undated)
+    b1 = show("dated", dated)
     return a1, b1
 
 
@@ -386,13 +464,28 @@ async def main() -> None:
     from daemon.llm.gateway import LLMGateway
 
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 30
+    arm1_only = len(sys.argv) > 2 and sys.argv[2] == "arm1"
     settings = Settings()
     providers = _build_providers(settings)
     gateway = LLMGateway(providers, settings.routing_table(), fallback=settings.fallback_route())
     history_block = _history_block()
 
-    print("ARM 1 - does the stale one-off stop dominating? (want: down)\n")
-    a1, b1 = await arm1(gateway, probe=WARM, context_block=history_block, n=n)
+    print(
+        "ARM 1 - does dating the stale rule make replies longer? "
+        "(want: dated > undated - see arm1() docstring)\n"
+    )
+    undated_lens, dated_lens = await arm1(gateway, probe=WARM, context_block=history_block, n=n)
+    u1 = _mannwhitney_u(undated_lens, dated_lens)
+    p1 = _permutation_p(undated_lens, dated_lens)
+    print(
+        f"ARM 1 stale dominates : undated n={len(undated_lens)} "
+        f"median={_median(undated_lens):.1f} mean={_mean(undated_lens):.1f}  "
+        f"-> dated n={len(dated_lens)} median={_median(dated_lens):.1f} "
+        f"mean={_mean(dated_lens):.1f}  U={u1:.1f} p={p1:.5f}"
+    )
+
+    if arm1_only:
+        return
 
     print("ARM 2 - is the real preference still honoured? (want: UNCHANGED)\n")
     a2 = await arm(
@@ -412,10 +505,6 @@ async def main() -> None:
     old3 = await reflection_arm(gateway, "old", system=OLD_SYSTEM, transcript=transcript, n=n)
     new3 = await reflection_arm(gateway, "new", system=NEW_SYSTEM, transcript=transcript, n=n)
 
-    print(
-        f"ARM 1 stale dominates : undated {a1}/{n} -> dated {b1}/{n}  "
-        f"p={fisher(b1, n, a1, n):.5f}"
-    )
     print(
         f"ARM 2 real honoured   : undated {a2}/{n} -> dated {b2}/{n}  "
         f"p={fisher(a2, n, b2, n):.5f}"
