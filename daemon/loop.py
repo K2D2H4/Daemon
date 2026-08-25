@@ -25,6 +25,7 @@ from datetime import datetime
 from daemon import clock, timesense
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
+from daemon.face import FaceBus, split_mood
 from daemon.llm.base import Message, ProviderError, ToolCall
 from daemon.llm.gateway import LLMGateway
 from daemon.memory.base import LoggedMessage
@@ -161,12 +162,16 @@ class ConversationLoop:
         *,
         context_turns: int = 20,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
+        face: FaceBus | None = None,
     ) -> None:
         self._channel = channel
         self._gateway = gateway
         self._companion = companion
         self._context_turns = context_turns
         self._max_tool_rounds = max_tool_rounds
+        # None is a complete no-op (daemon/face.py) - a text-only install pays
+        # nothing for this module existing.
+        self._face = face
 
     async def run(self) -> None:
         """Consume the channel forever. One bad turn must not end the loop."""
@@ -184,82 +189,108 @@ class ConversationLoop:
                     logger.exception("could not deliver the failure notice")
 
     async def handle(self, inbound: InboundMessage) -> None:
-        if inbound.external_id is not None and await self._companion.seen(
-            inbound.channel, inbound.external_id
-        ):
-            # A restart can land between handling a message and the channel
-            # confirming it, so the same message arrives twice. The markdown is
-            # append-only, so the duplicate has to be refused here rather than
-            # reconciled later - and answering twice is its own annoyance.
-            logger.info(
-                "skipping already-handled message channel=%s id=%s",
-                inbound.channel,
-                inbound.external_id,
-            )
-            return
-
-        origin = "owner" if inbound.authored_by_sender else "untrusted"
-
-        if self._companion.has_tools:
-            command = parse_command(inbound.text)
-            if command is not None:
-                # Control plane, not conversation: deliberately handled before the
-                # markdown write, so `/approve A3F2K9QT` does not become a memory
-                # that recall surfaces next week. What it authorised is recorded in
-                # `tool_calls` instead, where it belongs. A replay after a restart
-                # is harmless because spending a code is single-use (memory/store.py).
-                await self._approve(inbound, command, origin=origin)
+        if self._face is not None:
+            # Set before the early-return branches below too: whichever way this
+            # turn exits, the `finally` is what brings the face back, so it does
+            # not matter here that a duplicate or a `/approve` skips straight
+            # past the reply.
+            self._face.set_activity("thinking")
+        try:
+            if inbound.external_id is not None and await self._companion.seen(
+                inbound.channel, inbound.external_id
+            ):
+                # A restart can land between handling a message and the channel
+                # confirming it, so the same message arrives twice. The markdown is
+                # append-only, so the duplicate has to be refused here rather than
+                # reconciled later - and answering twice is its own annoyance.
+                logger.info(
+                    "skipping already-handled message channel=%s id=%s",
+                    inbound.channel,
+                    inbound.external_id,
+                )
                 return
 
-        session_kind = "voice" if inbound.modality == "voice" else "interactive"
+            origin = "owner" if inbound.authored_by_sender else "untrusted"
 
-        # Recorded before the model is called: if the process dies mid-call the
-        # user's words are already on disk. Markdown is the source of truth.
-        await self._companion.record(
-            LoggedMessage(
-                ts=inbound.received_at,
-                role="user",
-                content=inbound.text,
-                # An allowlisted sender relaying someone else's words - a
-                # forward, an inline-bot result - is not the owner speaking.
-                # Recording it as 'owner' would let injected text reach the
-                # curated tier and, through reflection, persona rules.
-                origin=origin,
-                session_kind=session_kind,
-                modality=inbound.modality,
-                channel=inbound.channel,
-                sender_id=inbound.sender_id,
-                external_id=inbound.external_id,
+            if self._companion.has_tools:
+                command = parse_command(inbound.text)
+                if command is not None:
+                    # Control plane, not conversation: deliberately handled before the
+                    # markdown write, so `/approve A3F2K9QT` does not become a memory
+                    # that recall surfaces next week. What it authorised is recorded in
+                    # `tool_calls` instead, where it belongs. A replay after a restart
+                    # is harmless because spending a code is single-use (memory/store.py).
+                    await self._approve(inbound, command, origin=origin)
+                    return
+
+            session_kind = "voice" if inbound.modality == "voice" else "interactive"
+
+            # Recorded before the model is called: if the process dies mid-call the
+            # user's words are already on disk. Markdown is the source of truth.
+            await self._companion.record(
+                LoggedMessage(
+                    ts=inbound.received_at,
+                    role="user",
+                    content=inbound.text,
+                    # An allowlisted sender relaying someone else's words - a
+                    # forward, an inline-bot result - is not the owner speaking.
+                    # Recording it as 'owner' would let injected text reach the
+                    # curated tier and, through reflection, persona rules.
+                    origin=origin,
+                    session_kind=session_kind,
+                    modality=inbound.modality,
+                    channel=inbound.channel,
+                    sender_id=inbound.sender_id,
+                    external_id=inbound.external_id,
+                )
             )
-        )
 
-        messages = await self._assemble(inbound, origin=origin)
-        # M1a routes every turn as text; voice is a later milestone and needs a
-        # native-audio provider rather than this text path (docs/PLAN.md 6.5).
-        text, outcome = await self._answer(
-            messages, origin=origin, channel=inbound.channel, sender_id=inbound.sender_id
-        )
-
-        await self._companion.record(
-            LoggedMessage(
-                ts=clock.now(),
-                role="assistant",
-                content=text,
-                origin="agent",
-                session_kind=session_kind,
-                modality=inbound.modality,
-                channel=inbound.channel,
+            messages = await self._assemble(inbound, origin=origin)
+            # M1a routes every turn as text; voice is a later milestone and needs a
+            # native-audio provider rather than this text path (docs/PLAN.md 6.5).
+            text, outcome = await self._answer(
+                messages, origin=origin, channel=inbound.channel, sender_id=inbound.sender_id
             )
-        )
 
-        await self._channel.send(OutboundMessage(text=text, recipient_id=inbound.sender_id))
-        await self._ask_approvals(outcome, inbound.sender_id)
-        # After the reply, never before: embedding costs a round trip to the local
-        # model, and the vector index is regenerable from the markdown while the
-        # user's wait is not recoverable. Both turns are indexed, because a vector
-        # index holding only one side of the conversation makes "what did you
-        # suggest?" unanswerable while looking like it works.
-        await self._companion.index_recorded()
+            # The strip happens here, before both exits: `record` below writes to
+            # the markdown log that recall replays back into later prompts, and
+            # `send` puts it on the wire. A tag surviving either would be read
+            # back to the model next turn as something it said, laundering an
+            # instruction into the personality that `data/persona/seed.md` being
+            # human-owned exists to prevent (daemon/face.py: split_mood).
+            text, mood = split_mood(text)
+            if self._face is not None:
+                if mood is not None:
+                    # Before the activity flips to speaking, not after: a face
+                    # moves just ahead of the words it is reacting to.
+                    self._face.one_shot(mood)
+                self._face.set_activity("speaking")
+
+            await self._companion.record(
+                LoggedMessage(
+                    ts=clock.now(),
+                    role="assistant",
+                    content=text,
+                    origin="agent",
+                    session_kind=session_kind,
+                    modality=inbound.modality,
+                    channel=inbound.channel,
+                )
+            )
+
+            await self._channel.send(OutboundMessage(text=text, recipient_id=inbound.sender_id))
+            await self._ask_approvals(outcome, inbound.sender_id)
+            # After the reply, never before: embedding costs a round trip to the local
+            # model, and the vector index is regenerable from the markdown while the
+            # user's wait is not recoverable. Both turns are indexed, because a vector
+            # index holding only one side of the conversation makes "what did you
+            # suggest?" unanswerable while looking like it works.
+            await self._companion.index_recorded()
+        finally:
+            if self._face is not None:
+                # Without this, one failed turn leaves the face stuck on
+                # "thinking" for the rest of the process's life.
+                self._face.set_activity("idle")
 
     async def _answer(
         self, messages: list[Message], *, origin: str, channel: str, sender_id: str | None

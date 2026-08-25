@@ -30,6 +30,7 @@ from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
 from daemon.tasks import Task
 from daemon.tools.base import ToolResult
 from daemon.tools.runner import Outcome
+from tests.test_face import RecordingBus
 
 
 class FakeMemory:
@@ -1012,6 +1013,95 @@ async def test_a_broken_channel_does_not_end_the_loop(data_dir: Path) -> None:
         gateway_for(FlakyProvider()),
         Companion(FakeMemory(), data_dir=data_dir),
     ).run()  # must return rather than raise
+
+
+# --- the face (Task 4): activity and mood, with no trace left behind --------
+
+
+async def test_the_face_sees_thinking_then_speaking_then_idle(
+    fake_provider: FakeProvider, data_dir: Path
+) -> None:
+    bus = RecordingBus()
+    channel = FakeChannel([inbound("hello")])
+
+    await ConversationLoop(
+        channel,
+        gateway_for(fake_provider),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=bus,
+    ).run()
+
+    assert bus.activities == ["thinking", "speaking", "idle"]
+
+
+async def test_a_mood_tag_becomes_an_event_and_leaves_no_trace(data_dir: Path) -> None:
+    provider = FakeProvider(replies=["[mood:amused] 그래서 웃었어"])
+    memory = FakeMemory()
+    channel = FakeChannel([inbound("웃겨?")])
+    bus = RecordingBus()
+
+    await ConversationLoop(
+        channel, gateway_for(provider), Companion(memory, data_dir=data_dir), face=bus
+    ).run()
+
+    assert bus.shots == ["amused"]
+    # The tag reaches neither of the two ways text escapes the turn.
+    assert [m.text for m in channel.sent] == ["그래서 웃었어"]
+    assert [m.content for m in memory.records if m.role == "assistant"] == ["그래서 웃었어"]
+
+
+async def test_the_expression_is_published_before_speaking_starts(data_dir: Path) -> None:
+    """A person's face moves just ahead of their words, and the tag arrives in time
+    to allow it - so the one-shot must be published before the activity flips."""
+    order: list[str] = []
+
+    class Ordered(RecordingBus):
+        def set_activity(self, activity):  # type: ignore[override]
+            super().set_activity(activity)
+            order.append(f"activity:{activity}")
+
+        def one_shot(self, clip):  # type: ignore[override]
+            super().one_shot(clip)
+            order.append(f"shot:{clip}")
+
+    await ConversationLoop(
+        FakeChannel([inbound("웃겨?")]),
+        gateway_for(FakeProvider(replies=["[mood:sulky] 삐졌어"])),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=Ordered(),
+    ).run()
+
+    assert order.index("shot:sulky") < order.index("activity:speaking")
+
+
+async def test_a_reply_with_no_tag_publishes_no_one_shot(
+    fake_provider: FakeProvider, data_dir: Path
+) -> None:
+    bus = RecordingBus()
+
+    await ConversationLoop(
+        FakeChannel([inbound("hello")]),
+        gateway_for(fake_provider),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=bus,
+    ).run()
+
+    assert bus.shots == []
+
+
+async def test_a_turn_that_raises_still_returns_the_face_to_idle(data_dir: Path) -> None:
+    """`handle` puts idle back in a `finally`. Without it one failed turn leaves the
+    face stuck on `thinking` for the rest of the process's life."""
+    bus = RecordingBus()
+
+    await ConversationLoop(
+        FakeChannel([inbound("hello")]),
+        gateway_for(FakeProvider(fail=True)),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=bus,
+    ).run()
+
+    assert bus.state.activity == "idle"
 
 
 # --- the M1a gate -----------------------------------------------------------
