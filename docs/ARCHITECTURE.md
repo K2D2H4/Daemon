@@ -469,3 +469,13 @@ secrets — the unit points at a working directory and the process reads `.env` 
 there, because `launchctl print` echoes plists back and `~/Library` is backed up.
 Residency is a precondition for M3: something that speaks first has to outlive the
 terminal and the reboot.
+
+## The face
+
+`daemon/face.py` defines `FaceBus`, one per process, built in `create_app` and
+handed by keyword to the conversation loop, the tool runner and the voice conversation -
+each publishes an `Activity` or a one-shot mood as it works, and nobody subscribed
+means the publish is a comparison. `daemon/face_routes.py` mounts alongside the
+admin router and serves it: `daemon/static/face.html` is the page, an SSE stream
+carries the bus, and clips play from `<data_dir>/face/` - unshipped, so a fresh
+install shows no face until something is dropped there.

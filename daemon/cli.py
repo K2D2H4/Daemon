@@ -155,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add("uninstall", group="setup", help="stop the OS service and remove its unit file")
     add("status", group="every day", help="is the service installed and running")
+    add("face", group="every day", help="open the face - a live status page - in its own window")
     log = add(
         "log",
         group="every day",
@@ -380,6 +381,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Also before Settings: this is the foreground grant Daemon.app execs
         # during `daemon install`, and it needs no config to pop the prompt.
         return _request_mic()
+    if command == "face":
+        # Also before Settings: opening a window on a known port should not
+        # depend on a provider being configured - a broken key must not stop a
+        # person from seeing the face.
+        return _face()
     if command == "wake" and args.wake_command == "calibrate":
         # Also before Settings, and for setup's reason: calibration reads nothing
         # out of the configuration and writes one key into `.env`, so it has to work
@@ -724,6 +730,27 @@ def _request_mic() -> int:
     status = request_microphone_access(timeout=60.0)  # a human has to click Allow
     print(f"microphone: {status}")
     return 0 if status == "authorized" else 1
+
+
+def _face() -> int:
+    """Open the face in its own window.
+
+    Reads the port the way `_env_setting` always does - without building
+    `Settings()` - so this works on a configuration that would otherwise refuse
+    to load. Never fails: no browser found is a printed URL, not an error, so a
+    headless box still says where to point one.
+    """
+    url = f"http://127.0.0.1:{_env_setting('DAEMON_PORT', 'port')}/face"
+    # Chrome's --app gives a window with no browser chrome, which is what an
+    # ambient presence wants; anything else at least gets the URL printed.
+    for argv in (
+        ["open", "-na", "Google Chrome", "--args", f"--app={url}", "--window-size=420,630"],
+        ["open", url],
+    ):
+        if subprocess.run(argv, capture_output=True).returncode == 0:
+            return OK
+    print(url)
+    return OK
 
 
 def _admin_url(settings: Settings) -> str:

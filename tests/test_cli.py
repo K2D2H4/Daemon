@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -722,6 +723,20 @@ def test_request_mic_reports_status_and_exit_code(
         "daemon.voice.mic_access.request_microphone_access", lambda **_: "denied"
     )
     assert cli.main(["request-mic"]) == 1
+
+
+def test_face_prints_the_url_when_it_cannot_open_a_browser(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Resolves the port from settings (`Settings.port`, default 8787) and prints
+    the URL when no `open` call succeeds - a headless box, or a machine with no
+    Chrome, must still be told where to point a browser rather than fail."""
+    monkeypatch.setattr(
+        "daemon.cli.subprocess.run",
+        lambda *a, **k: subprocess.CompletedProcess(args=[], returncode=1),
+    )
+    assert cli.main(["face"]) == 0
+    assert "127.0.0.1:8787/face" in capsys.readouterr().out
 
 
 def test_a_broken_config_stops_a_command_that_needs_it(
