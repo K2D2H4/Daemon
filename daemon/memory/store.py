@@ -1584,6 +1584,25 @@ class Store:
             "SELECT * FROM reflection_runs ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
 
+    def reflection_runs_by_dates(self, dates: Sequence[str]) -> dict[str, sqlite3.Row]:
+        """Reflection-run rows for a set of dates, keyed by date - the same
+        shape as `observations_by_ids`. The admin Memory tab's day list comes
+        from the reflection artifacts on disk, which outlive any row-count
+        window on this table; resolving by the exact dates being rendered
+        instead of `recent_reflection_runs`'s capped window is what keeps an
+        old day from reading as artifact-only when its row is still here.
+        Ordered by id ASC so a date with two passes (a re-run) has its later
+        row win the dict assignment, not its first."""
+        if not dates:
+            return {}
+        placeholders = ",".join("?" * len(dates))
+        rows = self.conn.execute(
+            f"SELECT * FROM reflection_runs WHERE date IN ({placeholders}) "
+            "ORDER BY id ASC",
+            tuple(dates),
+        ).fetchall()
+        return {row["date"]: row for row in rows}
+
     # --- M2: what reflection reads ------------------------------------------
 
     def messages_for_day(self, date: str) -> list[sqlite3.Row]:

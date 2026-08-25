@@ -1088,12 +1088,21 @@ async function loadMemory(){
     $('#reflect-list').innerHTML=m.reflections.length?m.reflections.map(reflectRow).join('')
       :'<p class="empty">No reflection has run yet.</p>';
     $('#c-memory').textContent=m.facts_active||'';
-  }catch(e){$('#fact-list').innerHTML=`<p class="empty">${esc(e.message)}</p>`;}
+  }catch(e){
+    const msg=`<p class="empty">${esc(e.message)}</p>`;
+    $('#fact-list').innerHTML=msg;$('#entity-list').innerHTML=msg;$('#reflect-list').innerHTML=msg;
+  }
 }
 function ruleRow(r){
+  // `evidence_cited` is what the rule claims; `evidence` is what resolved. A
+  // rebuilt rule (`persona/rules.py rebuild()`) cites nothing at all, which is
+  // not the same fact as every cited id having lost its row - see mind.py's
+  // `one_rule`.
   const ev=r.evidence.length
     ? `<pre class="well">${r.evidence.map(o=>`[${o.confidence.toFixed(2)}] ${o.body}`).map(esc).join('\n')}</pre>`
-    : '<p class="cap muted">No observation row is left for this rule’s evidence.</p>';
+    : r.evidence_cited
+      ? '<p class="cap muted">No observation row is left for this rule’s evidence.</p>'
+      : '<p class="cap muted">No evidence recorded for this rule.</p>';
   const head=r.status==='retired'
     ? `retired ${stamp(r.retired_at)} — ${r.retired_why||''}`
     : `${stamp(r.created_at)} · ${r.evidence.length} observation(s)`;
@@ -1145,7 +1154,10 @@ async function loadPersona(){
       :'<p class="empty">No evolution pass has written a diary yet.</p>';
     $('#c-persona').textContent=p.rules_active||'';
     $$('[data-forget]').forEach(b=>b.addEventListener('click',()=>forgetRule(+b.dataset.forget)));
-  }catch(e){$('#rule-list').innerHTML=`<p class="empty">${esc(e.message)}</p>`;}
+  }catch(e){
+    const msg=`<p class="empty">${esc(e.message)}</p>`;
+    $('#rule-list').innerHTML=msg;$('#obs-list').innerHTML=msg;$('#diary-list').innerHTML=msg;
+  }
 }
 async function forgetRule(id){
   const why=prompt('Why should she stop believing this? (recorded with the rule)');

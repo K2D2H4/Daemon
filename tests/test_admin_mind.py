@@ -295,9 +295,9 @@ def test_a_missing_note_file_is_a_null_body_not_a_crash(
 def test_a_second_reflection_run_for_the_same_date_wins(
     tmp_path: Path, store: Store
 ) -> None:
-    """`recent_reflection_runs` is id DESC (store.py:1513); `memory_payload`
-    reverses it before folding into a dict so the *last-inserted* (newest) row
-    for a date overwrites the first, rather than the other way around."""
+    """`reflection_runs_by_dates` orders by id ASC and folds rows into a dict
+    by date, so the *last-inserted* (newest) row for a date overwrites the
+    first, rather than the other way around."""
     _write(tmp_path / "memory" / "reflections" / "2026-08-19.md", "# 2026-08-19\n")
     store.record_reflection_run(
         now=_dt(19, 10), date="2026-08-19", status="written",
@@ -318,6 +318,64 @@ def test_a_second_reflection_run_for_the_same_date_wins(
     assert row["entities"] == 9
     assert row["observations"] == 9
     assert row["detail"] == "second pass"
+
+
+def test_reflection_runs_by_dates_keeps_the_newest_row_and_ignores_others(
+    store: Store,
+) -> None:
+    """Direct `Store` coverage for the method `memory_payload` now resolves
+    reflection status through, mirroring `observations_by_ids`: a date with two
+    passes keeps the later row, an unrequested date is absent even though its
+    row exists, and a requested date with no row is simply missing (not a
+    KeyError)."""
+    store.record_reflection_run(
+        now=_dt(19, 10), date="2026-08-19", status="written",
+        messages_read=1, facts=1, entities=1, observations=1, detail="first",
+    )
+    store.record_reflection_run(
+        now=_dt(19, 20), date="2026-08-19", status="skipped",
+        messages_read=2, facts=2, entities=2, observations=2, detail="second",
+    )
+    store.record_reflection_run(
+        now=_dt(1), date="2026-08-01", status="written",
+        messages_read=3, facts=3, entities=3, observations=3, detail="not requested",
+    )
+
+    got = store.reflection_runs_by_dates(["2026-08-19", "2026-08-14"])
+
+    assert set(got) == {"2026-08-19"}
+    assert got["2026-08-19"]["detail"] == "second"
+
+
+def test_reflection_runs_by_dates_of_an_empty_list_is_empty(store: Store) -> None:
+    assert store.reflection_runs_by_dates([]) == {}
+
+
+def test_a_reflection_row_resolves_without_the_capped_lookup(
+    tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug this fixes: `recent_reflection_runs(N)` is `ORDER BY id DESC
+    LIMIT N` - a fixed row-count window that quietly drops old rows once a
+    table outgrows it, so an old day's real status renders as `artifact
+    only`. `memory_payload` must resolve by date instead, and must not touch
+    `recent_reflection_runs` to do it - breaking that call here proves it."""
+    monkeypatch.setattr(
+        Store,
+        "recent_reflection_runs",
+        lambda self, *a, **k: (_ for _ in ()).throw(
+            AssertionError("memory_payload must not call recent_reflection_runs")
+        ),
+    )
+    _write(tmp_path / "memory" / "reflections" / "2026-08-19.md", "# 2026-08-19\n")
+    store.record_reflection_run(
+        now=_dt(19), date="2026-08-19", status="written",
+        messages_read=5, facts=1, entities=1, observations=1, detail="",
+    )
+
+    payload = memory_payload(store, tmp_path)
+
+    assert payload["reflections"][0]["status"] == "written"
+    assert payload["reflections_recorded"] == 1
 
 
 def test_the_body_budget_is_shared_and_entities_go_first(
@@ -462,6 +520,56 @@ def test_an_evidence_id_with_no_observation_row_is_skipped(
     payload = persona_payload(store, tmp_path, _settings(tmp_path))
 
     assert payload["rules"][0]["evidence"] == []
+
+
+def test_evidence_cited_distinguishes_no_evidence_from_lost_evidence(
+    tmp_path: Path, store: Store
+) -> None:
+    """`rebuild()` (persona/rules.py) restores a rule with `evidence='[]'` when
+    learned.md never recorded any - that must not read the same as a rule
+    whose cited ids all lost their observation row. `evidence_cited` is the
+    count the rule claims, before resolution; `evidence` is empty in both
+    cases, so the front end needs `evidence_cited` to tell them apart."""
+    never_cited = store.insert_persona_rule(
+        body="learned.md never recorded evidence for this",
+        created_at=_dt(9), evidence=[], supersession_key=None,
+    )
+    lost_its_row = store.insert_persona_rule(
+        body="근거가 사라진 규칙", created_at=_dt(9),
+        evidence=[4242], supersession_key=None,
+    )
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+    by_id = {r["id"]: r for r in payload["rules"]}
+
+    assert by_id[never_cited]["evidence"] == []
+    assert by_id[never_cited]["evidence_cited"] == 0
+    assert by_id[lost_its_row]["evidence"] == []
+    assert by_id[lost_its_row]["evidence_cited"] == 1
+
+
+def test_evidence_rejects_a_bool_masquerading_as_an_id(
+    tmp_path: Path, store: Store
+) -> None:
+    """`int(True)` is `1`. A rule whose evidence json is `[true]` - which
+    `insert_persona_rule` will happily store, since `bool` is an `int`
+    subclass - must not resolve to observation id 1. This module treats model
+    output as hostile."""
+    obs_id = store.insert_observation(
+        body="첫 번째 관찰", observed_from="2026-08-01/2026-08-01",
+        confidence=0.5, now=_dt(1),
+    )
+    assert obs_id == 1  # the id `int(True)` would coerce to, in a fresh store
+    rule = store.insert_persona_rule(
+        body="불리언 근거로 만든 규칙", created_at=_dt(9),
+        evidence=[True], supersession_key=None,
+    )
+
+    payload = persona_payload(store, tmp_path, _settings(tmp_path))
+    got = next(r for r in payload["rules"] if r["id"] == rule)
+
+    assert got["evidence"] == []
+    assert got["evidence_cited"] == 0
 
 
 def test_rule_evidence_resolves_past_the_capped_observation_window(
@@ -896,6 +1004,21 @@ def test_forget_rejects_an_empty_why_and_an_unknown_id(tmp_path: Path) -> None:
 
     assert blank.status_code == 400
     assert missing.status_code == 404
+
+
+def test_forget_rejects_a_bool_or_float_id(tmp_path: Path) -> None:
+    """`int(True)` is 1 and `int(3.9)` is 3 - either would coerce into retiring
+    a rule the caller never named. `bool` is an `int` subclass, so the guard
+    must check for it explicitly."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        as_bool = client.post("/admin/api/persona/forget", json={"id": True, "why": "왜"})
+        as_float = client.post("/admin/api/persona/forget", json={"id": 3.9, "why": "왜"})
+        as_string = client.post("/admin/api/persona/forget", json={"id": "1", "why": "왜"})
+
+    assert as_bool.status_code == 400
+    assert as_float.status_code == 400
+    assert as_string.status_code == 400
 
 
 def test_e_the_run_now_endpoints_take_the_shared_lock(

@@ -459,10 +459,13 @@ async def persona_forget(request: Request) -> JSONResponse:
         return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"detail": "body must be an object"}, status_code=400)
-    try:
-        rule_id = int(body.get("id"))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="id must be a rule id") from None
+    raw_id = body.get("id")
+    # `bool` is an `int` subclass and JSON numbers with a fraction decode as
+    # `float`, so a bare `int(...)` coercion also accepts `true` (-> 1) and
+    # `3.9` (-> 3) - either retires a rule the caller never named.
+    if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+        raise HTTPException(status_code=400, detail="id must be a rule id")
+    rule_id = raw_id
     why = str(body.get("why") or "").strip()
     if not why:
         # Required for the same reason the CLI requires it: a rule that vanished

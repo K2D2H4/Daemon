@@ -23,10 +23,12 @@ the drop is named, never silent - the failure this whole tab exists to fix.
 
 ## The reflection list is keyed on the files, not on `reflection_runs`
 
-`reflection_runs` arrived with M5; the artifacts predate it. Measured on the real
-install: 5 rows against 9 artifacts. Keyed on the table, four days of history
-disappear from the only screen that shows it. So the day is the file, and the row
-is the extra detail a day may or may not have.
+`reflection_runs` arrived with M5; the artifacts predate it. Measured 2026-08-25:
+6 rows against 11 artifacts, and the gap does not close on its own - the table
+only started counting from when it landed, so every install carries some number
+of file-only days permanently. Keyed on the table, that history disappears from
+the only screen that shows it. So the day is the file, and the row is the extra
+detail a day may or may not have.
 """
 
 from __future__ import annotations
@@ -42,10 +44,10 @@ MAX_FACTS = 200
 MAX_ENTITIES = 500
 MAX_OBSERVATIONS = 300
 MAX_RULES = 100
-MAX_REFLECTION_ROWS = 400
 """List ceilings, so a hand-edited limit cannot make the admin read an unbounded
-table into memory. Far above the real corpus (12 / 11 / 9 / 3) on purpose: these
-are a backstop, not the body caps below."""
+table into memory. Measured 2026-08-25, the real corpus was low tens per table
+(facts 11, entities 12, observations 11, rules 3) - two orders of magnitude below
+these on purpose: a backstop, not the body caps below."""
 
 MAX_REFLECTION_BODIES = 14
 MAX_DIARY_BODIES = 8
@@ -182,12 +184,10 @@ def memory_payload(store: Store, data_dir: Path) -> dict[str, Any]:
         (path.stem for path in reflect_dir.glob("*.md")) if reflect_dir.exists() else (),
         reverse=True,
     )
-    # `recent_reflection_runs` is id DESC (store.py:1513); reversed makes it id
-    # ASC so a day with two passes keeps the *newest* row, not the first.
-    runs = {
-        row["date"]: row
-        for row in reversed(store.recent_reflection_runs(MAX_REFLECTION_ROWS))
-    }
+    # Resolved by the exact days being rendered, not a row-count window - see
+    # `reflection_runs_by_dates`'s docstring. `days` is already the whole glob,
+    # so this never drops a day the way looking it up in a capped list would.
+    runs = store.reflection_runs_by_dates(days)
     reflect_paths = [
         (day, reflection_mod.artifact_path(data_dir, day)) for day in days
     ]
@@ -257,7 +257,14 @@ def _evidence(raw: str) -> list[int]:
         return []
     if not isinstance(parsed, list):
         return []
-    return [int(item) for item in parsed if isinstance(item, int)]
+    # `bool` is an `int` subclass, so `isinstance(item, int)` alone lets a
+    # model-emitted `true`/`false` through and `int(True)` silently becomes
+    # evidence id 1. This module treats model output as hostile; reject it.
+    return [
+        int(item)
+        for item in parsed
+        if isinstance(item, int) and not isinstance(item, bool)
+    ]
 
 
 def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[str, Any]:
@@ -318,6 +325,7 @@ def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[st
     evidence_by_id = store.observations_by_ids(sorted(evidence_ids))
 
     def one_rule(row: Any, status: str) -> dict[str, Any]:
+        cited = _evidence(row["evidence"])
         evidence = [
             {
                 "id": int(evidence_by_id[oid]["id"]),
@@ -326,7 +334,7 @@ def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[st
             }
             # A stale id is skipped, not raised on: `evidence` is model-supplied
             # json and an observation it names may predate a rebuild.
-            for oid in _evidence(row["evidence"])
+            for oid in cited
             if oid in evidence_by_id
         ]
         return {
@@ -337,6 +345,12 @@ def persona_payload(store: Store, data_dir: Path, settings: Settings) -> dict[st
             "retired_at": row["retired_at"],
             "retired_why": row["retired_why"],
             "evidence": evidence,
+            # `rebuild()` (persona/rules.py) inserts a restored rule with
+            # `evidence='[]'` when learned.md never recorded any - that is not
+            # the same fact as every cited id having lost its row, and an empty
+            # `evidence` list alone cannot tell the two apart. `cited` is the
+            # count the rule itself claims, before resolution.
+            "evidence_cited": len(cited),
         }
 
     active = [one_rule(row, "active") for row in active_rows]
