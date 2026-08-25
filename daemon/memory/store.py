@@ -1449,14 +1449,28 @@ class Store:
         ).fetchall()
         return [from_iso(row["ts"]) for row in rows]
 
-    def stale_entities(self, limit: int, quiet_since: datetime) -> list[sqlite3.Row]:
+    def stale_entities(
+        self, limit: int, quiet_since: datetime, raised_since: datetime
+    ) -> list[sqlite3.Row]:
         """Entities gone quiet, quietest first - what a `topic` candidate rotates
-        through. `updated_at` moves whenever reflection touches the note, so
-        raising a topic is what makes it stop being the quietest one."""
+        through. `updated_at` moves whenever reflection touches the note, but the
+        proactive path itself never writes it, so an entity already raised as a
+        `topic` inside `raised_since` is excluded here, in SQL, anchored to *its
+        own* most recent row in `proactive_candidates` - not to a shared clock
+        every entity would otherwise share, and not to a Python-side dedup key
+        that cannot remove it from `ORDER BY ... LIMIT` before a later entity
+        gets a chance at the slot."""
         return self.conn.execute(
-            "SELECT name, updated_at FROM entities WHERE updated_at < ? "
-            "ORDER BY updated_at ASC LIMIT ?",
-            (utc_iso(quiet_since), limit),
+            "SELECT e.name, e.updated_at FROM entities e "
+            "WHERE e.updated_at < ? "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM proactive_candidates c "
+            "  WHERE c.kind = 'topic' "
+            "  AND json_extract(c.payload, '$.entity') = e.name "
+            "  AND c.created_at >= ?"
+            ") "
+            "ORDER BY e.updated_at ASC LIMIT ?",
+            (utc_iso(quiet_since), utc_iso(raised_since), limit),
         ).fetchall()
 
     # --- M3: what was actually said -----------------------------------------

@@ -108,11 +108,20 @@ class SqlReader:
         ).fetchall()
         return {row["dedup"] for row in rows}
 
-    def stale_entities(self, limit: int, quiet_since: datetime) -> list[sqlite3.Row]:
+    def stale_entities(
+        self, limit: int, quiet_since: datetime, raised_since: datetime
+    ) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT name, updated_at FROM entities WHERE updated_at < ? "
-            "ORDER BY updated_at ASC LIMIT ?",
-            (utc_iso(quiet_since), limit),
+            "SELECT e.name, e.updated_at FROM entities e "
+            "WHERE e.updated_at < ? "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM proactive_candidates c "
+            "  WHERE c.kind = 'topic' "
+            "  AND json_extract(c.payload, '$.entity') = e.name "
+            "  AND c.created_at >= ?"
+            ") "
+            "ORDER BY e.updated_at ASC LIMIT ?",
+            (utc_iso(quiet_since), utc_iso(raised_since), limit),
         ).fetchall()
 
 
@@ -749,13 +758,17 @@ def test_the_reason_carries_the_name_and_the_gap_and_nothing_else(
     assert len(reason) <= 200
 
 
-def test_the_pool_is_wider_than_one_ticks_cap(store: Store, reader: SqlReader) -> None:
-    """`topic_candidates` itself does not cap its output - `open_loop_candidates`
-    does not either, and for the same reason: a fake or a query that quietly
-    truncated to `MAX_PER_KIND` here would make the ordering test above pass for
-    the wrong reason (exactly two stale entities queued), so this asserts the
-    pool actually holds all four. `generate_candidates` is what caps; see the
-    tick-level tests below for that."""
+def test_the_limit_is_max_per_kind_with_no_separate_pool(
+    store: Store, reader: SqlReader
+) -> None:
+    """Round 1 widened the SQL fetch past `MAX_PER_KIND` because a self-capping
+    query left already-spent entities occupying every slot forever. Round 2
+    excludes an ineligible entity from the query entirely (`NOT EXISTS` against
+    `proactive_candidates`, anchored to that entity's own last raise), so
+    nothing spent can occupy a slot in the first place - the widened pool's
+    whole reason to exist. A plain `MAX_PER_KIND` limit is correct again: four
+    stale, never-raised entities and a cap of three should return exactly the
+    three quietest."""
     now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
     entity_touched(store, "A", at=datetime(2026, 8, 1, tzinfo=UTC))
     entity_touched(store, "B", at=datetime(2026, 8, 2, tzinfo=UTC))
@@ -764,20 +777,25 @@ def test_the_pool_is_wider_than_one_ticks_cap(store: Store, reader: SqlReader) -
 
     produced = topic_candidates(reader, now)
 
-    assert [c.payload["entity"] for c in produced] == ["A", "B", "C", "D"]
+    assert [c.payload["entity"] for c in produced] == ["A", "B", "C"]
 
 
-def test_an_untouched_topic_rearms_on_its_own_clock(
+def test_an_untouched_topic_rearms_from_its_own_raise_not_a_shared_grid(
     db: sqlite3.Connection, store: Store, reader: SqlReader
 ) -> None:
-    """Measured defect this replaces: dedup keyed by `entities.updated_at` froze
-    the rotation forever, because nothing in the proactive path moves that
-    column - only nightly reflection (when it judges something new happened)
-    and `daemon rebuild` do. `raise_time` below sits exactly on a
-    `TOPIC_REARM_DAYS`-day boundary (2026-08-16's ordinal is divisible by 14) so
-    "13 days later" and "14 days later" land unambiguously either side of one
-    rearm window, with nothing else touching the note in between."""
-    raise_time = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    """Measured defect this replaces: a dedup key bucketed into shared
+    `TOPIC_REARM_DAYS`-day calendar windows put every entity's rearm boundary on
+    the same grid, so the real gap after a raise was anywhere from 1 to 14 days
+    depending only on where the raise happened to land in that grid - not the
+    intended `TOPIC_REARM_DAYS`. 2026-08-29 is the adversarial date: under that
+    old grid (2026-08-16 is a boundary, since its ordinal divides evenly by 14),
+    the very next day, 2026-08-30, was already a fresh boundary, so the old code
+    would have let this entity come back after a single day - the one-day
+    re-raise that is the owner's original complaint. Anchoring to this entity's
+    own raise instead of the grid means 13 days later must still be inside the
+    window and 15 days later must be outside it, regardless of where the raise
+    fell on any calendar."""
+    raise_time = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
     entity_touched(store, "Sendbird", at=raise_time - timedelta(days=10))
 
     first = generate_candidates(reader, settings(), now=raise_time)
@@ -785,22 +803,22 @@ def test_an_untouched_topic_rearms_on_its_own_clock(
     assert [c.payload["entity"] for c in topics] == ["Sendbird"]
     store_candidate(db, topics[0], now=raise_time)
 
-    before_rearm = generate_candidates(reader, settings(), now=raise_time + timedelta(days=13))
-    assert [c for c in before_rearm if c.kind == "topic"] == []
+    still_within = generate_candidates(reader, settings(), now=raise_time + timedelta(days=13))
+    assert [c for c in still_within if c.kind == "topic"] == []
 
-    after_rearm = generate_candidates(reader, settings(), now=raise_time + timedelta(days=14))
-    after_topics = [c for c in after_rearm if c.kind == "topic"]
-    assert [c.payload["entity"] for c in after_topics] == ["Sendbird"]
+    past_rearm = generate_candidates(reader, settings(), now=raise_time + timedelta(days=15))
+    past_topics = [c for c in past_rearm if c.kind == "topic"]
+    assert [c.payload["entity"] for c in past_topics] == ["Sendbird"]
 
 
 def test_entities_behind_the_cap_are_not_starved(
     db: sqlite3.Connection, store: Store, reader: SqlReader
 ) -> None:
-    """The other half of the same defect: `stale_entities` was fetched exactly
-    `MAX_PER_KIND` at a time, so once the quietest few were spent, the ones
-    behind them were never even read out of SQL. Four entities, one tick's cap
-    of three, and the fourth must still get its turn the moment the first three
-    are marked spent - not stuck behind them forever."""
+    """Proves the SQL exclusion actually frees a slot rather than merely
+    hiding a spent entity behind a wide fetch: four stale entities, one tick's
+    cap of `MAX_PER_KIND` (three), and the fourth must get its turn the moment
+    the first three are recorded as raised - not stuck behind them, and not
+    dropped for being outside whatever the fetch limit happens to be."""
     raise_time = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
     entity_touched(store, "A", at=raise_time - timedelta(days=40))
     entity_touched(store, "B", at=raise_time - timedelta(days=30))

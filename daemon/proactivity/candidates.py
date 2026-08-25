@@ -179,9 +179,18 @@ class CandidateReader(Protocol):
         grow with the table."""
         ...
 
-    def stale_entities(self, limit: int, quiet_since: datetime) -> list[sqlite3.Row]:
-        """Entities whose note has not been touched since `quiet_since`, quietest
-        first. `name` and `updated_at` are the columns used."""
+    def stale_entities(
+        self, limit: int, quiet_since: datetime, raised_since: datetime
+    ) -> list[sqlite3.Row]:
+        """Entities whose note has not been touched since `quiet_since` and which
+        were not raised as a `topic` candidate since `raised_since`, quietest
+        first. `name` and `updated_at` are the columns used.
+
+        The second exclusion has to happen here, in SQL, rather than after the
+        fact in Python: it has to be anchored to *this entity's own* last raise,
+        and it has to remove the entity from `ORDER BY ... LIMIT` entirely so an
+        ineligible entity cannot occupy a slot another entity should get.
+        """
         ...
 
 
@@ -263,35 +272,26 @@ a daemon that asks about the dog every morning is the repetition this whole bran
 started from."""
 
 TOPIC_REARM_DAYS = 14
-"""How long a raised topic stays spent before it is eligible again.
+"""How long a raised topic must stay excluded before it is eligible again.
 
-The obvious design - dedup by the entity's own `updated_at` - assumes raising a
-topic touches the note. It does not: nothing in the proactive path writes
-`entities.updated_at`, only `daemon/reflection.py`'s nightly pass (and only when
-it judges something new happened) and the offline `rebuild` command. A dedup key
-built from `updated_at` would go stale exactly once and then never move again,
-freezing whichever two entities were quietest at the time in permanent
-possession of the rotation - measured: this is exactly what happened before this
-constant existed. The key is built from wall-clock time instead, bucketed into
-`TOPIC_REARM_DAYS`-day windows, so rearming runs on a clock this generator
-actually controls. Longer than `TOPIC_QUIET_DAYS` on purpose - rearming the
+Two designs were tried and rejected before this one. Dedup by the entity's own
+`updated_at` assumed raising a topic touches the note; nothing in the proactive
+path does (only `daemon/reflection.py`'s nightly pass, and only when it judges
+something new happened, and the offline `rebuild` command move that column), so
+the same two entities occupied the rotation forever - measured. The fix for
+that, a dedup key bucketed into shared `TOPIC_REARM_DAYS`-day calendar windows,
+turned out to give some entities a real gap of one day rather than
+`TOPIC_REARM_DAYS`: every entity's boundary fell on the same grid, so an entity
+raised the day before a boundary rearmed the next day. Both were the same
+mistake - measuring the window from something other than *this entity's own*
+raise. `stale_entities` now excludes an entity directly in SQL, anchored to its
+own most recent `topic` row, so the number below is a true per-entity gap and
+this generator's dedup key no longer has to carry any rearm logic at all - see
+`topic_candidates`. Longer than `TOPIC_QUIET_DAYS` on purpose: rearming the
 moment an entity requalifies as stale would be the same nagging
 `TOPIC_QUIET_DAYS` exists to stop. 14 days against roughly a dozen entities and a
 few utterances a day gives each one a turn every couple of weeks rather than
 monopolising the slot."""
-
-TOPIC_POOL_SIZE = MAX_PER_KIND * 4
-"""Stale entities read per tick - deliberately more than a tick can use.
-
-`generate_candidates` already drops spent dedup keys and caps at `MAX_PER_KIND`;
-`open_loop_candidates` relies on exactly this (it returns every row it finds and
-lets the pipeline truncate). If this generator asked SQL for only as many rows as
-it meant to keep, the same handful of quietest entities would occupy every slot
-forever and the ones behind them would never even be read out of the database -
-the bug this constant fixes. Asking for a wider pool and letting the existing
-filter narrow it means there is no separate `MAX_TOPIC_CANDIDATES` cap here:
-`MAX_PER_KIND` already is that cap, and a second number next to it would just be
-two caps claiming the same job."""
 
 
 # --- Korean surface forms ----------------------------------------------------
@@ -582,25 +582,23 @@ def topic_candidates(reader: CandidateReader, now: datetime) -> list[Candidate]:
     not have; that arrives after the gate (ADR 0015), and a candidate whose search
     finds nothing is dropped rather than spoken.
 
-    `dedup` is keyed by wall-clock time, bucketed into `TOPIC_REARM_DAYS`-day
-    windows - not by the note's `updated_at`. See `TOPIC_REARM_DAYS`'s docstring
-    for why: nothing in this path ever moves that column, so a dedup key built
-    from it would go stale exactly once and freeze the rotation. Every entity
-    still eligible in the same window shares one bucket value, so raising one
-    does not by itself change another's key - each entity's own dedup key does
-    not move until the window rolls over, which is what makes the key spent
-    (once inserted) for the rest of that window and free again in the next.
+    Rearm is enforced in SQL (`stale_entities`'s `raised_since` exclusion),
+    anchored to each entity's own last `topic` row - not by this generator's
+    dedup key, and not by a shared calendar grid. See `TOPIC_REARM_DAYS`'s
+    docstring for the two designs that got this wrong first. Because SQL
+    already excludes an ineligible entity entirely - it cannot occupy an
+    `ORDER BY ... LIMIT` slot it is not a candidate for - a plain `MAX_PER_KIND`
+    limit is enough here: nothing "spent" is left sitting in front of the next
+    entity in line, so there is no separate pool-size constant either.
 
-    Reads a pool of `TOPIC_POOL_SIZE` stale entities, not just as many as one
-    tick means to keep - see that constant's docstring. `generate_candidates`
-    is what actually drops already-spent rows and caps at `MAX_PER_KIND`; this
-    function returns everything it found, quietest first, the same shape
-    `open_loop_candidates` already uses.
+    `dedup` only has to be unique per raise now, not carry any rearm logic -
+    `to_iso(now)` gives that for free, since SQL will not surface this entity
+    again until `TOPIC_REARM_DAYS` have actually passed.
     """
     quiet_since = now - timedelta(days=TOPIC_QUIET_DAYS)
-    bucket = now.toordinal() // TOPIC_REARM_DAYS
+    raised_since = now - timedelta(days=TOPIC_REARM_DAYS)
     found: list[Candidate] = []
-    for row in reader.stale_entities(TOPIC_POOL_SIZE, quiet_since):
+    for row in reader.stale_entities(MAX_PER_KIND, quiet_since, raised_since):
         name = str(row["name"])
         since = parse_iso(str(row["updated_at"]))
         days = max((now - since).days, TOPIC_QUIET_DAYS)
@@ -611,7 +609,7 @@ def topic_candidates(reader: CandidateReader, now: datetime) -> list[Candidate]:
                     f"'{name}' 이야기를 한 지 {days}일 됐다. "
                     "유저가 관심을 두는 주제이고, 그동안 소식을 나눈 적이 없다."
                 ),
-                payload={"entity": name, "dedup": f"topic:{name}:{bucket}"},
+                payload={"entity": name, "dedup": f"topic:{name}:{to_iso(now)}"},
             )
         )
     return found
