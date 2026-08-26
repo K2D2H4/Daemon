@@ -63,6 +63,34 @@ _GROUP_ORDER = (
 Ordered by how often a command is typed, so the top of the list is the part an
 owner actually uses."""
 
+SHUTDOWN_GRACE_SECONDS = 3.0
+"""How long a SIGTERM waits for in-flight responses before cutting them.
+
+Uvicorn's default is `None`, which means wait forever - correct only for an app
+whose every response ends. `/face/stream` (`daemon/face_routes.py`) is server-sent
+events, so it never does, and `connection.shutdown()` cannot close a connection
+whose response is still open: it clears `keep_alive` and waits. So one open face
+page pinned the process in `Waiting for connections to close` and it never exited.
+
+Measured cost of that: the admin's own restart button. `admin/restart.py` exits
+only because a supervisor will revive the process - but the process never exited,
+launchd never revived it, and the console sat on "applying…" forever polling a
+`/health` that had already stopped listening. Nothing in the log said so; it just
+stopped after the shutdown line.
+
+3 seconds because the slowest legitimate request here is `GET /admin/api/settings`
+at ~1.5s (two provider model listings), so a real request still finishes and only
+the endless ones are cut. Lifespan teardown still runs afterwards, so the channel,
+the sqlite handle and the MCP subprocesses close as before.
+
+**A backstop, not the mechanism.** The admin's own restart closes the face bus
+first (`admin/restart.py::schedule_exit`), so its streams end and the connections
+close on their own - reaching this bound logs uvicorn's `Cancel N running task(s)`
+at ERROR, and on the owner's normal path that would be an error line meaning
+"working as designed" on every settings save. This exists for the SIGTERMs no
+endpoint sees coming - `launchctl`, logout, `daemon update`, `daemon restart` - and
+for the next endless response somebody adds without reading this."""
+
 _LOG_LINES = 50
 """How much history `daemon log` shows before it starts following."""
 
@@ -875,7 +903,13 @@ def _serve(settings: Settings) -> int:
     # log_config=None): the admin web has no other way to announce where it is, and
     # "how do I open the console" should not need reading the source.
     print(f"admin console: {_admin_url(settings)}")
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
+    uvicorn.run(
+        create_app(settings),
+        host=settings.host,
+        port=settings.port,
+        log_config=None,
+        timeout_graceful_shutdown=SHUTDOWN_GRACE_SECONDS,
+    )
     return OK
 
 

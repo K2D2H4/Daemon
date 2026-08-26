@@ -319,3 +319,43 @@ def test_level_returns_to_zero_once_playback_is_over():
 )
 def test_split_mood(raw, text, mood):
     assert split_mood(raw) == (text, mood)
+async def test_close_ends_an_open_subscription():
+    """`close()` is what lets an SSE response finish, so the generator must actually
+    stop - not just go quiet. `admin/restart.py` calls it before the SIGTERM because
+    a stream that never ends is a connection uvicorn cannot close."""
+    bus = FaceBus()
+    agen = bus.subscribe()
+    await _drain(agen, 1)  # the snapshot
+
+    bus.close()
+
+    async with asyncio.timeout(1.0):
+        with pytest.raises(StopAsyncIteration):
+            await agen.__anext__()
+
+
+async def test_close_delivers_what_is_already_queued_before_it_stops():
+    """A close must not swallow an expression that was already published. The check
+    sits after the batch is yielded, not before it."""
+    bus = FaceBus()
+    agen = bus.subscribe()
+    await _drain(agen, 1)  # the snapshot
+    bus.one_shot("amused")
+    bus.close()
+
+    (event,) = await _drain(agen, 1)
+    assert isinstance(event, OneShot)
+    assert event.clip == "amused"
+    async with asyncio.timeout(1.0):
+        with pytest.raises(StopAsyncIteration):
+            await agen.__anext__()
+
+
+def test_close_with_nobody_subscribed_is_a_no_op():
+    """`daemon run` with no face page open is the common case, and a restart there
+    must not depend on there being a subscriber."""
+    bus = FaceBus()
+    bus.close()
+    bus.close()
+    bus.set_activity("speaking")
+    assert bus.state.activity == "speaking"

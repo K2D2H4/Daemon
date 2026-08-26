@@ -55,12 +55,13 @@ Event = FaceState | OneShot
 class _Sub:
     """One subscriber's mailbox: a slot for state, a small queue for one-shots."""
 
-    __slots__ = ("shots", "state", "wake")
+    __slots__ = ("closed", "shots", "state", "wake")
 
     def __init__(self) -> None:
         self.state: FaceState | None = None
         self.shots: deque[OneShot] = deque(maxlen=SHOT_BACKLOG)
         self.wake = asyncio.Event()
+        self.closed = False
 
 
 class FaceBus:
@@ -116,6 +117,13 @@ class FaceBus:
         self._subs.add(sub)
         try:
             while True:
+                # Before the wait, and only with the mailbox empty. After the wait it
+                # deadlocks (the wake that carried the close has been cleared and
+                # nothing will set it again); after the batch it drops whatever was
+                # published in the same tick as the close - measured, a one-shot
+                # queued just before `close()` never reached the page.
+                if sub.closed and not sub.shots and sub.state is None:
+                    return
                 await sub.wake.wait()
                 sub.wake.clear()
                 # Drained into a batch before anything is yielded, and state goes
@@ -147,6 +155,25 @@ class FaceBus:
                     yield event
         finally:
             self._subs.discard(sub)
+
+    def close(self) -> None:
+        """End every open subscription, so an SSE response can actually finish.
+
+        `/face/stream` is a response that by design never completes, and uvicorn
+        cannot close a connection whose response is still open - it clears
+        `keep_alive` and waits. One open face page was therefore enough to pin the
+        whole process in `Waiting for connections to close` (daemon/MEASURED.md),
+        which is the restart the admin console was waiting for. This is the release:
+        wake each subscriber with `closed` set so its generator returns, the
+        `StreamingResponse` completes, and the connection closes on its own.
+
+        A snapshot of the set, because each generator discards itself from `_subs`
+        in its own `finally` as it unwinds. Idempotent and safe with no subscribers:
+        `daemon run` with nothing watching is the common case.
+        """
+        for sub in tuple(self._subs):
+            sub.closed = True
+            sub.wake.set()
 
     def _fan(self, event: Event) -> None:
         for sub in self._subs:

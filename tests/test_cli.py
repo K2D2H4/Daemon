@@ -14,7 +14,8 @@ import os
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -435,6 +436,162 @@ def test_update_reports_a_failed_install(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.delenv("DAEMON_VERSION", raising=False)
 
     assert cli.main(["update"]) == 1
+
+
+# --- the restart bound: SIGTERM must not wait forever on an SSE stream --------
+
+
+def test_serve_bounds_the_graceful_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_serve` must hand uvicorn a finite `timeout_graceful_shutdown`.
+
+    Without it the default is `None`, which means "wait for every response to
+    finish, forever" - and `/face/stream` is a response that never finishes. A
+    settings save then left the admin console spinning on "applying..." because the
+    process it was waiting for was still sitting in shutdown. The mechanism is
+    pinned by the test below; this one pins that the product actually passes it.
+    """
+    import uvicorn
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(daemon_app, "create_app", lambda settings: object())
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append(kw))
+
+    assert cli.main(["run"]) == 0
+
+    assert calls, "uvicorn.run was never called"
+    grace = calls[0]["timeout_graceful_shutdown"]
+    assert grace is not None, "an unbounded graceful shutdown is the hang"
+    assert grace == cli.SHUTDOWN_GRACE_SECONDS
+    # A floor, not just "finite". The constant's own reason for being 3s is that
+    # `GET /admin/api/settings` takes ~1.5s, so a bound under that cancels a real
+    # request on every restart - and every assertion here would still pass.
+    assert 2.0 <= grace <= 30.0
+
+
+@dataclass
+class _Shutdown:
+    """What a shutdown attempt did: did it finish, and did the lifespan tear down?"""
+
+    finished: bool
+    torn_down: bool
+
+
+async def _shutdown_finishes(
+    tmp_path: Path, grace: float | None, wait: float, *, release: bool = False
+) -> _Shutdown:
+    """Drive real uvicorn holding a real `/face/stream` client, then ask it to exit.
+
+    `should_exit` is exactly what uvicorn's SIGTERM handler sets, so this is the
+    path `daemon/admin/restart.py` takes. `release=True` also closes the face bus
+    the way `schedule_exit` does, before the signal.
+
+    The app carries a lifespan that records its own teardown, because that is the
+    property the restart actually depends on: `admin/restart.py` sends a signal
+    rather than `sys.exit` so the channel, the sqlite handle and the MCP children
+    close. A shutdown that exits without running it is not the fix.
+    """
+    import uvicorn
+    from fastapi import FastAPI
+
+    from daemon.face import FaceBus
+    from daemon.face_routes import router as face_router
+
+    torn_down: list[bool] = []
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            torn_down.append(True)
+
+    api = FastAPI(lifespan=lifespan)
+    api.state.settings = Settings(_env_file=None, provider="ollama", data_dir=tmp_path)
+    bus = FaceBus()
+    api.state.face = bus
+    api.include_router(face_router)
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            api,
+            host="127.0.0.1",
+            port=0,
+            log_config=None,
+            timeout_graceful_shutdown=grace,
+        )
+    )
+    serving = asyncio.ensure_future(server.serve())
+    try:
+        for _ in range(500):
+            if server.started:
+                break
+            if serving.done():  # a bind failure: re-raise it now, not in 5s
+                await serving
+            await asyncio.sleep(0.01)
+        else:  # pragma: no cover - a server that never binds is a broken test
+            raise AssertionError("uvicorn never started")
+        port = server.servers[0].sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(b"GET /face/stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            await writer.drain()
+            assert b"200 OK" in await reader.readline()
+
+            if release:
+                bus.close()
+            server.should_exit = True
+            try:
+                await asyncio.wait_for(asyncio.shield(serving), wait)
+            except TimeoutError:
+                return _Shutdown(finished=False, torn_down=bool(torn_down))
+            return _Shutdown(finished=True, torn_down=bool(torn_down))
+        finally:
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
+    finally:
+        server.force_exit = True
+        serving.cancel()
+        with suppress(asyncio.CancelledError):
+            await serving
+
+
+def test_an_open_face_stream_blocks_an_unbounded_shutdown(tmp_path: Path) -> None:
+    """The hang, reproduced. `/face/stream` is an SSE response that by design never
+    completes, and uvicorn's `connection.shutdown()` cannot close a connection whose
+    response is still open - it only clears `keep_alive` and waits. With no bound the
+    wait is `while self.server_state.connections: await sleep(0.1)`, forever.
+
+    **This asserts a third-party behaviour, so read a failure here carefully.**
+    Measured against uvicorn 0.52.4. If a later uvicorn learns to close a streaming
+    response on shutdown, this goes red while the product is fine - that is uvicorn
+    improving, not `SHUTDOWN_GRACE_SECONDS` breaking, and the fix is to retire this
+    test rather than to chase it.
+    """
+    assert asyncio.run(_shutdown_finishes(tmp_path, grace=None, wait=0.6)).finished is False
+
+
+def test_a_bounded_shutdown_exits_with_the_stream_still_open(tmp_path: Path) -> None:
+    """The backstop: past the bound uvicorn cancels the stream's task, the connection
+    closes, and the lifespan teardown still runs - so the supervisor gets its exit
+    and the console's poll finds a daemon to reconnect to. This is the path a
+    `launchctl` or logout SIGTERM takes, where no endpoint got to release anything.
+    """
+    result = asyncio.run(_shutdown_finishes(tmp_path, grace=0.1, wait=5.0))
+    assert result.finished is True
+    assert result.torn_down is True, "exiting without the lifespan teardown is not the fix"
+
+
+def test_releasing_the_face_bus_exits_with_no_bound_at_all(tmp_path: Path) -> None:
+    """And the mechanism `schedule_exit` uses, which is the stronger statement: with
+    the bus closed the stream *ends*, so the response completes, the connection
+    closes on its own and the process leaves even with `timeout_graceful_shutdown`
+    still `None`. That is why the admin's restart is prompt and logs no error - the
+    bound above is only ever reached by a SIGTERM no endpoint saw coming.
+    """
+    result = asyncio.run(_shutdown_finishes(tmp_path, grace=None, wait=5.0, release=True))
+    assert result.finished is True
+    assert result.torn_down is True
 
 
 # --- .env secrets reach os.environ so MCP keys survive a restart -------------
