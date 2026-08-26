@@ -144,10 +144,11 @@ verdicts.
 - **Markdown is the source of truth.** Conversations, entity notes and the
   personality are plain wiki-linked files under `data/`, openable in Obsidian or
   `cat`. SQLite is a rebuildable index — delete it and run `daemon reindex`.
-- **File ownership is split, deliberately.** The seed persona is yours and the
-  code never writes to it; what it learns about you is its own file. That
-  asymmetry is what stops an evolving personality from drifting into whatever
-  agrees with you most.
+- **File ownership is split, deliberately.** The seed persona is yours — you
+  write it, by hand or in the admin console, and nothing the daemon produces is
+  ever written into it; what it learns about you is its own file. That asymmetry
+  is what stops an evolving personality from drifting into whatever agrees with
+  you most.
 
 Full layout, the write order and the measured latency budget:
 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
