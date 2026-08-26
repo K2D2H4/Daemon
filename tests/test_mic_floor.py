@@ -185,3 +185,31 @@ async def test_a_finished_request_does_not_clear_a_later_one(
     assert taken2 is not None and taken2[0] == "나중"
     mic_floor.answer(taken2[1], True)
     assert await later == "spoke"
+
+
+@pytest.mark.asyncio
+async def test_a_take_that_races_the_deadline_never_reports_no_listener() -> None:
+    """`no-listener` is the one answer that sends the caller to the speaker itself
+    (`ProactiveDelivery._say`), so returning it after `take` succeeded would say the
+    same sentence into the room twice - once by the wake loop that took it, once by
+    the caller that was told nobody had.
+
+    `take` sets the event and returns synchronously to a `_wake_round` that is about
+    to speak. Whether a timeout firing on the same loop iteration wins is a question
+    about asyncio's scheduling, and the answer must not depend on it: the event is
+    re-checked after the timeout, so the dangerous outcome is unreachable rather
+    than merely unlikely. Driven here with a deadline of zero, which is that race
+    with the timing removed."""
+    async def waiter() -> str:
+        return await mic_floor.request("한마디", wait_seconds=0)
+
+    task = asyncio.create_task(waiter())
+    await asyncio.sleep(0)
+    taken = mic_floor.take()
+    assert taken is not None, "the request must have been posted before the deadline ran"
+
+    mic_floor.answer(taken[1], True)
+    outcome = await task
+
+    assert outcome != "no-listener", "the caller would speak a line already being spoken"
+    assert outcome == "spoke"

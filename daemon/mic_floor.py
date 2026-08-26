@@ -126,11 +126,20 @@ async def request(text: str, *, wait_seconds: float = DEFAULT_TIMEOUT_SECONDS) -
         try:
             await asyncio.wait_for(taken.wait(), timeout=wait_seconds)
         except TimeoutError:
-            logger.info(
-                "mic floor: nothing took the line in %.0fs; no wake loop is listening",
-                wait_seconds,
-            )
-            return "no-listener"
+            if not taken.is_set():
+                logger.info(
+                    "mic floor: nothing took the line in %.0fs; no wake loop is listening",
+                    wait_seconds,
+                )
+                return "no-listener"
+            # Re-checked rather than argued. `no-listener` is the one answer that
+            # sends the caller to the speaker itself (`ProactiveDelivery._say`), so
+            # returning it after `take` succeeded would say the same sentence into
+            # the room twice. `take` sets this event and then returns synchronously
+            # to a `_wake_round` that is about to speak, and whether a timeout
+            # firing on the same loop iteration wins is a question about asyncio's
+            # scheduling that this module should not be relying on either way.
+            logger.info("mic floor: the take deadline and the take itself raced; taken wins")
         try:
             spoke = await asyncio.wait_for(
                 asyncio.shield(future), timeout=REPLY_CEILING_SECONDS
