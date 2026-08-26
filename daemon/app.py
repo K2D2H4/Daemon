@@ -1030,55 +1030,28 @@ this one is not something the owner lays out by hand - which is also why a missi
 cache here shows up as a download on first boot rather than as the "no weights"
 degradation below."""
 
-LIPSYNC_PUBLISH_SPACING = 0.010
-"""Minimum gap between two frames reaching the slot, and it is the difference between
-a 24fps mouth and a 12fps one.
-
-A model step computes `BATCH` = 2 frames, publishes the first and holds the second for
-the next call (`render.py:Renderer`). That next call costs no model time at all, so a
-loop that simply asked again immediately put both frames in the slot microseconds
-apart - and `Slot` is latest-wins, so the transport's 5ms poll never saw the first.
-Measured before this existed: 85 frames published, **47 seen at the socket, 38 lost**,
-and the mouth advanced two frames at a time. Exactly the failure `Renderer`'s own
-docstring predicts.
-
-10ms is two of `face_routes.FRAME_POLL_SECONDS`, so the first frame of a pair is in the
-slot across at least one poll. It is only ever waited *after* a step - the step's own
-~87ms already spaces the pair's second frame from the next pair's first. With it, three
-runs of 200+ frames each lost none."""
-
 LIPSYNC_CATCHUP_LIMIT = 64
-"""How many frame indices one tick may discard to stay level with the audio.
+"""How many frame indices one pass may discard to stay level with the audio.
 
 `FrameClock.due` hands back one frame per call and deliberately never skips - it says
 so, and its reason is that jumping forward after a hitch is worse than a moment of
 catching up. That is right about a hitch and wrong about a **structural** deficit, and
-this build has one: measured in situ, a two-frame model step costs 86.6ms against the
-83.3ms two frames are worth (74.7ms of it `engine.mouths`, 11ms the composite, the
-detail transfer and two JPEG encodes), so the loop sustains 20.4fps where the clock
-grants 24. Consuming one frame per grant then drifts by 15% of the utterance - 34
-frames, 1.4 seconds, over 9 seconds of speech, measured. That is not a mouth slightly
-behind, it is a different sentence.
+the first build had one: with the composite and the JPEGs in sequence behind the model
+step, a two-frame step cost 86.6ms against the 83.3ms two frames are worth, so the
+loop sustained 20.4fps where the clock granted 24 and consuming one grant per tick
+drifted the mouth 34 frames - 1.4 seconds - over 9 seconds of speech. Not a mouth
+slightly behind: a different sentence.
 
-So each tick takes the *newest* frame whose audio has already arrived and drops the
-ones behind it. What it costs is the skipped frames' own motion - about 3.4 of every 24
-- and the pairs stay contiguous because a step still renders `BATCH` neighbours, so at
-this deficit the jump between pairs is under half a frame. What it buys is twice over:
-the mouth stays at the audio front, and the crop's driving-frame index keeps tracking
-wall-clock elapsed the way the page's own `<video>` playhead does, which is the seam
-`face_routes.frames` describes and cannot fix from its side. Measured over 20 seconds
-of continuous speech, the rendered index stays within **0.1 frames (5ms)** of where the
-audio is, at 1s, 6s, 11s and 19s alike.
+That deficit is gone (`render.py:Renderer` splits the model half from the CPU half and
+`_lipsync_loop` runs them on two threads), so this now absorbs a *hitch* rather than a
+structural shortfall and is normally a no-op - the newest grant is the next one in
+sequence. What it still buys is the thing a hitch would otherwise cost permanently:
+the mouth stays at the audio front, and the rendered driving-frame index keeps
+tracking wall-clock elapsed the way the page's own `<video>` playhead does - measured
+at the socket, the overlay now sits a median **0.14 frames** behind that playhead
+where it used to sit 5.81 behind it (`render.py:DISPLAY_LEAD` closed the rest).
 
-The deficit itself is not fixable from here. Spec section 3 budgets 41.67ms a frame and
-assumes the CPU composite overlaps the GPU step, the way MuseTalk's own
-`realtime_inference.py` runs it on a second thread; `render.py:Renderer.render` does
-them in sequence in one call, so the 11ms lands on top of the 74.7ms instead of beside
-it. Overlapping them would put this back at ~23.6fps and remove the need to skip at
-all. That is a change to a file this task may not edit, so it is named here and in the
-report rather than made.
-
-The limit is a bound on one tick's work, not a policy: `due` returns None as soon as it
+The limit is a bound on one pass's work, not a policy: `due` returns None as soon as it
 reaches audio that has not arrived, so the drain ends on its own. 64 is two and a half
 seconds of frames - enough to absorb a long stall, small enough that a wild `origin`
 cannot spin here."""
@@ -1290,7 +1263,7 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
             sample_rate=OUTPUT_SAMPLE_RATE, width=2, seconds=LIPSYNC_RING_SECONDS
         )
         slot = Slot()
-        renderer = Renderer(engine=engine, cache=cache, ring=ring, slot=slot)
+        renderer = Renderer(engine=engine, cache=cache, ring=ring)
         clock = FrameClock(fps=fps)
         # One model step on THIS thread before the render loop ever uses another one,
         # and it is a requirement rather than a warm-up. **MLX aborts the process** -
@@ -1338,7 +1311,7 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
     )
 
     async def run() -> None:
-        await _lipsync_loop(face, renderer, clock, ring, queued, fps=fps)
+        await _lipsync_loop(face, renderer, clock, ring, queued, slot, fps=fps)
 
     return Lipsync(
         frames=_LipsyncFrames(renderer=renderer, slot=slot, clip=LIPSYNC_CLIP),
@@ -1353,34 +1326,48 @@ async def _lipsync_loop(
     clock: FrameClock,
     ring: PcmRing,
     queued: deque[tuple[bytes, float]],
+    slot: Slot,
     *,
     fps: float,
 ) -> None:
-    """One frame per tick while the daemon is speaking, in this process.
+    """One frame into the `Slot` per frame interval while the daemon is speaking.
 
     In-process, not a subprocess: CONTRACTS 9 allows the former explicitly and the
     model has to read audio this process is holding.
 
-    **The model step runs in a thread, the decisions do not.** A step is ~75ms of
-    UNet and TAESD for two frames (measured here, on the assembled engine), and run
-    inline it would hold the event loop for most of every 83ms - starving the voice
-    websocket, the audio pump and the activity stream, which is the difference between
-    a lip-synced face and a stuttering conversation. Draining the queue and asking
-    `FrameClock` stay here, on the loop, because `loop.time()` is the clock the audio
-    is stamped with and because it keeps the ring single-threaded (see the sink's
-    comment in `_build_lipsync`).
+    **Two halves, because one cannot be both.** Producing a frame takes longer than
+    displaying one - a model step covers `BATCH` frames and costs ~73ms against the
+    83.3ms two frames are worth - so a single loop that both stepped and published
+    could only publish between steps, in pairs. That is what the first build did, and
+    at the socket it measured 20.1fps arriving as pairs at 10Hz (gap median 81.6ms
+    where a frame is 41.67ms): a head moving smoothly over a mouth that stutters,
+    which is what the owner read as the picture getting worse the moment it spoke. So
+    `_step` produces into `ready` and `_publish` drains it on the clock. Nothing
+    serial fixes this - measured, releasing the held frame a whole interval later
+    instead made the cycle 117ms and dropped the socket to 14.2fps.
 
-    **Its own single-worker executor, not `asyncio.to_thread`.** Two reasons and both
-    are about the shared default executor: a 75ms model step queued in it delays
-    whatever else the process offloads there (starlette runs sync route handlers and
-    file responses through it), and MLX is only safe off the loading thread once
+    **The model step runs in a thread, the decisions do not.** ~73ms of UNet and
+    TAESD run inline would hold the event loop for most of every 83ms - starving the
+    voice websocket, the audio pump and the activity stream, which is the difference
+    between a lip-synced face and a stuttering conversation. Draining `queued` and
+    asking `FrameClock` stay here, on the loop, because `loop.time()` is the clock the
+    audio is stamped with and because it keeps the ring single-threaded (see the
+    sink's comment in `_build_lipsync`).
+
+    **Two single-worker executors, not `asyncio.to_thread`.** Two workers because the
+    CPU tail has to overlap the next model step or the ceiling is 42ms a frame instead
+    of 36.6 (`render.py:Renderer`), and *single*-worker each because `Renderer.encode`
+    reuses one frame buffer and MLX is only safe off the loading thread once
     `_build_lipsync`'s warm-up step has run - one thread of our own makes that a fact
-    about this loop rather than about whichever pool worker happened to be free.
+    about this loop rather than about whichever pool worker happened to be free. Not
+    the shared default executor either: a 73ms step queued in it delays whatever else
+    the process offloads there (starlette runs sync route handlers and file responses
+    through it).
 
-    **`loop.time()` for both `now` and `origin`.** `daemon/voice/conversation.py`
-    stamps every chunk with it deliberately (its `_playback_until` note), and
-    `daemon.clock.now()` here would type-check, run, and put the mouth an arbitrary
-    offset from the sound.
+    **`loop.time()` for `now`, `origin` and the publish grid.**
+    `daemon/voice/conversation.py` stamps every chunk with it deliberately (its
+    `_playback_until` note), and `daemon.clock.now()` here would type-check, run, and
+    put the mouth an arbitrary offset from the sound.
 
     **Only while `speaking`.** The measured throughput has 13% of headroom on a real
     duty cycle and none on a continuous run, and the idle windows are also where
@@ -1390,101 +1377,166 @@ async def _lipsync_loop(
 
     **Catches at the top level, once.** A background task that raises is logged by
     nobody and leaves a schedule reading as healthy forever - the failure this
-    project's own brief names. `Renderer.render` already swallows an engine failure
-    into `failed`; this is for everything else in the tick.
+    project's own brief names. Both `Renderer` halves already swallow their own
+    failure into `failed`; this is for everything else, and the publisher carries the
+    same guard because a task nobody awaits is exactly the shape that goes unnoticed.
     """
+    from daemon.face_lipsync.render import BATCH
+
     loop = asyncio.get_running_loop()
     interval = 1.0 / fps
-    speaking = False
-    holding = False
-    frame = 0
-    origin = 0.0
-    wait = interval
+    ready: asyncio.Queue[bytes] = asyncio.Queue()
+    turn = 0
+    """Bumped on every falling edge. A pair whose encode outlived its own utterance is
+    dropped rather than published into the next one - the last turn's mouth finishing
+    somebody else's sentence, at exactly the moment the page fades the face in."""
+
+    def collect(at: int, encoded: asyncio.Future[list[bytes]]) -> None:
+        """The CPU half's output, back on the event loop, in pair order.
+
+        A callback and not an await, because the whole point of the second worker is
+        that this runs *during* the next model step: awaiting it before starting that
+        step would serialise the two again, and awaiting it after would put every
+        pair's JPEGs a step - 73ms - further behind the sound for nothing.
+        """
+        if at != turn or encoded.cancelled():
+            return
+        for frame in encoded.result():
+            ready.put_nowait(frame)
+
+    async def publish() -> None:
+        """One frame into the slot per interval, and never two inside one.
+
+        `Slot` is latest-wins and never queues, so two puts closer together than the
+        transport's 5ms poll means the first is simply never seen: measured on the
+        build where a step published its own pair, **85 frames published, 47 seen at
+        the socket, 38 lost**, and the mouth advanced two frames at a time. The queue
+        is here rather than in `Slot` for the reason `Slot`'s docstring gives - a
+        transport that queued would show a mouth lagging the sound by however far
+        behind the reader is - and this side is the only place that knows the frame
+        rate the queue should come out at.
+
+        `target` is a grid, not `now + interval`: a put lands on it, so the average
+        gap is exactly one interval and the sleep's own overshoot does not accumulate
+        into 23fps. The floor is what stops a frame that arrived late from following
+        the one before it too closely.
+        """
+        target = loop.time()
+        try:
+            while True:
+                frame = await ready.get()
+                delay = target - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if face.state.activity == "speaking":
+                    # Checked here and not only at the falling edge: this half can be
+                    # holding a frame it took out of the queue before the turn ended,
+                    # and a frame whose sound has already finished playing is not a
+                    # frame anyone wants to see.
+                    slot.put(frame)
+                target = max(target + interval, loop.time() + interval / 2)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("face: the lip-sync publisher failed")
+
     try:
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="face-lipsync") as pool:
-            while not renderer.failed:
-                await asyncio.sleep(wait)
-                # Every path below sets its own next wait, and an absolute tick grid
-                # is what this replaced: a step overruns one interval, so the grid is
-                # permanently behind, every later sleep collapses to zero, and both
-                # frames of a pair land in the slot together - 38 of 85 frames never
-                # seen at the socket (see LIPSYNC_PUBLISH_SPACING).
-                while queued:
-                    chunk, audible_at = queued.popleft()
-                    ring.feed(chunk, audible_at)
-                if face.state.activity != "speaking":
-                    if speaking:
-                        speaking = False
-                        holding = False
-                        release_lipsync_memory()
-                    wait = interval
-                    continue
-                speaking = True
-                if holding:
-                    # The pair's second frame is already rendered and waiting inside
-                    # the renderer, so this call costs nothing and needs no grant from
-                    # the clock. Asking for one anyway is what made 60 ticks of a
-                    # 9-second turn do nothing at all: the drain below had already
-                    # taken every grant up to the audio front, so a frame in hand sat
-                    # there for a whole interval waiting for permission it did not
-                    # need.
-                    await loop.run_in_executor(
-                        pool,
+        with (
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="face-lipsync"
+            ) as model,
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="face-lipsync-cpu"
+            ) as cpu,
+        ):
+            pacer = asyncio.create_task(publish(), name="face-lipsync-publish")
+            try:
+                speaking = False
+                sent: int | None = None
+                wait = interval
+                while not renderer.failed:
+                    await asyncio.sleep(wait)
+                    # Every path below sets its own next wait. An absolute tick grid
+                    # is what this replaced: a step overruns one interval, so the grid
+                    # is permanently behind and every later sleep collapses to zero.
+                    while queued:
+                        chunk, audible_at = queued.popleft()
+                        ring.feed(chunk, audible_at)
+                    if face.state.activity != "speaking":
+                        if speaking:
+                            speaking = False
+                            sent = None
+                            turn += 1
+                            while not ready.empty():
+                                ready.get_nowait()
+                            release_lipsync_memory()
+                        wait = interval
+                        continue
+                    speaking = True
+                    if ready.qsize() >= BATCH:
+                        # Backpressure, and the only thing that bounds the queue: a
+                        # whole pair still unpublished means the publisher is the slow
+                        # half, and another step would buy latency rather than motion.
+                        wait = interval / 4
+                        continue
+                    # Read `origin` once and pass the same value to the clock and the
+                    # renderer: it moves, and asking twice would let the frame the
+                    # clock allowed be windowed against a different one.
+                    origin = ring.origin
+                    # The newest frame whose audio is already here, not the next one in
+                    # sequence - see LIPSYNC_CATCHUP_LIMIT. `None` is normal rather
+                    # than a fault: a step covers `BATCH` frames and cannot start until
+                    # the last of them has its audio, so the first passes of a turn are
+                    # a wait by design.
+                    found = None
+                    for _ in range(LIPSYNC_CATCHUP_LIMIT):
+                        due = clock.due(now=loop.time(), origin=origin)
+                        if due is None:
+                            break
+                        found = due
+                    if found is None:
+                        # A quarter of a frame, not a whole one: the next grant is less
+                        # than an interval away and sleeping a full one overshoots it.
+                        wait = interval / 4
+                        continue
+                    if sent is not None and found < sent:
+                        # The count went backwards, so the clock re-anchored under us -
+                        # a new turn inside one speaking stretch, or a barge-in. The
+                        # contiguity below is measured from the new count, not the old
+                        # one, or the loop would wait for a grant that will never come.
+                        sent = None
+                    if sent is not None and found < sent + BATCH:
+                        # A pair has to start where the last one ended. `due` hands out
+                        # one grant per call and a step covers `BATCH` of them, so this
+                        # half is now *faster* than the clock it is paced by - 27.3fps
+                        # of capacity against 24fps of grants - and a pass that gained
+                        # only one grant has nothing new to render. Stepping anyway
+                        # would render `found + 1` a second time and publish it twice:
+                        # a mouth that pauses for a frame three times a second, which
+                        # is a stutter rather than a frame rate. The first build could
+                        # not reach this - it ran at 20fps, behind the grants, always
+                        # skipping forward.
+                        wait = interval / 4
+                        continue
+                    sent = found
+                    # Awaited, and that is what keeps the ring lock-free: the drain
+                    # above is the only writer and it cannot run while this is in
+                    # flight. `Renderer.step` reads the ring inside the thread.
+                    step = await loop.run_in_executor(
+                        model,
                         partial(
-                            renderer.render, frame_index=frame, origin=origin, fps=fps
+                            renderer.step, frame_index=found, origin=origin, fps=fps
                         ),
                     )
-                    holding = False
-                    # Straight on to the next step rather than waiting another
-                    # interval: the model work is ~75ms of a 83ms two-frame budget, so
-                    # starting it the moment the held frame is out is what keeps the
-                    # next pair's first frame on the grid instead of a step behind it.
+                    if step is None:
+                        continue        # latched; the `while` above ends the loop
+                    encoding = loop.run_in_executor(cpu, renderer.encode, step)
+                    encoding.add_done_callback(partial(collect, turn))
+                    # Straight on: the next step's 73ms is the window this pair's
+                    # 11ms of compositing and JPEG has to finish inside.
                     wait = 0.0
-                    continue
-                # Read `origin` once and pass the same value to the clock and the
-                # renderer: it moves, and asking twice would let the frame the clock
-                # allowed be windowed against a different one.
-                origin = ring.origin
-                # The newest frame whose audio is already here, not the next one in
-                # sequence - see LIPSYNC_CATCHUP_LIMIT for the 1.4s of drift that
-                # buys back. `None` is normal rather than a fault: a step covers
-                # `BATCH` frames and cannot start until the last of them has its
-                # audio, so the first ticks of a turn are a wait by design.
-                found = None
-                for _ in range(LIPSYNC_CATCHUP_LIMIT):
-                    ready = clock.due(now=loop.time(), origin=origin)
-                    if ready is None:
-                        break
-                    found = ready
-                if found is None:
-                    # A quarter of a frame, not a whole one: the next grant is less
-                    # than an interval away and sleeping a full one overshoots it.
-                    wait = interval / 4
-                    continue
-                frame = found
-                await loop.run_in_executor(
-                    pool,
-                    partial(renderer.render, frame_index=frame, origin=origin, fps=fps),
-                )
-                # `holding` is asked, not inferred from how long the call took. The
-                # version this replaced timed it and then waited LIPSYNC_PUBLISH_SPACING
-                # - 10ms - before releasing the pair's second frame, so both landed
-                # inside a tenth of a frame and the next 80ms was empty. At the socket
-                # that is 20fps arriving as pairs at 10Hz, and the owner read it
-                # exactly that way: a head moving smoothly over a mouth that stutters.
-                # One frame per interval is the whole point of a frame rate.
-                holding = renderer.holding
-                # LIPSYNC_PUBLISH_SPACING and not `interval`, and this was measured
-                # both ways. Releasing the held frame a whole interval later evens the
-                # cadence on paper and costs more than it buys: the model step is 75ms
-                # of an 83.3ms two-frame budget, so waiting 41.7ms on top of it makes
-                # the cycle 117ms and the socket drops from 19.9fps to 14.2fps, with
-                # the gap median no better (83ms either way). Nothing serial fixes this
-                # - the step has to overlap the release, which means the loop
-                # publishing from a queue instead of the renderer publishing inline.
-                # Named here rather than attempted: it is a change to Renderer, and
-                # 19.9fps arriving in pairs beats 14.2fps arriving in pairs.
-                wait = LIPSYNC_PUBLISH_SPACING if holding else 0.0
+            finally:
+                pacer.cancel()
     except asyncio.CancelledError:
         # Shutdown, not a failure. Explicit because the clause below would not catch
         # it anyway and a reader should not have to know that.

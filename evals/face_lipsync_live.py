@@ -211,12 +211,104 @@ def report_phase(name: str, reader: FrameReader, mark: int, began: float) -> dic
         ),
         "gap_ms_max": round(max(gaps) * 1000, 1) if gaps else None,
         "kb_median": round(statistics.median(sizes) / 1024, 1),
+        # Every gap, not just the summary: the failure this feature keeps having is
+        # bimodal - a pair arriving together and then a hole - and a median alone
+        # cannot tell that from an even cadence at the same average rate.
+        "gaps_ms": [round(gap * 1000, 1) for gap in gaps],
     }
     print(
         f"  {name}: {stats['frames']} frames in {stats['seconds']}s = "
         f"{stats['fps']} fps | first at +{stats['first_frame_after']}s | "
         f"gap med {stats['gap_ms_median']}ms p90 {stats['gap_ms_p90']}ms "
         f"max {stats['gap_ms_max']}ms | {stats['kb_median']}KB/frame"
+    )
+    return stats
+
+
+Box = tuple[int, int, int, int]
+
+
+def _tell_tale(driving: np.ndarray, crop_boxes: list[Box]) -> Box:
+    """A 48x48 patch that identifies which driving frame a received JPEG was built on.
+
+    Outside every crop box, so the composite leaves it byte-identical to the driving
+    clip, and the highest-variance window that qualifies - a patch of still background
+    would match all 193 frames equally well and JPEG noise would pick the winner.
+    """
+    n, height, width = driving.shape[:3]
+    sample = np.asarray(driving[:: max(1, n // 24)], dtype=np.float32)
+    moving = sample.std(axis=0).mean(axis=2)
+    for xs, ys, xe, ye in crop_boxes:                 # never read the mouth region
+        moving[max(0, ys - 8) : ye + 8, max(0, xs - 8) : xe + 8] = -1.0
+    size, best, at = 48, -1.0, (0, 0)
+    for y in range(0, height - size, 24):
+        for x in range(0, width - size, 24):
+            block = moving[y : y + size, x : x + size]
+            if block.min() < 0:
+                continue
+            if block.mean() > best:
+                best, at = float(block.mean()), (x, y)
+    return at[0], at[1], at[0] + size, at[1] + size
+
+
+def report_alignment(
+    frames: list[bytes],
+    arrivals: list[float],
+    began: float,
+    *,
+    cache_dir: Path,
+    fps: float,
+) -> dict:
+    """Which driving frame each JPEG carries, against the one the page is showing.
+
+    The page runs the driving clip from frame 0 at 1.0x from the moment `speaking`
+    arrives, and lays the rendered frame over it - so at the 180ms crossfade in
+    `daemon/static/face.html` the two are dissolved into each other. If the renderer
+    is N frames behind the playhead, that dissolve is between two poses N frames
+    apart in the avatar's own motion, and N is what this measures. It is also the
+    audio-to-mouth lag, because a frame's driving index and its audio window index
+    are the same number.
+
+    Two numbers in one, and which one this is depends on
+    `render.py:DISPLAY_LEAD`. With no lead the driving index and the audio index are
+    the same number, so this is both the pose offset and the audio-to-mouth lag. With
+    the lead applied this is the *residual* pose offset - the thing the crossfade
+    dissolves across, and it should read near zero - and the audio lag is this plus
+    `DISPLAY_LEAD`.
+
+    The frame is identified rather than trusted: `_tell_tale` finds a patch the
+    composite never touches, and the driving frame whose patch is closest is the one
+    this JPEG was built on.
+    """
+    import cv2
+
+    driving = np.load(cache_dir / "frames.npy", mmap_mode="r")
+    meta = json.loads((cache_dir / "boxes.json").read_text())
+    x1, y1, x2, y2 = _tell_tale(driving, [tuple(b) for b in meta["crop_boxes"]])
+    book = np.asarray(driving[:, y1:y2, x1:x2], dtype=np.float32).reshape(
+        driving.shape[0], -1
+    )
+    lags = []
+    for payload, at in zip(frames, arrivals, strict=True):
+        image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+        patch = image[y1:y2, x1:x2].astype(np.float32).reshape(-1)
+        index = int(np.abs(book - patch).mean(axis=1).argmin())
+        # Unwrap the clip's cycle: the page's playhead does not wrap at 193 in one
+        # utterance, but the renderer's index is taken modulo the clip length.
+        elapsed = (at - began) * fps
+        cycles = round((elapsed - index) / driving.shape[0])
+        lags.append(elapsed - (index + cycles * driving.shape[0]))
+    stats = {
+        "tell_tale_box": [x1, y1, x2, y2],
+        "lag_frames_median": round(statistics.median(lags), 2),
+        "lag_ms_median": round(statistics.median(lags) / fps * 1000, 1),
+        "lag_frames_first": round(lags[0], 2),
+        "lag_frames_last": round(lags[-1], 2),
+    }
+    print(
+        f"  pose behind the page's playhead: median {stats['lag_frames_median']} frames "
+        f"({stats['lag_ms_median']}ms) | first {stats['lag_frames_first']} | "
+        f"last {stats['lag_frames_last']}"
     )
     return stats
 
@@ -450,6 +542,13 @@ async def main() -> int:
     )
     print(f"keepalive comments on the frame stream: {reader.keepalives}")
 
+    alignment = {}
+    if phase1_frames:
+        print("\nthe overlay against the clip the page is playing under it:")
+        alignment = report_alignment(
+            phase1_frames, phase1_arrivals, phase1_began, cache_dir=clip_dir, fps=fps
+        )
+
     if phase1_frames:
         print("\nthe thing to look at:")
         write_video(
@@ -481,6 +580,7 @@ async def main() -> int:
                     "active_after_idle": round(idle_active, 1),
                     "cached_after_idle": round(idle_cache, 1),
                 },
+                "alignment": alignment,
                 "keepalives": reader.keepalives,
                 "fps": fps,
                 "feed_rate_x_realtime": args.rate,

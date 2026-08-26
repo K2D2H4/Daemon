@@ -107,9 +107,9 @@ class LipsyncFrames(Protocol):
 
         Latest wins: this returns whatever is there now and never a backlog. A
         transport that queued would show a mouth lagging the sound by however far
-        behind the reader is, which is worse than dropping movement. It also returns
-        None on the ticks between model steps, which is normal rather than a fault -
-        a step covers two frames and releases them one apart.
+        behind the reader is, which is worse than dropping movement. Repeating the
+        same bytes between polls is normal rather than a fault: the producer paces one
+        frame in here per 41.67ms and this side polls eight times as often.
         """
         ...
 
@@ -282,11 +282,11 @@ async def frames(request: Request) -> Response:
     `<img>`. That is the fallback signal.
 
     Latest-wins, never a queue. `daemon/face_lipsync/ring.py:Slot` holds one frame and
-    `get()` returns whatever is there; identity comparison skips the ticks between
-    model steps, which are normal - a step covers two frames and releases them one
-    apart. Polling at `FRAME_POLL_SECONDS` rather than waiting on a condition keeps
-    this side free of the renderer's threading (`Slot` takes a lock, and this never
-    holds that lock across an await).
+    `get()` returns whatever is there; the identity comparison skips the polls between
+    two frames, which is most of them - `daemon/app.py:_lipsync_loop` puts one frame in
+    there per 41.67ms and this side looks eight times as often. Polling rather than
+    waiting on a condition keeps this side free of the renderer's threading (`Slot`
+    takes a lock, and this never holds that lock across an await).
     """
     source = _lipsync(request.app)
     if source is None:

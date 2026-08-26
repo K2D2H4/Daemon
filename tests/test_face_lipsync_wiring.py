@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import deque
 from functools import partial
 from pathlib import Path
@@ -142,26 +143,47 @@ def test_the_assembled_app_starts_with_no_mouth_and_no_sink(tmp_path):
 
 
 class FakeRenderer:
-    """Records what it was asked to render. `failed` is settable, like the real
-    latch."""
+    """Two halves, like the real one, and it publishes nothing.
 
-    def __init__(self) -> None:
+    `step` runs on a worker thread and returns an opaque token; `encode` turns that
+    token into two identifiable byte strings. What a test then asserts on is which of
+    those reached the `Slot` and when - the pacing that used to be inside `Renderer`
+    is the loop's now, so it has to be visible from out here.
+    """
+
+    def __init__(self, *, step_seconds: float = 0.0) -> None:
         self.failed = False
         self.calls: list[tuple[int, float, float]] = []
-        self.holding = False
-        """Alternates, like the real one: a model step leaves the pair's second frame
-        held, and the next call publishes it and does no work. The loop paces off this
-        rather than off how long the call took, so a fake that always reported False
-        would let the loop release both frames of a pair inside one tick again."""
+        self.encoded: list[int] = []
+        self.in_flight = False
+        """True while `step` is on the worker thread. `FakeRing` asserts against it:
+        the real ring has no lock, and the loop's whole reason for awaiting the step
+        is that it must never feed one while a step is reading it."""
+        self._step_seconds = step_seconds
+        """Blocking time per step, for the tests about overlap. A real one is ~73ms."""
+        self.label = "a"
+        """Stamped into every encoded frame. A test that flips this between two turns
+        can tell which turn a frame in the slot came from, which frame indices cannot
+        do - the real clock restarts its count at every turn boundary."""
 
-    def render(self, *, frame_index: int, origin: float, fps: float) -> None:
-        self.calls.append((frame_index, origin, fps))
-        self.holding = not self.holding
+    def step(self, *, frame_index: int, origin: float, fps: float) -> int | None:
+        self.in_flight = True
+        try:
+            if self._step_seconds:
+                time.sleep(self._step_seconds)
+            self.calls.append((frame_index, origin, fps))
+            return frame_index
+        finally:
+            self.in_flight = False
+
+    def encode(self, step: int) -> list[bytes]:
+        self.encoded.append(step)
+        return [f"{self.label}{step}-0".encode(), f"{self.label}{step}-1".encode()]
 
 
 class FakeClock:
     """`FrameClock` with the arithmetic replaced by a script, so a test can say
-    "this tick has a frame and that one does not" without simulating audio."""
+    "this pass has a frame and that one does not" without simulating audio."""
 
     def __init__(self, answers: list[int | None]) -> None:
         self.answers = answers
@@ -172,27 +194,80 @@ class FakeClock:
         return self.answers.pop(0) if self.answers else None
 
 
+class PacedClock:
+    """`FrameClock`'s pacing without its windowing: the frame whose time has come.
+
+    `FakeClock`'s scripted list cannot express "and keep going", which is exactly what
+    the throughput tests need - the real clock grants at `fps` off the playback
+    timeline and that rate is what the loop is paced by.
+    """
+
+    def __init__(self, *, fps: float) -> None:
+        self._fps = fps
+        self._frame = 0
+        self._began: float | None = None
+
+    def due(self, *, now: float, origin: float) -> int | None:
+        if self._began is None:
+            self._began = now
+        if (now - self._began) * self._fps < self._frame:
+            return None
+        frame = self._frame
+        self._frame += 1
+        return frame
+
+
 class FakeRing:
     """Records feeds and reports a fixed origin. The real ring's arithmetic is
     `tests/test_face_lipsync_ring.py`'s subject, not this file's."""
 
-    def __init__(self, origin: float = 100.0) -> None:
+    def __init__(self, origin: float = 100.0, renderer: FakeRenderer | None = None) -> None:
         self.origin = origin
         self.fed: list[tuple[bytes, float]] = []
+        self._renderer = renderer
+        """Given one, every feed asserts no step is in flight - see FakeRenderer."""
 
     def feed(self, chunk: bytes, audible_at: float) -> None:
+        if self._renderer is not None and self._renderer.in_flight:
+            raise AssertionError(
+                "the ring was fed while a model step was reading it - PcmRing has no "
+                "lock, and `feed` rebinds its samples before it advances its origin"
+            )
         self.fed.append((chunk, audible_at))
 
 
-async def _run_loop(face, renderer, clock, ring, queued, *, stop_after: float):
+class RecordingSlot:
+    """`Slot` plus the moment of each put, which is what these tests measure.
+
+    The real `Slot` is latest-wins and never queues, so a put that lands inside the
+    same tick as the one before it is a frame nothing ever sees. Timing it is the only
+    way to assert that from out here.
+    """
+
+    def __init__(self) -> None:
+        self.puts: list[bytes] = []
+        self.at: list[float] = []
+
+    def put(self, frame: bytes) -> None:
+        self.puts.append(frame)
+        self.at.append(asyncio.get_running_loop().time())
+
+    @property
+    def gaps(self) -> list[float]:
+        return [b - a for a, b in zip(self.at, self.at[1:], strict=False)]
+
+
+async def _run_loop(face, renderer, clock, ring, queued, *, stop_after: float, slot=None):
     """Drive `_lipsync_loop` for `stop_after` seconds, then cancel it."""
+    slot = RecordingSlot() if slot is None else slot
     task = asyncio.create_task(
-        _lipsync_loop(face, renderer, clock, ring, queued, fps=FPS)
+        _lipsync_loop(face, renderer, clock, ring, queued, slot, fps=FPS)
     )
     await asyncio.sleep(stop_after)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    return slot
 
 
 async def test_an_idle_face_never_reaches_the_model(monkeypatch):
@@ -208,44 +283,163 @@ async def test_an_idle_face_never_reaches_the_model(monkeypatch):
     assert not clock.asked, "an idle tick must not even ask which frame is due"
 
 
-async def test_the_loop_renders_the_newest_frame_whose_audio_has_arrived(monkeypatch):
-    """One render per tick, at the audio front - not the next index in sequence.
+async def test_the_loop_steps_the_newest_frame_whose_audio_has_arrived(monkeypatch):
+    """One step per pair, at the audio front - not the next index in sequence.
 
-    `FrameClock.due` never skips, on purpose, and against a hitch that is right. This
-    build has a structural deficit instead: a two-frame step measures 85.9ms in situ
-    against the 83.3ms two frames are worth, so consuming one grant per tick drifted
-    the mouth 1.4s behind over 9s of speech (measured). So the loop drains the grants
-    it is behind on and renders the newest - here 0 and 1 are dropped and 2 is drawn.
+    `FrameClock.due` never skips, on purpose, and against a hitch that is right. A
+    hitch still has to be caught up on though, or the mouth stays behind for the rest
+    of the utterance: measured on the build whose step overran its budget, consuming
+    one grant per tick drifted the mouth 1.4s behind over 9s of speech. So the loop
+    drains the grants it is behind on and steps at the newest - here 0 and 1 are
+    dropped and 2 is drawn.
     """
     monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
     face = FaceBus()
     face.set_activity("speaking")
     renderer, clock, ring = FakeRenderer(), FakeClock([0, 1, 2, None, 7, None]), FakeRing()
-    await _run_loop(face, renderer, clock, ring, deque(), stop_after=0.3)
-    # Each model step is followed one interval later by the release of the pair's
-    # second frame, at the same index - so a step at 2 and a step at 7 read as
-    # [2, 2, 7, 7]. The releases cost no model work; they are what makes the socket
-    # see one frame per interval instead of two 10ms apart.
-    assert [call[0] for call in renderer.calls] == [2, 2, 7, 7]
+    slot = await _run_loop(face, renderer, clock, ring, deque(), stop_after=0.3)
+    # One call per pair now, not two: the pair's second frame is a queued JPEG the
+    # publisher releases an interval later, not a second trip through the renderer.
+    assert [call[0] for call in renderer.calls] == [2, 7]
     assert all(call[1] == ring.origin for call in renderer.calls)
     assert all(call[2] == FPS for call in renderer.calls)
+    # And both frames of each pair reach the slot, in order.
+    assert slot.puts == [b"a2-0", b"a2-1", b"a7-0", b"a7-1"]
 
 
-async def test_a_tick_whose_audio_has_not_arrived_renders_nothing(monkeypatch):
-    """The batch-fill wait, which is most of the ticks at the start of a turn: a step
-    covers two frames and cannot begin until the second one's audio is here. Rendering
+async def test_a_pass_whose_audio_has_not_arrived_renders_nothing(monkeypatch):
+    """The batch-fill wait, which is most of the passes at the start of a turn: a step
+    covers two frames and cannot begin until the second one's audio is here. Stepping
     anyway would not fail - `PcmRing.window` zero-fills - it would silently condition
     the mouth on silence."""
     monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
     face = FaceBus()
     face.set_activity("speaking")
     renderer, clock, ring = FakeRenderer(), FakeClock([None, None, 4]), FakeRing()
-    await _run_loop(face, renderer, clock, ring, deque(), stop_after=0.2)
-    # Two calls, not one, and the second is not a second step: a model step leaves the
-    # pair's second frame held, and the loop releases it one interval later at the same
-    # index. Asserting a single call here is what let both frames of a pair go out
-    # 10ms apart.
-    assert [call[0] for call in renderer.calls] == [4, 4]
+    slot = await _run_loop(face, renderer, clock, ring, deque(), stop_after=0.2)
+    assert [call[0] for call in renderer.calls] == [4]
+    assert slot.puts == [b"a4-0", b"a4-1"], "the pair still goes out, one frame apart"
+
+
+async def test_the_pair_goes_out_one_frame_apart_and_never_two_in_one_tick(monkeypatch):
+    """The defect that made 20fps read as 10Hz, asserted at the slot.
+
+    `Slot` is latest-wins, so two puts closer together than the transport's 5ms poll
+    means the first is never seen - measured on the build where a step published its
+    own pair, 85 published and 38 of them lost. The owner read it exactly as it looks:
+    a head moving smoothly over a mouth that stutters. One frame per interval is the
+    whole point of a frame rate.
+    """
+    monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
+    face = FaceBus()
+    face.set_activity("speaking")
+    renderer, ring = FakeRenderer(), FakeRing()
+    slot = await _run_loop(
+        face, renderer, PacedClock(fps=FPS), ring, deque(), stop_after=0.6
+    )
+    assert len(slot.puts) >= 8, f"only {len(slot.puts)} frames in 0.6s"
+    interval = 1.0 / FPS
+    assert min(slot.gaps) > interval / 2, (
+        f"two frames landed {min(slot.gaps) * 1000:.1f}ms apart - closer than half a "
+        f"frame is a frame nothing will ever see: {[round(g * 1000, 1) for g in slot.gaps]}"
+    )
+    assert len(set(slot.puts)) == len(slot.puts), "a frame was published twice"
+
+
+async def test_the_next_model_step_runs_while_the_pair_is_still_going_out(monkeypatch):
+    """The throughput fix, and the only test here that can see it.
+
+    A step is ~73ms of model work for two frames worth 83.3ms, so a loop that had to
+    finish publishing before it could step again spent the publishing time idle and
+    the socket saw 20.1fps. Here the step blocks for 60ms - longer than a frame - and
+    the assertion is that frames keep landing at the frame rate anyway, which is only
+    possible if the publisher runs while the step does.
+    """
+    monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
+    face = FaceBus()
+    face.set_activity("speaking")
+    renderer = FakeRenderer(step_seconds=0.060)
+    slot = await _run_loop(
+        face, renderer, PacedClock(fps=FPS), FakeRing(), deque(), stop_after=0.6
+    )
+    interval = 1.0 / FPS
+    # 0.6s is 14 frames. Serial, a 60ms step per pair caps this at 20 - and every
+    # frame would arrive in a pair, so the gaps would alternate ~0 and ~60ms.
+    assert len(slot.puts) >= 11, f"only {len(slot.puts)} frames in 0.6s"
+    assert max(slot.gaps) < interval * 2, (
+        "a whole step went by with nothing published: "
+        f"{[round(g * 1000, 1) for g in slot.gaps]}"
+    )
+
+
+async def test_the_ring_is_never_fed_while_a_model_step_is_reading_it(monkeypatch):
+    """`PcmRing` has no lock, and this is why it does not need one.
+
+    `feed` rebinds the sample array and *then* advances the origin, so a `window()`
+    landing between those two statements reads new samples against a stale origin - a
+    window off by one chunk, which is a mouth off by one chunk. The step runs on a
+    thread and reads the ring there, so the guarantee is that the loop awaits it: the
+    drain cannot run while a step is in flight. `FakeRing` raises if it ever does, and
+    the loop logs rather than propagates, so the assertion is that nothing was logged.
+    """
+    monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
+    face = FaceBus()
+    face.set_activity("speaking")
+    renderer = FakeRenderer(step_seconds=0.050)
+    ring = FakeRing(renderer=renderer)
+    queued: deque[tuple[bytes, float]] = deque()
+
+    async def feeding() -> None:
+        """Audio arriving mid-step, which is when it always arrives."""
+        while True:
+            await asyncio.sleep(0.01)
+            queued.append((b"\x01\x02", 1.0))
+
+    pump = asyncio.create_task(feeding())
+    try:
+        await _run_loop(
+            face, renderer, PacedClock(fps=FPS), ring, queued, stop_after=0.5
+        )
+    finally:
+        pump.cancel()
+    assert len(ring.fed) > 10, "the fixture never fed anything"
+
+
+async def test_the_falling_edge_drops_a_pair_the_next_turn_must_not_show(monkeypatch):
+    """A frame from the utterance that just ended, published into the first interval
+    of the next one, is the mouth finishing somebody else's sentence - at exactly the
+    moment the page is fading the face in. The CPU half can still be encoding when
+    the turn ends, so the queue is emptied and the in-flight pair is disowned.
+    """
+    monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
+    face = FaceBus()
+    face.set_activity("speaking")
+    renderer, ring = FakeRenderer(), FakeRing()
+    slot = RecordingSlot()
+    # Twice the frame rate, so production runs into the loop's backpressure limit and
+    # a whole pair is always waiting when the turn ends. At the real 24fps of grants
+    # the queue hovers at one frame and the leak would be intermittent.
+    task = asyncio.create_task(
+        _lipsync_loop(
+            face, renderer, PacedClock(fps=FPS * 2), ring, deque(), slot, fps=FPS
+        )
+    )
+    await asyncio.sleep(0.15)
+    face.set_activity("idle")
+    renderer.label = "b"               # everything encoded from here belongs to turn 2
+    await asyncio.sleep(0.15)
+    published = list(slot.puts)
+    assert published, "the first turn published nothing at all"
+    face.set_activity("speaking")
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    fresh = slot.puts[len(published):]
+    assert fresh, "the second turn published nothing at all"
+    assert all(frame.startswith(b"b") for frame in fresh), (
+        f"the new turn opened with the last turn's frames: {fresh}"
+    )
 
 
 async def test_the_clock_is_asked_in_the_event_loop_s_own_time(monkeypatch):
@@ -339,7 +533,7 @@ async def test_the_end_of_speech_hands_back_the_gpu_cache(monkeypatch):
     face.set_activity("speaking")
     renderer, clock, ring = FakeRenderer(), FakeClock([0]), FakeRing()
     task = asyncio.create_task(
-        _lipsync_loop(face, renderer, clock, ring, deque(), fps=FPS)
+        _lipsync_loop(face, renderer, clock, ring, deque(), RecordingSlot(), fps=FPS)
     )
     await asyncio.sleep(0.1)
     assert not released, "nothing to release while it is still speaking"
@@ -361,7 +555,8 @@ async def test_a_latched_failure_ends_the_loop(monkeypatch, caplog):
     renderer.failed = True
     with caplog.at_level(logging.WARNING, logger="daemon.app"):
         await asyncio.wait_for(
-            _lipsync_loop(face, renderer, clock, ring, deque(), fps=FPS), 1.0
+            _lipsync_loop(face, renderer, clock, ring, deque(), RecordingSlot(), fps=FPS),
+            1.0,
         )
     assert not renderer.calls
     assert "back on its clips" in caplog.text
@@ -383,7 +578,10 @@ async def test_a_raising_tick_is_logged_rather_than_silently_orphaned(monkeypatc
     # No `pytest.raises`: a loop that let this out would take the task with it, and
     # `wait_for` returning is the assertion.
     await asyncio.wait_for(
-        _lipsync_loop(FaceBus(), renderer, clock, Exploding(), queued, fps=FPS), 1.0
+        _lipsync_loop(
+            FaceBus(), renderer, clock, Exploding(), queued, RecordingSlot(), fps=FPS
+        ),
+        1.0,
     )
 
 
