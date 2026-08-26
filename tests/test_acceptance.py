@@ -1003,6 +1003,229 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
         store.close()
 
 
+def test_proactive_speak_wires_the_bridge_for_topic_search_by_default(
+    tmp_path: Path,
+) -> None:
+    """`build_proactive_tick(..., speak=True)` is where `Judge` gets the MCP
+    bridge `topic` search needs (ADR 0015). Tools on and `full` - the product
+    default - means the bridge reaches the judge."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is not None
+    finally:
+        asyncio.run(closing())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"DAEMON_TOOLS_ENABLED": False},
+        {"DAEMON_TOOLS_MODE": "off"},
+    ],
+    ids=["tools_enabled=false", "tools_mode=off"],
+)
+def test_proactive_speak_withholds_the_bridge_when_tools_are_off(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    """Task 4's tools-off decision, made in `daemon/app.py` next to
+    `Judge(...)`: the topic search bridge calls `MCPBridge.call` directly and
+    bypasses `tools/policy.py` entirely (ADR 0015), so `tools_mode` alone would
+    not naturally stop it - `_build_tools` does not gate the bridge on mode, only
+    on `tools_enabled`. `build_proactive_tick` closes that gap itself, so an
+    owner who turned tools off either way gets no proactive network reach
+    either."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        **overrides,
+    )
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is None
+    finally:
+        asyncio.run(closing())
+
+
+class _FakeReusableBridge:
+    """A bridge `build_proactive_tick` is handed rather than asked to build -
+    stands in for the resident's `app.state.mcp`. Tracks whether anything ever
+    closed it, since that is exactly what must not happen to a bridge this tick
+    does not own."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def call(self, server: str, name: str, arguments: dict) -> str:
+        return "{}"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_a_reused_bridge_is_used_and_never_closed_by_the_tick(tmp_path: Path) -> None:
+    """Whole-branch review: every tick used to call `_build_tools` itself - a
+    stdio child process per configured server, connected and torn down 288 times
+    a day, whether or not a `topic` candidate even existed - while the app
+    lifespan already held a live bridge the whole time. `build_proactive_tick`'s
+    `bridge` parameter is the fix: given one, it is used directly, and it survives
+    `closing()` because this tick never owned it."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    fake = _FakeReusableBridge()
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True, bridge=fake))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is fake
+    finally:
+        asyncio.run(closing())
+    assert fake.closed is False, "a reused bridge must outlive the tick that borrowed it"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"DAEMON_TOOLS_ENABLED": False},
+        {"DAEMON_TOOLS_MODE": "off"},
+    ],
+    ids=["tools_enabled=false", "tools_mode=off"],
+)
+def test_a_reused_bridge_is_still_withheld_when_tools_are_off(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    """The off-withholding rule (task 4) must apply the same way whether the
+    bridge is reused or freshly built - reusing one must not become a second,
+    ungated path to the network for an owner who turned tools off."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        **overrides,
+    )
+    fake = _FakeReusableBridge()
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True, bridge=fake))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is None
+    finally:
+        asyncio.run(closing())
+    assert fake.closed is False, "a withheld reused bridge is still not this tick's to close"
+
+
+def test_a_server_that_never_finishes_connecting_is_bounded_and_leaves_no_orphan() -> None:
+    """A pathological MCP server must cost the tick its `topic` candidates, never
+    the scheduler - `_proactive_tick` runs `max_instances=1`, so a tick that never
+    returns is every later tick silently skipped forever, this project's signature
+    defect.
+
+    This asserts at `_ServerLink.open` rather than around `_build_tools`, which is
+    where an earlier version of this test sat. PR #113 review: bounding the caller
+    is worse than not bounding it. `_build_tools` constructs the bridge *inside*
+    the awaited coroutine and `_bring_up` opens each server in a detached task, so
+    cancelling the caller discards the only reference that could ever close the
+    children it already started. The two assertions below are exactly the two
+    halves of that: the wait ends, **and** the transport's own task is finished
+    rather than left running.
+    """
+    from daemon.tools.base import ToolError
+    from daemon.tools.mcp import McpBridge, ServerConfig, _ServerLink
+
+    async def scenario() -> tuple[float, bool]:
+        bridge = McpBridge.__new__(McpBridge)
+        config = ServerConfig(name="wedged", command="/bin/true", args=(), env={})
+        link = _ServerLink(bridge, config, secret=None, auth=None)
+
+        async def _never_connects() -> Any:
+            await asyncio.sleep(3600)
+
+        bridge._connect = lambda *a, **k: _never_connects()  # type: ignore[method-assign]
+
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        with pytest.raises(ToolError, match="did not finish connecting"):
+            await asyncio.wait_for(link.open(), timeout=5.0)
+        return loop.time() - began, link._task is not None and link._task.done()
+
+    import daemon.tools.mcp as mcp_module
+
+    original = mcp_module.STARTUP_TIMEOUT
+    mcp_module.STARTUP_TIMEOUT = 0.05
+    try:
+        elapsed, task_finished = asyncio.run(scenario())
+    finally:
+        mcp_module.STARTUP_TIMEOUT = original
+
+    assert elapsed < 2.0, "the connect wait is unbounded"
+    assert task_finished, "the transport's task outlived the timeout - an orphaned child"
+
+
+def test_the_scheduled_tick_reads_the_bridge_getter_fresh_each_fire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_proactive_tick`'s `get_bridge` is a callable, not the bridge itself,
+    specifically so it can be captured once at `scheduler.add_job` time and still
+    read whatever `app.state.mcp` currently is on every later fire (the lifespan
+    builds that attribute after the job is registered - see `_lifespan`'s own
+    comment). This pins the call-through: whatever `get_bridge()` returns this
+    fire is exactly what reaches `build_proactive_tick`."""
+    import daemon.app as app_module
+    from daemon.app import _proactive_tick
+
+    fake = _FakeReusableBridge()
+    seen: dict[str, Any] = {}
+
+    async def _fake_build_proactive_tick(settings: Settings, **kwargs: Any) -> Any:
+        seen["bridge"] = kwargs.get("bridge")
+
+        class _NullTick:
+            async def run(self) -> Any:
+                from daemon.proactivity.base import Reading
+                from daemon.proactivity.tick import TickResult
+
+                return TickResult(at=datetime.now(UTC), reading=Reading(
+                    at=datetime.now(UTC), idle_seconds=0.0, mic_busy=False, output_busy=False
+                ))
+
+        async def _close() -> None:
+            return None
+
+        return _NullTick(), _close
+
+    monkeypatch.setattr(app_module, "build_proactive_tick", _fake_build_proactive_tick)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asyncio.run(_proactive_tick(settings, get_bridge=lambda: fake))
+
+    assert seen["bridge"] is fake
+
+
 def test_send_message_is_registered_only_where_it_can_deliver(tmp_path: Path) -> None:
     """`send_message` exists so a spoken turn can put a link in writing - and only
     the resident's voice runtime passes it a channel to do that through.

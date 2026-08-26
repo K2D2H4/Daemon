@@ -1,16 +1,18 @@
 """Task 13: does the judge's decline few-shot earn its place on the hosted model?
+Superseded 2026-08-26 by docs/adr/0016-proactive-default-flips-to-speaking.md - see
+"What this measured, and why variant B is gone" below.
 
-`daemon/proactivity/judge.py`'s prompt carries two worked examples that teach the
-model to decline a `silence` or `pattern_time` reason outright - see its module
-docstring, "What the local model actually did with that prompt (gemma3:4b,
-2026-08-04)". Those two examples exist because a 4B local model, reading a reason
-with nothing in it but elapsed hours or a frequency, filled the gap with an empty
-line (`또 왔네.`) instead of declining. `DAEMON_PROACTIVE_JUDGE_LOCAL=false` routes
-`PROACTIVE_JUDGE` to the hosted `DAEMON_PROVIDER`, which may not have that weakness
-at all - and if it does not, the two examples are dead weight the model never
-needed, fitted to a install this one is not.
+`daemon/proactivity/judge.py`'s prompt used to carry two worked examples that
+taught the model to decline a `silence` or `pattern_time` reason outright - see
+its module docstring, "What the local model actually did with that prompt
+(gemma3:4b, 2026-08-04)". Those two examples existed because a 4B local model,
+reading a reason with nothing in it but elapsed hours or a frequency, filled the
+gap with an empty line (`또 왔네.`) instead of declining. `DAEMON_PROACTIVE_JUDGE_LOCAL=false`
+routes `PROACTIVE_JUDGE` to the hosted `DAEMON_PROVIDER`, which may not have that
+weakness at all - and if it does not, the two examples were dead weight the model
+never needed, fitted to an install this one is not.
 
-This settles it by running both variants against the real gateway and the real
+This settled it by running two variants against the real gateway and the real
 persona seed, not by reasoning about model capability from a spec sheet:
 
   (A) the current prompt, verbatim.
@@ -21,13 +23,31 @@ persona seed, not by reasoning about model capability from a spec sheet:
 Five kinds, three representative reasons each, plus two required `association`
 cases pulled from a live-database preview of what the type-E generator actually
 produces (`daemon/proactivity/candidates.py:association_candidates` has no
-content-worth filter): one built from conversational chaff ("우리 방금 무슨 얘기
-했었지?"), one with real substance ("교토 골목 국수집이 진짜 좋았어"). The chaff
-case is reported separately and prominently - it answers whether the *generator*
-needs a substance filter, which is a different question from whether the judge's
-prompt does.
+content-worth filter of its own): one built from conversational chaff ("우리 방금
+무슨 얘기 했었지?"), one with real substance ("교토 골목 국수집이 진짜 좋았어").
+The chaff case is reported separately and prominently - it answers whether the
+*generator* needs a substance filter, which is a different question from whether
+the judge's prompt does, and that question is untouched by ADR 0016.
 
-## The judgement criteria, declared before any number was seen
+## What this measured, and why variant B is gone
+
+Kept (A) on this run's own criteria (see `CRITERIA` below) - the two examples
+earned their place. ADR 0016 (2026-08-26) later removed them anyway, for a
+different, unrelated reason: the owner's repeated correction that an ordinary,
+contentless check-in should *speak*, not decline - the opposite conclusion from
+what this task was weighing. `variant_b_system()`'s "cut the muzzle" question
+does not exist to ask any more: `judge.SYSTEM`'s `silence` and `pattern_time`
+worked examples now both *speak*, so there is no muzzle left to cut, and a
+variant B built by stripping two blocks that no longer read as a muzzle would
+not measure what this file's own criteria were written to judge. Retired rather
+than patched to match new text - keeping the function alive on cosmetically
+updated strings would imply this A/B question is still live, when ADR 0016
+already answered the actual disagreement it was proxying for. `VARIANTS` now
+runs (A) alone: the fixed 17-case harness below is still useful as a live-model
+snapshot of what the shipped prompt does across all five kinds, just no longer
+as a two-way comparison.
+
+## The judgement criteria this run applied
 
 - **Adopt (B)** if, on the `silence`/`pattern_time` cases, (B)'s spoken lines (if
   any) are not empty-phrase filler in the `또 왔네.` / `요즘 어때` / `별일 없어`
@@ -35,11 +55,11 @@ prompt does.
 - **Keep (A)** otherwise - in particular if (B) manufactures an opener out of a
   contentless reason.
 
-This module does not compute that verdict. Whether a line is filler is a semantic
-call this file will not launder into a regex; the numbers and every sentence
-produced are printed and recorded, and the ruling against the criteria above goes
-into `.superpowers/sdd/2026-08-11-proactivity-humanization/task-13-report.md` by
-whoever reads the output, not by this script pretending to.
+This module did not compute that verdict itself. Whether a line is filler was a
+semantic call this file would not launder into a regex; the numbers and every
+sentence produced were printed and recorded, and the ruling against the criteria
+above is in
+`.superpowers/sdd/2026-08-11-proactivity-humanization/task-13-report.md`.
 
 ## Running it
 
@@ -134,7 +154,7 @@ CASES: tuple[Case, ...] = (
         "11시간 전에 '외롭다'는 얘기를 했고, 그 뒤로 대화가 없었다. "
         "그 뒤에 어떻게 됐는지 모른다.",
     ),
-    # --- Type C: silence - the kind whose few-shot example variant B removes --
+    # --- Type C: silence - variant B (retired) used to remove this kind's example --
     Case(
         "C1", "silence",
         "마지막 대화가 30시간 전이고 그 뒤로 아무 말도 오가지 않았다. 평소 간격보다 길다.",
@@ -147,7 +167,7 @@ CASES: tuple[Case, ...] = (
         "C3", "silence",
         "마지막 대화가 45시간 전이고 그 뒤로 아무 말도 오가지 않았다. 평소 간격보다 길다.",
     ),
-    # --- Type D: pattern_time - the other kind variant B removes an example for
+    # --- Type D: pattern_time - the other kind variant B (retired) removed an example for
     Case(
         "D1", "pattern_time",
         "최근 30일 중 12일은 이 시간(현지 21시)에 대화를 했는데, 오늘은 아직 한 마디도 없다.",
@@ -191,44 +211,12 @@ CASES: tuple[Case, ...] = (
 )
 
 
-# --- the two prompt variants ---------------------------------------------------
+# --- the prompt variant(s) ------------------------------------------------------
+# Variant B (the silence/pattern_time muzzle examples cut) is retired - see the
+# module docstring's "What this measured, and why variant B is gone". Only (A),
+# the live shipped prompt, still runs.
 
-_SILENCE_EXAMPLE = (
-    '예) 이유 (silence): 마지막 대화가 30시간 전이고 그 뒤로 아무 말도 오가지 않았다.\n'
-    '    -> {"say": ""}\n'
-)
-_PATTERN_EXAMPLE = (
-    '예) 이유 (pattern_time): 최근 30일 중 12일은 이 시간에 대화를 했는데, 오늘은 아직\n'
-    '    한 마디도 없다. -> {"say": ""}\n'
-)
-
-
-def variant_b_system() -> str:
-    """(B): the live prompt with the two examples fitted to gemma3:4b cut.
-
-    Built by removing two exact blocks from the real `judge.SYSTEM` rather than
-    a hand-copied duplicate, so a future edit to the shared instructions this
-    file does not touch is not silently untested here. Raises if either block
-    is no longer present verbatim - the same "fail loudly on drift" this
-    project applies elsewhere, and the right failure here: a silent no-op
-    would report variant B result as if the prompts actually differed.
-    """
-    system = judge_module.SYSTEM
-    for block in (_SILENCE_EXAMPLE, _PATTERN_EXAMPLE):
-        if block not in system:
-            raise AssertionError(
-                f"variant B expected this block verbatim in judge.SYSTEM and did not "
-                f"find it - judge.py's prompt changed shape since this file was "
-                f"written:\n{block!r}"
-            )
-        system = system.replace(block, "")
-    return system
-
-
-VARIANTS: tuple[tuple[str, str], ...] = (
-    ("A (current)", judge_module.SYSTEM),
-    ("B (silence/pattern_time examples cut)", variant_b_system()),
-)
+VARIANTS: tuple[tuple[str, str], ...] = (("A (current)", judge_module.SYSTEM),)
 
 
 # --- capturing the model that actually answered -------------------------------
@@ -480,9 +468,10 @@ async def _main(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Re-measure judge.py's decline few-shot (A) against a variant "
-        "with the silence/pattern_time examples cut (B), on the hosted model "
-        "PROACTIVE_JUDGE actually routes to."
+        description="Run judge.py's current prompt (A) against the fixed 17-case "
+        "set, on the hosted model PROACTIVE_JUDGE actually routes to. Variant B "
+        "(the silence/pattern_time muzzle examples cut) is retired - see the "
+        "module docstring."
     )
     parser.add_argument(
         "--json",

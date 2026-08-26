@@ -92,11 +92,26 @@ OPENAI_REALTIME_VOICES = frozenset({
 """OpenAI Realtime voices. `marin`/`cedar` are gpt-realtime-only; a voice the chosen
 model rejects comes back as a session error, the same class as Gemini's 1007."""
 
-PROACTIVE_KINDS = ("open_loop", "emotional", "silence", "pattern_time", "association")
-"""The five candidate kinds - `daemon/proactivity/base.py`'s `CandidateKind`,
+PROACTIVE_KINDS = (
+    "open_loop",
+    "emotional",
+    "silence",
+    "pattern_time",
+    "association",
+    "topic",
+)
+"""The six candidate kinds - `daemon/proactivity/base.py`'s `CandidateKind`,
 repeated here for the same reason `GEMINI_LIVE_VOICES` below is: this module is
 foundation and `daemon/proactivity/` sits above it, so importing would invert the
-layering. Validates the keys of `DAEMON_PROACTIVE_KIND_BUDGETS`."""
+layering. Validates the keys of `DAEMON_PROACTIVE_KIND_BUDGETS` - a name check
+only. `topic` belongs here even though it has no entry in
+`proactive_kind_budgets`'s default table below: this tuple validates kind
+*names* an owner may reference, that dict allocates per-kind *ceilings*, and the
+owner explicitly does not get a `topic` ceiling (see that field's docstring).
+Without `topic` here, an owner writing `DAEMON_PROACTIVE_KIND_BUDGETS` to set
+any other kind's cap alongside `topic` would have that whole setting rejected as
+naming an unknown kind - two task reports flagged exactly this gap before it was
+closed."""
 
 SENSITIVITIES = ("low", "high")
 """What the two speech-sensitivity settings accept, plus empty for "the server
@@ -448,8 +463,14 @@ class Settings(BaseSettings):
     """Off until the user turns it on. Something that decides on its own to speak
     is not a default anyone should be opted into."""
 
-    proactive_daily_budget: int = Field(default=8, alias="DAEMON_PROACTIVE_DAILY_BUDGET")
-    """Utterances per local day, all kinds. Eight, from PLAN 6.2."""
+    proactive_daily_budget: int = Field(default=5, alias="DAEMON_PROACTIVE_DAILY_BUDGET")
+    """Utterances per local day, all kinds. PLAN 6.2's original figure was eight,
+    but it was never once binding: 572 judge calls, all time, 0 utterances, so the
+    number that mattered was the judge declining, not this ceiling. It becomes a
+    real ceiling with the `topic` kind (ADR 0015): unlike the other four
+    generators, which need the owner to have said something in particular,
+    `topic` can always find material - any quiet entity plus a web search - so
+    five is the number that now does what eight never had to."""
 
     proactive_kind_budgets: Annotated[dict[str, int], NoDecode] = Field(
         default_factory=lambda: {
@@ -463,7 +484,7 @@ class Settings(BaseSettings):
     )
     """Per-kind ceilings for one local day. Replaces the single open_loop cap.
 
-    They sum to 9 against a daily budget of 8 on purpose: these are ceilings, not
+    They sum to 9 against a daily budget of 5 on purpose: these are ceilings, not
     allocations, and the total is what binds. The shape is PLAN 6.2's - the cheap
     kind to generate (open_loop) eats the budget on equal terms and turns a
     companion into a reminder app, and the Her feeling comes from the kinds with
@@ -478,10 +499,22 @@ class Settings(BaseSettings):
     this one replaced had a validator and this one shipped without one:
     `{"open_loop": 99, "nonsense": -5}` used to load clean, and a typo silently
     wiping the ceilings is exactly the reminder-app failure PLAN 6.2 wrote this
-    table to prevent."""
+    table to prevent.
 
-    proactive_cooldown_minutes: int = Field(default=30, alias="DAEMON_PROACTIVE_COOLDOWN_MINUTES")
-    """Minimum gap between two proactive utterances, whatever their kind."""
+    `topic` (ADR 0015) deliberately gets no entry here, and that is not an
+    omission to close: the owner rejected per-kind quotas for it as artificial,
+    and the sentence above already says these are ceilings while the daily total
+    is what binds - `topic` is bound by that total and by
+    `proactive_daily_budget` moving 8 -> 5 for exactly this reason, not by a
+    ceiling of its own. Do not add one."""
+
+    proactive_cooldown_minutes: int = Field(default=90, alias="DAEMON_PROACTIVE_COOLDOWN_MINUTES")
+    """Minimum gap between two proactive utterances, whatever their kind. Raised
+    from 30 alongside the daily budget above, and for the same reason: measured
+    against the live database, `open_loop` (the cheapest generator to satisfy)
+    fired 3 times in 7 days, so 30 minutes was never the thing keeping this
+    quiet. `topic` is not similarly rate-limited by needing the owner to say
+    something - a real cooldown is what stands in for that."""
 
     proactive_quiet_hours: str = Field(default="23:00-09:00", alias="DAEMON_PROACTIVE_QUIET_HOURS")
     """Local `HH:MM-HH:MM` when it never speaks. Wraps midnight when start > end."""

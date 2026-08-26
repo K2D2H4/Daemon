@@ -17,6 +17,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `openai_compatible_spike.py` | whether a real OpenAI-compatible endpoint answers `/models`, a Korean turn, and a tool round-trip |
 | `openai_compatible_loop_spike.py` | whether the *assembled* app survives a real turn on that endpoint — loop, recall, tool policy, audit table |
 | `screen_frame_arrival_spike.py` | why voice answered "what's on my screen" from nothing — a `realtimeInput.video` frame never arrives inside a tool round, and the fix is the image part *after* the tool response (0/20 → 19/20) |
+| `proactive_topic_spike.py` | docs/adr/0015's own reversal test — does a `topic` line read differently with a search result in the prompt than without one, on the owner's real entities and persona, arms interleaved trial-by-trial and compared directly (Fisher exact, never a threshold pooled from both) |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py

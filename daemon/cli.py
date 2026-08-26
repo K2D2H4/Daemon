@@ -1525,12 +1525,40 @@ def _proactivity_check(settings: Settings) -> Check:
 
     speaker = "speaker on" if settings.voice_enabled else "telegram only"
     quiet = settings.proactive_quiet_hours or "no quiet window"
+    # `topic` (ADR 0015) deliberately has no entry in `proactive_kind_budgets`
+    # (see that field's docstring: the owner rejected a per-kind quota for it as
+    # artificial) - appended by hand so `daemon doctor` names all six kinds, not
+    # just the five capped ones, which used to leave the uncapped kind invisible
+    # here (whole-branch review).
     kinds = ", ".join(
         f"{kind} {cap}" for kind, cap in settings.proactive_kind_budgets.items()
     )
+    if "topic" not in settings.proactive_kind_budgets:
+        # Only when the owner has not set one. `topic` is a legal key in
+        # `DAEMON_PROACTIVE_KIND_BUDGETS` (`config.py` puts it in `PROACTIVE_KINDS`
+        # deliberately) and `Gate._kind_budget` honours it, so an unconditional
+        # append named the kind twice and told the owner the opposite of what the
+        # gate would do - in the one line this block cites CONTRACTS 12 to justify
+        # (PR #113 review).
+        kinds = f"{kinds}, topic uncapped"
+    # `topic` (ADR 0015) is the one candidate kind that reaches the network - one
+    # read-only search per gate-passed candidate, via the MCP bridge, bypassing
+    # `tools/policy.py` entirely (it never goes through ToolRunner). `app.py`'s
+    # `build_proactive_tick` withholds that bridge when tools are off or
+    # `tools_mode == "off"`, on the reasoning written there; this line is what
+    # makes the resulting state visible rather than a capability nobody was
+    # asked about (CONTRACTS 12).
+    if not settings.tools_enabled:
+        topic_search = "off (DAEMON_TOOLS_ENABLED)"
+    elif settings.tools_mode == "off":
+        topic_search = "off (DAEMON_TOOLS_MODE=off)"
+    elif not settings.mcp_enabled:
+        topic_search = "on, but DAEMON_MCP_ENABLED is off so no server can answer it"
+    else:
+        topic_search = "on"
     detail = (
         f"on, {speaker} · budget {settings.proactive_daily_budget}/day "
-        f"({kinds}) · quiet {quiet}"
+        f"({kinds}) · quiet {quiet} · topic search {topic_search}"
     )
 
     path = settings.data_dir / DB_FILENAME

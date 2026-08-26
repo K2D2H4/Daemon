@@ -26,6 +26,8 @@ says "measured" was checked against the real thing, and the number is in the fil
 | [0012](0012-voice-is-its-own-axis.md) | Voice is its own axis, not a preset tier | accepted |
 | [0013](0013-split-the-presence-signals.md) | Split the presence signals | accepted, measured |
 | [0014](0014-provider-is-the-axis.md) | The provider is the axis; presets are gone | accepted |
+| [0015](0015-code-may-search-where-the-model-may-not.md) | Deterministic code may search on a proactive turn; the model still may not | accepted |
+| [0016](0016-proactive-default-flips-to-speaking.md) | The proactive default flips from silence to speaking | accepted, overturns 0008 in part |
 
 ## Format
 

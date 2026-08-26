@@ -296,7 +296,8 @@ CREATE TABLE IF NOT EXISTS proactive_candidates (
                       'emotional',      -- B: emotional follow-up
                       'silence',        -- C: quiet too long
                       'pattern_time',   -- D: usual talking hour, nothing today
-                      'association'     -- E: old memory strongly linked to recent context
+                      'association',    -- E: old memory strongly linked to recent context
+                      'topic'           -- F: something they care about, gone quiet
                   )),
     reason        TEXT    NOT NULL,     -- human-readable, goes into the LLM prompt
     payload       TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),

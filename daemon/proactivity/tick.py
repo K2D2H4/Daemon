@@ -195,7 +195,7 @@ class ProactiveTick:
                 # One judge call per tick, whatever it decided. The gate counts the
                 # daily budget from rows already stored, so a second call in the
                 # same tick would read the same pre-tick count and a delivery would
-                # overshoot it - and PLAN 6.2's budget of three (now eight) is the
+                # overshoot it - and PLAN 6.2's budget of three (now five) is the
                 # brake the whole design leans on. That covers a second *delivery*,
                 # but a decline is a model call too - with `proactive_judge_local=False`,
                 # PROACTIVE_JUDGE is hosted and paid for - and a tick with several
@@ -247,6 +247,39 @@ class ProactiveTick:
         reconsidered any sooner than the daemon would be allowed to speak
         again anyway. Reusing it means one knob tunes both paces instead of a
         second constant nobody would think to change together with the first.
+
+        **A rest can land past the candidate's own `expires_at`, and then it
+        never gets another turn** - `due_candidates` never sees it because
+        `expire_candidates` retires it first. That is deliberate (an observation
+        too stale to speak on is not worth one more model call), but ADR 0016
+        changed what it costs and the change is worth naming. Before the flip
+        `silence` declined 20/20, so a rest past expiry lost nothing that was
+        ever going to be said. After it, `silence` speaks 30/30, and because its
+        dedup key is one-per-episode (see `candidates.py`), a single late decline
+        now costs the **whole** silence episode rather than one attempt. Observed
+        on the owner's live database, 2026-08-26: the row for the
+        `2026-08-25T01:56:03Z` episode was rested at 00:33Z to a `due_at` of
+        02:03Z, four minutes past its 01:59Z expiry, and the episode produced
+        nothing.
+
+        `silence` is not the only kind with that shape - the permanence comes from
+        the dedup key, and `existing_dedup_keys` counts `expired` rows too.
+        `emotional` is identical (12h TTL, one key per message) and is the other
+        businessless kind PLAN 6.2 is about; `pattern_time` loses only a day but is
+        much the likeliest to hit this, since a 90-minute rest covers three
+        quarters of its 2-hour life. `topic` is exempt - its key is unique per
+        raise, and the rest that lands past `expires_at` *is* its designed
+        retirement.
+
+        Left as is. A clamp to `min(moment + rest, expires_at)` would break this
+        method's own invariant - that a declined candidate is not reconsidered any
+        sooner than the daemon could speak anyway - so it is not free, and
+        `TickResult.expired` already counts these where an operator can see them.
+        Recorded at the line a debugger would read rather than fixed. One number
+        not to over-read on the way past: the 0/30 above is `silence`. Declines are
+        not rare everywhere - a `topic` candidate on an install with no `tavily`
+        server is dropped before the model call **every** time, and every one of
+        those comes through here.
         """
         rest = timedelta(minutes=self._settings.proactive_cooldown_minutes)
         self._store.push_candidate_due(candidate.id, due_at=moment + rest)

@@ -20,7 +20,7 @@ below list surface variants rather than dictionary forms. A morphological
 analyser would do this properly and was declined for the same reason PLAN 4.3
 declined it for recall: too heavy a dependency for a self-hoster.
 
-## Five generators
+## Six generators
 
 Type E (association) was **deliberately not implemented** until now, because
 `MemoryRecall.search` - the recall index's only entry point at the time - was
@@ -53,6 +53,15 @@ is async and awaits the two separately, then merges their output.
 Type D's guards mean it produces nothing for the first two weeks of history. That
 is correct, not a bug: "the hour this person usually talks" is not a fact yet.
 
+Type F (topic) arrived later still, in
+docs/adr/0015-code-may-search-where-the-model-may-not.md, and is the odd one
+structurally: `topic_candidates` below names an entity that has
+gone quiet but carries no material of its own about *why* it is worth raising -
+that arrives after the gate, from one read-only web search `daemon/proactivity/judge.py`
+runs against the entity name, never from this file. Every other generator's
+`reason` is everything the judge gets; a `topic` candidate's is a stub the judge
+fills in or drops.
+
 ## What keeps 288 ticks a day from becoming 288 candidates
 
 Every candidate carries a deterministic `payload["dedup"]` key, and the tick
@@ -64,11 +73,22 @@ the natural unit of the reason is what gets deduplicated:
     silence       the last message's timestamp - one per silence *episode*, since
                   a reply moves the timestamp and starts a new episode
     pattern_time  the local date              - one per day
+    topic         the entity name + this raise's timestamp - unique per raise,
+                  not a rearm mechanism (see below)
 
 The `silence` key has a consequence worth stating: a silence that was generated
 and then blocked all the way through its expiry window never comes back, because
 the key is already spent. That is deliberate. "It has been quiet too long" is one
 observation, and a version of it that retries is an alarm clock.
+
+`topic` does not fit this table's own logic and is called out rather than
+squeezed in: every other kind's key stops that *same* candidate from being
+regenerated, and rearm is a separate question the gate or the TTL answers. A
+`topic` key is unique by construction (it carries `to_iso(now)`), so it can
+never itself deduplicate anything - rearm is enforced upstream, in SQL, before
+`stale_entities` ever returns the entity again (see `TOPIC_REARM_DAYS`). The key
+exists here only because every `Candidate` needs one, not because this one does
+the dedup job the column is named for.
 
 The key lives in `payload` because `daemon/memory/schema.sql` is frozen and has no
 column for it; a real column plus a unique index would be the better shape.
@@ -82,21 +102,34 @@ minutes, each honouring its own cooldown.
 
 ## What ends up in the LLM prompt
 
-`Candidate.reason` is fed to the model verbatim, so **no user text is put in it** -
-only words from the lexicons in this file, plus numbers and clock times. A
-follow-up therefore cannot be steered by what a forwarded message said, and A and
-B additionally only read rows with `origin = 'owner'`. The source message id is in
-`payload` for a caller that wants the actual words and can decide to trust them.
+`Candidate.reason` is fed to the model verbatim, so **for four of the six kinds,
+no user text is put in it** - only words from the lexicons in this file, plus
+numbers and clock times. A follow-up therefore cannot be steered by what a
+forwarded message said, and A and B additionally only read rows with
+`origin = 'owner'`. The source message id is in `payload` for a caller that
+wants the actual words and can decide to trust them.
 
-**`association_candidates` is the one exception, and it is bounded.** Type E has
-nothing to ask about without the memory's own words - a bare "you said something
-90 days ago" is the same contentless reason `silence` already produces, and the
-judge correctly declines it - so it quotes `RecalledItem.content`, up to
-`ASSOCIATION_QUOTE_CHARS` characters. What keeps this from being a hole in the
-rule above rather than a stated exception to it: it quotes only items where
-`origin == "owner"`. That is `messages.origin` - a column a model cannot forge
-through prose (non-negotiable 3) - but it is **not** the same guarantee CONTRACTS
-non-negotiable 10 relies on, and an earlier version of this paragraph said it
+**`association_candidates` and `topic_candidates` are the two exceptions, and
+each is bounded differently.** ADR 0015 line 86 predicted this docstring would
+need updating the day a second exception arrived, and it did: `topic_candidates`
+interpolates `entities.name` into `reason` (`'{name}' 이야기를 한 지 {days}일
+됐다...`), and that name is not first-party either - `daemon/reflection.py`
+writes it from the reflection *model* reading the day's own conversation log,
+the same as `RecalledItem.content` below. Its bound is different from type E's:
+not a length cap on the interpolated text (an entity name is already short), but
+`daemon/proactivity/judge.py:has_url` refusing a name that itself reads as a
+pointer, before the search or the model call runs (see that module's docstring).
+
+Type E has nothing to ask about without the memory's own words - a bare "you
+said something 90 days ago" is the same contentless reason `silence` used to be
+declined for before docs/adr/0016-proactive-default-flips-to-speaking.md flipped
+that default (see that ADR for what changed and why) - so it quotes
+`RecalledItem.content`, up to `ASSOCIATION_QUOTE_CHARS` characters. What keeps
+this from being a hole in the rule above rather than a stated exception to it:
+it quotes only items where `origin == "owner"`. That is `messages.origin` - a
+column a model cannot forge through prose (non-negotiable 3) - but it is
+**not** the same guarantee CONTRACTS non-negotiable 10 relies on, and an
+earlier version of this paragraph said it
 was. Non-negotiable 10 reads a *live* turn's `InboundMessage.authored_by_sender`
 (`daemon/tools/policy.py`), decided the moment the message arrived; this column
 can be re-derived later, by `daemon reindex`, from nothing but `role` - the
@@ -179,6 +212,20 @@ class CandidateReader(Protocol):
         grow with the table."""
         ...
 
+    def stale_entities(
+        self, limit: int, quiet_since: datetime, raised_since: datetime
+    ) -> list[sqlite3.Row]:
+        """Entities whose note has not been touched since `quiet_since` and which
+        were not raised as a `topic` candidate since `raised_since`, quietest
+        first. `name` and `updated_at` are the columns used.
+
+        The second exclusion has to happen here, in SQL, rather than after the
+        fact in Python: it has to be anchored to *this entity's own* last raise,
+        and it has to remove the entity from `ORDER BY ... LIMIT` entirely so an
+        ineligible entity cannot occupy a slot another entity should get.
+        """
+        ...
+
 
 @runtime_checkable
 class AssociativeRecall(Protocol):
@@ -249,6 +296,61 @@ the contentless reason that makes `silence` produce 빈말 - but the reason is
 still a record being shown to a model, so it is bounded."""
 
 ASSOCIATION_TTL_HOURS = 6
+
+TOPIC_QUIET_DAYS = 7
+"""How long an entity must have gone untouched before it is worth raising.
+
+Shorter turns rotation into nagging: the owner's `Kiwi` note moves most days, and
+a daemon that asks about the dog every morning is the repetition this whole branch
+started from."""
+
+TOPIC_REARM_DAYS = 14
+"""How long a raised topic must stay excluded before it is eligible again.
+
+Two designs were tried and rejected before this one. Dedup by the entity's own
+`updated_at` assumed raising a topic touches the note; nothing in the proactive
+path does (only `daemon/reflection.py`'s nightly pass, and only when it judges
+something new happened, and the offline `rebuild` command move that column), so
+the same two entities occupied the rotation forever - measured. The fix for
+that, a dedup key bucketed into shared `TOPIC_REARM_DAYS`-day calendar windows,
+turned out to give some entities a real gap of one day rather than
+`TOPIC_REARM_DAYS`: every entity's boundary fell on the same grid, so an entity
+raised the day before a boundary rearmed the next day. Both were the same
+mistake - measuring the window from something other than *this entity's own*
+raise. `stale_entities` now excludes an entity directly in SQL, anchored to its
+own most recent `topic` row, so the number below is a true per-entity gap and
+this generator's dedup key no longer has to carry any rearm logic at all - see
+`topic_candidates`. Longer than `TOPIC_QUIET_DAYS` on purpose: rearming the
+moment an entity requalifies as stale would be the same nagging
+`TOPIC_QUIET_DAYS` exists to stop. 14 days against roughly a dozen entities and a
+few utterances a day gives each one a turn every couple of weeks rather than
+monopolising the slot."""
+
+TOPIC_TTL_HOURS = 24
+"""How long an unfired `topic` candidate stays live before `expire_candidates`
+retires it. Added in the whole-branch review that found `topic_candidates` was
+the only generator building a `Candidate` with neither `due_at` nor
+`expires_at` set (compare `open_loop`/`emotional`/`silence`/`pattern_time`/
+`association` above, all 2-24h) - `Candidate.expires_at` defaults to `None` and
+`Store.expire_candidates` only retires rows `WHERE expires_at IS NOT NULL`, so
+an unfired topic row was permanent. That is the *normal* case on a default
+install: no `tavily` server configured means `Judge._topic_block` returns ""
+and `decide` drops the candidate every time (`judge.py`), `tick.py`'s `_rest`
+pushes `due_at` forward `proactive_cooldown_minutes` (90) and the row comes
+due again, forever - a permanent row per quiet entity, accumulating until every
+one has one, each re-evaluated by the gate every tick from then on.
+
+Not copied from another kind - a topic's material is a `TOPIC_QUIET_DAYS`-quiet
+entity, which is not urgent the way `silence` (12h) or `pattern_time` (2h) are:
+nothing about today makes tomorrow a worse day to raise it. The number is sized
+against the *retry*, not a deadline: at the 90-minute rest cadence, 24 hours is
+**at most** 16 attempts - fewer whenever another kind is also due, since
+`tick.py` judges one candidate per tick and breaks - which is enough for a flaky
+search (a `tavily` hiccup, a transient network failure) to recover before this
+generator gives up for the day. Past
+that there is no urgency to keep trying today, and `TOPIC_REARM_DAYS` already
+keeps the same entity from returning for two weeks regardless of whether this
+row fired, expired, or never got the chance."""
 
 
 # --- Korean surface forms ----------------------------------------------------
@@ -525,7 +627,74 @@ async def association_candidates(
     return [c for c in found if dedup_key(c) not in spent][:MAX_PER_KIND]
 
 
-_KIND_ORDER: tuple[CandidateKind, ...] = ("open_loop", "emotional", "silence", "pattern_time")
+def topic_candidates(reader: CandidateReader, now: datetime) -> list[Candidate]:
+    """Type F: something the owner cares about that has gone quiet.
+
+    PLAN 6.2 asked for the kinds with no business to transact - the Her feeling
+    comes from those and not from the reminder app - and then only the transactional
+    ones were built. Measured 2026-08-25: 572 judge calls, 0 utterances, because
+    `open_loop` needs the owner to mention a dated event in chat and he speaks to
+    this daemon in imperatives about tools (3 matches in 75 utterances over 7 days).
+
+    The reason carries the entity's name and the size of the gap - neither
+    first-party: `entities.name` is chosen by the reflection model reading the
+    day's conversation log, not something this generator originates (see
+    `daemon/proactivity/topics.py`'s `MAX_ENTITY_CHARS` docstring).
+    What the daemon will actually *say* about it needs material this generator does
+    not have; that arrives after the gate (ADR 0015), and a candidate whose search
+    finds nothing **at all** is dropped rather than spoken. A search that comes
+    back with titles about a namesake instead keeps the candidate: the titles are
+    discarded and the line becomes an ordinary check-in about the entity, which
+    after ADR 0016 is a shape the owner asked for. See `topics.render` for the
+    measurement that split those two cases apart.
+
+    Rearm is enforced in SQL (`stale_entities`'s `raised_since` exclusion),
+    anchored to each entity's own last `topic` row - not by this generator's
+    dedup key, and not by a shared calendar grid. See `TOPIC_REARM_DAYS`'s
+    docstring for the two designs that got this wrong first. Because SQL
+    already excludes an ineligible entity entirely - it cannot occupy an
+    `ORDER BY ... LIMIT` slot it is not a candidate for - a plain `MAX_PER_KIND`
+    limit is enough here: nothing "spent" is left sitting in front of the next
+    entity in line, so there is no separate pool-size constant either.
+
+    `dedup` only has to be unique per raise now, not carry any rearm logic -
+    `to_iso(now)` gives that for free, since SQL will not surface this entity
+    again until `TOPIC_REARM_DAYS` have actually passed.
+
+    `due_at=now` matches the other four non-A generators: nothing about this
+    candidate is waiting for a future moment, it is already true now. `expires_at`
+    is `TOPIC_TTL_HOURS` out - see that constant's docstring for why an unfired
+    row must not be immortal, found in the whole-branch review.
+    """
+    quiet_since = now - timedelta(days=TOPIC_QUIET_DAYS)
+    raised_since = now - timedelta(days=TOPIC_REARM_DAYS)
+    found: list[Candidate] = []
+    for row in reader.stale_entities(MAX_PER_KIND, quiet_since, raised_since):
+        name = str(row["name"])
+        since = parse_iso(str(row["updated_at"]))
+        days = max((now - since).days, TOPIC_QUIET_DAYS)
+        found.append(
+            Candidate(
+                kind="topic",
+                reason=(
+                    f"'{name}' 이야기를 한 지 {days}일 됐다. "
+                    "유저가 관심을 두는 주제이고, 그동안 소식을 나눈 적이 없다."
+                ),
+                payload={"entity": name, "dedup": f"topic:{name}:{to_iso(now)}"},
+                due_at=now,
+                expires_at=now + timedelta(hours=TOPIC_TTL_HOURS),
+            )
+        )
+    return found
+
+
+_KIND_ORDER: tuple[CandidateKind, ...] = (
+    "open_loop",
+    "emotional",
+    "silence",
+    "pattern_time",
+    "topic",
+)
 """Stable output order, and **not** a priority. Which kind gets the day's budget is
 the gate's decision (`proactive_kind_budgets` exists for exactly that), and
 deciding it here by sort order would put the decision in two places."""
@@ -554,6 +723,7 @@ def generate_candidates(
         + emotional_candidates(reader, moment)
         + silence_candidates(reader, settings, moment)
         + pattern_time_candidates(reader, moment)
+        + topic_candidates(reader, moment)
     )
     if not produced:
         return []
