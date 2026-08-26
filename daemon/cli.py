@@ -898,13 +898,14 @@ def _serve(settings: Settings) -> int:
     import uvicorn
 
     from daemon.app import create_app
+    from daemon.ollama_process import LocalOllama
 
     # Printed before uvicorn takes the terminal (its own logging is off,
     # log_config=None): the admin web has no other way to announce where it is, and
     # "how do I open the console" should not need reading the source.
     print(f"admin console: {_admin_url(settings)}")
     uvicorn.run(
-        create_app(settings),
+        create_app(settings, local_ollama=LocalOllama(settings.ollama_base_url)),
         host=settings.host,
         port=settings.port,
         log_config=None,

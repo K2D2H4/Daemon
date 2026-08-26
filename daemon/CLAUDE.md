@@ -3,7 +3,9 @@
 ## Owns
 
 One process: a FastAPI control plane, an in-process APScheduler, a channel loop — assembled
-in `app.py`, which owns every concrete-implementation import here.
+in `app.py`, which owns the concrete-implementation imports. One exception, and it is in
+the table below: `daemon run` in `cli.py` builds the `LocalOllama` it hands `create_app`,
+because a `create_app` that built its own would have every lifespan test probe localhost.
 
 ## Layout
 
@@ -24,6 +26,7 @@ in `app.py`, which owns every concrete-implementation import here.
 | `tui.py` · `service.py` | terminal presentation, CJK-aware widths, plain text when not a tty · the LaunchAgent / systemd user unit, which holds no secrets |
 | `fs.py` · `clock.py` · `mic_hold.py` · `mic_floor.py` | 0700 dirs, 0600 files, and the two durable writes — append, and atomic replace · the one timestamp helper, so nobody scatters `datetime.now()` · whether *this process* holds the microphone, a reentrant counter the wake listener and a voice session both increment. Top-level rather than inside `voice/` so `proactivity/presence.py` can subtract our own hold from the CoreAudio probe without importing the voice layer — a text-only install has no PortAudio and still has to answer presence (docs/adr/0013) · the mailbox a proactive line uses to ask the wake loop for the microphone, since the speaker refuses while `mic_hold` says this process holds it - the wake side takes the request and does the speaking, because releasing the capture stream is not something that can be done to the gate from outside |
 | `timesense.py` | how the daemon *speaks* about time — the current instant, relative phrasing, where a conversation broke, which commitments in view are past. `clock.py` reads the clock; this renders it. Holds the extraction primitives `proactivity/candidates.py` imports back, so both paths read one judgement instead of two |
+| `ollama_process.py` | the local Ollama the daemon starts for embeddings when nothing else has, behind four gates — the URL must name this machine, it must not already answer, the binary must be findable, it must answer within `READY_TIMEOUT_SECONDS` — and stops only what it started. Only `app.py` and `cli.py`'s `daemon run` call site import it |
 | `channels/` | `channels/base.py` (frozen) · `channels/telegram.py` · `channels/pairing.py` |
 | `llm/` | `llm/base.py` (frozen) · `llm/gateway.py` · `llm/providers/` (5) · `llm/embedders/` |
 | `memory/` | `memory/schema.sql` (frozen) · `store` · `log` · `writer` · `recall` · `curated` · `entities` · `reindex` |

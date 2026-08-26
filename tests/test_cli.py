@@ -453,7 +453,10 @@ def test_serve_bounds_the_graceful_shutdown(monkeypatch: pytest.MonkeyPatch) -> 
     import uvicorn
 
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(daemon_app, "create_app", lambda settings: object())
+    # `**_` rather than a bare `settings`: `_serve` also hands `create_app` the
+    # `local_ollama` it built, and a stub narrower than the real signature fails
+    # on the argument rather than on the thing this test is about.
+    monkeypatch.setattr(daemon_app, "create_app", lambda settings, **_: object())
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append(kw))
 
     assert cli.main(["run"]) == 0
