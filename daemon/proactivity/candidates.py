@@ -642,7 +642,11 @@ def topic_candidates(reader: CandidateReader, now: datetime) -> list[Candidate]:
     `daemon/proactivity/topics.py`'s `MAX_ENTITY_CHARS` docstring).
     What the daemon will actually *say* about it needs material this generator does
     not have; that arrives after the gate (ADR 0015), and a candidate whose search
-    finds nothing is dropped rather than spoken.
+    finds nothing **at all** is dropped rather than spoken. A search that comes
+    back with titles about a namesake instead keeps the candidate: the titles are
+    discarded and the line becomes an ordinary check-in about the entity, which
+    after ADR 0016 is a shape the owner asked for. See `topics.render` for the
+    measurement that split those two cases apart.
 
     Rearm is enforced in SQL (`stale_entities`'s `raised_since` exclusion),
     anchored to each entity's own last `topic` row - not by this generator's

@@ -58,7 +58,13 @@ NAME_SEPARATOR = "__"
 
 STARTUP_TIMEOUT = 30.0
 """Per server. An `npx` server downloads its package on first run, which is slow
-once and fast afterwards; unbounded would mean a typo in a command hangs startup."""
+once and fast afterwards; unbounded would mean a typo in a command hangs startup.
+
+Covers entering the transport and `initialize()` **together**, not each: `_ServerLink.open`
+waits on this same constant around the whole connect and, starting first, always wins - which
+makes `_connect`'s own inner `wait_for` unreachable. A remote server taking 20s to open a
+socket and 15s to initialize used to succeed and now fails. `_register`'s tool listing is a
+separate call and still gets its own full budget."""
 
 CALL_TIMEOUT = 60.0
 

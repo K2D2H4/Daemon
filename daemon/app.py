@@ -862,8 +862,14 @@ async def build_proactive_tick(
     `bridge.aclose()` at the end of the very same tick). `None` - the default, and
     what `daemon proactive` passes, since the CLI runs with no lifespan and no
     `app.state` to reuse at all - falls back to building, and owning, and later
-    closing, a bridge of its own, bounded by `PROACTIVE_TOOLS_BUILD_TIMEOUT` so a
-    wedged MCP server costs this one tick rather than the scheduler.
+    closing, a bridge of its own. A wedged MCP server costs this tick rather than
+    the scheduler, but the ceiling is not here: it is in `_ServerLink.open`
+    (`daemon/tools/mcp.py`), per server, where the task that owns the transport
+    can be cancelled. So this call is bounded by roughly the server count times
+    `STARTUP_TIMEOUT` rather than by any one number - on a multi-server install it
+    can outrun `PROACTIVE_TICK_MINUTES`, which `coalesce=True` absorbs by skipping
+    a round. What `max_instances=1` needs is that the job always *returns*, and
+    that is what moving the timeout down a level bought.
     """
     from daemon.fs import harden_existing
     from daemon.memory.store import Store
