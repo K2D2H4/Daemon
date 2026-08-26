@@ -463,6 +463,17 @@ class VoiceConversation:
                         # conversation that ends mid-answer needs one more nudge past
                         # `_until`, or the face is left talking to an empty room.
                         self._speech.pump(float("inf"))
+                    if self._face is not None:
+                        # And the flush above is not enough on its own: `pump` only
+                        # ever turns `speaking` back into `idle`, while
+                        # `_forward_microphone` publishes `listening` on every chunk
+                        # it forwards. With barge-in on (the default) that keeps
+                        # happening right through the answer, so almost every wake
+                        # round *ends* on `listening` - and nothing clears it, so on
+                        # a voice-only day the face never leaves it. Idle is the one
+                        # honest last word for a conversation that is over: nothing
+                        # is being heard and nothing is being said.
+                        self._face.set_activity("idle")
                     await _aclose(microphone)
                     await self._cancel_speculative()
                     # Reached on cancellation too, which is the point: the transcript

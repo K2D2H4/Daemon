@@ -2829,13 +2829,36 @@ async def test_listening_is_published_while_the_owner_talks() -> None:
 
 
 async def test_the_conversation_ending_leaves_the_face_idle() -> None:
-    """A conversation that ends mid-answer must not leave a talking face behind:
-    the timer task is cancelled with it and idle is the last word - not merely
-    "whatever `speaking`/`level` the last pump happened to leave on the bus"."""
+    """Idle is the last word, whatever the round happened to end on.
+
+    Scripted to end on `listening`, which is what a real round almost always
+    ends on and what this test used to miss: it ended on `speaking`, and the
+    shutdown flush is `SpeechClock.pump`, which only ever turns `speaking` back
+    into `idle`. `_forward_microphone` publishes `listening` on every chunk it
+    forwards, and with barge-in on (the default) it keeps forwarding right
+    through the answer - so the flush alone left the face stuck on `listening`
+    for the rest of the day on a voice-only install, and this test passed.
+
+    The `Does` step is what puts the mic chunk after the answer rather than
+    before it: `_forward_microphone`'s own half-duplex gate drops everything
+    while `now < _playback_until`, so without clearing that first the chunk is
+    dropped and the round ends on `speaking` again - which is exactly the shape
+    that made this test vacuous.
+    """
     bus = RecordingBus()
-    conv = conversation(FakeSession(b"\x00" * 48_000, Turn()), FakeAudio(), face=bus)
+    holder: dict[str, VoiceConversation] = {}
+    session = FakeSession(
+        b"\x00" * 48_000,
+        Does(lambda: setattr(holder["conv"], "_playback_until", 0.0)),
+        Turn(),
+    )
+    conv = conversation(session, FakeAudio(b"mic"), face=bus)
+    holder["conv"] = conv
     await conv.run()
 
+    assert bus.activities == ["speaking", "listening", "idle"], (
+        "the round has to actually end on listening for this to be testing anything"
+    )
     assert bus.state.activity == "idle"
 
 
