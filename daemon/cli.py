@@ -772,25 +772,53 @@ def _face() -> int:
 def _face_transitions(settings: Settings) -> int:
     """Rebuild the pose-match table (Task 9) and write it to the face dir.
 
-    `face_match.write_table` shells out to `ffmpeg` once per clip; two of its
-    failure shapes are handled here rather than left to raise a traceback
-    (module docstring: print what was found, don't raise one). A missing
-    binary raises `FileNotFoundError` - an `OSError`, not a nonzero exit - the
-    same shape `_face()` guards around `open`/Chrome. A present but corrupt
-    or unreadable clip raises `CalledProcessError` instead (`ffmpeg` ran and
-    exited nonzero, per `_frames`'s own `check=True`) - a different failure
-    with a different message, so it is caught separately rather than folded
-    into the same branch as "ffmpeg is missing entirely". Unlike `_face()`
-    this genuinely cannot proceed past either one, so it reports the problem
-    and stops rather than falling back to anything.
+    Four failure shapes are handled here rather than left to raise a traceback
+    (module docstring: print what was found, don't raise one), and they are
+    four rather than one because `except OSError` alone said "ffmpeg not
+    found" for all of them:
+
+    - **No Pillow.** `Pillow>=10.0; sys_platform == 'darwin'` in pyproject, so
+      on Linux a core install reaches this command with no PIL and used to get
+      a raw ImportError traceback.
+    - **No ffmpeg.** `face_match._frames` shells out to it once per clip and a
+      missing executable raises `FileNotFoundError` rather than returning a
+      nonzero exit - the same shape `_face()` guards around `open`/Chrome.
+    - **Any other OS error**, kept apart from that one: a `FileNotFoundError`
+      is not always a missing binary. `write_table`'s own `write_text` raised
+      exactly that on a fresh install with no `<data_dir>/face/`, and the
+      daemon told the owner to go install ffmpeg. `write_table` creates the
+      directory now, so this branch is for the ones left.
+    - **A corrupt clip**, which is `CalledProcessError` (`ffmpeg` ran and
+      exited nonzero, per `_frames`'s own `check=True`) - a different failure
+      with a different message.
+
+    Unlike `_face()` this genuinely cannot proceed past any of them, so it
+    reports the problem and stops rather than falling back to anything.
     """
-    from daemon.face_match import write_table
+    try:
+        from daemon.face_match import write_table
+    except ImportError as exc:
+        # `Pillow>=10.0; sys_platform == 'darwin'` in pyproject: it is a core
+        # dependency on macOS only, so on Linux a core install reaches this
+        # command with no PIL at all and used to get a raw traceback - against
+        # this file's own docstring.
+        print(f"daemon: face-transitions needs Pillow and numpy - {exc}", file=sys.stderr)
+        return PROBLEM
     from daemon.face_routes import face_dir
 
     try:
         path = write_table(face_dir(settings))
-    except OSError:
+    except FileNotFoundError:
         print("daemon: ffmpeg not found - install it and try again", file=sys.stderr)
+        return PROBLEM
+    except OSError as exc:
+        # Anything else the filesystem or the process layer raises. Kept apart
+        # from the branch above because `except OSError` alone reported every
+        # write failure as a missing ffmpeg: on a fresh install with no
+        # `<data_dir>/face/`, `write_table`'s own `write_text` raised
+        # `FileNotFoundError` and the daemon said to go install ffmpeg. That
+        # write now creates the directory, so this is only ever a real one.
+        print(f"daemon: could not write the table - {exc}", file=sys.stderr)
         return PROBLEM
     except subprocess.CalledProcessError as exc:
         print(f"daemon: ffmpeg could not read a clip - {exc}", file=sys.stderr)

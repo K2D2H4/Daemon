@@ -229,7 +229,14 @@ def write_table(face_dir: Path) -> Path:
     """Build the table and write it to `<face_dir>/transitions.json` - the path
     `GET /face/transitions` serves from, and the one the page's absence-means-
     frame-0 fallback (rule 4) depends on simply not existing until this has run.
+
+    Creates the directory. It is `<data_dir>/face/` and nothing else makes it:
+    the clips are the owner's and they arrive by being dropped there, so on an
+    install where they have not been yet this used to raise `FileNotFoundError`
+    from `write_text` - which `daemon.cli._face_transitions` then reported as a
+    missing ffmpeg.
     """
+    face_dir.mkdir(parents=True, exist_ok=True)
     path = face_dir / "transitions.json"
     path.write_text(json.dumps(build_table(face_dir)), encoding="utf-8")
     return path

@@ -13,6 +13,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -792,6 +793,62 @@ def test_face_transitions_reports_a_problem_when_ffmpeg_is_missing(
 
     assert cli.main(["face-transitions"]) == cli.PROBLEM
     assert "ffmpeg" in capsys.readouterr().err
+
+
+def test_face_transitions_creates_the_face_dir_rather_than_blaming_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The real `write_table`, on an install where nobody has made
+    `<data_dir>/face/` yet - which is every install until the owner drops clips
+    in, since nothing else creates it.
+
+    `write_text` raised `FileNotFoundError` there, and the command's blanket
+    `except OSError` reported it as "ffmpeg not found": wrong, and unactionable.
+    No ffmpeg is needed to reach it - with no clips present `build_table`
+    iterates nothing and never shells out - so this test is the real path, not
+    a stand-in for it.
+    """
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "fresh"))
+    assert not (tmp_path / "fresh" / "face").exists()
+
+    assert cli.main(["face-transitions"]) == 0
+    out, err = capsys.readouterr()
+    assert (tmp_path / "fresh" / "face" / "transitions.json").is_file()
+    assert "ffmpeg" not in err
+    assert "0 pair(s)" in out
+
+
+def test_face_transitions_says_it_needs_pillow_rather_than_raising(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`Pillow>=10.0; sys_platform == 'darwin'` in pyproject: it is core on macOS
+    only, so on Linux a core install reaches this command with no PIL at all and
+    got a raw ImportError traceback - against this module's own docstring. A
+    `None` in `sys.modules` is what makes `from ... import` raise ImportError
+    without needing an install that lacks the package."""
+    monkeypatch.setitem(sys.modules, "daemon.face_match", None)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    err = capsys.readouterr().err
+    assert "Pillow" in err
+    assert "ffmpeg" not in err, "a missing dependency is not a missing binary"
+
+
+def test_face_transitions_does_not_call_every_write_failure_a_missing_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half of the blanket-`except OSError` defect: an OS error that is
+    genuinely about writing must not be reported as an absent binary."""
+
+    def unwritable(face_dir: Path) -> Path:
+        raise PermissionError(f"{face_dir}/transitions.json")
+
+    monkeypatch.setattr("daemon.face_match.write_table", unwritable)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    err = capsys.readouterr().err
+    assert "ffmpeg" not in err
+    assert "transitions.json" in err
 
 
 def test_face_transitions_reports_a_problem_when_a_clip_is_corrupt(

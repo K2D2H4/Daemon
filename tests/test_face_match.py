@@ -20,6 +20,7 @@ WINDOW and DIRECTION_SPAN are both 5 frames (±500ms) as of the follow-up, so a
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -28,6 +29,14 @@ import pytest
 from PIL import Image
 
 from daemon.face_match import build_table, write_table
+
+pytestmark = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None, reason="ffmpeg is not installed"
+)
+"""Every test here builds its synthetic clips with ffmpeg and `face_match._frames`
+reads them back with it. CI is `ubuntu-latest` and installs no binaries
+(.github/workflows/ci.yml is `pip install` and nothing else), so without this
+these ERROR rather than skip - a red build that says nothing about the code."""
 
 FPS = 10
 """task-9-brief.md rule 1: "±2 frames at 10fps (±200ms)", later widened to
