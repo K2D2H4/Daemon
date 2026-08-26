@@ -247,6 +247,22 @@ class ProactiveTick:
         reconsidered any sooner than the daemon would be allowed to speak
         again anyway. Reusing it means one knob tunes both paces instead of a
         second constant nobody would think to change together with the first.
+
+        **A rest can land past the candidate's own `expires_at`, and then it
+        never gets another turn** - `due_candidates` never sees it because
+        `expire_candidates` retires it first. That is deliberate (an observation
+        too stale to speak on is not worth one more model call), but ADR 0016
+        changed what it costs and the change is worth naming. Before the flip
+        `silence` declined 20/20, so a rest past expiry lost nothing that was
+        ever going to be said. After it, `silence` speaks 30/30, and because its
+        dedup key is one-per-episode (see `candidates.py`), a single late decline
+        now costs the **whole** silence episode rather than one attempt. Observed
+        on the owner's live database, 2026-08-26: the row for the
+        `2026-08-25T01:56:03Z` episode was rested at 00:33Z to a `due_at` of
+        02:03Z, four minutes past its 01:59Z expiry, and the episode produced
+        nothing. Left as is because post-flip declines are rare (0/30 measured)
+        and a clamp would buy one extra judge call at the end of a TTL; recorded
+        so the next person to see an episode vanish knows where it went.
         """
         rest = timedelta(minutes=self._settings.proactive_cooldown_minutes)
         self._store.push_candidate_due(candidate.id, due_at=moment + rest)
