@@ -431,7 +431,9 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   reads as material, and the model has plenty to say about the wrong subject. Naming the
   shapes in `topics.render` (a namesake person or character, a same-named product, a
   dictionary entry for the word) put `Daemon` at 5/5 on the project and 0/5 on the
-  character, and `Kiwi` back on the owner's own. Two lessons worth more than the fix:
+  character, and `Kiwi` at 5/5 on the owner's own (it had been silent 5/5 - the
+  same-name rule turns a decline into a usable check-in, not just a wrong line
+  into a right one). Two lessons worth more than the fix:
   a confidently wrong line is a worse failure mode than an empty one and no instruction
   to be quiet in general catches it, and **an entity name is a search query only for
   names the web knows the way its owner does** — for the rest the search is discarded

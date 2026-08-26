@@ -1533,7 +1533,14 @@ def _proactivity_check(settings: Settings) -> Check:
     kinds = ", ".join(
         f"{kind} {cap}" for kind, cap in settings.proactive_kind_budgets.items()
     )
-    kinds = f"{kinds}, topic uncapped"
+    if "topic" not in settings.proactive_kind_budgets:
+        # Only when the owner has not set one. `topic` is a legal key in
+        # `DAEMON_PROACTIVE_KIND_BUDGETS` (`config.py` puts it in `PROACTIVE_KINDS`
+        # deliberately) and `Gate._kind_budget` honours it, so an unconditional
+        # append named the kind twice and told the owner the opposite of what the
+        # gate would do - in the one line this block cites CONTRACTS 12 to justify
+        # (PR #113 review).
+        kinds = f"{kinds}, topic uncapped"
     # `topic` (ADR 0015) is the one candidate kind that reaches the network - one
     # read-only search per gate-passed candidate, via the MCP bridge, bypassing
     # `tools/policy.py` entirely (it never goes through ToolRunner). `app.py`'s

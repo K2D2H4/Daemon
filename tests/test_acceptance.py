@@ -1134,37 +1134,51 @@ def test_a_reused_bridge_is_still_withheld_when_tools_are_off(
     assert fake.closed is False, "a withheld reused bridge is still not this tick's to close"
 
 
-def test_a_wedged_tool_build_times_out_instead_of_hanging_the_tick(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Whole-branch review: neither `_bring_up` nor `_register` bounds the
-    transport's own connect step, so a pathological MCP server can hang
-    `_build_tools` forever. `_proactive_tick`'s job runs `max_instances=1`, so a
-    tick that never returns is every later tick silently skipped forever - this
-    project's signature defect. `PROACTIVE_TOOLS_BUILD_TIMEOUT` bounds the one
-    path that still calls `_build_tools` per tick (no bridge was reused)."""
-    import daemon.app as app_module
-    from daemon.app import build_proactive_tick
+def test_a_server_that_never_finishes_connecting_is_bounded_and_leaves_no_orphan() -> None:
+    """A pathological MCP server must cost the tick its `topic` candidates, never
+    the scheduler - `_proactive_tick` runs `max_instances=1`, so a tick that never
+    returns is every later tick silently skipped forever, this project's signature
+    defect.
 
-    async def _hangs(*args: Any, **kwargs: Any) -> Any:
-        await asyncio.sleep(10)
-        raise AssertionError("should have timed out before sleeping this long")
+    This asserts at `_ServerLink.open` rather than around `_build_tools`, which is
+    where an earlier version of this test sat. PR #113 review: bounding the caller
+    is worse than not bounding it. `_build_tools` constructs the bridge *inside*
+    the awaited coroutine and `_bring_up` opens each server in a detached task, so
+    cancelling the caller discards the only reference that could ever close the
+    children it already started. The two assertions below are exactly the two
+    halves of that: the wait ends, **and** the transport's own task is finished
+    rather than left running.
+    """
+    from daemon.tools.base import ToolError
+    from daemon.tools.mcp import McpBridge, ServerConfig, _ServerLink
 
-    monkeypatch.setattr(app_module, "_build_tools", _hangs)
-    monkeypatch.setattr(app_module, "PROACTIVE_TOOLS_BUILD_TIMEOUT", 0.05)
+    async def scenario() -> tuple[float, bool]:
+        bridge = McpBridge.__new__(McpBridge)
+        config = ServerConfig(name="wedged", command="/bin/true", args=(), env={})
+        link = _ServerLink(bridge, config, secret=None, auth=None)
 
-    settings = Settings(
-        _env_file=None,
-        DAEMON_PROVIDER="ollama",
-        DAEMON_OLLAMA_MODEL="gemma3:4b",
-        DAEMON_DATA_DIR=str(tmp_path),
-    )
-    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True))
+        async def _never_connects() -> Any:
+            await asyncio.sleep(3600)
+
+        bridge._connect = lambda *a, **k: _never_connects()  # type: ignore[method-assign]
+
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        with pytest.raises(ToolError, match="did not finish connecting"):
+            await asyncio.wait_for(link.open(), timeout=5.0)
+        return loop.time() - began, link._task is not None and link._task.done()
+
+    import daemon.tools.mcp as mcp_module
+
+    original = mcp_module.STARTUP_TIMEOUT
+    mcp_module.STARTUP_TIMEOUT = 0.05
     try:
-        assert tick._judge is not None
-        assert tick._judge._bridge is None, "a wedged build must degrade to no bridge"
+        elapsed, task_finished = asyncio.run(scenario())
     finally:
-        asyncio.run(closing())
+        mcp_module.STARTUP_TIMEOUT = original
+
+    assert elapsed < 2.0, "the connect wait is unbounded"
+    assert task_finished, "the transport's task outlived the timeout - an orphaned child"
 
 
 def test_the_scheduled_tick_reads_the_bridge_getter_fresh_each_fire(

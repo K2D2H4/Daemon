@@ -106,22 +106,18 @@ PROACTIVE_TICK_MINUTES = 5
 passes the gate - so the cost of the interval is a few sqlite reads and three
 subprocess probes, not a model call."""
 
-PROACTIVE_TOOLS_BUILD_TIMEOUT = 60.0
-"""Ceiling on `build_proactive_tick`'s own `_build_tools` call, for the one path
-that still makes it: no reusable bridge was handed in (`daemon proactive`, which
-runs with no lifespan at all, or a resident tick fired before `app.state.mcp`
-exists). Whole-branch review: `MCPBridge.start` connects every configured
-server, and while `session.initialize()`/`session.list_tools()` each carry their
-own `STARTUP_TIMEOUT` (30s, `daemon/tools/mcp.py`), the transport's own connect
-step (`stdio_client`/`streamablehttp_client` entering their context) has none -
-so a pathological server can wedge `_bring_up` before either inner timeout ever
-starts counting. `_proactive_tick`'s job is registered `max_instances=1`, so a
-tick that never returns is not one missed round, it is every later tick silently
-skipped forever - this project's signature defect, reachable from an unrelated
-MCP server misbehaving. 60s leaves headroom under the 5-minute
-`PROACTIVE_TICK_MINUTES` cadence even for several slow-but-working servers, and
-a timeout here costs exactly what a missing bridge already costs: `topic`
-candidates drop for this one tick, the other five generators are unaffected."""
+# A `PROACTIVE_TOOLS_BUILD_TIMEOUT` used to live here, wrapping this module's own
+# `_build_tools` call in `asyncio.wait_for` so a wedged MCP server could not stop
+# the scheduler (`_proactive_tick` is registered `max_instances=1`, so a tick that
+# never returns is every later tick silently skipped). The PR #113 review showed it
+# made the failure worse, not better: `_build_tools` constructs the bridge *inside*
+# the awaited coroutine, and `McpBridge._bring_up` opens each server in a detached
+# task, so cancelling the caller left every already-connected stdio child running
+# with nothing holding a reference that could ever close it. The ceiling now sits
+# where the task owning the transport can actually be cancelled -
+# `_ServerLink.open` in `daemon/tools/mcp.py`, under `STARTUP_TIMEOUT` - which also
+# bounds the lifespan's own build and every other `_build_tools` caller, not just
+# this one.
 
 REFLECT_HOUR = 4
 """Local hour for the nightly pass. Late enough that the day is over, early enough
@@ -934,34 +930,23 @@ async def build_proactive_tick(
                 # that reaches for it until the next full restart.
                 tick_bridge = bridge
             else:
-                try:
-                    tools_runner, tick_bridge, _tools_status = await asyncio.wait_for(
-                        _build_tools(settings, store),
-                        timeout=PROACTIVE_TOOLS_BUILD_TIMEOUT,
-                    )
-                except TimeoutError:
-                    # An MCP server that hangs on connect must cost this tick's
-                    # `topic` candidates, never the scheduler itself - see
-                    # `PROACTIVE_TOOLS_BUILD_TIMEOUT`'s docstring for why an
-                    # unbounded wait here is this project's signature defect
-                    # waiting to happen. Same degrade path as no bridge at all.
-                    logger.warning(
-                        "proactive: tool layer did not come up within %.0fs; "
-                        "continuing without it this tick",
-                        PROACTIVE_TOOLS_BUILD_TIMEOUT,
-                    )
-                    tick_bridge = None
-                else:
-                    if tools_runner is not None:
-                        closers.append(tools_runner.aclose)
-                    if tick_bridge is not None:
-                        # A stdio MCP server is a child process - one left running
-                        # is an orphan per tick, the same reason the app lifespan
-                        # closes its own bridge ahead of the store (see
-                        # `_lifespan` above). Only reached on this, the "this
-                        # tick built its own" branch - a reused bridge is never
-                        # closed here (see the comment above).
-                        closers.append(tick_bridge.aclose)
+                # No `wait_for` around this: a server that hangs on connect is
+                # bounded inside `_ServerLink.open`, in the task that owns the
+                # transport and can therefore be cancelled cleanly. Wrapping the
+                # call here instead orphaned the children it had already started
+                # (see the note on the removed `PROACTIVE_TOOLS_BUILD_TIMEOUT`).
+                tools_runner, tick_bridge, _tools_status = await _build_tools(
+                    settings, store
+                )
+                if tools_runner is not None:
+                    closers.append(tools_runner.aclose)
+                if tick_bridge is not None:
+                    # A stdio MCP server is a child process - one left running is
+                    # an orphan per tick, the same reason the app lifespan closes
+                    # its own bridge ahead of the store (see `_lifespan` above).
+                    # Only reached on this, the "this tick built its own" branch -
+                    # a reused bridge is never closed here (see above).
+                    closers.append(tick_bridge.aclose)
         judge = Judge(gateway, data_dir=settings.data_dir, bridge=tick_bridge)
 
         channel = None

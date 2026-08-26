@@ -94,7 +94,12 @@ the model imitated them anyway, measurably, until the phrases were named.
   consequence this bullet predicted.)
 - A failed or disabled search drops the `topic` candidate and leaves the other
   five generators working. Proactivity degrades to today's behaviour, not to an
-  error.
+  error. (Narrowed 2026-08-26: this now means an *empty* search. A search that
+  returns only titles about a namesake keeps the candidate - the titles are
+  discarded and the line becomes an ordinary check-in about a thing the owner
+  wrote down, which after ADR 0016 is a shape he asked for. Only an empty result
+  still drops it, in `Judge.decide`. See `topics.render` for the measurement that
+  moved this line.)
 - The daily budget drops 8 → 5 and the cooldown rises 30 → 90 minutes. Not
   because the budget was ever binding — at 0 utterances nothing was binding — but
   because a generator that can always find material needs a real ceiling where
@@ -112,8 +117,13 @@ Four ADRs in this file were overturned by measurement. This one names its own
 test in advance so it can be the fifth without an argument.
 
 **Run 2026-08-25 (n=30 paired, `gemini-3.6-flash`): not overturned, but weaker
-than this ADR implies.** With the search, a topic line carried a concrete fact
-6/30 and 3/30 on two interleaved runs; without it, **0/30 both times**. No URL
+than this ADR implies.** With the search, a topic line scored as carrying a
+concrete fact 6/30 and 3/30 on two interleaved runs; without it, **0/30 both
+times**. Those counts are `evals/proactive_topic_spike.py`'s
+`_carries_concrete_fact` heuristic, not a hand audit - it scores any run of two
+Latin letters as content, so it would pass a contentless opener that merely
+names a Latin-scripted entity. Read them as a direction, not a rate; the
+hand-audited re-run below is the one to quote. No URL
 reached an utterance in 60 trials. So the line does not read the same either
 way, and the reversal condition is not met.
 

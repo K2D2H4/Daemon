@@ -762,6 +762,32 @@ def test_e_the_app_exposes_the_catchup_lock(tmp_path: Path) -> None:
         assert persona_job.args[1] is lock
 
 
+def test_the_proactive_job_is_handed_a_getter_not_a_bridge(tmp_path: Path) -> None:
+    """The tick must reuse the lifespan's live MCP bridge rather than connecting and
+    tearing down every configured server on its own, 288 times a day (PR #113).
+
+    A getter and not the bridge itself, because `add_job` captures `args` at
+    registration - which happens before `app.state.mcp` is built, so the value at
+    that moment is always `None`. Asserting the arg is callable and resolves to the
+    *current* `app.state.mcp` is the whole fix: reverting it to `args=[settings]`
+    restores the defect, and without this test the suite stays green while it does.
+    Identity against the live attribute, for the same reason
+    `test_e_the_app_exposes_the_catchup_lock` above asserts identity rather than
+    type - a getter that returned some other bridge would pass a callable check."""
+    app = create_app(_settings(tmp_path, proactive_enabled=True))
+    with TestClient(app, base_url=LOOPBACK):
+        job = app.state.scheduler.get_job("proactivity")
+        assert job is not None, "the proactive job was not registered"
+        assert len(job.args) == 2, "the tick was not handed a bridge source at all"
+        get_bridge = job.args[1]
+        assert callable(get_bridge), "a captured value cannot see a later app.state.mcp"
+
+        assert get_bridge() is app.state.mcp
+        sentinel = object()
+        app.state.mcp = sentinel
+        assert get_bridge() is sentinel, "the getter is not reading app.state fresh"
+
+
 @pytest.mark.asyncio
 async def test_run_reflection_now_raises_where_the_tick_swallows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

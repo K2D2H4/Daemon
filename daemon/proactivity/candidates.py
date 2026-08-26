@@ -344,8 +344,10 @@ Not copied from another kind - a topic's material is a `TOPIC_QUIET_DAYS`-quiet
 entity, which is not urgent the way `silence` (12h) or `pattern_time` (2h) are:
 nothing about today makes tomorrow a worse day to raise it. The number is sized
 against the *retry*, not a deadline: at the 90-minute rest cadence, 24 hours is
-about 16 attempts, enough for a flaky search (a `tavily` hiccup, a transient
-network failure) to recover before this generator gives up for the day. Past
+**at most** 16 attempts - fewer whenever another kind is also due, since
+`tick.py` judges one candidate per tick and breaks - which is enough for a flaky
+search (a `tavily` hiccup, a transient network failure) to recover before this
+generator gives up for the day. Past
 that there is no urgency to keep trying today, and `TOPIC_REARM_DAYS` already
 keeps the same entity from returning for two weeks regardless of whether this
 row fired, expired, or never got the chance."""

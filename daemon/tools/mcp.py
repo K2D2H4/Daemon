@@ -39,7 +39,7 @@ import os
 import re
 import shutil
 from collections.abc import Mapping
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -499,9 +499,39 @@ class _ServerLink:
         """Start the owning task and block until the session is up, or the connect
         failed. Returns the session; on failure raises exactly what the connect
         raised - the task has already torn its own partial stack down in that task,
-        so nothing is orphaned."""
+        so nothing is orphaned.
+
+        The wait is bounded because nothing under it was. `_connect` covers
+        `session.initialize()` with `STARTUP_TIMEOUT`, but entering the transport
+        context above it - `stdio_client` spawning a child, `streamablehttp_client`
+        opening a socket - has no ceiling of its own, so a server that accepts the
+        connection and then never speaks blocks here forever. Cancelling this task
+        is what makes that recoverable: `_run` relays `BaseException` out of
+        `_connect`, which closes its own partial stack **in this same task**, which
+        is the one place anyio permits it. Awaiting `aclose()` from the caller
+        instead would deadlock - `close()` sets `_close` and awaits `_task`, and a
+        task still inside `_connect` never reaches `await self._close.wait()`.
+
+        Found by the PR #113 review: `build_proactive_tick` had wrapped its own
+        `_build_tools` call in `asyncio.wait_for` to keep a wedged server from
+        stopping the scheduler, and that timeout made things worse rather than
+        better. Cancelling the *caller* leaves these tasks running, and the bridge
+        they belong to is constructed inside the cancelled coroutine, so nothing
+        can ever close them - one orphaned stdio child per already-connected
+        server, every tick, forever. A ceiling belongs here, where the task that
+        owns the transport can be cancelled.
+        """
         self._task = asyncio.create_task(self._run())
-        await self._ready.wait()
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=STARTUP_TIMEOUT)
+        except TimeoutError:
+            self._task.cancel()
+            with suppress(BaseException):
+                await self._task
+            raise ToolError(
+                f"the MCP server {self._config.name!r} did not finish connecting "
+                f"within {STARTUP_TIMEOUT:.0f}s"
+            ) from None
         if self._error is not None:
             await self._task
             raise self._error

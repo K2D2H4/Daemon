@@ -138,8 +138,17 @@ def test_unusable_titles_hand_the_turn_back_rather_than_forcing_silence() -> Non
 
 
 def test_no_titles_means_no_block() -> None:
-    """A candidate whose search found nothing must be dropped, not spoken. Four
-    content-free topic openers a day is `재미난 얘기 있어요?` with a different noun."""
+    """A candidate whose search found *nothing at all* must be dropped, not spoken.
+
+    Narrowed 2026-08-26 alongside the same-name tests above, which require the
+    opposite for a non-empty result: titles about a namesake are discarded and the
+    turn goes back to `judge.SYSTEM`, whose default is now to speak. The original
+    rationale here - "four content-free topic openers a day is `재미난 얘기 있어요?`
+    with a different noun" - was written when every check-in was suspect. The owner
+    then said the shape he rejected was the *demanding* question, not the ordinary
+    one (ADR 0016), and `TOPIC_REARM_DAYS` keeps a given entity to roughly one raise
+    a fortnight regardless. An empty search is still a drop: with no titles there is
+    no block at all, so there is nothing here to discard or keep."""
     assert topics.render("Sendbird", [], "ab12") == ""
 
 
