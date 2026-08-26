@@ -1,8 +1,11 @@
 """The audio window, which is where the latency budget actually comes from.
 
-MuseTalk v1.5 reads 10 whisper indices per frame at 20ms each - 120ms of past and
-80ms of future. That 80ms is the one number a faster GPU cannot reduce, so it is
-pinned here rather than left to the model code to imply.
+MuseTalk v1.5 reads 10 whisper indices per frame at 20ms each - 200ms total. The
+split between past and future is not flat: `floor()` quantisation makes the
+lookahead cycle 61.67-80ms and the lookbehind cycle 120-138.33ms, mirror images of
+each other twelve frames apart. 80ms is the lookahead's peak - the one number a
+faster GPU cannot reduce - so it is pinned here rather than left to the model code
+to imply.
 """
 
 import pytest
