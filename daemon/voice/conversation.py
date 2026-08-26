@@ -250,6 +250,7 @@ class VoiceConversation:
         screen_pump_factory: Callable[[VoiceSession], ScreenSharePump] | None = None,
         barge_in: bool = True,
         face: FaceBus | None = None,
+        pcm_sink: Callable[[bytes, float], None] | None = None,
     ) -> None:
         self._session = session
         self._audio = audio
@@ -371,8 +372,17 @@ class VoiceConversation:
                 face,
                 sample_rate=self._audio.playback_sample_rate,
                 bytes_per_frame=PLAYBACK_BYTES_PER_FRAME,
+                pcm_sink=pcm_sink,
             )
         )
+        """`pcm_sink` rides on this rather than on its own tap.
+
+        The lip-sync ring has to be addressed by when audio is *heard*, and
+        `SpeechClock` is where that arithmetic already lives - a second tap on the
+        same chunks would have to repeat it, and the copy that drifts is the one that
+        makes the mouth look dubbed. `None` when lip-sync is off, which is the
+        default.
+        """
         """`None` for a text-only install, which is what keeps this whole feature
         free for one: nothing below constructs a clock, starts a timer or calls the
         bus unless a caller handed one in. `playback_sample_rate`, not the

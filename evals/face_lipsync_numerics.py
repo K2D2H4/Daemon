@@ -26,16 +26,32 @@ What actually gets checked: the rename/split loop is run against every real
 tensor (686 -> 718 is what an earlier PyTorch-vs-MLX spike recorded for this
 conversion, docs/superpowers/specs/2026-08-25-face-design.md section 6 - print
 and compare by eye), `conv_in.weight` must land at (320, 3, 3, 8), and every
-`proj_in.weight` / `conv_shortcut.weight` must be rank 2. `conv_in` is a
+`proj_in.weight` / `proj_out.weight` / `conv_shortcut.weight` must be rank 2.
+`conv_in` is a
 meaningful canary and not an arbitrary pick: its input-channel count (8) differs
 from its kernel size (3), so a correct layout and a double-transposed one are
 actually distinguishable tuples here - unlike a tensor whose dimensions happen to
 coincide, where shape alone could not catch the same mistake. The rank check
 exists because `conv_in` cannot see everything: upstream mlx-examples'
 `map_unet_weights` does five things (rename, split, squeeze conv_shortcut,
-squeeze 4-D proj_in/proj_out, transpose) and this loader only does two (rename,
-split) - correct if the published weights truly need no squeeze, silently wrong
-if they do, and `conv_in` is unaffected either way so it cannot tell us which.
+squeeze 4-D proj_in/proj_out, transpose) and this loader does three - rename,
+split, squeeze - but never transposes.
+
+**That "three" used to read "two", and the difference is what this eval was for.**
+It said the squeeze was an open question: "correct if the published weights truly
+need no squeeze, silently wrong if they do". Running the assembled engine settled
+it. They need it - `proj_in` arrives as (320, 1, 1, 320) and `mx.addmm` rejects it
+outright, which is the loud version of the failure rather than the quiet one. So
+this check has changed job: it no longer probes an open premise, it asserts that
+`needs_squeeze` is still doing its work. 46 tensors depend on it.
+
+The mapping loop below deliberately calls the same `loader` helpers the engine
+does, rather than reimplementing them. An earlier version wrote its own rename and
+split inline, which meant it could pass while `daemon/face_lipsync/engine.py`
+failed - and it did: the split there collided on `.bias` keys, and mlx's
+`tree_unflatten` answers a duplicate key with unbounded recursion rather than an
+error naming the key.
+
 This does not run the model or recompute the spike's cosine similarity; it checks
 structural facts a running model would depend on. Never run in CI.
 """
@@ -46,7 +62,13 @@ import json
 import sys
 from pathlib import Path
 
-from daemon.face_lipsync.loader import needs_split, rename, unet_config
+from daemon.face_lipsync.loader import (
+    needs_split,
+    needs_squeeze,
+    rename,
+    split_names,
+    unet_config,
+)
 
 
 def main() -> int:
@@ -92,13 +114,30 @@ def main() -> int:
     weights = mx.load(weights_path)
     mapped = []
     for key, value in weights.items():
+        target = rename(key)
+        if needs_squeeze(target, value.ndim):
+            value = value.squeeze()
         if needs_split(key):
             a, b = mx.split(value, 2)
-            mapped.append((rename(key).replace("ff.net.0.proj", "linear1"), a))
-            mapped.append((rename(key).replace("ff.net.0.proj", "linear2"), b))
+            first, second = split_names(target)
+            mapped.append((first, a))
+            mapped.append((second, b))
         else:
-            mapped.append((rename(key), value))
+            mapped.append((target, value))
     print(f"  {len(weights)} tensors -> {len(mapped)} arrays")
+
+    # A duplicate destination is not a shape error and not an exception: mlx's
+    # tree_unflatten only stops recursing when a leaf holds exactly one entry, so it
+    # answers a collision with RecursionError from inside its own dict comprehension.
+    # Checking here names the key instead.
+    seen: set[str] = set()
+    duplicates = sorted({k for k, _ in mapped if k in seen or seen.add(k)})
+    if duplicates:
+        print("FAIL two weights mapped to the same destination:")
+        for key in duplicates:
+            print(f"  {key}")
+        return 1
+    print(f"  destinations unique ({len(mapped)})")
 
     # The check that matters: shape must stay NHWC. A double transpose shows up
     # here before it shows up as a blurry mouth.
@@ -109,15 +148,14 @@ def main() -> int:
     print("  layout OK (NHWC, not transposed)")
 
     # The narrower check conv_in cannot do: mlx-examples declares proj_in/proj_out
-    # and conv_shortcut as nn.Linear, which needs a 2-D (out, in) weight. This
-    # loader never squeezes (see module docstring), on the premise that the
-    # published weights need none - if that premise is wrong, one of these is
-    # still 4-D and building the real model would fail. A rank check now is
-    # strictly cheaper than waiting to find that out from a broken UNet.
+    # and conv_shortcut as nn.Linear, which needs a 2-D (out, in) weight, and the
+    # published weights arrive as 1x1 convolutions. `needs_squeeze` drops the
+    # singleton axes; this confirms it still did. proj_out is in the list now - it is
+    # squeezed for the same reason as the other two and was simply missing before.
     linear_like = [
         (key, value)
         for key, value in mapped
-        if key.endswith(("proj_in.weight", "conv_shortcut.weight"))
+        if key.endswith(("proj_in.weight", "proj_out.weight", "conv_shortcut.weight"))
     ]
     bad_rank = [(key, tuple(value.shape)) for key, value in linear_like if value.ndim != 2]
     if bad_rank:
@@ -125,7 +163,7 @@ def main() -> int:
         for key, shape in bad_rank:
             print(f"  {key}: {shape}")
         return 1
-    print(f"  proj_in/conv_shortcut rank OK ({len(linear_like)} tensors)")
+    print(f"  proj_in/proj_out/conv_shortcut rank OK ({len(linear_like)} tensors)")
     return 0
 
 
