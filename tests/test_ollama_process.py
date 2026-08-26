@@ -180,3 +180,19 @@ def test_is_local_accepts_loopback_and_rejects_another_host() -> None:
     assert is_local("http://[::1]:11434") is True
     assert is_local("http://192.168.1.50:11434") is False
     assert is_local("https://ollama.internal.example:11434") is False
+
+
+async def test_a_malformed_port_closes_the_gate_instead_of_raising() -> None:
+    """`urlparse(...).hostname` never touches the port, so `is_local` passes a
+    base_url like this straight through - it is the real `_probe` (unmocked
+    here on purpose) that hands httpx a URL it cannot parse.
+    `httpx.InvalidURL.__mro__` is `(InvalidURL, Exception, ...)`, not
+    `HTTPError`, so a one-character `.env` typo used to escape `ensure_running`'s
+    "never raises" promise entirely."""
+    local = LocalOllama(
+        "http://127.0.0.1:notaport",
+        find=lambda: None,
+        spawn=_never_spawn,
+    )
+
+    assert await local.ensure_running() is False

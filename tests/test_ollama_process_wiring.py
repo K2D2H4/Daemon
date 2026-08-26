@@ -13,8 +13,10 @@ without fixing the order just reproduces the first line with a shorter gap.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
+import pytest
 from starlette.testclient import TestClient
 
 from daemon.app import _backfill, create_app
@@ -70,6 +72,28 @@ async def test_the_backfill_does_not_run_against_an_embedder_that_never_came_up(
     await _backfill(recall, asyncio.create_task(never()))
 
     assert recall.calls == 0
+
+
+async def test_a_raising_ollama_readiness_is_logged_not_swallowed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`ensure_running` promises never to raise, but the wait for it used to sit
+    above `_backfill`'s own `try` - so if that promise were ever broken, the
+    exception would end the backfill task with zero log lines: `recall.calls ==
+    0` and nothing else to see it by, because `suppress(Exception)` in the
+    lifespan `finally` retrieves it before asyncio's own "never retrieved"
+    warning can fire. Asserting only "did not raise" would also pass against a
+    bare `except: pass`, so this checks that something was actually logged."""
+    recall = RecordingRecall()
+
+    async def broken() -> bool:
+        raise RuntimeError("ensure_running broke its 'never raises' promise")
+
+    with caplog.at_level(logging.ERROR):
+        await _backfill(recall, asyncio.create_task(broken()))
+
+    assert recall.calls == 0
+    assert caplog.text.strip() != ""
 
 
 class FakeOllama:

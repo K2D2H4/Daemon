@@ -85,7 +85,12 @@ async def _probe(base_url: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
             response = await client.get(f"{base_url.rstrip('/')}/api/tags")
-    except httpx.HTTPError:
+    except Exception:
+        # Broad on purpose: httpx.InvalidURL (e.g. a non-numeric port from a
+        # typo'd .env) is an Exception, not an httpx.HTTPError, and
+        # ollama_base_url has no validator (config.py) - a malformed URL must
+        # close this gate like any other, not raise past ensure_running's
+        # "never raises" promise.
         return False
     return response.status_code == 200
 

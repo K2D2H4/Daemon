@@ -501,6 +501,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.ollama_task = asyncio.create_task(
             local_ollama.ensure_running(), name="ollama-start"
         )
+        # Defense in depth alongside `_probe`'s broad `except`: `ensure_running`
+        # promises never to raise, but if that promise is ever broken again, this
+        # is what stands between the exception and vanishing the same way a dead
+        # conversation loop used to - `app.state` holding the reference is what
+        # keeps asyncio's own "never retrieved" warning from firing either.
+        app.state.ollama_task.add_done_callback(_report_ollama_start_death)
 
     if recall is not None:
         # Backfill after the loop is already serving, and in the background: a
@@ -797,6 +803,14 @@ def _report_loop_death(task: asyncio.Task[None]) -> None:
         )
 
 
+def _report_ollama_start_death(task: asyncio.Task[bool]) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("ollama start task died; recall stays keyword-only", exc_info=exc)
+
+
 async def _backfill(recall: Recall, ollama_ready: Awaitable[bool] | None = None) -> None:
     """Embed history the vector lane is missing, to exhaustion.
 
@@ -816,14 +830,14 @@ async def _backfill(recall: Recall, ollama_ready: Awaitable[bool] | None = None)
     Never fatal: recall degrades to keyword-only, which is worse than the full
     answer and far better than a dead conversation loop.
     """
-    if ollama_ready is not None and not await ollama_ready:
-        logger.info(
-            "recall backfill skipped: no embedder answered. Recall stays keyword-only "
-            "and the next restart tries again"
-        )
-        return
     total = 0
     try:
+        if ollama_ready is not None and not await ollama_ready:
+            logger.info(
+                "recall backfill skipped: no embedder answered. Recall stays keyword-only "
+                "and the next restart tries again"
+            )
+            return
         while True:
             landed = await recall.backfill(BACKFILL_CHUNK)
             total += landed
