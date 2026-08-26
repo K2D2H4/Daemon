@@ -1090,3 +1090,49 @@ def test_being_called_by_name_does_not_ask_for_the_owners_business() -> None:
         )
     for solicitation in ("wait for what they want", "how can i help", "what they need"):
         assert solicitation not in lowered
+
+
+@pytest.mark.asyncio
+async def test_the_gate_stands_down_when_a_proactive_line_wants_the_microphone() -> None:
+    """The daemon cannot listen and talk at once, and until 2026-08-26 the two
+    halves had no way to say so: the first proactive utterance this project ever
+    produced went to Telegram alone, with the speaker refusing because the gate
+    held the capture stream (`daemon/mic_floor.py`).
+
+    Ending the iteration is the gate's existing way of handing the microphone
+    back - the dead-stream watchdog returns exactly like this - so this asserts on
+    the *effect* a caller sees: the generator finishes, with no event, while there
+    is still audio left that would have fired it. Anything less would pass on a
+    gate that simply ran out of blocks."""
+    wanted = False
+
+    def floor_wanted() -> bool:
+        return wanted
+
+    blocks, probabilities = script(*(ONE_PHRASE * 2))
+    rig = build(blocks, probabilities, FakeRecognizer("헤이 대문"), floor_wanted=floor_wanted)
+
+    events: list[WakeEvent] = []
+    stream = rig.gate.listen()
+    async for event in stream:
+        events.append(event)
+        wanted = True  # asked for between blocks, the way the tick asks
+        break
+    assert events, "the first phrase should still have fired"
+
+    # A fresh listen with the request already standing must not consume the rest.
+    blocks2, probabilities2 = script(*(ONE_PHRASE * 2))
+    rig2 = build(blocks2, probabilities2, FakeRecognizer("헤이 대문"), floor_wanted=lambda: True)
+    assert await rig2.collect() == [], "the gate kept listening while a line waited"
+    assert rig2.gate.counters.frames_seen == 0, "it must stand down before consuming audio"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_mailbox_leaves_the_gate_alone() -> None:
+    """The check runs once per audio block on the hot path, so the case that must
+    not regress is the ordinary one: nobody is asking, and the gate behaves exactly
+    as it did before the seam existed."""
+    blocks, probabilities = script(*ONE_PHRASE)
+    rig = build(blocks, probabilities, FakeRecognizer("헤이 대문"), floor_wanted=lambda: False)
+
+    assert len(await rig.collect()) == 1

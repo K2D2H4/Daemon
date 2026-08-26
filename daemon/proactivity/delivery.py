@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -76,11 +77,17 @@ class ProactiveDelivery:
         *,
         channel: Channel | None = None,
         speaker: Speaker | None = None,
+        ask_for_the_floor: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self._store = store
         self._memory = memory
         self._channel = channel
         self._speaker = speaker
+        # `daemon/mic_floor.py`'s `request`, when a wake loop is running. Injected
+        # rather than imported so this module keeps knowing nothing about the voice
+        # layer, and so an install with no wake loop - voice off, or `daemon
+        # proactive --speak` from a terminal - still reaches the speaker directly.
+        self._ask_for_the_floor = ask_for_the_floor
 
     async def deliver(
         self,
@@ -138,6 +145,19 @@ class ProactiveDelivery:
         )
 
     async def _say(self, text: str) -> bool:
+        """Speak it here at the machine, if anything can.
+
+        Through the mic floor when a wake loop is running, because it is holding
+        the capture stream and `Speaker.say` refuses outright while this process
+        does (`daemon/proactivity/speaker.py`). Measured 2026-08-26, the first time
+        proactivity ever spoke: the gate saw the owner at the keyboard, chose
+        `both`, and the line went to Telegram alone because nothing could ask the
+        gate to stand down. `daemon/mic_floor.py` is the ask; the wake loop does
+        the speaking and answers `False` if it could not, which lands here exactly
+        like a speaker that refused.
+        """
+        if self._ask_for_the_floor is not None:
+            return await self._ask_for_the_floor(text)
         if self._speaker is None:
             # The gate should not have chosen a speaker route without one, but a
             # mismatch here must not lose the Telegram half.

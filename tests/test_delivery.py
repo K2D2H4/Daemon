@@ -301,3 +301,69 @@ async def test_the_row_exists_before_the_message_leaves(store: Store, data_dir: 
     await delivery.deliver(candidate(store), SAID, verdict(), now=NOW)
 
     assert seen == [True]
+
+
+async def test_the_speaker_is_reached_through_the_mic_floor_when_one_is_wired(
+    store: Store, data_dir: Path
+) -> None:
+    """The wake gate holds the capture stream, and `Speaker.say` refuses outright
+    while this process does - so on the resident, calling the speaker directly is
+    the same as not speaking. Measured 2026-08-26: the gate chose `both` and the
+    line went to Telegram alone.
+
+    Asserts the speaker is *not* called directly, because that is the half that
+    silently did nothing. A test that only checked the floor was asked would pass
+    on an implementation that asked and then spoke anyway."""
+    asked: list[str] = []
+    speaker = FakeSpeaker()
+
+    async def floor(text: str) -> bool:
+        asked.append(text)
+        return True
+
+    delivery, _ = delivery_for(
+        store, data_dir, channel=FakeChannel(), speaker=speaker, ask_for_the_floor=floor
+    )
+
+    result = await delivery.deliver(candidate(store), SAID, verdict("both"), now=NOW)
+
+    assert asked == ["발표 어떻게 됐어?"]
+    assert speaker.said == [], "the speaker was called directly and would have refused"
+    assert result.route == "both"
+
+
+async def test_a_floor_that_could_not_speak_leaves_the_channel_carrying_it(
+    store: Store, data_dir: Path
+) -> None:
+    """The wake loop answers `False` when nobody took the line, when the speaker
+    refused, and when the synthesiser failed. All three mean the same thing here:
+    the words still have to reach the owner."""
+
+    async def floor(text: str) -> bool:
+        return False
+
+    channel = FakeChannel()
+    delivery, _ = delivery_for(
+        store, data_dir, channel=channel, speaker=FakeSpeaker(), ask_for_the_floor=floor
+    )
+
+    result = await delivery.deliver(candidate(store), SAID, verdict("both"), now=NOW)
+
+    assert result.route == "telegram", "a `both` that could not speak is a telegram"
+    assert channel.sent[0].text == "발표 어떻게 됐어?"
+
+
+async def test_with_no_floor_wired_the_speaker_is_still_called_directly(
+    store: Store, data_dir: Path
+) -> None:
+    """`daemon proactive --speak` from a terminal has no wake round to take the
+    request, and neither does an install with the wake word off. Asking there would
+    cost the utterance ten seconds and then fall back to the speaker it could have
+    used at once."""
+    speaker = FakeSpeaker()
+    delivery, _ = delivery_for(store, data_dir, channel=FakeChannel(), speaker=speaker)
+
+    result = await delivery.deliver(candidate(store), SAID, verdict("both"), now=NOW)
+
+    assert speaker.said == ["발표 어떻게 됐어?"]
+    assert result.route == "both"

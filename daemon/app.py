@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
-from daemon import __version__
+from daemon import __version__, mic_floor
 from daemon.channels.base import Channel
 from daemon.clock import now_iso
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
@@ -970,9 +970,18 @@ async def build_proactive_tick(
             speaker = LocalSpeaker()
             closers.append(speaker.aclose)
 
+        # The floor, only when a wake loop could answer it. `speak` is the flag the
+        # resident sets and `daemon proactive` does not: from a terminal there is no
+        # wake round to take the request, so asking would cost the utterance ten
+        # seconds and then fall back to the speaker it could have used directly.
+        ask_for_the_floor = None
+        if speak and settings.voice_enabled and settings.wake_enabled:
+            ask_for_the_floor = mic_floor.request
+
         delivery = ProactiveDelivery(
             store,
             FileMemoryWriter(settings.data_dir, store),
+            ask_for_the_floor=ask_for_the_floor,
             channel=channel,
             speaker=speaker,
         )
@@ -1826,9 +1835,12 @@ async def _wake_round(
             await close_gate()
     if fired is None:
         # The stream ended without a wake word - a closed device, a test's scripted
-        # audio running out, or the gate's own dead-stream watchdog asking to be
-        # rebuilt. Not an error, but not a reason to spin either; the caller's own
-        # guard handles the pacing.
+        # audio running out, the gate's own dead-stream watchdog asking to be
+        # rebuilt, or proactivity asking for the microphone. Not an error, but not a
+        # reason to spin either; the caller's own guard handles the pacing.
+        taken = mic_floor.take()
+        if taken is not None:
+            await _speak_unprompted(settings, taken, shared)
         return
     logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
     # The segment that fired the gate goes with it - but only when it carries more
@@ -1859,6 +1871,69 @@ async def _wake_round(
     )
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
+    await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
+
+
+async def _speak_unprompted(
+    settings: Settings, taken: tuple[str, asyncio.Future[bool]], shared: VoiceRuntime | None
+) -> None:
+    """Say a proactive line at this machine, then listen for the answer.
+
+    Reached only from `_wake_round`, after its `finally` has closed the gate - so
+    the microphone is already free, released by the one sequence in this process
+    that is allowed to release it. Nothing here opens or closes a capture stream.
+
+    The line is spoken by `LocalSpeaker` and **not** handed to the voice session as
+    an opening. `opening_text` is a prompt the model answers
+    (`daemon/voice/conversation.py`), so a session asked to deliver this line would
+    say its own version of it - and the line it replaced has already been judged,
+    length-capped and refused for URLs by `daemon/proactivity/judge.py`. Speaking a
+    paraphrase would put an unchecked sentence in the owner's room while the checks
+    passed on a sentence nobody heard.
+
+    Then a session, with no opening at all, because the daemon has just spoken
+    first and the owner is most likely to answer in the next few seconds - the one
+    moment a gate rebuild would miss. It opens listening rather than talking: the
+    line is already in the conversation log (`ProactiveDelivery._log` writes it
+    before this returns), so the session assembles its context knowing what was
+    just said, without being told twice. `IDLE_TIMEOUT_SECONDS` bounds the cost at
+    30 seconds of silence, which is what makes this affordable on a per-minute
+    session that may well go unanswered.
+
+    A session is opened only if the line was actually spoken. Listening for an
+    answer to something the room never heard is the same billed minute for none of
+    the reason.
+    """
+    text, future = taken
+    spoke = False
+    try:
+        from daemon.proactivity.speaker import LocalSpeaker
+
+        speaker = LocalSpeaker()
+        try:
+            spoke = await speaker.say(text)
+        finally:
+            await speaker.aclose()
+    except Exception:
+        # Never raises into the wake loop: a failed line costs the utterance its
+        # speaker, and `mic_floor.request` is already falling back to the channel.
+        # Raising here would cost the round, and a round is the microphone.
+        logger.exception("wake: could not speak a proactive line")
+    finally:
+        # Owed unconditionally - `mic_floor.request` is sitting on this future, and
+        # dropping it turns its fallback into a ten-second delay for no reason.
+        mic_floor.answer(future, spoke)
+
+    if not spoke:
+        return
+    logger.info("wake: spoke first; listening for an answer")
+    try:
+        await run_voice(settings, shared=shared)
+    except Exception:
+        logger.exception("wake: the session opened after speaking first failed")
+    # Same handover the wake path takes, for the same reason: let the session's
+    # Voice-Processing unit finish releasing the microphone before the next round
+    # opens a fresh capture on it. See WAKE_REARM_SETTLE_SECONDS.
     await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
 
 
