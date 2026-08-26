@@ -243,6 +243,20 @@ class VoiceSession(Protocol):
         in voice mode: transcripts are how anything is remembered from a spoken
         turn, and a cancel between the last delta and the turn boundary otherwise
         loses the utterance from both the markdown and the mirror.
+
+        **An implementation must flush what it has before `receive()` returns or
+        raises**, so this drain is reached only on cancellation. Both shipped
+        sessions do; it is written down here because something now depends on it.
+        `VoiceConversation` skips recording the *first* assistant turn of a session
+        whose opening was already logged elsewhere - a proactive line, which
+        `ProactiveDelivery` writes as `session_kind='proactive'` - and it disarms
+        that skip at the turn boundary. A transcript that reached memory through
+        this drain instead would therefore be filed as an ordinary `voice` turn,
+        and `daemon/memory/store.py` states what that costs: the daemon's own
+        unprompted line resets the silence clock, "and speaking becomes its own
+        excuse to stop noticing the silence". A conforming implementation that
+        holds its last transcript back until cancellation reopens that with the
+        suite green (PR #126 review, found against the suite's own fake).
         """
         ...
 

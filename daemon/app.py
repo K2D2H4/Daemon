@@ -1565,7 +1565,19 @@ async def run_voice(
         # Before the handshake, so the acknowledgement is as close to the wake word
         # as it can be. Nothing is feeding the session yet, so the cue cannot be
         # heard as the owner interrupting.
-        await play_ready_cue(audio)
+        #
+        # Not when the daemon is the one about to talk. The cue means "the
+        # microphone is yours", and `on_spoke` is set by exactly one caller:
+        # `_speak_unprompted`, which opens a session to *say* something unprompted.
+        # Playing it there tells the owner to go ahead and then talks over him 1.3 s
+        # later, which is the opposite of what it means. Under `origin/main` the
+        # order was line-then-cue - `/usr/bin/say` spoke first and this ran
+        # afterwards - so routing the line through the session inverted it; caught
+        # in review of PR #126, whose whole subject is how being spoken to first
+        # sounds. The cue comes back on the owner's next turn, in the same session,
+        # because the session stays open to listen.
+        if on_spoke is None:
+            await play_ready_cue(audio)
 
         def new_session() -> Any:
             """A fresh session per attempt. Reconnecting means starting clean: the

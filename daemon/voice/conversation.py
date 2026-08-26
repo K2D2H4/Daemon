@@ -920,20 +920,38 @@ class VoiceConversation:
         self._played_bytes += size
         # The answer has started, so the microphone goes back to the room.
         self._answer_hold_until = 0.0
-        if self._first_audio_at is None:
+        first_chunk = self._first_audio_at is None
+        if first_chunk:
             self._first_audio_at = at
-            if self._on_first_audio is not None:
-                # Here, and not from the caller's `finally` around `run()`, which is
-                # what PR #126 shipped: that runs when the *attempt* ends, which for
-                # a line the owner answers is a whole conversation plus the closing
-                # 30 s of silence later - past the ceiling the one caller is waiting
-                # under. This is the instant the daemon starts talking.
-                notify, self._on_first_audio = self._on_first_audio, None
-                notify()
         seconds = size / (self._audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME)
         # Chunks queue behind each other, so playback ends after whatever is already
         # queued - not `at + seconds`, which would forget the backlog.
         self._playback_until = max(self._playback_until, at) + seconds
+        if first_chunk and self._on_first_audio is not None:
+            # Here, and not from the caller's `finally` around `run()`, which is what
+            # PR #126 shipped: that runs when the *attempt* ends, which for a line
+            # the owner answers is a whole conversation plus the closing 30 s of
+            # silence later - past the ceiling the one caller waits under. This is
+            # the instant the daemon starts talking.
+            #
+            # Below the bookkeeping above, not beside it. This method exists for
+            # `_playback_until` - the measured 28.4 s of audio arriving in 19 s, and
+            # the idle budget that had been running through ten of them - and a
+            # callback that raises must not be able to skip it. Cleared before the
+            # call so a re-entrant one cannot fire twice; the `first_chunk` guard
+            # and `_voice_attempts`' own `reported` flag already make that
+            # impossible, and this is the belt-and-braces of the three (PR #126
+            # review asked which was load-bearing: none of them alone).
+            notify, self._on_first_audio = self._on_first_audio, None
+            try:
+                notify()
+            except Exception:
+                # The contract says it must not raise; this is what happens when it
+                # does anyway. Every other cross-layer call on this path wraps and
+                # logs - `play_ready_cue`, `_send_opening`, `_send_continuity`,
+                # `_record_pending` - and losing the turn to report on it would be a
+                # worse trade than losing the report.
+                logger.exception("voice: the first-audio callback raised")
 
     async def _face_pump(self) -> None:
         """The falling edge, and the level while it lasts.

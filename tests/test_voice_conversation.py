@@ -2347,9 +2347,11 @@ async def test_run_voice_carries_the_proactive_signals_into_the_conversation(
     assert "answered" in events, "the caller was never told the daemon had spoken"
     assert events.count("answered") == 1, "a later turn reported the same line again"
     at = events.index("answered")
-    assert events[:at] == ["play"], (
-        f"nothing of the answer may have played yet - the one thing before it is "
-        f"`play_ready_cue`, which runs before the session is even opened: {events}"
+    assert events[:at] == [], (
+        f"nothing may have played before the daemon's own first chunk. "
+        f"`play_ready_cue` means 'the microphone is yours' and is skipped when she "
+        f"is the one about to talk - playing it here would tell the owner to go "
+        f"ahead and then talk over him (PR #126 review): {events}"
     )
     assert events[at + 1 :].count("play") == 2, (
         f"the caller was told at the end of the conversation rather than at the "
