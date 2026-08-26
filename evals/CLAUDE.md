@@ -18,6 +18,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `openai_compatible_loop_spike.py` | whether the *assembled* app survives a real turn on that endpoint — loop, recall, tool policy, audit table |
 | `screen_frame_arrival_spike.py` | why voice answered "what's on my screen" from nothing — a `realtimeInput.video` frame never arrives inside a tool round, and the fix is the image part *after* the tool response (0/20 → 19/20) |
 | `face_mood_tag_spike.py` | spec open question 4 — does the configured provider actually attach a leading `[mood:...]` tag, reliably and well-formed, under a candidate persona instruction nothing in this codebase ships yet |
+| `face_lipsync_prepare.py` | the offline preprocessing step — one driving mp4 in, the cache `daemon/face_lipsync` reads at runtime out. Needs torch and a MuseTalk checkout, which are deliberately not daemon dependencies |
 | `face_lipsync_numerics.py` | whether the product loader keeps real MLX weights in MLX layout — not whether the model runs, which it never does here — the published weights are diffusers-keyed but MLX-laid-out, and a second transpose is silent |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
@@ -239,6 +240,41 @@ the real origin gate and the real audit table, against a real endpoint. What
 remains **unproven**: `create_app`, the Telegram channel, `daemon run` as a
 resident process, and any Qwen endpoint at all. Nobody may read the four PASSes
 above as "a real Telegram conversation ran on Qwen".
+
+## face_lipsync_prepare.py
+
+```bash
+python3 -m evals.face_lipsync_prepare /path/to/idle1.mp4 \
+    --out data/face/lipsync/idle1 \
+    --musetalk ~/MuseTalk --weights ~/MuseTalk
+```
+
+The one tool in here that produces an asset rather than a number. It turns one driving
+clip into the five things `daemon/face_lipsync` reads at runtime — the frames, the face
+boxes, the blend regions, the BiSeNet masks, and the reference latents — so that **the
+runtime has no face detector and no torch in it at all.**
+
+It lives here and not in `scripts/` because `scripts/` is CI repo checks, stdlib only,
+importing nothing from `daemon` (see [scripts/CLAUDE.md](../scripts/CLAUDE.md)); this
+needs torch, diffusers, and a MuseTalk checkout, and must never run in CI. The plan
+doc, [docs/superpowers/plans/2026-08-26-face-lipsync-engine.md](../docs/superpowers/plans/2026-08-26-face-lipsync-engine.md),
+files it under `scripts/` and is wrong about that.
+
+Measured 2026-08-26 on `data/face/idle1.mp4` — 193 frames of 1080x1620 at 24fps, M-series
+Mac on MPS: **54.0s total** (landmarks 30.7s, VAE latents 11.0s, BiSeNet masks 12.3s),
+producing a 1.01GB frame store and a 3.2MB latents file.
+
+Two things worth knowing before trusting the output:
+
+- **`composite` on this cache is bit-identical to MuseTalk's own `get_image_blending`**
+  fed the same boxes, crop box and mask — max pixel difference 0. Not a tautology: a
+  crop box moved 12px changes the composited frame by up to 66/255, so the agreement is
+  a measurement of the geometry rather than a restatement of it.
+- **The landmarks are FAN, standing in for DWPose, and that substitution is still
+  unverified.** DWPose needs mmpose, which does not build on this machine. Both emit
+  the iBUG-68 scheme, so MuseTalk's box formula indexes the same anatomy — that is an
+  argument, not a number. The tool writes an overlay PNG for exactly this reason, and
+  nobody may call the box correct until it is compared against DWPose's.
 
 ## Common changes
 
