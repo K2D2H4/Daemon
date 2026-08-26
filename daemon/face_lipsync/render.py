@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from daemon.face_lipsync import Cache, LipsyncEngine, composite
-from daemon.face_lipsync.audio import CONTEXT_MS
+from daemon.face_lipsync.audio import CONTEXT_MS, latest_audio_ms
 from daemon.face_lipsync.ring import PcmRing, Slot
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,58 @@ N=3 is not the next step up: the batch cannot start until its last frame's audio
 arrived, so widening costs `(N-1) x 41.67ms` of latency and N=3 misses the 250ms
 ceiling by 7.6ms.
 """
+
+
+class FrameClock:
+    """Which frame to render on this tick, or `None` because its audio is not here yet.
+
+    The render loop in `daemon/app.py` ticks at `fps` and asks this each time. Three
+    things it exists to get right, none of which are visible from the loop:
+
+    **The batch-fill wait.** A step covers `BATCH` frames, so it cannot start until
+    the LAST of them has its audio - `(BATCH - 1) x 41.67ms` past what the first frame
+    alone needs. `PcmRing.window` zero-fills what has not arrived instead of erroring,
+    so a loop that just renders "the frame for now" gets a mouth conditioned on
+    silence and nothing anywhere complains.
+
+    **Re-anchoring.** `PcmRing.origin` moves - a new turn, a long silence, a barge-in
+    that rebuilds the clock, and continuously once the ring is full and dropping
+    samples. Frame indices are relative to it, so the count restarts whenever it
+    jumps. Small forward creep from sample dropping is not a new turn, hence the
+    tolerance.
+
+    **One frame per tick, never a skip.** Returning "the newest ready frame" would
+    jump the mouth forward after any hitch. Falling behind is corrected by the
+    renderer's own held-frame ticks, which cost nothing.
+
+    `now` and `origin` must come from the SAME clock, and in production that clock is
+    `loop.time()` - `daemon/voice/conversation.py` stamps audio with it deliberately
+    (see its `_playback_until` note). Passing `daemon.clock.now()` here type-checks,
+    runs, and puts the mouth an arbitrary offset away from the sound.
+    """
+
+    __slots__ = ("_fps", "_frame", "_origin")
+
+    RE_ANCHOR_TOLERANCE = 0.2
+    """Seconds of forward movement in `origin` treated as the ring dropping old
+    samples rather than as a new turn. A full ring creeps every feed; a turn boundary
+    jumps."""
+
+    def __init__(self, *, fps: float) -> None:
+        self._fps = fps
+        self._origin: float | None = None
+        self._frame = 0
+
+    def due(self, *, now: float, origin: float) -> int | None:
+        if self._origin is None or abs(origin - self._origin) > self.RE_ANCHOR_TOLERANCE:
+            self._origin = origin
+            self._frame = 0
+        needed = latest_audio_ms(self._frame + BATCH - 1, self._fps) / 1000.0
+        if now - origin < needed:
+            return None
+        frame = self._frame
+        self._frame += 1
+        return frame
 
 
 class Renderer:

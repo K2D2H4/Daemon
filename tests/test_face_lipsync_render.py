@@ -10,7 +10,13 @@ import cv2
 import numpy as np
 
 from daemon.face_lipsync import Cache, composite
-from daemon.face_lipsync.render import BATCH, Renderer, restore_detail
+from daemon.face_lipsync.audio import latest_audio_ms
+from daemon.face_lipsync.render import (
+    BATCH,
+    FrameClock,
+    Renderer,
+    restore_detail,
+)
 from daemon.face_lipsync.ring import PcmRing, Slot
 
 # Deliberately non-square, with a different margin on every side - not the
@@ -507,3 +513,54 @@ def test_a_latched_failure_stops_publishing_rather_than_repeating_a_frame():
     assert slot.get() is None
     r.render(frame_index=1, origin=0.0, fps=24.0)
     assert slot.get() is None
+
+
+# --- the clock that decides when a batch may start -------------------------------
+
+
+def test_the_first_frame_waits_for_the_LAST_frame_of_its_batch():
+    """The whole reason this class exists. Frame 0's own window ends at 100ms, but
+    the batch also contains frame 1, whose window ends at 120ms - and PcmRing.window
+    zero-fills what has not arrived instead of erroring, so rendering at 100ms
+    conditions frame 1 on silence with nothing anywhere complaining."""
+    clock = FrameClock(fps=24.0)
+    own = latest_audio_ms(0, 24.0) / 1000.0
+    batch = latest_audio_ms(BATCH - 1, 24.0) / 1000.0
+    assert batch > own, "the fixture is pointless if the batch needs no more audio"
+    assert clock.due(now=own, origin=0.0) is None
+    assert clock.due(now=batch, origin=0.0) == 0
+
+
+def test_frames_advance_one_per_tick_and_never_skip():
+    """Returning "the newest ready frame" would jump the mouth forward after any
+    hitch. Being behind is free - the renderer's held-frame ticks cost nothing."""
+    clock = FrameClock(fps=24.0)
+    assert clock.due(now=5.0, origin=0.0) == 0        # far past ready
+    assert clock.due(now=9.0, origin=0.0) == 1        # still 1, not 200-odd
+    assert clock.due(now=9.0, origin=0.0) == 2
+
+
+def test_a_new_turn_restarts_the_count():
+    clock = FrameClock(fps=24.0)
+    assert clock.due(now=1.0, origin=0.0) == 0
+    assert clock.due(now=1.0, origin=0.0) == 1
+    assert clock.due(now=31.0, origin=30.0) == 0, "a re-anchored ring is a new turn"
+
+
+def test_a_ring_dropping_old_samples_is_not_a_new_turn():
+    """`origin` creeps forward every feed once the ring is full. Treating that as a
+    turn boundary would reset the frame count several times a second and the mouth
+    would restart the utterance continuously."""
+    clock = FrameClock(fps=24.0)
+    assert clock.due(now=1.0, origin=0.0) == 0
+    assert clock.due(now=1.1, origin=0.04) == 1
+    assert clock.due(now=1.2, origin=0.08) == 2
+
+
+def test_a_backward_jump_also_restarts():
+    """Barge-in rebuilds the speech clock from scratch, so origin can move
+    backward - see PcmRing.feed's own note on the same hazard."""
+    clock = FrameClock(fps=24.0)
+    assert clock.due(now=31.0, origin=30.0) == 0
+    assert clock.due(now=31.0, origin=30.0) == 1
+    assert clock.due(now=1.0, origin=0.0) == 0
