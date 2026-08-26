@@ -152,6 +152,15 @@ ANCHOR
  active 3/20 · max +3/week · min obs 5 · last evolve 8/24 · unconsumed 0
  ▸ seed.md   26 lines — yours, code never writes this
  ▸ learned.md 3 lines — hers
+```
+
+> 2026-08-26: 위 목업의 `seed.md` 줄은 더 이상 이 카드에 없다. seed는 편집 가능한
+> 별도 카드(`SEED — YOURS`)로 옮겨졌고, 본문은 이 payload가 아니라 예산이 걸리지
+> 않은 `GET /admin/api/persona/seed`에서 읽는다 —
+> docs/adr/0019-the-seed-is-authored-not-unreachable.md. ANCHOR 카드에는
+> `learned.md` 하나만 남는다.
+
+```
 
 LEARNED RULES                                         3 active
  [1] 시스템 오류나 문제 발생 시 변명 없이 …        [Forget]

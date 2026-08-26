@@ -79,9 +79,24 @@ live-share pump's transport, which has no tool round in it.
    Nothing outside `daemon/channels/` imports a channel implementation.
    Callers use `LLMGateway.complete(task, ...)` and the `Channel` protocol.
 
-5. **`data/persona/seed.md` is human-owned. Code must never write to it.**
-   That asymmetry is the anchor that prevents personality collapse.
-   `data/persona/learned.md` is AI-owned; humans only read it or request deletion.
+5. **`data/persona/seed.md` is human-owned. Nothing the daemon produces may be
+   written into it.** That asymmetry is the anchor that prevents personality
+   collapse. `data/persona/learned.md` is AI-owned; humans only read it or
+   request deletion.
+
+   **Restated 2026-08-26** (docs/adr/0019-the-seed-is-authored-not-unreachable.md):
+   this used to read "code must never write to it", and that was never quite the
+   rule — `daemon/setup.py` has always composed the seed from the wizard's
+   answers. The rule is about *authorship*. Exactly two writers exist, and both
+   carry only characters a person typed: `daemon/setup.py` (creates it, never
+   overwrites) and `daemon/admin/seed_io.py` (the admin form's `PUT
+   /admin/api/persona/seed`). A third one is not forbidden because three is too
+   many — it is forbidden if anything that *thinks* is on the other end of it. No
+   button that drafts a persona, no evolution pass that edits the anchor, no tool
+   the model may call. `tests/test_admin_seed.py` fails if a second write route
+   appears; the ADR also records, measured, that `write_file` under the default
+   `DAEMON_TOOLS_ROOTS=~` can still reach the file, which is a gap that ADR names
+   rather than closes.
 
 6. **`observations` is append-only.** No UPDATE, no DELETE. Only `consumed_by`
    may be set later.

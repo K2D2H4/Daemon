@@ -30,6 +30,7 @@ says "measured" was checked against the real thing, and the number is in the fil
 | [0016](0016-proactive-default-flips-to-speaking.md) | The proactive default flips from silence to speaking | accepted, overturns 0008 in part |
 | [0017](0017-the-neutral-moment-not-the-matched-pose.md) | The face waits for the neutral moment; pose matching covers the tail | accepted, measured |
 | [0018](0018-a-declared-expression-is-not-a-tool-call.md) | A declared expression is not a tool call; rule 12 splits rather than weakens | accepted, measured |
+| [0019](0019-the-seed-is-authored-not-unreachable.md) | The seed is authored by the owner, not unreachable by code | accepted, measured, refines 0003 |
 
 ## Format
 

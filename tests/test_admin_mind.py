@@ -720,17 +720,19 @@ def test_the_read_endpoints_serve_the_payloads_over_loopback(tmp_path: Path) -> 
     assert persona.json()["anchor"]["max_active"] == 7
 
 
-def test_f_no_route_writes_the_seed() -> None:
-    """CONTRACTS non-negotiable 5. Asserted on the router, not on a code review:
-    a later hand could add a PATCH and every other test would stay green."""
-    from daemon.admin import routes
+def test_f_the_persona_write_surface_is_the_three_routes_we_meant() -> None:
+    """CONTRACTS non-negotiable 5, as amended by docs/adr/0019. Asserted on the
+    router, not on a code review: a later hand could add a PATCH and every other
+    test would stay green.
 
-    seed_routes = [
-        (route.path, sorted(getattr(route, "methods", set())))
-        for route in routes.router.routes
-        if "seed" in route.path
-    ]
-    assert seed_routes == []
+    This used to read `seed_routes == []`, because no route wrote `seed.md` at
+    all. One does now, and the guarantee moved rather than went away - the seed
+    is written only from a string the owner typed into the form, never from
+    anything a model produced. The seed route's own shape (exactly one method,
+    and which) is asserted in `tests/test_admin_seed.py`; what this one is for is
+    the *set* - that a fourth write path under /persona cannot appear unnoticed.
+    """
+    from daemon.admin import routes
 
     persona_writes = [
         (route.path, sorted(getattr(route, "methods", set())))
@@ -738,10 +740,10 @@ def test_f_no_route_writes_the_seed() -> None:
         if route.path.startswith("/admin/api/persona")
         and set(getattr(route, "methods", set())) - {"GET", "HEAD"}
     ]
-    # Only `forget` and `evolve` write anything under /persona, and neither
-    # touches seed.md - see Task 6.
-    assert {path for path, _ in persona_writes} <= {
-        "/admin/api/persona/forget", "/admin/api/persona/evolve"
+    assert {path for path, _ in persona_writes} == {
+        "/admin/api/persona/forget",
+        "/admin/api/persona/evolve",
+        "/admin/api/persona/seed",
     }
 
 

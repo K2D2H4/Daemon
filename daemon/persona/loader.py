@@ -1,9 +1,13 @@
 """Persona assembly: `persona/seed.md` (human-owned) + `persona/learned.md` (AI-owned).
 
 This is the read half of docs/PLAN.md 5.1's file-ownership split. The write halves
-live elsewhere on purpose: `seed.md` has no writer in this codebase at all
-(docs/CONTRACTS.md non-negotiable 5), and `learned.md` is written only by
-`daemon/persona/rules.py`. This module never writes either file.
+live elsewhere on purpose. `learned.md` is written only by
+`daemon/persona/rules.py`. `seed.md` is written only from text a person typed -
+`daemon/setup.py` (the wizard, which never overwrites an existing file) and
+`daemon/admin/seed_io.py` (the admin form) - and never from anything a model
+produced, which is the whole of docs/CONTRACTS.md non-negotiable 5 as restated by
+docs/adr/0019-the-seed-is-authored-not-unreachable.md. This module never writes
+either file.
 
 Read on every turn, not once at startup - this is `daemon/loop.py`'s current
 `_read_seed` behaviour, kept exactly: `seed.md` is edited by hand, and an edit

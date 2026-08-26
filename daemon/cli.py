@@ -1624,8 +1624,10 @@ def _proactivity_check(settings: Settings) -> Check:
             "proactivity",
             False,
             f"on, but {seed} is empty or missing. Every candidate will be declined "
-            "rather than spoken in a generic voice - run `daemon setup` to write a "
-            "persona seed.",
+            "rather than spoken in a generic voice - write a persona seed in the "
+            "admin console's Persona tab, or run `daemon setup`. (The console is "
+            "the shorter trip on an install that is already configured; re-running "
+            "setup walks the provider, keys and pairing again.)",
         )
 
     speaker = "speaker on" if settings.voice_enabled else "telegram only"
