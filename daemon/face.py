@@ -118,13 +118,33 @@ class FaceBus:
             while True:
                 await sub.wake.wait()
                 sub.wake.clear()
-                # One-shots before state: a mood tag arrives just before the audio
-                # does, and the expression is meant to land first.
-                while sub.shots:
-                    yield sub.shots.popleft()
+                # Drained into a batch before anything is yielded, and state goes
+                # first in it.
+                #
+                # State first because a mood is published *with* the `speaking` it
+                # belongs to, in one synchronous block, so both always land in the
+                # same wake and no publisher can separate them - only this order
+                # can. The other way round the page starts the mood and the
+                # `speaking` right behind it cuts it (spec 3.2: `speaking` is the
+                # one transition allowed to), so the expression was on screen for
+                # about 0ms. This way it plays over the speaking loop and the page
+                # hands back to that loop when the arc ends.
+                #
+                # Batched because yielding straight from the mailbox made the
+                # order depend on where this generator happened to be suspended:
+                # resuming from a `yield` re-enters mid-body and skips whatever
+                # came before it. A consumer that asks for the next event
+                # immediately (daemon/face_routes.py does) is almost always
+                # parked on the `wait()` above, which is why that read the right
+                # way round nearly all of the time rather than always.
+                batch: list[Event] = []
                 if sub.state is not None:
-                    state, sub.state = sub.state, None
-                    yield state
+                    batch.append(sub.state)
+                    sub.state = None
+                while sub.shots:
+                    batch.append(sub.shots.popleft())
+                for event in batch:
+                    yield event
         finally:
             self._subs.discard(sub)
 

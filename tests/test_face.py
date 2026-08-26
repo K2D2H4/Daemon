@@ -53,15 +53,45 @@ async def test_level_is_coalesced_not_queued():
     await agen.aclose()
 
 
-async def test_one_shots_are_queued_and_arrive_before_state():
+async def test_one_shots_are_queued_and_arrive_after_state():
+    """A one-shot is still queued (a dropped laugh is a missing expression), but
+    it is delivered *after* the state it shares a wake with, not before.
+
+    The two are published in one synchronous block by `ConversationLoop._speak`,
+    so they always arrive together and only this order can separate them. Sent
+    shot-first the page starts the mood and the `speaking` right behind it cuts
+    it - spec 3.2 lets `speaking` cut a one-shot - and the expression was on
+    screen for about 0ms. Spec 3.6's original ordering was written for voice,
+    where the audio really does arrive after the tag; the text path has no audio
+    for the mouth to lag, and 3.6 now says so.
+    """
+    bus = FaceBus()
+    agen = bus.subscribe()
+    await _drain(agen, 1)  # snapshot
+    bus.set_activity("speaking")
+    bus.one_shot("amused")
+    first, second = await _drain(agen, 2)
+    assert first.activity == "speaking"
+    assert second == OneShot(clip="amused")
+    await agen.aclose()
+
+
+async def test_the_order_within_a_wake_does_not_depend_on_publish_order():
+    """Same wake, published the other way round: still state, then the shot.
+
+    Both land in the subscriber's mailbox before it runs, so `one_shot` before
+    `set_activity` and `set_activity` before `one_shot` are the same event as far
+    as the bus is concerned - and the delivery order has to be the bus's own
+    decision rather than a side effect of where its generator was suspended.
+    """
     bus = FaceBus()
     agen = bus.subscribe()
     await _drain(agen, 1)  # snapshot
     bus.one_shot("amused")
     bus.set_activity("speaking")
     first, second = await _drain(agen, 2)
-    assert first == OneShot(clip="amused")
-    assert second.activity == "speaking"
+    assert first.activity == "speaking"
+    assert second == OneShot(clip="amused")
     await agen.aclose()
 
 

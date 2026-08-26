@@ -300,11 +300,19 @@ class ConversationLoop:
         """
         text, mood = split_mood(text)
         if self._face is not None:
-            if mood is not None:
-                # Before the activity flips to speaking, not after: a face
-                # moves just ahead of the words it is reacting to.
-                self._face.one_shot(mood)
+            # `speaking` FIRST, then the shot - the opposite of what spec 3.6
+            # originally said, and the spec now says this. 3.6 was written for
+            # voice, where the audio arrives after the tag and the expression can
+            # genuinely land ahead of the words. On the text path there is no
+            # audio for the mouth to lag: the two publishes are one synchronous
+            # block, so `speaking` follows the shot into the same event, and
+            # `speaking` is the one transition allowed to cut a one-shot - the
+            # mood was on screen for about 0ms. Published this way round the page
+            # plays the mood over the speaking loop and `advance()` hands back to
+            # it when the arc finishes.
             self._face.set_activity("speaking")
+            if mood is not None:
+                self._face.one_shot(mood)
         return text
 
     async def _answer(

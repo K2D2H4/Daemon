@@ -1051,9 +1051,17 @@ async def test_a_mood_tag_becomes_an_event_and_leaves_no_trace(data_dir: Path) -
     assert [m.content for m in memory.records if m.role == "assistant"] == ["그래서 웃었어"]
 
 
-async def test_the_expression_is_published_before_speaking_starts(data_dir: Path) -> None:
-    """A person's face moves just ahead of their words, and the tag arrives in time
-    to allow it - so the one-shot must be published before the activity flips."""
+async def test_the_expression_is_published_after_speaking_starts(data_dir: Path) -> None:
+    """The reverse of what this used to assert, and the spec is corrected to match.
+
+    Spec 3.6's "the expression lands first" was written for the voice path, where
+    the audio genuinely arrives after the tag. On the text path there is no audio
+    for the mouth to lag: `_speak` publishes both in one synchronous block, so
+    they reach the page in the same event either way - and `speaking` is the one
+    transition allowed to cut a one-shot (spec 3.2), so shot-first put the mood on
+    screen for about 0ms. Published this way round the page plays the mood over
+    the speaking loop and hands back to it when the arc ends.
+    """
     order: list[str] = []
 
     class Ordered(RecordingBus):
@@ -1072,7 +1080,7 @@ async def test_the_expression_is_published_before_speaking_starts(data_dir: Path
         face=Ordered(),
     ).run()
 
-    assert order.index("shot:sulky") < order.index("activity:speaking")
+    assert order == ["activity:thinking", "activity:speaking", "shot:sulky", "activity:idle"]
 
 
 async def test_a_reply_with_no_tag_publishes_no_one_shot(
