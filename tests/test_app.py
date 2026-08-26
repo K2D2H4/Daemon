@@ -28,4 +28,12 @@ def test_create_app_exposes_a_face_bus_and_the_routes(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
 
     assert isinstance(app.state.face, FaceBus)
-    assert "/face/stream" in {r.path for r in app.routes}
+    # Off the OpenAPI path table rather than `app.routes`, and that is not a
+    # stylistic choice. `pyproject.toml` pins only `fastapi>=0.115`, so CI resolves
+    # a newer FastAPI than a given checkout may have - and from 0.141 on,
+    # `include_router` leaves an `_IncludedRouter` in `app.routes` that has neither
+    # `.path` nor a `.routes` to descend into. Reading `.path` off every entry
+    # passed locally on 0.115 and raised `AttributeError` on CI's 0.141. The path
+    # table is public API and answers the question this test actually asks: does
+    # the assembled app serve this route.
+    assert "/face/stream" in app.openapi()["paths"]
