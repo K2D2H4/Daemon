@@ -18,7 +18,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `openai_compatible_loop_spike.py` | whether the *assembled* app survives a real turn on that endpoint — loop, recall, tool policy, audit table |
 | `screen_frame_arrival_spike.py` | why voice answered "what's on my screen" from nothing — a `realtimeInput.video` frame never arrives inside a tool round, and the fix is the image part *after* the tool response (0/20 → 19/20) |
 | `face_mood_tag_spike.py` | spec open question 4 — does the configured provider actually attach a leading `[mood:...]` tag, reliably and well-formed, under a candidate persona instruction nothing in this codebase ships yet |
-| `face_lipsync_prepare.py` | the offline preprocessing step — one driving mp4 in, the cache `daemon/face_lipsync` reads at runtime out. Needs torch and a MuseTalk checkout, which are deliberately not daemon dependencies |
+| `face_lipsync_prepare.py` | the offline preprocessing step — one driving mp4 in, the cache `daemon/face_lipsync` reads at runtime out. Apple Vision for the landmarks; still needs torch and a MuseTalk checkout for the VAE and the BiSeNet mask, which are deliberately not daemon dependencies |
 | `face_lipsync_numerics.py` | whether the product loader keeps real MLX weights in MLX layout — not whether the model runs, which it never does here — the published weights are diffusers-keyed but MLX-laid-out, and a second transpose is silent |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
@@ -261,20 +261,44 @@ doc, [docs/superpowers/plans/2026-08-26-face-lipsync-engine.md](../docs/superpow
 files it under `scripts/` and is wrong about that.
 
 Measured 2026-08-26 on `data/face/idle1.mp4` — 193 frames of 1080x1620 at 24fps, M-series
-Mac on MPS: **54.0s total** (landmarks 30.7s, VAE latents 11.0s, BiSeNet masks 12.3s),
-producing a 1.01GB frame store and a 3.2MB latents file.
+Mac on MPS: **36.2s** of model work (Vision landmarks 13.1s, sd-vae latents 11.5s,
+BiSeNet masks 11.6s), producing a 966MB frame store and a 3.0MB latents file.
 
-Two things worth knowing before trusting the output:
+Four things worth knowing before trusting the output:
 
+- **The landmarks are Apple Vision, per spec §4-1, and the mapping onto MuseTalk's box
+  formula is measured.** `faceContour` has 17 points where iBUG-68's jawline has 17, and
+  `lm[29]` — the lower nose bridge the formula indexes — is `noseCrest[2]`: FAN puts
+  iBUG-29 at fraction 0.697 of the 27→30 bridge and Vision's four crest points sit at
+  0, 0.331, 0.671, 1.0. **An earlier revision used FAN and that was wrong**, not a
+  shortcut: torch for one landmarker is what §4-1 exists to refuse.
+- **The substitution costs a stated 12px and it is not corrected.** Against FAN over 193
+  frames the chin and right edge agree (+1.1 and +2.0px) but `min x` is +11.9px inside
+  and `noseCrest[2]` is 12.1px above FAN's `lm[29]`, which the formula doubles into a
+  **~24px higher box top, 5.6% taller**. That is `bbox_shift = -12`, inside the ±20 the
+  spike swept when it found the whole documented range moves lip openness under 10%.
+  Rendered: the mouth moves 1.48× one frame of its own natural motion and reads 122% of
+  the driving frame's lip detail against FAN's 135%. The bias is stable across 7 clips
+  (−11.6 to −13.3px) but all 7 are the **same avatar**, so a constant fitted on it would
+  go silently wrong on another face. Stated, not fudged.
+- **The VAE is `sd-vae-ft-mse`'s encoder, and the spec never named it.** §4 lists UNet /
+  whisper / TAESD only, yet the reference latents are 8 channels — a half-masked encode
+  concatenated with a full one — which needs an encoder. **TAESD's encoder was measured
+  and rejected:** it is free (already in the same weights file, 1.9s against 34.6s) and
+  it costs **−5.7% lip saturation and −8.6% lip contrast on every one of 60 rendered
+  frames** (−5.20 ± 0.64), because its latents clamp into [−3.11, 2.89] where sd-vae
+  reaches [−7.26, 5.89]. Whole-latent cosine 0.980 looked survivable and was not. The
+  noise floor that makes that readable: sd-vae's own `sample()` against a second seed is
+  0.0001 mean abs and 0.00 ± 0.01 on lip saturation.
 - **`composite` on this cache is bit-identical to MuseTalk's own `get_image_blending`**
-  fed the same boxes, crop box and mask — max pixel difference 0. Not a tautology: a
-  crop box moved 12px changes the composited frame by up to 66/255, so the agreement is
-  a measurement of the geometry rather than a restatement of it.
-- **The landmarks are FAN, standing in for DWPose, and that substitution is still
-  unverified.** DWPose needs mmpose, which does not build on this machine. Both emit
-  the iBUG-68 scheme, so MuseTalk's box formula indexes the same anatomy — that is an
-  argument, not a number. The tool writes an overlay PNG for exactly this reason, and
-  nobody may call the box correct until it is compared against DWPose's.
+  fed the same boxes, crop box and mask — max pixel difference 0 over 5 frames on the
+  Vision geometry. Not a tautology: the same call with the crop box moved 12px differs
+  by up to 117/255.
+
+**Still open, and it is the owner's call.** §4-1 wants no torch in the *build* either,
+and this does not reach that. The VAE is not the blocker — `FaceParsing` (BiSeNet plus a
+torchvision transform) is, and nothing here replaces it. Porting sd-vae's encoder to MLX
+would drop `diffusers` and a 335MB download and leave torch exactly where it is.
 
 ## Common changes
 

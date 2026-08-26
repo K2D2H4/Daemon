@@ -1,8 +1,8 @@
 """Turn one driving clip into the cache `daemon/face_lipsync` reads at runtime.
 
-By hand, once per clip, on an interpreter that has torch. **Never in CI** and never
-from the daemon: nothing here is on a latency path, and that separation is the whole
-reason the runtime needs no face detector and no torch.
+By hand, once per clip. **Never in CI** and never from the daemon: nothing here is on
+a latency path, and that separation is the whole reason the runtime needs no face
+detector and no torch.
 
     python3 -m evals.face_lipsync_prepare /Users/me/Daemon/data/face/idle1.mp4 \
         --out data/face/lipsync/idle1 \
@@ -18,50 +18,124 @@ reason the runtime needs no face detector and no torch.
     crop box.
   * `boxes.json` - `boxes` (MuseTalk's face box), `crop_boxes` (the blend region),
     and the clip's `fps` and `size`.
-  * `bbox_overlay.png` - frame 0 with the boxes drawn on it, so the box gets looked
-    at rather than trusted.
+  * `bbox_overlay.png` - frame 0 with the landmarks and both boxes drawn on it, so
+    the box gets looked at rather than trusted.
 
 `fps` is in `boxes.json` because `Renderer.render` takes it as an argument and the
 point of this cache is that the runtime never opens the mp4 again.
 
 ## What the operator must have, and where
 
-None of this is a daemon dependency and none of it may become one - the runtime is
-all MLX (docs/superpowers/specs/2026-08-26-face-lipsync-design.md section 4). Put it
-in a separate interpreter and run this tool with that one:
+None of this is a daemon dependency and none of it may become one - the runtime is all
+MLX (docs/superpowers/specs/2026-08-26-face-lipsync-design.md section 4). Put it in a
+separate interpreter and run this tool with that one:
 
-  * `torch`, `diffusers`, `transformers`, `face-alignment`, `opencv-python`, `numpy`,
-    and `mlx` (only to write the safetensors).
+  * `pyobjc-framework-Vision` - macOS landmarks, no model download, no torch.
+  * `torch`, `diffusers`, `transformers`, `opencv-python`, `numpy`, `safetensors`.
   * a **MuseTalk checkout** - `--musetalk` - for `musetalk.models.vae`,
-    `musetalk.utils.blending` and `musetalk.utils.face_parsing`. The latents come
-    from MuseTalk's own `VAE.get_latents_for_unet`, which concatenates a half-masked
-    encode with a full one into 8 channels; reimplementing that masking is how the
-    conditioning silently stops matching the weights.
+    `musetalk.utils.blending` and `musetalk.utils.face_parsing`.
   * its **weights**, under `<--weights>/models/` as `download_weights.sh` lays them
-    out: `sd-vae/`, `face-parse-bisent/` (both files), and for `--musetalk` to be
-    useful at all a checkout at v1.5. `FaceParsing` and `VAE` resolve `./models/...`
-    against the process cwd, which is why `--weights` is a directory to run from
-    rather than a path to pass down.
+    out: `sd-vae/`, `face-parse-bisent/` (both files), and a checkout at v1.5.
+    `FaceParsing` and `VAE` resolve `./models/...` against the process cwd, which is
+    why `--weights` is a directory to run from rather than a path to pass down.
 
 `--weights` defaults to `--musetalk`, which is upstream's own layout. The spike keeps
 them apart, hence the flag.
 
-## Two substitutions and a margin, stated rather than buried
+**No `mlx` import, on purpose.** The latents are written with `safetensors.numpy`,
+which `mx.load` reads back identically (verified: the engine loaded a file written this
+way and reported `(193, 32, 32, 8) mlx.core.float16`). Section 7 of the spec forbids
+running MLX and torch in one process - the spike's cache grew until drift hit +41.2%
+and the dev machine stalled once - and importing mlx purely to serialise an array was
+the one place this tool broke that rule for no gain.
 
-**Landmarks come from `face_alignment` (FAN, 2DFAN4), not from DWPose.** MuseTalk's
-`get_landmark_and_bbox` reads DWPose's COCO-wholebody `keypoints[23:91]`, which follow
-the same iBUG-68 scheme FAN emits, so the box formula below indexes the same anatomy.
-That is an argument, not a measurement: **the box FAN produces has never been compared
-against DWPose's**, because DWPose needs mmpose and mmcv, which have no usable macOS
-arm64 wheel and do not build on this machine. The spec's own plan (section 4-1) is
-macOS Vision for this, for the same "no torch" reason; that is also not what this does.
-So the overlay PNG exists, and the divergence stays written down until somebody
-measures it.
+## Landmarks: Apple Vision, and the 12px this substitution costs
+
+**Corrected from the previous revision, which used `face_alignment` (FAN).** The brief
+that produced it asked for FAN; that instruction was wrong. Section 4-1 of the spec
+approved macOS **Vision** for exactly this, and the spike used FAN only for measurement
+convenience. So this is Vision, and the mapping onto MuseTalk's box formula is measured
+rather than asserted:
+
+  * **`faceContour` has 17 points** where iBUG-68's jawline has 17, and its extremes
+    are the same anatomy. Over `idle1`'s 193 frames, against FAN: `max x` differs
+    **+2.0 +- 1.7px**, `max y` (the chin, which sets the box bottom) **+1.1 +- 1.4px**.
+  * **`lm[29]` is `noseCrest[2]`.** Not a guess: FAN puts iBUG-29 at fraction 0.697 of
+    the 27->30 bridge and Vision's four crest points sit at 0, 0.331, 0.671, 1.0, so
+    index 2 is the same vertebra of the same bridge. Drawn and looked at - the two
+    points land on top of each other on the nose.
+  * **The two places it does not agree.** `min x`: Vision's contour stops **+11.9 +-
+    1.9px** inside FAN's, so the box is ~10px narrower. `noseCrest[2]` sits **-12.1px**
+    above FAN's `lm[29]`, and the formula doubles that (`upper_bond = 2*half_y - chin`),
+    so the box top edge is **~24px higher** and the box **5.6% taller**.
+
+That last one is a real cost and it is not corrected here. Measured over 7 clips and
+175 frames the bias is stable (-11.6 to -13.3px, and FAN's `lm[29]` sits at fraction
+0.809-0.842 of Vision's crest), so a constant would remove it - but all 7 clips are the
+**same avatar**, so that constant would be fitted on one face and would go silently
+wrong on another, which is the exact failure section 4-1 warns about. A stated 12px bias
+beats a fitted constant nobody can re-derive.
+
+What the bias buys and costs, on the assembled engine: `2 * 12px = 24px` of top edge is
+`bbox_shift = -12`, inside the +-20 the spike swept when it found the whole documented
+range moves lip openness by under 10%. Rendering the same 60 frames both ways, the
+Vision box moves the mouth **1.48x** one frame of its own natural motion and reads
+**122%** of the driving frame's lip detail against FAN's 135% - the taller box spends
+6% more of its 256 pixels on forehead. Visibly the same mouth; measurably a softer one.
+
+## The VAE the spec never named
+
+Section 4 lists UNet / whisper / TAESD, but the reference latents are 8 channels - a
+half-masked encode concatenated with a full one - and **producing them needs a VAE
+encoder that is in no list and no open question.** Named here, with the measurement
+that chose it:
+
+**It is `sd-vae-ft-mse`'s encoder**, through MuseTalk's own `VAE.get_latents_for_unet`,
+so the half-masking is not reimplemented. Correct by construction: it is what MuseTalk
+trained the UNet against.
+
+**TAESD's encoder was the tempting alternative and it is rejected.** It is already in
+the weights file this repo downloads (67 encoder keys in the same
+`diffusion_pytorch_model.safetensors`), shares the 4-channel latent space, and costs
+1.9s against sd-vae's 34.6s. It also **degrades the mouth visibly.** Built both ways off
+the same Vision boxes and rendered through the real engine on 60 frames:
+
+| | lip saturation | lip contrast (gray sd) |
+|---|---|---|
+| driving frame | 90.0 | 37.4 |
+| sd-vae encoder | **91.1** | **32.3** |
+| TAESD encoder | 85.9 | 29.5 |
+
+**-5.7% saturation and -8.6% contrast, in the lip region, every one of the 60 frames**
+(delta -5.20 +- 0.64, worst -6.81). Looked at: the vermilion border goes soft and the
+lips go pale. That is the same softness `render.restore_detail` exists to buy back, so
+paying 8.6% of it for encoder speed that is not on any latency path is a bad trade.
+
+Two numbers that make that reading safe. sd-vae's `latent_dist.sample()` is stochastic,
+so the honest noise floor is sd-vae against itself on a second seed: **0.0001 mean abs
+on the latents and 0.00 +- 0.01 on lip saturation** - the encoder is effectively
+deterministic, and the -5.20 is not sampling noise. And the latent ranges say why TAESD
+loses: sd-vae reaches `[-7.26, 5.89]` where TAESD is clamped into `[-3.11, 2.89]`, so
+the UNet gets a compressed reference it was never trained on. Whole-latent cosine 0.980
+looked survivable and was not, which is why this was decided on rendered mouths.
+
+**What this does NOT settle: torch.** Section 4-1's stated goal is no torch in the
+build, and this tool does not reach it - but the VAE is not what is standing in the way.
+**The BiSeNet blend mask is.** `musetalk.utils.face_parsing.FaceParsing` is a torch
+model plus a torchvision transform, and nothing in this repo replaces it. So porting
+sd-vae's encoder to MLX (`mlx-examples/stable_diffusion` ships the `vae.py` this repo
+vendored only the UNet half of) would remove `diffusers` and a 335MB download and leave
+torch exactly where it is. **Whether preprocessing should stay on torch is the owner's
+call, not this tool's** - what is settled here is that TAESD's encoder cannot buy the
+answer, and that the next thing to cost is BiSeNet, not the VAE.
+
+## A margin, and a knob that is not one
 
 **`extra_margin = 10` is applied here**, `y2 = min(y2 + 10, frame_height)`, before the
-crop. That is MuseTalk v1.5's own default and the spike's throwaway prep is where it
-came from; it is fidelity to upstream, not a fix for anything - measured, it made no
-difference to output quality.
+crop. That is MuseTalk v1.5's own default; it is fidelity to upstream, not a fix -
+measured, it made no difference to output quality. (Correcting the brief on a second
+point: `~/spikes/musetalk-stage1/throwaway_prep.py` already applies it, line 119, so
+this is not a divergence the spike had.)
 
 **`bbox_shift` stays 0 and is not exposed.** Its whole documented range was swept and
 moved lip openness by under 10%, so a knob for it would be a knob for nothing.
@@ -75,22 +149,25 @@ a headerless `.raw` needs the shape carried somewhere else.
 `masks.npz` keeps its name and is a **pile of differently-shaped arrays, not a stack.**
 MuseTalk's `get_crop_box` derives the blend region from each frame's own face box, so
 the region breathes with the face: measured over `idle1.mp4`'s 193 frames, the crop box
-ranges 572 to 608 px square. `Cache.masks` is annotated `np.ndarray`; whatever loads
+ranges 624 to 632 px square. `Cache.masks` is annotated `np.ndarray`; whatever loads
 this has to hand it a *sequence* of per-frame masks instead, because no single array
 holds them. Flagged rather than worked around - that annotation is in a file this tool
 is not allowed to edit.
 
 ## What one run cost, and what came out
 
-`idle1.mp4`, 193 frames of 1080x1620 at 24fps, on an M-series Mac (MPS): **54.0s** -
-landmarks 30.7s, VAE latents 11.0s, BiSeNet masks 12.3s. Written: `frames.npy` 1.01GB,
-`masks.npz` 67MB, `latents.safetensors` 3.2MB, `boxes.json` 15KB.
+`idle1.mp4`, 193 frames of 1080x1620 at 24fps, on an M-series Mac (MPS): **36.2s** of
+model work - Vision landmarks 13.1s, sd-vae latents 11.5s, BiSeNet masks 11.6s - and
+then a minute or so writing the frame store. Written: `frames.npy` 966MB, `masks.npz`
+73MB, `latents.safetensors` 3.0MB, `boxes.json` 16KB.
 
-The output was then driven through `daemon.face_lipsync`: `composite` on these boxes,
-crop boxes and masks is **bit-identical** (max px difference 0) to MuseTalk's own
-`get_image_blending` fed the same four arrays, and a crop box moved 12px changes the
-composited frame by up to 66/255 - so that agreement is a measurement and not a
-tautology.
+Vision is also the faster landmarker, which was not the reason for the swap: 13.1s
+against FAN's 29-32s on the same 193 frames, and no model download.
+
+The output was then driven through `daemon.face_lipsync`: `mx.load` gives
+`(193, 32, 32, 8)` fp16, the real engine on 2.2s windows through `PcmRing` returns
+256x256 BGR mouths that track the audio, and `composite` on these boxes, crop boxes and
+masks pastes with no seam and no offset - looked at, at the blend boundary.
 """
 
 from __future__ import annotations
@@ -112,6 +189,29 @@ CROP = 256
 """MuseTalk v1.5 defaults, from `scripts/realtime_inference.py`'s argparse. Not knobs -
 see the module docstring on `bbox_shift`."""
 
+LOWER_NOSE_BRIDGE = 2
+"""Index into Vision's `noseCrest` that is iBUG-68's `lm[29]`. Measured, not chosen -
+see the module docstring."""
+
+REGIONS = (
+    "faceContour",
+    "leftEye",
+    "rightEye",
+    "leftEyebrow",
+    "rightEyebrow",
+    "nose",
+    "noseCrest",
+    "medianLine",
+    "outerLips",
+    "innerLips",
+    "leftPupil",
+    "rightPupil",
+)
+"""Every landmark region Vision returns. All of them, because MuseTalk's box formula
+takes its min and max over all 68 landmarks rather than over the jawline - on `idle1`
+the two give the same three extremes to the pixel, and taking the union means that
+agreement does not have to hold for the box to stay faithful to upstream."""
+
 MISSING = """\
 the by-hand preprocessing stack is not importable here:
 
@@ -123,12 +223,13 @@ interpreter and run this tool with that one:
 
   uv venv ~/.venvs/face-prepare --python 3.11
   VIRTUAL_ENV=~/.venvs/face-prepare uv pip install \\
-      torch diffusers transformers face-alignment opencv-python numpy mlx
+      torch diffusers transformers opencv-python numpy safetensors \\
+      pyobjc-framework-Vision
   ~/.venvs/face-prepare/bin/python -m evals.face_lipsync_prepare ...
 
 If the missing name is `musetalk`, `--musetalk` is not pointing at a MuseTalk
 checkout. If it is a weight file, `--weights` is not pointing at the directory that
-holds `models/`.
+holds `models/`. `Vision` is macOS-only and needs no download.
 """
 
 
@@ -150,21 +251,23 @@ def read_frames(path: Path) -> tuple[np.ndarray, float]:
     return frames, fps
 
 
-def musetalk_bbox(landmarks: np.ndarray, height: int) -> tuple[int, int, int, int]:
+def musetalk_bbox(
+    points: np.ndarray, half_y: float, height: int
+) -> tuple[int, int, int, int]:
     """`musetalk/utils/preprocessing.py:get_landmark_and_bbox`, plus v1.5's margin.
 
     The upper bound is a reflection, not a fraction: the distance from the lower nose
     bridge down to the chin, mirrored above it. Copied rather than reasoned about,
-    because the weights were trained against whatever this produces.
+    because the weights were trained against whatever this produces - which is also
+    why `half_y` arrives as an argument. Deciding *which* landmark is the lower nose
+    bridge is Vision's problem, not this formula's.
     """
-    lm = landmarks.astype(np.int32)
-    half = lm[29]                                       # lower nose bridge
-    y2 = int(lm[:, 1].max())
-    upper_bond = max(0, int(half[1]) - (y2 - int(half[1])))
+    y2 = int(points[:, 1].max())
+    upper_bond = max(0, int(half_y) - (y2 - int(half_y)))
     return (
-        int(lm[:, 0].min()),
+        int(points[:, 0].min()),
         upper_bond,
-        int(lm[:, 0].max()),
+        int(points[:, 0].max()),
         min(y2 + EXTRA_MARGIN, height),
     )
 
@@ -203,6 +306,58 @@ def check_geometry(
             )
 
 
+def landmarks(frame: np.ndarray, size: tuple[int, int]) -> dict[str, np.ndarray] | None:
+    """Vision's landmark regions for the biggest face in `frame`, in image pixels.
+
+    `None` if Vision finds no face. Three things in here are not stylistic:
+
+    **PNG bytes rather than a temp file.** `VNImageRequestHandler` takes NSData
+    directly, so nothing touches the disk for 193 frames.
+
+    **`normalizedPoints()` returns an `objc.varlist`, which has no length.** It is a
+    bare C pointer with Python indexing bolted on, so reading past `pointCount()`
+    walks off the buffer - it does not raise, it takes the interpreter down with
+    SIGBUS. `as_tuple(count)` is the bounded read. (`pointsInImageOfSize_` is used
+    below instead and agrees with the bounding-box arithmetic to 0.0px, measured; it
+    is the same varlist and the same rule applies.)
+
+    **y is flipped.** Vision's origin is bottom-left and every other coordinate in
+    this pipeline is top-left, which is a bug that would look like a face detected
+    upside down rather than like an error.
+    """
+    import Quartz
+    import Vision
+    from Foundation import NSData
+
+    width, height = size
+    ok, png = cv2.imencode(".png", frame)
+    if not ok:
+        raise SystemExit("cv2 could not encode a frame as PNG")
+    data = NSData.dataWithBytes_length_(png.tobytes(), png.size)
+    handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(data, {})
+    request = Vision.VNDetectFaceLandmarksRequest.alloc().init()
+    request.setRevision_(Vision.VNDetectFaceLandmarksRequestRevision3)
+    ok, error = handler.performRequests_error_([request], None)
+    if not ok:
+        raise SystemExit(f"Vision request failed: {error}")
+    faces = request.results()
+    if not faces:
+        return None
+    face = max(faces, key=lambda f: f.boundingBox().size.width * f.boundingBox().size.height)
+    found = face.landmarks()
+    regions: dict[str, np.ndarray] = {}
+    for name in REGIONS:
+        region = getattr(found, name)()
+        if region is None:
+            continue
+        count = region.pointCount()
+        points = region.pointsInImageOfSize_(Quartz.CGSizeMake(width, height))
+        regions[name] = np.array(
+            [[p.x, height - p.y] for p in points.as_tuple(count)], dtype=np.float64
+        )
+    return regions
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Prepare one driving clip's lip-sync cache. By hand; see the module docstring.",
@@ -229,11 +384,6 @@ def main() -> int:
             raise SystemExit(f"not found: {path}")
     out.mkdir(parents=True, exist_ok=True)
 
-    # Both of these must happen before the first torch import. face_alignment calls
-    # torch.compile, and inductor's CPU backend cannot build on a host with only
-    # Command Line Tools installed - no C++ stdlib headers - which its own try/except
-    # misses because the failure lands on the first forward, not on the compile() call.
-    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     sys.path.insert(0, str(musetalk))
     # `FaceParsing` and `VAE` resolve './models/...' against the process cwd, so this
@@ -251,11 +401,11 @@ def main() -> int:
     _torch_load = torch.load
     torch.load = lambda *a, **kw: _torch_load(*a, **{"weights_only": False, **kw})
     try:
-        import face_alignment
-        import mlx.core as mx
+        import Vision  # noqa: F401  - imported here so a missing pyobjc says so once
         from musetalk.models.vae import VAE
         from musetalk.utils.blending import get_image_prepare_material
         from musetalk.utils.face_parsing import FaceParsing
+        from safetensors.numpy import save_file
     except ImportError as exc:
         raise SystemExit(MISSING.format(exc=exc)) from None
 
@@ -264,23 +414,21 @@ def main() -> int:
     n, height, width = frames.shape[:3]
     print(f"clip {clip.name}: {n} frames at {width}x{height}, {fps:.3f}fps, device {device}")
 
-    landmark_type = getattr(
-        face_alignment.LandmarksType, "TWO_D", None
-    ) or face_alignment.LandmarksType._2D
-    fa = face_alignment.FaceAlignment(landmark_type, flip_input=False, device=str(device))
     start = time.perf_counter()
-    boxes, first_landmarks = [], None
+    boxes, first_regions = [], None
     for i in range(n):
-        found = fa.get_landmarks_from_image(cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB))
-        if not found:
+        regions = landmarks(frames[i], (width, height))
+        if regions is None:
             raise SystemExit(
-                f"no face found in frame {i}. Every frame needs one - the cache is "
-                "per-frame and there is no detector at runtime to fill a gap."
+                f"Vision found no face in frame {i}. Every frame needs one - the cache "
+                "is per-frame and there is no detector at runtime to fill a gap."
             )
         if i == 0:
-            first_landmarks = found[0]
-        boxes.append(musetalk_bbox(found[0], height))
-    print(f"landmarks + boxes: {time.perf_counter() - start:.1f}s")
+            first_regions = regions
+        every = np.concatenate(list(regions.values()))
+        half_y = regions["noseCrest"][LOWER_NOSE_BRIDGE][1]
+        boxes.append(musetalk_bbox(every, half_y, height))
+    print(f"Vision landmarks + boxes: {time.perf_counter() - start:.1f}s")
 
     vae = VAE(model_path="models/sd-vae")
     vae.vae.to(device)
@@ -292,8 +440,8 @@ def main() -> int:
             frames[i][y1:y2, x1:x2], (CROP, CROP), interpolation=cv2.INTER_LANCZOS4
         )
         # (1, 8, 32, 32) NCHW from MuseTalk; the MLX UNet reads NHWC.
-        latents[i] = vae.get_latents_for_unet(crop).cpu().numpy()[0].transpose(1, 2, 0)
-    print(f"VAE latents: {time.perf_counter() - start:.1f}s")
+        latents[i] = vae.get_latents_for_unet(crop).detach().cpu().numpy()[0].transpose(1, 2, 0)
+    print(f"sd-vae latents: {time.perf_counter() - start:.1f}s")
 
     parsing = FaceParsing(left_cheek_width=CHEEK_WIDTH, right_cheek_width=CHEEK_WIDTH)
     start = time.perf_counter()
@@ -312,7 +460,7 @@ def main() -> int:
     check_geometry(boxes, crop_boxes, masks, (width, height))
 
     np.save(out / "frames.npy", frames)
-    mx.save_safetensors(str(out / "latents.safetensors"), {"latents": mx.array(latents)})
+    save_file({"latents": latents}, str(out / "latents.safetensors"))
     np.savez(out / "masks.npz", **{f"{i:06d}": mask for i, mask in enumerate(masks)})
     (out / "boxes.json").write_text(
         json.dumps(
@@ -333,8 +481,12 @@ def main() -> int:
     xs, ys, xe, ye = crop_boxes[0]
     cv2.rectangle(overlay, (xs, ys), (xe, ye), (0, 200, 255), 2)
     cv2.line(overlay, (xs, (ys + ye) // 2), (xe, (ys + ye) // 2), (0, 0, 255), 2)
-    for px, py in first_landmarks.astype(int):
-        cv2.circle(overlay, (px, py), 3, (255, 0, 255), -1)
+    assert first_regions is not None
+    for points in first_regions.values():
+        for px, py in points.astype(int):
+            cv2.circle(overlay, (px, py), 3, (255, 0, 255), -1)
+    px, py = first_regions["noseCrest"][LOWER_NOSE_BRIDGE].astype(int)
+    cv2.circle(overlay, (px, py), 9, (255, 255, 0), -1)
     cv2.imwrite(str(out / "bbox_overlay.png"), overlay)
 
     sides = sorted({box[2] - box[0] for box in crop_boxes})
@@ -344,8 +496,10 @@ def main() -> int:
     print(f"  masks.npz           {n} masks, crop box {sides[0]}-{sides[-1]}px square")
     print(f"  boxes.json          {n} boxes + {n} crop boxes, fps {fps:.3f}")
     print("  bbox_overlay.png    green = model input box, orange = blend region,")
-    print("                      red = upper_boundary_ratio=0.5 cut (only below is blended)")
-    print("\nLook at bbox_overlay.png. The FAN-for-DWPose substitution is unverified.")
+    print("                      red = upper_boundary_ratio=0.5 cut (only below is blended),")
+    print("                      cyan = the noseCrest point standing in for iBUG-68 lm[29]")
+    print("\nLook at bbox_overlay.png. The cyan point sits ~12px above where FAN puts")
+    print("lm[29]; that bias is measured and documented, not corrected.")
     return 0
 
 
