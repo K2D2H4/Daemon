@@ -17,7 +17,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `openai_compatible_spike.py` | whether a real OpenAI-compatible endpoint answers `/models`, a Korean turn, and a tool round-trip |
 | `openai_compatible_loop_spike.py` | whether the *assembled* app survives a real turn on that endpoint — loop, recall, tool policy, audit table |
 | `screen_frame_arrival_spike.py` | why voice answered "what's on my screen" from nothing — a `realtimeInput.video` frame never arrives inside a tool round, and the fix is the image part *after* the tool response (0/20 → 19/20) |
-| `face_mood_tag_spike.py` | spec open question 4 — does the configured provider actually attach a leading `[mood:...]` tag, reliably and well-formed, under a candidate persona instruction nothing in this codebase ships yet |
+| `face_mood_tag_spike.py` | spec open question 4 — does the configured provider actually attach a leading `[mood:...]` tag, reliably and well-formed? It scores `daemon/face.py:MOOD_INSTRUCTION` **as imported**, not a copy, so it measures the string the text path really sends. Answering yes on one install is what shipped it; re-run it on another provider, another model, or after any edit to that string |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py

@@ -1,17 +1,21 @@
 """Does the model actually attach the mood tag, reliably and well-formed? Ask it.
 
 Spec open question 4 (docs/superpowers/specs/2026-08-25-face-design.md, closing
-table, item 4): `daemon/face.py:split_mood` and `daemon/loop.py:_speak` are ready
-to strip a leading `[mood:amused|sulky|curious]` tag off a reply the moment one
-arrives - before it reaches the wire or the markdown log - but **nothing in this
-codebase yet instructs the model to write one**. `daemon/persona/loader.py` has no
-such line. So the question this milestone left open is whether adding that
-instruction would actually work: does the configured provider attach the tag
-reliably, and in the exact syntax the stripper requires?
+table, item 4): `daemon/face.py:split_mood` and `daemon/loop.py:_speak` strip
+a leading `[mood:amused|sulky|curious]` tag off a reply the moment one arrives -
+before it reaches the wire or the markdown log - and `daemon/loop.py:_mood_rule`
+now asks the model for one on every text turn a face is attached to. **This is
+the run that decided that.** Before it, nothing in the codebase wrote the
+instruction, and the open question was whether adding it would work at all: does
+the configured provider attach the tag reliably, and in the exact syntax the
+stripper requires?
 
-If it does not, the text path lands exactly where spec section 5 already put
-voice - mood becomes a feature the daemon quietly does not have, drawn as an
-expression on the face and never actually triggered.
+The answer was yes on the install it was run against, so the instruction shipped.
+It stays runnable because that answer is not portable: a different provider, a
+different model, or an edited `MOOD_INSTRUCTION` all put the question back open.
+If compliance is poor on some install, the text path lands where spec section 5
+already put voice - mood becomes a feature the daemon quietly does not have,
+drawn as an expression on the face and never actually triggered.
 
 This asks the *configured* provider - whatever `.env`/the environment resolves
 `DAEMON_PROVIDER` to (`daemon/config.py:Settings`), through the same
@@ -41,19 +45,14 @@ import asyncio
 import re
 from dataclasses import dataclass
 
-from daemon.face import split_mood
-
-MOOD_INSTRUCTION = (
-    "표현 방식: 정말로 그렇게 느껴질 때만 답장 맨 앞에 다음 세 가지 중 하나를 붙인다 - "
-    "[mood:amused] (재미있음/웃김), [mood:sulky] (서운함/삐침), [mood:curious] (궁금함). "
-    "형식은 정확히 이대로 쓴다: 대괄호, mood, 콜론, 소문자 영어 단어, 그 뒤에 공백 하나와 "
-    "답장 본문. 느껴지는 게 없으면 아무것도 붙이지 않고 답만 쓴다. 태그를 언급하거나 "
-    "설명하지 않는다."
-)
-"""The candidate instruction this spike tests. Not wired into `persona/loader.py`
-anywhere yet - this is the wording a real install would add if this run says it
-is worth adding, phrased the way the rest of this codebase's Korean system text
-reads (docs/superpowers/specs/2026-08-25-face-design.md decision 2)."""
+# Imported rather than copied, and that is the point of this file now: the string
+# this spike scores is the string the text path actually sends
+# (`daemon/loop.py:_mood_rule`). A copy would let the two drift, and the drift
+# would be invisible - a reworded install prompt would keep quoting a number
+# measured against wording it no longer uses. So re-run this after any edit to
+# that constant: the number belongs to the wording, the provider and the model,
+# not to the feature.
+from daemon.face import MOOD_INSTRUCTION, split_mood
 
 SEED = "너는 사용자와 매일 대화하는 개인 동반자다. 말은 짧고 자연스럽게 한다."
 """A minimal stand-in persona seed - enough for the instruction to sit inside

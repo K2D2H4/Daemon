@@ -13,7 +13,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from conftest import FakeProvider
@@ -23,6 +23,7 @@ from daemon.app import create_app
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
 from daemon.config import Route, Settings
+from daemon.face import MOOD_INSTRUCTION, Mood, split_mood
 from daemon.llm.base import Completion, ImageBlock, Message, ProviderError, ToolCall
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import FAILURE_NOTICE, ConversationLoop
@@ -1153,6 +1154,69 @@ async def test_the_approval_resume_reply_also_gets_its_mood_tag_stripped(
     # Same two exits as the ordinary turn: the wire and the markdown log.
     assert [m.text for m in channel.sent] == ["다 됐어"]
     assert [m.content for m in memory.records if m.role == "assistant"] == ["다 됐어"]
+
+
+def _system_texts(messages: list[Any]) -> list[str]:
+    return [m.content for m in messages if m.role == "system"]
+
+
+async def test_the_model_is_asked_for_the_mood_tag_when_a_face_is_attached(
+    data_dir: Path,
+) -> None:
+    """The other half of `split_mood`. Stripping a tag is worth nothing if nothing
+    ever asks for one - which is exactly where this feature sat until
+    `evals/face_mood_tag_spike.py` measured that asking works."""
+    provider = FakeProvider()
+    channel = FakeChannel([inbound("웃겨?")])
+
+    await ConversationLoop(
+        channel,
+        gateway_for(provider),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=RecordingBus(),
+    ).run()
+
+    assert MOOD_INSTRUCTION in _system_texts(provider.calls[0])
+
+
+async def test_no_face_means_the_model_is_never_asked_for_a_mood(data_dir: Path) -> None:
+    """A text-only install pays nothing for a face it does not have. Without the
+    gate this is two hundred tokens on every turn asking for a tag `_speak` would
+    strip and no page would ever draw."""
+    provider = FakeProvider()
+    channel = FakeChannel([inbound("웃겨?")])
+
+    await ConversationLoop(
+        channel, gateway_for(provider), Companion(FakeMemory(), data_dir=data_dir)
+    ).run()
+
+    assert all("mood:" not in text for text in _system_texts(provider.calls[0]))
+
+
+async def test_the_approval_resume_is_asked_for_a_mood_too(data_dir: Path) -> None:
+    """`_assemble_after_tool` builds its own message list from scratch, so it can
+    forget this independently of the ordinary turn - and did, in the draft where
+    only `_speak` was covered."""
+    provider = FakeProvider()
+    channel = FakeChannel([inbound("/approve A3F2K9QT")])
+    companion = ApprovingCompanion(FakeMemory(), data_dir=data_dir, tools=object())
+
+    await ConversationLoop(
+        channel, gateway_for(provider), companion, face=RecordingBus()
+    ).run()
+
+    assert MOOD_INSTRUCTION in _system_texts(provider.calls[0])
+
+
+def test_the_instruction_and_the_parser_still_agree() -> None:
+    """Two halves of one contract in two files (`daemon/face.py`). If a reworded
+    instruction stops naming a mood, or names one the parser will not accept, the
+    face goes quiet and every reply still looks perfectly fine."""
+    # Off the `Mood` type itself, so a fourth mood added to the Literal without a
+    # matching line in the instruction fails here rather than on screen.
+    for mood in get_args(Mood):
+        assert f"[mood:{mood}]" in MOOD_INSTRUCTION
+        assert split_mood(f"[mood:{mood}] 본문") == ("본문", mood)
 
 
 # --- the M1a gate -----------------------------------------------------------

@@ -224,6 +224,31 @@ def _rms(chunk: bytes) -> float:
 
 _MOOD_TAG = re.compile(r"^\s*\[mood:(amused|sulky|curious)\]\s*", re.IGNORECASE)
 
+MOOD_INSTRUCTION = (
+    "표현 방식: 정말로 그렇게 느껴질 때만 답장 맨 앞에 다음 세 가지 중 하나를 붙인다 - "
+    "[mood:amused] (재미있음/웃김), [mood:sulky] (서운함/삐침), [mood:curious] (궁금함). "
+    "형식은 정확히 이대로 쓴다: 대괄호, mood, 콜론, 소문자 영어 단어, 그 뒤에 공백 하나와 "
+    "답장 본문. 느껴지는 게 없으면 아무것도 붙이지 않고 답만 쓴다. 태그를 언급하거나 "
+    "설명하지 않는다."
+)
+"""What makes a model write the tag `_MOOD_TAG` above reads. Here, next to the
+parser, because the two are one contract: change the syntax in one and the other
+silently stops matching, and the failure mode is invisible - replies keep
+arriving, the face just never reacts.
+
+Measured before shipping rather than assumed (`evals/face_mood_tag_spike.py`,
+which imports this exact string so a later edit re-measures the thing that ships).
+gemini-3.6-flash, 2026-08-26, 60 replies: **zero malformed attempts** and 45/45 on
+prompts aimed at a mood. The known weakness is the other direction - 11 of 15
+deliberately neutral prompts still got `[mood:curious]`, every false positive that
+one word, because the model counts its own follow-up question as curiosity. So
+`curious` fires often and `amused`/`sulky` stay honest. Tightening the wording is
+a change to a *measured* string: re-run the spike, do not just reword it.
+
+Text only. Spec section 5 keeps mood off the voice path, so this is attached in
+`daemon/loop.py` and never in `Companion.context`, which both paths share.
+"""
+
 
 def split_mood(text: str) -> tuple[str, Mood | None]:
     """Pull a leading `[mood:...]` tag off a model reply, returning both halves.
