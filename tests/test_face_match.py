@@ -255,12 +255,37 @@ def test_a_source_frame_with_no_direction_falls_back_to_appearance_only(tmp_path
     assert table["match"]["idle1"]["idle2"][0] == pytest.approx(2 / FPS)
 
 
+def test_near_neutral_moments_are_found_through_the_middle_of_a_clip(tmp_path):
+    """Task 9's 3rd follow-up: `neutral[stem]` must mark every BUCKET-second
+    slice that is close to the clip's own frame 0, not only the very start
+    and end - the owner's own question was exactly whether transitions land
+    mid-clip, and the whole fix depends on "near neutral" being found there
+    too, not just at the boundaries.
+
+    idle1's frame 0 is 100. Bucket 0 (indices 0-4) stays close to it (102..108
+    - small deviations). Bucket 1 (indices 5-9) moves far away (200..208 -
+    the largest deviation in the clip, so it sets the peak-departure scale
+    the threshold is a fraction of). Bucket 2 (indices 10-14) returns to
+    exactly 100 - neutral again, in the middle of the clip's own timeline,
+    not at either edge.
+    """
+    values = [100, 102, 104, 106, 108] + [200, 202, 204, 206, 208] + [100, 100, 100, 100, 100]
+    _clip(tmp_path / "idle1.mp4", values)
+
+    table = build_table(tmp_path)
+
+    assert table["neutral"]["idle1"] == [True, False, True]
+
+
 def test_one_shots_are_not_matched_into(tmp_path):
-    """The table has no entries whose destination is a one-shot clip.
+    """The table has no entries whose destination is a one-shot clip, and no
+    `neutral` entry for one either.
 
     A mood one-shot (amused) is an arc from neutral and back (rule 3); entering
     it mid-arc destroys the arc, so it must never be a destination - or a
-    source, since face_match.py's LOOPS is the same set for both axes.
+    source, since face_match.py's LOOPS is the same set for both axes. It also
+    has no business being waited-for as a neutral moment (task 9's 3rd
+    follow-up) - one-shots stay immediate, always.
     """
     _clip(tmp_path / "idle1.mp4", [10, 20, 30, 40, 50])
     _clip(tmp_path / "idle2.mp4", [60, 70, 80, 90, 100])
@@ -271,6 +296,7 @@ def test_one_shots_are_not_matched_into(tmp_path):
     assert "amused" not in table["match"], "a one-shot must never be a source"
     for destinations in table["match"].values():
         assert "amused" not in destinations, "a one-shot must never be a destination"
+    assert "amused" not in table["neutral"], "a one-shot must have no neutral spans"
 
 
 def test_a_missing_clip_is_simply_absent_from_the_table(tmp_path):

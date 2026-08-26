@@ -83,12 +83,13 @@ def test_speaking_falls_back_to_idle_when_both_speaking_clips_are_missing():
     )
 
 
-def test_the_wait_is_bounded_and_generalised_beyond_idle():
-    # spec 3.2: idle/listening/thinking/working may wait - up to WAIT_MS - for the
-    # outgoing clip to reach its own loop end (its neutral pose) instead of cutting
-    # it mid-gesture. Scoped to toActivity()'s own body, comments stripped, so a
-    # mention of WAIT_MS elsewhere (its own top-level declaration) or in prose can't
-    # stand in for the mechanism actually living here.
+def test_the_wait_is_for_the_next_neutral_moment_and_is_bounded():
+    # Task 9's 3rd follow-up: idle/listening/thinking/working may wait for the
+    # outgoing clip's next near-neutral moment (not only its own end) before
+    # cutting, capped so a clip that never gets there does not stall the page.
+    # Scoped to toActivity()'s own body, comments stripped, so a mention of
+    # these names elsewhere (their own top-level declarations) can't stand in
+    # for the mechanism actually living here.
     start = PAGE.index("function toActivity(act) {")
     end = PAGE.index("\n}\n", start)
     body = _without_line_comments(PAGE[start:end])
@@ -96,10 +97,28 @@ def test_the_wait_is_bounded_and_generalised_beyond_idle():
         "the wait must be conditioned on the activity being wait-eligible, not "
         "hardcoded to idle alone"
     )
-    assert "WAIT_MS" in body, "the wait must be bounded, not open-ended"
-    assert "showing.loop = false" in body, (
-        "letting the outgoing clip reach its own end relies on disabling its loop "
-        "so it fires `ended` instead of seeking back to 0"
+    assert "neutralWaitMs(" in body, (
+        "the wait duration must come from the neutral-moment lookup, not a fixed "
+        "or hardcoded delay"
+    )
+    assert "setTimeout(" in body, (
+        "waiting for a moment that is not necessarily the clip's own end cannot "
+        "rely on the native `ended` event - it needs its own timer"
+    )
+
+    # The bound itself lives in neutralWaitMs(), scoped to its own body: it must
+    # actually be used to cap the returned wait, not just declared unused.
+    start = PAGE.index("function neutralWaitMs(video) {")
+    end = PAGE.index("\n}\n", start)
+    wait_body = _without_line_comments(PAGE[start:end])
+    assert "NEUTRAL_WAIT_CAP_MS" in wait_body, "the wait must be bounded, not open-ended"
+    assert "Math.min(" in wait_body, (
+        "NEUTRAL_WAIT_CAP_MS must actually cap the computed wait, not just be "
+        "declared nearby and left unused"
+    )
+    assert "transitions.neutral" in wait_body, (
+        "the wait must be driven by the neutral-moment lookup the table provides, "
+        "not guessed or hardcoded"
     )
 
     # The pool itself, scoped to its own declaration, must actually name the three

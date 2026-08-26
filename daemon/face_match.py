@@ -41,6 +41,25 @@ outweighed. Pose matching recovers pose well (FOLLOW-UP 1's 41%) and motion
 barely (this section); no larger LAMBDA_DIRECTION closes that gap, and
 re-sweeping it later would just re-find the same ceiling.
 
+FOLLOW-UP 3 (still task 9, after the owner asked why clips with neutral time
+at each end still cut badly): waiting for the outgoing clip to reach a near-
+neutral moment was ruled out early, before FOLLOW-UP 1, on a first measurement
+at a different scale where near-neutral time looked like a two-tenths-of-a-
+second sliver at the very end of each clip - too narrow to be worth much, so
+pose matching (and later, direction) was built instead. Re-measured against
+this module's own `_frames`: at this scale, near-neutral time is wide, not
+narrow - the median wait for the next near-neutral moment is 0s for every
+loop clip (most of the time the outgoing clip already qualifies), and the
+worst-case p90 is a few seconds. The earlier conclusion inverted. This also
+explains why FOLLOW-UP 2's ceiling exists: pose matching was trying to match
+arbitrary mid-motion poses across twelve clips with no shared motion
+manifold, when the one moment they all genuinely share - neutral - was sitting
+unused. `_neutral_buckets` (below) is that moment, made lookupable; the page
+now waits for it (capped, see `daemon/static/face.html`'s NEUTRAL_WAIT_CAP_MS)
+on a non-urgent transition, and only falls through to pose-matched entry when
+that wait times out - narrowing what pose matching is needed for rather than
+replacing it, since a timed-out wait still has to land somewhere.
+
 Offline and dependency-light on purpose - no model, no network, and nothing
 imported from `daemon/` beyond `face_routes`'s clip vocabulary (`CLIPS`). This
 module never runs on the request path; `daemon face-transitions` runs it by hand,
@@ -133,6 +152,20 @@ matched frames have essentially uncorrelated motion. No larger LAMBDA fixes
 this; the ceiling is structural, not a tuning problem (see the module
 docstring's FOLLOW-UP 2 section)."""
 
+NEUTRAL_THRESHOLD_FRACTION = 0.20
+"""How close a frame must be to its own clip's frame 0 to count as "near
+neutral" (see `_neutral_buckets`) - a fraction of that clip's own peak
+departure (the largest mean-squared distance any of its frames reaches from
+frame 0), not an absolute distance, since clips differ in how far they stray.
+
+Measured at 0.15 and 0.25 of peak departure against all twelve of the owner's
+real clips (FOLLOW-UP 3, still task 9): the resulting wait times (median 0s,
+p90 well under a couple of seconds for every loop clip but flourish_arms)
+barely moved between the two, so the choice inside that band is not load-
+bearing. 0.20 is the midpoint of the two endpoints actually measured, not a
+third, untested value - splitting the difference rather than committing to
+either edge those two runs happened to use."""
+
 ONE_SHOTS = frozenset({"amused", "sulky", "curious", "flourish_arms"})
 """Mood one-shots and the idle flourish: each is an arc from the shared neutral
 pose and back (design spec §1's "hub-and-spoke"), so entering one mid-arc, at
@@ -149,16 +182,17 @@ in `match`, because it is never in the set the table iterates."""
 
 
 def build_table(face_dir: Path) -> dict[str, Any]:
-    """The pose-match table for every ordered pair of LOOP clips present under
+    """The pose-match and near-neutral table for every LOOP clip present under
     `face_dir`. A clip that does not exist on disk is simply absent from every
-    row and column it would have appeared in (rule 4) - there is no interpolation
-    or substitution for a missing clip, only omission.
+    row, column and `neutral` entry it would have appeared in (rule 4) - there
+    is no interpolation or substitution for a missing clip, only omission.
 
-    `version` is 2 as of the direction-penalty follow-up (still task 9): the
-    seek values a version-1 table produced can move mid-sigh, so a stale
-    version-1 `transitions.json` left over from before this fix needs to be
-    distinguishable from a fresh one, even though the schema shape (fps,
-    window, bucket, match) is unchanged.
+    `version` is 3 as of the neutral-wait follow-up (still task 9): earlier
+    versions carried `match` alone, this one adds `neutral`, so a stale
+    version-1 or version-2 `transitions.json` (no `neutral` key at all) needs
+    to be distinguishable from a fresh one - the same reasoning version 2 used
+    for the direction-penalty fix, now applied to an actual schema change
+    rather than a same-shape retuning.
     """
     present = [name for name in LOOPS if (face_dir / f"{name}.mp4").is_file()]
     frames = {name: _frames(face_dir / f"{name}.mp4") for name in present}
@@ -179,7 +213,16 @@ def build_table(face_dir: Path) -> dict[str, Any]:
         if row:
             match[a] = row
 
-    return {"version": 2, "fps": FPS, "window": WINDOW, "bucket": BUCKET, "match": match}
+    neutral = {name: _neutral_buckets(frames[name]) for name in present}
+
+    return {
+        "version": 3,
+        "fps": FPS,
+        "window": WINDOW,
+        "bucket": BUCKET,
+        "match": match,
+        "neutral": neutral,
+    }
 
 
 def write_table(face_dir: Path) -> Path:
@@ -192,22 +235,51 @@ def write_table(face_dir: Path) -> Path:
     return path
 
 
+def _bucket_ranges(n_frames: int) -> list[tuple[int, int]]:
+    """The `[lo, hi)` frame-index range of each `BUCKET`-second slice of a
+    clip's own `n_frames`-long timeline (rule 2) - the one place this
+    computation lives, so `_seeks` and `_neutral_buckets` cannot drift apart
+    on what a "slice" means.
+    """
+    frames_per_bucket = round(BUCKET * FPS)
+    n_buckets = math.ceil(n_frames / frames_per_bucket)
+    return [
+        (k * frames_per_bucket, min(n_frames, (k + 1) * frames_per_bucket))
+        for k in range(n_buckets)
+    ]
+
+
 def _seeks(frames_a: np.ndarray, frames_b: np.ndarray) -> list[float]:
     """One seek-into-B per `BUCKET`-second slice of A's timeline: the second
     (from B's own start) with the lowest cost - appearance plus the direction
     penalty (`_cost`) - within that slice of A.
     """
     cost = _cost(frames_a, frames_b)
-    frames_per_bucket = round(BUCKET * FPS)
-    n_buckets = math.ceil(frames_a.shape[0] / frames_per_bucket)
     seeks: list[float] = []
-    for k in range(n_buckets):
-        lo = k * frames_per_bucket
-        hi = min(frames_a.shape[0], lo + frames_per_bucket)
+    for lo, hi in _bucket_ranges(frames_a.shape[0]):
         window = cost[lo:hi]
         _, best_j = np.unravel_index(np.argmin(window), window.shape)
         seeks.append(round(float(best_j) / FPS, 3))
     return seeks
+
+
+def _neutral_buckets(frames: np.ndarray) -> list[bool]:
+    """Which `BUCKET`-second slices of `frames`' own timeline are near its
+    own frame 0 (task 9's 3rd follow-up: waiting for the clip's next such
+    moment beats matching pose against an unrelated clip's motion, which
+    twelve independently generated clips were never going to share - see the
+    module docstring's FOLLOW-UP 2). A slice counts as near neutral if any
+    frame within it is within `NEUTRAL_THRESHOLD_FRACTION` of the clip's own
+    peak departure from frame 0 - bucketed the same way as `match`
+    (`_bucket_ranges`), so the page can look this up instead of recomputing
+    distances itself.
+    """
+    if frames.shape[0] == 0:
+        return []
+    dist_to_first = _pairwise_mean_sq_dist(frames, frames[:1])[:, 0]
+    threshold = NEUTRAL_THRESHOLD_FRACTION * float(dist_to_first.max())
+    near = dist_to_first <= threshold
+    return [bool(near[lo:hi].any()) for lo, hi in _bucket_ranges(frames.shape[0])]
 
 
 def _cost(frames_a: np.ndarray, frames_b: np.ndarray) -> np.ndarray:

@@ -54,15 +54,19 @@ const FADE_SLOW_MS = 400;     // spec 3.2 - listening/thinking/working and the i
                                // A starting value, not a measured one: 180ms measurably
                                // read as a cut on a real window, and only the owner's
                                // eye against a real window can settle where this lands.
-const WAIT_MS = 500;          // spec 3.2's wait window, generalised beyond idle to
-                               // every non-urgent activity (listening/thinking/working
-                               // too). Measured, and worth saying plainly: near-neutral
-                               // windows sit almost entirely at a clip's own start/end
-                               // (see the report), so this only helps when the arrival
-                               // happens to land in that narrow slice. Nearly free, so
-                               // worth doing - NOT a fix for a clip that strays far from
-                               // neutral for most of its length (flourish_arms worst:
-                               // near neutral only 18% of the time).
+const NEUTRAL_WAIT_CAP_MS = 1200;
+// task 9 (3rd follow-up): supersedes the original wait rule that used to sit
+// here (WAIT_MS). That rule only checked whether the outgoing clip was near
+// its own natural end - measured (at a different scale) to be a narrow
+// window, so it rarely fired. Re-measured against this page's own scale
+// (face_match.py's own _frames): most clips are near neutral MOST of the
+// time (median wait across every loop clip is 0s), just not necessarily at
+// the literal end - so the fix is to wait for the next near-neutral MOMENT,
+// wherever it falls, not only the clip's own finish. 1.2s is a round cap in
+// the ballpark of that measurement, not a per-clip guarantee: some clips'
+// own p90 (thinking 2.3s, working 1.8s) run past it, so this only bounds how
+// long the page waits before giving up and switching anyway via the pose-
+// matched entry point - it does not promise neutral is reached.
 const RATE_MIN = 0.85;        // below ~0.8 reads as slow motion
 const RATE_MAX = 1.25;        // above ~1.3 reads as fast-forward
 const ATTACK = 0.30;          // fast open
@@ -87,9 +91,10 @@ const FOR_ACTIVITY = {
 const SLOW_FADE_ACTIVITIES = new Set(["listening", "thinking", "working", "idle"]);
 
 // Which activities may wait (spec 3.2, generalised beyond idle) for the outgoing
-// clip's own loop end before cutting. Same membership as SLOW_FADE_ACTIVITIES
-// today - kept as its own constant because fade speed and wait eligibility are
-// separate questions that happen to share an answer, not one concern with two names.
+// clip's next near-neutral moment before cutting - see neutralWaitMs() below.
+// Same membership as SLOW_FADE_ACTIVITIES today - kept as its own constant
+// because fade speed and wait eligibility are separate questions that happen
+// to share an answer, not one concern with two names.
 const WAIT_ACTIVITIES = new Set(["listening", "thinking", "working", "idle"]);
 
 const stage = document.getElementById("stage");
@@ -103,7 +108,9 @@ let env = 0;                  // smoothed level
 let loudSince = 0;
 let flourishAt = 0;
 let oneShotUntil = 0;
-let pendingWaitFade = 0;      // set only while waiting out spec 3.2's WAIT_MS delay
+let pendingWaitTimer = 0;     // task 9 (3rd follow-up): setTimeout handle for a
+                               // pending wait-for-next-neutral-moment delay, if any
+                               // is outstanding - see neutralWaitMs()/toActivity()
 let queuedActivity = null;    // spec 3.6: a non-speaking activity change held until an
                                // in-flight one-shot finishes, rather than dropped or
                                // acted on mid-gesture
@@ -177,6 +184,44 @@ function poseMatchTime(prev, stem) {
   return seeks[Math.min(Math.max(bucket, 0), seeks.length - 1)] ?? 0;
 }
 
+// --- WAIT FOR THE NEXT NEAR-NEUTRAL MOMENT (task 9, 3rd follow-up) ---------
+// Supersedes the original wait rule (spec 3.2): that rule waited only for the
+// outgoing clip's own literal end, within WAIT_MS of it. Measured against
+// this page's own scale (face_match.py's own _frames, on the owner's real
+// clips), that was solving the wrong problem: near-neutral time is not
+// confined to a clip's own end, it is spread through most of the clip, so
+// checking only the end rarely found it. `transitions.neutral[stem]` is one
+// bool per BUCKET-second slice of `stem`'s own timeline - true where some
+// frame in that slice is within face_match.py's own threshold of the clip's
+// frame 0 (see NEUTRAL_THRESHOLD_FRACTION there). This looks up whether
+// `video` is near neutral right now, and if not, how long until the next
+// slice that is - capped at NEUTRAL_WAIT_CAP_MS, since a bucket that never
+// arrives is exactly the case pose-matched entry (poseMatchTime, above) still
+// covers.
+function neutralWaitMs(video) {
+  if (!transitions || !video) return null;
+  const spans = transitions.neutral?.[video.dataset.stem];
+  if (!spans || !spans.length) return null;
+  const bucket = transitions.bucket;
+  const cur = Math.floor(video.currentTime / bucket) % spans.length;
+  if (spans[cur]) return 0;                // already near neutral - no wait needed
+  for (let step = 1; step <= spans.length; step++) {
+    const idx = (cur + step) % spans.length;    // wraps: the clip loops
+    if (spans[idx]) {
+      const waitS = step * bucket - (video.currentTime % bucket);
+      return Math.min(waitS * 1000, NEUTRAL_WAIT_CAP_MS);
+    }
+  }
+  return null;                             // no near-neutral slice anywhere in this clip
+}
+
+function clearPendingWait() {
+  if (pendingWaitTimer) {
+    clearTimeout(pendingWaitTimer);
+    pendingWaitTimer = 0;
+  }
+}
+
 // --- SINGLE-SIDED CROSSFADE -------------------------------------------------
 function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {
   const next = els.get(stem);
@@ -209,9 +254,10 @@ function ensurePlaying() {
   // theoretical): it can pause an already-showing clip to save power, or it can
   // reject a switch's play() outright, leaving the old clip showing and still
   // playing - just the wrong one. Resuming what's on screen is always correct,
-  // including mid a pending WAIT_MS wait (that clip just needs to keep running
-  // toward its own end), so it takes priority; only once it isn't paused do we
-  // check whether it's even the right clip for the current activity.
+  // including mid a pending neutral-moment wait (that clip just needs to keep
+  // running - its own setTimeout, not this function, decides when to switch),
+  // so it takes priority; only once it isn't paused do we check whether it's
+  // even the right clip for the current activity.
   if (!showing) return;
   if (showing.paused) { showing.play().catch(() => {}); return; }
   if (!oneShotUntil) {
@@ -221,9 +267,11 @@ function ensurePlaying() {
 }
 
 function advance() {
-  // A finished clip: one-shots hand back to the activity, idle reshuffles. A
-  // deferred wait (toActivity, below) also lands here once the outgoing clip
-  // reaches its own end, carrying the fade speed that call already chose.
+  // A finished clip: one-shots hand back to the activity, idle reshuffles.
+  // (A wait-for-neutral-moment delay, task 9's 3rd follow-up, no longer routes
+  // through here - it fires its own setTimeout in toActivity(), below, rather
+  // than waiting for this clip's `ended`, since the neutral moment it is
+  // waiting for is not necessarily the clip's own end any more.)
   oneShotUntil = 0;
   if (queuedActivity !== null) {
     // spec 3.6: a non-speaking activity change arrived mid-one-shot and was held
@@ -235,10 +283,8 @@ function advance() {
     toActivity(act);
     return;
   }
-  const fadeMs = pendingWaitFade || FADE_MS;
-  pendingWaitFade = 0;
   const stem = clipFor(activity);
-  if (stem) show(stem, { loop: activity !== "idle", fadeMs });
+  if (stem) show(stem, { loop: activity !== "idle" });
 }
 
 function toActivity(act) {
@@ -248,7 +294,7 @@ function toActivity(act) {
     // claim. Remember it instead; advance() (above) applies it once the one-shot's
     // own `ended` fires. This also settles the wait/one-shot interaction: a
     // one-shot already in flight blocks a *new* wait from starting here (this
-    // check runs first), and playOneShot() (below) always clears pendingWaitFade,
+    // check runs first), and playOneShot() (below) always clears a pending wait,
     // so a one-shot always wins over a wait that was already pending.
     queuedActivity = act;
     return;
@@ -256,32 +302,37 @@ function toActivity(act) {
   queuedActivity = null;
   activity = act;
   oneShotUntil = 0;
-  pendingWaitFade = 0;          // any earlier deferred wait is moot now
+  clearPendingWait();           // any earlier deferred wait is moot now
   scheduleFlourish();
   const fadeMs = SLOW_FADE_ACTIVITIES.has(act) ? FADE_SLOW_MS : FADE_MS;
+  const stem = clipFor(act);
+  if (!stem) return;
   // !showing.paused excludes a clip that has already reached its end (paused,
   // non-looping - e.g. a one-shot whose `ended` just fired and landed us here via
-  // advance()'s queuedActivity branch, above): it will never fire `ended` again,
-  // so waiting on it would strand the page on a frozen last frame.
+  // advance()'s queuedActivity branch, above): it will never move again, so
+  // waiting on it would strand the page on a frozen last frame.
   if (WAIT_ACTIVITIES.has(act) && showing && !showing.paused) {
-    const remaining = (showing.duration - showing.currentTime) * 1000;
-    if (Number.isFinite(remaining) && remaining >= 0 && remaining <= WAIT_MS) {
-      // spec 3.2: let the outgoing clip reach its own loop end (its neutral pose)
-      // instead of cutting it mid-gesture. Clearing loop makes it fire `ended`,
-      // which advance() (wired in prime(), above) is already listening for.
-      showing.loop = false;
-      pendingWaitFade = fadeMs;
+    const waitMs = neutralWaitMs(showing);
+    if (waitMs > 0) {
+      // Keep playing (and looping) toward that moment; the switch itself still
+      // goes through show(), so it still looks up the pose-matched entry point
+      // (poseMatchTime) for wherever the outgoing clip actually is when this
+      // fires - exactly on time if a neutral moment was reached, or wherever
+      // NEUTRAL_WAIT_CAP_MS ran out if it timed out first.
+      pendingWaitTimer = setTimeout(() => {
+        pendingWaitTimer = 0;
+        show(stem, { loop: act !== "idle", fadeMs });
+      }, waitMs);
       return;
     }
   }
-  const stem = clipFor(act);
-  if (stem) show(stem, { loop: act !== "idle", fadeMs });
+  show(stem, { loop: act !== "idle", fadeMs });
 }
 
 function playOneShot(stem) {
   if (!have.has(stem)) return;           // no clip, no expression - never substitute idle
   oneShotUntil = Infinity;
-  pendingWaitFade = 0;          // a fresh one-shot supersedes any pending wait
+  clearPendingWait();            // a fresh one-shot supersedes any pending wait
   show(stem, { loop: false });
 }
 
