@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
 
 import cv2
 import numpy as np
@@ -15,6 +14,30 @@ from daemon.face_lipsync.ring import PcmRing, Slot
 logger = logging.getLogger(__name__)
 
 JPEG_QUALITY = 85
+
+# A published frame is the WHOLE composited frame, and two earlier attempts at
+# sending less were both wrong.
+#
+# The first sent each frame's crop box, on a measurement that was real but did not
+# apply: the crop is 3.4x cheaper to send (52KB against 174KB, 0.46ms against 2.45ms)
+# - and this page is served over loopback to the same machine, where 47 Mbit/s costs
+# nothing. The saving bought nothing and was paid for in the only currency the owner
+# is judging.
+#
+# The second made it worse by sending the union of those boxes, 1.40x the area of any
+# one of them, and claimed the extra margin "carries unmodified driving-clip pixels,
+# which is what the page has underneath anyway". That is false whenever the page's
+# `<video>` is not on the same frame as the render, which is always: the margin lands
+# on mismatched pixels and draws a bright rectangle across the head. Measured, the
+# model only ever rewrites `mask > 0` inside `box` - 289-314 x 230-274px, a mean of
+# 73k pixels against the union's 556k. Seven times more pixels than the model touches,
+# every one of them head and chest, to produce a seam that did not have to exist.
+#
+# The spike's own 1:1 comparison is seamless for one reason: the server composited
+# into the same frame, and a gaussian-blurred mask has no boundary to see. Compositing
+# in the browser cannot reproduce that - a JPEG has no alpha, so its edge is hard
+# however small it is. So the whole frame goes over the wire and the page displays it
+# rather than blending anything.
 
 DETAIL_SIGMA = 1.1
 """Gaussian sigma separating "texture" from "structure" in the driving frame.
@@ -69,16 +92,6 @@ N=3 is not the next step up: the batch cannot start until its last frame's audio
 arrived, so widening costs `(N-1) x 41.67ms` of latency and N=3 misses the 250ms
 ceiling by 7.6ms.
 """
-
-
-def _union(boxes: Sequence[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
-    """The smallest `(x1, y1, x2, y2)` containing all of `boxes`."""
-    return (
-        min(b[0] for b in boxes),
-        min(b[1] for b in boxes),
-        max(b[2] for b in boxes),
-        max(b[3] for b in boxes),
-    )
 
 
 class FrameClock:
@@ -181,21 +194,6 @@ class Renderer:
         self._ring = ring
         self._slot = slot
         self._buffer = np.empty_like(cache.frames[0])
-        self.frame_box = _union(cache.crop_boxes)
-        """The one rectangle every published JPEG covers, `(x1, y1, x2, y2)`.
-
-        Publishing the whole composited frame is what this replaced, and the cost was
-        not marginal: 1080x1620 is 174KB and 2.43ms to encode against 52KB and 0.46ms
-        for the crop, i.e. 34.2 Mbit/s against 10.1 at 24fps - and the page already
-        holds the driving clip, so the rest of the frame is bytes it can already draw.
-
-        It has to be ONE rectangle, not each frame's own crop box. Those vary with the
-        face (572-608px across a single clip), and a payload whose size changes per
-        frame cannot be placed by a page that positions the overlay once. So this is
-        their union, and the margin it adds over a smaller frame's box carries
-        unmodified driving-clip pixels - which is exactly what the page has underneath
-        anyway. `daemon/app.py` hands this to the transport as `LipsyncFrames.box`.
-        """
         self._pending: bytes | None = None
         """The batch's second frame, waiting for the next call. See the class docstring."""
         self.failed = False
@@ -242,13 +240,9 @@ class Renderer:
                 out=self._buffer,
             )
             # Encode inside the loop: `out` is one reusable buffer, so the second
-            # composite overwrites the first frame's pixels. And encode `frame_box`
-            # only - see its docstring for what the whole frame cost.
-            fx1, fy1, fx2, fy2 = self.frame_box
+            # composite overwrites the first frame's pixels.
             ok, buf = cv2.imencode(
-                ".jpg",
-                out[fy1:fy2, fx1:fx2],
-                [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+                ".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
             )
             if ok:
                 encoded.append(buf.tobytes())

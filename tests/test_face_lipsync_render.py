@@ -149,43 +149,29 @@ def test_the_published_frame_contains_the_engines_mouth_pixels():
     published = slot.get()
     assert published is not None
     frame = cv2.imdecode(np.frombuffer(published, np.uint8), cv2.IMREAD_COLOR)
-    # The payload is the crop box, not the whole composited frame, so the point has
-    # to be addressed in the crop's own pixels: (80, 70) minus the box's origin.
-    assert abs(int(frame[80 - CROP_BOX[1], 70 - CROP_BOX[0], 0]) - 200) < 20
+    # Centre of the box: the engine's mouth colour (200), not the background (0).
+    # JPEG is lossy, so allow a margin nowhere near the 200-value gap.
+    assert abs(int(frame[80, 70, 0]) - 200) < 20
 
 
-def test_the_payload_is_the_crop_box_and_not_the_whole_frame():
-    """The transport's whole bandwidth argument rests on this: 1080x1620 is 174KB and
-    2.43ms to encode against 52KB and 0.46ms for the crop, and the page already holds
-    the driving clip. Publishing the frame instead still renders correctly and still
-    passes every other test in this file, which is why it needs its own."""
+def test_the_payload_is_the_whole_composited_frame():
+    """Two earlier versions of this test pinned a crop instead, and both were wrong.
+
+    The crop is genuinely 3.4x cheaper to send, but this page is served over loopback,
+    where that saving buys nothing - and compositing a JPEG over the page's own
+    `<video>` cannot be seamless, because a JPEG has no alpha and the video is not on
+    the same frame. The spike's comparison is seamless because the SERVER composited
+    into the frame. So the payload is the frame.
+    """
     slot = Slot()
     cache = _cache()
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
-    r = Renderer(engine=FakeEngine(), cache=cache, ring=ring, slot=slot)
-    r.render(frame_index=0, origin=0.0, fps=24.0)
-    got = cv2.imdecode(np.frombuffer(slot.get(), np.uint8), cv2.IMREAD_COLOR)
-    x1, y1, x2, y2 = r.frame_box
-    assert got.shape[:2] == (y2 - y1, x2 - x1)
-    assert got.shape[:2] != cache.frames[0].shape[:2]
-
-
-def test_the_frame_box_is_the_union_of_the_per_frame_crop_boxes():
-    """Crop boxes vary with the face - 572-608px across one real clip - and a payload
-    whose size changes per frame cannot be placed by a page that positions the overlay
-    once. One rectangle, covering all of them."""
-    cache = _cache(n=3)
-    boxes = [(30, 15, 120, 155), (28, 20, 118, 150), (34, 12, 124, 158)]
-    cache = Cache(
-        frames=cache.frames,
-        boxes=cache.boxes,
-        crop_boxes=boxes,
-        masks=cache.masks,
+    Renderer(engine=FakeEngine(), cache=cache, ring=ring, slot=slot).render(
+        frame_index=0, origin=0.0, fps=24.0
     )
-    ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
-    r = Renderer(engine=FakeEngine(), cache=cache, ring=ring, slot=Slot())
-    assert r.frame_box == (28, 12, 124, 158)
+    got = cv2.imdecode(np.frombuffer(slot.get(), np.uint8), cv2.IMREAD_COLOR)
+    assert got.shape[:2] == cache.frames[0].shape[:2]
 
 
 def test_a_failing_engine_does_not_take_the_renderer_down():
@@ -455,15 +441,14 @@ def test_render_actually_restores_detail():
 
     got = cv2.imdecode(np.frombuffer(slot.get(), np.uint8), cv2.IMREAD_COLOR)
     flat = np.full((120, 60, 3), 200, np.uint8)
-    x1, y1, x2, y2 = CROP_BOX
-    plain = composite(cache.frames[0], flat, BOX, CROP_BOX, cache.masks[0])[y1:y2, x1:x2]
+    plain = composite(cache.frames[0], flat, BOX, CROP_BOX, cache.masks[0])
     restored = composite(
         cache.frames[0],
         restore_detail(flat, cache.frames[0], BOX),
         BOX,
         CROP_BOX,
         cache.masks[0],
-    )[y1:y2, x1:x2]
+    )
     d_plain = np.abs(got.astype(int) - plain.astype(int)).mean()
     d_restored = np.abs(got.astype(int) - restored.astype(int)).mean()
     assert d_restored < d_plain / 2, (d_restored, d_plain)

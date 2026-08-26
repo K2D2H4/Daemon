@@ -15,7 +15,6 @@ checking the signal the page actually keys off.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 
 import httpx
@@ -25,7 +24,7 @@ from fastapi.testclient import TestClient
 
 from daemon.config import Settings
 from daemon.face import FaceBus
-from daemon.face_routes import CLIPS, available_clips, face_dir, router
+from daemon.face_routes import BOUNDARY, CLIPS, available_clips, face_dir, router
 
 
 def _settings(tmp_path, **kw):
@@ -173,10 +172,9 @@ class FakeFrames:
     route works against the one object the layering says it must not depend on.
     """
 
-    def __init__(self, *, clip: str = "idle2", box=(245, 300, 835, 890)) -> None:
+    def __init__(self, *, clip: str = "idle2") -> None:
         self.failed = False
         self.clip = clip
-        self.box = box
         self._frame: bytes | None = None
 
     def put(self, frame: bytes) -> None:
@@ -227,6 +225,9 @@ async def _transcript(app, drive):
 
     What this cannot show is that a frame reached the page *promptly*; the transcript
     proves order and content, not latency. That is what running the real thing is for.
+
+    Returns the raw body, not lines: the response is multipart with JPEG payloads, so
+    splitting it on newlines would cut through the images themselves.
     """
     task = asyncio.create_task(drive())
     try:
@@ -236,13 +237,32 @@ async def _transcript(app, drive):
     finally:
         task.cancel()
     assert r.status_code == 200
-    assert "text/event-stream" in r.headers["content-type"]
-    return r.text.splitlines()
+    assert "multipart/x-mixed-replace" in r.headers["content-type"]
+    return r.content
 
 
-def _frames_in(lines):
-    """The JPEGs the page would have received, decoded back out of the data lines."""
-    return [base64.b64decode(ln[5:].strip()) for ln in lines if ln.startswith("data:")]
+def _frames_in(body):
+    """The JPEGs the page would have received, taken back out of the multipart parts.
+
+    Parsed by the declared Content-Length rather than by searching for the next
+    boundary: JPEG is binary and may contain the boundary bytes, and a parser that
+    scanned for them would truncate exactly the frames it was meant to prove intact.
+    """
+    out, sep = [], b"--" + BOUNDARY + b"\r\n"
+    for part in body.split(sep)[1:]:
+        head, _, rest = part.partition(b"\r\n\r\n")
+        length = next(
+            (
+                int(line.split(b":")[1])
+                for line in head.split(b"\r\n")
+                if line.lower().startswith(b"content-length")
+            ),
+            None,
+        )
+        assert length is not None, f"part with no Content-Length: {head!r}"
+        assert b"image/jpeg" in head.lower(), f"part is not a JPEG: {head!r}"
+        out.append(rest[:length])
+    return out
 
 
 def test_frames_say_the_switch_is_off_rather_than_just_failing(app):
@@ -286,7 +306,6 @@ def test_a_latched_failure_stops_both_surfaces_advertising_a_mouth(app):
     _with_lipsync(app, source)
     assert TestClient(app).get("/face/manifest").json()["lipsync"] == {
         "clip": "idle2",
-        "box": [245, 300, 835, 890],
     }
 
     source.failed = True
@@ -298,13 +317,13 @@ def test_a_latched_failure_stops_both_surfaces_advertising_a_mouth(app):
     assert TestClient(app).get("/face/manifest").json()["lipsync"] is False
 
 
-def test_the_manifest_tells_the_page_where_to_put_the_crops(app):
-    """Geometry rides on the manifest, not on the frames: the page positions one
-    `<img>` from this once and the frames are then only pixels. One box for the whole
-    clip, so the overlay is never re-placed frame to frame."""
-    _with_lipsync(app, FakeFrames(clip="idle3", box=(10, 20, 600, 610)))
+def test_the_manifest_names_the_driving_clip_and_no_geometry(app):
+    """This used to carry a box for the page to place a crop with. The frames are whole
+    composited images now, so there is nothing to place - and a box the page cannot use
+    would be the last trace of the transport that drew a rectangle across the head."""
+    _with_lipsync(app, FakeFrames(clip="idle3"))
     body = TestClient(app).get("/face/manifest").json()
-    assert body["lipsync"] == {"clip": "idle3", "box": [10, 20, 600, 610]}
+    assert body["lipsync"] == {"clip": "idle3"}
 
 
 async def test_a_quiet_renderer_keeps_the_stream_open_and_sends_no_frame(app):
@@ -312,21 +331,25 @@ async def test_a_quiet_renderer_keeps_the_stream_open_and_sends_no_frame(app):
 
     A model step covers two frames and cannot start until the second one's audio has
     arrived, so the source answers "nothing new" on some ticks by design; between turns
-    it answers that for minutes. What goes out then is keepalive comments, which are
-    not events, so nothing reaches the page's `onmessage` and its overlay ages out and
-    fades instead of holding a mouth that is no longer being drawn.
+    it answers that for minutes, and the response has to stay open across it without
+    inventing a picture. The keepalive this test used to assert is gone with SSE: a
+    multipart stream has nothing to keep alive, and a comment frame would be a
+    malformed part. What proves liveness now is that the response is still open when
+    the driver ends it - which `_transcript` establishes by getting a 200 at all.
     """
     source = FakeFrames()          # never fed: no frame has ever existed
 
     async def drive():
-        await asyncio.sleep(0.25)  # ~50 poll turns, ~5 keepalives at 0.05
+        await asyncio.sleep(0.25)  # ~50 poll turns at FRAME_POLL_SECONDS
         source.failed = True
 
     _with_lipsync(app, source)
-    lines = await _transcript(app, drive)
+    body = await _transcript(app, drive)
 
-    assert not _frames_in(lines), "a quiet renderer must not produce a frame"
-    assert ":" in lines, "a silent stream still has to prove it is alive"
+    assert not _frames_in(body), "a quiet renderer must not produce a frame"
+    assert body.endswith(b"--" + BOUNDARY + b"--\r\n"), (
+        "the stream must close cleanly so the page's <img> sees the end"
+    )
 
 
 async def test_the_frames_reach_the_page_byte_for_byte_and_in_order(app):

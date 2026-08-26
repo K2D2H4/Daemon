@@ -1135,11 +1135,10 @@ class _LipsyncFrames:
         self._renderer = renderer
         self._slot = slot
         self.clip = clip
-        self.box = renderer.frame_box
-        """Constant for the life of the process, which the transport requires: every
-        JPEG is `out[y1:y2, x1:x2]` at this one rectangle, so the page places its
-        overlay once. `Renderer` already computes it as the union of the clip's
-        per-frame crop boxes - 729x763 for `idle2`, whose own boxes range 608-726px."""
+        # No box. Every JPEG is the whole composited frame now, so there is no
+        # rectangle for the page to place - and reading `renderer.frame_box` here after
+        # it was removed would have been an AttributeError on the first real build,
+        # which no test caught because they all inject a fake renderer.
 
     @property
     def failed(self) -> bool:

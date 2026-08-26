@@ -210,20 +210,21 @@ def test_the_mouth_is_an_overlay_that_is_allowed_to_die():
     # then publish nothing. An <img> fed a stream that stopped keeps showing its last
     # frame and fires no event, so a page that treated lip-sync as a mode it had
     # switched into would hold a frozen mouth over a face that is still talking.
-    # Two separate questions, and the split is the point - see mouthReady/mouthLive.
     assert "function mouthReady()" in PAGE
-    live = _body("function mouthLive()")
-    assert "MOUTH_STALE_MS" in live, (
-        "liveness has to be decided by the age of the last frame; a boolean set when "
-        "the stream opened cannot tell a dead renderer from a quiet one"
-    )
 
+    # The per-frame staleness clock this used to require is gone with the transport.
+    # An <img> fed multipart/x-mixed-replace gives the page no per-frame event to time
+    # from - Chrome fires `load` once for the whole stream - so there is nothing to age.
+    # What replaces it is narrower and does not need one: the overlay is gated on
+    # `activity === "speaking"` from the activity stream, and the renderer only draws
+    # while speaking.
     stream = _body("function mouthStream() {")
-    assert "onerror" in stream and "EventSource.CLOSED" in stream, (
-        "the definite end of the stream is EventSource giving up (readyState CLOSED "
-        "after /face/frames answers 503), not the first dropped connection"
-    )
+    assert "onerror" in stream, "the end of the stream is what falls back"
     assert "mouthDead" in stream, "giving up has to be recorded, or nothing falls back"
+    assert 'mouth.src = "/face/frames"' in stream, (
+        "the browser has to be the one streaming it; a page assigning data: URIs per "
+        "frame is the base64 path this replaced"
+    )
 
 
 def test_a_dead_mouth_falls_back_to_the_v1_speaking_clip():
@@ -263,12 +264,10 @@ def test_the_crop_is_not_taken_off_the_screen_by_rAF():
     assert "refreshMouth" not in _body("function tick() {"), (
         "the overlay's visibility must not depend on rAF running"
     )
-    stream = _body("function mouthStream() {")
-    assert "setTimeout" in stream and "MOUTH_STALE_MS" in stream, (
-        "a frame failing to arrive is an event too, and a timer is what survives a "
-        "backgrounded tab (clamped to ~1s, not stopped)"
-    )
-    assert "refreshMouth" in stream, "an arriving frame is what puts the crop on screen"
+    # No timer here any more: with the browser streaming the image there is no
+    # per-frame callback to re-arm one from, and nothing to age out. Everything that
+    # can change the answer still has to say so, which is what the loop below checks -
+    # and that set now carries the whole job rather than sharing it with a watchdog.
     # And every other place the answer can change has to say so, or the crop outlives
     # the state that justified it: a mood one-shot replacing the driving clip, the
     # activity leaving speaking, and becoming visible after rAF was stopped.
@@ -294,15 +293,25 @@ def test_the_frame_stream_is_only_opened_when_the_daemon_offers_one():
     )
 
 
-def test_the_crop_is_placed_through_the_clips_own_letterboxing():
-    # The box arrives in the driving clip's pixels (1080x1620) and the clip is drawn
-    # with object-fit: contain, so the same fit - scale by the tighter axis, centre the
-    # remainder - has to be applied or the mouth lands somewhere near the jaw.
-    body = _body("function layoutMouth() {")
-    assert "videoWidth" in body and "Math.min" in body, (
-        "the crop box must be scaled by object-fit: contain's own factor"
+def test_the_rendered_frame_needs_no_placing_at_all():
+    """This replaced a test that checked the crop was scaled through object-fit's own
+    letterboxing, which was the right check for the wrong design.
+
+    Two versions of this page laid a crop of the mouth over the playing clip, and both
+    drew a visible rectangle across the head: a JPEG has no alpha, so its edge is hard
+    however small the crop is, and the clip underneath is never on the frame the
+    renderer drew. The payload is the whole composited frame now, so it takes the same
+    geometry as the clips it replaces and there is nothing left to line up - which is
+    the property to pin, because re-introducing any positioning maths would mean the
+    crop is back.
+    """
+    assert "layoutMouth" not in PAGE, "positioning the overlay means it is a crop again"
+    assert "mouthBox" not in PAGE, "and so does carrying a box to position it with"
+    start = PAGE.index("#mouth {")
+    css = PAGE[start : PAGE.index("}", start)]
+    assert "inset: 0" in css and "object-fit: contain" in css, (
+        "the frame has to be drawn exactly where the clips are, by the same fit"
     )
-    assert "mouthBox" in body, "and positioned from the manifest's box, not a constant"
 
 
 def test_the_mouth_overlay_cannot_fall_behind_a_clip():

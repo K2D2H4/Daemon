@@ -388,7 +388,9 @@ def test_the_frames_source_is_exactly_what_the_transport_asks_for():
     renderer, slot = FakeRenderer(), Slot()
     frames = _LipsyncFrames(renderer=renderer, slot=slot, clip="idle2")
     assert frames.clip == "idle2"
-    assert frames.box == renderer.frame_box
+    assert not hasattr(frames, "box"), (
+        "a box here would mean the page is placing a crop again"
+    )
     assert frames.get() is None
     slot.put(b"jpeg")
     assert frames.get() == b"jpeg"

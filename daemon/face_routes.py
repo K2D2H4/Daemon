@@ -19,7 +19,6 @@ exactly as it takes the `FaceBus` from `app.state.face` rather than building one
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -69,17 +68,27 @@ explaining that."""
 class LipsyncFrames(Protocol):
     """The lip-sync renderer as `/face/frames` sees it, and nothing more.
 
-    Four members, because four is what a transport needs. `daemon/app.py` builds
-    whatever satisfies this; nothing here knows that a model, a driving-clip cache or
-    a PCM ring exist, which is what keeps this file free of `daemon.face_lipsync`
-    (CONTRACTS 4) and what lets the tests drive the route with a dozen-line fake.
+    Three members, because three is what a transport needs once the page stops
+    compositing. `daemon/app.py` builds whatever satisfies this; nothing here knows
+    that a model, a driving-clip cache or a PCM ring exist, which is what keeps this
+    file free of `daemon.face_lipsync` (CONTRACTS 4) and what lets the tests drive the
+    route with a dozen-line fake.
 
-    **Deliberately no frame counter and no "changed since" token**, even though either
-    would make a per-frame-fetch transport possible. `daemon/face_lipsync/ring.py:Slot`
-    is `put` and `get`, and nothing else; a protocol asking for more than the object it
-    describes actually offers would be satisfiable only by an adapter invented to
-    satisfy it. That absence is a real constraint, and it is what settles the transport
-    in `frames()` below.
+    **A frame is the WHOLE composited frame, and two earlier versions of this contract
+    sent less.** The first sent each frame's crop box, the second their union. Both
+    rested on a real measurement - the crop is 3.4x cheaper, 55KB against 180KB - that
+    does not apply where this runs: the page is served over loopback to the same
+    machine, where 47 Mbit/s costs nothing. And both produced the defect the crop was
+    supposed to avoid. A JPEG has no alpha, so laying one over the page's own `<video>`
+    has a hard edge however small it is, and the video is never on the same frame as
+    the render, so the margin lands on mismatched pixels: a bright rectangle across
+    the head, which is what the owner saw. Measured, the model only rewrites 289-314 x
+    230-274px of a 1080x1620 frame - so the union was carrying seven times the pixels
+    the model touches, all of it head and chest, to create a seam that need not exist.
+
+    The spike's own 1:1 comparison has no seam for one reason: the server composited
+    into the frame, and a gaussian-blurred mask leaves no boundary. This transport
+    carries that composite whole and the page displays it.
     """
 
     failed: bool
@@ -88,55 +97,27 @@ class LipsyncFrames(Protocol):
     visible: the response closes and the page goes back to the pre-rendered clips."""
 
     clip: str
-    """The driving clip these crops belong on, by the same stem `/face/clips/{name}`
-    serves - `idle2` for the shipped avatar. The page has to lay the crop over *this*
-    clip, not over the v1 speaking clip, or the head under the mouth is a different
-    head."""
-
-    box: tuple[int, int, int, int]
-    """Where the crop sits in the driving clip's own pixels, `(x1, y1, x2, y2)` - the
-    same corner convention as the renderer's own boxes, so the wiring passes a crop box
-    straight through instead of converting it into a width and a height on the way past.
-
-    **One box for the whole clip, and the per-frame ones really do differ.** MuseTalk
-    derives the blend region from each frame's own face box, so it breathes: measured
-    over `idle1.mp4`'s 193 frames it ranges 572 to 608 px square
-    (`evals/face_lipsync_prepare.py`). This is therefore their *union*, not
-    `crop_boxes[0]`. A rectangle that moved frame to frame would be a rectangle the
-    page has to re-place frame to frame, which reads as a wobble around the jaw - the
-    artefact 2026-08-25-face-design.md spent nine attempts chasing. The union costs a
-    few hundred pixels of JPEG and buys a still seam.
-
-    Two things the wiring owns, written here because this is the contract they have to
-    meet and neither is true of `daemon/face_lipsync` today:
-
-    - the union has to be padded to a constant size, since a JPEG whose *pixel*
-      dimensions changed per frame would resize the page's overlay per frame;
-    - `render.py:Renderer._render` encodes `out`, which is the whole composited
-      1080x1620 frame. To satisfy `get()` below it must encode `out[y1:y2, x1:x2]` at
-      this box instead. That file is outside this task's scope, so it is named rather
-      than changed."""
+    """The driving clip these frames were rendered from, by the same stem
+    `/face/clips/{name}` serves - `idle2` for the shipped avatar. The page no longer
+    composites, so it does not need this to place anything; it needs it to know which
+    clip to fall back to when the frames stop, and to report what is on screen."""
 
     def get(self) -> bytes | None:
-        """The newest JPEG **of `box` only**, or None before the first one exists.
+        """The newest whole-frame JPEG, or None before the first one exists.
 
         Latest wins: this returns whatever is there now and never a backlog. A
-        transport that queued would show a mouth that lags the sound by however far
-        behind the reader is, which is worse than dropping movement.
-
-        Crop and not the whole frame, because the page already has the driving clip
-        decoded and the other 87% of those pixels are pixels it can draw itself.
-        Re-measured here on frame 40 of the shipped `idle2.mp4` (1080x1620, 24fps),
-        JPEG q85, against 2026-08-25-face-design.md's own 174KB/52KB and 2.43/0.46ms:
-
-            whole frame  1080x1620   2.70ms   180KB   35.5 Mbit/s
-            crop box       590x590   0.54ms    55KB   10.8 Mbit/s
-
-        The encode is on the CPU side, so the 2.2ms it saves is not taken out of the
-        2.5% of headroom the GPU budget has left - but it is still 2.2ms, and the bytes
-        are 3.3x."""
+        transport that queued would show a mouth lagging the sound by however far
+        behind the reader is, which is worse than dropping movement. It also returns
+        None on the ticks between model steps, which is normal rather than a fault -
+        a step covers two frames and releases them one apart.
+        """
         ...
 
+
+
+BOUNDARY = b"daemonface"
+"""multipart part separator. Fixed rather than random: it appears in the response's own
+Content-Type, so a reader tailing `curl` can grep for it."""
 
 FRAME_POLL_SECONDS = 0.005
 """How often the open stream looks for a new frame.
@@ -199,7 +180,9 @@ def lipsync_manifest(app: Any) -> dict[str, Any] | bool:
     source = _lipsync(app)
     if source is None:
         return False
-    return {"clip": source.clip, "box": list(source.box)}
+    # No box: the page no longer positions anything, and reporting one it cannot use
+    # would be the only remaining trace of the crop transport.
+    return {"clip": source.clip}
 
 
 def face_dir(settings: Any) -> Path:
@@ -281,134 +264,63 @@ async def stream(request: Request) -> StreamingResponse:
 
 @router.get("/face/frames")
 async def frames(request: Request) -> Response:
-    """The lip-synced mouth: one crop-box JPEG per video frame, 24 a second, over SSE.
+    """The lip-synced face: one whole composited JPEG per video frame, 24 a second.
 
-    **This is not the transport 2026-08-26-face-lipsync-design.md approved**, and the
-    departure is deliberate rather than an oversight. That table says "서버가 완성
-    프레임, MJPEG" - whole frames, multipart. Both halves changed, for different
-    reasons, and each is named here so nobody has to reverse-engineer which:
+    **multipart/x-mixed-replace, which is what 2026-08-26-face-lipsync-design.md
+    approved all along.** An earlier version of this route shipped SSE instead, and
+    that was the right call for the page it was written against - one that composited
+    a crop over its own `<video>` and therefore needed a per-frame arrival time and an
+    end-of-stream event, neither of which multipart into an `<img>` provides. The page
+    no longer composites, so that requirement is gone, and what is left is the cost:
+    SSE has to base64 the payload, which is +33% on the wire (180KB becomes 241KB) and
+    hands the main thread a quarter-megabyte JS string 24 times a second to decode.
+    An `<img>` fed multipart decodes natively, off that thread, from the raw bytes.
 
-    - *whole frames -> the crop box.* The design deferred crops because a patch needs
-      browser->daemon feedback, which §2 deliberately removed. It is worth the deferral
-      no longer: 180KB against 55KB per frame, 35.5 against 10.8 Mbit/s (see
-      `LipsyncFrames.get`). The design's own render-loop budget in §3 already quotes
-      the 0.46ms *crop* encode, so this is the direction that makes that document
-      internally consistent, not the one that breaks it. What it costs is named under
-      "the seam" below.
-    - *multipart -> SSE.* Argued next.
+    What the page gives up is knowing, from this route, that a frame has arrived.
+    It does not need to: it already subscribes to `/face/stream` for activity, and a
+    renderer that latches `failed` ends this response, which fires `error` on the
+    `<img>`. That is the fallback signal.
 
-    **Why SSE.** The deciding constraint is not bandwidth - this is loopback - it is
-    that the renderer can latch `failed` mid-utterance, after which it publishes
-    nothing, and the page has to notice and go back to the clips rather than hold a
-    frozen mouth over a speaking face. Noticing needs two signals in the page: a
-    per-frame arrival time, and an end-of-stream. `EventSource` gives both for free
-    (`onmessage`, then `onerror` with `readyState === CLOSED` once the retry lands on
-    the 503 below), it is the idiom `/face/stream` and `face.html` already use, and the
-    page still just assigns `img.src`, so the browser keeps doing the decode.
-
-    It pays base64, and that is the honest cost: 55KB becomes 73KB, 10.8 becomes
-    14.4 Mbit/s, and `b64encode` costs 0.039ms per frame (measured, same frame as
-    `LipsyncFrames.get`). Against the approved full-frame MJPEG's 35.5 Mbit/s it is
-    still 2.5x less traffic, so the crop pays for the framing twice over.
-
-    **What was rejected.**
-
-    - *`multipart/x-mixed-replace` into `<img>`* - fewer bytes and the browser frames
-      it, but no portable per-frame or end-of-stream event: Chrome fires `load` once
-      for the whole stream and a clean end fires nothing at all. That is exactly the
-      signal the `failed` path needs, so buying 17KB a frame on loopback would cost
-      the failure mode. Parsing multipart out of `fetch()` by hand instead would get
-      the signal back and put a framing parser on the main thread to do it.
-    - *One fetch per frame* - the tidiest client and the only one whose latest-wins is
-      in the protocol rather than in this generator. It needs to ask "anything newer
-      than what I hold?", and `LipsyncFrames` cannot answer: `Slot` is `put`/`get`
-      with no counter (see the protocol's note), so a poll either re-serves the 55KB
-      it already has 24 times a second or the protocol grows a field the object it
-      describes does not have. Note the cost that is *not* a reason: `daemon log`
-      already filters successful `uvicorn.access` GET lines (`cli.py`'s `_LOG_NOISE`),
-      so 24 requests a second would not bury the log the way an earlier draft of this
-      comment claimed - the log *file* still grows, which is a smaller objection.
-    - *A websocket* - nothing here is bidirectional, and it would be a dependency for
-      a stream that flows one way.
-    - *Folding frames into `/face/stream`* - one channel, no second connection. But
-      that stream carries activity and level, exists switch or no switch, and must not
-      have a state change queued behind a 73KB frame. Different lifetime, different
-      payload size, different channel.
-
-    **The seam, and its one real limitation.** The page holds the driving clip under
-    the crop, so if its playhead is not on the frame the renderer drew, the pose inside
-    the box does not match the pose outside it. `FrameClock` restarts at frame 0 on
-    every re-anchor and `render.py` indexes `% len(cache.boxes)`, so the convention is:
-    the page restarts the driving clip at the start of each spoken turn and both run at
-    1.0x off their own clocks. That is why `face.html` must not modulate the driving
-    clip's `playbackRate` the way the v1 mouth does. It does *not* cure drift over a
-    long turn - `<video>` at 1.0x and the render loop's wall clock are not the same
-    clock - and curing it needs the driving frame index in the payload, which needs the
-    source to expose one. Not added speculatively; named so the fix is obvious if the
-    seam turns out to be visible on a real window, which is the only place it can be.
-
-    Latest-wins survives a slow reader: the generator re-reads the slot each turn, so a
-    page that falls behind loses the frames in between rather than accumulating them,
-    and the renderer never blocks on this side (it overwrites the slot under its own
-    lock, and this never holds that lock across an await).
+    Latest-wins, never a queue. `daemon/face_lipsync/ring.py:Slot` holds one frame and
+    `get()` returns whatever is there; identity comparison skips the ticks between
+    model steps, which are normal - a step covers two frames and releases them one
+    apart. Polling at `FRAME_POLL_SECONDS` rather than waiting on a condition keeps
+    this side free of the renderer's threading (`Slot` takes a lock, and this never
+    holds that lock across an await).
     """
     source = _lipsync(request.app)
     if source is None:
-        # 503, not 404: the route exists and will serve frames the moment the renderer
-        # does. The body says which of the three reasons it is - a bare status here
-        # would be the `HTTP 409` that cost someone hours in `channels/telegram.py`.
-        # It is also load-bearing for the page: a non-200 makes `EventSource` fail the
-        # connection permanently instead of retrying, which is how a latched `failed`
-        # becomes a definite answer rather than a reconnect loop.
+        # 503 rather than 404: the route exists, and which of the three reasons it is
+        # unavailable belongs in the body where a person reading `curl` output sees it.
         return PlainTextResponse(
             f"face: {_lipsync_unavailable(request.app)}\n", status_code=503
         )
+    if source.failed:
+        return PlainTextResponse(
+            "face: the lip-sync renderer has failed; the face is back on its clips\n",
+            status_code=503,
+        )
 
-    # Same override `/face/stream` above takes, so a test can watch the keepalive path
-    # without waiting 20s for it. Worth correcting the neighbouring comment while
-    # relying on it: `httpx.ASGITransport` (0.28.1) does not merely hold the first
-    # chunk, it has no streaming path at all and runs the ASGI app to completion, so a
-    # short keepalive is not what unblocks such a test - ending the response is
-    # (`tests/test_face_routes.py:_transcript`).
-    keepalive = getattr(request.app.state, "keepalive_seconds", KEEPALIVE_SECONDS)
-
-    async def events() -> AsyncIterator[bytes]:
+    async def parts() -> AsyncIterator[bytes]:
         last: bytes | None = None
-        quiet = 0.0
-        # No `is_disconnected()` check: `StreamingResponse` already runs
-        # `listen_for_disconnect` beside this generator and cancels it, which is what
-        # `/face/stream` above relies on too. Peeking at `receive` from in here would
-        # put a second consumer on the one channel that call is already blocked on.
         while not source.failed:
             frame = source.get()
             if frame is not None and frame is not last:
-                # Identity, not equality: `Slot.get` hands back the same object until
-                # the renderer overwrites it, and `last` holds a reference so the
-                # address cannot be recycled underneath. Comparing 55KB instead would
-                # also call two consecutive identical mouths "unchanged", which they
-                # are not - a still mouth is a frame the page should still receive.
                 last = frame
-                quiet = 0.0
-                yield b"data: " + base64.b64encode(frame) + b"\n\n"
-            else:
-                # A gap of a tick or two is the normal state, not a fault: a step
-                # covers `BATCH` frames and cannot start until the last of them has
-                # its audio, so `FrameClock.due` answers None on some ticks by design
-                # (daemon/face_lipsync/render.py). The page's staleness threshold, not
-                # this loop, is what has to tolerate that.
-                quiet += FRAME_POLL_SECONDS
-                if quiet >= keepalive:
-                    # A comment line, so it never reaches the page's `onmessage` and
-                    # cannot be mistaken for a frame. Same reason `/face/stream` has
-                    # one, and more pressing here: silence is this stream's resting
-                    # state, so a proxy or a sleeping laptop dropping the socket would
-                    # otherwise leave a face that looks fine and never moves again.
-                    quiet = 0.0
-                    yield b":\n\n"
+                yield (
+                    b"--" + BOUNDARY + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n"
+                    + frame + b"\r\n"
+                )
             await asyncio.sleep(FRAME_POLL_SECONDS)
+        # Closing the multipart stream is the signal: the <img> fires `error` and the
+        # page reverts to clip playback. No keepalive - unlike SSE there is nothing to
+        # keep alive, and a comment frame here would be a malformed part.
+        yield b"--" + BOUNDARY + b"--\r\n"
 
     return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
+        parts(),
+        media_type=f"multipart/x-mixed-replace; boundary={BOUNDARY.decode()}",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
