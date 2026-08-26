@@ -12,6 +12,8 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -722,6 +724,151 @@ def test_request_mic_reports_status_and_exit_code(
         "daemon.voice.mic_access.request_microphone_access", lambda **_: "denied"
     )
     assert cli.main(["request-mic"]) == 1
+
+
+def test_face_prints_the_url_when_it_cannot_open_a_browser(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Resolves the port from settings (`Settings.port`, default 8787) and prints
+    the URL when no `open` call succeeds - a headless box, or a machine with no
+    Chrome, must still be told where to point a browser rather than fail."""
+    monkeypatch.setattr(
+        "daemon.cli.subprocess.run",
+        lambda *a, **k: subprocess.CompletedProcess(args=[], returncode=1),
+    )
+    assert cli.main(["face"]) == 0
+    assert "127.0.0.1:8787/face" in capsys.readouterr().out
+
+
+def test_face_prints_the_url_when_open_is_not_on_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`open` is macOS-only; a real headless box - the phrase the other face test
+    already uses - has no such binary at all, and `subprocess.run` raises
+    `FileNotFoundError` for a missing executable rather than returning a nonzero
+    `CompletedProcess`. The other test's stand-in covers "the command ran and
+    failed"; this covers "the command does not exist", which is the shape the
+    docstring's "headless box" claim actually depends on."""
+
+    def missing(*a: object, **k: object) -> None:
+        raise FileNotFoundError("open")
+
+    monkeypatch.setattr("daemon.cli.subprocess.run", missing)
+    assert cli.main(["face"]) == 0
+    assert "127.0.0.1:8787/face" in capsys.readouterr().out
+
+
+def test_face_transitions_reports_the_path_and_pair_count(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    written = tmp_path / "transitions.json"
+    written.write_text(
+        json.dumps({"match": {"idle1": {"idle2": [0.1]}, "idle2": {"idle1": [0.2, 0.3]}}})
+    )
+    # face_match.write_table is the expensive (ffmpeg-shelling) part; the command
+    # re-reads its output for the pair count rather than re-running it.
+    monkeypatch.setattr("daemon.face_match.write_table", lambda face_dir: written)
+
+    assert cli.main(["face-transitions"]) == 0
+    out = capsys.readouterr().out
+    assert str(written) in out
+    # Pair count is ordered (A, B) entries - idle1->idle2 and idle2->idle1 - not
+    # the number of per-bucket seek values inside either one.
+    assert "2 pair(s)" in out
+
+
+def test_face_transitions_reports_a_problem_when_ffmpeg_is_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`face_match._frames` shells out to ffmpeg; a missing binary raises
+    `FileNotFoundError` - an `OSError`, not a nonzero exit (same shape as the two
+    `face` tests above). Raising it directly from `write_table`, not from a
+    `subprocess.run` stand-in that merely returns a failure code, is the point:
+    a mocked nonzero exit would never exercise this path at all."""
+
+    def missing(face_dir: Path) -> Path:
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr("daemon.face_match.write_table", missing)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    assert "ffmpeg" in capsys.readouterr().err
+
+
+def test_face_transitions_creates_the_face_dir_rather_than_blaming_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The real `write_table`, on an install where nobody has made
+    `<data_dir>/face/` yet - which is every install until the owner drops clips
+    in, since nothing else creates it.
+
+    `write_text` raised `FileNotFoundError` there, and the command's blanket
+    `except OSError` reported it as "ffmpeg not found": wrong, and unactionable.
+    No ffmpeg is needed to reach it - with no clips present `build_table`
+    iterates nothing and never shells out - so this test is the real path, not
+    a stand-in for it.
+    """
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "fresh"))
+    assert not (tmp_path / "fresh" / "face").exists()
+
+    assert cli.main(["face-transitions"]) == 0
+    out, err = capsys.readouterr()
+    assert (tmp_path / "fresh" / "face" / "transitions.json").is_file()
+    assert "ffmpeg" not in err
+    assert "0 pair(s)" in out
+
+
+def test_face_transitions_says_it_needs_pillow_rather_than_raising(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`Pillow>=10.0; sys_platform == 'darwin'` in pyproject: it is core on macOS
+    only, so on Linux a core install reaches this command with no PIL at all and
+    got a raw ImportError traceback - against this module's own docstring. A
+    `None` in `sys.modules` is what makes `from ... import` raise ImportError
+    without needing an install that lacks the package."""
+    monkeypatch.setitem(sys.modules, "daemon.face_match", None)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    err = capsys.readouterr().err
+    assert "Pillow" in err
+    assert "ffmpeg" not in err, "a missing dependency is not a missing binary"
+
+
+def test_face_transitions_does_not_call_every_write_failure_a_missing_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half of the blanket-`except OSError` defect: an OS error that is
+    genuinely about writing must not be reported as an absent binary."""
+
+    def unwritable(face_dir: Path) -> Path:
+        raise PermissionError(f"{face_dir}/transitions.json")
+
+    monkeypatch.setattr("daemon.face_match.write_table", unwritable)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    err = capsys.readouterr().err
+    assert "ffmpeg" not in err
+    assert "transitions.json" in err
+
+
+def test_face_transitions_reports_a_problem_when_a_clip_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A different failure from a missing binary: ffmpeg is present and runs,
+    but a present-on-disk clip it cannot decode makes it exit nonzero, which
+    `_frames`'s own `check=True` turns into `CalledProcessError` - not an
+    `OSError`, so it needs its own except clause rather than falling through
+    the missing-ffmpeg one (which would print a misleading "not found")."""
+
+    def corrupt(face_dir: Path) -> Path:
+        raise subprocess.CalledProcessError(1, ["ffmpeg"], stderr=b"invalid data found")
+
+    monkeypatch.setattr("daemon.face_match.write_table", corrupt)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    err = capsys.readouterr().err
+    assert "ffmpeg" in err
+    assert "not found" not in err, "a corrupt clip is not the same failure as a missing binary"
 
 
 def test_a_broken_config_stops_a_command_that_needs_it(

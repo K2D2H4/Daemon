@@ -891,6 +891,46 @@ async def test_the_app_seam_passes_the_tuning_settings_through(
     assert gate.counters.skipped_short == 1
 
 
+async def test_a_wake_round_hands_the_residents_own_bus_to_the_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first hop of the face's five-hop keyword chain, and the one that
+    decides whether a spoken turn moves the face at all: `_wake_round` reads the
+    resident's bus off `app.state` and passes it to `run_voice`. Deleting that
+    argument passed the whole suite - `tests/test_reachable.py` can see that
+    something calls `run_voice`, never with what.
+
+    Asserted on the call rather than through a conversation, because everything
+    past this hop needs a live session and real audio;
+    `tests/test_voice_conversation.py::test_the_face_reaches_the_conversation_
+    through_voice_attempts` covers the far end of the same chain for real.
+    """
+    fake_machine(monkeypatch)
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+    app = app_module()
+    seen: dict[str, Any] = {}
+
+    async def fake_run_voice(_settings: Any, **kwargs: Any) -> int:
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(app, "run_voice", fake_run_voice)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    from daemon.face import FaceBus
+
+    class State:
+        face = FaceBus()
+        wake_gate: Any = None
+
+    state = State()
+    await app._wake_round(settings, state=state)
+
+    assert seen.get("face") is state.face, (
+        "the round ran a conversation that could not move the face"
+    )
+
+
 # --- configuration a person can actually write --------------------------------
 
 

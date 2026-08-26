@@ -1828,6 +1828,214 @@ def test_switching_the_browser_on_adds_three_tools(tmp_path: Path) -> None:
         store.close()
 
 
+# --- the face: the whole chain, driven through the real entrypoint wiring ---
+
+
+async def test_a_turn_drives_the_face_and_leaves_no_tag_in_the_markdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Assembled the way the entrypoint does it - `daemon.app._lifespan`, the same
+    function `create_app`'s FastAPI hands to uvicorn, called directly here instead
+    of through `TestClient` so the turn can run on this test's own event loop - one
+    real turn, and the whole chain: the activities the page would see, the
+    one-shot, the reply, and the part unit tests structurally cannot reach - the
+    markdown on disk, which is what recall replays into later prompts.
+
+    `bus` is read off `app.state.face`, not a bus this test built and handed to a
+    hand-assembled `ConversationLoop` - so if `face=app.state.face` were ever
+    dropped from `_lifespan`'s real `ConversationLoop(...)` call, `bus.activities`
+    would stay empty and this test would fail for exactly that reason. That is the
+    property Task 7's review flagged as resting on manual review alone.
+
+    Only the model is faked (`_build_providers`, the one seam between this file's
+    real assembly and the network) and the channel is one this test drives by
+    hand, the same way `channel=_Idle()`/`memory=_Mem()` stand in for Telegram in
+    the other lifespan tests above - the tool layer and the voice runtime are both
+    assembled from a *built* `_build_io`, which a directly-injected channel/memory
+    bypasses, so this covers the text path's wiring and not those two.
+    """
+    from daemon import app as daemon_app
+    from tests.test_face import RecordingBus
+
+    provider = Provider(reply="[mood:amused] 그래서")
+    # `_lifespan` calls `_build_providers(settings)` by its bare name, so patching
+    # the module attribute reaches every call site inside app.py - including the
+    # boot-time reflection/persona catch-up this settings/data_dir also triggers.
+    monkeypatch.setattr(daemon_app, "_build_providers", lambda _settings: {"ollama": provider})
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    try:
+        writer = FileMemoryWriter(tmp_path, store)
+
+        class DrivenChannel:
+            """A channel this test controls directly: one queued inbound message,
+            and every outbound one recorded - `_lifespan` builds the real
+            `ConversationLoop` around it exactly as it would around Telegram."""
+
+            name = "telegram"
+
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self.queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
+
+            async def send(self, message: Any) -> None:
+                self.sent.append(message.text)
+
+            async def listen(self) -> Any:
+                while True:
+                    yield await self.queue.get()
+
+            async def close(self) -> None:
+                return None
+
+        channel = DrivenChannel()
+        app = daemon_app.create_app(_settings(tmp_path), channel=channel, memory=writer)
+        # Overwritten before the lifespan runs, not after: `_lifespan` reads
+        # `app.state.face` exactly once, when it builds the `ConversationLoop`.
+        app.state.face = RecordingBus()
+
+        async with daemon_app._lifespan(app):
+            await channel.queue.put(
+                InboundMessage(
+                    text="오늘 뭐 했어",
+                    sender_id=str(OWNER),
+                    received_at=datetime.now(UTC),
+                    channel="telegram",
+                    external_id="1",
+                )
+            )
+            for _ in range(500):  # up to ~5s of real time, then give up and assert
+                await asyncio.sleep(0.01)
+                if channel.sent:
+                    break
+
+            # Asserted *inside* the block, before teardown starts cancelling
+            # `loop_task`: `handle()`'s own `finally` (daemon/loop.py:284-288) is
+            # what sets the face back to idle, and there is a real `await` between
+            # `channel.send()` (:276) and that `finally` running - closing the
+            # `async with` before this point would race a cancellation against it.
+            bus = app.state.face
+            assert bus.activities == ["thinking", "speaking", "idle"]
+            assert bus.shots == ["amused"]
+            assert channel.sent == ["그래서"], "the mood tag must not reach the wire either"
+
+            log_files = list((tmp_path / "memory").rglob("*.md"))
+            text = "\n".join(p.read_text(encoding="utf-8") for p in log_files)
+            assert "그래서" in text, "the source of truth does not have the reply"
+            assert "mood:" not in text, "a tag in the log is read back to the model by recall"
+    finally:
+        store.close()
+
+
+# --- the second of the three wiring sites: the tool layer's own face ---------
+
+
+async def test_a_tool_call_flips_the_face_to_working_and_back(tmp_path: Path) -> None:
+    """The second of the three sites Task 7 wired: `ToolRunner`'s own `face=`,
+    threaded through `_build_tools` (`daemon/app.py`, `ToolRunner(registry, policy,
+    store, face=face)`) exactly the way the real lifespan calls it
+    (`face=app.state.face` at the `_build_tools(settings, io.store, face=...)`
+    call site).
+
+    Covered directly against `_build_tools` itself, the same way the neighbouring
+    `test_switching_the_browser_on_adds_three_tools` above it covers the rest of
+    that function's assembly - no lifespan, no channel, because `_build_tools`
+    takes only `settings` and a bare `store`. `ToolRunner.execute`
+    (`daemon/tools/runner.py`) sets `working` before running a call and restores
+    whatever activity it found beforehand once the call is done, so a real tool
+    call through the real assembly has to produce exactly that pair - if
+    `face=face` were ever dropped from the `ToolRunner(...)` call `_build_tools`
+    makes, `bus.activities` would stay empty and this would fail for that reason.
+    """
+    from daemon.app import _build_tools
+    from daemon.tools.runner import TurnContext
+    from tests.test_face import RecordingBus
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN=TOKEN,
+        DAEMON_TOOLS_ENABLED=True,
+        DAEMON_TOOLS_ROOTS=str(tmp_path),
+    )
+    target = tmp_path / "notes.md"
+    target.write_text("발표는 목요일", encoding="utf-8")
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    bus = RecordingBus()
+    runner = None
+    try:
+        runner, _bridge, _status = await _build_tools(settings, store, face=bus)
+        assert runner is not None
+
+        await runner.execute(
+            [ToolCall(id="1", name="read_file", arguments={"path": str(target)})],
+            TurnContext(origin="owner", channel="telegram", sender_id=str(OWNER)),
+        )
+
+        assert bus.activities == ["working", "idle"], (
+            "a tool call must flip the face to `working` and back to what it was "
+            "before - `face=` was probably dropped from the `ToolRunner(...)` call "
+            "`_build_tools` makes"
+        )
+    finally:
+        if runner is not None:
+            await runner.aclose()
+        store.close()
+
+
+async def test_a_spoken_tool_call_flips_the_face_too(tmp_path: Path) -> None:
+    """The same wiring one layer out: the *voice* tool runner is a second
+    `_build_tools` call, made by `_build_voice_runtime` with its own `face=face`,
+    and the wake path's tools come from there rather than from the one above.
+    Dropping that keyword passed the whole suite - a spoken tool call would run
+    with the face frozen wherever the conversation left it.
+
+    Driven against `_build_voice_runtime` itself for the same reason the test
+    above is driven against `_build_tools`: everything past it needs a live
+    session. `writer` and `recall` are only carried into the returned
+    `VoiceRuntime`, so they can be anything.
+    """
+    from daemon.app import _build_voice_runtime
+    from daemon.tools.runner import TurnContext
+    from tests.test_face import RecordingBus
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN=TOKEN,
+        DAEMON_TOOLS_ENABLED=True,
+        DAEMON_TOOLS_ROOTS=str(tmp_path),
+        DAEMON_SCREEN_ENABLED=False,
+    )
+    target = tmp_path / "notes.md"
+    target.write_text("발표는 목요일", encoding="utf-8")
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    bus = RecordingBus()
+    runtime = None
+    try:
+        runtime = await _build_voice_runtime(settings, store, None, None, face=bus)
+
+        await runtime.tools.execute(
+            [ToolCall(id="1", name="read_file", arguments={"path": str(target)})],
+            TurnContext(origin="owner", channel="voice", sender_id=str(OWNER)),
+        )
+
+        assert bus.activities == ["working", "idle"], (
+            "a spoken tool call must flip the face too - `face=face` was probably "
+            "dropped from the `_build_tools(...)` call `_build_voice_runtime` makes"
+        )
+    finally:
+        if runtime is not None:
+            await runtime.tools.aclose()
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_a_proactive_line_reaches_the_speaker_through_the_wake_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

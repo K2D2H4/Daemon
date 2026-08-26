@@ -15,6 +15,7 @@ from datetime import datetime
 from time import perf_counter
 from typing import Any, Protocol
 
+from daemon.face import FaceBus
 from daemon.llm.base import ImageBlock, ToolCall, ToolSpec
 from daemon.tools.base import Registry, Tool, ToolError, ToolOutput, ToolResult, canonical_arguments
 from daemon.tools.policy import Approval, Claimed, Command, ToolPolicy
@@ -73,10 +74,13 @@ class Outcome:
 
 
 class ToolRunner:
-    def __init__(self, registry: Registry, policy: ToolPolicy, audit: AuditStore) -> None:
+    def __init__(
+        self, registry: Registry, policy: ToolPolicy, audit: AuditStore, face: FaceBus | None = None
+    ) -> None:
         self._registry = registry
         self._policy = policy
         self._audit = audit
+        self._face = face
 
     def specs(self) -> tuple[ToolSpec, ...]:
         return self._registry.specs()
@@ -100,6 +104,23 @@ class ToolRunner:
         return self._policy.claim(command, sender_id=sender_id)
 
     async def execute(self, calls: Sequence[ToolCall], context: TurnContext) -> Outcome:
+        """Run one round of tool calls, in the order the model asked for them.
+
+        Restores the activity state the tool call found, rather than assuming idle.
+        This is important because tool execution happens inside a turn that is already
+        `thinking` — dropping to idle afterwards would read as the daemon giving up
+        mid-reply.
+        """
+        if self._face is None:
+            return await self._execute(calls, context)
+        before = self._face.state.activity
+        self._face.set_activity("working")
+        try:
+            return await self._execute(calls, context)
+        finally:
+            self._face.set_activity(before)
+
+    async def _execute(self, calls: Sequence[ToolCall], context: TurnContext) -> Outcome:
         """Run one round of tool calls, in the order the model asked for them.
 
         Sequential rather than concurrent, and that is a decision rather than an

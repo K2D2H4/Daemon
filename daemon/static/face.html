@@ -1,0 +1,504 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>face</title>
+<!--
+  Self-contained, offline, one file - the same posture as the admin shell. It talks to
+  three routes on its own origin and loads nothing else.
+
+  Three details here are the whole difference between "alive" and "wrong", and all
+  three were learned by getting them wrong first:
+
+  1. PRIMING. Every clip is play-then-paused once on load so a decoded frame exists.
+     Without it the first switch to a cold clip flashes the page background.
+  2. SINGLE-SIDED CROSSFADE. Only the incoming element's opacity animates, on top,
+     while the outgoing one stays fully opaque underneath until the fade finishes.
+     Fading both at once leaves a moment where neither is opaque, the background shows
+     through, and the brightness dips - which reads worse than a hard cut. The hide
+     that follows the fade has to check the element is still the outgoing one: come
+     back to it within fadeMs and the stale timer blanks BOTH layers (see show()).
+  3. NO rAF TIMEKEEPING. <video> playback is native, unlike requestAnimationFrame,
+     which throttles in a backgrounded window - rAF only nudges playbackRate, so
+     being throttled makes it update less often rather than drift. Native playback
+     is not immune to the browser either, though (spec 3.8 claimed it was, and that
+     was wrong): Chrome pauses muted background video to save power even in a
+     merely-occluded window, measured live - see ensurePlaying(), below.
+-->
+<style>
+  :root { --bg: #19191B; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; opacity: 0; transition: opacity 180ms linear;
+  }
+  #hint {
+    position: fixed; inset: 0; display: grid; place-items: center; padding: 2rem;
+    color: #8a8a90; font: 13px/1.7 -apple-system, system-ui, sans-serif;
+    text-align: center;
+  }
+  #hint code { color: #d8d8dc; }
+  @media (prefers-reduced-motion: reduce) {
+    video { transition: none; }
+  }
+</style>
+
+<div id="stage"></div>
+<div id="hint" hidden></div>
+
+<script>
+"use strict";
+
+const FADE_MS = 180;          // spec 3.2 - fast fade: speaking's mouth-snap and mood
+                               // one-shots, where immediacy matters more than smoothness
+const FADE_SLOW_MS = 400;     // spec 3.2 - listening/thinking/working and the idle
+                               // return, where nothing is urgent and a mismatched pose
+                               // needs longer to read as deliberate rather than a cut.
+                               // A starting value, not a measured one: 180ms measurably
+                               // read as a cut on a real window, and only the owner's
+                               // eye against a real window can settle where this lands.
+const NEUTRAL_WAIT_CAP_MS = 1200;
+// task 9 (3rd follow-up): supersedes the original wait rule that used to sit
+// here (WAIT_MS). That rule only checked whether the outgoing clip was near
+// its own natural end - measured (at a different scale) to be a narrow
+// window, so it rarely fired. Re-measured against this page's own scale
+// (face_match.py's own _frames): most clips are near neutral MOST of the
+// time (median wait across every loop clip is 0s), just not necessarily at
+// the literal end - so the fix is to wait for the next near-neutral MOMENT,
+// wherever it falls, not only the clip's own finish. 1.2s is a round cap in
+// the ballpark of that measurement, not a per-clip guarantee: some clips'
+// own p90 (thinking 2.3s, working 1.8s) run past it, so this only bounds how
+// long the page waits before giving up and switching anyway via the pose-
+// matched entry point - it does not promise neutral is reached.
+const RATE_MIN = 0.85;        // below ~0.8 reads as slow motion
+const RATE_MAX = 1.25;        // above ~1.3 reads as fast-forward
+const ATTACK = 0.30;          // fast open
+const RELEASE = 0.06;         // slow close - real mouths are asymmetric
+const IDLES = ["idle1", "idle2", "idle3"];
+const FLOURISHES = ["flourish_arms"];
+const FLOURISH_MIN_MS = 15000, FLOURISH_MAX_MS = 60000;
+// Was 40-120s, which spec open question 6 admitted was a guess. The guess was
+// wrong in a way that made the clip unreachable in use rather than merely rare:
+// scheduleFlourish() arms only while `idle` and any other activity disarms it, and
+// across a live 8-turn session the longest uninterrupted idle stretch was **36s**
+// (then 12s, then nothing above 1s). Every gap was shorter than the minimum wait,
+// so `flourish_arms` could not fire once - not because the conversation was busy,
+// but because the window never opened.
+//
+// 15-60s fits the gaps that actually occur while still averaging under the "once a
+// minute breaks the loop's visible period" the spec wanted it for. Left alone for
+// minutes, the face now flourishes several times rather than never.
+const LOUD_ENTER = 0.27, LOUD_HOLD_MS = 500;
+// Now a measurement. Taken off the running resident's own /face/stream through a
+// live 8-turn voice session, with this file's ATTACK/RELEASE filter replayed over
+// the captured levels so the number sits on the same `env` scale the comparison
+// below uses: 295 samples, median 0.233, p75 0.254, **p90 0.272**, p99 0.307,
+// max 0.315. The old 0.62 cleared *nothing* - `speaking_loud` was a rendered clip
+// that could not play. 0.27 is that p90, and with LOUD_HOLD_MS it engaged 4 times
+// across those 8 turns (0.26 -> 8, 0.25 -> 16, which is fidgeting, and 0.30 -> 1).
+//
+// What the same data says about spec open question 3 ("keep speaking_loud?"): this
+// speaker has **no loud mode**. The whole envelope lives in 0.23-0.32 on a scale
+// where a full-scale sine reaches 0.707, so this threshold selects her loudest
+// decile rather than detecting loudness in any absolute sense. Kept because the
+// clip exists and the top decile is a real, repeatable part of the signal - but
+// one session, one voice, one provider. logEnvelope() below still prints a summary
+// per speaking turn, and that is still the thing to read before moving this.
+const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// activity -> clip, with the fallback chain from spec §3.7 applied at load time.
+const FOR_ACTIVITY = {
+  idle: IDLES,
+  listening: ["listening", "idle1"],
+  thinking: ["thinking", "idle1"],
+  working: ["working", "thinking", "idle1"],
+  speaking: ["speaking_soft", "idle1"],
+};
+
+// Which activities get the slow fade (spec 3.2). speaking is deliberately absent:
+// its mouth-snap, and the mood one-shots in playOneShot() below, keep FADE_MS.
+const SLOW_FADE_ACTIVITIES = new Set(["listening", "thinking", "working", "idle"]);
+
+// Which activities may wait (spec 3.2, generalised beyond idle) for the outgoing
+// clip's next near-neutral moment before cutting - see neutralWaitMs() below.
+// Same membership as SLOW_FADE_ACTIVITIES today - kept as its own constant
+// because fade speed and wait eligibility are separate questions that happen
+// to share an answer, not one concern with two names.
+const WAIT_ACTIVITIES = new Set(["listening", "thinking", "working", "idle"]);
+
+const stage = document.getElementById("stage");
+const hint = document.getElementById("hint");
+const els = new Map();        // stem -> <video>
+let have = new Set();
+let showing = null;           // the <video> currently opaque
+let activity = "idle";
+let z = 1;
+let env = 0;                  // smoothed level
+let loudSince = 0;
+let flourishAt = 0;
+let oneShotUntil = 0;
+let oneShotIsFlourish = false;  // spec 3.6: a flourish means nothing, so any
+                               // activity change cuts it. A mood does not (spec
+                               // 3.2) - that is the daemon saying something, and
+                               // only speaking may cut it
+let pendingWaitTimer = 0;     // task 9 (3rd follow-up): setTimeout handle for a
+                               // pending wait-for-next-neutral-moment delay, if any
+                               // is outstanding - see neutralWaitMs()/toActivity()
+let queuedActivity = null;    // spec 3.6: a non-speaking activity change held until an
+                               // in-flight one-shot finishes, rather than dropped or
+                               // acted on mid-gesture
+let transitions = null;       // task 9: the pose-match table from /face/transitions,
+                               // or null if none was ever built (rule 4: absent means
+                               // frame 0, same as today)
+
+function first(list) { return (list || []).find(s => have.has(s)) || null; }
+
+function clipFor(act) {
+  if (act === "idle") {
+    const pool = IDLES.filter(s => have.has(s));
+    if (!pool.length) return null;
+    const cur = showing && showing.dataset.stem;
+    const pick = pool.filter(s => s !== cur);
+    return (pick.length ? pick : pool)[Math.floor(Math.random() * (pick.length ? pick.length : pool.length))];
+  }
+  if (act === "speaking") {
+    const loud = loudSince && performance.now() - loudSince > LOUD_HOLD_MS;
+    // spec 3.7: speaking_loud -> speaking_soft -> idle. The first two links are
+    // this branch's own ordering; reusing FOR_ACTIVITY[act] for the last link keeps
+    // the same shape every other activity already uses to reach idle.
+    return first(loud ? ["speaking_loud", "speaking_soft"] : ["speaking_soft"])
+      || first(["speaking_loud"])
+      || first(FOR_ACTIVITY[act]);
+  }
+  return first(FOR_ACTIVITY[act]);
+}
+
+// --- PRIME: one decoded frame per clip, then hold at zero -------------------
+async function prime(stem) {
+  const v = document.createElement("video");
+  v.src = `/face/clips/${stem}`;
+  // Both the IDL property and the content attribute: some WebKit builds only
+  // honour the latter, and setting both costs nothing.
+  v.muted = true; v.playsInline = true; v.setAttribute("playsinline", "");
+  v.preload = "auto"; v.loop = false;
+  v.dataset.stem = stem;
+  stage.appendChild(v);
+  els.set(stem, v);
+  await new Promise(res => {
+    v.addEventListener("loadeddata", res, { once: true });
+    v.addEventListener("error", res, { once: true });
+  });
+  try { await v.play(); v.pause(); v.currentTime = 0; } catch { /* held at frame 0 */ }
+  v.addEventListener("ended", () => { if (v === showing) advance(); });
+  // A pause we did not ask for: measured live, Chrome pauses muted background video
+  // to save power even in a merely-occluded window, not just a backgrounded one.
+  // A paused clip never fires `ended`, so nothing else here would ever notice.
+  // `!v.ended`: `pause` fires BEFORE `ended` per the HTML spec, so a clip
+  // reaching its own end arrives here looking exactly like a browser-imposed
+  // pause - and play() at currentTime == duration restarts it from 0, underneath
+  // the crossfade the `ended` listener above is about to start.
+  v.addEventListener("pause", () => { if (v === showing && !v.ended) ensurePlaying(); });
+}
+
+// --- POSE-MATCHED ENTRY (task 9) --------------------------------------------
+// Blending outgoing[t] into incoming[0] reads as a cut because a clip's
+// near-neutral pose sits only at its own start and end (measured: median
+// distance 6.4, cut to 3.8 by matching pose instead - the table is in
+// docs/superpowers/plans/2026-08-25-face-v1.md, Task 9, and the decision it
+// led to is docs/adr/0017-the-neutral-moment-not-the-matched-pose.md).
+// Look up the frame of `stem` whose pose was measured closest to whatever pose
+// `prev` was showing when the switch fired, instead of always seeking to 0.
+//
+// Rules 3 and 4 collapse into one case here, on purpose: a one-shot
+// destination is never a key under any source in transitions.match, because
+// daemon/face_match.py builds the table only over LOOP clips (both axes) - so
+// "entering a one-shot" and "no table at all" both just miss the lookup and
+// fall through to the same 0. No separate one-shot check is needed, and one
+// would risk drifting from face_match.py's own ONE_SHOTS list.
+function poseMatchTime(prev, stem) {
+  if (!transitions || !prev) return 0;
+  const seeks = transitions.match?.[prev.dataset.stem]?.[stem];
+  if (!seeks || !seeks.length) return 0;
+  const bucket = Math.floor(prev.currentTime / transitions.bucket);
+  return seeks[Math.min(Math.max(bucket, 0), seeks.length - 1)] ?? 0;
+}
+
+// --- WAIT FOR THE NEXT NEAR-NEUTRAL MOMENT (task 9, 3rd follow-up) ---------
+// Supersedes the original wait rule (spec 3.2): that rule waited only for the
+// outgoing clip's own literal end, within WAIT_MS of it. Measured against
+// this page's own scale (face_match.py's own _frames, on the owner's real
+// clips), that was solving the wrong problem: near-neutral time is not
+// confined to a clip's own end, it is spread through most of the clip, so
+// checking only the end rarely found it. `transitions.neutral[stem]` is one
+// bool per BUCKET-second slice of `stem`'s own timeline - true where some
+// frame in that slice is within face_match.py's own threshold of the clip's
+// frame 0 (see NEUTRAL_THRESHOLD_FRACTION there). This looks up whether
+// `video` is near neutral right now, and if not, how long until the next
+// slice that is - capped at NEUTRAL_WAIT_CAP_MS, since a bucket that never
+// arrives is exactly the case pose-matched entry (poseMatchTime, above) still
+// covers.
+function neutralWaitMs(video) {
+  if (!transitions || !video) return null;
+  const spans = transitions.neutral?.[video.dataset.stem];
+  if (!spans || !spans.length) return null;
+  const bucket = transitions.bucket;
+  const cur = Math.floor(video.currentTime / bucket) % spans.length;
+  if (spans[cur]) return 0;                // already near neutral - no wait needed
+  for (let step = 1; step <= spans.length; step++) {
+    const idx = (cur + step) % spans.length;    // wraps: the clip loops
+    if (spans[idx]) {
+      const waitS = step * bucket - (video.currentTime % bucket);
+      return Math.min(waitS * 1000, NEUTRAL_WAIT_CAP_MS);
+    }
+  }
+  return null;                             // no near-neutral slice anywhere in this clip
+}
+
+function clearPendingWait() {
+  if (pendingWaitTimer) {
+    clearTimeout(pendingWaitTimer);
+    pendingWaitTimer = 0;
+  }
+}
+
+// --- SINGLE-SIDED CROSSFADE -------------------------------------------------
+function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {
+  const next = els.get(stem);
+  if (!next || next === showing) return;
+  const prev = showing;
+  next.loop = loop;
+  next.currentTime = poseMatchTime(prev, stem);
+  next.style.zIndex = String(++z);       // on top, so fading in covers rather than blends
+  if (!REDUCED_MOTION) next.style.transitionDuration = `${fadeMs}ms`; // spec 3.2's fast/slow split
+  next.playbackRate = 1;
+  next.play().then(() => {
+    next.style.opacity = "1";
+    showing = next;
+    if (prev) setTimeout(() => {         // hidden behind an already-opaque layer
+      // ...unless it is back in front. Switch away and back inside fadeMs and
+      // this stale timer hides the element that is now `showing`, leaving BOTH
+      // layers transparent and the page on flat #19191B until something
+      // switches to a different element again. Not a rare race: with tools at
+      // the default mode=full a read_file round finishes well inside 400ms, so
+      // thinking -> working -> thinking blanks the face.
+      if (prev === showing) return;
+      prev.style.opacity = "0";
+      prev.pause();
+    }, fadeMs);
+  }).catch(() => {
+    // Surfaced, not swallowed: silently eating this left `showing` stuck on the old
+    // clip forever with nothing retrying (measured live). Recovery is ensurePlaying(),
+    // triggered by the next real pause/visibilitychange event, not retried right here
+    // - if the browser is withholding playback, an immediate retry fails the same way.
+    console.warn(`face: play() rejected for ${stem}`);
+  });
+}
+
+// --- SELF-HEALING PLAYBACK ---------------------------------------------------
+function ensurePlaying() {
+  // Two independent ways the browser strands the page (both measured live, not
+  // theoretical): it can pause an already-showing clip to save power, or it can
+  // reject a switch's play() outright, leaving the old clip showing and still
+  // playing - just the wrong one. Resuming what's on screen is always correct,
+  // so it takes priority; only once it isn't paused do we check whether it's
+  // even the right clip for the current activity.
+  //
+  // A pending neutral-moment wait (pendingWaitTimer) is deliberately left
+  // alone here, not pre-empted: toActivity() (below) sets `activity` to the
+  // wait's target *before* scheduling its timer, so clipFor(activity) below
+  // would already agree with what the wait is waiting for and force an
+  // immediate switch out from under it - at the fast fade instead of the
+  // wait's own chosen one, and skipping the neutral moment entirely. This is
+  // a live path, not a theoretical one: visibilitychange (wired in boot(),
+  // below) calls this every time an ambient window is occluded and shown
+  // again, which measured live happens constantly.
+  if (!showing) return;
+  if (showing.paused) { showing.play().catch(() => {}); return; }
+  if (!oneShotUntil && !pendingWaitTimer) {
+    const want = clipFor(activity);
+    if (want && want !== showing.dataset.stem) show(want, { loop: activity !== "idle" });
+  }
+}
+
+function advance() {
+  // A finished clip: one-shots hand back to the activity, idle reshuffles.
+  // The pending wait goes first: idle clips are shown with loop:false, so a wait
+  // scheduled against the outgoing clip's own timeline outlives that clip ending
+  // and would fire up to NEUTRAL_WAIT_CAP_MS later, over whatever this switched to.
+  // (The wait is *scheduled* in toActivity(), on its own setTimeout rather than
+  // this clip's `ended`, since the neutral moment it waits for is not
+  // necessarily the clip's own end - but it still has to be cancelled here.)
+  clearPendingWait();
+  oneShotUntil = 0;
+  oneShotIsFlourish = false;
+  if (queuedActivity !== null) {
+    // spec 3.6: a non-speaking activity change arrived mid-one-shot and was held
+    // instead of dropped or applied over the gesture; the one-shot has now
+    // actually finished, so apply it. oneShotUntil is already 0 here, so this
+    // re-enters toActivity() as a normal (non-queued) transition.
+    const act = queuedActivity;
+    queuedActivity = null;
+    toActivity(act);
+    return;
+  }
+  // Spec 1 wants one every 40-120s for as long as idle lasts, because that is
+  // what breaks an 8s loop's period. scheduleFlourish() used to be reachable only
+  // from toActivity(), so entering idle armed exactly one: tick() zeroed
+  // flourishAt when it fired and nothing ever set it again.
+  if (activity === "idle") scheduleFlourish();
+  const stem = clipFor(activity);
+  if (stem) show(stem, { loop: activity !== "idle" });
+}
+
+function toActivity(act) {
+  if (oneShotUntil && !oneShotIsFlourish && act !== "speaking") {
+    // A MOOD in flight (spec 3.2): only a transition to speaking may cut it - the
+    // mouth cannot lag the audio, and idle/listening/thinking/working have no such
+    // claim over something the daemon is actually saying. Remember it instead;
+    // advance() (above) applies it once the one-shot's own `ended` fires.
+    //
+    // A FLOURISH goes the other way (spec 3.6): decoration with no trigger and no
+    // meaning, so any activity change cuts it rather than holding `listening`
+    // behind six seconds of gesture nobody asked for. The two spec sections
+    // contradicted each other on this and this page used to cite 3.6 for the
+    // opposite of what 3.6 says; both now say this split.
+    //
+    // It also settles the wait/one-shot interaction: a one-shot already in flight
+    // blocks a *new* wait from starting here (this check runs first), and
+    // playOneShot() (below) always clears a pending wait, so a one-shot always
+    // wins over a wait that was already pending.
+    queuedActivity = act;
+    return;
+  }
+  queuedActivity = null;
+  activity = act;
+  oneShotUntil = 0;
+  oneShotIsFlourish = false;
+  clearPendingWait();           // any earlier deferred wait is moot now
+  scheduleFlourish();
+  const fadeMs = SLOW_FADE_ACTIVITIES.has(act) ? FADE_SLOW_MS : FADE_MS;
+  const stem = clipFor(act);
+  if (!stem) return;
+  // !showing.paused excludes a clip that has already reached its end (paused,
+  // non-looping - e.g. a one-shot whose `ended` just fired and landed us here via
+  // advance()'s queuedActivity branch, above): it will never move again, so
+  // waiting on it would strand the page on a frozen last frame.
+  if (WAIT_ACTIVITIES.has(act) && showing && !showing.paused) {
+    const waitMs = neutralWaitMs(showing);
+    if (waitMs > 0) {
+      // Keep playing (and looping) toward that moment; the switch itself still
+      // goes through show(), so it still looks up the pose-matched entry point
+      // (poseMatchTime) for wherever the outgoing clip actually is when this
+      // fires - exactly on time if a neutral moment was reached, or wherever
+      // NEUTRAL_WAIT_CAP_MS ran out if it timed out first.
+      pendingWaitTimer = setTimeout(() => {
+        pendingWaitTimer = 0;
+        show(stem, { loop: act !== "idle", fadeMs });
+      }, waitMs);
+      return;
+    }
+  }
+  show(stem, { loop: act !== "idle", fadeMs });
+}
+
+function playOneShot(stem, { flourish = false } = {}) {
+  if (!have.has(stem)) return;           // no clip, no expression - never substitute idle
+  oneShotUntil = Infinity;
+  oneShotIsFlourish = flourish;  // see toActivity(): only a flourish yields to an
+                                 // activity change
+  clearPendingWait();            // a fresh one-shot supersedes any pending wait
+  show(stem, { loop: false });
+}
+
+// --- what the envelope actually does, for spec open question 3 --------------
+let envSamples = [];
+function logEnvelope() {
+  // One line per speaking turn: enough to answer "does the envelope ever reach
+  // a high band at all", which is what decides both LOUD_ENTER and whether
+  // speaking_loud earns its place. Two samples is not a distribution.
+  if (envSamples.length < 2) { envSamples = []; return; }
+  const s = envSamples.slice().sort((a, b) => a - b);
+  const at = q => s[Math.min(s.length - 1, Math.floor(q * s.length))];
+  console.log(
+    `face: envelope over ${s.length} ticks - min ${at(0).toFixed(3)}, ` +
+    `median ${at(0.5).toFixed(3)}, p90 ${at(0.9).toFixed(3)}, ` +
+    `max ${s[s.length - 1].toFixed(3)} (LOUD_ENTER ${LOUD_ENTER})`);
+  envSamples = [];
+}
+
+function scheduleFlourish() {
+  flourishAt = activity === "idle"
+    ? performance.now() + FLOURISH_MIN_MS + Math.random() * (FLOURISH_MAX_MS - FLOURISH_MIN_MS)
+    : 0;
+}
+
+// --- mouth: envelope -> playbackRate ---------------------------------------
+function tick() {
+  if (showing && activity === "speaking") {
+    const rate = RATE_MIN + (RATE_MAX - RATE_MIN) * env;
+    if (Math.abs(showing.playbackRate - rate) > 0.01) showing.playbackRate = rate;
+    const want = clipFor("speaking");
+    if (want && showing.dataset.stem !== want && !oneShotUntil) show(want);
+  }
+  if (flourishAt && performance.now() > flourishAt && activity === "idle") {
+    flourishAt = 0;
+    const f = FLOURISHES.filter(s => have.has(s));
+    if (f.length) playOneShot(f[Math.floor(Math.random() * f.length)], { flourish: true });
+  }
+  requestAnimationFrame(tick);
+}
+
+// --- wire ------------------------------------------------------------------
+async function boot() {
+  const manifest = await fetch("/face/manifest").then(r => r.json()).catch(() => ({ clips: [] }));
+  have = new Set(manifest.clips);
+  // 404 (no table built yet) and a network hiccup both leave transitions null,
+  // which poseMatchTime() already treats as "fall back to frame 0" (rule 4).
+  transitions = await fetch("/face/transitions").then(r => r.ok ? r.json() : null).catch(() => null);
+  // Two hints, because a partial set is supposed to work (spec 3.7) and one of
+  // its shapes did not: with clips present but no idle clip, boot's own
+  // toActivity("idle") has nothing to show and the page rendered flat #19191B
+  // with no explanation at all. The hint sits behind every <video> (they carry a
+  // z-index, it does not), so whatever the set DOES have still covers it the
+  // moment the daemon does something.
+  const noIdle = have.size > 0 && !clipFor("idle");
+  if (!have.size || noIdle) {
+    hint.hidden = false;
+    hint.innerHTML = noIdle
+      ? "No idle clip. Add <code>idle1</code>, <code>idle2</code> or <code>idle3</code> " +
+        "to <code>&lt;data_dir&gt;/face/</code> &mdash; the rest of the set still plays."
+      : "No clips yet. Put them in <code>&lt;data_dir&gt;/face/</code> " +
+        "&mdash; see <code>docs/superpowers/specs/2026-08-25-face-design.md</code> §4.";
+    if (!have.size) return;
+  }
+  await Promise.all([...have].map(prime));
+  toActivity("idle");
+  requestAnimationFrame(tick);
+
+  const es = new EventSource("/face/stream");   // reconnects on its own
+  es.onmessage = (m) => {
+    const e = JSON.parse(m.data);
+    if (e.kind === "shot") { playOneShot(e.clip); return; }
+    // `queuedActivity ?? activity`: while a mood one-shot holds a change,
+    // `activity` still names the one before it, so comparing against `activity`
+    // alone let a change back and forth during the one-shot apply the stale half
+    // of it afterwards.
+    const cur = queuedActivity ?? activity;
+    if (e.activity !== cur) toActivity(e.activity);
+    const target = e.activity === "speaking" ? e.level : 0;
+    env += (target - env) * (target > env ? ATTACK : RELEASE);
+    // On `env`, not `e.level`: see LOUD_ENTER's own note above.
+    if (env >= LOUD_ENTER) { if (!loudSince) loudSince = performance.now(); }
+    else loudSince = 0;
+    if (e.activity === "speaking") envSamples.push(env);
+    else logEnvelope();
+  };
+
+  // The other half of self-healing: becoming visible again is exactly when the
+  // browser will actually let a previously-withheld play() succeed.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") ensurePlaying();
+  });
+}
+
+boot();
+</script>

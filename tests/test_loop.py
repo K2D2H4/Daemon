@@ -13,7 +13,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from conftest import FakeProvider
@@ -23,13 +23,16 @@ from daemon.app import create_app
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
 from daemon.config import Route, Settings
+from daemon.face import MOOD_INSTRUCTION, Mood, split_mood
 from daemon.llm.base import Completion, ImageBlock, Message, ProviderError, ToolCall
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import FAILURE_NOTICE, ConversationLoop
 from daemon.memory.base import LoggedMessage, MemoryWriter, Recall, RecalledItem
 from daemon.tasks import Task
 from daemon.tools.base import ToolResult
+from daemon.tools.policy import Claimed
 from daemon.tools.runner import Outcome
+from tests.test_face import RecordingBus
 
 
 class FakeMemory:
@@ -1012,6 +1015,208 @@ async def test_a_broken_channel_does_not_end_the_loop(data_dir: Path) -> None:
         gateway_for(FlakyProvider()),
         Companion(FakeMemory(), data_dir=data_dir),
     ).run()  # must return rather than raise
+
+
+# --- the face (Task 4): activity and mood, with no trace left behind --------
+
+
+async def test_the_face_sees_thinking_then_speaking_then_idle(
+    fake_provider: FakeProvider, data_dir: Path
+) -> None:
+    bus = RecordingBus()
+    channel = FakeChannel([inbound("hello")])
+
+    await ConversationLoop(
+        channel,
+        gateway_for(fake_provider),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=bus,
+    ).run()
+
+    assert bus.activities == ["thinking", "speaking", "idle"]
+
+
+async def test_a_mood_tag_becomes_an_event_and_leaves_no_trace(data_dir: Path) -> None:
+    provider = FakeProvider(replies=["[mood:amused] 그래서 웃었어"])
+    memory = FakeMemory()
+    channel = FakeChannel([inbound("웃겨?")])
+    bus = RecordingBus()
+
+    await ConversationLoop(
+        channel, gateway_for(provider), Companion(memory, data_dir=data_dir), face=bus
+    ).run()
+
+    assert bus.shots == ["amused"]
+    # The tag reaches neither of the two ways text escapes the turn.
+    assert [m.text for m in channel.sent] == ["그래서 웃었어"]
+    assert [m.content for m in memory.records if m.role == "assistant"] == ["그래서 웃었어"]
+
+
+async def test_the_expression_is_published_after_speaking_starts(data_dir: Path) -> None:
+    """The reverse of what this used to assert, and the spec is corrected to match.
+
+    Spec 3.6's "the expression lands first" was written for the voice path, where
+    the audio genuinely arrives after the tag. On the text path there is no audio
+    for the mouth to lag: `_speak` publishes both in one synchronous block, so
+    they reach the page in the same event either way - and `speaking` is the one
+    transition allowed to cut a one-shot (spec 3.2), so shot-first put the mood on
+    screen for about 0ms. Published this way round the page plays the mood over
+    the speaking loop and hands back to it when the arc ends.
+    """
+    order: list[str] = []
+
+    class Ordered(RecordingBus):
+        def set_activity(self, activity):  # type: ignore[override]
+            super().set_activity(activity)
+            order.append(f"activity:{activity}")
+
+        def one_shot(self, clip):  # type: ignore[override]
+            super().one_shot(clip)
+            order.append(f"shot:{clip}")
+
+    await ConversationLoop(
+        FakeChannel([inbound("웃겨?")]),
+        gateway_for(FakeProvider(replies=["[mood:sulky] 삐졌어"])),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=Ordered(),
+    ).run()
+
+    assert order == ["activity:thinking", "activity:speaking", "shot:sulky", "activity:idle"]
+
+
+async def test_a_reply_with_no_tag_publishes_no_one_shot(
+    fake_provider: FakeProvider, data_dir: Path
+) -> None:
+    bus = RecordingBus()
+
+    await ConversationLoop(
+        FakeChannel([inbound("hello")]),
+        gateway_for(fake_provider),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=bus,
+    ).run()
+
+    assert bus.shots == []
+
+
+async def test_a_turn_that_raises_still_returns_the_face_to_idle(data_dir: Path) -> None:
+    """`handle` puts idle back in a `finally`. Without it one failed turn leaves the
+    face stuck on `thinking` for the rest of the process's life."""
+    bus = RecordingBus()
+
+    await ConversationLoop(
+        FakeChannel([inbound("hello")]),
+        gateway_for(FakeProvider(fail=True)),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=bus,
+    ).run()
+
+    assert bus.state.activity == "idle"
+
+
+class ApprovingCompanion(Companion):
+    """Fakes a granted `/approve` directly - the same one-method-override style
+    `FakeImageToolCompanion` above uses for `run_tools` - so `_approve`'s own
+    reply path can be driven for real without wiring a `ToolRunner`/`ToolPolicy`
+    /`Store` just to manufacture one pending approval."""
+
+    def claim(self, command: Any, *, sender_id: str) -> Claimed | None:
+        return Claimed(
+            tool="run_command",
+            arguments={"command": "echo hi"},
+            preview="`run_command` echo hi",
+            denied=False,
+            fingerprint="x",
+        )
+
+    async def resume(
+        self, claimed: Any, *, origin: str, channel: str, sender_id: str | None
+    ) -> ToolResult:
+        return ToolResult(call_id="1", name="run_command", content="hi\n")
+
+
+async def test_the_approval_resume_reply_also_gets_its_mood_tag_stripped(
+    data_dir: Path,
+) -> None:
+    """`_approve` makes its own model call (`daemon/loop.py`) once the owner's
+    `/approve CODE` resumes a parked tool - a second, genuine escape route for a
+    mood tag, independent of the ordinary reply path above. Same rule, same
+    strip point (`_speak`)."""
+    provider = FakeProvider(replies=["[mood:amused] 다 됐어"])
+    memory = FakeMemory()
+    channel = FakeChannel([inbound("/approve A3F2K9QT")])
+    bus = RecordingBus()
+    companion = ApprovingCompanion(memory, data_dir=data_dir, tools=object())
+
+    await ConversationLoop(channel, gateway_for(provider), companion, face=bus).run()
+
+    assert bus.shots == ["amused"]
+    # Same two exits as the ordinary turn: the wire and the markdown log.
+    assert [m.text for m in channel.sent] == ["다 됐어"]
+    assert [m.content for m in memory.records if m.role == "assistant"] == ["다 됐어"]
+
+
+def _system_texts(messages: list[Any]) -> list[str]:
+    return [m.content for m in messages if m.role == "system"]
+
+
+async def test_the_model_is_asked_for_the_mood_tag_when_a_face_is_attached(
+    data_dir: Path,
+) -> None:
+    """The other half of `split_mood`. Stripping a tag is worth nothing if nothing
+    ever asks for one - which is exactly where this feature sat until
+    `evals/face_mood_tag_spike.py` measured that asking works."""
+    provider = FakeProvider()
+    channel = FakeChannel([inbound("웃겨?")])
+
+    await ConversationLoop(
+        channel,
+        gateway_for(provider),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=RecordingBus(),
+    ).run()
+
+    assert MOOD_INSTRUCTION in _system_texts(provider.calls[0])
+
+
+async def test_no_face_means_the_model_is_never_asked_for_a_mood(data_dir: Path) -> None:
+    """A text-only install pays nothing for a face it does not have. Without the
+    gate this is two hundred tokens on every turn asking for a tag `_speak` would
+    strip and no page would ever draw."""
+    provider = FakeProvider()
+    channel = FakeChannel([inbound("웃겨?")])
+
+    await ConversationLoop(
+        channel, gateway_for(provider), Companion(FakeMemory(), data_dir=data_dir)
+    ).run()
+
+    assert all("mood:" not in text for text in _system_texts(provider.calls[0]))
+
+
+async def test_the_approval_resume_is_asked_for_a_mood_too(data_dir: Path) -> None:
+    """`_assemble_after_tool` builds its own message list from scratch, so it can
+    forget this independently of the ordinary turn - and did, in the draft where
+    only `_speak` was covered."""
+    provider = FakeProvider()
+    channel = FakeChannel([inbound("/approve A3F2K9QT")])
+    companion = ApprovingCompanion(FakeMemory(), data_dir=data_dir, tools=object())
+
+    await ConversationLoop(
+        channel, gateway_for(provider), companion, face=RecordingBus()
+    ).run()
+
+    assert MOOD_INSTRUCTION in _system_texts(provider.calls[0])
+
+
+def test_the_instruction_and_the_parser_still_agree() -> None:
+    """Two halves of one contract in two files (`daemon/face.py`). If a reworded
+    instruction stops naming a mood, or names one the parser will not accept, the
+    face goes quiet and every reply still looks perfectly fine."""
+    # Off the `Mood` type itself, so a fourth mood added to the Literal without a
+    # matching line in the instruction fails here rather than on screen.
+    for mood in get_args(Mood):
+        assert f"[mood:{mood}]" in MOOD_INSTRUCTION
+        assert split_mood(f"[mood:{mood}] 본문") == ("본문", mood)
 
 
 # --- the M1a gate -----------------------------------------------------------
