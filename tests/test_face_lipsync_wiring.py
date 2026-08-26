@@ -437,6 +437,54 @@ def test_the_cache_loader_reads_what_the_prepare_tool_writes(tmp_path):
     assert [int(mask[0, 0]) for mask in cache.masks] == [0, 1, 2], "in frame order"
 
 
+async def test_a_wake_round_hands_the_process_s_own_sink_to_the_voice_call(monkeypatch):
+    """The first link of the same chain, and it had no test at all.
+
+    `_wake_round` is what the resident's gate calls, and it is where `app.state` meets
+    `run_voice`. Nothing under `tests/` drove it before this, so a sink dropped here
+    would have left every assertion green and every spoken turn mouthless - the same
+    defect as the `deque.append` one, one signature earlier.
+
+    Both handles are read off `state` at call time rather than captured when the gate
+    came up, so the switch is a property of the process and not of the moment the wake
+    loop started.
+    """
+    from types import SimpleNamespace
+
+    from daemon import app as module
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_voice(settings, **kwargs):
+        captured.update(kwargs)
+        return 0
+
+    class FakeGate:
+        async def listen(self):
+            yield SimpleNamespace(heard="\ubca8\ub77c", matched="\ubca8\ub77c", pcm=b"\x00\x01")
+
+    async def fake_build(settings):
+        async def close() -> None:
+            return None
+
+        return FakeGate(), close
+
+    monkeypatch.setattr(module, "run_voice", fake_run_voice)
+    monkeypatch.setattr(module, "build_wake_gate", fake_build)
+    monkeypatch.setattr(module, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    bus = FaceBus()
+
+    def sink(chunk: bytes, at: float) -> None:
+        return None
+
+    state = SimpleNamespace(face=bus, face_pcm_sink=sink, wake_gate=None)
+    await module._wake_round(_settings(Path("/tmp")), state=state)
+
+    assert captured["pcm_sink"] is sink
+    assert captured["face"] is bus
+
+
 async def test_the_voice_path_carries_the_sink_to_the_conversation(monkeypatch):
     """The seam that makes the whole feature work, and the one nothing else can see.
 
