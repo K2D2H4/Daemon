@@ -41,6 +41,7 @@ from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
 from daemon.memory.base import MemoryWriter, Recall
+from daemon.ollama_process import LocalOllama
 from daemon.persona.evolve import EvolutionResult, PersonaEvolution
 from daemon.proactivity.tick import ProactiveTick
 from daemon.reflection import Reflection, Result
@@ -138,6 +139,7 @@ def create_app(
     memory: MemoryWriter | None = None,
     recall: Recall | None = None,
     wake: WakeRound | None = None,
+    local_ollama: LocalOllama | None = None,
 ) -> FastAPI:
     """Assemble the process. `channel`/`memory`/`recall`/`wake` are injection points
     for tests; normally all four are built from settings during startup.
@@ -145,6 +147,12 @@ def create_app(
     `wake` is one round of "listen until called, then hold a conversation" - see
     `_wake_round`. Injected rather than assembled in tests because the real one
     opens a microphone and then a billed session, and neither belongs in a test.
+
+    `local_ollama` is never built here - `None` means no start task, exactly
+    today's behaviour, so every existing test that does not pass one keeps not
+    touching the network. Only `daemon run` (`daemon/cli.py`) constructs the real
+    one; a test that built its own here would probe localhost and could spawn a
+    real `ollama serve`.
     """
     resolved = settings or Settings()
     app = FastAPI(title="Daemon", version=__version__, lifespan=_lifespan)
@@ -152,6 +160,7 @@ def create_app(
     app.state.channel = channel
     app.state.memory = memory
     app.state.recall = recall
+    app.state.local_ollama = local_ollama
     app.state.recall_status = "injected" if recall is not None else "not started"
     app.state.loop_task = None
     app.state.reflection_boot_task = None
@@ -337,6 +346,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     channel = app.state.channel
     memory = app.state.memory
     recall: Recall | None = app.state.recall
+    local_ollama: LocalOllama | None = app.state.local_ollama
     resolve_id: ResolveId | None = None
     close_io: Callable[[], None] | None = None
     embedder: Any = None
@@ -480,6 +490,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 worker.run(), name="delegation-worker"
             )
 
+    app.state.ollama_task = None
+    if local_ollama is not None:
+        # Not gated on `recall`: `provider=ollama` routes chat here too, and
+        # `recall` is None whenever `_build_recall` failed - exactly the case where
+        # hanging the start off the backfill would leave the daemon with no local
+        # model at all. Not awaited, for the same log-clock reason as the backfill
+        # below. Only `daemon run` passes one; a test passing none gets no start
+        # task, because a test that spawns a server is a broken test.
+        app.state.ollama_task = asyncio.create_task(
+            local_ollama.ensure_running(), name="ollama-start"
+        )
+
     if recall is not None:
         # Backfill after the loop is already serving, and in the background: a
         # rebuilt sqlite file gives every message a new id and drops `embeddings`
@@ -487,9 +509,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # while /health still says recall is ready. Measured on the golden set,
         # that silent state is a 50% ceiling for Korean rather than the hybrid
         # number - a regression where nothing fails. Not awaited, because a cold
-        # embedder must not delay the log clock (docs/PLAN.md 8.1).
+        # embedder must not delay the log clock (docs/PLAN.md 8.1) - and that is
+        # also why `_backfill` waits for Ollama inside itself rather than here.
         app.state.backfill_task = asyncio.create_task(
-            _backfill(recall), name="recall-backfill"
+            _backfill(recall, app.state.ollama_task), name="recall-backfill"
         )
 
     if memory is not None:
@@ -552,6 +575,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # revoked bot token was enough to leak the lot on every restart.
         for name in (
             "backfill_task",
+            "ollama_task",
             "loop_task",
             "wake_task",
             "reflection_boot_task",
@@ -566,6 +590,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if channel is not None:
             with suppress(Exception):
                 await channel.close()
+        local = getattr(app.state, "local_ollama", None)
+        if local is not None:
+            # A child process, like the stdio MCP servers below: an Ollama this
+            # daemon started and did not stop is one more orphan per restart. One
+            # it did *not* start is somebody else's and stays running.
+            with suppress(Exception):
+                await local.aclose()
         mcp = getattr(app.state, "mcp", None)
         if mcp is not None:
             # Before the sqlite close and the scheduler shutdown, because these are
@@ -766,7 +797,7 @@ def _report_loop_death(task: asyncio.Task[None]) -> None:
         )
 
 
-async def _backfill(recall: Recall) -> None:
+async def _backfill(recall: Recall, ollama_ready: Awaitable[bool] | None = None) -> None:
     """Embed history the vector lane is missing, to exhaustion.
 
     One call was not enough. It stopped at its default 500 rows and never ran
@@ -775,9 +806,22 @@ async def _backfill(recall: Recall) -> None:
     still reported recall ready. That is the same invisible Korean ceiling the
     protocol change was meant to prevent, just further along.
 
+    The wait for Ollama lives here rather than in `lifespan` on purpose: a cold
+    embedder must not delay the log clock (docs/PLAN.md 8.1), and awaiting
+    readiness before the `yield` would block uvicorn's "startup complete" and
+    /health for as long as a cold start takes. Measured 2026-08-26, skipping the
+    wait entirely is what logged `backfill stopped after 0 message(s)` and left 49
+    messages unembedded until an unrelated restart.
+
     Never fatal: recall degrades to keyword-only, which is worse than the full
     answer and far better than a dead conversation loop.
     """
+    if ollama_ready is not None and not await ollama_ready:
+        logger.info(
+            "recall backfill skipped: no embedder answered. Recall stays keyword-only "
+            "and the next restart tries again"
+        )
+        return
     total = 0
     try:
         while True:
