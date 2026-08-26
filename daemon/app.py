@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
@@ -1451,14 +1452,25 @@ async def run_voice(
     opening_text: str = "",
     shared: VoiceRuntime | None = None,
     face: FaceBus | None = None,
+    on_spoke: Callable[[], None] | None = None,
+    opening_already_logged: bool = False,
 ) -> int:
     """One spoken conversation at this machine, then exit.
 
     Assembled here rather than inside the daemon's own loop because voice is a
     thing a person starts, not a thing that happens to them: the session is
     billed per minute, so holding one open on the chance of being spoken to is
-    pure cost (docs/PLAN.md 6.5). Proactive speech at the machine is the local
-    speaker's job and belongs to M3.
+    pure cost (docs/PLAN.md 6.5).
+
+    Proactive speech at the machine is one of the things that starts one, though,
+    and it is the caller `on_spoke` and `opening_already_logged` exist for -
+    `_speak_unprompted` is the only one that passes either. `on_spoke` fires on the
+    first chunk of audio the session produces - from `VoiceConversation._on_audio`,
+    the one place that knows, and *not* at the end of the attempt, which is far too
+    late for the caller waiting on it - and is what decides whether the line still
+    needs `/usr/bin/say`; `opening_already_logged` says the opening is
+    already in the conversation log, so the turn that speaks it must not be written
+    down a second time (`VoiceConversation._skip_opening_record`).
 
     Returns a shell exit code, because the caller is a CLI command.
     """
@@ -1611,7 +1623,19 @@ async def run_voice(
         # Before the handshake, so the acknowledgement is as close to the wake word
         # as it can be. Nothing is feeding the session yet, so the cue cannot be
         # heard as the owner interrupting.
-        await play_ready_cue(audio)
+        #
+        # Not when the daemon is the one about to talk. The cue means "the
+        # microphone is yours", and `on_spoke` is set by exactly one caller:
+        # `_speak_unprompted`, which opens a session to *say* something unprompted.
+        # Playing it there tells the owner to go ahead and then talks over him 1.3 s
+        # later, which is the opposite of what it means. Under `origin/main` the
+        # order was line-then-cue - `/usr/bin/say` spoke first and this ran
+        # afterwards - so routing the line through the session inverted it; caught
+        # in review of PR #126, whose whole subject is how being spoken to first
+        # sounds. The cue comes back on the owner's next turn, in the same session,
+        # because the session stays open to listen.
+        if on_spoke is None:
+            await play_ready_cue(audio)
 
         def new_session() -> Any:
             """A fresh session per attempt. Reconnecting means starting clean: the
@@ -1682,6 +1706,8 @@ async def run_voice(
                 screen_pump_factory=screen_pump_factory,
                 barge_in=settings.voice_barge_in,
                 face=face,
+                on_spoke=on_spoke,
+                opening_already_logged=opening_already_logged,
             )
         finally:
             with suppress(Exception):
@@ -1800,6 +1826,8 @@ async def _voice_attempts(
     screen_pump_factory: Callable[[Any], Any] | None = None,
     barge_in: bool = True,
     face: FaceBus | None = None,
+    on_spoke: Callable[[], None] | None = None,
+    opening_already_logged: bool = False,
 ) -> int:
     """Hold a conversation, and pick it back up if the session is cut.
 
@@ -1828,6 +1856,44 @@ async def _voice_attempts(
     # attempt cut down during the handshake never gets the utterance in front of a
     # model, and the owner is back to saying the wake phrase twice.
     pending_opening = opening_audio
+    # Carried and cleared exactly like `pending_opening` above, and for a sharper
+    # reason: with `CALLED_BY_NAME` a repeat was a redundant "네?", while with
+    # `SPEAK_VERBATIM` it is a second literal delivery of the proactive line, in the
+    # same voice, to an owner who has already answered the first one.
+    pending_text = opening_text
+    reported = False
+
+    def note_first_audio() -> None:
+        """Tell the caller the daemon has started talking, once per call.
+
+        Handed to every attempt's conversation, which fires it on the first chunk of
+        audio it receives - the instant the answer begins, which is the only instant
+        the one caller can use. `_speak_unprompted` is blocked inside
+        `mic_floor.request` under `REPLY_CEILING_SECONDS` while a conversation runs
+        with no total cap of its own, so a report at the end of the attempt is a
+        report after the deadline: the row would record `route='telegram'`,
+        `modality='text'` for a line the owner heard in her voice and answered aloud.
+        PR #126 shipped it in this function's `finally` and had exactly that.
+
+        What the earlier placement was right about is kept for free: a failure that
+        is not a `session_error` leaves `_voice_attempts` entirely, and firing at the
+        first chunk has already reported by the time anything can raise.
+
+        `reported` rather than clearing `on_spoke`, so the guard reads the same on a
+        reconnect: a second attempt that plays audio must not report twice, because
+        the caller uses this to decide whether the line still needs `/usr/bin/say`
+        and it may already have answered a future on the strength of the first one.
+        """
+        nonlocal reported
+        if on_spoke is None or reported:
+            return
+        reported = True
+        # Deliberately not "the room heard it": `_on_audio` counts the chunk one
+        # line before `AudioIO.play` is awaited with it, so a dead output device
+        # reports here too. That is the safe direction - a false positive costs a
+        # line nobody heard, a false negative says the same sentence twice.
+        on_spoke()
+
     for attempt in range(1, VOICE_RECONNECT_ATTEMPTS + 1):
         session = new_session()
         conversation = VoiceConversation(
@@ -1835,7 +1901,12 @@ async def _voice_attempts(
             audio,
             companion,
             opening_audio=pending_opening,
-            opening_text=opening_text,
+            opening_text=pending_text,
+            # Only while the opening is still pending. Once it has been said, a
+            # later attempt's first assistant turn is an answer to the owner and
+            # belongs in the log like any other voice turn.
+            opening_already_logged=opening_already_logged and bool(pending_text),
+            on_first_audio=None if on_spoke is None else note_first_audio,
             screen_share=screen_share,
             screen_pump_factory=screen_pump_factory,
             barge_in=barge_in,
@@ -1863,9 +1934,10 @@ async def _voice_attempts(
         if conversation.stats.played_seconds > 0:
             # Something was said back, so the opening utterance has been answered.
             # Re-sending it on a later attempt would have the daemon answer the same
-            # question twice.
+            # question twice - or, for a proactive opening, say it twice.
             pending_opening = b""
-        elif pending_opening:
+            pending_text = ""
+        elif pending_opening or pending_text:
             logger.info("voice: the opening utterance was not answered; carrying it over")
 
         if failure is None and not getattr(session, "going_away", False):
@@ -2081,66 +2153,132 @@ async def _speak_unprompted(
     the microphone is already free, released by the one sequence in this process
     that is allowed to release it. Nothing here opens or closes a capture stream.
 
-    The line is spoken by `LocalSpeaker` and **not** handed to the voice session as
-    an opening. `opening_text` is a prompt the model answers
-    (`daemon/voice/conversation.py`), so a session asked to deliver this line would
-    say its own version of it - and the line it replaced has already been judged,
-    length-capped and refused for URLs by `daemon/proactivity/judge.py`. Speaking a
-    paraphrase would put an unchecked sentence in the owner's room while the checks
-    passed on a sentence nobody heard.
+    **The session says it, in her own voice.** A session was always going to open
+    here - the daemon has just spoken first, and the owner is likeliest to answer
+    in the next few seconds, the one moment a gate rebuild would miss - so letting
+    it deliver the line costs nothing and ends the thing the owner reported on
+    2026-08-27: a proactive line arriving in `/usr/bin/say`'s system voice while
+    every answer he had ever heard came from the one he picked.
 
-    Then a session, with no opening at all, because the daemon has just spoken
-    first and the owner is most likely to answer in the next few seconds - the one
-    moment a gate rebuild would miss. It opens listening rather than talking, and
-    *normally* it knows what was just said: `deliver` runs `_say` -> `_send` ->
-    `_log`, so the conversation-log row lands while this function is still
-    connecting a websocket, and `continuity_block` picks it up. Normally, not
-    always - a slow Telegram (`telegram.py` allows each request 40 s) can push
-    `_log` past the connect, and the session then opens without the line in its
-    context and the owner's reply answers nothing. Left as a race rather than
-    fixed by reordering `deliver`: logging before the route is known would put an
-    utterance that reached nobody into the log and the silence clock and then
-    delete its row, which is a hygiene-rule-1 violation (PLAN 4.2) and a worse
-    failure than a rarely-missing continuity block (PR #115 review).
+    PR #115 built it the other way round and argued that `opening_text` is a prompt
+    the model *answers*, so the line would come out as a paraphrase and the sentence
+    the judge length-capped and refused for URLs would not be the sentence the room
+    heard. That argument was never measured, and it was wrong:
+    `evals/proactive_verbatim_spike.py` (8 live sessions per cell) puts a plain
+    instruction at **exact 0/8** and `SPEAK_VERBATIM` at **8/8**, and the same again
+    after the nonce fence went in - 0/16 against 16/16 over two runs. The 0/8 is not
+    paraphrase either: the model says the line and then adds a question of its own,
+    which `SPEAK_VERBATIM` forbids by name. What that measurement does *not* cover -
+    the far harder prompt production actually sends around it - is written out in
+    `SPEAK_VERBATIM`'s own docstring, and nobody has measured that.
 
-    `IDLE_TIMEOUT_SECONDS` bounds the cost at
-    30 seconds of silence, which is what makes this affordable on a per-minute
-    session that may well go unanswered.
+    Note what is *not* at risk, and was overstated in that PR: the search titles
+    never reach a voice session at all (they exist only in the judge's prompt), so
+    the model cannot speak a pointer it has never seen. What was really at risk is
+    that `proactive_utterances.text` - the row the owner's label attaches to - stops
+    being what was said, which is why the wording is measured and pinned.
 
-    A session is opened only if the line was actually spoken. Listening for an
-    answer to something the room never heard is the same billed minute for none of
-    the reason.
+    `/usr/bin/say` stays as the fallback, for an install with voice off and for a
+    session that never played anything - guarded on whether audio was handed to the
+    player (`on_spoke`, and see what it can and cannot tell in `_voice_attempts`)
+    rather than on whether an exception was raised.
+
+    **The session knows what was said because it said it**, which is what makes the
+    ordering here different from PR #115's. There, `deliver` ran `_say` -> `_send`
+    -> `_log` and the log row raced this function's websocket connect for a place in
+    `continuity_block`. Now the line is this session's own first turn, so nothing
+    has to be carried into its context at all - and `_log` no longer even tries to
+    get there first: `_say` does not return until `note_spoke` answers the future,
+    which happens once the line is playing. The row lands during the conversation
+    rather than before it, and the only thing that depended on the old order - the
+    session knowing what it had just said - is now structural.
+
+    That row is also why the session is opened with `opening_already_logged=True`.
+    `_log` writes the sentence as `session_kind="proactive"`; the transcript of the
+    turn that speaks it would be a second copy, filed as `voice`, and
+    `daemon/memory/store.py`'s three M3 readers select exactly
+    `session_kind IN ('interactive', 'voice')` so that the daemon's own speech does
+    not reset the 12-hour silence clock it is measured against.
+
+    `IDLE_TIMEOUT_SECONDS` bounds the cost at 30 seconds of silence, which is what
+    makes this affordable on a per-minute session that may well go unanswered.
     """
+    from daemon.voice.conversation import speak_verbatim
+
     text, future = taken
     spoke = False
-    try:
-        from daemon.proactivity.speaker import LocalSpeaker
 
-        speaker = LocalSpeaker()
+    def note_spoke() -> None:
+        """The room has heard the line. Answer the caller now, not at the end."""
+        nonlocal spoke
+        spoke = True
+        # Here rather than after the conversation, because the conversation has no
+        # total cap: `VoiceConversation._receive` reschedules its idle budget per
+        # audio item, so a real exchange plus the closing 30 s of silence runs past
+        # `mic_floor.REPLY_CEILING_SECONDS`. Waiting would have `request` log a
+        # broken contract and return `not-spoken`, and the row would then record
+        # `route='telegram'`, `modality='text'` for a line the owner heard in her
+        # voice and answered aloud - the same verdict-and-outcome mismatch the
+        # ceiling exists to close. Answering now also lets `deliver` finish while
+        # she is still talking, so the Telegram copy and its label buttons arrive in
+        # seconds rather than minutes, and the proactive tick stops being blocked
+        # for the length of a conversation under `max_instances=1`.
+        mic_floor.answer(future, True)
+
+    try:
         try:
-            spoke = await speaker.say(text)
-        finally:
-            await speaker.aclose()
-    except Exception:
-        # Never raises into the wake loop: a failed line costs the utterance its
-        # speaker, and `mic_floor.request` is already falling back to the channel.
-        # Raising here would cost the round, and a round is the microphone.
-        logger.exception("wake: could not speak a proactive line")
+            await run_voice(
+                settings,
+                # Fenced under a fresh nonce, not `.format`ted here: this is the
+                # judge's reply, and it is about to enter a model that holds this
+                # install's tools. See `speak_verbatim`.
+                opening_text=speak_verbatim(text, secrets.token_hex(4)),
+                shared=shared,
+                on_spoke=note_spoke,
+                # `deliver` already wrote this sentence down as `proactive`. The
+                # turn that says it must not be written down again as `voice`, or
+                # the daemon speaking resets its own silence clock
+                # (daemon/memory/store.py).
+                opening_already_logged=True,
+            )
+        except Exception:
+            # Never raises into the wake loop. A round is the microphone, so a
+            # failed line costs the utterance its voice and nothing else.
+            logger.exception("wake: the session opened to speak first failed")
+
+        if not spoke:
+            # Nothing reached the room - no voice configured, a socket that never
+            # opened, a session that generated an answer and interrupted itself
+            # before playing any of it. `/usr/bin/say` is the fallback rather than
+            # the first choice because it is a different engine in a different voice
+            # from every answer the owner has ever heard, which is the whole reason
+            # this path changed. Guarded on `spoke` and not on the exception: a
+            # session that played audio and *then* failed has already said the line,
+            # and saying it again is worse than not saying it at all.
+            try:
+                from daemon.proactivity.speaker import LocalSpeaker
+
+                speaker = LocalSpeaker()
+                try:
+                    spoke = await speaker.say(text)
+                finally:
+                    await speaker.aclose()
+            except Exception:
+                logger.exception("wake: could not speak a proactive line")
     finally:
-        # Owed unconditionally - `mic_floor.request` is sitting on this future, and
-        # dropping it turns its fallback into a ten-second delay for no reason.
+        # Owed on *every* path, which is why this is a `finally` and not a statement
+        # after an `except Exception` that cannot catch a `CancelledError` (PR #115;
+        # `daemon/mic_floor.py` says so in three places and this is the code those
+        # sentences are about). A no-op when `note_spoke` already answered it -
+        # `answer` checks. `request` is sitting on this future, and dropping it
+        # turns its fallback into a two-and-a-half-minute stall.
         mic_floor.answer(future, spoke)
 
-    if not spoke:
-        return
-    logger.info("wake: spoke first; listening for an answer")
-    try:
-        await run_voice(settings, shared=shared)
-    except Exception:
-        logger.exception("wake: the session opened after speaking first failed")
     # Same handover the wake path takes, for the same reason: let the session's
     # Voice-Processing unit finish releasing the microphone before the next round
-    # opens a fresh capture on it. See WAKE_REARM_SETTLE_SECONDS.
+    # opens a fresh capture on it. See WAKE_REARM_SETTLE_SECONDS. Unconditional
+    # because a session is now opened on every path through this function, even the
+    # ones where it never gets as far as the device.
     await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
 
 

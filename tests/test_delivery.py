@@ -396,8 +396,12 @@ async def test_no_listener_falls_through_to_the_speaker(store: Store, data_dir: 
 
 async def test_not_spoken_does_not_go_around_the_wake_loop(store: Store, data_dir: Path) -> None:
     """The other half of the distinction: a wake loop that took the line and could
-    not say it still *has* the microphone, so reaching for the speaker here would
-    be refused anyway - and on reasoning that would be wrong the day it was not."""
+    not say it is still the one in charge, so reaching for the speaker here would be
+    a second attempt at what just failed - and it would race the gate the wake loop
+    is already rebuilding (`ProactiveDelivery._say`).
+
+    Not "it still has the microphone": `daemon/mic_floor.py` retracts that reading
+    explicitly, and the reasons that survive it are the two above."""
     speaker = FakeSpeaker()
 
     async def floor(text: str) -> str:
