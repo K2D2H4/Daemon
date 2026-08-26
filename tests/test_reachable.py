@@ -44,17 +44,15 @@ PENDING_TASKS = {
 }
 
 PENDING_CLASSES: dict[str, str] = {
-    # Empty. `LocalSpeaker` was the last entry and closing it is what M3b is: the
-    # thing that speaks at the machine now exists and `app.build_proactive_tick`
-    # constructs it.
-    #
-    # And it stays empty through the tool-grant work, which is worth writing down
-    # because that work *is* unreachable and this dict cannot say so: it is not a
-    # class. A grant is rows plus methods on `Store`, which `app.py` already
-    # constructs - so `_constructed` finds it and reports the whole thing wired. The
+    # Empty from `LocalSpeaker` (closed at M3b: the thing that speaks at the
+    # machine now exists and `app.build_proactive_tick` constructs it) through the
+    # tool-grant work below - worth writing down because that work *is*
+    # unreachable and this dict cannot say so on its own: it is not a class. A
+    # grant is rows plus methods on `Store`, which `app.py` already constructs -
+    # so `_constructed` finds it and reports the whole thing wired. The
     # `tool_grant` entries in `PENDING_WIRING` below are the both-directions
-    # declaration instead. Same blind spot `WakeGate`'s comment describes: this file
-    # asks whether something *calls* a name, never with what.
+    # declaration instead. Same blind spot `WakeGate`'s comment describes: this
+    # file asks whether something *calls* a name, never with what.
     #
     # The voice tool frame was the other half of that, until PR-2b. `send_tool_response`
     # was declared in `PENDING_WIRING`, not here, because `GeminiLiveSession(tools=...)`
@@ -63,6 +61,37 @@ PENDING_CLASSES: dict[str, str] = {
     # routes a spoken tool call through `Companion.run_tools` and answers it with
     # `send_tool_response`, and `daemon/app.py`'s `run_voice` offers the session the
     # owner's tool specs, pinned to `allowlist`.
+    #
+    # Not empty any more. Face lip-sync (MuseTalk, `daemon/face_lipsync/*`, branch
+    # `claude/face-lipsync-phase2`) built five classes and nothing under `daemon/`
+    # constructs any of them - wiring them in (`daemon/app.py`, the PCM sink, the
+    # MJPEG transport, the config switch) is deliberately a second, not-yet-written
+    # plan; `docs/superpowers/plans/2026-08-26-face-lipsync-engine.md` is the one
+    # that built these five. Face lip-sync sits outside docs/PLAN.md's M0-M5
+    # roadmap (§8.2) entirely, so there is no milestone letter to give it yet -
+    # the reason strings below say that plainly rather than inventing one.
+    "LipsyncEngine": (
+        "the face lip-sync wiring plan (2026-08-26-face-lipsync-engine.md's "
+        "sequel, unwritten; not on the M0-M5 roadmap) - the model protocol "
+        "`app.py` would build an implementation behind"
+    ),
+    "Cache": (
+        "the face lip-sync wiring plan (same plan as LipsyncEngine above; not on "
+        "the M0-M5 roadmap) - the driving-clip handle its offline loader step "
+        "would produce"
+    ),
+    "PcmRing": (
+        "the face lip-sync wiring plan (same plan as LipsyncEngine above; not on "
+        "the M0-M5 roadmap) - fed by the PCM sink it adds to SpeechClock"
+    ),
+    "Slot": (
+        "the face lip-sync wiring plan (same plan as LipsyncEngine above; not on "
+        "the M0-M5 roadmap) - read by the MJPEG transport it adds"
+    ),
+    "Renderer": (
+        "the face lip-sync wiring plan (same plan as LipsyncEngine above; not on "
+        "the M0-M5 roadmap) - the render loop its config switch would start"
+    ),
 }
 
 PENDING_WIRING = {
