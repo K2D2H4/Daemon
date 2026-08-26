@@ -1228,6 +1228,7 @@ async def test_the_exchange_lands_in_the_markdown_log(
     """docs/PLAN.md 8.2, M1a gate: message it, it answers, and the exchange is in
     memory/log/YYYY-MM-DD.md. Everything but the channel is real here."""
     from daemon.clock import now
+    from daemon.memory.log import local_date
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
 
@@ -1247,7 +1248,10 @@ async def test_the_exchange_lands_in_the_markdown_log(
         channel, gateway_for(fake_provider), Companion(memory, data_dir=data_dir)
     ).run()
 
-    today = f"{now():%Y-%m-%d}.md"
+    # local_date, not a UTC strftime: the writer names the file by the owner's
+    # calendar day, so a UTC-formatted expectation is wrong for the nine hours a
+    # day KST runs ahead of UTC - and longer in zones further east.
+    today = f"{local_date(now())}.md"
     logs = sorted(p.name for p in (data_dir / "memory" / "log").glob("*.md"))
     assert logs == [today]
     written = (data_dir / "memory" / "log" / today).read_text(encoding="utf-8")

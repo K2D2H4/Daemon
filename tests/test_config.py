@@ -815,6 +815,39 @@ def test_a_budget_of_zero_is_allowed_as_a_way_to_silence_it() -> None:
     )
 
 
+def test_the_proactive_budget_is_five_a_day_ninety_minutes_apart() -> None:
+    """The owner asked for 3-4 a day. The budget was never what stopped it - 8/day
+    against 0 actual utterances - but a generator that can always find material
+    needs a real ceiling where one that fired three times a week did not.
+
+    `make_settings` rather than a bare `Settings()` as task-4-brief.md's own
+    snippet has it: `tests/conftest.py`'s autouse `no_real_configuration` chdirs
+    every test into an empty `tmp_path` and strips `DAEMON_*` from the process
+    environment specifically so a developer's real `.env` (which does set
+    DAEMON_PROVIDER) cannot decide a test's result - so an un-isolated
+    `Settings()` here finds no provider and raises ConfigError before either
+    assertion runs, in this suite though not necessarily in the one the brief was
+    written against."""
+    settings = make_settings(provider="ollama")
+
+    assert settings.proactive_daily_budget == 5
+    assert settings.proactive_cooldown_minutes == 90
+
+
+def test_topic_is_a_validatable_kind_name_with_no_budget_ceiling() -> None:
+    """`PROACTIVE_KINDS` validates kind *names*; `proactive_kind_budgets` allocates
+    per-kind *ceilings*. `topic` belongs in the first (an owner naming it in
+    DAEMON_PROACTIVE_KIND_BUDGETS for some other kind must not be rejected as
+    unknown) and deliberately not in the second (the owner rejected a `topic`
+    quota as artificial - ADR 0015)."""
+    from daemon.config import PROACTIVE_KINDS
+
+    assert "topic" in PROACTIVE_KINDS
+    settings = make_settings(provider="ollama", proactive_kind_budgets={"topic": 1})
+    assert settings.proactive_kind_budgets == {"topic": 1}
+    assert "topic" not in Settings(_env_file=None, provider="ollama").proactive_kind_budgets
+
+
 # --- tool use ---------------------------------------------------------------
 
 

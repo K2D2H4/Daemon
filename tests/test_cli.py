@@ -1259,6 +1259,30 @@ def test_reflect_with_nothing_to_do_says_so(
     assert "nothing to reflect on" in capsys.readouterr().out
 
 
+def test_reflect_names_the_escape_hatch_when_only_today_is_pending(
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`catch_up()` drops today unconditionally (still being written to), so a
+    day with only today's log also returns no results - the same empty list as
+    the "nothing logged at all" case above. The old message ("no day has a log
+    without a reflection already") was false on exactly this common day; the
+    fix names why today does not count and how to force it anyway.
+    """
+    from daemon import clock
+    from daemon.memory import log
+
+    reflection_seam()
+    _logged_day(data_dir, log.local_date(clock.now()))
+
+    assert cli.main(["reflect"]) == 0
+    out = capsys.readouterr().out
+    assert "nothing to reflect on" in out
+    assert "no day has a log without a reflection already" not in out
+    assert "daemon reflect --date" in out
+
+
 @pytest.mark.parametrize(
     ("reply", "fail", "status"),
     [("죄송해요, 잘 모르겠어요", False, "unparseable"), ("", True, "unavailable")],
@@ -1956,3 +1980,21 @@ def test_reflect_says_how_much_came_off_a_tool_rather_than_the_conversation(
     assert cli.main(["reflect", "--date", "2026-08-03", "--force"]) == 0
 
     assert "1 from tool(s)" in capsys.readouterr().out
+
+
+def test_doctor_names_topic_as_the_uncapped_sixth_kind(data_dir: Path) -> None:
+    """Whole-branch review: `_proactivity_check` used to build `kinds` only from
+    `settings.proactive_kind_budgets.items()`, which has no `topic` entry by
+    design (`config.py`: the owner rejected a per-kind quota for it as
+    artificial) - so `daemon doctor` showed five capped kinds and never
+    mentioned the uncapped sixth, leaving a real capability invisible
+    (CONTRACTS rule 12)."""
+    (data_dir / "persona").mkdir()
+    (data_dir / "persona" / "seed.md").write_text("씨앗", encoding="utf-8")
+    settings = Settings(
+        _env_file=None, DAEMON_DATA_DIR=str(data_dir), DAEMON_PROACTIVE_ENABLED=True
+    )
+
+    check = cli._proactivity_check(settings)
+
+    assert "topic uncapped" in check.detail

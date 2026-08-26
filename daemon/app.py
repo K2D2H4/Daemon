@@ -41,9 +41,9 @@ from daemon.llm.base import Provider
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
 from daemon.memory.base import MemoryWriter, Recall
-from daemon.persona.evolve import PersonaEvolution
+from daemon.persona.evolve import EvolutionResult, PersonaEvolution
 from daemon.proactivity.tick import ProactiveTick
-from daemon.reflection import Reflection
+from daemon.reflection import Reflection, Result
 from daemon.tasks import Task
 
 if TYPE_CHECKING:  # the wake gate, used only in the signatures below
@@ -106,6 +106,19 @@ PROACTIVE_TICK_MINUTES = 5
 """docs/PLAN.md 6.1's tick. Deterministic work only, unless a candidate is due and
 passes the gate - so the cost of the interval is a few sqlite reads and three
 subprocess probes, not a model call."""
+
+# A `PROACTIVE_TOOLS_BUILD_TIMEOUT` used to live here, wrapping this module's own
+# `_build_tools` call in `asyncio.wait_for` so a wedged MCP server could not stop
+# the scheduler (`_proactive_tick` is registered `max_instances=1`, so a tick that
+# never returns is every later tick silently skipped). The PR #113 review showed it
+# made the failure worse, not better: `_build_tools` constructs the bridge *inside*
+# the awaited coroutine, and `McpBridge._bring_up` opens each server in a detached
+# task, so cancelling the caller left every already-connected stdio child running
+# with nothing holding a reference that could ever close it. The ceiling now sits
+# where the task owning the transport can actually be cancelled -
+# `_ServerLink.open` in `daemon/tools/mcp.py`, under `STARTUP_TIMEOUT` - which also
+# bounds the lifespan's own build and every other `_build_tools` caller, not just
+# this one.
 
 REFLECT_HOUR = 4
 """Local hour for the nightly pass. Late enough that the day is over, early enough
@@ -249,6 +262,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # corrupting the M4 log clock (docs/PLAN.md 8.1). Whoever acquires it second finds
     # the day's artifact/diary already written and skips.
     catchup_lock = asyncio.Lock()
+    # Exposed so the admin's "run now" buttons take the very same lock. Without
+    # this they would be a third writer beside the cron and the boot task, and the
+    # comment above says what two `run(date)` for one day costs.
+    app.state.catchup_lock = catchup_lock
     # Local time, not UTC: "overnight" is a fact about the person asleep next to
     # the machine, and a UTC 04:00 lands mid-afternoon in KST. The 5-minute
     # proactivity tick (M3) lands here too.
@@ -288,11 +305,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Registered only when the user asked for it. A job that wakes every five
         # minutes to decide against speaking is cheap but not free, and its absence
         # is a clearer statement of "off" than a disabled job that still fires.
+        #
+        # `_get_lifespan_bridge` is a closure, not `app.state.mcp` itself:
+        # `scheduler.add_job`'s `args` are captured now, before the rest of this
+        # function has necessarily built `app.state.mcp` (it is set further down,
+        # only once `io` succeeds) - so the job needs something that reads the
+        # attribute fresh on every fire, not its value at registration time. Every
+        # fire after that reuses whatever live bridge the lifespan is currently
+        # holding instead of `_proactive_tick` connecting and tearing down every
+        # configured MCP server itself, every five minutes (whole-branch review;
+        # see `build_proactive_tick`'s `bridge` parameter).
+        def _get_lifespan_bridge() -> Any:
+            return getattr(app.state, "mcp", None)
+
         scheduler.add_job(
             _proactive_tick,
             "interval",
             minutes=PROACTIVE_TICK_MINUTES,
-            args=[settings],
+            args=[settings, _get_lifespan_bridge],
             id="proactivity",
             max_instances=1,
             coalesce=True,
@@ -825,7 +855,7 @@ def open_store(settings: Settings) -> Iterator[Any]:
 
 
 async def build_proactive_tick(
-    settings: Settings, *, speak: bool = False
+    settings: Settings, *, speak: bool = False, bridge: Any = None
 ) -> tuple[ProactiveTick, Callable[[], Awaitable[None]]]:
     """A tick and the coroutine that releases what it holds.
 
@@ -837,6 +867,24 @@ async def build_proactive_tick(
 
     The speaker is built only when the user asked for it *and* the platform can do
     it. Everything else degrades to Telegram, which is the safe direction.
+
+    `bridge`, when given, is a live MCP bridge this call does **not** own - the
+    resident's `app.state.mcp`, connected once by `_lifespan` and closed only at
+    shutdown. `_proactive_tick` passes it on every scheduled fire so a tick reuses
+    the connections already up instead of connecting and tearing every configured
+    server down 288 times a day (whole-branch review: `_build_tools` unconditionally
+    called `bridge.start(registry)`, a stdio child process per server, then
+    `bridge.aclose()` at the end of the very same tick). `None` - the default, and
+    what `daemon proactive` passes, since the CLI runs with no lifespan and no
+    `app.state` to reuse at all - falls back to building, and owning, and later
+    closing, a bridge of its own. A wedged MCP server costs this tick rather than
+    the scheduler, but the ceiling is not here: it is in `_ServerLink.open`
+    (`daemon/tools/mcp.py`), per server, where the task that owns the transport
+    can be cancelled. So this call is bounded by roughly the server count times
+    `STARTUP_TIMEOUT` rather than by any one number - on a multi-server install it
+    can outrun `PROACTIVE_TICK_MINUTES`, which `coalesce=True` absorbs by skipping
+    a round. What `max_instances=1` needs is that the job always *returns*, and
+    that is what moving the timeout down a level bought.
     """
     from daemon.fs import harden_existing
     from daemon.memory.store import Store
@@ -866,7 +914,61 @@ async def build_proactive_tick(
         gateway = LLMGateway(
             providers, settings.routing_table(), fallback=settings.fallback_route()
         )
-        judge = Judge(gateway, data_dir=settings.data_dir)
+
+        # The `topic` candidate's one search (ADR 0015) goes through this bridge,
+        # never through `tools/policy.py:decide` - it calls `MCPBridge.call`
+        # directly, so `tools_mode`'s own handling of `off` (ToolPolicy refusing
+        # every guarded tool) never sees this call and cannot stop it by itself.
+        # Rule 10 forbids the *model* choosing and running a tool on a non-owner
+        # turn; a fixed, code-issued, read-only search is the thing ADR 0015 says
+        # is not that - so `tools_enabled=false` would already be a defensible
+        # place to stop.
+        #
+        # This wiring goes one step further and also withholds the bridge when
+        # `tools_mode == "off"`, even though nothing in ADR 0015 requires it.
+        # Reasoning: `off` is the setting an owner reaches for to mean "nothing
+        # this daemon does reaches outside this conversation without me asking",
+        # and proactivity is the one channel where that promise matters most - an
+        # utterance that was never asked for, arriving in Telegram or out of the
+        # laptop speaker in a voice the owner trusts. Honouring the letter of the
+        # ADR (only `tools_enabled` gates it) while ignoring the mode the owner
+        # actually set because this path is technically outside the policy it
+        # governs is exactly the kind of capability-nobody-was-asked-about state
+        # CONTRACTS rule 12 exists to prevent. `full`, `ask` and `allowlist` all
+        # leave tool use switched on in spirit, so those three still get the
+        # bridge; only `off` (and the master switch) withhold it.
+        #
+        # With no bridge, `Judge` drops every `topic` candidate and the other
+        # four generators are unaffected - the same degrade path a missing or
+        # unconfigured MCP server already takes.
+        tick_bridge = None
+        if settings.tools_enabled and settings.tools_mode != "off":
+            if bridge is not None:
+                # Reused, owned by the caller - never added to `closers`. Closing
+                # a bridge this tick did not build would tear down every MCP
+                # server the rest of the running app depends on the moment this
+                # one tick ends, orphaning `app.state.mcp` for everything else
+                # that reaches for it until the next full restart.
+                tick_bridge = bridge
+            else:
+                # No `wait_for` around this: a server that hangs on connect is
+                # bounded inside `_ServerLink.open`, in the task that owns the
+                # transport and can therefore be cancelled cleanly. Wrapping the
+                # call here instead orphaned the children it had already started
+                # (see the note on the removed `PROACTIVE_TOOLS_BUILD_TIMEOUT`).
+                tools_runner, tick_bridge, _tools_status = await _build_tools(
+                    settings, store
+                )
+                if tools_runner is not None:
+                    closers.append(tools_runner.aclose)
+                if tick_bridge is not None:
+                    # A stdio MCP server is a child process - one left running is
+                    # an orphan per tick, the same reason the app lifespan closes
+                    # its own bridge ahead of the store (see `_lifespan` above).
+                    # Only reached on this, the "this tick built its own" branch -
+                    # a reused bridge is never closed here (see above).
+                    closers.append(tick_bridge.aclose)
+        judge = Judge(gateway, data_dir=settings.data_dir, bridge=tick_bridge)
 
         channel = None
         try:
@@ -977,7 +1079,9 @@ async def build_persona_evolution(
     )
 
 
-async def _proactive_tick(settings: Settings) -> None:
+async def _proactive_tick(
+    settings: Settings, get_bridge: Callable[[], Any] | None = None
+) -> None:
     """The five-minute round. Catches everything, for the same reason the reflection
     tick does: a job that raises inside APScheduler is logged once and then the
     schedule carries on, which reads as a working loop that has silently decided
@@ -985,9 +1089,18 @@ async def _proactive_tick(settings: Settings) -> None:
 
     Logged at INFO even when nothing happened, because "it stayed silent" is the
     output people need to be able to check.
+
+    `get_bridge`, when given, is called fresh on every fire to read whatever the
+    lifespan's `app.state.mcp` currently is - a callable rather than the bridge
+    itself, because `scheduler.add_job` captures its `args` once at registration
+    time, before `_lifespan` has necessarily finished building `app.state.mcp`
+    (see `_lifespan`'s own registration call). `None` (the default, and what every
+    test constructing this function directly gets) means `build_proactive_tick`
+    builds its own bridge, exactly as it always has.
     """
+    bridge = get_bridge() if get_bridge is not None else None
     try:
-        tick, close = await build_proactive_tick(settings, speak=True)
+        tick, close = await build_proactive_tick(settings, speak=True, bridge=bridge)
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
         logger.error("proactive tick could not start: %s", exc)
         return
@@ -1018,29 +1131,59 @@ async def _proactive_tick(settings: Settings) -> None:
     )
 
 
+async def run_reflection_now(
+    settings: Settings, lock: asyncio.Lock | None
+) -> list[Result]:
+    """Reflect on every unreflected day, and *raise* if it could not.
+
+    The opposite contract from `_reflect_tick`, on purpose. A scheduled job that
+    raises inside APScheduler stops being scheduled, so the tick swallows. A
+    button press has a person waiting for the answer, and swallowing there would
+    report success for a pass that never reached the model.
+
+    `lock` is `app.state.catchup_lock`: the same one the cron and the boot task
+    take, because this is a third writer of the same append-only artifact.
+    """
+    reflection_pass, close = await build_reflection(settings)
+    try:
+        async with lock if lock is not None else nullcontext():
+            return await reflection_pass.catch_up()
+    finally:
+        with suppress(Exception):
+            await close()
+
+
+async def run_persona_evolution_now(
+    settings: Settings, lock: asyncio.Lock | None, *, force: bool = False
+) -> EvolutionResult:
+    """Run the weekly pass now, and raise if it could not. Same split as
+    `run_reflection_now`, same reason.
+
+    `lock` is `app.state.catchup_lock` here too: two `run()` in one week would
+    both write the week's diary and re-consume observations.
+    """
+    evolution, close = await build_persona_evolution(settings)
+    try:
+        async with lock if lock is not None else nullcontext():
+            return await evolution.run(force=force)
+    finally:
+        with suppress(Exception):
+            await close()
+
+
 async def _reflect_tick(settings: Settings, lock: asyncio.Lock | None = None) -> None:
     """The scheduled pass. Catches everything: a job that raises inside
     APScheduler is logged once and then the schedule carries on, which reads as a
     working reflection loop that has silently done nothing for a month.
 
-    `lock`, when passed, serialises the actual `catch_up` against the boot task
-    (`_boot_catchup`) running the same pass: both walk the unreflected days, and two
-    `run(date)` for one day double-write its append-only artifact and observations.
-    A lock-less call (`lock=None`) still works via `nullcontext`."""
+    The work itself is `run_reflection_now`, which raises - the admin's button
+    needs the failure. This wrapper is the swallowing half.
+    """
     try:
-        reflection, close = await build_reflection(settings)
+        results = await run_reflection_now(settings, lock)
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
-        logger.error("reflection tick could not start: %s", exc)
-        return
-    try:
-        async with lock if lock is not None else nullcontext():
-            results = await reflection.catch_up()
-    except Exception as exc:  # noqa: BLE001
         logger.error("reflection tick failed: %s", exc)
         return
-    finally:
-        with suppress(Exception):
-            await close()
     for result in results:
         logger.info(
             "reflection %s: %s (%d message(s) -> %d fact(s), %d entity(ies), %d observation(s))%s",
@@ -1056,34 +1199,17 @@ async def _reflect_tick(settings: Settings, lock: asyncio.Lock | None = None) ->
 
 async def _persona_tick(settings: Settings, lock: asyncio.Lock | None = None) -> None:
     """The weekly persona-evolution pass. Catches everything, same reason as
-    reflection and the proactive tick: a job that raises inside APScheduler is
-    logged once and then the schedule carries on, which reads as a working
-    weekly pass that has silently done nothing for months.
+    reflection and the proactive tick.
 
     Logged at INFO even when the pass was skipped, because "not enough
     observations yet" and "already ran this week" both have to be visible
-    without opening sqlite - the same reasoning as the reflection tick's log
-    line.
-
-    `lock`, when passed, serialises the actual `run` against the boot task the
-    same way the reflection tick does: two `run()` in one week would both write
-    the week's diary and re-consume observations. A lock-less call (`lock=None`)
-    still works via `nullcontext`.
+    without opening sqlite.
     """
     try:
-        evolution, close = await build_persona_evolution(settings)
+        result = await run_persona_evolution_now(settings, lock)
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
-        logger.error("persona evolution tick could not start: %s", exc)
-        return
-    try:
-        async with lock if lock is not None else nullcontext():
-            result = await evolution.run()
-    except Exception as exc:  # noqa: BLE001
         logger.error("persona evolution tick failed: %s", exc)
         return
-    finally:
-        with suppress(Exception):
-            await close()
 
     logger.info(
         "persona evolve %s: %s (%d observation(s) read -> %d proposed, %d added, "

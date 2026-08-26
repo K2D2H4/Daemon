@@ -1,4 +1,4 @@
-# 0015 — The neutral moment, not the matched pose
+# 0017 — The neutral moment, not the matched pose
 
 **Status:** accepted · 2026-08-26 · measured
 

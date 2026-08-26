@@ -22,7 +22,7 @@ Two lookups, both offline, both written to `<data_dir>/face/transitions.json` by
 **That order - wait first, match second - is the decision, and it was originally
 the other way round.** Why, what the measurements were, and why no amount of
 tuning closes the gap pose matching leaves, are in
-[ADR 0015](../docs/adr/0015-the-neutral-moment-not-the-matched-pose.md); the
+[ADR 0017](../docs/adr/0017-the-neutral-moment-not-the-matched-pose.md); the
 constants below each carry the number that set them.
 
 The numbered rules cited below are Task 9's four in
@@ -118,7 +118,7 @@ was barely distinguishable from LAMBDA=0.
 **The limit this sweep exposes matters more than the value it picked.** Even
 at LAMBDA=300, median cosine only reaches 0.16 - across every weight tried,
 matched frames have essentially uncorrelated motion. No larger LAMBDA fixes
-this; the ceiling is structural, not a tuning problem (ADR 0015 §2)."""
+this; the ceiling is structural, not a tuning problem (ADR 0017 §2)."""
 
 NEUTRAL_THRESHOLD_FRACTION = 0.20
 """How close a frame must be to its own clip's frame 0 to count as "near
@@ -127,7 +127,7 @@ departure (the largest mean-squared distance any of its frames reaches from
 frame 0), not an absolute distance, since clips differ in how far they stray.
 
 Measured at 0.15 and 0.25 of peak departure against all twelve of the owner's
-real clips (ADR 0015 §3): the resulting wait times (median 0s,
+real clips (ADR 0017 §3): the resulting wait times (median 0s,
 p90 well under a couple of seconds for every loop clip but flourish_arms)
 barely moved between the two, so the choice inside that band is not load-
 bearing. 0.20 is the midpoint of the two endpoints actually measured, not a
@@ -156,7 +156,7 @@ def build_table(face_dir: Path) -> dict[str, Any]:
     row, column and `neutral` entry it would have appeared in (rule 4) - there
     is no interpolation or substitution for a missing clip, only omission.
 
-    `version` is 3 as of the neutral-wait decision (ADR 0015 §3): earlier
+    `version` is 3 as of the neutral-wait decision (ADR 0017 §3): earlier
     versions carried `match` alone, this one adds `neutral`, so a stale
     version-1 or version-2 `transitions.json` (no `neutral` key at all) needs
     to be distinguishable from a fresh one - the same reasoning version 2 used
@@ -241,7 +241,7 @@ def _seeks(frames_a: np.ndarray, frames_b: np.ndarray) -> list[float]:
 
 def _neutral_buckets(frames: np.ndarray) -> list[bool]:
     """Which `BUCKET`-second slices of `frames`' own timeline are near its
-    own frame 0 (ADR 0015 §3: waiting for the clip's next such moment beats
+    own frame 0 (ADR 0017 §3: waiting for the clip's next such moment beats
     matching pose against an unrelated clip's motion, which twelve
     independently generated clips were never going to share). A slice counts
     as near neutral if any

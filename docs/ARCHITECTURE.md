@@ -487,4 +487,4 @@ One more route, `/face/transitions`, serves a table the page uses to decide
 `<data_dir>/face/transitions.json`, so the route 404s until that has been run
 and the page falls back to cutting at frame 0. Which of its two mechanisms
 leads is the decision worth knowing:
-[ADR 0015](adr/0015-the-neutral-moment-not-the-matched-pose.md).
+[ADR 0017](adr/0017-the-neutral-moment-not-the-matched-pose.md).

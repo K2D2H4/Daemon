@@ -289,6 +289,37 @@ section.on{animation:rise .3s ease both}
 .trow .d{font-size:11.5px;text-align:right;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media(max-width:900px){.trow{grid-template-columns:70px 96px minmax(0,1fr);row-gap:4px}
  .trow .o,.trow .m,.trow .d{grid-column:1/-1;text-align:left}}
+.trow.col{display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+/* A row whose whole line is the disclosure. `.trow`'s own grid has six tracks and
+   pins `.x` to a fixed 110px one with `text-overflow:ellipsis` - right for the
+   60-row Activity log, wrong for facts and observations, which are full Korean
+   sentences and exist to be read. The summary keeps the dense grid with the body
+   in the flexible track; the full text opens underneath. `summary` stays
+   `display:list-item` and the grid lives on a child, so the native disclosure
+   marker still renders - the same affordance the entity and reflection rows use. */
+.trow.det{display:block;padding:0}
+.trow.det>summary{display:grid;grid-template-columns:14px 78px minmax(0,1fr) 110px 150px;
+ gap:12px;align-items:center;padding:11px 16px;cursor:pointer;list-style:none}
+.trow.det>summary::-webkit-details-marker{display:none}
+/* The marker is drawn rather than inherited: `display:grid` on a summary drops the
+   native one, and a block child that kept it would sit on its own line above the
+   row. Same glyphs as the disclosures the entity and reflection rows get for free. */
+.trow.det>summary::before{content:'\25b8';color:var(--tm);font-size:11px}
+.trow.det[open]>summary::before{content:'\25be'}
+.trow.det>pre.well{margin:0 16px 8px}
+.trow.det>.meta{margin:0 16px 12px;font-size:11.5px;color:var(--tf)}
+@media(max-width:900px){.trow.det>summary{grid-template-columns:14px 70px minmax(0,1fr);row-gap:4px}
+ .trow.det>summary .m,.trow.det>summary .t{grid-column:1/-1}
+ /* A full-width row is not on its own enough to stop the clipping: `.trow .m`
+    above still sets nowrap/ellipsis and matches as a descendant. Release those
+    three here so the meta really does show whole - measured clipping at 375px
+    with the wiki-path fact's four trigger phrases. Only then is dropping the
+    repeat below the body honest rather than a way of hiding it twice. */
+ .trow.det>summary .m{white-space:normal;overflow:visible;text-overflow:clip}
+ .trow.det>.meta{display:none}}
+pre.well{background:var(--well);border:1px solid var(--line);border-radius:6px;
+  padding:10px;margin:8px 0 0;overflow-x:auto;white-space:pre-wrap;
+  font-family:var(--mono);font-size:12px;color:var(--tb)}
 
 /* --- mcp ------------------------------------------------------------------ */
 .srow{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--hair);flex-wrap:wrap}
@@ -398,6 +429,8 @@ input:focus,select:focus{border-color:var(--accent);outline:none}
     <button class="nav-item" data-nav="proactive">Proactive<span class="count ok" id="c-proactive"></span></button>
     <button class="nav-item" data-nav="tools">Tools<span class="count" id="c-tools"></span></button>
     <button class="nav-item" data-nav="mcp">MCP<span class="count" id="c-mcp"></span></button>
+    <button class="nav-item" data-nav="memory">Memory<span class="count" id="c-memory"></span></button>
+    <button class="nav-item" data-nav="persona">Persona<span class="count" id="c-persona"></span></button>
     <button class="nav-item" data-nav="chat">Chat test</button>
     <button class="nav-item" data-nav="settings">Settings</button>
   </nav>
@@ -488,6 +521,53 @@ input:focus,select:focus{border-color:var(--accent);outline:none}
     <p class="note" id="mcp-note"></p>
   </section>
 
+  <section id="view-memory">
+    <div><span class="lab">MEMORY</span>
+      <p class="cap" id="memory-summary" style="margin:8px 0 0">—</p></div>
+    <div class="card">
+      <div class="card-head"><span class="card-title">FACTS</span>
+        <span class="right cap" id="fact-count"></span></div>
+      <div id="fact-list"><p class="empty">Loading…</p></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><span class="card-title">ENTITIES</span>
+        <span class="right cap" id="entity-count"></span></div>
+      <div id="entity-list"><p class="empty">Loading…</p></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><span class="card-title">REFLECTION</span>
+        <span class="right"><button class="btn" id="reflect-btn">Reflect now</button></span></div>
+      <div id="reflect-list"><p class="empty">Loading…</p></div>
+    </div>
+    <p class="note" id="memory-note"></p>
+  </section>
+
+  <section id="view-persona">
+    <div><span class="lab">PERSONA</span>
+      <p class="cap" style="margin:8px 0 0;max-width:640px">What she has worked out about dealing with you. She writes <code>learned.md</code>; <code>seed.md</code> is yours and code never writes it.</p></div>
+    <div class="card pad">
+      <div class="card-head"><span class="card-title">ANCHOR</span></div>
+      <div id="anchor-gauge" class="kv"></div>
+      <div id="anchor-files"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><span class="card-title">LEARNED RULES</span>
+        <span class="right cap" id="rule-count"></span></div>
+      <div id="rule-list"><p class="empty">Loading…</p></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><span class="card-title">OBSERVATIONS</span>
+        <span class="right cap" id="obs-count"></span></div>
+      <div id="obs-list"><p class="empty">Loading…</p></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><span class="card-title">EVOLUTION</span>
+        <span class="right"><button class="btn" id="evolve-btn">Evolve now</button></span></div>
+      <div id="diary-list"><p class="empty">Loading…</p></div>
+    </div>
+    <p class="note" id="persona-note"></p>
+  </section>
+
   <section id="view-chat">
     <div class="chatwrap">
       <div><span class="lab">CHAT TEST</span>
@@ -556,7 +636,8 @@ const NAV={overview:{view:'overview'},activity:{view:'activity',filter:'all'},
   // Its own view, not the merged log filtered: `origin` is the column the whole
   // tool policy turns on, and the merged log has no room for it.
   tools:{view:'tools'},
-  mcp:{view:'mcp'},chat:{view:'chat'},settings:{view:'settings'}};
+  mcp:{view:'mcp'},memory:{view:'memory'},persona:{view:'persona'},
+  chat:{view:'chat'},settings:{view:'settings'}};
 const LOG_TITLE={all:'ACTIVITY',proact:'PROACTIVE',tool:'TOOL CALLS',reflect:'REFLECTION',refused:'REFUSED'};
 let NAV_KEY='overview', FILTER='all';
 
@@ -569,6 +650,8 @@ function go(key,{push=true}={}){
   if(spec.view==='activity'){syncFilterChips();renderLog();loadActivity();}
   if(spec.view==='tools')loadToolLog();
   if(spec.view==='mcp')loadMcp();
+  if(spec.view==='memory'){$('#memory-note').textContent='';loadMemory();}
+  if(spec.view==='persona'){$('#persona-note').textContent='';loadPersona();}
   if(push&&location.hash.slice(1)!==key)location.hash=key;
 }
 $$('[data-nav]').forEach(b=>b.addEventListener('click',()=>go(b.dataset.nav)));
@@ -977,6 +1060,179 @@ async function loadToolLog(){
       :'<p class="empty">No tool call has been recorded yet.</p>';
   }catch(e){$('#tool-log').innerHTML=`<p class="empty">${esc(e.message)}</p>`;}
 }
+
+// --- memory & persona: what she knows, and what she learned ------------------
+// Not on the 15s poll: these change once a day and carry ~12KB of markdown.
+// Bodies arrive inlined, so `disclose` never fetches - it only unhides.
+function disclose(label,body,file){
+  // `body==null` covers two different reasons (missing note file, or cut by the
+  // budget/count cap) that the payload does not distinguish per-item - see
+  // mind.py's `_read`/`_bodies`. Naming a specific reason here would be a guess,
+  // so this says only what is true in both cases, and keeps the label (name,
+  // mentions, links, or date/counts) instead of dropping it - a bare file path
+  // for '벨라' told you nothing else about the row.
+  if(body==null)return `<p class="cap muted">${esc(label)} — ${esc(file)} (no body loaded)</p>`;
+  return `<details><summary class="cap">${esc(label)}</summary><pre class="well">${esc(body)}</pre></details>`;
+}
+// One fact or observation. The summary is the dense row; the disclosure holds
+// whatever the summary had to clip. `body` therefore appears twice on purpose,
+// and `meta` only repeats when the caller says it can outgrow its 110px track -
+// a fact's trigger phrases can, an observation's `pending` cannot. Both arrive
+// raw and are escaped here, so no caller has to remember to.
+function detailRow({extra='',chipClass,chip,body,meta,metaClips=false,ts}){
+  return `<details class="trow det${extra}"><summary>`
+    +`<span class="chip ${chipClass}">${esc(chip)}</span>`
+    +`<span class="x">${esc(body)}</span>`
+    +`<span class="m">${esc(meta)}</span>`
+    +`<span class="t">${stamp(ts)}</span>`
+    +`</summary><pre class="well">${esc(body)}</pre>`
+    +(metaClips&&meta?`<p class="meta">${esc(meta)}</p>`:'')
+    +`</details>`;
+}
+function factRow(f){
+  const retired=f.status==='retired';
+  return detailRow({extra:retired?' muted':'',chipClass:retired?'k-refused':'k-reflect',
+    chip:f.importance,body:f.body,ts:f.updated_at,metaClips:true,
+    meta:(f.key||'')+(f.triggers.length?' · '+f.triggers.join(', '):'')});
+}
+function entityRow(e){
+  const head=`${e.name}${e.kind?' · '+e.kind:''} · ${e.mentions} mention(s)`
+    +(e.links.length?' · '+e.links.join(', '):'');
+  return `<div class="trow col">${disclose(head,e.body,e.file)}</div>`;
+}
+function reflectRow(r){
+  const counts=r.status==null?'artifact only'
+    :`${r.status} · ${r.messages_read} msg → ${r.facts} fact(s), ${r.entities} entity(ies), ${r.observations} obs`;
+  return `<div class="trow col">${disclose(`${r.date}  ${counts}`,r.body,r.file)}</div>`;
+}
+async function loadMemory(){
+  try{const m=await api('/admin/api/memory');
+    $('#memory-summary').textContent=
+      `${m.facts_active} fact(s) always injected · ${m.entities_total} entity note(s) · `
+      +`${m.reflections_total} day(s) reflected`
+      // `pending_days` includes today, which `Reflect now` can never clear -
+      // `Reflection.catch_up` drops it unconditionally. Left unexplained, the
+      // count and the button read as contradicting each other on the (common)
+      // day where today is the only entry.
+      +(m.pending_days.length?` · ${m.pending_days.length} day(s) waiting`
+        +' (today is reflected after midnight; `daemon reflect --date` forces it)':'')
+      +' · loads when you open this view';
+    $('#fact-count').textContent=`${m.facts_active} active · ${m.facts_retired} retired`
+      +(m.facts_list_truncated?' · not all facts shown':'');
+    $('#fact-list').innerHTML=m.facts.length?m.facts.map(factRow).join('')
+      :'<p class="empty">Nothing curated yet. Facts land here after a reflection pass.</p>';
+    $('#entity-count').textContent=`${m.entities_total}`
+      +(m.entities_list_truncated?' · not all entities shown':'')
+      +(m.entities_bodies_truncated?' · some notes not loaded':'');
+    $('#entity-list').innerHTML=m.entities.length?m.entities.map(entityRow).join('')
+      :'<p class="empty">No entity notes yet.</p>';
+    $('#reflect-list').innerHTML=m.reflections.length?m.reflections.map(reflectRow).join('')
+      :'<p class="empty">No reflection has run yet.</p>';
+    $('#c-memory').textContent=m.facts_active||'';
+  }catch(e){
+    const msg=`<p class="empty">${esc(e.message)}</p>`;
+    $('#fact-list').innerHTML=msg;$('#entity-list').innerHTML=msg;$('#reflect-list').innerHTML=msg;
+  }
+}
+function ruleRow(r){
+  // `evidence_cited` is what the rule claims; `evidence` is what resolved. A
+  // rebuilt rule (`persona/rules.py rebuild()`) cites nothing at all, which is
+  // not the same fact as every cited id having lost its row - see mind.py's
+  // `one_rule`.
+  const ev=r.evidence.length
+    ? `<pre class="well">${r.evidence.map(o=>`[${o.confidence.toFixed(2)}] ${o.body}`).map(esc).join('\n')}</pre>`
+    : r.evidence_cited
+      ? '<p class="cap muted">No observation row is left for this rule’s evidence.</p>'
+      : '<p class="cap muted">No evidence recorded for this rule.</p>';
+  const head=r.status==='retired'
+    ? `retired ${stamp(r.retired_at)} — ${r.retired_why||''}`
+    : `${stamp(r.created_at)} · ${r.evidence.length} observation(s)`;
+  return `<div class="trow col${r.status==='retired'?' muted':''}">
+    <div class="row"><span class="x">${esc(r.body)}</span>
+      ${r.status==='active'?`<button class="btn" data-forget="${r.id}">Forget</button>`:''}</div>
+    <details><summary class="cap">${esc(head)}</summary>${ev}</details></div>`;
+}
+function obsRow(o){
+  return detailRow({chipClass:'k-reflect',chip:o.confidence.toFixed(2),body:o.body,
+    ts:o.created_at,meta:o.consumed_by==null?'pending':'→ rule '+o.consumed_by});
+}
+async function loadPersona(){
+  try{const p=await api('/admin/api/persona');
+    const a=p.anchor;
+    $('#anchor-gauge').innerHTML=[
+      ['ACTIVE',`${a.active}/${a.max_active}`],
+      ['MAX NEW / WEEK',String(a.max_new_per_cycle)],
+      ['MIN OBSERVATIONS',String(a.min_observations)],
+      ['UNCONSUMED',String(a.unconsumed)],
+      ['LAST RULE',a.last_rule_at?stamp(a.last_rule_at):'never'],
+    ].map(([k,v])=>`<span class="k">${k}</span><span class="v">${esc(v)}</span>`).join('');
+    // `lines` is null, not 0, for a file the budget never got to - see
+    // mind.py's `_file_view`. Omitting the clause instead of printing
+    // "null line(s)" is the fix; `truncated` names the reason.
+    $('#anchor-files').innerHTML=
+      disclose(`seed.md${a.seed.lines==null?'':` · ${a.seed.lines} line(s)`}`
+               +' — yours, code never writes this'
+               +(a.seed.truncated?' · not loaded (budget)':''),
+               a.seed.text,a.seed.file)
+     +disclose(`learned.md${a.learned.lines==null?'':` · ${a.learned.lines} line(s)`}`
+               +' — hers'
+               +(a.learned.truncated?' · not loaded (budget)':''),
+               a.learned.text,a.learned.file);
+    $('#rule-count').textContent=`${p.rules_active} active · ${p.rules_retired} retired`
+      +(p.rules_list_truncated?' · not all retired rules shown':'');
+    $('#rule-list').innerHTML=p.rules.length?p.rules.map(ruleRow).join('')
+      :'<p class="empty">She has not concluded anything yet. Rules need '
+       +`${a.min_observations} observation(s) and a weekly pass.</p>`;
+    $('#obs-count').textContent=
+      `${p.observations_total} · ${p.observations_consumed} consumed`
+      +(p.observations_list_truncated?' · not all observations shown':'');
+    $('#obs-list').innerHTML=p.observations.length?p.observations.map(obsRow).join('')
+      :'<p class="empty">No observations yet.</p>';
+    $('#diary-list').innerHTML=p.diaries.length
+      ?p.diaries.map(d=>`<div class="trow col">${disclose(d.date,d.body,d.file)}</div>`).join('')
+      :'<p class="empty">No evolution pass has written a diary yet.</p>';
+    $('#c-persona').textContent=p.rules_active||'';
+    $$('[data-forget]').forEach(b=>b.addEventListener('click',()=>forgetRule(+b.dataset.forget)));
+  }catch(e){
+    const msg=`<p class="empty">${esc(e.message)}</p>`;
+    $('#rule-list').innerHTML=msg;$('#obs-list').innerHTML=msg;$('#diary-list').innerHTML=msg;
+  }
+}
+async function forgetRule(id){
+  const why=prompt('Why should she stop believing this? (recorded with the rule)');
+  if(why===null)return;
+  if(!why.trim()){$('#persona-note').textContent='A reason is required.';return;}
+  $('#persona-note').textContent='Forgetting…';
+  try{await api('/admin/api/persona/forget',{method:'POST',
+        headers:{'content-type':'application/json'},body:JSON.stringify({id,why})});
+    $('#persona-note').textContent=`Rule ${id} retired.`;
+    await loadPersona();
+  }catch(e){$('#persona-note').textContent=e.message;}
+}
+async function runPass(btn,note,path,done){
+  const b=$(btn);b.disabled=true;$(note).textContent='Running… this makes a model call.';
+  try{const r=await api(path,{method:'POST',
+        headers:{'content-type':'application/json'},body:JSON.stringify({})});
+    $(note).textContent=done(r);
+  }catch(e){$(note).textContent=e.message;}
+  finally{b.disabled=false;}
+}
+$('#reflect-btn').addEventListener('click',()=>runPass(
+  '#reflect-btn','#memory-note','/admin/api/reflect',
+  r=>r.results.length
+    ?r.results.map(x=>`${x.date}: ${x.status} (${x.messages_read} msg → ${x.facts} fact(s), `
+       +`${x.entities} entity(ies), ${x.observations} obs)`).join(' · ')
+    // `catch_up()` (reflection.py) drops today from its backlog unconditionally,
+    // so an empty result never means today got reflected - only that every day
+    // *before* today already has one. Saying "every day with a log" here would
+    // be false on the (common) day where today itself is still pending.
+    :'Nothing to reflect on: every day before today already has a reflection.')
+  .then(loadMemory));
+$('#evolve-btn').addEventListener('click',()=>runPass(
+  '#evolve-btn','#persona-note','/admin/api/persona/evolve',
+  r=>`${r.date}: ${r.skipped||'ran'} (${r.observations_read} observation(s) read → `
+     +`${r.proposed} proposed, ${r.added} added, ${r.retired} retired)`)
+  .then(loadPersona));
 
 // --- chat -------------------------------------------------------------------
 let chatRevert=null;

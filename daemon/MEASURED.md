@@ -231,6 +231,12 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   (A): a tie is not evidence for removing a muzzle that costs six lines and no latency,
   and the task this measurement was for says plainly that changing code because it was
   expected to is worse than reporting no change needed with evidence.
+  **Superseded 2026-08-26 by docs/adr/0016-proactive-default-flips-to-speaking.md.**
+  Both worked examples now answer with a line, so the muzzle this entry argued for
+  keeping no longer exists. Nothing above was overturned - the 2026-08-11 tie stands,
+  and it was never the reason the muzzle came off. What removed it was the owner
+  saying the shape he had objected to was the *demanding* question
+  (`무슨 재밌는 일 없어요?`), not the ordinary check-in the examples were muzzling.
 - **A live-data preview of the type-E generator turned up conversational chaff among
   its own candidates, and the judge caught it without being told to.**
   `association_candidates` (`daemon/proactivity/candidates.py`) quotes the owner's own
@@ -243,6 +249,13 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   filter of its own, but on this model the judge's own content criterion ("구체적인
   사건·감정·기억이 내용으로 적혀 있다") already screens chaff before anyone hears it, so
   nothing in this run argues for adding one now.
+  **The mechanism this conclusion rests on was removed 2026-08-26** (ADR 0016): that
+  content criterion is the clause the flip deleted, so "the judge already screens
+  chaff" stopped being a reason to leave `association_candidates` unfiltered. A
+  narrower rule was carved back out in its place, and re-measured on this same
+  material - a reason built from the owner's command history declines **0/30 spoke**
+  (n=30, `gemini-3.6-flash`, 2026-08-26). The conclusion holds; the thing holding it
+  up is now a named carve-out rather than a general criterion.
 - **The C rhythm was accepted on the machine, not in the suite (2026-08-11).** Every
   routing rule was driven against a live `Reading` from this Mac, with the daemon's
   own microphone hold declared the way the wake listener declares it:
@@ -368,7 +381,11 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   above, all before v0.1.54. **A generator whose reason is nothing but elapsed time
   cannot produce speech**, so the 288 ticks a day that generate one are spending a
   model call to be refused. That is PLAN 6.2's asymmetric default working, and it is
-  also the whole of type C's contribution.
+  also the whole of type C's contribution. **Superseded 2026-08-26** —
+  [docs/adr/0016](../docs/adr/0016-proactive-default-flips-to-speaking.md) flips
+  this: `silence` and `pattern_time` now speak on an elapsed-time-only reason by
+  design, so this bullet's "cannot produce speech" is what the old prompt did, not
+  what the current one does.
 - **Lowering `ASSOCIATION_MIN_AGE_DAYS` was proposed and the measurement killed it
   (2026-08-18).** At floors 7/10/14 days against 884 embedded messages, type E
   surfaced 3/2/0 candidates. What it surfaced at 7 days was the owner's own
@@ -379,6 +396,12 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   similarity is real and the association is worthless, and the judge said so 20/20
   on both. So E's floor is not what stops E; **this install's conversation is almost
   entirely tool commands**, and E quotes owner messages. The constant was left at 30.
+  **Still relevant 2026-08-26, narrowed** —
+  [docs/adr/0016](../docs/adr/0016-proactive-default-flips-to-speaking.md) flips the
+  judge's default to speaking and deleted the clause that produced this 20/20; a
+  narrower clause was carved back out specifically for a quoted line that is an
+  instruction to the daemon, so this finding is expected to still hold, but has not
+  been re-measured against the new prompt.
 - **Type B is starved by the same fact, and its lexicon is not the problem
   (2026-08-18).** 463 owner utterances, **0** matching `_EMOTIONS`. Widening the scan
   to 30 emotion words that are deliberately *not* in the lexicon (피곤·귀찮·실망·후회·
@@ -387,6 +410,34 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   So of the five generators, exactly one (A) can currently produce a reason the judge
   will speak on, which is the shape PLAN 6.2 warns about: a competent assistant
   rather than a companion. That is not a tuning gap.
+  **Both halves of that sentence changed 2026-08-26.** There are now six generators
+  (`topic`, ADR 0015), and `silence` and `pattern_time` speak rather than decline
+  (ADR 0016) - `silence` measured **30/30 spoke, 0/30 demanding shape** (n=30,
+  `gemini-3.6-flash`). The scarcity this entry measured was real and is why both ADRs
+  exist; it is no longer a description of what the judge does.
+- **The proactive search buys content on two entity names out of six, and invented a
+  whole new failure on the other four (2026-08-26).** ADR 0015's reversal test was first
+  run before ADR 0016 flipped the judge's default, so it measured a prompt that no longer
+  ships; the re-run is the number that counts. Live search results for six of this owner's
+  real entities, `gemini-3.6-flash`, n=30, every line hand-audited because
+  `_carries_concrete_fact` scores any Latin run as content and would have passed a
+  contentless opener that merely names the entity. **The predicted failure barely
+  happened**: obvious chaff was still declined with no help from any instruction —
+  `Sendbird` (a job posting, an Instagram page, a salary table) silent 5/5, `ReadyTalk`
+  (`Breakfast is ready talk to ya later.`) silent 5/5, `Kiwi` (the bird, the fruit)
+  silent 5/5. **A different failure did**: `Daemon` returns House of the Dragon's Daemon
+  Targaryen, and 3 of 5 lines asked the owner — whose `Daemon` is this project — whether
+  he was waiting for season 3. Chaff is declined because it reads as chaff; a namesake
+  reads as material, and the model has plenty to say about the wrong subject. Naming the
+  shapes in `topics.render` (a namesake person or character, a same-named product, a
+  dictionary entry for the word) put `Daemon` at 5/5 on the project and 0/5 on the
+  character, and `Kiwi` at 5/5 on the owner's own (it had been silent 5/5 - the
+  same-name rule turns a decline into a usable check-in, not just a wrong line
+  into a right one). Two lessons worth more than the fix:
+  a confidently wrong line is a worse failure mode than an empty one and no instruction
+  to be quiet in general catches it, and **an entity name is a search query only for
+  names the web knows the way its owner does** — for the rest the search is discarded
+  work and the line is an ordinary check-in.
 - **Half-duplex was leaking the daemon's own voice into memory as the owner's words,
   and the tell is that every leak is a *tail* (2026-08-19).** `DAEMON_VOICE_BARGE_IN=
   false` was set and `apple audio: ... echo cancellation on` was in the log, yet
@@ -601,3 +652,66 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   `clientContent` + `inline_data` closes this model with 1007 did not reproduce on a
   correctly-shaped raw payload; it was the library's bug, not the API's, which is again
   the whole reason to ask the socket. `evals/screen_frame_arrival_spike.py`.
+- **Dating a learned rule by its age and observation count was reverted: three
+  independent measurements against the live model found no detectable effect,
+  and the one run that looked significant did not replicate.** The idea
+  (`daemon/persona/loader.py::rule_line`, `e34785d`/`d53be62`/`f7593fc`/
+  `22255b9`/`586d804`, all reverted) was that a rule formed from a single
+  terse-QA exchange should carry less weight in the prompt than one built
+  from many repeated observations, so a stale one-off correction fades while
+  a real, repeatedly-confirmed preference holds. It looked right in the first
+  hand-audited three-arm run (the spike script, n=30 each, removed here but
+  recoverable from `ee2801a`): the stale rule's dominance trended down
+  (17/30 → 13/30) while the real preference held - **30/30 → 28/30, and it
+  never dropped below that in this run or any later one, so the mechanism was
+  never a regression to weigh against. It was inert, not harmful.**
+
+  **Two defects in the probe had to be found before arm 1's number meant
+  anything.** First, its judge demanded a reply clear four clauses at once (no
+  jokes, no affection, no self-disclosure, no question back) to count as
+  "terse", and this persona never clears all four together even while
+  visibly shortening - so it answered "no" unconditionally regardless of
+  which arm was dated. Replacing that with reply length against the two arms'
+  *pooled* median fixed the floor/ceiling problem but created a second one:
+  the two hit-counts became structurally near-complementary (they sum to
+  about n), so a Fisher exact over them was scoring roughly one coin flip
+  about which arm landed on the short side, not a real difference - caught
+  only because an identical second n=30 run reversed the sign (13/30 → 19/30
+  against the first run's 17/30 → 13/30). `ee2801a` replaced it with the two
+  reply-length distributions compared directly: median and mean per arm, a
+  rank-sum test, and a two-sided permutation p-value over 20000 shuffles.
+  That is the metric every number below used.
+
+  With the corrected metric: n=30, the dated arm was shorter (p=0.40); n=60,
+  it was longer (p=0.00065); a second n=60 replication came back shorter
+  again (p=0.34). Pooled, 120 vs 120, the medians are identical at **99.0**
+  (p=0.107). No effect survives pooling, and the single run that cleared
+  conventional significance did not replicate - it was noise a large enough
+  one-off sample can produce, not a real effect too small to see at n=30.
+
+  **Arm 3 (does a manner remark leak from `facts` into `observations` under
+  reflection's old prompt) never reproduced on the real 2026-08-19 incident
+  day: `facts` 0/30 under both the old and new prompt.** So `70c6a37`'s
+  `facts`/`observations` boundary closes a path rarer than the incident that
+  prompted it implied - and it stays anyway, being one paragraph of prompt
+  wording whose cost was not measured: `facts` was 0/30 under both prompts,
+  so the run had no positive `facts` control to weigh a cost against, unlike
+  the dating mechanism it shipped alongside and which this entry retires.
+
+  **A real defect the same hand audit turned up: on 2 of 60 records, the
+  model returned `observations` as a bare list of strings instead of
+  `{"body": ..., "confidence": ...}` objects.** No test caught this - it
+  surfaced only from reading the spike's raw replies by hand - and
+  `reflection.py::_items` treated every such entry as "not an object" and
+  dropped it, discarding that whole night's persona signal silently. Fixed by
+  making `_items` recover a bare string as `body`, falling back to the
+  schema's own defaults for everything else. The `facts`/`observations`
+  boundary above routes more content into `observations`, so this parsing gap
+  gets more consequential, not less.
+
+  **What a retry would need first, if anyone repeats this.** The spike runs
+  all of one arm and then all of the other, so arm is confounded with
+  whatever drifted between the two blocks - model routing, load, anything
+  else that changes over the run's wall-clock span. Every number above
+  inherits that confound. Interleaving the two arms trial-by-trial, not a
+  larger n, is what a retry needs before its p-value means anything either.

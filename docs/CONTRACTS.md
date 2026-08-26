@@ -90,7 +90,11 @@ live-share pump's transport, which has no tool round in it.
    make zero *LLM* calls - same distinction non-negotiable 2 draws, and the same
    allowance: type E's `association_candidates` awaits the embedder every tick,
    which is not a call that thinks. Exactly one LLM call, and only for candidates
-   that already passed the gate.
+   that already passed the gate. (This headline names the call *count*, not what
+   the one call answers when it runs - [ADR 0016](adr/0016-proactive-default-flips-to-speaking.md)
+   changed the judge's own default from declining to speaking without touching
+   this rule's shape: stages 1-2 are still zero calls, stage 3 is still exactly
+   one, only for a candidate the gate already passed.)
 
 8. **Timestamps** are ISO-8601 UTC with `Z`, stored as TEXT. Use one helper,
    do not scatter `datetime.now()` calls.
@@ -109,6 +113,38 @@ live-share pump's transport, which has no tool round in it.
     The offering side lives with the capability rather than in an endpoint so that a
     second endpoint getting tools cannot get them ungated. If you find yourself
     needing an exception, stop and flag it.
+
+    **Split 2026-08-25** (docs/adr/0015-code-may-search-where-the-model-may-not.md):
+    the model still may not choose or run a tool on a non-owner turn - that half is
+    unchanged. What changed is that **deterministic code**, never the model, may
+    issue exactly one read-only search on the proactive path, for a `topic`
+    candidate that already passed the gate (`daemon/proactivity/judge.py` calling
+    `daemon/proactivity/topics.py:search_titles`). The model is offered zero tools
+    either way - `tests/test_judge.py::test_the_judge_is_offered_no_tools` fails if
+    that ever stops being true - and it does not choose the query at call time: the
+    query is `entities.name`, read by code with no model call in between to pick it.
+    That is not a claim that `entities.name` is safe text, and round 4 of this
+    task's own review corrected an earlier draft of this sentence that implied it
+    was: `daemon/reflection.py` writes the column from the reflection model's own reading
+    of the day's conversation log, so it **is** a prior model reply, one level
+    removed. What actually bounds the risk is `daemon/proactivity/judge.py:has_url`
+    running twice: once on the entity name itself, before any search or model
+    call, dropping a `topic` candidate whose entity reads as a pointer right
+    there (round 5, after three rounds tried and failed to build a safe
+    exemption for it); and once on the model's reply, the output check ADR 0015
+    names as its load-bearing defence, because that is the choke point between
+    attacker-controlled search results and something the owner hears. Neither is
+    an assumption that the query is trustworthy because code read it out of a
+    column, and neither is a carve-out that lets a domain-shaped entity be
+    spoken anyway. This path
+    calls `daemon/tools/mcp.py:MCPBridge.call` directly, **bypassing
+    `tools/policy.py:decide` entirely** - it is not subject to `mode=off`, the
+    allowlist, or a standing grant, because it never goes through `ToolRunner` or
+    the policy at all. That is not an oversight to close here: whether the bridge
+    is even passed to the judge when the owner has tools switched off is a decision
+    the wiring task (not this rule) makes explicitly, and it must be made in the
+    open, not discovered later by someone assuming `mode=off` covers every call to
+    the machine.
 
 11. **The tool policy makes no model calls.** Same rule as recall Lane 1 and for a
     different reason: a gate that asks a model whether to open the gate is not a

@@ -34,6 +34,7 @@ from daemon.memory.store import Store
 from daemon.proactivity.base import Candidate
 from daemon.proactivity.candidates import (
     MAX_PER_KIND,
+    TOPIC_TTL_HOURS,
     CandidateReader,
     association_candidates,
     dedup_key,
@@ -42,6 +43,7 @@ from daemon.proactivity.candidates import (
     open_loop_candidates,
     pattern_time_candidates,
     silence_candidates,
+    topic_candidates,
 )
 from daemon.proactivity.judge import MAX_REASON_CHARS
 
@@ -106,6 +108,22 @@ class SqlReader:
             tuple(keys),
         ).fetchall()
         return {row["dedup"] for row in rows}
+
+    def stale_entities(
+        self, limit: int, quiet_since: datetime, raised_since: datetime
+    ) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT e.name, e.updated_at FROM entities e "
+            "WHERE e.updated_at < ? "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM proactive_candidates c "
+            "  WHERE c.kind = 'topic' "
+            "  AND json_extract(c.payload, '$.entity') = e.name "
+            "  AND c.created_at >= ?"
+            ") "
+            "ORDER BY e.updated_at ASC LIMIT ?",
+            (utc_iso(quiet_since), utc_iso(raised_since), limit),
+        ).fetchall()
 
 
 def store_candidate(conn: sqlite3.Connection, candidate: Candidate, *, now: datetime) -> None:
@@ -173,6 +191,12 @@ def said(
         ),
         log_file=f"memory/log/{local_date(at)}.md",
     )
+
+
+def entity_touched(store: Store, name: str, *, at: datetime) -> None:
+    """Write one entity's note through the real schema, last touched `at` - so a
+    test cannot assert an ordering the real `updated_at` column never produced."""
+    store.upsert_entity(name=name, kind=None, file=f"memory/entities/{name}.md", now=at)
 
 
 def test_the_reader_satisfies_the_protocol(reader: SqlReader) -> None:
@@ -688,6 +712,147 @@ async def test_no_recent_conversation_means_no_query(reader: SqlReader) -> None:
 
     assert await association_candidates(recall, reader, now=NOW) == []
     assert recall.queries == [], "no query should have been issued at all"
+
+
+# --- type F: topic -------------------------------------------------------------
+
+
+def test_the_quietest_topic_comes_up_first(store: Store, reader: SqlReader) -> None:
+    """Variety falls out of the ordering rather than out of a quota: pick the
+    entity gone quiet longest. The owner rejected per-kind quotas as artificial
+    and he was right - `config.py` already says the per-kind numbers are
+    ceilings and the total is what binds."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "Sendbird", at=datetime(2026, 8, 1, tzinfo=UTC))
+    entity_touched(store, "Kiwi", at=datetime(2026, 8, 24, tzinfo=UTC))
+    entity_touched(store, "llm-wiki", at=datetime(2026, 8, 10, tzinfo=UTC))
+
+    produced = topic_candidates(reader, now)
+
+    assert [c.payload["entity"] for c in produced] == ["Sendbird", "llm-wiki"]
+    assert all(c.kind == "topic" for c in produced)
+    assert "Sendbird" in produced[0].reason
+
+
+def test_a_topic_candidate_is_not_immortal(store: Store, reader: SqlReader) -> None:
+    """Whole-branch review: `topic_candidates` was the only generator building a
+    `Candidate` with neither `due_at` nor `expires_at`, so an unfired row (the
+    normal outcome with no `tavily` configured - `Judge._topic_block` returns ""
+    and `decide` drops the candidate every time) never expired and came back
+    forever, `tick.py`'s `_rest` pushing it 90 minutes at a time. `due_at=now`
+    matches every other generator except `open_loop`, which alone waits for a
+    future moment; `expires_at` bounds the row the same way the other four are
+    bounded, see `TOPIC_TTL_HOURS`'s docstring for the number."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "Sendbird", at=datetime(2026, 8, 1, tzinfo=UTC))
+
+    candidate = topic_candidates(reader, now)[0]
+
+    assert candidate.due_at == now
+    assert candidate.expires_at == now + timedelta(hours=TOPIC_TTL_HOURS)
+
+
+def test_a_topic_raised_recently_is_not_raised_again(store: Store, reader: SqlReader) -> None:
+    """`Kiwi` was discussed yesterday. Bringing it up again tomorrow is the
+    repetition the owner complained about in the first place."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "Kiwi", at=datetime(2026, 8, 24, tzinfo=UTC))
+
+    assert topic_candidates(reader, now) == []
+
+
+def test_the_reason_carries_the_name_and_the_gap_and_nothing_else(
+    store: Store, reader: SqlReader
+) -> None:
+    """The reason goes into the LLM prompt verbatim. Every other generator builds
+    it from lexicons, clock times and dates precisely so an unsolicited utterance
+    cannot be steered by text that arrived from somewhere else; the entity *name*
+    is first-party, but nothing else from the note may join it."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "Sendbird", at=datetime(2026, 8, 1, tzinfo=UTC))
+
+    reason = topic_candidates(reader, now)[0].reason
+
+    assert "Sendbird" in reason and "24일" in reason
+    assert len(reason) <= 200
+
+
+def test_the_limit_is_max_per_kind_with_no_separate_pool(
+    store: Store, reader: SqlReader
+) -> None:
+    """Round 1 widened the SQL fetch past `MAX_PER_KIND` because a self-capping
+    query left already-spent entities occupying every slot forever. Round 2
+    excludes an ineligible entity from the query entirely (`NOT EXISTS` against
+    `proactive_candidates`, anchored to that entity's own last raise), so
+    nothing spent can occupy a slot in the first place - the widened pool's
+    whole reason to exist. A plain `MAX_PER_KIND` limit is correct again: four
+    stale, never-raised entities and a cap of three should return exactly the
+    three quietest."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "A", at=datetime(2026, 8, 1, tzinfo=UTC))
+    entity_touched(store, "B", at=datetime(2026, 8, 2, tzinfo=UTC))
+    entity_touched(store, "C", at=datetime(2026, 8, 3, tzinfo=UTC))
+    entity_touched(store, "D", at=datetime(2026, 8, 4, tzinfo=UTC))
+
+    produced = topic_candidates(reader, now)
+
+    assert [c.payload["entity"] for c in produced] == ["A", "B", "C"]
+
+
+def test_an_untouched_topic_rearms_from_its_own_raise_not_a_shared_grid(
+    db: sqlite3.Connection, store: Store, reader: SqlReader
+) -> None:
+    """Measured defect this replaces: a dedup key bucketed into shared
+    `TOPIC_REARM_DAYS`-day calendar windows put every entity's rearm boundary on
+    the same grid, so the real gap after a raise was anywhere from 1 to 14 days
+    depending only on where the raise happened to land in that grid - not the
+    intended `TOPIC_REARM_DAYS`. 2026-08-29 is the adversarial date: under that
+    old grid (2026-08-16 is a boundary, since its ordinal divides evenly by 14),
+    the very next day, 2026-08-30, was already a fresh boundary, so the old code
+    would have let this entity come back after a single day - the one-day
+    re-raise that is the owner's original complaint. Anchoring to this entity's
+    own raise instead of the grid means 13 days later must still be inside the
+    window and 15 days later must be outside it, regardless of where the raise
+    fell on any calendar."""
+    raise_time = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    entity_touched(store, "Sendbird", at=raise_time - timedelta(days=10))
+
+    first = generate_candidates(reader, settings(), now=raise_time)
+    topics = [c for c in first if c.kind == "topic"]
+    assert [c.payload["entity"] for c in topics] == ["Sendbird"]
+    store_candidate(db, topics[0], now=raise_time)
+
+    still_within = generate_candidates(reader, settings(), now=raise_time + timedelta(days=13))
+    assert [c for c in still_within if c.kind == "topic"] == []
+
+    past_rearm = generate_candidates(reader, settings(), now=raise_time + timedelta(days=15))
+    past_topics = [c for c in past_rearm if c.kind == "topic"]
+    assert [c.payload["entity"] for c in past_topics] == ["Sendbird"]
+
+
+def test_entities_behind_the_cap_are_not_starved(
+    db: sqlite3.Connection, store: Store, reader: SqlReader
+) -> None:
+    """Proves the SQL exclusion actually frees a slot rather than merely
+    hiding a spent entity behind a wide fetch: four stale entities, one tick's
+    cap of `MAX_PER_KIND` (three), and the fourth must get its turn the moment
+    the first three are recorded as raised - not stuck behind them, and not
+    dropped for being outside whatever the fetch limit happens to be."""
+    raise_time = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    entity_touched(store, "A", at=raise_time - timedelta(days=40))
+    entity_touched(store, "B", at=raise_time - timedelta(days=30))
+    entity_touched(store, "C", at=raise_time - timedelta(days=20))
+    entity_touched(store, "D", at=raise_time - timedelta(days=10))
+
+    first = generate_candidates(reader, settings(), now=raise_time)
+    topics = [c for c in first if c.kind == "topic"]
+    assert [c.payload["entity"] for c in topics] == ["A", "B", "C"]
+    for candidate in topics:
+        store_candidate(db, candidate, now=raise_time)
+
+    later = generate_candidates(reader, settings(), now=raise_time + timedelta(hours=1))
+    later_topics = [c for c in later if c.kind == "topic"]
+    assert [c.payload["entity"] for c in later_topics] == ["D"]
 
 
 # --- the tick: dedup, expiry, and the user's switch --------------------------

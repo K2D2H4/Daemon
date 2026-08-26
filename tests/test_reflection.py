@@ -324,6 +324,65 @@ async def test_a_list_that_is_not_a_list_is_a_reported_problem(
     assert any("was not a list" in problem for problem in result.problems)
 
 
+async def test_a_bare_string_observation_is_recovered_not_dropped(
+    data_dir: Path, store: Store
+) -> None:
+    """The Task 7 hand audit of the spike's raw output found this on 2 of 60
+    records: the model returned `observations` as a bare list of strings
+    instead of `{"body": ..., "confidence": ...}` objects, and every string
+    hit `_items`'s "not an object" branch, so the whole array's persona
+    signal was silently discarded for that night - a defect no test had
+    caught, only found by reading raw replies by hand (daemon/MEASURED.md).
+    Change (A) routes more into `observations`, so this path only gets more
+    consequential. A string must recover as the body, with confidence
+    falling back to the schema's own default, rather than being dropped.
+    """
+    record(store, "무슨 말")
+    reply = json.dumps(
+        {"observations": ["아침에는 말을 걸지 않는 게 낫다"]}, ensure_ascii=False
+    )
+
+    result = await pass_for(data_dir, store, reply).run(DAY)
+
+    assert result.observations == 1
+    assert not result.problems
+    rows = store.unconsumed_observations()
+    assert [row["body"] for row in rows] == ["아침에는 말을 걸지 않는 게 낫다"]
+    assert rows[0]["confidence"] == pytest.approx(0.5)
+
+
+async def test_a_bare_string_entity_is_dropped_not_recovered(
+    data_dir: Path, store: Store
+) -> None:
+    """64ed650 scoped the bare-string recovery to `observations` only, because
+    for `entities` recovering is actively harmful: a junk string entry would
+    survive into the list, consume one of the 12 `MAX_ENTITIES` slots ahead of
+    the slice, and only then get rejected in the entities loop for having no
+    `name`/`note` - so a genuine entity later in an oversized array could be
+    truncated away by junk that used to cost nothing before the slice existed.
+    Twelve bare strings ahead of one real entity pins that: with the old,
+    unscoped recovery the junk would fill every slot and the real entity would
+    never be seen; dropped before the slice, as facts and entities always were,
+    it survives.
+    """
+    record(store, "무슨 말")
+    junk = ["쓸모없는 문자열"] * 12
+    reply = json.dumps(
+        {
+            "entities": [
+                *junk,
+                {"name": "지현", "kind": "person", "note": "연희동 카페에서 만났다고 했다"},
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+    result = await pass_for(data_dir, store, reply).run(DAY)
+
+    assert result.entities == 1
+    assert sum("was not an object" in problem for problem in result.problems) == 12
+
+
 async def test_an_empty_conclusion_is_still_a_written_day(
     data_dir: Path, store: Store
 ) -> None:
@@ -1241,3 +1300,64 @@ def test_a_web_search_still_counts_as_something_the_person_did(
     tool_call(store, "tavily__tavily_search", '{"results": []}')
 
     assert "tavily__tavily_search" in _tool_usage(store.tool_calls_for_day(DAY))
+
+
+def test_the_facts_bucket_refuses_manner_and_names_where_it_goes() -> None:
+    """The leak this whole plan exists for. On 2026-08-19 the owner said once that
+    he was tired of being asked `무슨 재미난 얘기 있어요?`, and reflection wrote
+
+        - 사용자가 AI 비서에게 반복적인 질문(...)을 자제하고 담백하게 대화해 줄 것을 요청함
+
+    into `core.md` as a *fact*, beside his dog's name and his birthday. `core.md`
+    is injected whole on every turn, has no cap, no decay and no retraction, so
+    one remark became a standing order.
+
+    The prompt already had the right bucket - `observations` is "대화 내용이 아니라
+    대화 방식에 대한 것" and feeds M4's rated path (weekly, >=5 observations, <=3
+    new, <=20 active, `daemon persona forget`). The model simply filed it in the
+    wrong one. So the boundary is stated, and stated as a prohibition on `facts`
+    rather than only as a description of `observations`: the description was
+    already there and lost.
+    """
+    from daemon.reflection import SYSTEM
+
+    facts_rule = SYSTEM.split("- entities:")[0]
+    assert "말투" in facts_rule and "observations" in facts_rule, (
+        "the facts bucket must name manner and say where it goes instead"
+    )
+    for banned in ("자제", "요청", "선호"):
+        assert banned in facts_rule, (
+            f"{banned!r} is the shape the misfiled line took; the prompt has to "
+            "name the kind, not hope the model generalises"
+        )
+
+
+def test_the_ending_test_does_not_swallow_every_preference() -> None:
+    """The clause's closing sentence used to be a bare surface-form test: any
+    Korean 개조식 sentence ending in '~를 선호함' counted as `observations`, with
+    no reference back to the clause's own "나를 어떻게 대해 달라는 말" scoping.
+    That collides with `facts`'s own allowed list two lines above (일, 일정) -
+    '재택근무를 선호함' and '아침 회의를 선호함' are genuine life-facts that end
+    exactly that way. Routed to `observations` they never reach `core.md`, and
+    M4's evolve prompt ("이 사람을 어떻게 대하면 좋은지에 대한 관찰") does not turn a
+    work-from-home preference into a persona rule either - so it would simply be
+    lost. A daemon that quietly stops remembering where its owner works is a
+    worse failure than the manner-leak this clause was written to close.
+
+    So the ending test must be conditioned on the target being the daemon
+    itself, and a life-side preference phrased the same way must be named as
+    staying a fact.
+    """
+    from daemon.reflection import SYSTEM
+
+    facts_rule = SYSTEM.split("- entities:")[0]
+    ending = facts_rule[facts_rule.index("한 문장이") :]
+    assert "나(비서)" in ending, (
+        "the '~를 선호함' ending test must be conditioned on the target being "
+        "the daemon, not just the surface form - otherwise it claims every "
+        "preference sentence for observations"
+    )
+    assert "재택근무를 선호함" in facts_rule, (
+        "a work-from-home preference must be named as staying a fact - the "
+        "concrete case the un-scoped clause would have lost"
+    )

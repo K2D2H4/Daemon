@@ -2,7 +2,7 @@
 
 Written from Task 9's four rules in
 `docs/superpowers/plans/2026-08-25-face-v1.md` and the direction-penalty
-decision (`docs/adr/0015-the-neutral-moment-not-the-matched-pose.md`), not from
+decision (`docs/adr/0017-the-neutral-moment-not-the-matched-pose.md`), not from
 the module's own shape: each test below constructs synthetic clips
 whose "correct" match is knowable by construction (disjoint value bands, so
 only the intended alignment can hit a distance of zero, or a hand-derived cost
@@ -42,7 +42,7 @@ these ERROR rather than skip - a red build that says nothing about the code."""
 
 FPS = 10
 """Task 9's rule 1: "±2 frames at 10fps (±200ms)", later widened to ±500ms by
-the direction penalty (ADR 0015 §1). Hardcoded here, not imported from
+the direction penalty (ADR 0017 §1). Hardcoded here, not imported from
 face_match, so these tests exercise the brief's stated contract rather than
 whatever face_match.py happens to name its own constant."""
 
