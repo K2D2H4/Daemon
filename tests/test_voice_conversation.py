@@ -673,6 +673,39 @@ async def test_the_proactive_opening_is_not_recorded_a_second_time() -> None:
     ], "the line the daemon was told to say was written down twice"
 
 
+async def test_an_opening_that_was_never_answered_does_not_swallow_the_next_turn(
+) -> None:
+    """The flag is disarmed by the turn ending, not by a transcript arriving.
+
+    A session can produce nothing at all for its opening - the model ignores it, the
+    socket dies before it answers, the turn comes back empty. If the skip is only
+    disarmed when it fires, the flag sits armed into the *next* turn and eats the
+    first thing she says to the owner, who by then has asked her a question. The log
+    then holds his question with no answer under it, and the next turn's continuity
+    block reads as her having ignored him."""
+    session = FakeSession(
+        Turn(),  # the opening went out and nothing came back
+        Says("user", "어, 뭐라고?"),
+        Says("assistant", "아, 아니에요"),
+        b"\x01" * 4800,
+        Turn(),
+    )
+    memory = FakeMemory()
+    await run(
+        conversation(
+            session,
+            memory=memory,
+            opening_text="이 문장을 그대로 말해라",
+            opening_already_logged=True,
+        )
+    )
+
+    assert [(r.role, r.content) for r in memory.records] == [
+        ("user", "어, 뭐라고?"),
+        ("assistant", "아, 아니에요"),
+    ], "her answer to the owner was dropped as though it were the opening"
+
+
 async def test_an_ordinary_opening_still_records_the_answer_to_it() -> None:
     """The other side of the same flag, and why it is not the default.
 
@@ -2146,6 +2179,58 @@ async def test_an_answered_opening_text_is_not_said_again(
     assert opening not in built[1].texts, "the proactive line was said a second time"
 
 
+async def test_a_reconnect_after_the_line_was_said_records_normally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterpart, and the conjunction nothing else asserts.
+
+    `opening_already_logged` is passed as `... and bool(pending_text)` precisely
+    because the two have to be cleared together. Attempt 1 says the proactive line,
+    which is already in the log and must not be recorded; attempt 2 opens with no
+    opening at all, so *its* first assistant turn is her answering the owner and
+    belongs in the log like any other voice turn. Dropping the conjunction leaves
+    the flag armed on attempt 2 and takes that answer out of the log, with the whole
+    suite green.
+
+    The same two attempts answer the other reconnect question, which has the same
+    shape: `on_spoke` must fire **once per call**, not once per attempt. The caller
+    answers a future on the first one and uses it to decide whether the line still
+    needs `/usr/bin/say`, so a second report is a second decision about a line that
+    was already dealt with."""
+    from daemon import app as app_module
+
+    monkeypatch.setattr(app_module, "VOICE_RECONNECT_BACKOFF_SECONDS", 0.0)
+    line = "요즘 llm-wiki 쪽은 잘 돼가고 있어요?"
+    spoke: list[bool] = []
+    said = FakeSession(Says("assistant", line), b"\x01" * 4800, Turn())
+    said.going_away = True  # forces a reconnect after a turn that did play
+    resumed = FakeSession(
+        Says("user", "잘 되고 있어요"), Says("assistant", "다행이네요"), b"\x01" * 4800, Turn()
+    )
+    queue = [said, resumed]
+    memory = FakeMemory()
+
+    def new_session() -> FakeSession:
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    await app_module._voice_attempts(
+        new_session,
+        FakeAudio(),
+        companion_for(memory),
+        Cut,
+        opening_text="이 문장을 그대로 말해라",
+        opening_already_logged=True,
+        on_spoke=lambda: spoke.append(True),
+    )
+
+    assert spoke == [True], "the reconnected attempt reported the line a second time"
+    contents = [r.content for r in memory.records]
+    assert line not in contents, "the line the daemon was told to say was logged twice"
+    assert contents == ["잘 되고 있어요", "다행이네요"], (
+        "the reconnected attempt's first answer was dropped as though it were the opening"
+    )
+
+
 # --- run_voice wires the tools into the session ------------------------------
 # tests/test_reachable.py has a blind spot it names itself: `GeminiLiveSession` is
 # already constructed by app.py, so nothing there can tell whether run_voice passes
@@ -2218,11 +2303,24 @@ async def test_run_voice_carries_the_proactive_signals_into_the_conversation(
     is the row that resets its 12-hour silence clock (daemon/memory/store.py).
 
     So this drives the real `run_voice` with a scripted session and reads what
-    landed in the real store: only the socket and the hardware are fakes."""
+    landed in the real store: only the socket and the hardware are fakes.
+
+    **And it pins *when* `on_spoke` fires**, against the same clock the audio does.
+    That is not a refinement of the wiring question, it is the whole point of the
+    signal: `_speak_unprompted` is blocked inside `mic_floor.request` under
+    `REPLY_CEILING_SECONDS = 150` while this conversation runs with no total cap of
+    its own, so a report that lands when the *attempt* ends lands after the deadline
+    for any line the owner actually answers - and the row then records
+    `route='telegram'`, `modality='text'` for a line he heard in her voice. PR #126
+    fired it from `_voice_attempts`' `finally`, which reads like "as soon as it was
+    spoken" and is not: the shared `events` list below came back
+    `['play', 'play', 'answered']` against that build, and this test fails on it."""
     from daemon import app as app_module
 
     line = "요즘 llm-wiki 쪽은 잘 돼가고 있어요?"
-    spoke: list[bool] = []
+    # One list, so the ordering question is answered by the ordering rather than by
+    # two clocks that have to be compared afterwards. `FakeAudio` appends "play".
+    events: list[str] = []
 
     def scripted(**kwargs: Any) -> FakeSession:
         return FakeSession(
@@ -2235,18 +2333,28 @@ async def test_run_voice_carries_the_proactive_signals_into_the_conversation(
             Turn(),
         )
 
-    monkeypatch.setattr(app_module, "build_voice_audio", lambda: FakeAudio())
+    monkeypatch.setattr(app_module, "build_voice_audio", lambda: FakeAudio(events=events))
     monkeypatch.setattr("daemon.voice.gemini_live.GeminiLiveSession", scripted)
 
     code = await app_module.run_voice(
         _voice_settings(tmp_path),
         opening_text="아래 문장을 그대로 말해라",
-        on_spoke=lambda: spoke.append(True),
+        on_spoke=lambda: events.append("answered"),
         opening_already_logged=True,
     )
 
     assert code == 0
-    assert spoke == [True], "the caller was never told the room had heard it"
+    assert "answered" in events, "the caller was never told the daemon had spoken"
+    assert events.count("answered") == 1, "a later turn reported the same line again"
+    at = events.index("answered")
+    assert events[:at] == ["play"], (
+        f"nothing of the answer may have played yet - the one thing before it is "
+        f"`play_ready_cue`, which runs before the session is even opened: {events}"
+    )
+    assert events[at + 1 :].count("play") == 2, (
+        f"the caller was told at the end of the conversation rather than at the "
+        f"start of the line: {events}"
+    )
     store = Store.open(tmp_path / app_module.DB_FILENAME)
     try:
         rows = store.conn.execute(

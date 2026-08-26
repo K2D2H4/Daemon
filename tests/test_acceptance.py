@@ -2285,19 +2285,29 @@ async def test_a_cancelled_speaker_still_answers_the_caller(
 async def test_the_caller_is_answered_while_the_conversation_is_still_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The answer is owed when the line has been *said*, not when the talking stops.
+    """Half of the ordering question, and only half - read the other half first.
 
-    `mic_floor.request` is blocked on this future and gives up at
-    `REPLY_CEILING_SECONDS` (150 s). The session that says the line has no total cap
-    - `VoiceConversation._receive` reschedules its idle budget per audio item - so a
-    real exchange plus the closing 30 s of silence runs straight past it, and the
-    ceiling would then log a broken contract and return `not-spoken` for a line the
-    owner heard in her voice and answered aloud. That is the verdict-and-outcome
-    mismatch the ceiling exists to close, arriving through the ceiling itself.
+    This covers `_speak_unprompted`'s half: the floor is answered from *inside*
+    `on_spoke`, so it is answered whenever the session says it was spoken rather
+    than after `run_voice` returns. It cannot cover the half that decides in
+    production, because it replaces `run_voice` and therefore chooses the timing it
+    is measuring - PR #126 shipped a build where the real chain fired `on_spoke`
+    only at the end of the attempt, and this test was green against it.
+    `test_run_voice_carries_the_proactive_signals_into_the_conversation`
+    (tests/test_voice_conversation.py) is the one that pins the real ordering,
+    against the audio.
 
-    Also what keeps `deliver` moving: the Telegram copy and its 👍/👎 buttons go out
-    while she is still talking rather than minutes later, and the proactive tick
-    stops being blocked for the length of a conversation under `max_instances=1`.
+    Why the ordering matters at all: `mic_floor.request` is blocked on this future
+    and gives up at `REPLY_CEILING_SECONDS` (150 s), while the session that says the
+    line has no total cap - `VoiceConversation._receive` reschedules its idle budget
+    per audio item - so a real exchange plus the closing 30 s of silence runs
+    straight past it. The ceiling would then log a broken contract and return
+    `not-spoken` for a line the owner heard in her voice and answered aloud, which is
+    the verdict-and-outcome mismatch the ceiling exists to close, arriving through
+    the ceiling itself. It is also what keeps `deliver` moving: the Telegram copy and
+    its 👍/👎 buttons go out while she is still talking rather than minutes later,
+    and the proactive tick stops being blocked for the length of a conversation
+    under `max_instances=1`.
     """
     from daemon import mic_floor
     from daemon.app import _speak_unprompted

@@ -351,6 +351,7 @@ class VoiceConversation:
         opening_audio: bytes = b"",
         opening_text: str = "",
         opening_already_logged: bool = False,
+        on_first_audio: Callable[[], None] | None = None,
         screen_share: ScreenShareController | None = None,
         screen_pump_factory: Callable[[VoiceSession], ScreenSharePump] | None = None,
         barge_in: bool = True,
@@ -382,6 +383,27 @@ class VoiceConversation:
         matched the alias, and used to throw the sound away - so the session began
         deaf to the question it was opened for and the owner said it again. At
         `AudioIO.sample_rate`, because that is what a session must be fed."""
+
+        self._on_first_audio = on_first_audio
+        """Called once, when the first chunk of this conversation's audio arrives.
+
+        The only place in this process that knows the daemon has started talking at
+        the moment it starts, rather than at the next boundary something else
+        happens to reach. `app._speak_unprompted` is the caller: it is blocked
+        inside `mic_floor.request`, which gives up at `REPLY_CEILING_SECONDS`, and a
+        conversation has no total cap at all - so anything that reports at the *end*
+        reports too late for a line the owner answered and talked through.
+
+        Fired from `_on_audio`, which is a chunk arriving from the server and being
+        counted, one line before `AudioIO.play` is awaited with it. So it means
+        "the answer has begun", not "the room heard it": a speaker that fails on
+        this very chunk still fires this. That direction is deliberate and
+        `app._voice_attempts` says why - a false positive costs a line nobody heard,
+        a false negative says the same sentence into the room twice.
+
+        Must not raise: this runs on the audio path, and an exception here would
+        take the turn it is reporting on with it.
+        """
 
         self._skip_opening_record = opening_already_logged
         """Whether whoever opened this session has already written the opening down.
@@ -788,6 +810,13 @@ class VoiceConversation:
         # never flushing would mean a memory searched for and then silently dropped.
         self._generating = False
         self._answering_tool = False
+        # Whatever this turn was, it is over, so nothing after it can be the answer
+        # to the opening. Disarmed here rather than inside the skip itself, which is
+        # the case `_skip_opening_record` says it must not have: a turn that produced
+        # no assistant transcript at all - the model ignored the opening, or the
+        # socket died before it answered - would leave the flag armed, and the first
+        # thing the *owner* got an answer to would vanish from the log instead.
+        self._skip_opening_record = False
         await self._flush_deferred(session)
         self.ended = getattr(session, "ended", None)
         if produced:
@@ -893,6 +922,14 @@ class VoiceConversation:
         self._answer_hold_until = 0.0
         if self._first_audio_at is None:
             self._first_audio_at = at
+            if self._on_first_audio is not None:
+                # Here, and not from the caller's `finally` around `run()`, which is
+                # what PR #126 shipped: that runs when the *attempt* ends, which for
+                # a line the owner answers is a whole conversation plus the closing
+                # 30 s of silence later - past the ceiling the one caller is waiting
+                # under. This is the instant the daemon starts talking.
+                notify, self._on_first_audio = self._on_first_audio, None
+                notify()
         seconds = size / (self._audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME)
         # Chunks queue behind each other, so playback ends after whatever is already
         # queued - not `at + seconds`, which would forget the backlog.
@@ -999,10 +1036,9 @@ class VoiceConversation:
         if transcript.role == "assistant" and self._skip_opening_record:
             # The opening line, coming back as the session's own first turn. It is
             # already in the log, written by whoever asked for it - see
-            # `_skip_opening_record`. Disarmed here rather than at send time so an
-            # opening the model never actually said does not silently swallow the
-            # first thing it does say.
-            self._skip_opening_record = False
+            # `_skip_opening_record`. Not disarmed here: `_one_turn` disarms at the
+            # turn boundary instead, so an opening the model never said cannot sit
+            # armed and swallow the first thing it does say.
             logger.info("voice: the opening line is already recorded; not logging it twice")
             return
         await self._companion.record(

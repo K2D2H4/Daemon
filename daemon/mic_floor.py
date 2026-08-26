@@ -50,19 +50,28 @@ in charge, and the caller's only job is to record what happened. `no-listener` i
 the different thing: **nobody took it**, so nothing in this process ever will, and
 the caller is free to use the speaker directly.
 
-Note what does *not* separate them: whether the microphone is held. Nothing is
-holding it when `not-spoken` comes back - `listen()`'s `finally` closes the capture
-stream, which exits `record()`'s hold, before `_wake_round` closes the gate, and
-the voice session `_speak_unprompted` opens (PR #126) has already ended by the time
-that answer is given. An earlier version of this paragraph said `not-spoken` meant
-the wake loop still had the device (PR #115 review). It does not, and the real
-reasons are in `ProactiveDelivery._say`.
+Note what does *not* separate them: whether the microphone is held. On
+`_speak_unprompted` - the path that takes a line and speaks it - nothing is holding
+it when the answer comes back: `listen()`'s `finally` closes the capture stream,
+which exits `record()`'s hold, before `_wake_round` closes the gate, and the voice
+session that path opens (PR #126) has ended by the time it answers `not-spoken`. An
+earlier version of this paragraph said `not-spoken` meant the wake loop still had
+the device (PR #115 review). On that path it does not, and the real reasons are in
+`ProactiveDelivery._say`.
 
-`spoke` is the one that now arrives from inside a live session that *is* holding
-the device: PR #126 answers it the moment the line starts playing rather than when
-the conversation ends, because the conversation has no total cap and
-`REPLY_CEILING_SECONDS` does. That costs nothing here, since `spoke` is the answer
-that sends the caller nowhere near the speaker.
+Scoped to that path deliberately, because one `not-spoken` *does* come back with the
+device held and it is the one nobody should generalise from: `_wake_round`'s
+wedged-microphone branch answers `False` without speaking at all, precisely because
+`close_gate()` reported that the capture stream never came back. Nothing downstream
+is hurt - `_say` does not reach for the speaker on `not-spoken` anyway, and on
+`no-listener` it relies on exactly that wedged gate holding `mic_hold` for its 45 s
+watchdog so `LocalSpeaker.say` refuses (`daemon/proactivity/delivery.py`).
+
+`spoke` is the answer that now arrives from inside a live session that *is* holding
+the device: PR #126 answers it on the first chunk of the session's audio
+(`VoiceConversation._on_audio`) rather than when the conversation ends, because the
+conversation has no total cap and `REPLY_CEILING_SECONDS` does. That costs nothing
+here, since `spoke` is the answer that sends the caller nowhere near the speaker.
 
 Collapsing the last two into a single `False` is what the first version did, and
 it was wrong in a way that would only show on installs where the wake loop is

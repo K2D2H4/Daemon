@@ -1406,9 +1406,11 @@ async def run_voice(
 
     Proactive speech at the machine is one of the things that starts one, though,
     and it is the caller `on_spoke` and `opening_already_logged` exist for -
-    `_speak_unprompted` is the only one that passes either. `on_spoke` fires the
-    moment audio has been handed to the player, which is what decides whether the
-    line still needs `/usr/bin/say`; `opening_already_logged` says the opening is
+    `_speak_unprompted` is the only one that passes either. `on_spoke` fires on the
+    first chunk of audio the session produces - from `VoiceConversation._on_audio`,
+    the one place that knows, and *not* at the end of the attempt, which is far too
+    late for the caller waiting on it - and is what decides whether the line still
+    needs `/usr/bin/say`; `opening_already_logged` says the opening is
     already in the conversation log, so the turn that speaks it must not be written
     down a second time (`VoiceConversation._skip_opening_record`).
 
@@ -1789,6 +1791,39 @@ async def _voice_attempts(
     # `SPEAK_VERBATIM` it is a second literal delivery of the proactive line, in the
     # same voice, to an owner who has already answered the first one.
     pending_text = opening_text
+    reported = False
+
+    def note_first_audio() -> None:
+        """Tell the caller the daemon has started talking, once per call.
+
+        Handed to every attempt's conversation, which fires it on the first chunk of
+        audio it receives - the instant the answer begins, which is the only instant
+        the one caller can use. `_speak_unprompted` is blocked inside
+        `mic_floor.request` under `REPLY_CEILING_SECONDS` while a conversation runs
+        with no total cap of its own, so a report at the end of the attempt is a
+        report after the deadline: the row would record `route='telegram'`,
+        `modality='text'` for a line the owner heard in her voice and answered aloud.
+        PR #126 shipped it in this function's `finally` and had exactly that.
+
+        What the earlier placement was right about is kept for free: a failure that
+        is not a `session_error` leaves `_voice_attempts` entirely, and firing at the
+        first chunk has already reported by the time anything can raise.
+
+        `reported` rather than clearing `on_spoke`, so the guard reads the same on a
+        reconnect: a second attempt that plays audio must not report twice, because
+        the caller uses this to decide whether the line still needs `/usr/bin/say`
+        and it may already have answered a future on the strength of the first one.
+        """
+        nonlocal reported
+        if on_spoke is None or reported:
+            return
+        reported = True
+        # Deliberately not "the room heard it": `_on_audio` counts the chunk one
+        # line before `AudioIO.play` is awaited with it, so a dead output device
+        # reports here too. That is the safe direction - a false positive costs a
+        # line nobody heard, a false negative says the same sentence twice.
+        on_spoke()
+
     for attempt in range(1, VOICE_RECONNECT_ATTEMPTS + 1):
         session = new_session()
         conversation = VoiceConversation(
@@ -1801,6 +1836,7 @@ async def _voice_attempts(
             # later attempt's first assistant turn is an answer to the owner and
             # belongs in the log like any other voice turn.
             opening_already_logged=opening_already_logged and bool(pending_text),
+            on_first_audio=None if on_spoke is None else note_first_audio,
             screen_share=screen_share,
             screen_pump_factory=screen_pump_factory,
             barge_in=barge_in,
@@ -1823,26 +1859,6 @@ async def _voice_attempts(
                 f" (attempt {attempt})" if attempt > 1 else "",
                 conversation.stats.describe(),
             )
-            if on_spoke is not None and conversation.stats.played_seconds > 0:
-                # The nearest thing to "the room heard it" this process has: audio
-                # was handed to the player, as opposed to a session that opened,
-                # generated an answer and interrupted itself before playing any of
-                # it - a state `stats.describe()` exists because it looked like
-                # nothing at all from outside. Not proof it was *audible*:
-                # `_on_audio` counts a chunk before `AudioIO.play` takes it, so a
-                # dead output device counts here too. Over-reporting is the safe
-                # side, because `_speak_unprompted` uses this to decide whether the
-                # line still needs `/usr/bin/say`: a false positive costs a line
-                # nobody heard, a false negative says the same sentence into the
-                # room twice.
-                #
-                # In the `finally`, not after it, so it survives whatever ended the
-                # attempt. `AudioIO.play` raising on an output-device change after
-                # the first chunk went through is not a `session_error`, so it
-                # leaves this function entirely - and out there the fallback would
-                # repeat a line the room has already partly heard.
-                on_spoke()
-                on_spoke = None
         if conversation.ended:
             logger.info("voice session ended: %s", conversation.ended)
         if conversation.stats.played_seconds > 0:
