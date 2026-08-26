@@ -193,6 +193,14 @@ WIRED_CLASSES = (
     # (`_build_tools`, when `channel` is passed - which only the resident's voice
     # runtime does).
     "SendMessage",
+
+    # The face: `create_app` builds the one bus for the process and hands it to
+    # `ConversationLoop`, `ToolRunner` and the voice conversation, all by keyword.
+    # `FaceState` and `OneShot` stay off this list on purpose - `FaceBus` is the
+    # only one of the three ever constructed outside `daemon/face.py` itself (its
+    # own methods build the other two), so `_constructed` cannot see them and
+    # listing them here would just fail the way a stale PENDING entry does.
+    "FaceBus",
 )
 
 

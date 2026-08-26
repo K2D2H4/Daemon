@@ -155,6 +155,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add("uninstall", group="setup", help="stop the OS service and remove its unit file")
     add("status", group="every day", help="is the service installed and running")
+    add("face", group="every day", help="open the face - a live status page - in its own window")
+    add(
+        "face-transitions",
+        group="now and then",
+        help="rebuild the pose-match table the face uses to enter a loop clip mid-pose",
+    )
     log = add(
         "log",
         group="every day",
@@ -380,6 +386,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Also before Settings: this is the foreground grant Daemon.app execs
         # during `daemon install`, and it needs no config to pop the prompt.
         return _request_mic()
+    if command == "face":
+        # Also before Settings: opening a window on a known port should not
+        # depend on a provider being configured - a broken key must not stop a
+        # person from seeing the face.
+        return _face()
     if command == "wake" and args.wake_command == "calibrate":
         # Also before Settings, and for setup's reason: calibration reads nothing
         # out of the configuration and writes one key into `.env`, so it has to work
@@ -421,6 +432,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         inserted = _reindex(settings)
         print(f"reindexed {inserted} message(s) the mirror was missing")
         return OK
+    if command == "face-transitions":
+        return _face_transitions(settings)
     if command == "proactive":
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
         return asyncio.run(_proactive(settings, speak=args.speak))
@@ -724,6 +737,98 @@ def _request_mic() -> int:
     status = request_microphone_access(timeout=60.0)  # a human has to click Allow
     print(f"microphone: {status}")
     return 0 if status == "authorized" else 1
+
+
+def _face() -> int:
+    """Open the face in its own window.
+
+    Reads the port the way `_env_setting` always does - without building
+    `Settings()` - so this works on a configuration that would otherwise refuse
+    to load. Never fails: no browser found is a printed URL, not an error, so a
+    headless box still says where to point one.
+    """
+    url = f"http://127.0.0.1:{_env_setting('DAEMON_PORT', 'port')}/face"
+    # Chrome's --app gives a window with no browser chrome, which is what an
+    # ambient presence wants; anything else at least gets the URL printed.
+    for argv in (
+        ["open", "-na", "Google Chrome", "--args", f"--app={url}", "--window-size=420,630"],
+        ["open", url],
+    ):
+        try:
+            if subprocess.run(argv, capture_output=True).returncode == 0:
+                return OK
+        except OSError:
+            # `open` is macOS-only (docs/PLAN.md's Linux/Windows residency
+            # targets have no such binary), and a missing executable raises
+            # FileNotFoundError rather than returning a nonzero exit - the same
+            # shape `_install` guards around `codesign`. Try the next argv
+            # instead of letting this escape as a raw traceback (module
+            # docstring).
+            continue
+    print(url)
+    return OK
+
+
+def _face_transitions(settings: Settings) -> int:
+    """Rebuild the pose-match table (Task 9) and write it to the face dir.
+
+    Four failure shapes are handled here rather than left to raise a traceback
+    (module docstring: print what was found, don't raise one), and they are
+    four rather than one because `except OSError` alone said "ffmpeg not
+    found" for all of them:
+
+    - **No Pillow.** `Pillow>=10.0; sys_platform == 'darwin'` in pyproject, so
+      on Linux a core install reaches this command with no PIL and used to get
+      a raw ImportError traceback.
+    - **No ffmpeg.** `face_match._frames` shells out to it once per clip and a
+      missing executable raises `FileNotFoundError` rather than returning a
+      nonzero exit - the same shape `_face()` guards around `open`/Chrome.
+    - **Any other OS error**, kept apart from that one: a `FileNotFoundError`
+      is not always a missing binary. `write_table`'s own `write_text` raised
+      exactly that on a fresh install with no `<data_dir>/face/`, and the
+      daemon told the owner to go install ffmpeg. `write_table` creates the
+      directory now, so this branch is for the ones left.
+    - **A corrupt clip**, which is `CalledProcessError` (`ffmpeg` ran and
+      exited nonzero, per `_frames`'s own `check=True`) - a different failure
+      with a different message.
+
+    Unlike `_face()` this genuinely cannot proceed past any of them, so it
+    reports the problem and stops rather than falling back to anything.
+    """
+    try:
+        from daemon.face_match import write_table
+    except ImportError as exc:
+        # `Pillow>=10.0; sys_platform == 'darwin'` in pyproject: it is a core
+        # dependency on macOS only, so on Linux a core install reaches this
+        # command with no PIL at all and used to get a raw traceback - against
+        # this file's own docstring.
+        print(f"daemon: face-transitions needs Pillow and numpy - {exc}", file=sys.stderr)
+        return PROBLEM
+    from daemon.face_routes import face_dir
+
+    try:
+        path = write_table(face_dir(settings))
+    except FileNotFoundError:
+        print("daemon: ffmpeg not found - install it and try again", file=sys.stderr)
+        return PROBLEM
+    except OSError as exc:
+        # Anything else the filesystem or the process layer raises. Kept apart
+        # from the branch above because `except OSError` alone reported every
+        # write failure as a missing ffmpeg: on a fresh install with no
+        # `<data_dir>/face/`, `write_table`'s own `write_text` raised
+        # `FileNotFoundError` and the daemon said to go install ffmpeg. That
+        # write now creates the directory, so this is only ever a real one.
+        print(f"daemon: could not write the table - {exc}", file=sys.stderr)
+        return PROBLEM
+    except subprocess.CalledProcessError as exc:
+        print(f"daemon: ffmpeg could not read a clip - {exc}", file=sys.stderr)
+        return PROBLEM
+    # Re-read rather than re-run build_table: writing already computed it once,
+    # and ffmpeg per clip is the expensive part.
+    table = json.loads(path.read_text(encoding="utf-8"))
+    pairs = sum(len(dests) for dests in table["match"].values())
+    print(f"{path} ({pairs} pair(s))")
+    return OK
 
 
 def _admin_url(settings: Settings) -> str:

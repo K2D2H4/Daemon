@@ -47,6 +47,7 @@ from daemon.reflection import Reflection, Result
 from daemon.tasks import Task
 
 if TYPE_CHECKING:  # the wake gate, used only in the signatures below
+    from daemon.face import FaceBus
     from daemon.voice.base import AudioIO, SpeechRecognizer
     from daemon.voice.wake import WakeGate
 
@@ -172,6 +173,11 @@ def create_app(
     # file Settings loaded (config.ENV_FILE, cwd-relative), so the admin edits the
     # one source of truth rather than a second copy. A test overrides it.
     app.state.env_path = Path(ENV_FILE)
+    # One bus for the process. Publishing to it with nobody subscribed costs a
+    # comparison, so a text-only install that never opens /face pays nothing.
+    from daemon.face import FaceBus
+
+    app.state.face = FaceBus()
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -185,6 +191,13 @@ def create_app(
     from daemon.admin.routes import router as admin_router
 
     app.include_router(admin_router)
+
+    # The face's own endpoints: a page, an SSE stream off the bus above, and clip
+    # bytes. Read-only and side-effect free (daemon/face_routes.py), so mounting it
+    # unconditionally costs nothing on an install that never opens it.
+    from daemon.face_routes import router as face_router
+
+    app.include_router(face_router)
 
     return app
 
@@ -351,7 +364,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             # depend on this `if`.
             app.state.delegate_wake = asyncio.Event()
             tools, app.state.mcp, app.state.tools_status = await _build_tools(
-                settings, io.store
+                settings, io.store, face=app.state.face
             )
             app.state.tools = tools
             if settings.voice_enabled and settings.wake_enabled:
@@ -367,6 +380,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                         recall,
                         delegate_wake=app.state.delegate_wake,
                         channel=channel,
+                        face=app.state.face,
                     )
                 except Exception as exc:
                     # The wake round falls back to building its own per call -
@@ -396,6 +410,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 tools=tools,
             ),
             max_tool_rounds=settings.tools_max_rounds,
+            face=app.state.face,
         )
         task = asyncio.create_task(loop.run(), name="conversation-loop")
         # run() only guards individual turns; anything raised by the channel's own
@@ -1268,6 +1283,7 @@ async def _build_voice_runtime(
     *,
     delegate_wake: asyncio.Event | None = None,
     channel: Any = None,
+    face: FaceBus | None = None,
 ) -> VoiceRuntime:
     """The voice half of the tool layer, built once at startup.
 
@@ -1306,6 +1322,7 @@ async def _build_voice_runtime(
         screen_share=screen_share,
         delegate_wake=delegate_wake,
         channel=channel,
+        face=face,
     )
     return VoiceRuntime(
         store=store, writer=writer, recall=recall, tools=tools, mcp=mcp, screen_share=screen_share
@@ -1318,6 +1335,7 @@ async def run_voice(
     opening_audio: bytes = b"",
     opening_text: str = "",
     shared: VoiceRuntime | None = None,
+    face: FaceBus | None = None,
 ) -> int:
     """One spoken conversation at this machine, then exit.
 
@@ -1417,7 +1435,7 @@ async def run_voice(
             # `DAEMON_TOOLS_ENABLED` is false, exactly like text.
             voice_mode = "allowlist" if settings.tools_mode == "ask" else settings.tools_mode
             tools, mcp_bridge, _tools_status = await _build_tools(
-                settings, store, mode=voice_mode, screen_share=screen_share
+                settings, store, mode=voice_mode, screen_share=screen_share, face=face
             )
         else:
             screen_share = shared.screen_share
@@ -1529,6 +1547,7 @@ async def run_voice(
                 screen_share=screen_share,
                 screen_pump_factory=screen_pump_factory,
                 barge_in=settings.voice_barge_in,
+                face=face,
             )
         finally:
             with suppress(Exception):
@@ -1646,6 +1665,7 @@ async def _voice_attempts(
     screen_share: Any = None,
     screen_pump_factory: Callable[[Any], Any] | None = None,
     barge_in: bool = True,
+    face: FaceBus | None = None,
 ) -> int:
     """Hold a conversation, and pick it back up if the session is cut.
 
@@ -1685,6 +1705,7 @@ async def _voice_attempts(
             screen_share=screen_share,
             screen_pump_factory=screen_pump_factory,
             barge_in=barge_in,
+            face=face,
         )
         failure: Exception | None = None
         try:
@@ -1856,6 +1877,10 @@ async def _wake_round(
         # over made the daemon puzzle over a word nobody said.
         opening_text=CALLED_BY_NAME if name_only else "",
         shared=shared,
+        # `state` is `app.state` when this round is the resident's own (the
+        # injected-round tests pass none) - the same bus the text loop publishes
+        # to, so the face reflects a spoken turn exactly as it does a typed one.
+        face=getattr(state, "face", None),
     )
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
@@ -2046,6 +2071,7 @@ async def _build_tools(
     screen_share: Any = None,
     delegate_wake: asyncio.Event | None = None,
     channel: Any = None,
+    face: FaceBus | None = None,
 ) -> tuple[Any, Any, str]:
     """Assemble the tool layer. Returns (runner, mcp bridge, status).
 
@@ -2228,7 +2254,7 @@ async def _build_tools(
         allowlist=settings.tools_allowlist,
         enabled=True,
     )
-    runner = ToolRunner(registry, policy, store)
+    runner = ToolRunner(registry, policy, store, face=face)
     logger.info(
         "tool layer ready: %d tool(s), mode=%s", len(registry), effective_mode
     )

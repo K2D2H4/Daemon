@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import pathlib
 from collections.abc import Sequence
@@ -38,6 +39,7 @@ from daemon.voice import conversation as conversation_module
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 from daemon.voice.conversation import VoiceConversation
 from daemon.voice.gemini_live import GeminiLiveSession
+from tests.test_face import RecordingBus
 
 POLL = 0.005
 """How often a test that has to wait for another task looks again. Only the
@@ -1483,6 +1485,34 @@ async def _drive(*sessions: FakeSession, audio: FakeAudio | None = None) -> tupl
     return code, built
 
 
+async def test_the_face_reaches_the_conversation_through_voice_attempts() -> None:
+    """The one face-wiring site nothing covered.
+
+    `face` reaches a `VoiceConversation` down a five-hop keyword chain -
+    `_wake_round` -> `run_voice` -> `_voice_attempts` -> `VoiceConversation` (plus
+    `_build_voice_runtime` -> `_build_tools` for the spoken tool runner) - and
+    deleting `face=face` from any of them passed the whole suite. This covers the
+    hop that actually constructs the object, against the real `_voice_attempts`
+    rather than a stand-in: the conversation it builds has to publish through the
+    bus it was handed. `tests/test_wake.py` covers the first hop; the two in
+    `run_voice` itself still rest on review, because reaching them means building
+    a live session and real audio.
+    """
+    from daemon import app as app_module
+
+    bus = RecordingBus()
+    _, new_session, _built, companion = _attempts(FakeSession(b"\x00" * 48_000, Turn()))
+
+    code = await app_module._voice_attempts(
+        new_session, FakeAudio(), companion, Cut, face=bus
+    )
+
+    assert code == 0
+    assert bus.activities == ["speaking", "idle"], (
+        "the bus handed to _voice_attempts never reached the conversation it built"
+    )
+
+
 async def test_a_conversation_that_simply_ends_is_not_reconnected() -> None:
     """An idle timeout is the conversation being over. Reconnecting into one bills
     per minute for nothing."""
@@ -2775,3 +2805,221 @@ async def test_a_stale_conversation_reports_no_tics_either() -> None:
         "precondition: the tail is stale, so none of it was sent"
     )
     assert not [text for text in session.contexts if text.startswith("[verbal-tics]")]
+
+
+# --- the voice path publishes to the face -------------------------------------
+#
+# `SpeechClock` itself - the boundary, the backlog, the level timing - is tested
+# against a fake clock in tests/test_face.py with no session at all. What is left
+# here is the wiring: does a real turn feed it, pump it on arrival, and tear its
+# timer down with the conversation?
+
+
+async def test_playing_audio_turns_the_face_to_speaking_immediately() -> None:
+    """The rising edge is synchronous: no timer stands between the first chunk and
+    the mouth. Only the falling edge waits, and `test_face.py` already pins where
+    it lands."""
+    bus = RecordingBus()
+    audio = FakeAudio()
+    conv = conversation(FakeSession(b"\x00" * 48_000, Turn()), audio, face=bus)
+    await conv.run()
+
+    assert "speaking" in bus.activities
+    assert audio.played, "sanity: the harness really did play something"
+
+
+async def test_listening_is_published_while_the_owner_talks() -> None:
+    """Driven through `_forward_microphone` directly, like the other gating tests
+    below (`test_an_audio_opening_does_not_hold_the_microphone` and neighbours) -
+    not through `conv.run()`.
+
+    A `FakeSession(Turn())` run through `conv.run()` never gives the microphone
+    task a turn at all: with nothing in the script that awaits (no `Says`, no
+    audio), the receive loop is a pure synchronous handoff from one `_one_turn`
+    call to the next, and a task merely `create_task`-scheduled never gets a step
+    in before the conversation ends and cancels it (see the comment on
+    `test_model_audio_reaches_the_speaker_and_the_microphone_the_session`, which
+    names a `Says` step as what makes that pump task runnable at all). The mic
+    gating tests already avoid that race by calling `_forward_microphone` on its
+    own, so this follows them rather than inventing a second way to reach the same
+    code.
+    """
+    bus = RecordingBus()
+    session = FakeSession()
+    conv = conversation(session, face=bus)
+
+    async def mic() -> Any:
+        yield b"\x00" * 640
+
+    await conv._forward_microphone(session, mic())
+
+    assert "listening" in bus.activities
+
+
+async def test_the_conversation_ending_leaves_the_face_idle() -> None:
+    """Idle is the last word, whatever the round happened to end on.
+
+    Scripted to end on `listening`, which is what a real round almost always
+    ends on and what this test used to miss: it ended on `speaking`, and the
+    shutdown flush is `SpeechClock.pump`, which only ever turns `speaking` back
+    into `idle`. `_forward_microphone` publishes `listening` on every chunk it
+    forwards, and with barge-in on (the default) it keeps forwarding right
+    through the answer - so the flush alone left the face stuck on `listening`
+    for the rest of the day on a voice-only install, and this test passed.
+
+    The `Does` step is what puts the mic chunk after the answer rather than
+    before it: `_forward_microphone`'s own half-duplex gate drops everything
+    while `now < _playback_until`, so without clearing that first the chunk is
+    dropped and the round ends on `speaking` again - which is exactly the shape
+    that made this test vacuous.
+    """
+    bus = RecordingBus()
+    holder: dict[str, VoiceConversation] = {}
+    session = FakeSession(
+        b"\x00" * 48_000,
+        Does(lambda: setattr(holder["conv"], "_playback_until", 0.0)),
+        Turn(),
+    )
+    conv = conversation(session, FakeAudio(b"mic"), face=bus)
+    holder["conv"] = conv
+    await conv.run()
+
+    assert bus.activities == ["speaking", "listening", "idle"], (
+        "the round has to actually end on listening for this to be testing anything"
+    )
+    assert bus.state.activity == "idle"
+
+
+async def test_no_bus_means_no_behaviour_change() -> None:
+    """`face=None` is the default and must be a no-op - a text-only install runs
+    this same code path and pays nothing for a bus it never built."""
+    audio = FakeAudio()
+    conv = conversation(FakeSession(b"\x00" * 48_000, Turn()), audio)
+    assert conv._face is None and conv._speech is None, (
+        "no bus in means no clock built - the real no-op is not constructing one"
+    )
+
+    await conv.run()
+
+    assert audio.played
+
+
+# --- review findings: barge-in and the mic loop must not fight the face -------
+
+
+async def test_a_barge_in_stops_the_face_from_speaking_too() -> None:
+    """`_barge_in` resets `_playback_until` for the half-duplex gate and the idle
+    budget, but the face reads a separate clock: `_playback_until = 0.0` alone
+    left `SpeechClock._until` standing at its pre-barge-in instant, so `speaking`
+    stayed published for however much backlog was queued - up to the whole 30s
+    budget the module docstring on `_barge_in` already measures for the idle case.
+
+    Checked mid-conversation (`Hang()` after the cut), not after `run()` returns:
+    the unconditional shutdown flush in `run()`'s `finally` also forces idle, so a
+    version of this test that only looked at the state *after* `run()` completed
+    would pass even with the fix in `_barge_in` reverted.
+    """
+    bus = RecordingBus()
+    session = FakeSession(b"\x00" * 48_000, Cuts(), Hang())  # 1s of audio, then cut
+    conv = conversation(session, FakeAudio(), face=bus)
+
+    task = asyncio.create_task(conv.run())
+    await asyncio.sleep(0.05)
+    # Snapshotted before cancelling, not after: `task.cancel()` unwinds `run()`'s
+    # own `finally`, which flushes the face to idle unconditionally on *every*
+    # shutdown (verified separately by `test_the_conversation_ending_leaves_the_
+    # face_idle`) - reading `bus.activities` after that would pass even with the
+    # fix in `_barge_in` reverted, because shutdown's own flush would launder it.
+    mid_conversation = list(bus.activities)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert mid_conversation == ["speaking", "idle"], (
+        "the face kept speaking after the barge-in emptied the speaker"
+    )
+
+
+async def test_listening_never_overrides_speaking_while_the_answer_plays() -> None:
+    """With barge-in on (the default), mic chunks cross *while the daemon is
+    speaking* on purpose - that is what makes barge-in possible, and this test
+    must not defeat it by gating the forwarding itself, only the face publish.
+    Before the fix, every crossing chunk republished `listening` over `speaking`,
+    so one continuous answer read on screen as the mouth stopping mid-sentence,
+    crossfading to the listening clip, and resuming - repeatedly, for as long as
+    the answer played."""
+    from daemon.voice.conversation import PLAYBACK_BYTES_PER_FRAME
+
+    bus = RecordingBus()
+    audio = FakeAudio()
+    session = FakeSession()
+    conv = conversation(session, audio, face=bus)
+    loop = asyncio.get_running_loop()
+
+    # A full second of audio, fed and pumped the way `_one_turn` does beside
+    # `_on_audio` - the precondition is that the answer is actually playing.
+    one_second = audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME
+    at = loop.time()
+    conv._on_audio(at, one_second)
+    conv._speech.fed(b"\x00" * one_second, at)
+    conv._speech.pump(at)
+    assert bus.state.activity == "speaking", "precondition: the answer is playing"
+
+    async def mic() -> Any:
+        yield b"m1"  # crosses during playback - barge-in must still see it
+        yield b"m2"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"m1", b"m2"], "barge-in must not be gated by this fix"
+    assert "listening" not in bus.activities, (
+        "listening republished over speaking while the answer was still playing"
+    )
+
+
+async def test_listening_never_overrides_thinking_either() -> None:
+    """Same failure mode, for the gap between the owner's utterance settling and
+    the answer starting: no gate in `_forward_microphone` applies there either (no
+    tool is pending, the wake-word hold does not apply, and barge-in leaves
+    half-duplex out of it) - so every mic chunk that crosses during it would
+    otherwise republish `listening` over `thinking` immediately, on the very first
+    chunk."""
+    bus = RecordingBus()
+    bus.set_activity("thinking")
+    session = FakeSession()
+    conv = conversation(session, face=bus)
+
+    async def mic() -> Any:
+        yield b"m1"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"m1"], "the chunk must still reach the session"
+    assert bus.state.activity == "thinking", "listening overrode thinking"
+
+
+async def test_face_pump_ticks_the_falling_edge_on_a_real_clock() -> None:
+    """The one line in this diff no test above reaches on its own: every scripted
+    conversation above finishes before `_face_pump`'s first 0.04s sleep returns,
+    so the timer is always cancelled asleep on its very first iteration - the
+    idle seen in `test_the_conversation_ending_leaves_the_face_idle` comes from
+    the unconditional shutdown flush in `run()`, not from this loop. Reverting
+    `_face_pump` to `clock.now().timestamp()` (the wall-clock/monotonic-clock bug
+    the review caught) would fail nothing above; this runs the loop for real
+    instead of relying on the shutdown flush."""
+    bus = RecordingBus()
+    conv = conversation(FakeSession(), FakeAudio(), face=bus)
+    assert conv._speech is not None
+    loop = asyncio.get_running_loop()
+    conv._speech.fed(b"\x00" * 4_800, loop.time())  # ~0.1s of audio, starting now
+
+    task = asyncio.create_task(conv._face_pump())
+    try:
+        await asyncio.sleep(0.3)  # several 0.04s ticks, well past the 0.1s fed
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert bus.activities == ["speaking", "idle"], (
+        "the timer never ticked the falling edge on its own real clock"
+    )
