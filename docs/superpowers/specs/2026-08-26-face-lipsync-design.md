@@ -36,8 +36,8 @@ v1의 얼굴은 `speaking` 동안 클립을 틀고 `playbackRate`를 RMS 엔벨�
 - PCM 링과 렌더 루프
 - 최신 JPEG 슬롯
 
-**`daemon/face.py`** — `SpeechClock`이 sink 하나를 주입받는다. 기본 `None`이면 v1
-동작 그대로이고 비용 0이다.
+**`daemon/face.py`** — **`FaceBus`가** sink 하나를 주입받고 `SpeechClock.fed()`가
+그것을 호출한다. 기본 `None`이면 v1 동작 그대로이고 비용 0이다.
 
 **`daemon/app.py`** — 플래그가 켜져 있고 에셋이 있을 때만 렌더러를 만들어 주입한다.
 다른 어떤 모듈도 `face_lipsync`를 import하지 않는다.
@@ -52,15 +52,19 @@ self._until = starts + seconds
 ```
 
 립싱크가 필요한 것이 정확히 이것이다. `conversation.py`가 barge-in에 쓰는 것과 같은
-산술이므로 이미 검증돼 있고, 새로 배선할 것이 없다. sink는 PCM과 그 시각을 함께
-받는다:
+산술이므로 이미 검증돼 있고, 새로 배선할 것이 없다.
 
 ```python
 PcmSink = Callable[[bytes, float], None]   # (chunk, audible_at)
 ```
 
-**`voice/` 아래는 건드리지 않는다.** §6이 울타리를 친 경로이고 PortAudio 데드락 이력이
-있는 곳이다.
+**sink는 `SpeechClock`이 아니라 `FaceBus`가 든다.** `conversation.py`는
+`SpeechClock(face, sample_rate=..., bytes_per_frame=...)`로 **버스 하나만** 넘기므로,
+sink가 버스에 얹혀 있으면 `voice/` 아래가 **한 줄도 바뀌지 않는다.** `SpeechClock`은
+`fed()`에서 `self._bus.pcm(chunk, starts)`를 부르기만 한다.
+
+§6이 울타리를 친 경로이고 PortAudio 데드락 이력이 있는 곳이라, 이 seam이 설계의
+제약을 실제로 지키는 유일한 형태다.
 
 이 급수는 발화 시작의 동작도 자동으로 정한다. 턴이 시작될 때는 큐가 비어 `starts == at`
 이라 미래 오디오가 없다. MuseTalk은 범위 밖 인덱스를 엣지로 클램프하므로(§6, 측정)
