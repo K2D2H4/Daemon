@@ -107,6 +107,9 @@ let pendingWaitFade = 0;      // set only while waiting out spec 3.2's WAIT_MS d
 let queuedActivity = null;    // spec 3.6: a non-speaking activity change held until an
                                // in-flight one-shot finishes, rather than dropped or
                                // acted on mid-gesture
+let transitions = null;       // task 9: the pose-match table from /face/transitions,
+                               // or null if none was ever built (rule 4: absent means
+                               // frame 0, same as today)
 
 function first(list) { return (list || []).find(s => have.has(s)) || null; }
 
@@ -153,13 +156,34 @@ async function prime(stem) {
   v.addEventListener("pause", () => { if (v === showing) ensurePlaying(); });
 }
 
+// --- POSE-MATCHED ENTRY (task 9) --------------------------------------------
+// Blending outgoing[t] into incoming[0] reads as a cut because a clip's
+// near-neutral pose sits only at its own start and end (measured:
+// task-9-brief.md - median distance 6.4, cut to 3.8 by matching pose instead).
+// Look up the frame of `stem` whose pose was measured closest to whatever pose
+// `prev` was showing when the switch fired, instead of always seeking to 0.
+//
+// Rules 3 and 4 collapse into one case here, on purpose: a one-shot
+// destination is never a key under any source in transitions.match, because
+// daemon/face_match.py builds the table only over LOOP clips (both axes) - so
+// "entering a one-shot" and "no table at all" both just miss the lookup and
+// fall through to the same 0. No separate one-shot check is needed, and one
+// would risk drifting from face_match.py's own ONE_SHOTS list.
+function poseMatchTime(prev, stem) {
+  if (!transitions || !prev) return 0;
+  const seeks = transitions.match?.[prev.dataset.stem]?.[stem];
+  if (!seeks || !seeks.length) return 0;
+  const bucket = Math.floor(prev.currentTime / transitions.bucket);
+  return seeks[Math.min(Math.max(bucket, 0), seeks.length - 1)] ?? 0;
+}
+
 // --- SINGLE-SIDED CROSSFADE -------------------------------------------------
 function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {
   const next = els.get(stem);
   if (!next || next === showing) return;
   const prev = showing;
   next.loop = loop;
-  next.currentTime = 0;
+  next.currentTime = poseMatchTime(prev, stem);
   next.style.zIndex = String(++z);       // on top, so fading in covers rather than blends
   if (!REDUCED_MOTION) next.style.transitionDuration = `${fadeMs}ms`; // spec 3.2's fast/slow split
   next.playbackRate = 1;
@@ -287,6 +311,9 @@ function tick() {
 async function boot() {
   const manifest = await fetch("/face/manifest").then(r => r.json()).catch(() => ({ clips: [] }));
   have = new Set(manifest.clips);
+  // 404 (no table built yet) and a network hiccup both leave transitions null,
+  // which poseMatchTime() already treats as "fall back to frame 0" (rule 4).
+  transitions = await fetch("/face/transitions").then(r => r.ok ? r.json() : null).catch(() => null);
   if (!have.size) {
     hint.hidden = false;
     hint.innerHTML =

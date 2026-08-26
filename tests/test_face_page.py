@@ -188,3 +188,56 @@ def test_playback_recovers_from_an_external_pause_or_a_rejected_switch():
     end = PAGE.index("\n}\n", start)
     heal_body = _without_line_comments(PAGE[start:end])
     assert ".play()" in heal_body, "recovery must actually attempt to resume playback"
+
+
+def test_a_loop_entry_is_looked_up_not_hardcoded_to_frame_zero():
+    # Task 9: show() must seek to the pose-matched entry time instead of always
+    # frame 0. Scoped to show()'s own body so a stray "currentTime = 0" elsewhere
+    # on the page (prime()'s own decoder-priming reset, which must stay frame 0)
+    # cannot stand in for this.
+    start = PAGE.index("function show(stem")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert "currentTime = 0" not in body, (
+        "show() must not hardcode frame 0 - poseMatchTime() is what falls back "
+        "to 0 when there is no table or no matching entry"
+    )
+    assert "poseMatchTime(" in body, "show() must call the pose-match lookup"
+
+    # And prime()'s own reset - a different concern (decode one frame, hold it)
+    # - must be untouched: the brief says change one thing in show(), not this.
+    start = PAGE.index("async function prime(stem) {")
+    end = PAGE.index("\n}\n", start)
+    prime_body = _without_line_comments(PAGE[start:end])
+    assert "currentTime = 0" in prime_body, "priming must still hold at frame 0"
+
+
+def test_the_transitions_table_is_fetched_alongside_the_manifest_at_boot():
+    start = PAGE.index("async function boot() {")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert "/face/transitions" in body, (
+        "the pose-match table must be fetched at boot, same as the manifest"
+    )
+    assert "transitions =" in body, "the fetched table must actually be kept, not discarded"
+
+
+def test_pose_match_lookup_falls_back_to_frame_zero_when_absent():
+    # Rule 4: no table, or a clip missing from it, must silently produce 0 -
+    # never throw and never leave currentTime unset. Scoped to the lookup
+    # function's own body.
+    start = PAGE.index("function poseMatchTime(")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert "!transitions" in body, "a missing table must be checked for explicitly"
+    assert "return 0" in body, "the fallback must be 0, not undefined or a thrown error"
+
+    # And it must actually key the lookup off both the outgoing and incoming
+    # clip's names, using the table's own bucket size (rule 2) - not a bare
+    # constant, since face_match.py's BUCKET is what the table was built with.
+    assert "prev.dataset.stem" in body and "stem" in body, (
+        "the lookup must be keyed on both the outgoing and incoming clip"
+    )
+    assert "transitions.bucket" in body, (
+        "bucketing must use the table's own bucket size, not a hardcoded one"
+    )
