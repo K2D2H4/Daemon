@@ -19,8 +19,16 @@ async tests need no decorator), ruff.
 
 ## Global Constraints
 
-- **Layering (CONTRACTS 4).** Only `daemon/app.py` imports `ollama_process`. Do
-  not import it from `cli.py`, `setup.py`, `loop.py`, or `companion.py`.
+- **Layering (CONTRACTS 4).** Only `daemon/app.py` and the `daemon run` call site
+  in `daemon/cli.py` import `ollama_process` (ledger Ruling 4 — `cli.py` is where
+  the real one is constructed and injected). Do not import it from `setup.py`,
+  `loop.py`, `companion.py`, or anything under `memory/`.
+- **No test may spawn a real Ollama.** `create_app`'s `local_ollama` parameter
+  defaults to `None`, which means no start task and no wait — today's behaviour
+  exactly. Only `daemon/cli.py` passes a real one. Never construct one inside
+  `create_app`: `tests/test_acceptance.py:96` leaves `DAEMON_OLLAMA_BASE_URL` at
+  `127.0.0.1:11434`, so every lifespan test would probe localhost and start a
+  server.
 - **Do not import `daemon.cli` from `daemon.app`.** `probe_ollama` lives in
   `cli.py`; `ollama_process` gets its own probe rather than importing upward.
 - **Soft dependency.** Any gate may fail and the daemon must still boot, serve
@@ -488,14 +496,25 @@ service."
 ### Task 2: Wire it into the daemon, and make the backfill wait
 
 **Files:**
-- Modify: `daemon/app.py` — `_backfill` (line 769), the `recall is not None` block
-  (line 487-493), the `finally` block (line 546-565)
+- Modify: `daemon/app.py` — `create_app`'s signature (line 134), `_backfill`
+  (line 769), the `recall is not None` block (line 487-493), the `finally` block
+  (line 546-565)
+- Modify: `daemon/cli.py:878` — the one production `create_app` call
 - Test: `tests/test_ollama_process_wiring.py`
 
 **Interfaces:**
 - Consumes: `LocalOllama`, `ensure_running`, `aclose`, `started_by_us` from Task 1.
-- Produces: `_backfill(recall: Recall, local_ollama: LocalOllama | None) -> None`
+- Produces: `_backfill(recall: Recall, ollama_ready: Awaitable[bool] | None = None) -> None`
   — the second parameter is new and positional.
+
+**Amended before execution (ledger Ruling 1).** Starting Ollama does **not** live
+inside `_backfill`. `recall` is nullable (`daemon/app.py:339`; `_build_recall`'s
+docstring at :805 requires an embedder failure not to stop boot), so hanging the
+startup off the backfill would leave a `provider=ollama` user with no Ollama and no
+chat. `lifespan` starts it unconditionally in its own task and hands that task to
+the backfill, which **awaits** it rather than calling it. Awaiting one `asyncio.Task`
+more than once is defined behaviour and returns the cached result, so
+`ensure_running` still runs exactly once.
 
 - [ ] **Step 1: Write the failing test that the backfill waits**
 
@@ -528,25 +547,24 @@ class RecordingRecall:
         return 0
 
 
-class Waiter:
-    """A `LocalOllama` that reports when it was asked, and answers slowly."""
-
-    def __init__(self, *, ready: bool) -> None:
-        self._ready = ready
-        self.asked = False
-
-    async def ensure_running(self) -> bool:
-        self.asked = True
-        return self._ready
-
-
-async def test_the_backfill_asks_for_ollama_before_embedding_anything() -> None:
+async def test_the_backfill_waits_rather_than_embedding_against_a_cold_ollama() -> None:
+    """The ordering assertion, not just the outcome: while Ollama is still coming
+    up, `backfill` must not have been called even once. Asserting only the final
+    count would pass against code that never waited at all."""
     recall = RecordingRecall()
-    waiter = Waiter(ready=True)
+    gate = asyncio.Event()
 
-    await _backfill(recall, waiter)
+    async def ollama_ready() -> bool:
+        await gate.wait()
+        return True
 
-    assert waiter.asked is True
+    running = asyncio.create_task(_backfill(recall, asyncio.create_task(ollama_ready())))
+    await asyncio.sleep(0)
+    assert recall.calls == 0  # the whole point: still waiting
+
+    gate.set()
+    await running
+
     assert recall.calls == 1
 
 
@@ -554,13 +572,16 @@ async def test_the_backfill_does_not_run_against_an_embedder_that_never_came_up(
     """Not a silent skip - `backfill` would only log `stopped after 0 message(s)`
     and never run again, which is the bug this whole change exists to remove."""
     recall = RecordingRecall()
-    waiter = Waiter(ready=False)
 
-    await _backfill(recall, waiter)
+    async def never() -> bool:
+        return False
 
-    assert waiter.asked is True
+    await _backfill(recall, asyncio.create_task(never()))
+
     assert recall.calls == 0
 ```
+
+`import asyncio` at the top of the test file alongside the existing imports.
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -570,10 +591,12 @@ Expected: FAIL — `TypeError: _backfill() takes 1 positional argument but 2 wer
 - [ ] **Step 3: Give `_backfill` the wait**
 
 In `daemon/app.py`, change `_backfill`'s signature and add the wait at the top of
-the body, leaving the exhaustion loop and its comments untouched:
+the body, leaving the exhaustion loop and its comments untouched. `Awaitable` comes
+from `collections.abc` — add it to the existing import from there rather than
+introducing a `typing` one:
 
 ```python
-async def _backfill(recall: Recall, local_ollama: LocalOllama | None = None) -> None:
+async def _backfill(recall: Recall, ollama_ready: Awaitable[bool] | None = None) -> None:
     """Embed history the vector lane is missing, to exhaustion.
 
     One call was not enough. It stopped at its default 500 rows and never ran
@@ -592,7 +615,7 @@ async def _backfill(recall: Recall, local_ollama: LocalOllama | None = None) -> 
     Never fatal: recall degrades to keyword-only, which is worse than the full
     answer and far better than a dead conversation loop.
     """
-    if local_ollama is not None and not await local_ollama.ensure_running():
+    if ollama_ready is not None and not await ollama_ready:
         logger.info(
             "recall backfill skipped: no embedder answered. Recall stays keyword-only "
             "and the next restart tries again"
@@ -615,13 +638,33 @@ In `daemon/app.py`, add the import at the top with the other `daemon` imports:
 from daemon.ollama_process import LocalOllama
 ```
 
-Replace the `recall is not None` block (currently lines 487-493) so the object is
-built and passed in. Construction is cheap and touches nothing, so it stays
-outside the `if`— the `finally` needs it either way:
+Replace the `recall is not None` block (currently lines 487-493). Construction is
+cheap and touches nothing, and both the start task and the `finally` need it, so it
+sits outside the `if` — see the amendment note under **Interfaces** for why the
+start is not conditional on `recall`:
+
+First add the parameter to `create_app` (line 134), beside the existing
+`channel` / `memory` / `recall` injections and for the same reason they exist:
 
 ```python
-    local_ollama = LocalOllama(settings.ollama_base_url)
+    local_ollama: LocalOllama | None = None,
+```
+
+Then in `lifespan`:
+
+```python
     app.state.local_ollama = local_ollama
+    app.state.ollama_task = None
+    if local_ollama is not None:
+        # Not gated on `recall`: `provider=ollama` routes chat here too, and
+        # `recall` is None whenever `_build_recall` failed - exactly the case where
+        # hanging the start off the backfill would leave the daemon with no local
+        # model at all. Not awaited, for the same log-clock reason as the backfill
+        # below. Only `daemon run` passes one; a test passing none gets no start
+        # task, because a test that spawns a server is a broken test.
+        app.state.ollama_task = asyncio.create_task(
+            local_ollama.ensure_running(), name="ollama-start"
+        )
 
     if recall is not None:
         # Backfill after the loop is already serving, and in the background: a
@@ -633,9 +676,15 @@ outside the `if`— the `finally` needs it either way:
         # embedder must not delay the log clock (docs/PLAN.md 8.1) - and that is
         # also why `_backfill` waits for Ollama inside itself rather than here.
         app.state.backfill_task = asyncio.create_task(
-            _backfill(recall, local_ollama), name="recall-backfill"
+            _backfill(recall, app.state.ollama_task), name="recall-backfill"
         )
 ```
+
+Add `"ollama_task"` to the tuple of task names the `finally` cancels (currently
+`"backfill_task", "loop_task", "wake_task", "reflection_boot_task",
+"delegation_task"`). Put it **immediately after** `"backfill_task"`: the backfill
+is the thing awaiting it, so cancelling the waiter first means nothing is left
+waiting when the awaited task goes.
 
 In the `finally` block, close it next to the MCP cleanup — after the task
 cancellations, so a backfill mid-`ensure_running` is already cancelled:
@@ -657,36 +706,81 @@ Append to `tests/test_ollama_process_wiring.py`:
 ```python
 from pathlib import Path
 
+from starlette.testclient import TestClient
+
 from daemon.app import create_app
 
 
-async def test_the_lifespan_builds_and_closes_the_ollama_it_owns(tmp_path: Path) -> None:
-    """`app.state.local_ollama` has to exist, and the `finally` has to reach it -
-    a child process nothing closes is one orphan per restart."""
-    from httpx import ASGITransport, AsyncClient
+class FakeOllama:
+    """An injected stand-in. A real `LocalOllama` here would probe localhost and
+    start a server, which is what `local_ollama=None` exists to prevent."""
 
+    def __init__(self) -> None:
+        self.asked = False
+        self.closed = False
+
+    async def ensure_running(self) -> bool:
+        self.asked = True
+        return True
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_the_lifespan_starts_and_closes_the_ollama_it_was_given(tmp_path: Path) -> None:
+    """A child process nothing closes is one orphan per restart - the reason the
+    stdio MCP servers are closed in the same `finally`."""
+    fake = FakeOllama()
+
+    with TestClient(create_app(_settings_for(tmp_path), local_ollama=fake)) as client:
+        assert client.get("/health").json()["status"] == "ok"
+
+    assert fake.asked is True
+    assert fake.closed is True
+
+
+def test_no_ollama_injected_means_no_start_task(tmp_path: Path) -> None:
+    """The default every existing test takes. If this ever regresses, the suite
+    starts spawning real servers on whatever machine runs it."""
     app = create_app(_settings_for(tmp_path))
-    closed: list[bool] = []
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test"):
-        local = app.state.local_ollama
-        assert local is not None
-        original = local.aclose
-
-        async def record() -> None:
-            closed.append(True)
-            await original()
-
-        local.aclose = record  # type: ignore[method-assign]
-
-    assert closed == [True]
+    with TestClient(app):
+        assert app.state.ollama_task is None
 ```
 
 Reuse the settings helper the acceptance tests already use — see
-`tests/test_acceptance.py:157` `test_the_lifespan_actually_starts_the_conversation_loop`
-and its `_settings(tmp_path)`. Import that rather than writing `_settings_for`; if
-it is private to that module, copy its body into this test file's own
-`_settings_for` and say so in a comment.
+`tests/test_acceptance.py:96` `_settings(tmp_path)`, called by
+`test_the_lifespan_actually_starts_the_conversation_loop` at line 157. Import it if
+it is importable; if it is private to that module, copy its body into this file's
+own `_settings_for` and say so in a comment. Note it sets
+`DAEMON_PROVIDER="ollama"` and leaves `DAEMON_OLLAMA_BASE_URL` at the
+`127.0.0.1:11434` default — which is exactly why the second test matters. Those
+tests inject `channel=_Idle(), memory=_Mem()` to stay off the network; if
+`/health` will not come up without them here, do the same.
+
+- [ ] **Step 6b: Pass the real one from `daemon run`**
+
+`daemon/cli.py:878` is the only production call site:
+
+```python
+    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
+```
+
+becomes:
+
+```python
+    from daemon.ollama_process import LocalOllama
+
+    uvicorn.run(
+        create_app(settings, local_ollama=LocalOllama(settings.ollama_base_url)),
+        host=settings.host,
+        port=settings.port,
+        log_config=None,
+    )
+```
+
+Put the import beside the `from daemon.app import create_app` already at
+`daemon/cli.py:872`, matching its local-import style. **This line is the entire
+feature** — without it nothing ever starts Ollama, and every test still passes.
 
 - [ ] **Step 7: Run it, then the neighbouring suites**
 
@@ -699,8 +793,8 @@ new behaviour rather than widening the default.
 - [ ] **Step 8: Lint and commit**
 
 ```bash
-python3 -m ruff check daemon/app.py tests/test_ollama_process_wiring.py
-git add daemon/app.py tests/test_ollama_process_wiring.py
+python3 -m ruff check daemon/app.py daemon/cli.py tests/test_ollama_process_wiring.py
+git add daemon/app.py daemon/cli.py tests/test_ollama_process_wiring.py
 git commit -m "ollama: start it at boot, and make the backfill wait for it
 
 The backfill fired at t=0 against an embedder that answers seconds later,
@@ -884,8 +978,18 @@ def pull_model(model: str) -> bool:
 
     Not an HTTP call to `/api/pull`: the CLI already prints a progress bar, and a
     1.2GB download with no visible progress is a wizard that looks hung."""
-    return subprocess.run(("ollama", "pull", model), check=False).returncode == 0
+    try:
+        return subprocess.run(("ollama", "pull", model), check=False).returncode == 0
+    except OSError:
+        # Not on PATH at all. `subprocess.run` raises here rather than returning
+        # non-zero, and an uncaught FileNotFoundError would end the wizard
+        # mid-question. Setup degrades; it does not crash.
+        return False
 ```
+
+The `try` is not optional (ledger Ruling 3): without it a user whose `ollama` is
+installed but not on their shell PATH crashes `daemon setup`, and no test in this
+plan would catch it because they all inject a fake `pull`.
 
 Add it to `Checks` (line 889), keeping the one-bundle-of-probes shape:
 
@@ -1004,12 +1108,12 @@ for' comment: it now asks. Chat models stay printed-only."
 - [ ] **Step 1: Check whether reachability needs an entry**
 
 Run: `python3 -m pytest tests/test_reachable.py -v`
-Expected: PASS with no new entry. `LocalOllama` is constructed by
-`daemon/app.py`'s `lifespan`, so `_constructed` finds it — unlike a grant or a
-constructor argument, which is why `PENDING_CLASSES` is empty and its comment
-explains the blind spot. **If it fails,** read the comment at
-`tests/test_reachable.py:46` before adding anything: the fix is usually to
-construct the thing, not to declare it pending.
+Expected: PASS with no new entry. `_constructed`
+(`tests/test_reachable.py:217`) matches `Name(...)` in **any** file under
+`daemon/` that does not define it, so `LocalOllama(...)` at `daemon/cli.py:878`
+satisfies it — verified against that function before this plan was written.
+**If it fails,** read the comment at `tests/test_reachable.py:46` before adding
+anything: the fix is usually to construct the thing, not to declare it pending.
 
 - [ ] **Step 2: Add the module to both layout docs**
 
@@ -1119,6 +1223,16 @@ spelled identically in Tasks 1, 2 and 4. `Checks.pull` is
 `Callable[[str], bool]` in both its definition (Task 3 Step 6) and every test
 that injects it (Step 4). `_backfill`'s second parameter is positional with a
 `None` default in both the test (Step 1) and the implementation (Step 3).
+
+**Amended before execution.** The pre-flight scan found four things, ruled on in
+`.superpowers/sdd/2026-08-26-ollama-with-the-daemon/progress.md` and folded into
+the task text above: Ollama's start moved out of `_backfill` into its own lifespan
+task (Ruling 1, because `recall` is nullable); `pull_model` keeps the bare binary
+name (Ruling 2) but must catch `OSError` (Ruling 3, or `daemon setup` crashes);
+and `LocalOllama` is injected into `create_app` from `daemon/cli.py` rather than
+constructed inside it (Ruling 4, or the existing test suite starts spawning real
+servers). Task 1 was already dispatched when Rulings 1-4 were made and is
+unaffected by all of them.
 
 **Known unknowns, flagged rather than guessed.** Three places tell the
 implementer to read the repo instead of trusting this plan: `GEMINI_ANSWERS`
