@@ -99,6 +99,14 @@ class FrameClock:
     jumps. Small forward creep from sample dropping is not a new turn, hence the
     tolerance.
 
+    That tolerance only makes creep harmless; it does not make it correct. A frame
+    index means "this far after `origin`", so an `origin` that has moved forward
+    points the same index at later audio. **Size the ring to hold a whole utterance**
+    and the question does not arise, because nothing is dropped until the turn ends -
+    which is what `daemon/app.py` does. A ring sized for the 2.2s window alone is
+    dropping samples continuously mid-turn, and the mouth drifts against the sound
+    without anything reporting it.
+
     **One frame per tick, never a skip.** Returning "the newest ready frame" would
     jump the mouth forward after any hitch. Falling behind is corrected by the
     renderer's own held-frame ticks, which cost nothing.
@@ -112,9 +120,17 @@ class FrameClock:
     __slots__ = ("_fps", "_frame", "_origin")
 
     RE_ANCHOR_TOLERANCE = 0.2
-    """Seconds of forward movement in `origin` treated as the ring dropping old
+    """Seconds of movement **since the previous tick** treated as the ring dropping old
     samples rather than as a new turn. A full ring creeps every feed; a turn boundary
-    jumps."""
+    jumps.
+
+    Since the previous tick, not since the anchor - and the first version got that
+    wrong. It compared against the value captured at the last re-anchor, so steady
+    creep accumulated against a fixed reference and tripped this threshold every time
+    it passed 0.2s: measured 7 false re-anchors in 40 ticks at 40ms of creep each,
+    which restarts the utterance from frame 0 five times a second. The test that was
+    supposed to cover this fed two 40ms steps and never let them add up.
+    """
 
     def __init__(self, *, fps: float) -> None:
         self._fps = fps
@@ -123,8 +139,8 @@ class FrameClock:
 
     def due(self, *, now: float, origin: float) -> int | None:
         if self._origin is None or abs(origin - self._origin) > self.RE_ANCHOR_TOLERANCE:
-            self._origin = origin
             self._frame = 0
+        self._origin = origin
         needed = latest_audio_ms(self._frame + BATCH - 1, self._fps) / 1000.0
         if now - origin < needed:
             return None

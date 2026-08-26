@@ -592,6 +592,39 @@ def test_a_ring_dropping_old_samples_is_not_a_new_turn():
     assert clock.due(now=1.2, origin=0.08) == 2
 
 
+def test_creep_does_not_re_anchor_once_it_ADDS_UP_past_the_tolerance():
+    """The case the two steps above miss, and the bug they let through.
+
+    Comparing `origin` against the value captured at the last re-anchor makes steady
+    creep accumulate against a fixed reference, so it crosses RE_ANCHOR_TOLERANCE
+    however small each step is: measured 7 false resets in 40 ticks at 40ms each, five
+    restarts of the utterance per second. The comparison has to be against the
+    PREVIOUS TICK. 40 ticks here total 1.6s of creep, eight times the tolerance.
+    """
+    clock = FrameClock(fps=24.0)
+    origin, now, frames = 0.0, 1.0, []
+    for _ in range(40):
+        frames.append(clock.due(now=now, origin=origin))
+        origin += 0.04
+        now += 1 / 24.0
+    advanced = [f for f in frames if f is not None]
+    assert advanced == sorted(advanced), f"the frame count went backwards: {frames}"
+    assert advanced.count(0) <= 1, (
+        f"frame 0 was handed out {advanced.count(0)} times - the utterance restarted"
+    )
+
+
+def test_a_real_turn_boundary_still_re_anchors_after_creep():
+    """The fix must not buy creep-immunity by never re-anchoring at all."""
+    clock = FrameClock(fps=24.0)
+    origin, now = 0.0, 1.0
+    for _ in range(10):
+        clock.due(now=now, origin=origin)
+        origin += 0.04
+        now += 1 / 24.0
+    assert clock.due(now=now + 30.0, origin=origin + 30.0) == 0
+
+
 def test_a_backward_jump_also_restarts():
     """Barge-in rebuilds the speech clock from scratch, so origin can move
     backward - see PcmRing.feed's own note on the same hazard."""
