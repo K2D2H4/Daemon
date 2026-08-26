@@ -1910,10 +1910,19 @@ async def _speak_unprompted(
 
     Then a session, with no opening at all, because the daemon has just spoken
     first and the owner is most likely to answer in the next few seconds - the one
-    moment a gate rebuild would miss. It opens listening rather than talking: the
-    line is already in the conversation log (`ProactiveDelivery._log` writes it
-    before this returns), so the session assembles its context knowing what was
-    just said, without being told twice. `IDLE_TIMEOUT_SECONDS` bounds the cost at
+    moment a gate rebuild would miss. It opens listening rather than talking, and
+    *normally* it knows what was just said: `deliver` runs `_say` -> `_send` ->
+    `_log`, so the conversation-log row lands while this function is still
+    connecting a websocket, and `continuity_block` picks it up. Normally, not
+    always - a slow Telegram (`telegram.py` allows each request 40 s) can push
+    `_log` past the connect, and the session then opens without the line in its
+    context and the owner's reply answers nothing. Left as a race rather than
+    fixed by reordering `deliver`: logging before the route is known would put an
+    utterance that reached nobody into the log and the silence clock and then
+    delete its row, which is a hygiene-rule-1 violation (PLAN 4.2) and a worse
+    failure than a rarely-missing continuity block (PR #115 review).
+
+    `IDLE_TIMEOUT_SECONDS` bounds the cost at
     30 seconds of silence, which is what makes this affordable on a per-minute
     session that may well go unanswered.
 

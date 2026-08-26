@@ -47,8 +47,15 @@ Outcome = Literal["spoke", "not-spoken", "no-listener"]
 Three, not two, because the caller does something different in each. `spoke` and
 `not-spoken` both come from a wake loop that took the request and ran it - it is
 in charge, and the caller's only job is to record what happened. `no-listener` is
-the different thing: **nobody took it**, so nothing in this process is holding the
-microphone either, and the caller is free to use the speaker directly.
+the different thing: **nobody took it**, so nothing in this process ever will, and
+the caller is free to use the speaker directly.
+
+Note what does *not* separate them: whether the microphone is held. `mic_hold` is
+zero for the whole of `_speak_unprompted` - `listen()`'s `finally` closes the
+capture stream, which exits `record()`'s hold, before `_wake_round` closes the
+gate and long before anything is spoken. An earlier version of this paragraph said
+`not-spoken` meant the wake loop still had the device (PR #115 review). It does
+not, and the real reasons are in `ProactiveDelivery._say`.
 
 Collapsing the last two into a single `False` is what the first version did, and
 it was wrong in a way that would only show on installs where the wake loop is

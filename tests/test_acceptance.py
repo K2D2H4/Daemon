@@ -2214,3 +2214,80 @@ async def test_the_session_opened_after_speaking_is_given_no_opening(
     assert len(opened) == 1
     assert not opened[0].get("opening_text"), "the model would say its own version of the line"
     assert not opened[0].get("opening_audio")
+
+
+@pytest.mark.asyncio
+async def test_the_real_mailbox_and_the_real_delivery_agree_on_no_listener(
+    tmp_path: Path, db: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two modules agree on three bare strings across a module boundary, and
+    nothing was binding them. PR #115 review renamed `no-listener` in `mic_floor`
+    alone and `test_delivery.py` plus every acceptance test stayed green - only
+    `test_mic_floor.py` failed, which is exactly the file whoever renames it would
+    update. That would have shipped the silence this change exists to fix, with a
+    green suite.
+
+    So this runs the *real* `mic_floor.request` into the *real* `ProactiveDelivery`
+    with no fake between them: nobody takes the line, and the speaker must still
+    end up saying it. Both fakes here are at the process edge - a speaker and a
+    channel - which is where `tests/CLAUDE.md` says fakes belong."""
+    from daemon import mic_floor
+    from daemon.memory.store import Store
+    from daemon.memory.writer import FileMemoryWriter
+    from daemon.proactivity.base import Candidate, Utterance, Verdict
+    from daemon.proactivity.delivery import ProactiveDelivery
+    from daemon.proactivity.presence import Reading
+
+    moment = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    said: list[str] = []
+    sent: list[Any] = []
+
+    class EdgeSpeaker:
+        async def say(self, text: str) -> bool:
+            said.append(text)
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    class EdgeChannel:
+        async def send(self, message: Any) -> None:
+            sent.append(message)
+
+    store = Store(db)
+    candidate_id = store.insert_candidate(
+        kind="topic", reason="'llm-wiki' 이야기를 한 지 15일 됐다.", payload="{}", now=moment
+    )
+    delivery = ProactiveDelivery(
+        store,
+        FileMemoryWriter(tmp_path, store),
+        channel=EdgeChannel(),
+        speaker=EdgeSpeaker(),
+        # The real one, with a deadline short enough that the test does not wait.
+        ask_for_the_floor=lambda text: mic_floor.request(text, wait_seconds=0.05),
+    )
+
+    result = await delivery.deliver(
+        Candidate(kind="topic", reason="'llm-wiki' 이야기를 한 지 15일 됐다.", id=candidate_id),
+        Utterance(text="요즘 llm-wiki 쪽은 잘 돼가고 있어요?"),
+        Verdict(
+            allowed=True,
+            why="ok",
+            reading=Reading(
+                at=moment,
+                idle_seconds=5.0,
+                foreground_app="Warp",
+                mic_busy=False,
+                output_busy=False,
+            ),
+            delivery="both",
+        ),
+        now=moment,
+    )
+
+    assert said == ["요즘 llm-wiki 쪽은 잘 돼가고 있어요?"], (
+        "the two modules stopped agreeing on what 'nobody took it' is called"
+    )
+    assert result.route == "both"
