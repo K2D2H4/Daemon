@@ -88,6 +88,27 @@ async def test_two_subscribers_both_get_events():
     await b.aclose()
 
 
+async def test_an_unchanged_level_is_not_republished():
+    """Design spec §2: the socket stays open and the traffic is zero when nothing
+    is happening. `SpeechClock.pump` runs at 25Hz for the whole of a voice
+    conversation and hands `set_level` the same 0.0 on every tick once the
+    speaker is empty - forty identical events a second down every open stream
+    unless the bus stops them here, the way it already stops a repeated
+    activity."""
+    bus = FaceBus()
+    agen = bus.subscribe()
+    await _drain(agen, 1)  # snapshot, level 0.0
+    # A real change gets through first, so this is a filter and not a mute.
+    bus.set_level(0.4)
+    (changed,) = await _drain(agen, 1)
+    assert changed.level == 0.4
+    for _ in range(5):
+        bus.set_level(0.4)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(agen.__anext__(), 0.05)
+    await agen.aclose()
+
+
 def test_level_is_clamped():
     bus = FaceBus()
     bus.set_level(-1.0)

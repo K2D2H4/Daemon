@@ -27,8 +27,6 @@ from typing import Literal
 Activity = Literal["idle", "listening", "thinking", "speaking", "working"]
 Mood = Literal["amused", "sulky", "curious"]
 
-MOODS: tuple[Mood, ...] = ("amused", "sulky", "curious")
-
 SHOT_BACKLOG = 4
 """One-shots queue, unlike `level`, because a dropped laugh is a missing expression
 rather than a stale one. The cap exists anyway: a subscriber far enough behind to owe
@@ -91,6 +89,14 @@ class FaceBus:
 
     def set_level(self, level: float) -> None:
         level = 0.0 if level < 0.0 else 1.0 if level > 1.0 else level
+        if level == self._state.level:
+            # Same guard `set_activity` already has, and for the same reason
+            # (design spec §2: the socket is open and the traffic is zero while
+            # nothing is happening). Without it `SpeechClock.pump` republishes an
+            # identical `level: 0.0` on every one of its 25Hz ticks for the whole
+            # of a voice conversation - forty events a second down every open
+            # stream saying nothing changed.
+            return
         self._state = FaceState(activity=self._state.activity, level=level)
         if self._subs:
             self._fan(self._state)

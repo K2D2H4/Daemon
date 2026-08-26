@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -129,21 +130,42 @@ async def stream(request: Request) -> StreamingResponse:
     events. Coalesces state changes but queues one-shots. Emits a keepalive comment
     every N seconds so sleeping clients don't close the connection."""
     bus: FaceBus = request.app.state.face
-    keepalive = getattr(request.app.state, 'keepalive_seconds', KEEPALIVE_SECONDS)
 
     async def events() -> AsyncIterator[bytes]:
         agen = bus.subscribe()
+        # One `__anext__` that OUTLIVES a keepalive tick, waited on rather than
+        # raced. `asyncio.wait_for(agen.__anext__(), ...)` *cancels* the pending
+        # call on timeout, and the bus generator is suspended inside
+        # `await sub.wake.wait()` (daemon/face.py), so that cancellation runs its
+        # `finally` - unsubscribing this client and ending the generator. The
+        # next `__anext__` then raised StopAsyncIteration and the stream simply
+        # stopped after the first quiet 20 seconds. `EventSource` reconnects, so
+        # the face survived it, but a one-shot published in the gap is gone for
+        # good: the reconnect's snapshot re-sends state and nothing else.
+        pending: asyncio.Future[Event] = asyncio.ensure_future(agen.__anext__())
         try:
             while True:
-                try:
-                    event = await asyncio.wait_for(agen.__anext__(), keepalive)
-                except TimeoutError:
+                done, _ = await asyncio.wait({pending}, timeout=KEEPALIVE_SECONDS)
+                if not done:
                     yield b":\n\n"
                     continue
+                try:
+                    event = pending.result()
                 except StopAsyncIteration:
                     return
+                pending = asyncio.ensure_future(agen.__anext__())
                 yield f"data: {json.dumps(_payload(event))}\n\n".encode()
         finally:
+            pending.cancel()
+            # Awaited, not merely cancelled. Delivering the cancellation is what
+            # runs the bus generator's own `finally` and discards this subscriber,
+            # and until it lands the generator still counts as running - which
+            # makes the `aclose()` below raise `RuntimeError: aclose():
+            # asynchronous generator is already running` instead (measured on the
+            # client-disconnect path). Once it has landed the generator is
+            # finished and `aclose()` is the no-op that says so.
+            with suppress(asyncio.CancelledError, StopAsyncIteration):
+                await pending
             await agen.aclose()
 
     return StreamingResponse(
