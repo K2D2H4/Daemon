@@ -50,7 +50,7 @@ flowchart LR
     LOG["log.py<br/>markdown · fsynced"]
     STORE["store.py<br/>sqlite · provenance"]
     RECALL["recall.py<br/>Lane 1 · no LLM call"]
-    OLLP["ollama_process.py<br/>starts the local embedder · app.py only"]
+    OLLP["ollama_process.py<br/>starts the local embedder · app.py + cli.py only"]
     CUR["curated.py<br/>core.md · rewritten whole"]
     ENT["entities.py<br/>notes · wiki-linked · appended"]
   end
