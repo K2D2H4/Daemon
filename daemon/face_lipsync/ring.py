@@ -3,6 +3,8 @@
 `SpeechClock` already stamps every chunk with the moment it becomes audible, so
 this stores audio on that timeline rather than on arrival time - which is what lets
 a frame index be turned into a sample offset without knowing anything about queues.
+The ring re-anchors when it detects a gap, so it always holds the current timeline,
+not a stale one.
 """
 
 from __future__ import annotations
@@ -29,6 +31,16 @@ class PcmRing:
         block = np.frombuffer(chunk, dtype=np.int16)
         if self._samples.size == 0:
             self._start = audible_at
+        else:
+            # Detect if incoming chunk is discontinuous from buffered audio.
+            # SpeechClock ensures chunks are contiguous within a turn
+            # (starts = max(self._until, at)). A gap >1ms indicates a new turn.
+            buffer_end = self._start + self._samples.size / self._rate
+            gap = audible_at - buffer_end
+            if gap > 0.001:  # 1ms tolerance for float noise within a turn
+                # New turn or long silence: discard stale samples and re-anchor.
+                self._samples = np.zeros(0, dtype=np.int16)
+                self._start = audible_at
         self._samples = np.concatenate([self._samples, block])
         if self._samples.size > self._max:
             drop = self._samples.size - self._max
