@@ -18,7 +18,7 @@ MS_PER_INDEX = 1000.0 / AUDIO_FPS
 
 PADDING_LEFT = 2
 PADDING_RIGHT = 2
-"""MuseTalk v15 defaults (`--audio_padding_length_left/right`)."""
+"""MuseTalk v1.5 defaults (`--audio_padding_length_left/right`)."""
 
 WINDOW = 2 * (PADDING_LEFT + PADDING_RIGHT + 1)
 """10 indices = 200ms."""

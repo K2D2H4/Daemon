@@ -20,12 +20,18 @@ class PcmRing:
     """Recent PCM, addressed by the time it is heard rather than when it arrived."""
 
     def __init__(self, *, sample_rate: int, width: int, seconds: float) -> None:
+        assert width == 2, "PcmRing is 16-bit mono; width must be 2 (bytes/sample)"
         self._rate = sample_rate
-        self._width = width
         self._max = int(sample_rate * seconds)
         self._samples = np.zeros(0, dtype=np.int16)
         self._start = 0.0
         """Audible time of `self._samples[0]`."""
+
+    @property
+    def sample_rate(self) -> int:
+        """The rate `window()`'s output is sampled at - not whisper's assumed
+        16kHz. See `LipsyncEngine.mouths`'s docstring for why that gap matters."""
+        return self._rate
 
     def feed(self, chunk: bytes, audible_at: float) -> None:
         block = np.frombuffer(chunk, dtype=np.int16)

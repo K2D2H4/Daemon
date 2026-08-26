@@ -16,7 +16,15 @@ JPEG_QUALITY = 85
 
 
 class Renderer:
-    """One frame at a time. The loop that calls this lives in `daemon/app.py`."""
+    """One frame at a time. The loop that calls this lives in `daemon/app.py`.
+
+    N=1 is the shipped shape - `_render` always calls `mouths(audio, [i])` - even
+    though the spec calls N=2 the only viable batch. Widening to N=2 is not a
+    protocol change here: it would need `mouths` to take two windows rather than
+    one audio array (two frames are two whisper indices apart, so a single array
+    cannot express both), and it would mean revisiting `Slot`'s latest-wins
+    semantics too.
+    """
 
     def __init__(
         self,

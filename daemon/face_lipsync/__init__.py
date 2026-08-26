@@ -23,7 +23,14 @@ class LipsyncEngine(Protocol):
     def mouths(
         self, audio: np.ndarray, frame_indices: Sequence[int]
     ) -> list[np.ndarray]:
-        """256x256 BGR mouths, one per index, in the same order."""
+        """256x256 BGR mouths, one per index, in the same order.
+
+        `audio` is `PcmRing.window()`'s own output and nothing else: float32,
+        `-1..1`, 200ms long at `PcmRing.sample_rate` (24kHz in production -
+        `daemon/voice/audio.py`'s OUTPUT_SAMPLE_RATE) - not the 16kHz whisper's
+        own mel front-end assumes. An implementation that feeds this straight to
+        whisper without resampling first gets a 1.5x-stretched, late mouth.
+        """
         ...
 
 
