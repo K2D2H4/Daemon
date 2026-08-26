@@ -88,11 +88,29 @@ rather than routine coverage: `set_mood` must never appear in the registry, and 
 `set_mood` call must never reach `run_tools`. If a future capability needs an entry
 here, it needs its own ADR and its own measurement, not a line added to a list.
 
-One thing this does not do: the mood is published when the answer's first audio
-arrives, not when the call does. A blocking tool call reaches us before any audio, and
-`speaking` is the one transition allowed to cut a one-shot — so publishing on arrival
-put the expression on screen for about 0ms. The text path learned this first and the
-fix is the same one.
+### Correction, same day — the ordering, and the microphone
+
+Two things this ADR got wrong on first writing, both found by the owner running it and
+both the cost of reasoning from the text path instead of measuring this one.
+
+**The mood is published when the call arrives, not when the audio does.** The first
+version held it for the first audio chunk so the arc would play over the speaking loop,
+copying the text path. Over voice that broke the mouth: `speaking` is already up by
+then and `set_activity` dedupes, so the single event allowed to cut a one-shot had
+passed, and the arc suppressed the speaking clip for its whole length — reported as
+"the mood plays and the speaking clip never comes". A blocking tool call arrives about
+1.7s before the first audio, so unlike text there is a real gap for the expression to
+live in and the audio arriving is what hands the mouth back. Spec 3.6's *original*
+ordering, which only voice ever fitted.
+
+**Declaring a mood takes the microphone floor.** The first version skipped
+`_answering_tool` for `set_mood`, reasoning that answering the call is instant.
+Answering is; being answered is not. The window runs until the model's first audio
+returns, and `_forward_microphone` already documented what room noise inside it does —
+the server reads it as the owner interrupting and cancels the pending call, so the
+daemon never speaks the result. Reported as "she does not answer properly any more".
+That one cost answers rather than pixels, and the comment warning about it was already
+in the file.
 
 ## Alternative rejected
 

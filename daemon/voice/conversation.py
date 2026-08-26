@@ -369,16 +369,6 @@ class VoiceConversation:
         rather than redone does not seed the same memories twice."""
 
         self._face = face
-        self._pending_mood: Mood | None = None
-        """A mood the model declared, waiting for the answer it belongs to.
-
-        Not published when the call arrives, and that is the whole point. A blocking
-        tool call reaches us *before any audio* (measured - daemon/voice/base.py), and
-        `speaking` is the one transition allowed to cut a one-shot (spec 3.2), so a
-        mood published on arrival is cut by the answer it was about and spends roughly
-        0ms on screen. The text path already learned this and publishes `speaking`
-        first; here the wait is longer but the fix is the same one.
-        """
         self._speech = (
             None
             if face is None
@@ -640,12 +630,6 @@ class VoiceConversation:
                         # `_face_pump` only ever has to notice the falling edge.
                         self._speech.fed(item, at)
                         self._speech.pump(at)
-                    if self._pending_mood is not None and self._face is not None:
-                        # `speaking` is up as of the pump above, so the page plays the
-                        # mood *over* the speaking loop and hands back when the arc
-                        # ends - the ordering spec 3.6 was corrected to.
-                        self._face.one_shot(self._pending_mood)
-                        self._pending_mood = None
                     await self._audio.play(item)
                 elif isinstance(item, Interrupted):
                     await self._barge_in(session)
@@ -670,9 +654,6 @@ class VoiceConversation:
         # never flushing would mean a memory searched for and then silently dropped.
         self._generating = False
         self._answering_tool = False
-        # An answer that never arrived has no expression to carry. Holding it would
-        # put this turn's mood on whatever the *next* one says.
-        self._pending_mood = None
         await self._flush_deferred(session)
         self.ended = getattr(session, "ended", None)
         if produced:
@@ -1105,9 +1086,24 @@ class VoiceConversation:
         session blocks until it gets a response, so refusing to reply would cost the
         answer rather than the expression.
         """
+        # The microphone floor, for the same reason every other tool call takes it and
+        # NOT for microseconds: the window is from here until the model's *first audio
+        # comes back*, about 1.7s measured, and any room sound inside it is read by the
+        # server as the owner interrupting - which cancels the pending call and costs
+        # the whole answer (see `_forward_microphone`). v0.1.70 skipped this on the
+        # reasoning that answering is instant. Answering is; being answered is not.
+        self._answering_tool = True
         asked = call.arguments.get("mood")
         if asked in _MOODS and self._face is not None:
-            self._pending_mood = asked  # published with `speaking`, see the field
+            # Published now, not held for the audio. That 1.7s gap is the expression's
+            # whole window and it is real, unlike on the text path where reply and
+            # audio are the same instant - so spec 3.6's original ordering is right
+            # here even though the text path had to invert it. `speaking` then cuts
+            # the arc when the answer starts, which is what gives the mouth back:
+            # held until the audio instead, the one-shot had already outlived the
+            # single `speaking` event that could cut it (the bus dedupes the rest) and
+            # suppressed the speaking clip for its entire length.
+            self._face.one_shot(asked)
         else:
             logger.debug("voice: ignoring set_mood(%r)", asked)
         await session.send_tool_response(

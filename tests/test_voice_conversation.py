@@ -853,13 +853,23 @@ async def test_a_mood_the_model_invented_is_dropped_but_still_answered(
     assert session.tool_responses, "the call was never answered - the turn would hang"
 
 
-async def test_the_expression_waits_for_the_audio_it_belongs_to(
+async def test_the_expression_lands_in_the_gap_before_the_answer_is_heard(
     db: Any, tmp_path: pathlib.Path
 ) -> None:
-    """A blocking tool call arrives *before any audio* (daemon/voice/base.py), and
-    `speaking` is the one transition allowed to cut a one-shot (spec 3.2) - so a mood
-    published on arrival is cut by the answer it was about and spends roughly 0ms on
-    screen. The text path learned this first; the ordering has to hold here too."""
+    """The reverse of what v0.1.70 asserted, and the reversal is the fix.
+
+    That version held the mood until the answer's first audio, reasoning from the text
+    path: publish `speaking` first so the arc plays over the speaking loop. On the text
+    path that is right, because reply and audio are the same instant. **Over voice it
+    broke the mouth.** `speaking` was already up by then, `set_activity` dedupes, so
+    the single event that may cut a one-shot (spec 3.2) had passed - and the arc then
+    suppressed the speaking clip for its whole length. Reported from a live session:
+    "the mood plays and the speaking clip never comes".
+
+    A blocking tool call arrives about 1.7s before the first audio, so unlike text
+    there is a real gap for the expression to live in, and the audio arriving is what
+    hands the mouth back. Spec 3.6's original ordering, which only voice ever fitted.
+    """
     runner, _store = tool_runner(db, tmp_path)
     bus = RecordingBus()
     session = FakeSession(
@@ -872,8 +882,31 @@ async def test_the_expression_waits_for_the_audio_it_belongs_to(
 
     assert bus.shots == ["sulky"]
     assert "speaking" in bus.activities, "precondition: the answer was heard"
-    assert bus.order.index("activity:speaking") < bus.order.index("shot:sulky"), (
-        "the mood was published before speaking, so the page would cut it instantly"
+    assert bus.order.index("shot:sulky") < bus.order.index("activity:speaking"), (
+        "the mood was held until speaking, which had already been published - nothing "
+        "was left to cut the arc and the speaking clip never got the screen"
+    )
+
+
+async def test_declaring_a_mood_takes_the_microphone_floor(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The regression that cost answers, not pixels.
+
+    v0.1.70 skipped `_answering_tool` for `set_mood` on the reasoning that answering
+    the call is instant. Answering is; *being answered* is not - the window runs until
+    the model's first audio comes back, and `_forward_microphone` already documents
+    what room noise inside it does: the server reads it as the owner interrupting and
+    cancels the pending call, so the daemon never speaks the result. Reported from a
+    live session as "she does not answer properly any more".
+    """
+    runner, _store = tool_runner(db, tmp_path)
+    convo = conversation(FakeSession(), FakeAudio(), tools=runner, face=RecordingBus())
+    await convo._set_mood(FakeSession(), _mood_call("amused"))
+
+    assert convo._answering_tool, (
+        "the mood call left the microphone open until the answer arrived, which is "
+        "what cancels the turn"
     )
 
 
