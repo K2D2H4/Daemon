@@ -810,3 +810,50 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   fix is argued from the two cases already fixed the same way, and the honest check
   is the same 30-trial-per-arm shape the `realtimeInput.text` entry above needed -
   count unanswered turns, do not run one session and call it settled.
+- **The admin's restart button hung 6 of 8 times on one day, and what it left behind
+  was not a stopped daemon but a live one with no HTTP surface.** Read off the
+  resident's own log for 2026-08-26: eight `Shutting down` lines, and six of them
+  reached `Waiting for connections to close.` and never printed another word. The
+  gaps to the next `Application startup complete` were 16s, 27s, 29s, 29s, 3m and
+  **40m** — every one of them ended by something external, never by the process.
+  Meanwhile the stuck process kept working: at 17:03:32, eighty seconds into a
+  shutdown it never finished, it woke on '연락' and opened a full voice session.
+  The wake loop, the embedder and Telegram's long poll all survive a graceful
+  shutdown; only the listening socket does not. So the symptom the owner sees is
+  the console frozen on "applying…" (its `pollBack` retries `/health` forever, and
+  `/health` stopped listening), while the daemon is still talking to them.
+
+  **Cause: one endpoint that never ends, plus a wait with no bound.** `/face/stream`
+  is server-sent events, so its response is open for as long as the face page is.
+  Uvicorn's `connection.shutdown()` cannot close a connection whose response is
+  still open — it clears `keep_alive` and waits — and `timeout_graceful_shutdown`
+  defaults to `None`, i.e. `while self.server_state.connections: await sleep(0.1)`,
+  forever. One open face page is enough. Reproduced deterministically against real
+  uvicorn and the real handler: no stream open, exit in **0.18s**; one stream open,
+  **still alive after 15s**; `timeout_graceful_shutdown=3`, exit in **3.18s**.
+
+  **The bound alone was a fix that logged an error on every success, so it is the
+  backstop and not the mechanism.** Reaching it makes uvicorn print `Cancel 1
+  running task(s), timeout graceful shutdown exceeded` at **ERROR** — and
+  `daemon/cli.py::_LOG_NOISE` does not filter it (checked), correctly, since that
+  filter exists to never hide a real error. So the owner's normal settings save
+  would have printed an ERROR line meaning "working as designed", every time,
+  which is the fastest way to teach someone to stop reading them. Measured on the
+  assembled app with a face page open: bound only → **3.19s** and that ERROR line;
+  `FaceBus.close()` from `admin/restart.py::schedule_exit` before the signal →
+  **0.40s**, and `Waiting for connections to close.` never appears at all. The
+  bound stays for the SIGTERMs no endpoint sees coming — `launchctl`, logout,
+  `daemon update` — and for the next endless response somebody adds.
+
+  **Where the close check goes is a two-sided constraint, and both sides were
+  measured.** In `FaceBus._events`, after the wait it deadlocks (the wake that
+  carried the close has already been cleared and nothing will set it again); after
+  the yielded batch it drops whatever was published in the same tick as the close
+  — a one-shot queued just before `close()` never reached the page, caught by a
+  test written before the placement was. It goes at the top of the loop, guarded on
+  an empty mailbox.
+
+  **The tell, for next time: a shutdown that stops logging is not a shutdown that
+  finished.** `Waiting for connections to close.` is the last line either way, and
+  nothing downstream of it says which. `Application shutdown complete.` is the line
+  that means the process is actually leaving; grep for its *absence*.

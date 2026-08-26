@@ -342,10 +342,14 @@ async def patch_settings(request: Request) -> JSONResponse:
 
 
 @router.post("/api/restart")
-async def restart() -> JSONResponse:
+async def restart(request: Request) -> JSONResponse:
     """Exit gracefully so the supervisor revives us on the new config - but only
     if a supervisor exists. Otherwise say so plainly rather than killing a process
-    nothing will bring back (decision 3)."""
+    nothing will bring back (decision 3).
+
+    The face bus goes to `schedule_exit`, which closes it before the signal: an open
+    `/face/stream` is a response uvicorn cannot close, and it used to hold the exit
+    this endpoint promises. `getattr` because a test app need not have built one."""
     if not is_supervised():
         return JSONResponse(
             {
@@ -358,7 +362,7 @@ async def restart() -> JSONResponse:
             },
             status_code=409,
         )
-    schedule_exit()
+    schedule_exit(getattr(request.app.state, "face", None))
     return JSONResponse({"restarted": True, "supervised": True})
 
 
