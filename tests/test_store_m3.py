@@ -32,12 +32,19 @@ def candidate(store: Store, kind: str = "silence", **kwargs: Any) -> int:
     return store.insert_candidate(kind=kind, **{**defaults, **kwargs})
 
 
-def utterance(store: Store, uid: str, *, kind: str = "silence", at: datetime = NOW) -> None:
+def utterance(
+    store: Store,
+    uid: str,
+    *,
+    kind: str = "silence",
+    at: datetime = NOW,
+    text: str = "자기 전에 한마디",
+) -> None:
     store.insert_utterance(
         utterance_id=uid,
         candidate_id=None,
         kind=kind,
-        text="자기 전에 한마디",
+        text=text,
         route="telegram",
         gate_snapshot=json.dumps({"allowed": True, "why": "ok"}),
         now=at,
@@ -185,6 +192,23 @@ def test_the_budget_window_is_a_boundary_the_caller_chooses(store: Store) -> Non
 
     rows = store.utterances_since(since=NOW - timedelta(hours=12))
     assert [row["id"] for row in rows] == ["inside"]
+
+
+def test_recent_utterance_texts_is_oldest_first(store: Store) -> None:
+    """Task 6: `persona.tics.verbal_tics`'s `said` input, read from this table
+    rather than `messages` - see the method's docstring for why. Oldest first,
+    matching `Store.recent`'s convention for anything meant to become a window."""
+    utterance(store, "old", at=NOW - timedelta(hours=2), text="오래된 말")
+    utterance(store, "new", at=NOW - timedelta(minutes=1), text="최근 말")
+
+    assert store.recent_utterance_texts() == ["오래된 말", "최근 말"]
+
+
+def test_recent_utterance_texts_limit_keeps_the_newest(store: Store) -> None:
+    for i in range(5):
+        utterance(store, f"u{i}", at=NOW - timedelta(hours=5 - i), text=f"{i}번째")
+
+    assert store.recent_utterance_texts(limit=2) == ["3번째", "4번째"]
 
 
 def test_labelling_records_the_verdict(store: Store) -> None:

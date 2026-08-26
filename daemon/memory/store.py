@@ -744,6 +744,26 @@ class Store:
         rows.reverse()
         return rows
 
+    def recent_owner_lines(self, limit: int = 20) -> list[str]:
+        """The owner's last `limit` conversation turns, oldest first - the `heard`
+        half of `persona.tics.verbal_tics`'s input for a caller with no window of
+        its own (`proactivity/judge.py`; `companion.py`'s callers already have one
+        and build `heard` from it directly).
+
+        `session_kind IN ('interactive', 'voice')` excludes the daemon's own
+        proactive and reflection turns - the same "conversation" filter
+        `messages_for_day` and `candidates.py`'s `CandidateReader` already use,
+        for the same reason: counting the daemon's own words as something the
+        owner said would let it exclude its own tics from itself.
+        """
+        rows = self.conn.execute(
+            "SELECT content FROM messages WHERE role = 'user' "
+            "AND session_kind IN ('interactive', 'voice') "
+            "ORDER BY ts DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [row["content"] for row in reversed(rows)]
+
     def messages_by_ids(self, ids: Sequence[int]) -> dict[int, sqlite3.Row]:
         """Rows for a set of ids, keyed by id. The vector lane produces ids and
         needs the text and timestamp back; returning a mapping keeps the caller
@@ -1528,6 +1548,21 @@ class Store:
             "SELECT spoken_at FROM proactive_utterances ORDER BY spoken_at DESC LIMIT 1"
         ).fetchone()
         return None if row is None else from_iso(row["spoken_at"])
+
+    def recent_utterance_texts(self, limit: int = 20) -> list[str]:
+        """The daemon's own last `limit` proactive lines, oldest first - the
+        `said` half of `persona.tics.verbal_tics`'s input for `proactivity/judge.py`.
+
+        Reads `proactive_utterances.text`, the canonical record of what actually
+        went out (this table is also what the label clock and `last_utterance_at`
+        read), rather than `messages` - `session_kind='proactive'` rows there are
+        a mirror of the same text through the same append-only writer every other
+        turn goes through, not a second source of it.
+        """
+        rows = self.conn.execute(
+            "SELECT text FROM proactive_utterances ORDER BY spoken_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [row["text"] for row in reversed(rows)]
 
     def utterances_since(self, *, since: datetime) -> list[sqlite3.Row]:
         """Everything spoken since `since`, newest first.

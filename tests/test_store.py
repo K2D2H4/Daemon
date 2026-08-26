@@ -93,6 +93,46 @@ def test_recent_limit_keeps_the_newest(db: sqlite3.Connection) -> None:
     assert [row["content"] for row in store.recent(limit=2)] == ["4분", "5분"]
 
 
+def test_recent_owner_lines_excludes_the_daemons_own_voice(db: sqlite3.Connection) -> None:
+    """Task 6: the `heard` half of `persona.tics.verbal_tics`'s input for
+    `proactivity/judge.py`. `session_kind IN ('interactive', 'voice')` is the
+    same "conversation" filter `messages_for_day` and `candidates.py`'s
+    `CandidateReader` already use - a proactive or reflection row is the
+    daemon's own words, and counting it as something the owner said would let
+    the tic filter exclude the daemon's own habits from itself."""
+    store = Store(db)
+    store.insert_message(
+        replace(message("회의 있었어"), ts=datetime(2026, 8, 3, 7, 1, tzinfo=UTC)),
+        log_file="memory/log/2026-08-03.md",
+    )
+    store.insert_message(
+        replace(
+            message("재밌는 일 없었어?", role="assistant"),
+            session_kind="proactive",
+            origin="agent",
+            ts=datetime(2026, 8, 3, 7, 2, tzinfo=UTC),
+        ),
+        log_file="memory/log/2026-08-03.md",
+    )
+    store.insert_message(
+        replace(message("응 있었지"), ts=datetime(2026, 8, 3, 7, 3, tzinfo=UTC)),
+        log_file="memory/log/2026-08-03.md",
+    )
+
+    assert store.recent_owner_lines() == ["회의 있었어", "응 있었지"]
+
+
+def test_recent_owner_lines_limit_keeps_the_newest(db: sqlite3.Connection) -> None:
+    store = Store(db)
+    for minute in range(1, 6):
+        store.insert_message(
+            message(f"{minute}번째", ts=datetime(2026, 8, 3, 7, minute, tzinfo=UTC)),
+            log_file="memory/log/2026-08-03.md",
+        )
+
+    assert store.recent_owner_lines(limit=2) == ["4번째", "5번째"]
+
+
 def test_messages_sharing_a_second_keep_insertion_order(db: sqlite3.Connection) -> None:
     """Timestamps are second-resolution, so a question and its answer can collide."""
     store = Store(db)

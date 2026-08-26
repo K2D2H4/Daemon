@@ -49,29 +49,72 @@ VAGUE = Candidate(
 declining exists for. Type D knows only that an hour usually has a conversation."""
 
 
-def test_the_two_conditions_name_the_same_three_kinds() -> None:
-    """SYSTEM's two conditions are AND'ed (`둘 다`): a candidate that satisfies 1
-    but not 2 is declined forever. Condition 1 admits 사건/감정/기억 (event, feeling,
-    memory - the last added for type E); condition 2 has to ask about the same
-    three or a reason that only ever names a memory - never an event or a feeling -
-    can pass 1 and always fail 2, which is exactly what shipped in review round 1:
-    every type E candidate declined regardless of content, making that generator's
-    output permanently inert.
+def test_the_default_is_speaking_not_declining() -> None:
+    """Task 6 (docs/adr/0016-proactive-default-flips-to-speaking.md): 572 judge
+    calls, 0 utterances, ever. The owner asked three times to loosen this, and
+    `SYSTEM` used to open with "기본값은 침묵이다" plus two AND'd conditions that
+    had to both be satisfied before a sentence was allowed - the two-condition
+    gate this test used to check is gone.
 
-    Also checks the fix did not widen 2 the other way: the exclusion in 1's second
-    sentence (time/interval/frequency alone is not content) is 1's job, and 2 must
-    not independently start admitting it.
+    Declining is not deleted - a reason with nothing in it and nothing to say
+    about it can still come back `{"say": ""}`, and this checks that language is
+    still present - it is just no longer the thing the model has to earn its way
+    out of by default.
     """
-    _, numbered = SYSTEM.split("\n\n1. ", 1)
-    condition_1, rest = numbered.split("\n2. ", 1)
-    condition_2, _ = rest.split("\n\n", 1)
+    assert "기본값은 말을 거는 것이다" in SYSTEM
+    assert "기본값은 침묵이다" not in SYSTEM
+    assert "say 를 빈 문자열로 두는 것은 예외다" in SYSTEM
+    # The old two-condition AND gate is gone, not just renamed.
+    assert "\n\n1. " not in SYSTEM
+    assert "둘 다" not in SYSTEM
 
-    for noun in ("사건", "감정", "기억"):
-        assert noun in condition_1, f"condition 1 no longer names {noun}"
-        assert noun in condition_2, f"condition 2 does not ask about {noun}"
 
-    for excluded in ("시간", "간격", "빈도"):
-        assert excluded not in condition_2
+def test_the_banned_shape_is_demanding_not_contentless() -> None:
+    """The owner's correction, arrived at after two misreadings of his own
+    complaint: he was never bothered by a contentless reason producing an
+    ordinary opener. He was bothered by being asked to supply the conversation
+    himself - '무슨 재밌는 일 없어요?' demands he produce something interesting;
+    '뭐하세요?' does not, and he said explicitly that ordinary check-ins are
+    fine. The old `SYSTEM` called the first list of phrases below "빈 말" and
+    told the model to decline instead of saying them; this checks that framing
+    is gone and the phrases that actually bothered him are named instead, in
+    the language `daemon/voice/conversation.py`'s `CALLED_BY_NAME` and the
+    owner's own persona/seed.md already use for the same rule elsewhere.
+    """
+    now_acceptable = (
+        "오랜만이야", "요즘 어때", "별일 없어", "시간이 많이 흘렀네", "오늘도 변함없네"
+    )
+    for phrase in now_acceptable:
+        assert phrase in SYSTEM, f"{phrase!r} should read as an ordinary, acceptable check-in"
+
+    demanding = (
+        "무슨 재밌는 일 없어요?", "오늘은 어떤 얘기 해주실 거예요?", "재밌는 얘기 좀 해주세요"
+    )
+    for phrase in demanding:
+        assert phrase in SYSTEM, f"{phrase!r} should be named as the shape to avoid"
+
+    # A one-line rule the model can apply to a demanding shape not in the list
+    # above, not just the list of examples - matching CALLED_BY_NAME's "do not
+    # ask what they want" and persona/seed.md's own wording rather than
+    # inventing new phrasing for the same idea.
+    assert "화제를 내놓으라고 요구하지 않는다" in SYSTEM
+
+
+def test_the_silence_example_now_speaks() -> None:
+    """The clearest sign the reversal actually landed in the few-shot set, not
+    just the prose above it: the `silence` worked example - the exact reason
+    shape the owner's own "그냥 아무말이나 좋으니" was about - used to be this
+    file's example of declining, and leaving it declining would have shown the
+    model one behaviour in prose and the opposite one in the example it
+    actually imitates.
+
+    `pattern_time`'s example is left declining on purpose (not asserted here as
+    a decline, but not touched either) - see judge.py's "Task 6" comment above
+    `SYSTEM` for why one worked decline stays in the mix.
+    """
+    example = SYSTEM.split("이유 (silence): ", 1)[1].split("\n예) 이유 (pattern_time)", 1)[0]
+    assert '{"say": ""}' not in example
+    assert '{"say": "' in example
 
 
 def judge_for(
@@ -80,6 +123,7 @@ def judge_for(
     *,
     fail: bool = False,
     seed: str | None = SEED,
+    store: object | None = None,
 ) -> tuple[Judge, FakeProvider]:
     if seed is not None:
         (data_dir / "persona" / "seed.md").write_text(seed, encoding="utf-8")
@@ -89,7 +133,7 @@ def judge_for(
     gateway = LLMGateway(
         {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
     )
-    return Judge(gateway, data_dir), provider
+    return Judge(gateway, data_dir, store=store), provider  # type: ignore[arg-type]
 
 
 def system_text(provider: FakeProvider) -> str:
@@ -227,6 +271,100 @@ async def test_an_enormous_reason_is_bounded(data_dir: Path) -> None:
     await judge.decide(Candidate(kind="emotional", reason="힘들다 " * 2000))
 
     assert len(user_text(provider)) < 600
+
+
+# --- the tic-avoidance block (persona/tics.py), task 6 -----------------------
+
+
+class _FakeUtteranceReader:
+    """Stands in for `daemon.memory.store.Store` - no sqlite, no disk."""
+
+    def __init__(self, *, said: list[str] | None = None, heard: list[str] | None = None) -> None:
+        self.said = said or []
+        self.heard = heard or []
+
+    def recent_utterance_texts(self, limit: int) -> list[str]:
+        return self.said[-limit:]
+
+    def recent_owner_lines(self, limit: int) -> list[str]:
+        return self.heard[-limit:]
+
+
+async def test_no_store_means_no_tic_block(data_dir: Path) -> None:
+    """The default for every existing caller (`Judge(gateway, data_dir)`, no
+    `store`) and the honest one: this feature did not exist before task 6, and
+    every install that has not been touched by it must behave exactly as before."""
+    judge, provider = judge_for(data_dir)
+
+    await judge.decide(OPEN_LOOP)
+
+    assert "verbal-tics" not in system_text(provider)
+
+
+async def test_a_repeated_phrase_reaches_the_prompt(data_dir: Path) -> None:
+    """The whole point of wiring `tics.verbal_tics` in: a phrase the daemon has
+    said three times running and the owner has never said becomes a named,
+    avoidable habit in the prompt - the same mechanism `companion.py` already
+    uses for the text and voice loops (measured there: 18/30 -> 6/30, p=0.0017)."""
+    store = _FakeUtteranceReader(
+        said=["재밌는 일 없었어?", "오늘 재밌는 일 없었어?", "뭐 재밌는 일 없었어?"],
+        heard=["오늘 회의 있었어", "발표 준비중이야"],
+    )
+    judge, provider = judge_for(data_dir, store=store)
+
+    await judge.decide(OPEN_LOOP)
+
+    assert "verbal-tics" in system_text(provider)
+    assert "재밌는 일" in system_text(provider)
+
+
+async def test_no_repetition_means_no_block(data_dir: Path) -> None:
+    """`MIN_TURNS` (persona/tics.py) is 3: two prior lines, however similar, are
+    not yet a habit, and the block must not appear at all - `tics.block` already
+    returns "" here, and this checks `_tics_block` passes that through rather
+    than adding a system turn that says nothing."""
+    store = _FakeUtteranceReader(said=["뭐하세요?", "뭐해?"], heard=["안녕"])
+    judge, provider = judge_for(data_dir, store=store)
+
+    await judge.decide(OPEN_LOOP)
+
+    assert "verbal-tics" not in system_text(provider)
+
+
+async def test_the_tic_block_never_costs_a_second_model_call(data_dir: Path) -> None:
+    """The owner said repetition was never his complaint, so naming a tic must
+    not become a second reason to call the model twice or to decline - it can
+    only ever change *how* the model says something, never *whether*
+    `decide` speaks. One call, same as every other path through this file."""
+    store = _FakeUtteranceReader(
+        said=["재밌는 일 없었어?"] * 5, heard=["회의 있었어"]
+    )
+    judge, provider = judge_for(data_dir, store=store)
+
+    await judge.decide(OPEN_LOOP)
+
+    assert len(provider.calls) == 1
+
+
+async def test_a_broken_store_costs_the_block_not_the_turn(data_dir: Path) -> None:
+    """`companion.py`'s `_tics_or_empty` wraps the same call for the same reason
+    (spec's Error handling section: never fail a turn over an annotation) -
+    `_tics_block` keeps that shape rather than letting a store error reach
+    `decide` and turn a working judge into a silent one."""
+
+    class _BrokenReader:
+        def recent_utterance_texts(self, limit: int) -> list[str]:
+            raise RuntimeError("sqlite is not available in this test")
+
+        def recent_owner_lines(self, limit: int) -> list[str]:
+            return []
+
+    judge, provider = judge_for(data_dir, store=_BrokenReader())
+
+    utterance = await judge.decide(OPEN_LOOP)
+
+    assert utterance  # still spoke - the broken store cost the block, not the turn
+    assert "verbal-tics" not in system_text(provider)
 
 
 # --- the reply treated as hostile --------------------------------------------

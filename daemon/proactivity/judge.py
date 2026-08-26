@@ -36,6 +36,29 @@ two kinds never have anything to ask about, and it should not have to - "this ki
 speaks less often" is a budget, and budgets are `gate.py`'s. Worth revisiting when
 `PROACTIVE_JUDGE` routes hosted (`proactive_judge_local=False` already does).
 
+## Reversed, 2026-08-26 (task 6, ADR 0016)
+
+The paragraph above names the gap this design left on purpose: a 4B model fills a
+contentless `silence`/`pattern_time` reason with a generic line instead of
+declining it, and 2026-08-04 filed that under "the gate's job, not the prompt's".
+What changed is not that measurement - it is what counts as a defect. The owner
+asked three times to loosen this, and read back correctly (twice getting it
+wrong first), the complaint was never "don't fill in the contentless reasons" -
+it was the *shape* of the line the model reached for when it did. `무슨 재밌는
+일 없어요?` demands he supply the content; `뭐하세요?` does not, and he is fine
+with the second one. `또 왔네.` was never the problem either - 572 judge calls,
+0 utterances, ever, and the owner has never heard either line.
+
+So `SYSTEM` below now states *speaking* as the default and reserves `{"say": ""}`
+for a reason with nothing in it and nothing to say about it - a real case, not a
+default - and it names the demanding-question shape directly instead of banning
+the phrases that happened to appear in one spike two years' worth of design
+decisions ago. `daemon/voice/conversation.py`'s `CALLED_BY_NAME` already does the
+same thing for the wake-word turn ("do not ask what they want, and do not offer
+to help"); this file is the one place that rule had not reached. See
+docs/adr/0016-proactive-default-flips-to-speaking.md for what would overturn this
+a second time.
+
 ## Why the reply is JSON for one short sentence
 
 Because the failure it prevents is the expensive one. A model that decides not to
@@ -96,10 +119,13 @@ import logging
 import re
 import secrets
 import unicodedata
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Protocol
 
 from daemon.llm.base import Message, ProviderError
 from daemon.llm.gateway import LLMGateway
+from daemon.persona import tics
 from daemon.persona.loader import load_persona, read_file, seed_path
 from daemon.proactivity import topics
 from daemon.proactivity.base import Candidate, Utterance
@@ -151,26 +177,43 @@ to think and buys the product nothing to say at greater length."""
 # which kind is being judged, so a sixth one shifts the few-shot mix the model
 # sees for `silence` and `pattern_time` calls too. Not yet measured at n>2 - see
 # this task's own report for what a follow-up run should check.
+#
+# Task 6, 2026-08-26 (docs/adr/0016-proactive-default-flips-to-speaking.md): the
+# default flipped from silence to speaking, on the owner's third and clearest
+# request - see the module docstring's "Reversed" section for what changed and
+# why the 2026-08-04 measurement this used to rest on does not settle the
+# question either way. Three edits: the two-condition AND'd gate that made
+# silence the default is gone; the list of banned "empty phrases" (which
+# included ordinary check-ins like "요즘 어때") is replaced with a rule against
+# the *demanding* shape the owner actually objected to; and the `silence`
+# example - which used to be this file's worked example of the behaviour now
+# being reversed - now shows an ordinary opener instead of a decline.
+# `pattern_time`'s example is left declining on purpose, so the few-shot set
+# still shows silence as a real, reachable answer and not a dead branch.
 SYSTEM = """유저가 말을 걸지 않았는데 네가 먼저 한 마디 건네려는 순간이다.
 
 '이유'는 시스템이 이미 찾아낸 것이다. 지금 말을 걸어도 되는 시각인지, 너무 자주 거는
 것은 아닌지, 유저가 자리에 있는지도 이미 확인됐다. 그러니 그건 다시 판단하지 마라.
 네가 답할 것은 하나다 — 이 이유로 건넬 말이 실제로 있는가, 있으면 그게 뭔가.
 
-**기본값은 침묵이다.** say 를 빈 문자열로 두는 것이 대부분의 정답이고, 문장을 넣는
-것은 예외다. 아래를 **둘 다** 만족할 때만 문장을 넣는다.
+**기본값은 말을 거는 것이다.** say 에 문장을 넣는 것이 대부분의 정답이다. 이유 안에
+구체적인 사건·감정·기억이 없어도 된다 — 시간·간격·빈도만 적힌 이유에도 평범한 안부면
+충분하다. say 를 빈 문자열로 두는 것은 예외다: 이유에도, 지금 상황에도 걸 만한 말이
+정말 하나도 없을 때만 그렇게 한다.
 
-1. 이유 안에 구체적인 사건·감정·기억이 내용으로 적혀 있다 (발표, 면접, 힘들다,
-   또는 유저가 예전에 한 말 자체). 시간·간격·빈도만 적혀 있으면 그건 내용이 아니다.
-2. 그 사건·감정·기억에 대해 유저에게 물을 것이 실제로 있다.
-
-"오랜만이야", "요즘 어때", "별일 없어", "시간이 많이 흘렀네", "오늘도 변함없네" 는
-말할 것이 없을 때 나오는 빈 말이다. 그런 문장이 떠오르면 그게 곧 {"say": ""} 다.
+**상대에게 화제를 내놓으라고 요구하지 않는다.** "무슨 재밌는 일 없어요?",
+"오늘은 어떤 얘기 해주실 거예요?", "재밌는 얘기 좀 해주세요"처럼 유저가 화제나
+재미를 만들어서 대답해야 하는 질문은 쓰지 않는다 — 그건 손님을 맞는 말투지,
+먼저 말 거는 말투가 아니다.
+"오랜만이야", "요즘 어때", "별일 없어", "시간이 많이 흘렀네", "오늘도 변함없네" 같은
+평범한 안부는 괜찮다. 유저에게 뭔가를 만들어 내놓으라고 요구하는지 아닌지가 기준이지,
+내용이 있고 없고가 기준이 아니다.
 
 말할 것이 있을 때:
 - 한 문장. 길어도 두 문장. 120자 이내.
 - 유저가 묻지 않았다. 대답이 아니라 네가 먼저 꺼내는 말이다.
-- 위 페르소나의 말투를 그대로 쓴다. 위로나 조언이 아니라 물어보는 말이다.
+- 위 페르소나의 말투를 그대로 쓴다. 위로나 조언이 아니라, 안부를 묻거나 지금 떠오른
+  걸 편하게 건네는 말이다.
 - 무엇을 도와드릴까 하는 비서 말투는 쓰지 않는다.
 - 설명·인사말·따옴표·마크다운 없이 문장 그 자체만.
 
@@ -179,7 +222,7 @@ SYSTEM = """유저가 말을 걸지 않았는데 네가 먼저 한 마디 건네
 
 JSON만 출력한다.
 예) 이유 (silence): 마지막 대화가 30시간 전이고 그 뒤로 아무 말도 오가지 않았다.
-    -> {"say": ""}
+    -> {"say": "뭐하세요?"}
 예) 이유 (pattern_time): 최근 30일 중 12일은 이 시간에 대화를 했는데, 오늘은 아직
     한 마디도 없다. -> {"say": ""}
 예) 이유 (open_loop): 08월 01일에 '내일 시험' 이야기를 했고, 그 시각이 지났다.
@@ -199,11 +242,41 @@ JSON만 출력한다.
     -> {"say": "ReadyTalk 시리즈 B 받았대, 봤어?"}"""
 
 
+class UtteranceReader(Protocol):
+    """The reads the tic-avoidance block needs. `daemon.memory.store.Store`
+    satisfies it.
+
+    Declared here rather than importing `Store`, matching `gate.py`'s
+    `UtteranceHistory` and `candidates.py`'s `CandidateReader`: the judge depends
+    on two queries, not on the store.
+    """
+
+    def recent_utterance_texts(self, limit: int) -> Sequence[str]:
+        """The daemon's own last `limit` proactive lines, oldest first."""
+        ...
+
+    def recent_owner_lines(self, limit: int) -> Sequence[str]:
+        """The owner's last `limit` conversation turns, oldest first."""
+        ...
+
+
+TIC_WINDOW = 20
+"""How many of each side `persona.tics.verbal_tics` sees. Matches
+`companion.py`'s conversation window (`MemoryRecall`'s default), not a separate
+number chosen for this call site - the measurement behind `MIN_TURNS`/`MIN_CHARS`
+in `persona/tics.py` was run against that same window size."""
+
+
 class Judge:
     """The one model call. Constructed per run; holds nothing between decisions."""
 
     def __init__(
-        self, gateway: LLMGateway, data_dir: Path, *, bridge: topics.Bridge | None = None
+        self,
+        gateway: LLMGateway,
+        data_dir: Path,
+        *,
+        bridge: topics.Bridge | None = None,
+        store: UtteranceReader | None = None,
     ) -> None:
         self._gateway = gateway
         # ADR 0015: deterministic code, not the model, may issue one read-only
@@ -234,6 +307,19 @@ class Judge:
         # call per tick, and a decline rests the candidate instead of leaving
         # it due).
         self._data_dir = Path(data_dir)
+        # Task 6, 2026-08-26: optional and secondary, on purpose. `persona/tics.py`
+        # already does this job for the text and voice loops - naming the
+        # daemon's own repeated phrases so it stops reaching for them - and this
+        # is the one caller that never got it. `None` is the honest default for
+        # every test and any caller that has no store to offer (there was and is
+        # no `store` parameter on this class before this task), and it costs
+        # nothing: `_tics_block` below returns "" and the prompt is unchanged.
+        # Kept out of the default-flip's own reasoning deliberately - the owner
+        # said repetition was never his complaint, so this must not become a
+        # second bar that suppresses speech the new SYSTEM now allows. It only
+        # ever asks the model to say the same thing a different way, never asks
+        # it to stay silent.
+        self._store = store
 
     async def decide(self, candidate: Candidate) -> Utterance:
         """What to say about `candidate`, or a falsy `Utterance` and why not.
@@ -288,8 +374,13 @@ class Judge:
         messages = [
             Message(role="system", content=persona),
             Message(role="system", content=SYSTEM),
-            Message(role="user", content=compose_reason(candidate, topic_block)),
         ]
+        tic_block = self._tics_block()
+        if tic_block:
+            # Last, like `companion.py`'s ordering - it is about the sentence
+            # being written now, not a fact about the world or a standing rule.
+            messages.append(Message(role="system", content=tic_block))
+        messages.append(Message(role="user", content=compose_reason(candidate, topic_block)))
         try:
             # One call. No retry: a second attempt at "is there something to say"
             # is the open question PLAN 6.2 warns about, asked twice. This is also
@@ -319,6 +410,26 @@ class Judge:
         if not utterance:
             logger.info("judge: declined %s (%s)", candidate.kind, utterance.why_not)
         return utterance
+
+    def _tics_block(self) -> str:
+        """`tics.block` over the last `TIC_WINDOW` proactive lines and owner
+        turns, or "" when there is no store to read them from or nothing to
+        report.
+
+        Synchronous and wrapped, the same shape `companion.py`'s `_tics_or_empty`
+        already uses for the same call: a raise here costs the block, not the
+        turn, because a habit going unnamed for one more line is not worth
+        adding a second reason for `decide` to come back with nothing to say.
+        """
+        if self._store is None:
+            return ""
+        try:
+            said = self._store.recent_utterance_texts(TIC_WINDOW)
+            heard = self._store.recent_owner_lines(TIC_WINDOW)
+            return tics.block(said, heard=heard)
+        except Exception:
+            logger.exception("judge: could not work out the recent verbal tics")
+            return ""
 
     async def _topic_block(self, entity: str) -> str:
         """The search result for a `topic` candidate, rendered for the prompt - or
