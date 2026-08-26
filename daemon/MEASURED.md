@@ -718,7 +718,7 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
 - **The resident cannot see homebrew, so `shutil.which` is not binary discovery.**
   Measured 2026-08-26 on the live `ai.daemon.default` job: `PATH` is
   `/usr/bin:/bin:/usr/sbin:/sbin` while `ollama` is at `/opt/homebrew/bin/ollama`.
-  `_render_plist` omits `EnvironmentVariables` deliberately (`service.py:226` - the
+  `_render_plist` omits `EnvironmentVariables` deliberately (`service.py:227` - the
   working directory is how the process finds `.env`) and `launchctl getenv PATH` is
   unset, so nothing puts homebrew's bin back. `which("ollama")` therefore resolves
   in every terminal test and returns `None` in the service the code actually runs
