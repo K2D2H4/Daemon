@@ -438,6 +438,24 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   to be quiet in general catches it, and **an entity name is a search query only for
   names the web knows the way its owner does** — for the rest the search is discarded
   work and the line is an ordinary check-in.
+- **The first proactive utterance ever spoken went to Telegram while the owner sat at
+  the keyboard, and neither half was wrong (2026-08-26).** `gate_snapshot` on the row:
+  `"why": "ok"`, `"delivery": "both"`, `idle_seconds: 0.06`, screen unlocked, mic and
+  output free - the gate read presence correctly and asked for the speaker. The `route`
+  column says `telegram`, and the log says why: `speaker: refusing to speak while this
+  process holds the microphone`. `Speaker.say`'s rule is right (a speaker talking into a
+  live gate is the gate hearing the daemon), the gate's reading was right, and the two
+  had no way to say either thing to each other - so the failure was invisible from both
+  sides and from the utterance row, which records the achieved route but not that a
+  route was achievable. Fixed by `daemon/mic_floor.py`; live-verified on this Mac with a
+  real capture stream and a real `say`, gate standing down and frames climbing again
+  afterwards (290 -> 636). **Two things worth keeping from it.** A verdict field and an
+  outcome column that disagree is not a lie either one told, and it is the shape to look
+  for when a feature works in tests and does nothing in the room. And the acceptance
+  tests written for the fix passed on a build where `_wake_round` never called the code
+  they exercised - they drove the helper directly - which is `tests/CLAUDE.md`'s
+  documented blind spot arriving on schedule; four seams were mutation-checked before
+  the fix was believed.
 - **Half-duplex was leaking the daemon's own voice into memory as the owner's words,
   and the tell is that every leak is a *tail* (2026-08-19).** `DAEMON_VOICE_BARGE_IN=
   false` was set and `apple audio: ... echo cancellation on` was in the log, yet

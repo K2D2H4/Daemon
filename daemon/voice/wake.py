@@ -56,9 +56,10 @@ import logging
 import time
 import unicodedata
 from collections import deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 
+from daemon import mic_floor
 from daemon.voice.base import AudioIO, SpeechRecognizer, VoiceActivityDetector, WakeEvent
 
 logger = logging.getLogger(__name__)
@@ -223,6 +224,7 @@ class WakeGate:
         max_segment_ms: int = DEFAULT_MAX_SEGMENT_MS,
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
         dead_stream_ms: int = DEFAULT_DEAD_STREAM_MS,
+        floor_wanted: Callable[[], bool] | None = None,
     ) -> None:
         if vad.sample_rate != audio.sample_rate:
             # Loud, because the quiet version of this is the worst bug the gate can
@@ -251,6 +253,11 @@ class WakeGate:
         self._dead_stream_frames = max(1, round(dead_stream_ms / frame_ms))
         self._dead_stream_seconds = dead_stream_ms / 1000.0
         self._last_fire: float | None = None
+        # Same seam `daemon/proactivity/speaker.py` uses for `daemon/mic_hold.py`,
+        # for the same reason: a plain in-process predicate a test could call
+        # directly, injectable anyway so a case is made by wiring rather than by
+        # reaching for a module-level global.
+        self._floor_wanted = floor_wanted if floor_wanted is not None else mic_floor.pending
         self.counters = WakeCounters()
 
     async def listen(self) -> AsyncIterator[WakeEvent]:
@@ -298,6 +305,20 @@ class WakeGate:
                     return
                 except StopAsyncIteration:
                     break
+                if self._floor_wanted():
+                    # Proactivity has a line to say and cannot say it while this
+                    # generator holds the capture stream (daemon/mic_floor.py).
+                    # Ending the iteration is how the gate already gives the
+                    # microphone up - the dead-stream watchdog above returns the
+                    # same way, and so does a wake word firing, whose consumer
+                    # breaks out of the loop. `daemon/app.py`'s `_wake_round` then
+                    # closes the gate in its `finally` and does the speaking, which
+                    # is the one sequence in this process allowed to hand the device
+                    # over. Checked here, between blocks, rather than by cancelling
+                    # this task from the scheduler: the cancellation route is the
+                    # CoreAudio contention that froze the daemon for eleven hours.
+                    logger.info("wake: a proactive line wants the microphone; standing down")
+                    return
                 pending += block
                 while len(pending) >= self._frame_bytes:
                     frame = bytes(pending[: self._frame_bytes])
