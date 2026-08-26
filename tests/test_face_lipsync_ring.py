@@ -85,6 +85,32 @@ def test_gap_between_turns_re_anchors_the_buffer():
     assert not np.all(np.abs(got - turn1_value) < 0.001), "Turn 1 audio should NOT be present"
 
 
+def test_barge_in_jumping_backward_also_re_anchors_the_buffer():
+    """The mirror image of the test above. A forward gap is a new turn starting
+    after a silence; barge-in is the opposite shape - `daemon/voice/conversation.py`'s
+    `_barge_in` rebuilds `SpeechClock` from scratch (`_until` back to 0.0), so the
+    next chunk's `audible_at` can land BEFORE the ring's current buffer end, not
+    after it. A one-sided `gap > 0.001` check treats that negative gap as no
+    discontinuity at all: the cancelled turn's samples stay exactly where they
+    were, the barge-in reply's samples get appended past them, and `window()`
+    keeps reading the interrupted sentence instead of the new one.
+    """
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
+    # Old (about-to-be-cancelled) turn: 1s of audio starting at 0.0, so the
+    # buffer end sits at 1.0s.
+    ring.feed(_tone(1000, value=10000), audible_at=0.0)
+    # Barge-in rebuilds the clock: the new turn's first chunk is audible at
+    # 0.2s - *before* the old buffer end (1.0s), a gap of -0.8s.
+    ring.feed(_tone(200, value=25000), audible_at=0.2)
+    got = ring.window(frame_index=0, fps=24.0, origin=0.2)
+    new_value = 25000 / 32768.0
+    old_value = 10000 / 32768.0
+    assert np.any(np.abs(got - new_value) < 0.001), "Barge-in audio should be present"
+    assert not np.any(np.abs(got - old_value) < 0.001), (
+        "Cancelled turn's audio should NOT be present once barge-in re-anchors"
+    )
+
+
 def test_the_slot_keeps_only_the_latest_frame():
     slot = Slot()
     slot.put(b"first")

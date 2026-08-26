@@ -32,13 +32,20 @@ class PcmRing:
         if self._samples.size == 0:
             self._start = audible_at
         else:
-            # Detect if incoming chunk is discontinuous from buffered audio.
-            # SpeechClock ensures chunks are contiguous within a turn
-            # (starts = max(self._until, at)). A gap >1ms indicates a new turn.
+            # Detect if incoming chunk is discontinuous from buffered audio in
+            # EITHER direction. A chunk arriving LATER than the buffer end is a
+            # new turn or a long silence. One arriving EARLIER means the clock
+            # itself was rebuilt from scratch - `daemon/voice/conversation.py`'s
+            # `_barge_in` replaces `SpeechClock` wholesale on barge-in, resetting
+            # `_until` to 0.0 - and that is just as much a discontinuity as a gap
+            # forward: left unhandled, the cancelled turn's audio stays at the
+            # front of the buffer and `window()` keeps reading it instead of the
+            # new reply.
             buffer_end = self._start + self._samples.size / self._rate
             gap = audible_at - buffer_end
-            if gap > 0.001:  # 1ms tolerance for float noise within a turn
-                # New turn or long silence: discard stale samples and re-anchor.
+            if abs(gap) > 0.001:  # 1ms tolerance for float noise within a turn
+                # New turn, long silence, or a rebuilt clock (barge-in): discard
+                # stale samples and re-anchor.
                 self._samples = np.zeros(0, dtype=np.int16)
                 self._start = audible_at
         self._samples = np.concatenate([self._samples, block])
