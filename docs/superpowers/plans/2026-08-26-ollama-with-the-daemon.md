@@ -881,8 +881,25 @@ def test_a_hosted_provider_still_gets_the_embed_model_checked(tmp_path: Path) ->
     assert "bge-m3" in result.out
 
 
-def test_the_chat_model_is_not_checked_under_a_hosted_provider(tmp_path: Path) -> None:
-    """The one thing the early return had right: a gemini user needs no qwen3."""
+def test_a_hosted_judge_means_the_chat_model_is_not_checked(tmp_path: Path) -> None:
+    """Hosted provider AND hosted judge: nothing on this machine loads a chat
+    model, so checking one would be noise."""
+    checks = Checks(
+        gemini=lambda key: Verdict(True, "key works"),
+        telegram=lambda token: Verdict(True, "connected to @test_bot"),
+        ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ()),
+        pull=lambda model: False,
+    )
+    result = drive(tmp_path, GEMINI_JUDGE_HOSTED_ANSWERS + ["n"], checks=checks)
+
+    assert result.code == 0
+    assert "gemma3:4b: not pulled yet" not in result.out
+
+
+def test_a_local_judge_means_the_chat_model_is_checked_under_gemini(tmp_path: Path) -> None:
+    """The case the plan originally got backwards. `proactive_judge_local`
+    defaults to True, so a gemini user on defaults loads a local model for the
+    five-minute judge - and setup has to say when it is missing."""
     checks = Checks(
         gemini=lambda key: Verdict(True, "key works"),
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
@@ -892,8 +909,7 @@ def test_the_chat_model_is_not_checked_under_a_hosted_provider(tmp_path: Path) -
     result = drive(tmp_path, GEMINI_ANSWERS + ["n"], checks=checks)
 
     assert result.code == 0
-    assert "gemma3:4b" not in result.out
-    assert "qwen3" not in result.out
+    assert "gemma3:4b: not pulled yet" in result.out
 
 
 def test_declining_the_embed_model_pull_is_not_an_error(tmp_path: Path) -> None:
@@ -957,11 +973,37 @@ def test_an_unreachable_ollama_does_not_offer_to_pull(tmp_path: Path) -> None:
     assert "https://ollama.com" in result.out
 ```
 
-`GEMINI_ANSWERS` may not exist. Find the answer list an existing gemini test
-passes to `drive` — grep `def test_` around `gemini` in `tests/test_setup.py` — and
-either reuse its module-level constant or define `GEMINI_ANSWERS` beside the
-existing `TOOLS_YES` / `GOOD_TOKEN` constants with the same values that test uses.
-Do not guess the order; copy it from a passing test.
+**The two answer-list constants above do not exist yet. Here is exactly where they
+come from — do not guess an order, derive it.**
+
+`tests/test_setup.py:2844` already has the gemini-with-a-local-judge path:
+
+```python
+VOICE_ANSWERS = [TOOLS_YES, "gemini", "", "y", "gemma3:4b", GOOD_GEMINI]
+```
+
+Its docstring names each answer: tools, provider, the background-judge toggle
+(`""` = keep the default, which is local), voice on, the local model, then the key.
+That is the `GEMINI_ANSWERS` the local-judge test wants — define it as a
+module-level constant beside `TOOLS_YES` / `GOOD_TOKEN`, or reuse `VOICE_ANSWERS`
+directly if the trailing questions line up.
+
+For `GEMINI_JUDGE_HOSTED_ANSWERS`, change the third answer — the judge toggle —
+from `""` to whatever answers "no, run it hosted". Read the question at
+`daemon/setup.py:2193` (`current = env.get("DAEMON_PROACTIVE_JUDGE_LOCAL", "")`)
+to see what it accepts, then confirm by running the test: a wrong answer here
+desynchronizes the rest of the list and the failure will be obvious.
+
+`drive` takes `existing: str | None` (line 140), **not** an `env` kwarg. Pre-seeding
+`.env` through `existing=` also changes which questions get asked — see the comment
+at `tests/test_setup.py:162` — so prefer answering the question over seeding the
+file. If you do reach for `existing=`, re-derive the whole answer list.
+
+The invariant both tests must hold, whatever the answers turn out to be: with a
+local judge the output contains `gemma3:4b: not pulled yet`, and with a hosted
+judge it does not. Assert on that check-line form, never on a bare `"gemma3:4b"`
+substring — the wizard's own question prints the model name and would make a bare
+assertion lie.
 
 - [ ] **Step 5: Run them to verify they fail**
 
@@ -1028,8 +1070,13 @@ Replace `daemon/setup.py:2386-2423` entirely:
 
         say(status(theme, "ok", f"Ollama {state.detail}"))
         wanted = [embed_model]
-        if provider == OLLAMA:
-            # The one thing the old early return had right.
+        if provider == OLLAMA or _truthy(env.get("DAEMON_PROACTIVE_JUDGE_LOCAL", "true")):
+            # Not `provider == OLLAMA` alone (ledger Ruling 5). config.py:1146 routes
+            # the proactive judge to ollama when *either* axis says local, and
+            # `proactive_judge_local` defaults to True - so a gemini user on defaults
+            # loads this model for the five-minute judge. `VOICE_ANSWERS` in
+            # tests/test_setup.py answers the local-model question on a gemini path
+            # for exactly this reason.
             wanted.append(env.get("DAEMON_OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL)
         missing = [model for model in wanted if not _installed(state.models, model)]
         for model in wanted:
@@ -1224,7 +1271,8 @@ spelled identically in Tasks 1, 2 and 4. `Checks.pull` is
 that injects it (Step 4). `_backfill`'s second parameter is positional with a
 `None` default in both the test (Step 1) and the implementation (Step 3).
 
-**Amended before execution.** The pre-flight scan found four things, ruled on in
+**Amended before execution.** The pre-flight scan and the prep for Task 3 found
+five things, ruled on in
 `.superpowers/sdd/2026-08-26-ollama-with-the-daemon/progress.md` and folded into
 the task text above: Ollama's start moved out of `_backfill` into its own lifespan
 task (Ruling 1, because `recall` is nullable); `pull_model` keeps the bare binary
@@ -1233,6 +1281,13 @@ and `LocalOllama` is injected into `create_app` from `daemon/cli.py` rather than
 constructed inside it (Ruling 4, or the existing test suite starts spawning real
 servers). Task 1 was already dispatched when Rulings 1-4 were made and is
 unaffected by all of them.
+
+Ruling 5 is the one that changes behaviour rather than wiring: the chat model is
+checked when `provider == ollama` **or** the proactive judge is local, because
+`config.py:1146` routes that judge to Ollama on either axis and
+`proactive_judge_local` defaults to `True`. The original rule would have skipped a
+model the daemon actually loads for most hosted-provider users, and the test
+written to guard it asserted the opposite of the truth.
 
 **Known unknowns, flagged rather than guessed.** Three places tell the
 implementer to read the repo instead of trusting this plan: `GEMINI_ANSWERS`
