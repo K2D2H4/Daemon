@@ -121,3 +121,43 @@ def test_the_slot_keeps_only_the_latest_frame():
 
 def test_an_empty_slot_reports_nothing_rather_than_blocking():
     assert Slot().get() is None
+
+
+# --- the context lead-in ---------------------------------------------------------
+#
+# whisper's log-mel normalises against the peak of whatever it is handed, so a bare
+# 200ms slice comes out anti-correlated (measured cosine -0.29) with the same audio
+# inside a stream. `context_ms` prepends the audio that settles it, and the model's
+# own window has to stay at the TAIL - an engine reading from the front would be
+# conditioning on audio ~2s stale, which no shape check would catch.
+
+
+def test_context_lengthens_the_window_at_the_front_only():
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=6.0)
+    for step in range(50):
+        ring.feed(_tone(100, value=1000 * (step % 30 + 1)), audible_at=step * 0.1)
+    plain = ring.window(frame_index=72, fps=24.0, origin=0.0)
+    with_ctx = ring.window(frame_index=72, fps=24.0, origin=0.0, context_ms=2000.0)
+    assert with_ctx.size == plain.size + int(24_000 * 2.0)
+    assert np.array_equal(with_ctx[-plain.size :], plain)
+
+
+def test_context_defaults_to_off_so_existing_callers_are_unchanged():
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
+    ring.feed(_tone(2000), audible_at=0.0)
+    assert np.array_equal(
+        ring.window(frame_index=24, fps=24.0, origin=0.0),
+        ring.window(frame_index=24, fps=24.0, origin=0.0, context_ms=0.0),
+    )
+
+
+def test_context_reaching_before_the_turn_began_is_zero_filled_not_wrapped():
+    """A turn's first frames have no 2s of history. The lead-in must read as silence,
+    not as the tail of the previous turn or a wrapped slice of this one."""
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=6.0)
+    ring.feed(_tone(400), audible_at=0.0)
+    got = ring.window(frame_index=0, fps=24.0, origin=0.0, context_ms=2000.0)
+    assert got.size == int(24_000 * 2.2)
+    head = got[: int(24_000 * 1.9)]
+    assert not head.any(), "context before the turn should be silence"
+    assert got[-int(24_000 * 0.1) :].any(), "the window itself should still have audio"

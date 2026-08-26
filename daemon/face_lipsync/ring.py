@@ -61,17 +61,34 @@ class PcmRing:
             self._start += drop / self._rate
 
     def window(
-        self, *, frame_index: int, fps: float, origin: float
+        self, *, frame_index: int, fps: float, origin: float, context_ms: float = 0.0
     ) -> np.ndarray:
-        """The 200ms the model reads for `frame_index`, as float32 in -1..1.
+        """`context_ms` of preceding audio, then the 200ms the model reads for
+        `frame_index`. float32 in -1..1, and the model's window is the TAIL.
 
         Clamped at both ends: a turn's first frames ask for audio from before it
         began, and the newest frames may outrun what has arrived.
+
+        The context exists because whisper's front-end is not local. Its log-mel
+        clamps at `log_spec.max() - 8` and rescales, so handing it a bare 200ms
+        normalises that slice against its own peak - measured *anti-correlated*
+        (cosine -0.29) with the same 200ms taken from a longer stream. See
+        `audio.CONTEXT_MS` for the sweep that settled the length.
+
+        Whoever builds the ring has to size `seconds` for at least
+        `context_ms + 200ms`, or the context is silently truncated to whatever the
+        ring still holds and the features degrade with no error anywhere.
         """
         first, _ = window_for(frame_index, fps)
         begin_s = origin + first * MS_PER_INDEX / 1000.0
-        need = int(self._rate * WINDOW * MS_PER_INDEX / 1000.0)
-        offset = int((begin_s - self._start) * self._rate)
+        # The lead-in is subtracted in SAMPLES, not seconds. Doing it in seconds
+        # shifted the window by one sample against the no-context call, because the
+        # subtraction is inexact in binary: 2.88 - 2.0 is 0.8799999999999999, and
+        # int() then floors to 21119 where the direct 2.88 gives 69120. Harmless as
+        # audio, but it means the tail is not the window the arithmetic promised.
+        lead = int(self._rate * context_ms / 1000.0)
+        need = lead + int(self._rate * WINDOW * MS_PER_INDEX / 1000.0)
+        offset = int((begin_s - self._start) * self._rate) - lead
         lo = max(0, offset)
         hi = min(self._samples.size, offset + need)
         got = self._samples[lo:hi] if hi > lo else self._samples[:0]
