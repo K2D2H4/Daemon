@@ -94,6 +94,17 @@ mcp = [
     # ported to the v2 surface.
     "mcp>=1.9,<2",
 ]
+face = [
+    # Only needed once face lip-sync (MuseTalk) is wired in and turned on -
+    # `daemon/face_lipsync/render.py` imports cv2 directly, and unlike voice/mcp
+    # nothing under `daemon/app.py` constructs a Renderer yet
+    # (tests/test_reachable.py's PENDING_CLASSES), but the tests import it
+    # unconditionally, so CI needs this extra even before wiring lands.
+    # opencv-python-headless, not opencv-python: this runs on a server with no
+    # display, so the GUI/Qt bindings the non-headless wheel links against are
+    # dead weight neither install nor CI has any use for.
+    "opencv-python-headless>=4.10",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",

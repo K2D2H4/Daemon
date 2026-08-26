@@ -18,10 +18,12 @@ jobs:
         with:
           python-version: "3.13"
 
-      # `voice` and `mcp` too: those tests import the module, and a missing extra
-      # would pass locally on a machine that happens to have it (the same trap the
-      # MCP suite fell into - it was green locally and ModuleNotFound on CI).
-      - run: pip install -e ".[dev,voice,mcp]"
+      # `voice`, `mcp` and `face` too: those tests import the module, and a missing
+      # extra would pass locally on a machine that happens to have it (the same
+      # trap the MCP suite fell into - it was green locally and ModuleNotFound on
+      # CI; cv2 hit the identical trap, undeclared anywhere until this line named
+      # it explicitly).
+      - run: pip install -e ".[dev,voice,mcp,face]"
 
       - name: lint
         run: python3 -m ruff check .
