@@ -2,8 +2,12 @@
 
 The published file is diffusers-keyed but MLX-laid-out: `conv_in.weight` is
 (320, 3, 3, 8) where torch's is (320, 8, 3, 3). Transposing it again produces a
-model that runs and returns nonsense, so the mapping here renames and splits but
-never touches layout - and that is asserted rather than commented.
+model that runs and returns nonsense. `rename` and `needs_split` below are
+str -> str and str -> bool - they never receive a tensor, so the mapping never
+touches layout by construction, not because anything in this file asserts it:
+these tests check renaming and splitting only. The layout invariant itself is
+checked by `evals/face_lipsync_numerics.py`, against the real weights, by hand,
+outside CI.
 """
 
 from daemon.face_lipsync.loader import needs_split, rename, unet_config
