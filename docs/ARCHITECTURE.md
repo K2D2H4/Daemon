@@ -479,3 +479,12 @@ means the publish is a comparison. `daemon/face_routes.py` mounts alongside the
 admin router and serves it: `daemon/static/face.html` is the page, an SSE stream
 carries the bus, and clips play from `<data_dir>/face/` - unshipped, so a fresh
 install shows no face until something is dropped there.
+
+One more route, `/face/transitions`, serves a table the page uses to decide
+*when* to cross from one clip to the next and *where* to enter the next one.
+`daemon/face_match.py` builds it offline from the owner's own clips -
+`daemon face-transitions`, never on the request path - and writes it to
+`<data_dir>/face/transitions.json`, so the route 404s until that has been run
+and the page falls back to cutting at frame 0. Which of its two mechanisms
+leads is the decision worth knowing:
+[ADR 0015](adr/0015-the-neutral-moment-not-the-matched-pose.md).

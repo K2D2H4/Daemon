@@ -1,64 +1,33 @@
-"""Which frame to enter a loop clip on, instead of always frame 0.
+"""Where to enter a clip, and when it is a good moment to leave one.
 
-Task 9's measurement (task-9-brief.md): a loop-to-loop crossfade blends
-`outgoing[t]` into `incoming[0]`, and every clip's near-neutral pose sits only at
-its own start and end - so `incoming[0]` is usually far from whatever pose
-`outgoing` happened to be in when the switch fired. Matching the outgoing pose to
-the closest-looking moment in the incoming clip cut the median distance 41% over
-all 56 loop-to-loop pairs of the owner's real clips; matching normalised *phase*
-instead measured *worse* than today (9.6 vs 6.4), so pose is the only lever.
+Two lookups, both offline, both written to `<data_dir>/face/transitions.json` by
+`daemon face-transitions` and served to the page by `daemon/face_routes.py`:
 
-This is [Video Textures](https://www.researchgate.net/publication/2624304_Video_Textures)
-(Schodl et al., SIGGRAPH 2000) applied across clips instead of within one, plus
-its own refinement: comparing a small window of frames rather than a single one.
-A single frame cannot tell a hand rising through a pose from a hand falling
-through the same pose - they can be pixel-identical - and splicing the two plays
-the motion backwards. A window catches it: the neighbourhoods disagree even when
-the centre frames match exactly.
+- `neutral[stem]` - one bool per BUCKET-second slice of `stem`'s own timeline,
+  true where some frame in it is near that clip's own frame 0. The page waits
+  (capped) for the next such moment before a non-urgent transition. This is the
+  main mechanism: every clip starts and ends on the same neutral pose by
+  construction (design spec §4.3's hub-and-spoke), and that shared moment is the
+  only thing twelve independently generated clips actually have in common.
+- `match[a][b]` - for each BUCKET-second slice of `a`, the second to seek to in
+  `b` so the incoming frame looks, and moves, most like the outgoing one. This
+  covers the measured 14% where the wait above expires and the page has to cut
+  anyway. It is [Video
+  Textures](https://www.researchgate.net/publication/2624304_Video_Textures)
+  (Schodl et al., SIGGRAPH 2000) applied across clips instead of within one, plus
+  its refinement of comparing a short window rather than a single frame - a hand
+  rising through a pose and a hand falling through it can be pixel-identical, and
+  splicing the two plays the motion backwards.
 
-FOLLOW-UP 1 (still task 9, after shipping): matching *pose* was not enough on
-its own. The owner reported a cut landing mid-sigh - a breath cycle is 3-4s, and
-the shipped ±200ms window sees about a tenth of one, so it cannot tell inhaling
-from exhaling at the same chest position. Measured: 41% of the shipped matches
-had the incoming clip moving *opposite* to the outgoing clip at the splice
-point. Widening the window to ±500ms alone gets that down to ~28-30% and then
-plateaus; a direction term in the cost is what actually fixes it (see
-LAMBDA_DIRECTION below).
+**That order - wait first, match second - is the decision, and it was originally
+the other way round.** Why, what the measurements were, and why no amount of
+tuning closes the gap pose matching leaves, are in
+[ADR 0015](../docs/adr/0015-the-neutral-moment-not-the-matched-pose.md); the
+constants below each carry the number that set them.
 
-FOLLOW-UP 2 (still task 9, after tuning LAMBDA_DIRECTION): a sweep of LAMBDA
-against this implementation's own `_directions` vectors and `_frames` found the
-weight (100.0, see LAMBDA_DIRECTION) - and, more importantly, its ceiling. Even
-at LAMBDA=300, well past the point of worthwhile appearance-matching cost,
-median cosine between matched frames reaches only 0.16: across every weight
-tried, matched motion stays essentially uncorrelated. This is structural, not
-a tuning problem. Video Textures (this module's whole premise) works *within
-one continuous recording*, where every frame belongs to the same motion
-manifold and a nearby frame is very likely to be moving a similar way. These
-are twelve *independently generated* clips sharing only a neutral pose - there
-is no manifold linking their motion, so a frame in one clip has no reason to
-move anything like a frame in another, no matter how strongly appearance is
-outweighed. Pose matching recovers pose well (FOLLOW-UP 1's 41%) and motion
-barely (this section); no larger LAMBDA_DIRECTION closes that gap, and
-re-sweeping it later would just re-find the same ceiling.
-
-FOLLOW-UP 3 (still task 9, after the owner asked why clips with neutral time
-at each end still cut badly): waiting for the outgoing clip to reach a near-
-neutral moment was ruled out early, before FOLLOW-UP 1, on a first measurement
-at a different scale where near-neutral time looked like a two-tenths-of-a-
-second sliver at the very end of each clip - too narrow to be worth much, so
-pose matching (and later, direction) was built instead. Re-measured against
-this module's own `_frames`: at this scale, near-neutral time is wide, not
-narrow - the median wait for the next near-neutral moment is 0s for every
-loop clip (most of the time the outgoing clip already qualifies), and the
-worst-case p90 is a few seconds. The earlier conclusion inverted. This also
-explains why FOLLOW-UP 2's ceiling exists: pose matching was trying to match
-arbitrary mid-motion poses across twelve clips with no shared motion
-manifold, when the one moment they all genuinely share - neutral - was sitting
-unused. `_neutral_buckets` (below) is that moment, made lookupable; the page
-now waits for it (capped, see `daemon/static/face.html`'s NEUTRAL_WAIT_CAP_MS)
-on a non-urgent transition, and only falls through to pose-matched entry when
-that wait times out - narrowing what pose matching is needed for rather than
-replacing it, since a timed-out wait still has to land somewhere.
+The numbered rules cited below are Task 9's four in
+`docs/superpowers/plans/2026-08-25-face-v1.md`, which is also where the
+median-distance table behind pose matching lives.
 
 Offline and dependency-light on purpose - no model, no network, and nothing
 imported from `daemon/` beyond `face_routes`'s clip vocabulary (`CLIPS`). This
@@ -149,8 +118,7 @@ was barely distinguishable from LAMBDA=0.
 **The limit this sweep exposes matters more than the value it picked.** Even
 at LAMBDA=300, median cosine only reaches 0.16 - across every weight tried,
 matched frames have essentially uncorrelated motion. No larger LAMBDA fixes
-this; the ceiling is structural, not a tuning problem (see the module
-docstring's FOLLOW-UP 2 section)."""
+this; the ceiling is structural, not a tuning problem (ADR 0015 §2)."""
 
 NEUTRAL_THRESHOLD_FRACTION = 0.20
 """How close a frame must be to its own clip's frame 0 to count as "near
@@ -159,7 +127,7 @@ departure (the largest mean-squared distance any of its frames reaches from
 frame 0), not an absolute distance, since clips differ in how far they stray.
 
 Measured at 0.15 and 0.25 of peak departure against all twelve of the owner's
-real clips (FOLLOW-UP 3, still task 9): the resulting wait times (median 0s,
+real clips (ADR 0015 §3): the resulting wait times (median 0s,
 p90 well under a couple of seconds for every loop clip but flourish_arms)
 barely moved between the two, so the choice inside that band is not load-
 bearing. 0.20 is the midpoint of the two endpoints actually measured, not a
@@ -170,9 +138,10 @@ ONE_SHOTS = frozenset({"amused", "sulky", "curious", "flourish_arms"})
 """Mood one-shots and the idle flourish: each is an arc from the shared neutral
 pose and back (design spec §1's "hub-and-spoke"), so entering one mid-arc, at
 whatever pose the outgoing loop left off on, would destroy the arc (rule 3).
-Hardcoded rather than imported: `daemon/face.py`'s `MOODS` and the flourish list
-in `daemon/static/face.html` both know this split, but this module may import
-neither - only `face_routes`'s flat `CLIPS` tuple, which does not carry it."""
+Hardcoded rather than imported: `daemon/face.py`'s `Mood` literal and the
+flourish list in `daemon/static/face.html` both know this split, but this module
+may import neither - only `face_routes`'s flat `CLIPS` tuple, which does not
+carry it."""
 
 LOOPS: tuple[str, ...] = tuple(name for name in CLIPS if name not in ONE_SHOTS)
 """Every clip that is a continuous activity loop rather than a one-shot. Building
@@ -187,7 +156,7 @@ def build_table(face_dir: Path) -> dict[str, Any]:
     row, column and `neutral` entry it would have appeared in (rule 4) - there
     is no interpolation or substitution for a missing clip, only omission.
 
-    `version` is 3 as of the neutral-wait follow-up (still task 9): earlier
+    `version` is 3 as of the neutral-wait decision (ADR 0015 §3): earlier
     versions carried `match` alone, this one adds `neutral`, so a stale
     version-1 or version-2 `transitions.json` (no `neutral` key at all) needs
     to be distinguishable from a fresh one - the same reasoning version 2 used
@@ -272,10 +241,10 @@ def _seeks(frames_a: np.ndarray, frames_b: np.ndarray) -> list[float]:
 
 def _neutral_buckets(frames: np.ndarray) -> list[bool]:
     """Which `BUCKET`-second slices of `frames`' own timeline are near its
-    own frame 0 (task 9's 3rd follow-up: waiting for the clip's next such
-    moment beats matching pose against an unrelated clip's motion, which
-    twelve independently generated clips were never going to share - see the
-    module docstring's FOLLOW-UP 2). A slice counts as near neutral if any
+    own frame 0 (ADR 0015 §3: waiting for the clip's next such moment beats
+    matching pose against an unrelated clip's motion, which twelve
+    independently generated clips were never going to share). A slice counts
+    as near neutral if any
     frame within it is within `NEUTRAL_THRESHOLD_FRACTION` of the clip's own
     peak departure from frame 0 - bucketed the same way as `match`
     (`_bucket_ranges`), so the page can look this up instead of recomputing
