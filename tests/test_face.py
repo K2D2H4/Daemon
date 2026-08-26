@@ -261,6 +261,20 @@ def test_the_gap_is_silent_but_still_speaking():
     assert bus.state.level == 0.0, "a gap is silence, even though the turn goes on"
 
 
+def test_the_falling_edge_lands_on_the_callers_resting_state():
+    """`idle` is only right for the text path. In an open voice conversation the
+    microphone is live, so an answer ending means `listening` - and publishing `idle`
+    put a zero-length blip in front of the `listening` the next microphone chunk set
+    microseconds later, at the end of every single turn of a live session.
+    """
+    bus = RecordingBus()
+    clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
+    clock.fed(_pcm(0.2), at=100.0)
+    clock.pump(100.0)
+    clock.pump(100.5, resting="listening")
+    assert bus.activities == ["speaking", "listening"], "no idle blip in between"
+
+
 def test_the_falling_edge_is_still_exact_once_the_turn_is_over():
     """The hold is a flag, not a debounce: with the turn done, the end of speech is
     the same instant it always was - no lateness bought for the flicker fix."""

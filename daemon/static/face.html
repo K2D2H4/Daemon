@@ -76,17 +76,17 @@ const RELEASE = 0.06;         // slow close - real mouths are asymmetric
 const IDLES = ["idle1", "idle2", "idle3"];
 const FLOURISHES = ["flourish_arms"];
 const FLOURISH_MIN_MS = 15000, FLOURISH_MAX_MS = 60000;
-// Was 40-120s, which spec open question 6 admitted was a guess. The guess was
-// wrong in a way that made the clip unreachable in use rather than merely rare:
-// scheduleFlourish() arms only while `idle` and any other activity disarms it, and
-// across a live 8-turn session the longest uninterrupted idle stretch was **36s**
-// (then 12s, then nothing above 1s). Every gap was shorter than the minimum wait,
-// so `flourish_arms` could not fire once - not because the conversation was busy,
-// but because the window never opened.
+// Down from the 40-120s spec open question 6 admitted was a guess, but **the
+// interval was never why the flourish did not appear** - advance() was re-arming
+// the deadline on every idle clip's end (see there). An earlier revision of this
+// comment blamed the interval, citing a live session whose longest uninterrupted
+// idle stretch was 36s. That number is real and it is the wrong explanation: the
+// flourish is for the long ambient idle *after* a session, not for gaps inside one,
+// and with the re-arm fixed 40-120s would have worked too.
 //
-// 15-60s fits the gaps that actually occur while still averaging under the "once a
-// minute breaks the loop's visible period" the spec wanted it for. Left alone for
-// minutes, the face now flourishes several times rather than never.
+// So this is now a taste choice and labelled as one: 15-60s makes the gesture
+// something the owner actually sees while the face sits there, averaging 37s
+// against the spec's "once a minute breaks the loop's visible period".
 const LOUD_ENTER = 0.27, LOUD_HOLD_MS = 500;
 // Now a measurement. Taken off the running resident's own /face/stream through a
 // live 8-turn voice session, with this file's ATTACK/RELEASE filter replayed over
@@ -340,11 +340,21 @@ function advance() {
     toActivity(act);
     return;
   }
-  // Spec 1 wants one every 40-120s for as long as idle lasts, because that is
-  // what breaks an 8s loop's period. scheduleFlourish() used to be reachable only
-  // from toActivity(), so entering idle armed exactly one: tick() zeroed
-  // flourishAt when it fired and nothing ever set it again.
-  if (activity === "idle") scheduleFlourish();
+  // Spec 1 wants one every interval for as long as idle lasts, because that is what
+  // breaks an 8s loop's period. scheduleFlourish() used to be reachable only from
+  // toActivity(), so entering idle armed exactly one: tick() zeroed flourishAt when
+  // it fired and nothing ever set it again.
+  //
+  // `&& !flourishAt` is the whole point of this line and its absence was a *worse*
+  // bug than the one above. This runs on every idle clip's `ended`, and an idle clip
+  // is about 8s while the wait is tens of seconds - so re-arming unconditionally
+  // pushed the deadline further away than time advanced and the flourish could never
+  // fire at all. Measured in a live page: flourishAt went 37.3s -> 73.1s while the
+  // clock went 7.1s -> 35.7s, chasing a deadline it would never reach.
+  //
+  // Re-arm only when *disarmed*, which is exactly the two moments that want it:
+  // entering idle (toActivity arms it) and just after one fired (tick zeroes it).
+  if (activity === "idle" && !flourishAt) scheduleFlourish();
   const stem = clipFor(activity);
   if (stem) show(stem, { loop: activity !== "idle" });
 }

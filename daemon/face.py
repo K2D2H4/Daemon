@@ -199,7 +199,7 @@ class SpeechClock:
         self._until = starts + seconds
         self._pending.append((self._until, _rms(chunk)))
 
-    def pump(self, at: float, *, generating: bool = False) -> None:
+    def pump(self, at: float, *, generating: bool = False, resting: Activity = "idle") -> None:
         """Publish whatever is audible at `at`. Call this on a timer.
 
         `generating` is "the model is still producing this turn". While it is true
@@ -220,6 +220,16 @@ class SpeechClock:
         late by however long the hold is, and this class exists to publish an exact
         instant rather than a guessed one. Holding on a flag the caller already
         maintains keeps the falling edge exact whenever it is real.
+
+        `resting` is what "not speaking any more" means to the caller, and the
+        default is only right for the text path. In an open voice conversation the
+        microphone is live, so the answer ending means the daemon is *listening* -
+        publishing `idle` there put a zero-length blip between `speaking` and the
+        `listening` that the very next microphone chunk set microseconds later.
+        Measured on a live 6-turn session: that happened at the end of **every one
+        of the six turns**, half of all the sub-second noise left in it, and each
+        one costs the page two neutral-wait cycles at exactly the moment the owner
+        is watching for the mouth to stop.
         """
         while len(self._pending) > 1 and self._pending[0][0] <= at:
             self._pending.popleft()
@@ -235,7 +245,7 @@ class SpeechClock:
         self._pending.clear()
         self._bus.set_level(0.0)
         if self._bus.state.activity == "speaking":
-            self._bus.set_activity("idle")
+            self._bus.set_activity(resting)
 
 
 def _rms(chunk: bytes) -> float:
