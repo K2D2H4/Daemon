@@ -2904,6 +2904,75 @@ async def test_no_bus_means_no_behaviour_change() -> None:
     assert audio.played
 
 
+# --- the pump has to be *told* about the turn, not merely able to be -----------
+
+
+async def test_a_gap_between_chunks_does_not_reach_the_page_as_idle() -> None:
+    """Drives the real `_face_pump` task, because the call site is the bug surface.
+
+    `SpeechClock.pump` grew a `generating` hold and `tests/test_face.py` proves the
+    hold works - and deleting `generating=self._generating` from `_face_pump` still
+    passed every one of those tests. Same shape as the wiring hops this file already
+    guards: something calls it, nothing asserted with what.
+
+    20ms of audio - shorter than one 40ms tick - then a turn that has not ended.
+    Every tick in that gap finds the queue dry while the model is still producing,
+    which is the start of every real answer.
+    """
+    bus = RecordingBus()
+    session = FakeSession(b"\x00" * 960, Hang())   # 20ms at 24kHz/16-bit, then a gap
+    conv = conversation(session, FakeAudio(), face=bus)
+
+    task = asyncio.create_task(conv.run())
+    await asyncio.sleep(0.2)                       # ~5 pump ticks inside the gap
+    # Read mid-conversation: `run()`'s `finally` flushes the face to idle on every
+    # shutdown, so a version of this that looked after the task finished would pass
+    # with the fix reverted.
+    mid_conversation = list(bus.activities)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert mid_conversation == ["speaking"], (
+        f"a gap between chunks was published as the end of speech: {mid_conversation}"
+    )
+
+
+# --- a late user transcript must not put `thinking` over a live answer --------
+
+
+async def test_a_user_transcript_settling_mid_answer_does_not_publish_thinking() -> None:
+    """Measured on a live session, not imagined: the SSE stream carried a lone
+    `thinking` frame in the middle of two separate spoken turns, 40ms wide, wiped by
+    `_face_pump`'s next tick.
+
+    A *user* transcript finalises whenever the provider gets round to it, routinely
+    after the daemon has started replying. `_on_transcript` then published
+    `thinking` unconditionally - false on its face (the daemon is talking), and
+    destructive rather than merely wrong, because the page has to wait for a neutral
+    moment before every non-speaking clip and a blip cancels the wait it was already
+    serving. Guarded against `_playback_until`, the same clock the `listening`
+    publisher already answers to.
+    """
+    bus = RecordingBus()
+    conv = conversation(FakeSession(), FakeAudio(), face=bus)
+    conv._face = bus
+    loop = asyncio.get_running_loop()
+
+    # The answer is audibly under way.
+    conv._playback_until = loop.time() + 5.0
+    bus.set_activity("speaking")
+    await conv._on_transcript(FakeSession(), Transcript(text="물어봤어", role="user", final=True))
+    assert bus.state.activity == "speaking", "the daemon is speaking, not thinking"
+    assert "thinking" not in bus.activities
+
+    # Once the room is quiet again, the same transcript means what it always meant.
+    conv._playback_until = loop.time() - 1.0
+    await conv._on_transcript(
+        FakeSession(), Transcript(text="또 물어봤어", role="user", final=True)
+    )
+    assert bus.state.activity == "thinking"
+
+
 # --- review findings: barge-in and the mic loop must not fight the face -------
 
 
