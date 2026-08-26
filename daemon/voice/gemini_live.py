@@ -608,9 +608,14 @@ class GeminiLiveSession:
 
         Note the honest limitation: this is a *prompt*, not a verbatim TTS
         instruction, so the model answers this text rather than reading it out.
-        Proactive utterances that must come out word for word go to the local
-        speaker instead (docs/PLAN.md 6.3), which is also the path that never
-        leaves the machine.
+
+        That is a statement about the wire, and PR #126 retracts what this
+        paragraph used to conclude from it ("proactive utterances that must come
+        out word for word go to the local speaker instead"). Asked plainly enough,
+        the model answers by saying the sentence and nothing else - measured 8/8
+        against 0/8 for an ordinary instruction (`daemon/voice/base.py:send_text`,
+        `evals/proactive_verbatim_spike.py`) - so a proactive line does come
+        through here now, and `/usr/bin/say` is the fallback.
 
         **`turnComplete: true` is what makes the answer arrive at all.** This used
         to be `realtimeInput.text`, whose turn-end is "derived from user activity"

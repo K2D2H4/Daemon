@@ -1,17 +1,28 @@
 """Saying one already-chosen sentence out loud, at this machine and nowhere else.
 
 The `Speaker` implementation behind docs/PLAN.md 6.3's left-hand branch: when the
-user is at the keyboard, a proactive utterance comes out of the local speaker and
-**nothing leaves the device.** That is the one privacy claim in docs/PLAN.md 7 that
-survives voice being switched on, so it is worth protecting in code rather than
-only in prose - hence no client, no session, no socket in this file, and a single
-`/usr/bin/say` whose text goes in over a pipe.
+user is at the keyboard, a proactive utterance can come out of the local speaker
+and **nothing leaves the device.** Nothing in this file has a client, a session or
+a socket, and the text goes into a single `/usr/bin/say` over a pipe - so that
+claim is protected in code rather than only in prose.
 
-This is not a special case of `VoiceSession` and cannot be built on one.
-docs/PLAN.md 6.5: **Live API has no verbatim TTS path.** `realtimeInput.text` is a
-prompt, so the model *answers* the sentence instead of reading it. Speaking a
-sentence the judge already picked is therefore a local job by elimination, not by
-preference.
+**It is the fallback now, not the route.** This file used to say a session "cannot
+be built on one" of these, because docs/PLAN.md 6.5 records that Live API has no
+verbatim TTS path - `realtimeInput.text` is a prompt, so the model *answers* the
+sentence instead of reading it. True of the mechanism, wrong as a conclusion: a
+model asked precisely enough answers by saying the sentence and nothing else,
+measured 8/8 against 0/8 (`evals/proactive_verbatim_spike.py`, PR #126). The owner
+picked a voice, every answer he has ever heard is in it, and a proactive line
+arriving in the system voice sounded like a different program - so
+`daemon/app.py:_speak_unprompted` gives the line to the session that was opening
+anyway, and reaches for this file when the session played nothing: voice switched
+off, a socket that never opened, an answer the session interrupted before any of it
+played.
+
+Which narrows the privacy claim rather than removing it. With voice off this is
+still the whole of proactive speech at the machine and still leaves no trace on any
+network; with voice on, the line goes to the owner's chosen provider like every
+other spoken turn (docs/PLAN.md 7 says so now).
 
 ## What was measured here, and the one number that shapes the file
 
