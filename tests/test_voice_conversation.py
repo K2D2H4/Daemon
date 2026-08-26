@@ -1485,6 +1485,34 @@ async def _drive(*sessions: FakeSession, audio: FakeAudio | None = None) -> tupl
     return code, built
 
 
+async def test_the_face_reaches_the_conversation_through_voice_attempts() -> None:
+    """The one face-wiring site nothing covered.
+
+    `face` reaches a `VoiceConversation` down a five-hop keyword chain -
+    `_wake_round` -> `run_voice` -> `_voice_attempts` -> `VoiceConversation` (plus
+    `_build_voice_runtime` -> `_build_tools` for the spoken tool runner) - and
+    deleting `face=face` from any of them passed the whole suite. This covers the
+    hop that actually constructs the object, against the real `_voice_attempts`
+    rather than a stand-in: the conversation it builds has to publish through the
+    bus it was handed. `tests/test_wake.py` covers the first hop; the two in
+    `run_voice` itself still rest on review, because reaching them means building
+    a live session and real audio.
+    """
+    from daemon import app as app_module
+
+    bus = RecordingBus()
+    _, new_session, _built, companion = _attempts(FakeSession(b"\x00" * 48_000, Turn()))
+
+    code = await app_module._voice_attempts(
+        new_session, FakeAudio(), companion, Cut, face=bus
+    )
+
+    assert code == 0
+    assert bus.activities == ["speaking", "idle"], (
+        "the bus handed to _voice_attempts never reached the conversation it built"
+    )
+
+
 async def test_a_conversation_that_simply_ends_is_not_reconnected() -> None:
     """An idle timeout is the conversation being over. Reconnecting into one bills
     per minute for nothing."""

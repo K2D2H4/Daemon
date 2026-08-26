@@ -1761,3 +1761,53 @@ async def test_a_tool_call_flips_the_face_to_working_and_back(tmp_path: Path) ->
         if runner is not None:
             await runner.aclose()
         store.close()
+
+
+async def test_a_spoken_tool_call_flips_the_face_too(tmp_path: Path) -> None:
+    """The same wiring one layer out: the *voice* tool runner is a second
+    `_build_tools` call, made by `_build_voice_runtime` with its own `face=face`,
+    and the wake path's tools come from there rather than from the one above.
+    Dropping that keyword passed the whole suite - a spoken tool call would run
+    with the face frozen wherever the conversation left it.
+
+    Driven against `_build_voice_runtime` itself for the same reason the test
+    above is driven against `_build_tools`: everything past it needs a live
+    session. `writer` and `recall` are only carried into the returned
+    `VoiceRuntime`, so they can be anything.
+    """
+    from daemon.app import _build_voice_runtime
+    from daemon.tools.runner import TurnContext
+    from tests.test_face import RecordingBus
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN=TOKEN,
+        DAEMON_TOOLS_ENABLED=True,
+        DAEMON_TOOLS_ROOTS=str(tmp_path),
+        DAEMON_SCREEN_ENABLED=False,
+    )
+    target = tmp_path / "notes.md"
+    target.write_text("발표는 목요일", encoding="utf-8")
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    bus = RecordingBus()
+    runtime = None
+    try:
+        runtime = await _build_voice_runtime(settings, store, None, None, face=bus)
+
+        await runtime.tools.execute(
+            [ToolCall(id="1", name="read_file", arguments={"path": str(target)})],
+            TurnContext(origin="owner", channel="voice", sender_id=str(OWNER)),
+        )
+
+        assert bus.activities == ["working", "idle"], (
+            "a spoken tool call must flip the face too - `face=face` was probably "
+            "dropped from the `_build_tools(...)` call `_build_voice_runtime` makes"
+        )
+    finally:
+        if runtime is not None:
+            await runtime.tools.aclose()
+        store.close()
