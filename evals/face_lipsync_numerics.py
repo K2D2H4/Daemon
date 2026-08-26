@@ -25,13 +25,19 @@ never reported as a pass.
 What actually gets checked: the rename/split loop is run against every real
 tensor (686 -> 718 is what an earlier PyTorch-vs-MLX spike recorded for this
 conversion, docs/superpowers/specs/2026-08-25-face-design.md section 6 - print
-and compare by eye), and `conv_in.weight` must land at (320, 3, 3, 8). That
-tensor is a meaningful canary and not an arbitrary pick: its input-channel count
-(8) differs from its kernel size (3), so a correct layout and a double-transposed
-one are actually distinguishable tuples here - unlike a tensor whose dimensions
-happen to coincide, where shape alone could not catch the same mistake. This does
-not run the model or recompute the spike's cosine similarity; it checks the one
-structural fact that numeric pass depended on. Never run in CI.
+and compare by eye), `conv_in.weight` must land at (320, 3, 3, 8), and every
+`proj_in.weight` / `conv_shortcut.weight` must be rank 2. `conv_in` is a
+meaningful canary and not an arbitrary pick: its input-channel count (8) differs
+from its kernel size (3), so a correct layout and a double-transposed one are
+actually distinguishable tuples here - unlike a tensor whose dimensions happen to
+coincide, where shape alone could not catch the same mistake. The rank check
+exists because `conv_in` cannot see everything: upstream mlx-examples'
+`map_unet_weights` does five things (rename, split, squeeze conv_shortcut,
+squeeze 4-D proj_in/proj_out, transpose) and this loader only does two (rename,
+split) - correct if the published weights truly need no squeeze, silently wrong
+if they do, and `conv_in` is unaffected either way so it cannot tell us which.
+This does not run the model or recompute the spike's cosine similarity; it checks
+structural facts a running model would depend on. Never run in CI.
 """
 
 from __future__ import annotations
@@ -40,12 +46,24 @@ import json
 import sys
 from pathlib import Path
 
-import mlx.core as mx
-
 from daemon.face_lipsync.loader import needs_split, rename, unet_config
 
 
 def main() -> int:
+    try:
+        import mlx.core as mx
+    except ImportError as exc:
+        print("MISSING MLX - nothing was checked, this is not a pass:")
+        print(f"  {exc}")
+        print(
+            "mlx is a macOS/Apple-silicon runtime dependency this eval needs to load "
+            "the weights. It is deliberately not declared in pyproject.toml or any "
+            "extra - this file is never run in CI (see the module docstring) - so a "
+            "fresh checkout does not have it. Install it by hand and re-run:\n"
+            "  pip install mlx"
+        )
+        return 1
+
     root = Path("data/face/lipsync/models")
     config_path = root / "musetalk.json"
     weights_path = root / "unet.safetensors"
@@ -89,6 +107,25 @@ def main() -> int:
         print(f"FAIL conv_in.weight is {tuple(conv_in.shape)}, expected (320, 3, 3, 8)")
         return 1
     print("  layout OK (NHWC, not transposed)")
+
+    # The narrower check conv_in cannot do: mlx-examples declares proj_in/proj_out
+    # and conv_shortcut as nn.Linear, which needs a 2-D (out, in) weight. This
+    # loader never squeezes (see module docstring), on the premise that the
+    # published weights need none - if that premise is wrong, one of these is
+    # still 4-D and building the real model would fail. A rank check now is
+    # strictly cheaper than waiting to find that out from a broken UNet.
+    linear_like = [
+        (key, value)
+        for key, value in mapped
+        if key.endswith(("proj_in.weight", "conv_shortcut.weight"))
+    ]
+    bad_rank = [(key, tuple(value.shape)) for key, value in linear_like if value.ndim != 2]
+    if bad_rank:
+        print("FAIL expected 2-D (nn.Linear) weight, got:")
+        for key, shape in bad_rank:
+            print(f"  {key}: {shape}")
+        return 1
+    print(f"  proj_in/conv_shortcut rank OK ({len(linear_like)} tensors)")
     return 0
 
 
