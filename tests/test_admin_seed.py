@@ -158,6 +158,44 @@ def test_write_keeps_the_previous_text_in_one_backup_slot(tmp_path: Path) -> Non
     assert (tmp_path / "persona" / "seed.md.bak").read_text(encoding="utf-8") == SEED
 
 
+def test_a_failed_write_does_not_spend_the_one_backup_slot(tmp_path: Path) -> None:
+    """The backup is only meaningful as "the content the last *successful* save
+    replaced". Written before the seed, a write that then failed would leave the
+    slot holding the same text as the file - consuming the owner's only undo for
+    a save that never happened."""
+    _write_seed_file(tmp_path, SEED)
+    (tmp_path / "persona" / "seed.md.bak").write_text("훨씬 예전 내용\n", encoding="utf-8")
+
+    from daemon.admin import seed_io
+
+    real = seed_io.write_private_replace
+
+    def fail_on_the_seed(path: Path, content: str, **kw: object) -> None:
+        if path.name == "seed.md":
+            raise OSError("no space left on device")
+        real(path, content, **kw)  # type: ignore[arg-type]
+
+    seed_io.write_private_replace = fail_on_the_seed  # type: ignore[assignment]
+    try:
+        with pytest.raises(OSError):
+            write_seed(tmp_path, "새 내용\n", expected_sha256=_sha(SEED))
+    finally:
+        seed_io.write_private_replace = real  # type: ignore[assignment]
+
+    assert _seed_file(tmp_path).read_text(encoding="utf-8") == SEED
+    assert (tmp_path / "persona" / "seed.md.bak").read_text(encoding="utf-8") == "훨씬 예전 내용\n"
+
+
+def test_write_keeps_the_blank_lines_the_owner_left_at_the_end(tmp_path: Path) -> None:
+    """Normalisation guarantees a *final* newline; it does not get to reformat
+    human-owned text. Collapsing the spacing someone left between sections is an
+    edit they did not make to the one file this contract keeps as written."""
+    saved = write_seed(tmp_path, "# 나\n\n짧게 말한다.\n\n\n", expected_sha256="")
+
+    assert _seed_file(tmp_path).read_text(encoding="utf-8") == "# 나\n\n짧게 말한다.\n\n\n"
+    assert saved.sha256 == _sha("# 나\n\n짧게 말한다.\n\n\n")
+
+
 def test_write_refuses_a_blank_seed(tmp_path: Path) -> None:
     """An empty seed is not a neutral state: the daemon speaks as a stock
     assistant and `daemon doctor` calls it a proactivity blocker. It is also what
@@ -293,6 +331,44 @@ def test_the_save_route_requires_a_hash_rather_than_defaulting_to_overwrite(
 
     assert r.status_code == 400
     assert _seed_file(tmp_path).read_text(encoding="utf-8") == SEED
+
+
+def test_a_cross_site_put_to_the_seed_is_refused(tmp_path: Path) -> None:
+    """PUT is the first unsafe verb this router serves, and every other guard test
+    drives PATCH /api/settings - so nothing proved the screen covers this one. A
+    page on any other origin can `fetch()` 127.0.0.1 with no preflight, and the
+    thing on the other end here is the personality anchor."""
+    _write_seed_file(tmp_path, SEED)
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        cross = client.put(
+            "/admin/api/persona/seed",
+            json={"text": "공격자가 쓴 인격\n", "sha256": _sha(SEED)},
+            headers={"Origin": "http://evil.example"},
+        )
+        metadata = client.put(
+            "/admin/api/persona/seed",
+            json={"text": "공격자가 쓴 인격\n", "sha256": _sha(SEED)},
+            headers={"Sec-Fetch-Site": "cross-site"},
+        )
+
+    assert cross.status_code == 403
+    assert metadata.status_code == 403
+    assert _seed_file(tmp_path).read_text(encoding="utf-8") == SEED
+
+
+def test_the_reload_button_asks_before_discarding_an_edit(tmp_path: Path) -> None:
+    """`go()` already refuses to re-read over an unsaved edit; the button was the
+    one path that skipped that guard, and there is no draft and no undo behind it.
+    Asserted on the shipped page, the way the other index.html structure tests are."""
+    app = create_app(_settings(tmp_path))
+    with TestClient(app, base_url=LOOPBACK) as client:
+        html = client.get("/admin/").text
+
+    start = html.index("async function loadSeed(")
+    body = html[start : html.index("\nasync function ", start + 1)]
+    assert "seedEdited()" in body and "confirm(" in body
 
 
 def test_the_only_seed_write_route_is_the_owners_own_form() -> None:

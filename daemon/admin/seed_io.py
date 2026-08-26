@@ -39,6 +39,7 @@ route would be the more confusing choice.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -100,11 +101,18 @@ def _current(path: Path) -> tuple[bytes | None, str]:
 
 
 def _normalise(text: str) -> str:
-    """What a textarea posts, as a markdown file: LF endings, one trailing
-    newline. Without this a CRLF submission would be written verbatim, go into
-    the prompt verbatim, and hash differently from the text the page is showing -
-    so the next save from the same page would conflict with itself."""
-    return text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
+    """What a textarea posts, as a markdown file: LF endings, and a final newline.
+
+    Without the ending conversion a CRLF submission would be written verbatim, go
+    into the prompt verbatim, and hash differently from the text the page is
+    showing - so the next save from the same page would conflict with itself.
+
+    It stops there. An earlier version also `rstrip("\\n")`-ed, which collapsed
+    whatever blank lines the owner had left between sections - an edit they did
+    not make, to the one file this contract exists to keep exactly as written.
+    """
+    body = text.replace("\r\n", "\n").replace("\r", "\n")
+    return body if body.endswith("\n") else body + "\n"
 
 
 def read_seed(data_dir: Path) -> SeedView:
@@ -159,19 +167,31 @@ def write_seed(data_dir: Path, text: str, *, expected_sha256: str) -> SeedSaved:
             "Reload the file, and re-apply the edit on top of what is there."
         )
 
-    backup: str | None = None
+    # The backup is staged first and moved into place last, so the slot holds the
+    # content of the last *successful* save and nothing else. Neither simpler
+    # order gets that: writing the backup outright would let a seed write that
+    # then failed (no space, a read-only dir) consume the owner's only undo for a
+    # save that never happened, and writing the seed first would leave a bad save
+    # - the case the backup exists for - with nothing behind it if the backup
+    # write is the one that fails.
+    #
+    # `raw` decodes: the hash matched, so these are the bytes `read_seed`
+    # already decoded to hand the caller that hash.
+    staged = None
     if raw is not None:
-        # The hash matched, so these bytes are the ones `read_seed` decoded -
-        # a decode failure here would mean the state changed under a matching
-        # hash, and the safe answer to that is to write nothing.
-        try:
-            previous = raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise SeedUnreadable(f"{SEED_FILE} cannot be backed up: {exc.reason}") from exc
-        write_private_replace(path.with_name(path.name + BACKUP_SUFFIX), previous)
-        backup = str(SEED_FILE) + BACKUP_SUFFIX
+        staged = path.with_name(path.name + BACKUP_SUFFIX + ".new")
+        write_private_replace(staged, raw.decode("utf-8"))
+    try:
+        write_private_replace(path, body)
+    except BaseException:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+        raise
 
-    write_private_replace(path, body)
+    backup: str | None = None
+    if staged is not None:
+        os.replace(staged, path.with_name(path.name + BACKUP_SUFFIX))
+        backup = str(SEED_FILE) + BACKUP_SUFFIX
     return SeedSaved(
         sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
         lines=len(body.splitlines()),

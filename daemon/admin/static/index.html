@@ -1234,17 +1234,24 @@ const seedEdited=()=>$('#seed-text').value!==SEED.loaded;
 function seedSyncButtons(){
   $('#seed-save').disabled=$('#seed-text').disabled||SEED.sha===null||!seedEdited();
 }
-async function loadSeed(){
+async function loadSeed({force=false}={}){
   const ta=$('#seed-text');
+  // Re-reading is destructive when the box has been typed into: there is no
+  // draft, no undo, and the text is the owner's own. `go()` handles that case by
+  // not reading at all; the button asks instead. `force` is the read that
+  // follows a successful save, where differing from `SEED.loaded` is expected.
+  if(!force&&seedEdited()
+     &&!confirm('Discard your unsaved edit and re-read seed.md from disk?'))return;
   ta.disabled=true;$('#seed-note').textContent='';
   try{const s=await api('/admin/api/persona/seed');
     SEED.sha=s.sha256;SEED.loaded=s.text;
     ta.value=s.text;ta.disabled=false;
     // `splitlines()`, not `split('\n').length` - the file ends in a newline, so
     // the naive count is one higher than the number the save reports back and
-    // the two disagreed on screen.
+    // the two disagreed on screen. Empty text is 0 lines, not 1, for the same
+    // reason: that is what the server would say about the same file.
     $('#seed-meta').textContent=s.exists
-      ? `${s.file} · ${s.text.split('\n').length-(s.text.endsWith('\n')?1:0)} line(s)`
+      ? `${s.file} · ${s.text?s.text.split('\n').length-(s.text.endsWith('\n')?1:0):0} line(s)`
       : `${s.file} · not written yet`;
     if(!s.exists)$('#seed-note').textContent=
       'No seed yet — until there is one she talks like a stock assistant and every proactive candidate is declined.';
@@ -1265,7 +1272,9 @@ async function saveSeed(){
         body:JSON.stringify({text:$('#seed-text').value,sha256:SEED.sha})});
     // Re-read rather than trust what we sent: the server normalises line endings
     // and the trailing newline, so the file is not byte-identical to the box.
-    await loadSeed();
+    // Forced, because the box legitimately differs from the text we loaded - the
+    // discard prompt is for the Reload button, not for the save that just won.
+    await loadSeed({force:true});
     $('#seed-note').textContent=`Saved · ${r.lines} line(s) · she reads it on her next message`
       +(r.backup?` · previous kept as ${r.backup}`:'');
   }catch(e){
@@ -1275,7 +1284,9 @@ async function saveSeed(){
 }
 $('#seed-text').addEventListener('input',seedSyncButtons);
 $('#seed-save').addEventListener('click',saveSeed);
-$('#seed-reload').addEventListener('click',loadSeed);
+// Wrapped, not passed by name: a listener is handed the click Event, which would
+// arrive as `loadSeed`'s options object and destructure `force` off a MouseEvent.
+$('#seed-reload').addEventListener('click',()=>loadSeed());
 
 async function forgetRule(id){
   const why=prompt('Why should she stop believing this? (recorded with the rule)');

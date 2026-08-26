@@ -50,6 +50,16 @@ seed's content from a model — a "help me write my persona" button, an evolutio
 pass that edits the anchor, a tool the model can call — is still forbidden, and
 that is the rule the ADR exists to carry.
 
+[ADR 0018](0018-a-declared-expression-is-not-a-tool-call.md) landed the same day
+and the two restatements now sit beside each other in CONTRACTS, so it is worth
+saying that they do not stack. 0018 carved out what counts as a *tool call* for
+rule 12's audit row: a value the model declares which touches nothing outside
+this process. Nothing reachable through that carve-out can write the seed —
+writing a file is the definition of touching something outside the process — and
+"the model declared it rather than calling a tool" is not a route past rule 5
+either, because rule 5 is about where the bytes came from, and a declared value
+came from the model.
+
 `PUT /admin/api/persona/seed` is the whole surface. Three refusals in
 `daemon/admin/seed_io.py` do the work, and each one closes a trap that was
 already in the code the editor had to sit on:
