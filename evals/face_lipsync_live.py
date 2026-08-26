@@ -277,6 +277,14 @@ async def main() -> int:
     parser.add_argument("--seconds", type=float, default=8.0, help="audio per utterance")
     parser.add_argument("--out", type=Path, default=Path("/tmp/face_lipsync_live"))
     parser.add_argument("--idle", type=float, default=6.0, help="idle stretch to watch")
+    parser.add_argument(
+        "--watch",
+        type=float,
+        default=0.0,
+        help="after the phases, keep the server up and keep speaking for N seconds so "
+        "a browser can watch /face. The pass mark is a person looking at it, and this "
+        "is the only mode that lets them",
+    )
     args = parser.parse_args()
 
     import uvicorn
@@ -394,6 +402,19 @@ async def main() -> int:
     await speak(clock, pcm, rate=rate, ahead=args.rate)
     await asyncio.sleep(args.seconds / args.rate + 0.5)
     results.append(report_phase("phase 3", reader, mark, began))
+
+    if args.watch:
+        # Nothing about this is measurement: it holds the whole assembled thing open,
+        # speaking on a loop with a gap between utterances, so the face page can be
+        # opened and looked at. The gap matters - the switch's whole justification is
+        # that the mouth has to be judged against the v1 clips, and the falling edge
+        # is where the two are side by side.
+        print(f"\nwatch: open http://127.0.0.1:{args.port}/face - speaking for {args.watch}s")
+        until = loop.time() + args.watch
+        while loop.time() < until:
+            await speak(clock, pcm, rate=rate, ahead=args.rate)
+            await asyncio.sleep(args.seconds / args.rate + 2.0)
+        print("watch: done")
 
     pumping.cancel()
     with contextlib.suppress(asyncio.CancelledError):
