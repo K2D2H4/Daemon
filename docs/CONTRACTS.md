@@ -154,7 +154,22 @@ live-share pump's transport, which has no tool round in it.
 12. **Every executed tool call leaves a `tool_calls` audit row.** That row is the
     owner's ground-truth record of what touched the machine, readable with `daemon
     tools log`; a tool that ran without one is a defect, which is why `ToolRunner`
-    owns decide, execute and audit together instead of exposing them separately. The
+    owns decide, execute and audit together instead of exposing them separately.
+    **Split 2026-08-26** ([ADR 0018](adr/0018-a-declared-expression-is-not-a-tool-call.md)):
+    that sentence is unchanged, and what is carved out is what counts as a tool call.
+    **A value the model declares which touches nothing outside this process is not
+    one** - today exactly `set_mood`, which changes the face's expression and nothing
+    else, so it has nothing to put in the row this rule exists to write. The boundary
+    is mechanical, not a promise: it is absent from the registry, so no execution path
+    exists to skip a row on; `daemon/voice/conversation.py` answers it before
+    `ToolRunner` is reached, so the exemption is that the runner never sees it rather
+    than a runner that sometimes omits a row; its argument is validated against the
+    `Mood` type rather than trusted; and it is declared only when a face is attached.
+    `tests/test_voice_conversation.py` fails if a `set_mood` call ever reaches
+    `run_tools` and `tests/test_tool_loop.py` fails if it appears in the registry -
+    **those tests are the rule, not coverage of it.** Anything else wanting on this
+    list needs its own ADR and its own measurement; "every" having one named exception
+    is a door, and that is the cost this split accepted. The
     reply the owner reads carries **only the model's answer** - the raw
     `run`/`write`/`rm` lines are not folded into it, in text or spoken aloud in
     voice, because narrating every call reads as clutter and the audit is the record

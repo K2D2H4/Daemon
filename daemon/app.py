@@ -37,7 +37,8 @@ from daemon.config import (
     ConfigError,
     Settings,
 )
-from daemon.llm.base import Provider
+from daemon.face import MOOD_TOOL, MOOD_VOICE_INSTRUCTION
+from daemon.llm.base import Provider, ToolSpec
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
 from daemon.memory.base import MemoryWriter, Recall
@@ -1355,6 +1356,36 @@ async def _build_voice_runtime(
     )
 
 
+def _mood_declaration() -> ToolSpec:
+    """`set_mood` as the model is told about it. **Declared, never registered.**
+
+    A `ToolSpec` is how a model is offered anything at all, so this rides the
+    function-calling channel - that is transport, not a claim that it is a tool. What
+    makes it not one is that `daemon/tools/` has no entry for it and
+    `daemon/voice/conversation.py` answers it before `ToolRunner` is reached, which is
+    what CONTRACTS 12's exemption rests on (docs/adr/0018).
+
+    Flat on purpose - one enum string. `evals/voice_write_nudge_spike.py` measured that
+    nested argument schemas are what the voice model fakes rather than calls, and
+    `evals/voice_set_mood_spike.py` measured this shape at 24/24 over the live socket.
+    """
+    return ToolSpec(
+        name=MOOD_TOOL,
+        description=(
+            "Set the facial expression shown on the companion's own face. Call this "
+            "when you genuinely feel amused, sulky or curious about what was just "
+            "said. It changes nothing except the expression."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "mood": {"type": "string", "enum": ["amused", "sulky", "curious"]}
+            },
+            "required": ["mood"],
+        },
+    )
+
+
 async def run_voice(
     settings: Settings,
     *,
@@ -1490,13 +1521,32 @@ async def run_voice(
         # gate offers tools only to it. Empty when tools are off, which leaves the
         # session declaring none and so never yielding a tool call.
         tool_specs = companion.specs(origin="owner", surface="voice")
+        # `set_mood` is declared here rather than by `Companion.specs`, and only with a
+        # face attached, for two separate reasons. It is not a tool - it never reaches
+        # `ToolRunner` and leaves no audit row (docs/adr/0018, CONTRACTS 12) - so it has
+        # no business in the list a registry builds. And declaring it without a face
+        # would offer the model a switch wired to nothing. This module is the one
+        # allowed to assemble (CONTRACTS 4), and it is the only place that has both.
+        mood_specs = [_mood_declaration()] if face is not None else []
+        tool_specs = (*tool_specs, *mood_specs)
         # The tool contract rides with the persona in the system instruction, so the
         # endpoint getting tools inherits the rules the text path already has instead
         # of being written without them - which is exactly how voice came to have no
         # index() call (daemon/companion.py, TOOL_CONTRACT). Only when there is a tool
         # to use: 200 tokens of rules about a capability the model lacks buys nothing.
+        #
+        # `MOOD_VOICE_INSTRUCTION` only when the switch is actually on offer, same
+        # rule: an instruction about a tool the model does not have is pure tax, and
+        # its "never say this out loud" sentence is load-bearing (0/32 spoken aloud,
+        # `evals/voice_set_mood_spike.py`) rather than decorative.
         instruction_parts = [
-            block for block in (seed, TOOL_CONTRACT if tool_specs else "") if block
+            block
+            for block in (
+                seed,
+                TOOL_CONTRACT if tool_specs else "",
+                MOOD_VOICE_INSTRUCTION if mood_specs else "",
+            )
+            if block
         ]
         system_instruction = "\n\n".join(instruction_parts) or None
         audio = build_voice_audio()

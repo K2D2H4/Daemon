@@ -58,6 +58,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
+from typing import get_args
 
 from daemon import clock
 
@@ -69,7 +70,7 @@ from daemon import clock
 # position to start from: the wire has no role that means "reference material", so
 # the block arrives as a *user* turn.
 from daemon.companion import Companion
-from daemon.face import FaceBus, SpeechClock
+from daemon.face import MOOD_TOOL, FaceBus, Mood, SpeechClock
 from daemon.llm.base import ToolCall
 from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.tools.base import ToolResult
@@ -77,6 +78,10 @@ from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
 from daemon.voice.screen_share import ScreenShareController, ScreenSharePump
 
 logger = logging.getLogger(__name__)
+
+_MOODS = frozenset(get_args(Mood))
+"""What `set_mood` may be given, off the type itself so a fourth mood cannot be
+accepted here without existing there."""
 
 VOICE_CHANNEL = "voice"
 """`channel` for a recorded voice turn. Not the provider's name: the column says
@@ -364,6 +369,16 @@ class VoiceConversation:
         rather than redone does not seed the same memories twice."""
 
         self._face = face
+        self._pending_mood: Mood | None = None
+        """A mood the model declared, waiting for the answer it belongs to.
+
+        Not published when the call arrives, and that is the whole point. A blocking
+        tool call reaches us *before any audio* (measured - daemon/voice/base.py), and
+        `speaking` is the one transition allowed to cut a one-shot (spec 3.2), so a
+        mood published on arrival is cut by the answer it was about and spends roughly
+        0ms on screen. The text path already learned this and publishes `speaking`
+        first; here the wait is longer but the fix is the same one.
+        """
         self._speech = (
             None
             if face is None
@@ -625,6 +640,12 @@ class VoiceConversation:
                         # `_face_pump` only ever has to notice the falling edge.
                         self._speech.fed(item, at)
                         self._speech.pump(at)
+                    if self._pending_mood is not None and self._face is not None:
+                        # `speaking` is up as of the pump above, so the page plays the
+                        # mood *over* the speaking loop and hands back when the arc
+                        # ends - the ordering spec 3.6 was corrected to.
+                        self._face.one_shot(self._pending_mood)
+                        self._pending_mood = None
                     await self._audio.play(item)
                 elif isinstance(item, Interrupted):
                     await self._barge_in(session)
@@ -649,6 +670,9 @@ class VoiceConversation:
         # never flushing would mean a memory searched for and then silently dropped.
         self._generating = False
         self._answering_tool = False
+        # An answer that never arrived has no expression to carry. Holding it would
+        # put this turn's mood on whatever the *next* one says.
+        self._pending_mood = None
         await self._flush_deferred(session)
         self.ended = getattr(session, "ended", None)
         if produced:
@@ -1064,8 +1088,37 @@ class VoiceConversation:
 
     # --- tools ---------------------------------------------------------------
 
+    async def _set_mood(self, session: VoiceSession, call: ToolCall) -> None:
+        """Answer `set_mood`, the one model-invoked value that is not a tool call.
+
+        **It must not reach `Companion.run_tools`, and this returning before that is
+        the mechanism, not an optimisation.** CONTRACTS 12 exempts it from an audit
+        row because it touches nothing outside this process, and rule 12 is otherwise
+        untouched - so the exemption has to be that the runner never sees it, rather
+        than a runner that sometimes skips a row. `MOOD_TOOL` is deliberately absent
+        from the tool registry too, so there is no second path to try. See
+        docs/adr/0018.
+
+        The mood is validated against `Mood` rather than trusted: the argument is a
+        string a model chose, and an enum in the declaration is a request, not a
+        guarantee. An unknown value is dropped and the call still answered - the
+        session blocks until it gets a response, so refusing to reply would cost the
+        answer rather than the expression.
+        """
+        asked = call.arguments.get("mood")
+        if asked in _MOODS and self._face is not None:
+            self._pending_mood = asked  # published with `speaking`, see the field
+        else:
+            logger.debug("voice: ignoring set_mood(%r)", asked)
+        await session.send_tool_response(
+            [ToolResult(call_id=call.id, name=call.name, content='{"ok": true}')]
+        )
+
     async def _run_tool_call(self, session: VoiceSession, call: ToolCall) -> None:
         """Run one tool the model asked for and hand the result back on the socket.
+
+        `set_mood` is intercepted first and never reaches the runner - it is not a
+        tool (`daemon/face.py:MOOD_TOOL`, docs/adr/0018).
 
         The same `Companion.run_tools` the text loop drives, so a spoken call goes
         through the same policy, the same registry and the same `tool_calls` audit
@@ -1090,6 +1143,9 @@ class VoiceConversation:
         # server cancels the call - see `_answering_tool`. Set before running the
         # tool, because the user's own transcript settles recall in this same
         # window.
+        if call.name == MOOD_TOOL:
+            await self._set_mood(session, call)
+            return
         self._answering_tool = True
         outcome = await self._companion.run_tools(
             [call], origin="owner", channel=self._channel, sender_id=None
