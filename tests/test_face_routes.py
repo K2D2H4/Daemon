@@ -53,6 +53,13 @@ def test_the_page_renders_with_no_assets_at_all(app):
     assert "text/html" in r.headers["content-type"]
 
 
+def test_the_page_is_never_cached(app):
+    # A browser caching the page shell means a shipped fix needs a hard
+    # refresh to take effect - measured cost, not a hypothetical one.
+    r = TestClient(app).get("/face")
+    assert r.headers.get("cache-control") == "no-store"
+
+
 def test_available_clips_reports_only_what_exists(app):
     settings = app.state.settings
     assert available_clips(settings) == ()

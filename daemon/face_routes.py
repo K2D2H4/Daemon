@@ -75,8 +75,19 @@ def _payload(event: Event) -> dict[str, Any]:
 
 @router.get("/face", response_class=HTMLResponse)
 async def page() -> HTMLResponse:
-    """Serve the face page."""
-    return HTMLResponse(PAGE.read_text(encoding="utf-8"))
+    """Serve the face page.
+
+    `Cache-Control: no-store`, matching `/face/stream`'s own header - a browser
+    caching this shell means a shipped fix needs a hard refresh to actually
+    take effect, which is exactly what cost the owner and the coordinator time
+    chasing this follow-up. `/face/clips/{name}` and `/face/transitions` keep
+    whatever caching FastAPI/Starlette's `FileResponse` already gives them by
+    default (no header added here): both are content that changes rarely (a
+    new clip, a rebuilt table) rather than something that changes underneath a
+    page already open, so a stale cache there costs far less than a stale page
+    shell does, and touching them wasn't part of what broke.
+    """
+    return HTMLResponse(PAGE.read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
 
 
 @router.get("/face/clips/{name}")
