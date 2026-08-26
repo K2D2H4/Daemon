@@ -8,6 +8,7 @@ backlog of stale ones.
 """
 
 import numpy as np
+import pytest
 
 from daemon.face_lipsync.ring import PcmRing, Slot
 
@@ -161,3 +162,33 @@ def test_context_reaching_before_the_turn_began_is_zero_filled_not_wrapped():
     head = got[: int(24_000 * 1.9)]
     assert not head.any(), "context before the turn should be silence"
     assert got[-int(24_000 * 0.1) :].any(), "the window itself should still have audio"
+
+
+# --- the anchor a render loop reads each tick ------------------------------------
+
+
+def test_origin_is_the_audible_time_of_the_oldest_sample_held():
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
+    assert ring.origin == 0.0
+    ring.feed(_tone(500, value=9000), audible_at=7.25)
+    assert ring.origin == 7.25
+
+
+def test_origin_moves_when_a_new_turn_re_anchors_the_buffer():
+    """A loop that captured this once would keep addressing the previous turn's
+    audio, and `window` answers with silence rather than an error."""
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
+    ring.feed(_tone(500, value=9000), audible_at=1.0)
+    ring.feed(_tone(500, value=9000), audible_at=30.0)   # a gap: new turn
+    assert ring.origin == 30.0
+
+
+def test_origin_creeps_forward_as_the_ring_drops_old_samples():
+    """Not only on re-anchor. Once the buffer is full the oldest sample changes on
+    every feed, so the anchor moves continuously during a long turn."""
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=1.0)
+    ring.feed(_tone(800, value=9000), audible_at=0.0)
+    assert ring.origin == 0.0
+    ring.feed(_tone(800, value=9000), audible_at=0.8)    # continuous, overfills 1.0s
+    assert ring.origin > 0.0
+    assert ring.origin == pytest.approx(0.6, abs=0.01)

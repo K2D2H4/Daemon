@@ -28,6 +28,20 @@ class PcmRing:
         """Audible time of `self._samples[0]`."""
 
     @property
+    def origin(self) -> float:
+        """Audible time of the oldest sample held - the turn's start, in practice.
+
+        `window()` addresses frames relative to an `origin` the caller supplies, and
+        this is where that value comes from. It MOVES: `feed` re-anchors on a gap in
+        either direction (a new turn, a long silence, or a barge-in that rebuilds the
+        clock), and it also creeps forward as the ring drops samples past `seconds`.
+        A render loop therefore has to read it each tick rather than capture it once
+        - a stale origin points frame indices at audio that is no longer there, and
+        `window` answers with silence rather than an error.
+        """
+        return self._start
+
+    @property
     def sample_rate(self) -> int:
         """The rate `window()`'s output is sampled at - not whisper's assumed
         16kHz. See `LipsyncEngine.mouths`'s docstring for why that gap matters."""
