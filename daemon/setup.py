@@ -63,6 +63,7 @@ from __future__ import annotations
 import getpass
 import json
 import re
+import subprocess
 import sys
 import time
 import webbrowser
@@ -831,6 +832,20 @@ def fetch_updates(token: str, offset: int | None, timeout: int) -> Updates:
     return Updates(True, tuple(item for item in result if isinstance(item, dict)))
 
 
+def pull_model(model: str) -> bool:
+    """`ollama pull <model>`, straight through to the terminal.
+
+    Not an HTTP call to `/api/pull`: the CLI already prints a progress bar, and a
+    1.2GB download with no visible progress is a wizard that looks hung."""
+    try:
+        return subprocess.run(("ollama", "pull", model), check=False).returncode == 0
+    except OSError:
+        # Not on PATH at all. `subprocess.run` raises here rather than returning
+        # non-zero, and an uncaught FileNotFoundError would end the wizard
+        # mid-question. Setup degrades; it does not crash.
+        return False
+
+
 def check_ollama(base_url: str) -> OllamaState:
     """Reachability plus the installed model list, in two cheap local calls."""
     root = base_url.rstrip("/")
@@ -895,6 +910,7 @@ class Checks:
     gemini: Callable[[str], Verdict] = check_gemini
     telegram: Callable[[str], Verdict] = check_telegram
     ollama: Callable[[str], OllamaState] = check_ollama
+    pull: Callable[[str], bool] = pull_model
     updates: Callable[[str, int | None, int], Updates] = fetch_updates
     health: Callable[[str], HealthState] = check_health
 
@@ -2384,39 +2400,64 @@ class Wizard:
         return Verdict(True, "")
 
     def _check_ollama(self, provider: str, env: Mapping[str, str]) -> None:
-        if provider != OLLAMA:
-            embed_model = env.get("DAEMON_EMBED_MODEL") or DEFAULT_EMBED_MODEL
-            self.prompt.say("Nothing here needs a local chat model.")
-            self.prompt.say("Recall embeddings are always local, so `ollama pull")
-            self.prompt.say(f"{embed_model}` is still worth doing - `daemon doctor` checks it.")
-            self.prompt.say()
-            return
+        """Reachability and the embed model, under every provider.
 
+        This used to return early for anyone not on a local chat model, saying
+        "Nothing here needs a local chat model" - true, and beside the point.
+        `Task.EMBED` is always ollama whatever `DAEMON_PROVIDER` says, so the embed
+        model is needed under every provider and the branch skipped the check for
+        exactly the users who would never think to run it. Measured 2026-08-26:
+        that gap cost a gemini user fifteen hours of keyword-only Korean recall,
+        with `daemon doctor` reporting it correctly the whole time and nothing
+        prompting anybody to run `daemon doctor`.
+        """
         theme = self.prompt.theme
         say = self.prompt.say
         base_url = env.get("DAEMON_OLLAMA_BASE_URL") or _config_default("ollama_base_url")
+        embed_model = env.get("DAEMON_EMBED_MODEL") or DEFAULT_EMBED_MODEL
         state = self.checks.ollama(base_url)
         if not state.reachable:
             say(status(theme, "warn", f"Ollama {state.detail}"))
             say("  Install it from https://ollama.com, then run `ollama serve`.")
-            say("  Setup continues; `daemon doctor` re-checks this.")
+            say("  Recall stays keyword-only until it answers - `daemon doctor` re-checks.")
             say()
             return
 
         say(status(theme, "ok", f"Ollama {state.detail}"))
-        wanted = [
-            env.get("DAEMON_OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL,
-            env.get("DAEMON_EMBED_MODEL") or DEFAULT_EMBED_MODEL,
-        ]
+        wanted = [embed_model]
+        if provider == OLLAMA or _truthy(env.get("DAEMON_PROACTIVE_JUDGE_LOCAL", "true")):
+            # Not `provider == OLLAMA` alone (ledger Ruling 5). config.py:1146 routes
+            # the proactive judge to ollama when *either* axis says local, and
+            # `proactive_judge_local` defaults to True - so a gemini user on defaults
+            # loads this model for the five-minute judge. `VOICE_ANSWERS` in
+            # tests/test_setup.py answers the local-model question on a gemini path
+            # for exactly this reason.
+            wanted.append(env.get("DAEMON_OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL)
         missing = [model for model in wanted if not _installed(state.models, model)]
         for model in wanted:
             if model not in missing:
                 say(status(theme, "ok", f"{model}: installed"))
         for model in missing:
             say(status(theme, "missing", f"{model}: not pulled yet"))
+        if not missing:
+            say()
+            return
+
+        # It used to print the commands and stop, on the grounds that "a wizard
+        # should not start a download the user did not ask for". Asking is how the
+        # user asks for it, and the alternative measured worse: `bge-m3` missing is
+        # a Korean recall ceiling nobody sees, and a printed command is one a person
+        # reads past. Chat models stay printed-only - they are several GB and only a
+        # local-provider user needs them.
+        if embed_model in missing:
+            say("  Without it, recall drops to keyword-only - Korean worst of all.")
+            if self.prompt.ask_yes_no(f"  Pull {embed_model} now? (1.2GB)", default=False):
+                if self.checks.pull(embed_model):
+                    say(status(theme, "ok", f"{embed_model}: pulled"))
+                    missing = [model for model in missing if model != embed_model]
+                else:
+                    say(status(theme, "warn", f"{embed_model}: pull failed"))
         if missing:
-            # Deliberately not run for them: these are gigabytes, and a wizard
-            # should not start a download the user did not ask for.
             say("  Run these yourself (they are large):")
             for model in missing:
                 say(f"    ollama pull {model}")
