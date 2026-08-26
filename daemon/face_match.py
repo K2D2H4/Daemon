@@ -16,13 +16,30 @@ through the same pose - they can be pixel-identical - and splicing the two plays
 the motion backwards. A window catches it: the neighbourhoods disagree even when
 the centre frames match exactly.
 
-FOLLOW-UP (still task 9, after shipping): matching *pose* was not enough on its
-own. The owner reported a cut landing mid-sigh - a breath cycle is 3-4s, and the
-shipped ±200ms window sees about a tenth of one, so it cannot tell inhaling from
-exhaling at the same chest position. Measured: 41% of the shipped matches had the
-incoming clip moving *opposite* to the outgoing clip at the splice point. Widening
-the window to ±500ms alone gets that down to ~28-30% and then plateaus; a direction
-term in the cost is what actually fixes it (see LAMBDA_DIRECTION below).
+FOLLOW-UP 1 (still task 9, after shipping): matching *pose* was not enough on
+its own. The owner reported a cut landing mid-sigh - a breath cycle is 3-4s, and
+the shipped ±200ms window sees about a tenth of one, so it cannot tell inhaling
+from exhaling at the same chest position. Measured: 41% of the shipped matches
+had the incoming clip moving *opposite* to the outgoing clip at the splice
+point. Widening the window to ±500ms alone gets that down to ~28-30% and then
+plateaus; a direction term in the cost is what actually fixes it (see
+LAMBDA_DIRECTION below).
+
+FOLLOW-UP 2 (still task 9, after tuning LAMBDA_DIRECTION): a sweep of LAMBDA
+against this implementation's own `_directions` vectors and `_frames` found the
+weight (100.0, see LAMBDA_DIRECTION) - and, more importantly, its ceiling. Even
+at LAMBDA=300, well past the point of worthwhile appearance-matching cost,
+median cosine between matched frames reaches only 0.16: across every weight
+tried, matched motion stays essentially uncorrelated. This is structural, not
+a tuning problem. Video Textures (this module's whole premise) works *within
+one continuous recording*, where every frame belongs to the same motion
+manifold and a nearby frame is very likely to be moving a similar way. These
+are twelve *independently generated* clips sharing only a neutral pose - there
+is no manifold linking their motion, so a frame in one clip has no reason to
+move anything like a frame in another, no matter how strongly appearance is
+outweighed. Pose matching recovers pose well (FOLLOW-UP 1's 41%) and motion
+barely (this section); no larger LAMBDA_DIRECTION closes that gap, and
+re-sweeping it later would just re-find the same ceiling.
 
 Offline and dependency-light on purpose - no model, no network, and nothing
 imported from `daemon/` beyond `face_routes`'s clip vocabulary (`CLIPS`). This
@@ -80,29 +97,41 @@ averaged into one comparison, this governs how much time a *direction* vector
 spans, and there is no reason those should have to move together if either is
 retuned later."""
 
-LAMBDA_DIRECTION = 3.0
+LAMBDA_DIRECTION = 100.0
 """Weight on the direction penalty in `_cost`: cost = appearance + LAMBDA *
 (1 - cos(dir_a, dir_b)), so an aligned match (cos=1) pays nothing extra and a
 directly opposed one (cos=-1) pays 2*LAMBDA. `appearance` here is *mean*
 squared pixel distance (see `_pairwise_mean_sq_dist`), not the raw sum, so its
-scale is comparable to LAMBDA's 0..2*3=6 range instead of dwarfing it by three
-orders of magnitude (measured: 1536 pixels means the raw sum runs to the tens
-of thousands).
+scale is comparable to LAMBDA's range instead of dwarfing it by orders of
+magnitude (measured: 1536 pixels means the raw sum runs to the tens of
+thousands).
 
-Measured across all 56 loop-to-loop pairs of the owner's real clips, at the
-±500ms window above:
+Measured by sweeping LAMBDA through *this* implementation's own `_directions`
+and `_frames` against all 56 loop-to-loop pairs of the owner's real clips -
+not against a separate offline script with its own normalisation, which is
+exactly how this constant misled once already (a first table here, measured
+against a different appearance scale, made 3.0 look like a strong weight when
+on this implementation's scale it was barely distinguishable from off):
 
-    lambda | opposed matches | median cosine | appearance cost
-    0      | 28%              | 0.08          | 2.52
-    1.0    | 15%              | 0.17          | 2.57
-    3.0    | 10%              | 0.21          | 2.65 (+5%)
-    8.0    | 6%               | 0.24          | 2.74 (+9%)
+    lambda | opposed matches | median cosine | appearance | vs lambda=0
+    0      | 38%              | 0.04          | 24.3       | --
+    3.0    | 34%              | 0.07          | --         | --
+    10     | 31%              | 0.08          | --         | --
+    30     | 26%              | 0.11          | 26.0       | +7%
+    100    | 20%              | 0.13          | 27.4       | +13%
+    300    | 16%              | 0.16          | 35.0       | +44%
 
-3.0 is the pick: it cuts opposed motion from 28% to 10% (two thirds) for a 5%
-appearance-matching cost, the same kind of trade pose-matching itself made
-against frame 0 (41% better pose for a strategy that does nothing for pure
-"phase" matching). 8.0 buys another 4 points of opposed-motion reduction for
-almost double the appearance cost - not worth it by the same reasoning."""
+100 is the knee: opposed matches nearly halve (38% -> 20%) for 13% worse
+appearance matching. 300 buys four more points of opposed-motion reduction
+for 44% - clearly past the knee. 3.0 (this constant's first value, carried
+over from a table measured on a different scale) bought only 4 points and
+was barely distinguishable from LAMBDA=0.
+
+**The limit this sweep exposes matters more than the value it picked.** Even
+at LAMBDA=300, median cosine only reaches 0.16 - across every weight tried,
+matched frames have essentially uncorrelated motion. No larger LAMBDA fixes
+this; the ceiling is structural, not a tuning problem (see the module
+docstring's FOLLOW-UP 2 section)."""
 
 ONE_SHOTS = frozenset({"amused", "sulky", "curious", "flourish_arms"})
 """Mood one-shots and the idle flourish: each is an arc from the shared neutral

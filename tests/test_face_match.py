@@ -151,10 +151,12 @@ def test_a_direction_penalty_prevents_a_reversed_match(tmp_path):
     rising the same way idle1 is).
 
     Appearance alone would pick the opposed candidate (18.2 < 20.1). With
-    LAMBDA_DIRECTION = 3.0, the opposed candidate pays +6.0 (2*lambda, fully
-    opposed) and the aligned candidate pays +0 (fully aligned), flipping the
-    total cost in the aligned candidate's favour (18.2+6.0=24.2 vs
-    20.1+0=20.1) - the table must follow that flip.
+    LAMBDA_DIRECTION >= ~1.0 (currently 100.0, comfortably above that), the
+    opposed candidate pays +2*LAMBDA (fully opposed) and the aligned candidate
+    pays +0 (fully aligned), flipping the total cost in the aligned
+    candidate's favour - the table must follow that flip regardless of
+    exactly how large LAMBDA_DIRECTION is tuned to, as long as it clears the
+    ~1.9-point appearance gap this scenario was built around.
     """
     a_ramp = [45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55]
     opposed = [55, 46, 47, 48, 49, 50, 51, 52, 53, 54, 45]  # endpoints swapped
