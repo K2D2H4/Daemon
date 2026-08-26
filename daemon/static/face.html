@@ -254,13 +254,21 @@ function ensurePlaying() {
   // theoretical): it can pause an already-showing clip to save power, or it can
   // reject a switch's play() outright, leaving the old clip showing and still
   // playing - just the wrong one. Resuming what's on screen is always correct,
-  // including mid a pending neutral-moment wait (that clip just needs to keep
-  // running - its own setTimeout, not this function, decides when to switch),
   // so it takes priority; only once it isn't paused do we check whether it's
   // even the right clip for the current activity.
+  //
+  // A pending neutral-moment wait (pendingWaitTimer) is deliberately left
+  // alone here, not pre-empted: toActivity() (below) sets `activity` to the
+  // wait's target *before* scheduling its timer, so clipFor(activity) below
+  // would already agree with what the wait is waiting for and force an
+  // immediate switch out from under it - at the fast fade instead of the
+  // wait's own chosen one, and skipping the neutral moment entirely. This is
+  // a live path, not a theoretical one: visibilitychange (wired in boot(),
+  // below) calls this every time an ambient window is occluded and shown
+  // again, which measured live happens constantly.
   if (!showing) return;
   if (showing.paused) { showing.play().catch(() => {}); return; }
-  if (!oneShotUntil) {
+  if (!oneShotUntil && !pendingWaitTimer) {
     const want = clipFor(activity);
     if (want && want !== showing.dataset.stem) show(want, { loop: activity !== "idle" });
   }

@@ -209,6 +209,23 @@ def test_playback_recovers_from_an_external_pause_or_a_rejected_switch():
     assert ".play()" in heal_body, "recovery must actually attempt to resume playback"
 
 
+def test_ensure_playing_defers_to_a_pending_neutral_wait():
+    # ensurePlaying() must not pre-empt a pending neutral-moment wait
+    # (pendingWaitTimer). toActivity() sets `activity` to the wait's target
+    # *before* scheduling its timer, so ensurePlaying()'s own clipFor(activity)
+    # lookup already agrees with what the wait is waiting for - without this
+    # guard it would force an immediate switch out from under the wait, at the
+    # fast fade instead of the wait's own chosen one, and skip the neutral
+    # moment entirely. Live, not theoretical: visibilitychange calls this
+    # every time an ambient window is occluded and shown again.
+    start = PAGE.index("function ensurePlaying() {")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert "!pendingWaitTimer" in body, (
+        "the forced-switch branch must be skipped while a wait is pending"
+    )
+
+
 def test_a_loop_entry_is_looked_up_not_hardcoded_to_frame_zero():
     # Task 9: show() must seek to the pose-matched entry time instead of always
     # frame 0. Scoped to show()'s own body so a stray "currentTime = 0" elsewhere

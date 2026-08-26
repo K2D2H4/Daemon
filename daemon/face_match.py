@@ -421,6 +421,15 @@ def _windowed(distance: np.ndarray, window: int) -> np.ndarray:
 def _frames(clip: Path) -> np.ndarray:
     """Every frame of `clip`, resampled to FPS and shrunk to a grey THUMB_W x
     THUMB_H thumbnail: one float64 row per frame, flattened.
+
+    `check=True` means two different failures surface as two different
+    exceptions, both left to propagate rather than caught here: a missing
+    `ffmpeg` binary raises `FileNotFoundError` (an `OSError`), and a present
+    but corrupt or unreadable clip raises `CalledProcessError`. Deliberately
+    not this module's problem - it stays offline and side-effect-free
+    (module docstring) - so `daemon.cli._face_transitions` (the one caller
+    that runs this on an operator's machine) is where both get turned into
+    a printed message instead of a raw traceback.
     """
     with tempfile.TemporaryDirectory() as td:
         pattern = Path(td) / "f%05d.png"

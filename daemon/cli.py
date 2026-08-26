@@ -772,12 +772,17 @@ def _face() -> int:
 def _face_transitions(settings: Settings) -> int:
     """Rebuild the pose-match table (Task 9) and write it to the face dir.
 
-    `face_match.write_table` shells out to `ffmpeg` once per clip; a missing
+    `face_match.write_table` shells out to `ffmpeg` once per clip; two of its
+    failure shapes are handled here rather than left to raise a traceback
+    (module docstring: print what was found, don't raise one). A missing
     binary raises `FileNotFoundError` - an `OSError`, not a nonzero exit - the
-    same shape `_face()` guards around `open`/Chrome (module docstring: print
-    what was found, don't raise a traceback). Unlike `_face()` this genuinely
-    cannot proceed without ffmpeg, so it reports the problem and stops rather
-    than falling back to anything.
+    same shape `_face()` guards around `open`/Chrome. A present but corrupt
+    or unreadable clip raises `CalledProcessError` instead (`ffmpeg` ran and
+    exited nonzero, per `_frames`'s own `check=True`) - a different failure
+    with a different message, so it is caught separately rather than folded
+    into the same branch as "ffmpeg is missing entirely". Unlike `_face()`
+    this genuinely cannot proceed past either one, so it reports the problem
+    and stops rather than falling back to anything.
     """
     from daemon.face_match import write_table
     from daemon.face_routes import face_dir
@@ -786,6 +791,9 @@ def _face_transitions(settings: Settings) -> int:
         path = write_table(face_dir(settings))
     except OSError:
         print("daemon: ffmpeg not found - install it and try again", file=sys.stderr)
+        return PROBLEM
+    except subprocess.CalledProcessError as exc:
+        print(f"daemon: ffmpeg could not read a clip - {exc}", file=sys.stderr)
         return PROBLEM
     # Re-read rather than re-run build_table: writing already computed it once,
     # and ffmpeg per clip is the expensive part.

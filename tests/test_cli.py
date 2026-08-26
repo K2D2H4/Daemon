@@ -794,6 +794,26 @@ def test_face_transitions_reports_a_problem_when_ffmpeg_is_missing(
     assert "ffmpeg" in capsys.readouterr().err
 
 
+def test_face_transitions_reports_a_problem_when_a_clip_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A different failure from a missing binary: ffmpeg is present and runs,
+    but a present-on-disk clip it cannot decode makes it exit nonzero, which
+    `_frames`'s own `check=True` turns into `CalledProcessError` - not an
+    `OSError`, so it needs its own except clause rather than falling through
+    the missing-ffmpeg one (which would print a misleading "not found")."""
+
+    def corrupt(face_dir: Path) -> Path:
+        raise subprocess.CalledProcessError(1, ["ffmpeg"], stderr=b"invalid data found")
+
+    monkeypatch.setattr("daemon.face_match.write_table", corrupt)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    err = capsys.readouterr().err
+    assert "ffmpeg" in err
+    assert "not found" not in err, "a corrupt clip is not the same failure as a missing binary"
+
+
 def test_a_broken_config_stops_a_command_that_needs_it(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

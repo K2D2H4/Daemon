@@ -324,3 +324,12 @@ def test_write_table_writes_transitions_json_at_the_right_path(tmp_path):
     assert path == tmp_path / "transitions.json"
     written = json.loads(path.read_text(encoding="utf-8"))
     assert written == build_table(tmp_path)
+
+
+def test_the_table_version_is_3(tmp_path):
+    """A stale table from before `neutral` existed (version 1 or 2) must be
+    distinguishable from a fresh one - low stakes since nothing reads the
+    field today, but a silent revert of the bump would otherwise go uncaught."""
+    _clip(tmp_path / "idle1.mp4", [10, 20, 30])
+
+    assert build_table(tmp_path)["version"] == 3
