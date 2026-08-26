@@ -14,7 +14,9 @@ import numpy as np
 
 from daemon.face_lipsync.loader import (
     needs_split,
+    needs_squeeze,
     rename,
+    split_names,
     taesd_rename,
     taesd_to_mlx,
     unet_config,
@@ -32,6 +34,27 @@ def test_the_mid_block_becomes_an_indexed_list():
     assert rename("mid_block.resnets.0.norm1.weight").startswith("mid_blocks.0.")
     assert rename("mid_block.attentions.0.proj_in.weight").startswith("mid_blocks.1.")
     assert rename("mid_block.resnets.1.norm1.weight").startswith("mid_blocks.2.")
+
+
+def test_the_geglu_split_gives_two_distinct_paths_for_weight_AND_bias():
+    """The bias is the regression. A rule written around the word "weight" leaves
+    `.bias` untouched, so both halves land on one path - and mlx's `tree_unflatten`
+    answers a duplicate key with an unbounded recursion whose traceback names a dict
+    comprehension inside mlx, not the key."""
+    for suffix in ("weight", "bias"):
+        key = f"down_blocks.0.attentions.0.transformer_blocks.0.ff.net.0.proj.{suffix}"
+        first, second = split_names(key)
+        assert first != second
+        assert first == f"down_blocks.0.attentions.0.transformer_blocks.0.linear1.{suffix}"
+        assert second == f"down_blocks.0.attentions.0.transformer_blocks.0.linear2.{suffix}"
+
+
+def test_the_split_replaces_the_segment_rather_than_deleting_it():
+    """Removing `ff.net.0.proj.` and re-appending a name happens to work for a weight
+    and silently collides for a bias, which is exactly how this broke."""
+    first, _ = split_names("x.ff.net.0.proj.bias")
+    assert first == "x.linear1.bias"
+    assert "ff.net" not in first
 
 
 def test_the_feedforward_projection_is_the_only_split():
@@ -131,3 +154,34 @@ def test_the_transpose_decision_is_by_rank_not_by_name():
     odd = np.zeros((7, 6, 5, 4), np.float32)
     assert taesd_to_mlx("anything.at.all", odd).shape == (7, 5, 4, 6)
     assert taesd_to_mlx("decoder.layers.0.weight", np.zeros((3,), np.float32)).shape == (3,)
+
+
+# --- the squeeze the eval was written to catch ----------------------------------
+#
+# mlx-examples declares proj_in / proj_out / conv_shortcut as nn.Linear, which needs a
+# 2-D (out, in) weight, while diffusers stores them as 1x1 convolutions. The eval
+# flagged this as an open question - "correct if the published weights truly need no
+# squeeze, silently wrong otherwise" - and running the assembled engine answered it:
+# they are all rank 4 with (1, 1) spatial extents, 46 tensors of them.
+
+
+def test_the_three_one_by_one_weights_are_squeezed():
+    for name in ("proj_in", "proj_out", "conv_shortcut"):
+        assert needs_squeeze(f"down_blocks.0.attentions.0.{name}.weight", 4)
+
+
+def test_an_already_squeezed_weight_is_left_alone():
+    """Squeezing twice would collapse a (1, N) weight to (N,). Guarding on rank rather
+    than trusting the caller keeps that impossible."""
+    assert not needs_squeeze("down_blocks.0.attentions.0.proj_in.weight", 2)
+
+
+def test_ordinary_convolutions_keep_their_rank():
+    """conv_in is the one to protect: it is genuinely 4-D and squeezing it would be
+    silent, since (320, 3, 3, 8) has no singleton axis to lose."""
+    assert not needs_squeeze("conv_in.weight", 4)
+    assert not needs_squeeze("down_blocks.0.resnets.0.conv1.weight", 4)
+
+
+def test_biases_are_never_squeezed():
+    assert not needs_squeeze("down_blocks.0.attentions.0.proj_in.bias", 4)

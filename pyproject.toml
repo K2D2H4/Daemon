@@ -104,6 +104,17 @@ face = [
     # display, so the GUI/Qt bindings the non-headless wheel links against are
     # dead weight neither install nor CI has any use for.
     "opencv-python-headless>=4.10",
+    # Apple-silicon only, and marked as such because CI is ubuntu: mlx publishes no
+    # Linux wheels, so an unmarked entry makes `pip install .[face]` fail there
+    # outright rather than skip. Nothing CI imports pulls these in - test_reachable
+    # reads daemon/*.py as text, and the mlx-only modules are exercised by
+    # evals/face_lipsync_numerics.py by hand.
+    "mlx>=0.22; platform_system=='Darwin' and platform_machine=='arm64'",
+    # For whisper's mel front-end and encoder weights. Verified to reproduce
+    # transformers' own output exactly (mel cosine 1.000000, encoder states
+    # 1.000000/0.999997), which is what lets the daemon skip a 2.5GB torch dependency
+    # for an 8M-parameter encoder.
+    "mlx-whisper>=0.4; platform_system=='Darwin' and platform_machine=='arm64'",
 ]
 dev = [
     "pytest>=8.3",
@@ -132,6 +143,10 @@ addopts = "-q"
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+# Vendored third-party source, byte-identical to upstream on purpose. Linting it
+# would produce a diff we are not allowed to apply - see daemon/face_lipsync/vendor.
+extend-exclude = ["daemon/face_lipsync/vendor/mlx_sd/config.py",
+                  "daemon/face_lipsync/vendor/mlx_sd/unet.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]

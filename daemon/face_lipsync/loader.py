@@ -37,6 +37,20 @@ SPLIT_KEY = "ff.net.0.proj"
 """diffusers keeps GEGLU's two projections in one tensor; MLX wants them apart."""
 
 
+def split_names(key: str) -> tuple[str, str]:
+    """The two destination paths a GEGLU tensor splits into.
+
+    Substituting the whole `ff.net.0.proj` segment, rather than editing the trailing
+    `weight`, is the point: the projection has a bias as well, and a rule written
+    around the word "weight" leaves a `.bias` key untouched so BOTH halves land on the
+    same path. mlx's `tree_unflatten` does not report that as a collision - it only
+    stops recursing when a leaf has exactly one entry, so a duplicate key sends it
+    into infinite recursion and reports `RecursionError` from inside a dict
+    comprehension, which says nothing about the key that caused it.
+    """
+    return key.replace(SPLIT_KEY, "linear1"), key.replace(SPLIT_KEY, "linear2")
+
+
 def rename(key: str) -> str:
     """diffusers parameter path -> mlx-examples parameter path."""
     for old, new in _RENAMES:
@@ -47,6 +61,30 @@ def rename(key: str) -> str:
 
 def needs_split(key: str) -> bool:
     return SPLIT_KEY in key
+
+
+ONE_BY_ONE = ("proj_in.weight", "proj_out.weight", "conv_shortcut.weight")
+"""The three weights mlx-examples declares as `nn.Linear` and diffusers stores as 1x1
+convolutions. Measured in the published file: 16 + 16 + 14 tensors, every one rank 4
+with (1, 1) spatial extents."""
+
+
+def needs_squeeze(key: str, ndim: int) -> bool:
+    """Does this tensor have to lose its singleton spatial axes?
+
+    `nn.Linear` wants a 2-D `(out, in)` weight and the published MLX weights keep the
+    4-D convolution form, so the loader has to drop it. This was an open question
+    rather than a guess - `evals/face_lipsync_numerics.py` was written to flag exactly
+    this, on the premise that pre-converted weights might need no squeeze at all.
+    Running the assembled engine settled it: `proj_in` arrives as (320, 1, 1, 320) and
+    `mx.addmm` rejects it outright, which is the good case. A silent version of this
+    mistake is what the eval was guarding against.
+
+    Guarded on rank so an already-squeezed weight is left alone rather than collapsed
+    further. Kept as `str, int -> bool` so this module still never touches a tensor,
+    which is what lets it be tested without weights or MLX.
+    """
+    return ndim == 4 and key.endswith(ONE_BY_ONE)
 
 
 def unet_config(cfg: dict[str, Any]) -> dict[str, Any]:
