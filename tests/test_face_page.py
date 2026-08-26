@@ -375,13 +375,63 @@ def test_a_queued_activity_cannot_go_stale():
     )
 
 
+# Envelope measured off the running resident's /face/stream, one live 8-turn voice
+# session, this page's own ATTACK/RELEASE replayed over the captured levels. The
+# thresholds below are checked against these, not against taste.
+ENV_MEDIAN, ENV_P90, ENV_MAX = 0.233, 0.272, 0.315
+
+
+def _const(name):
+    """The numeric value of a top-level `const NAME = <number>` in the page."""
+    m = re.search(rf"\b{name}\s*=\s*([0-9.]+)", _without_line_comments(PAGE))
+    assert m, f"{name} is gone from the page"
+    return float(m.group(1))
+
+
+def test_the_loud_threshold_is_reachable_by_the_signal_it_is_compared_against():
+    """`speaking_loud` shipped unreachable: LOUD_ENTER was 0.62 against an envelope
+    whose measured maximum is 0.315, so a rendered clip could never play once. The
+    guard is the measurement, not a literal - any threshold above what the signal
+    reaches is the same bug again, however it got there.
+    """
+    loud = _const("LOUD_ENTER")
+    assert loud <= ENV_MAX, (
+        f"LOUD_ENTER={loud} is above the measured envelope maximum {ENV_MAX} - "
+        "speaking_loud can never engage"
+    )
+    assert loud > ENV_MEDIAN, (
+        f"LOUD_ENTER={loud} is at or below the median {ENV_MEDIAN} - speaking_loud "
+        "would be the normal case rather than the emphatic one"
+    )
+
+
+def test_an_idle_clip_ending_does_not_push_the_flourish_deadline_away():
+    """Why `flourish_arms` never appeared, and it was not the interval.
+
+    `advance()` runs on every idle clip's `ended`, and an idle clip is about 8s while
+    the flourish wait is tens of seconds. Re-arming unconditionally there moved the
+    deadline further out than the clock advanced, so it could never be reached -
+    measured in a live page, flourishAt went 37.3s -> 73.1s while performance.now()
+    went 7.1s -> 35.7s. Re-arm only when disarmed: entering idle arms it, and tick()
+    zeroes it after one fires.
+    """
+    body = _without_line_comments(PAGE)
+    m = re.search(r'if \(activity === "idle"([^)]*)\)\s*scheduleFlourish\(\)', body)
+    assert m, "advance() no longer re-arms the flourish at all - tick() zeroes it once"
+    assert "!flourishAt" in m.group(1), (
+        "advance() re-arms the flourish unconditionally; an 8s idle clip ending then "
+        "pushes the deadline past where the clock can reach it"
+    )
+    lo, hi = _const("FLOURISH_MIN_MS") / 1000, _const("FLOURISH_MAX_MS") / 1000
+    assert lo < hi, "the flourish window has to be a window"
+
+
 def test_the_loud_switch_reads_the_envelope_and_the_envelope_is_recorded():
-    # Two things, both from the same measurement gap. LOUD_ENTER gated on the raw
-    # per-tick level, which spec 3.4 itself calls too jittery to use directly -
-    # one sub-threshold 40ms tick reset the hold - so it reads the smoothed
-    # envelope now. The threshold is deliberately NOT retuned: spec open question
-    # 3 ("keep speaking_loud?") is supposed to be settled by v1's own data and
-    # nothing was recording any, so the page logs the distribution instead.
+    # LOUD_ENTER gated on the raw per-tick level, which spec 3.4 itself calls too
+    # jittery to use directly - one sub-threshold 40ms tick reset the hold - so it
+    # reads the smoothed envelope now. The threshold itself is now a measurement;
+    # the two tests above hold it to that. logEnvelope() stays because one session
+    # on one voice is what those numbers are, and the next move needs more.
     body = _onmessage_body()
     assert "env >= LOUD_ENTER" in body, (
         "the loud switch must read the smoothed envelope, not the raw level"

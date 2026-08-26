@@ -14,6 +14,8 @@ Endpoints (docs/design/2026-08-07-m5-admin-web-design.md, "JSON API"):
     GET   /admin/api/tools/log    tool calls and refusals with their policy decision
     GET   /admin/api/memory       curated facts, entity notes, the reflection history
     GET   /admin/api/persona      the anchor, learned rules with evidence, diaries
+    GET   /admin/api/persona/seed the seed for editing, unbudgeted; 409 if undecodable
+    PUT   /admin/api/persona/seed {text, sha256} -> {saved, sha256, lines, backup}
     POST  /admin/api/persona/forget  {id, why} -> {retired, id}; 409 on a diverged file
     POST  /admin/api/reflect      {} -> {results: [...]}; runs under the shared catch-up lock
     POST  /admin/api/persona/evolve  {force} -> {date, skipped, ...}; same lock
@@ -61,6 +63,13 @@ from daemon.admin.activity import (
 from daemon.admin.mcp_oauth import OAuthError, complete_oauth_flow, start_oauth_flow
 from daemon.admin.mind import memory_payload, persona_payload
 from daemon.admin.restart import is_supervised, schedule_exit
+from daemon.admin.seed_io import (
+    SeedConflict,
+    SeedRejected,
+    SeedUnreadable,
+    read_seed,
+    write_seed,
+)
 from daemon.admin.settings_io import (
     PatchError,
     apply_patch,
@@ -333,10 +342,14 @@ async def patch_settings(request: Request) -> JSONResponse:
 
 
 @router.post("/api/restart")
-async def restart() -> JSONResponse:
+async def restart(request: Request) -> JSONResponse:
     """Exit gracefully so the supervisor revives us on the new config - but only
     if a supervisor exists. Otherwise say so plainly rather than killing a process
-    nothing will bring back (decision 3)."""
+    nothing will bring back (decision 3).
+
+    The face bus goes to `schedule_exit`, which closes it before the signal: an open
+    `/face/stream` is a response uvicorn cannot close, and it used to hold the exit
+    this endpoint promises. `getattr` because a test app need not have built one."""
     if not is_supervised():
         return JSONResponse(
             {
@@ -349,7 +362,7 @@ async def restart() -> JSONResponse:
             },
             status_code=409,
         )
-    schedule_exit()
+    schedule_exit(getattr(request.app.state, "face", None))
     return JSONResponse({"restarted": True, "supervised": True})
 
 
@@ -444,10 +457,84 @@ async def persona(request: Request) -> JSONResponse:
     return JSONResponse(payload)
 
 
-# The write half: three handles, each calling a function the CLI already calls.
-# Nothing here adds a rule or edits one - `persona/learned.md` is AI-owned
+@router.get("/api/persona/seed")
+async def persona_seed(request: Request) -> JSONResponse:
+    """The seed as the editor must load it: whole, and with the hash a save needs.
+
+    Deliberately *not* `/api/persona`'s copy of the same file. That one shares a
+    64 KB body budget with the diaries and comes back `text: None` once they fill
+    it (`daemon/admin/mind.py:_file_view`), which an editor would show as an empty
+    box over a file full of text - and then save.
+    """
+    settings = request.app.state.settings
+    try:
+        view = read_seed(settings.data_dir)
+    except SeedUnreadable as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return JSONResponse(
+        {
+            "text": view.text,
+            "sha256": view.sha256,
+            "exists": view.exists,
+            "file": view.file,
+        }
+    )
+
+
+# The write half: four handles. Three call a function the CLI already calls, and
+# none of them adds or edits a learned rule - `persona/learned.md` is AI-owned
 # (docs/CONTRACTS.md non-negotiable 5) and retiring is the one thing a human was
-# ever able to ask for (`daemon persona forget`). No route writes `seed.md`.
+# ever able to ask for (`daemon persona forget`).
+#
+# The fourth writes `seed.md`, which no route used to do. docs/adr/0019 is the
+# record: the anchor is that no *model output* reaches the seed, and this handler
+# writes one string that arrived on the request and calls nothing that thinks.
+# `daemon/admin/seed_io.py` carries the refusals; there is no second write path,
+# and `tests/test_admin_seed.py` fails if one appears.
+
+
+@router.put("/api/persona/seed")
+async def persona_seed_save(request: Request) -> JSONResponse:
+    """Replace `persona/seed.md` with what the owner typed.
+
+    No `catchup_lock`, unlike the three handlers below it. Nothing else in the
+    daemon writes this file, and the passes that *read* it (`persona/evolve.py`,
+    `proactivity/judge.py`, `load_persona` on every turn) get the old text or the
+    new one from an atomic replace - never a half-written file. A lock here would
+    serialise the save behind a reflection run for no property it needs.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "body must be an object"}, status_code=400)
+    text = body.get("text")
+    if not isinstance(text, str):
+        raise HTTPException(status_code=400, detail="text must be a string")
+    expected = body.get("sha256")
+    if not isinstance(expected, str):
+        # Required, not defaulted. A missing hash standing for "there was no
+        # file" is the one reading that overwrites, and it is exactly what a
+        # client that forgot the field sends.
+        raise HTTPException(
+            status_code=400, detail="sha256 is required - reload the seed and save again"
+        )
+
+    settings = request.app.state.settings
+    try:
+        saved = write_seed(settings.data_dir, text, expected_sha256=expected)
+    except SeedRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except (SeedConflict, SeedUnreadable) as exc:
+        # 409 and the exception's own words, the same shape `forget` uses for a
+        # diverged `learned.md`: a refusal with a fix in it, not a broken button.
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not write the seed: {exc}") from None
+    return JSONResponse(
+        {"saved": True, "sha256": saved.sha256, "lines": saved.lines, "backup": saved.backup}
+    )
 
 
 @router.post("/api/persona/forget")

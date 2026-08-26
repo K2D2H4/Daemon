@@ -82,9 +82,24 @@ live-share pump's transport, which has no tool round in it.
    Nothing outside `daemon/channels/` imports a channel implementation.
    Callers use `LLMGateway.complete(task, ...)` and the `Channel` protocol.
 
-5. **`data/persona/seed.md` is human-owned. Code must never write to it.**
-   That asymmetry is the anchor that prevents personality collapse.
-   `data/persona/learned.md` is AI-owned; humans only read it or request deletion.
+5. **`data/persona/seed.md` is human-owned. Nothing the daemon produces may be
+   written into it.** That asymmetry is the anchor that prevents personality
+   collapse. `data/persona/learned.md` is AI-owned; humans only read it or
+   request deletion.
+
+   **Restated 2026-08-26** (docs/adr/0019-the-seed-is-authored-not-unreachable.md):
+   this used to read "code must never write to it", and that was never quite the
+   rule — `daemon/setup.py` has always composed the seed from the wizard's
+   answers. The rule is about *authorship*. Exactly two writers exist, and both
+   carry only characters a person typed: `daemon/setup.py` (creates it, never
+   overwrites) and `daemon/admin/seed_io.py` (the admin form's `PUT
+   /admin/api/persona/seed`). A third one is not forbidden because three is too
+   many — it is forbidden if anything that *thinks* is on the other end of it. No
+   button that drafts a persona, no evolution pass that edits the anchor, no tool
+   the model may call. `tests/test_admin_seed.py` fails if a second write route
+   appears; the ADR also records, measured, that `write_file` under the default
+   `DAEMON_TOOLS_ROOTS=~` can still reach the file, which is a gap that ADR names
+   rather than closes.
 
 6. **`observations` is append-only.** No UPDATE, no DELETE. Only `consumed_by`
    may be set later.
@@ -157,7 +172,22 @@ live-share pump's transport, which has no tool round in it.
 12. **Every executed tool call leaves a `tool_calls` audit row.** That row is the
     owner's ground-truth record of what touched the machine, readable with `daemon
     tools log`; a tool that ran without one is a defect, which is why `ToolRunner`
-    owns decide, execute and audit together instead of exposing them separately. The
+    owns decide, execute and audit together instead of exposing them separately.
+    **Split 2026-08-26** ([ADR 0018](adr/0018-a-declared-expression-is-not-a-tool-call.md)):
+    that sentence is unchanged, and what is carved out is what counts as a tool call.
+    **A value the model declares which touches nothing outside this process is not
+    one** - today exactly `set_mood`, which changes the face's expression and nothing
+    else, so it has nothing to put in the row this rule exists to write. The boundary
+    is mechanical, not a promise: it is absent from the registry, so no execution path
+    exists to skip a row on; `daemon/voice/conversation.py` answers it before
+    `ToolRunner` is reached, so the exemption is that the runner never sees it rather
+    than a runner that sometimes omits a row; its argument is validated against the
+    `Mood` type rather than trusted; and it is declared only when a face is attached.
+    `tests/test_voice_conversation.py` fails if a `set_mood` call ever reaches
+    `run_tools` and `tests/test_tool_loop.py` fails if it appears in the registry -
+    **those tests are the rule, not coverage of it.** Anything else wanting on this
+    list needs its own ADR and its own measurement; "every" having one named exception
+    is a door, and that is the cost this split accepted. The
     reply the owner reads carries **only the model's answer** - the raw
     `run`/`write`/`rm` lines are not folded into it, in text or spoken aloud in
     voice, because narrating every call reads as clutter and the audit is the record

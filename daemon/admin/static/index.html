@@ -363,6 +363,13 @@ input[type=text],input[type=number],input[type=password],select{
  width:100%;font:inherit;color:var(--tb);background:var(--well);border:2px solid var(--line);
  padding:10px 12px;box-shadow:inset 2px 2px 0 0 var(--inset)}
 input:focus,select:focus{border-color:var(--accent);outline:none}
+/* The seed editor. Monospace and resizable because the content is markdown the
+   owner keeps rather than a field they fill in once. */
+textarea{width:100%;font-family:var(--mono);font-size:12.5px;line-height:1.6;color:var(--tb);
+ background:var(--well);border:2px solid var(--line);padding:10px 12px;resize:vertical;
+ box-shadow:inset 2px 2px 0 0 var(--inset)}
+textarea:focus{border-color:var(--accent);outline:none}
+textarea[disabled]{opacity:.5}
 .toggle{display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid var(--hair)}
 .toggle:last-child{border-bottom:none}
 .toggle .txt{min-width:0}
@@ -544,11 +551,22 @@ input:focus,select:focus{border-color:var(--accent);outline:none}
 
   <section id="view-persona">
     <div><span class="lab">PERSONA</span>
-      <p class="cap" style="margin:8px 0 0;max-width:640px">What she has worked out about dealing with you. She writes <code>learned.md</code>; <code>seed.md</code> is yours and code never writes it.</p></div>
+      <p class="cap" style="margin:8px 0 0;max-width:640px">What she has worked out about dealing with you. She writes <code>learned.md</code>; <code>seed.md</code> is yours — nothing she produces is ever written into it.</p></div>
     <div class="card pad">
       <div class="card-head"><span class="card-title">ANCHOR</span></div>
       <div id="anchor-gauge" class="kv"></div>
       <div id="anchor-files"></div>
+    </div>
+    <div class="card pad">
+      <div class="card-head"><span class="card-title">SEED — YOURS</span>
+        <span class="right cap" id="seed-meta"></span></div>
+      <p class="cap" style="margin:0 0 12px;max-width:640px">Who she is. She reads this file on every message, so an edit here lands on the next one — no restart. The weekly pass reads it and never writes back.</p>
+      <textarea id="seed-text" rows="16" spellcheck="false" disabled></textarea>
+      <div class="row" style="gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap">
+        <button class="btn pri" id="seed-save" disabled>Save</button>
+        <button class="btn" id="seed-reload">Reload from disk</button>
+        <span class="cap" id="seed-note"></span>
+      </div>
     </div>
     <div class="card">
       <div class="card-head"><span class="card-title">LEARNED RULES</span>
@@ -651,7 +669,10 @@ function go(key,{push=true}={}){
   if(spec.view==='tools')loadToolLog();
   if(spec.view==='mcp')loadMcp();
   if(spec.view==='memory'){$('#memory-note').textContent='';loadMemory();}
-  if(spec.view==='persona'){$('#persona-note').textContent='';loadPersona();}
+  // The seed is re-read on entry, but never over an edit in progress - leaving
+  // and coming back to this tab must not throw away what was typed.
+  if(spec.view==='persona'){$('#persona-note').textContent='';loadPersona();
+    if(!seedEdited())loadSeed();}
   if(push&&location.hash.slice(1)!==key)location.hash=key;
 }
 $$('[data-nav]').forEach(b=>b.addEventListener('click',()=>go(b.dataset.nav)));
@@ -1169,12 +1190,13 @@ async function loadPersona(){
     // `lines` is null, not 0, for a file the budget never got to - see
     // mind.py's `_file_view`. Omitting the clause instead of printing
     // "null line(s)" is the fix; `truncated` names the reason.
+    //
+    // seed.md is deliberately NOT shown from this payload any more. Its body
+    // shares the same 64 KB budget as the diaries above it and legitimately
+    // arrives as null, which is fine for a read-only disclosure and fatal for
+    // an editor - so the SEED card loads it from /api/persona/seed instead.
     $('#anchor-files').innerHTML=
-      disclose(`seed.md${a.seed.lines==null?'':` · ${a.seed.lines} line(s)`}`
-               +' — yours, code never writes this'
-               +(a.seed.truncated?' · not loaded (budget)':''),
-               a.seed.text,a.seed.file)
-     +disclose(`learned.md${a.learned.lines==null?'':` · ${a.learned.lines} line(s)`}`
+      disclose(`learned.md${a.learned.lines==null?'':` · ${a.learned.lines} line(s)`}`
                +' — hers'
                +(a.learned.truncated?' · not loaded (budget)':''),
                a.learned.text,a.learned.file);
@@ -1198,6 +1220,74 @@ async function loadPersona(){
     $('#rule-list').innerHTML=msg;$('#obs-list').innerHTML=msg;$('#diary-list').innerHTML=msg;
   }
 }
+// --- the seed editor --------------------------------------------------------
+// The one place in this console that writes `persona/seed.md` (docs/adr/0019).
+// Three things it must not do, each matching a refusal in admin/seed_io.py:
+//   * load the seed from /api/persona, whose copy of it can be null;
+//   * open a box over a file the server could not decode - `sha` stays null and
+//     the textarea stays disabled, so there is nothing to save from;
+//   * lose what the owner typed. A save conflict keeps their text on screen and
+//     points at "Reload from disk", and navigating away and back does not
+//     re-read over an unsaved edit.
+const SEED={sha:null,loaded:''};
+const seedEdited=()=>$('#seed-text').value!==SEED.loaded;
+function seedSyncButtons(){
+  $('#seed-save').disabled=$('#seed-text').disabled||SEED.sha===null||!seedEdited();
+}
+async function loadSeed({force=false}={}){
+  const ta=$('#seed-text');
+  // Re-reading is destructive when the box has been typed into: there is no
+  // draft, no undo, and the text is the owner's own. `go()` handles that case by
+  // not reading at all; the button asks instead. `force` is the read that
+  // follows a successful save, where differing from `SEED.loaded` is expected.
+  if(!force&&seedEdited()
+     &&!confirm('Discard your unsaved edit and re-read seed.md from disk?'))return;
+  ta.disabled=true;$('#seed-note').textContent='';
+  try{const s=await api('/admin/api/persona/seed');
+    SEED.sha=s.sha256;SEED.loaded=s.text;
+    ta.value=s.text;ta.disabled=false;
+    // `splitlines()`, not `split('\n').length` - the file ends in a newline, so
+    // the naive count is one higher than the number the save reports back and
+    // the two disagreed on screen. Empty text is 0 lines, not 1, for the same
+    // reason: that is what the server would say about the same file.
+    $('#seed-meta').textContent=s.exists
+      ? `${s.file} · ${s.text?s.text.split('\n').length-(s.text.endsWith('\n')?1:0):0} line(s)`
+      : `${s.file} · not written yet`;
+    if(!s.exists)$('#seed-note').textContent=
+      'No seed yet — until there is one she talks like a stock assistant and every proactive candidate is declined.';
+  }catch(e){
+    // Includes the 409 for a file that is not valid UTF-8. Leaving the box
+    // disabled and empty is the whole point: an empty box you can save from is
+    // how a seed full of text gets deleted.
+    SEED.sha=null;SEED.loaded=ta.value='';
+    $('#seed-meta').textContent='';
+    $('#seed-note').textContent=e.message;
+  }
+  seedSyncButtons();
+}
+async function saveSeed(){
+  $('#seed-save').disabled=true;$('#seed-note').textContent='Saving…';
+  try{const r=await api('/admin/api/persona/seed',{method:'PUT',
+        headers:{'content-type':'application/json'},
+        body:JSON.stringify({text:$('#seed-text').value,sha256:SEED.sha})});
+    // Re-read rather than trust what we sent: the server normalises line endings
+    // and the trailing newline, so the file is not byte-identical to the box.
+    // Forced, because the box legitimately differs from the text we loaded - the
+    // discard prompt is for the Reload button, not for the save that just won.
+    await loadSeed({force:true});
+    $('#seed-note').textContent=`Saved · ${r.lines} line(s) · she reads it on her next message`
+      +(r.backup?` · previous kept as ${r.backup}`:'');
+  }catch(e){
+    $('#seed-note').textContent=e.message;
+    seedSyncButtons();
+  }
+}
+$('#seed-text').addEventListener('input',seedSyncButtons);
+$('#seed-save').addEventListener('click',saveSeed);
+// Wrapped, not passed by name: a listener is handed the click Event, which would
+// arrive as `loadSeed`'s options object and destructure `force` off a MouseEvent.
+$('#seed-reload').addEventListener('click',()=>loadSeed());
+
 async function forgetRule(id){
   const why=prompt('Why should she stop believing this? (recorded with the rule)');
   if(why===null)return;

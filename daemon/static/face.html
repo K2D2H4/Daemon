@@ -75,17 +75,34 @@ const ATTACK = 0.30;          // fast open
 const RELEASE = 0.06;         // slow close - real mouths are asymmetric
 const IDLES = ["idle1", "idle2", "idle3"];
 const FLOURISHES = ["flourish_arms"];
-const FLOURISH_MIN_MS = 40000, FLOURISH_MAX_MS = 120000;
-const LOUD_ENTER = 0.62, LOUD_HOLD_MS = 500;
-// LOUD_ENTER is NOT settled, and the value here is not a measurement. It sits on
-// the raw scale daemon/face.py's _rms produces, where a full-scale sine only
-// reaches 0.707 - louder than speech ever gets - and it used to be compared
-// against the raw per-tick level, which spec 3.4 itself calls too jittery to use
-// directly: one sub-threshold 40ms tick reset the whole hold. It is compared
-// against the smoothed envelope now, which is the right signal; the right
-// THRESHOLD needs data nobody has. Spec open question 3 ("keep speaking_loud?")
-// is supposed to be settled by v1's own measurements and v1 was recording none,
-// so logEnvelope() below prints one summary per speaking turn.
+const FLOURISH_MIN_MS = 15000, FLOURISH_MAX_MS = 60000;
+// Down from the 40-120s spec open question 6 admitted was a guess, but **the
+// interval was never why the flourish did not appear** - advance() was re-arming
+// the deadline on every idle clip's end (see there). An earlier revision of this
+// comment blamed the interval, citing a live session whose longest uninterrupted
+// idle stretch was 36s. That number is real and it is the wrong explanation: the
+// flourish is for the long ambient idle *after* a session, not for gaps inside one,
+// and with the re-arm fixed 40-120s would have worked too.
+//
+// So this is now a taste choice and labelled as one: 15-60s makes the gesture
+// something the owner actually sees while the face sits there, averaging 37s
+// against the spec's "once a minute breaks the loop's visible period".
+const LOUD_ENTER = 0.27, LOUD_HOLD_MS = 500;
+// Now a measurement. Taken off the running resident's own /face/stream through a
+// live 8-turn voice session, with this file's ATTACK/RELEASE filter replayed over
+// the captured levels so the number sits on the same `env` scale the comparison
+// below uses: 295 samples, median 0.233, p75 0.254, **p90 0.272**, p99 0.307,
+// max 0.315. The old 0.62 cleared *nothing* - `speaking_loud` was a rendered clip
+// that could not play. 0.27 is that p90, and with LOUD_HOLD_MS it engaged 4 times
+// across those 8 turns (0.26 -> 8, 0.25 -> 16, which is fidgeting, and 0.30 -> 1).
+//
+// What the same data says about spec open question 3 ("keep speaking_loud?"): this
+// speaker has **no loud mode**. The whole envelope lives in 0.23-0.32 on a scale
+// where a full-scale sine reaches 0.707, so this threshold selects her loudest
+// decile rather than detecting loudness in any absolute sense. Kept because the
+// clip exists and the top decile is a real, repeatable part of the signal - but
+// one session, one voice, one provider. logEnvelope() below still prints a summary
+// per speaking turn, and that is still the thing to read before moving this.
 const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 // activity -> clip, with the fallback chain from spec §3.7 applied at load time.
@@ -323,11 +340,21 @@ function advance() {
     toActivity(act);
     return;
   }
-  // Spec 1 wants one every 40-120s for as long as idle lasts, because that is
-  // what breaks an 8s loop's period. scheduleFlourish() used to be reachable only
-  // from toActivity(), so entering idle armed exactly one: tick() zeroed
-  // flourishAt when it fired and nothing ever set it again.
-  if (activity === "idle") scheduleFlourish();
+  // Spec 1 wants one every interval for as long as idle lasts, because that is what
+  // breaks an 8s loop's period. scheduleFlourish() used to be reachable only from
+  // toActivity(), so entering idle armed exactly one: tick() zeroed flourishAt when
+  // it fired and nothing ever set it again.
+  //
+  // `&& !flourishAt` is the whole point of this line and its absence was a *worse*
+  // bug than the one above. This runs on every idle clip's `ended`, and an idle clip
+  // is about 8s while the wait is tens of seconds - so re-arming unconditionally
+  // pushed the deadline further away than time advanced and the flourish could never
+  // fire at all. Measured in a live page: flourishAt went 37.3s -> 73.1s while the
+  // clock went 7.1s -> 35.7s, chasing a deadline it would never reach.
+  //
+  // Re-arm only when *disarmed*, which is exactly the two moments that want it:
+  // entering idle (toActivity arms it) and just after one fired (tick zeroes it).
+  if (activity === "idle" && !flourishAt) scheduleFlourish();
   const stem = clipFor(activity);
   if (stem) show(stem, { loop: activity !== "idle" });
 }

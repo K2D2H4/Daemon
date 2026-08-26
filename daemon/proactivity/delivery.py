@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -47,6 +48,7 @@ from daemon.channels.base import Channel, OutboundMessage
 from daemon.clock import now as clock_now
 from daemon.memory.base import LoggedMessage, MemoryWriter
 from daemon.memory.store import Store
+from daemon.mic_floor import Outcome
 from daemon.proactivity.base import Candidate, Delivery, Speaker, Utterance, Verdict
 
 logger = logging.getLogger(__name__)
@@ -76,11 +78,17 @@ class ProactiveDelivery:
         *,
         channel: Channel | None = None,
         speaker: Speaker | None = None,
+        ask_for_the_floor: Callable[[str], Awaitable[Outcome]] | None = None,
     ) -> None:
         self._store = store
         self._memory = memory
         self._channel = channel
         self._speaker = speaker
+        # `daemon/mic_floor.py`'s `request`, when a wake loop is running. Injected
+        # rather than imported so this module keeps knowing nothing about the voice
+        # layer, and so an install with no wake loop - voice off, or `daemon
+        # proactive --speak` from a terminal - still reaches the speaker directly.
+        self._ask_for_the_floor = ask_for_the_floor
 
     async def deliver(
         self,
@@ -138,6 +146,39 @@ class ProactiveDelivery:
         )
 
     async def _say(self, text: str) -> bool:
+        """Speak it here at the machine, if anything can.
+
+        Through the mic floor when a wake loop is running, because it is holding
+        the capture stream and `Speaker.say` refuses outright while this process
+        does (`daemon/proactivity/speaker.py`). Measured 2026-08-26, the first time
+        proactivity ever spoke: the gate saw the owner at the keyboard, chose
+        `both`, and the line went to Telegram alone because nothing could ask the
+        gate to stand down. `daemon/mic_floor.py` is the ask.
+
+        Three answers come back, and only `no-listener` reaches the speaker below.
+        **Not** because the other two mean the microphone is still held - it is
+        not, `mic_hold` is zero for the whole of `_speak_unprompted` - but because
+        after `not-spoken` a second call would hit whatever made the first one
+        fail moments earlier, and because `_wake_round` returns from that path with
+        no settle, so `_wake_forever` is already rebuilding the gate and a
+        fall-through would race a reopening capture stream against
+        `LocalSpeaker`'s point-in-time `mic_hold` read.
+        """
+        if self._ask_for_the_floor is not None:
+            outcome = await self._ask_for_the_floor(text)
+            if outcome != "no-listener":
+                return outcome == "spoke"
+            # Nobody took it, so nobody in this process ever will, and the speaker
+            # below is the only thing left that could say it. PR #115 review: an
+            # install with the wake word configured but its loop not running - no
+            # recognizer, a mic grant this build cannot use, a task that died -
+            # would otherwise have gone quiet on the local machine while a speaker
+            # that worked was never tried, and nothing would have said why.
+            #
+            # Safe even when something *is* holding the device: a gate wedged in a
+            # dead capture keeps `mic_hold` for its full 45 s watchdog, outlasting
+            # the take deadline, and `LocalSpeaker.say` re-reads `mic_hold` and
+            # refuses. That is the pre-fix behaviour, arrived at correctly.
         if self._speaker is None:
             # The gate should not have chosen a speaker route without one, but a
             # mismatch here must not lose the Telegram half.

@@ -785,6 +785,131 @@ async def test_the_user_speaking_first_is_not_a_barge_in() -> None:
     assert audio.played == [b"\x01"]
 
 
+# --- set_mood: the exemption CONTRACTS 12 was split for (ADR 0018) ------------
+# These three ARE the rule, not coverage of it. Rule 12 keeps its wording and
+# `set_mood` sits outside it only because the runner never sees the call, the registry
+# has no entry to route, and the argument is checked rather than trusted. Each of those
+# is asserted here, because "every executed tool call leaves an audit row" having a
+# named exception is a door and this is the lock on it.
+
+
+def _mood_call(mood: str, call_id: str = "m1") -> ToolCall:
+    return ToolCall(id=call_id, name="set_mood", arguments={"mood": mood})
+
+
+async def test_set_mood_never_reaches_the_runner_and_leaves_no_audit_row(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The mechanism the exemption rests on. Driven through the real `ToolRunner` and
+    the real store, so the audit table is read back rather than reasoned about - a
+    version of this that mocked the runner would pass even if the call went through
+    it."""
+    runner, store = tool_runner(db, tmp_path)
+    bus = RecordingBus()
+    session = FakeSession(
+        Calls(_mood_call("amused")),
+        b"\x01",
+        Says("assistant", "그거 진짜 웃기네"),
+        Turn(),
+    )
+    await run(conversation(session, tools=runner, face=bus))
+
+    rows = store.recent_tool_calls()
+    assert [row["tool"] for row in rows] == [], f"set_mood wrote an audit row: {rows}"
+    assert bus.shots == ["amused"], "the expression did not reach the face either"
+
+
+async def test_the_expression_is_not_in_the_tool_registry_at_all(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The second half: no entry means no policy decision and no execution path, so
+    there is no route by which a row could be skipped rather than absent."""
+    runner, _store = tool_runner(db, tmp_path)
+    names = {spec.name for spec in runner.specs()}
+    # The precondition matters: a `specs()` that came back empty would satisfy the
+    # real assertion below while proving nothing at all.
+    assert "read_file" in names, "precondition: the real registry is populated"
+    assert "set_mood" not in names
+
+
+async def test_a_mood_the_model_invented_is_dropped_but_still_answered(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """An enum in a declaration is a request, not a guarantee. And the call is still
+    answered: the session blocks until it is, so refusing would cost the answer rather
+    than the expression."""
+    runner, _store = tool_runner(db, tmp_path)
+    bus = RecordingBus()
+    session = FakeSession(
+        Calls(_mood_call("smug")),
+        b"\x01",
+        Says("assistant", "응, 알았어"),
+        Turn(),
+    )
+    convo = conversation(session, tools=runner, face=bus)
+    await run(convo)
+
+    assert bus.shots == [], "an unknown mood reached the face"
+    assert session.tool_responses, "the call was never answered - the turn would hang"
+
+
+async def test_the_expression_lands_in_the_gap_before_the_answer_is_heard(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The reverse of what v0.1.70 asserted, and the reversal is the fix.
+
+    That version held the mood until the answer's first audio, reasoning from the text
+    path: publish `speaking` first so the arc plays over the speaking loop. On the text
+    path that is right, because reply and audio are the same instant. **Over voice it
+    broke the mouth.** `speaking` was already up by then, `set_activity` dedupes, so
+    the single event that may cut a one-shot (spec 3.2) had passed - and the arc then
+    suppressed the speaking clip for its whole length. Reported from a live session:
+    "the mood plays and the speaking clip never comes".
+
+    A blocking tool call arrives about 1.7s before the first audio, so unlike text
+    there is a real gap for the expression to live in, and the audio arriving is what
+    hands the mouth back. Spec 3.6's original ordering, which only voice ever fitted.
+    """
+    runner, _store = tool_runner(db, tmp_path)
+    bus = RecordingBus()
+    session = FakeSession(
+        Calls(_mood_call("sulky")),
+        b"\x01",
+        Says("assistant", "치, 알았어"),
+        Turn(),
+    )
+    await run(conversation(session, tools=runner, face=bus))
+
+    assert bus.shots == ["sulky"]
+    assert "speaking" in bus.activities, "precondition: the answer was heard"
+    assert bus.order.index("shot:sulky") < bus.order.index("activity:speaking"), (
+        "the mood was held until speaking, which had already been published - nothing "
+        "was left to cut the arc and the speaking clip never got the screen"
+    )
+
+
+async def test_declaring_a_mood_takes_the_microphone_floor(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The regression that cost answers, not pixels.
+
+    v0.1.70 skipped `_answering_tool` for `set_mood` on the reasoning that answering
+    the call is instant. Answering is; *being answered* is not - the window runs until
+    the model's first audio comes back, and `_forward_microphone` already documents
+    what room noise inside it does: the server reads it as the owner interrupting and
+    cancels the pending call, so the daemon never speaks the result. Reported from a
+    live session as "she does not answer properly any more".
+    """
+    runner, _store = tool_runner(db, tmp_path)
+    convo = conversation(FakeSession(), FakeAudio(), tools=runner, face=RecordingBus())
+    await convo._set_mood(FakeSession(), _mood_call("amused"))
+
+    assert convo._answering_tool, (
+        "the mood call left the microphone open until the answer arrived, which is "
+        "what cancels the turn"
+    )
+
+
 # --- tools --------------------------------------------------------------------
 # A spoken tool call is the same event as a typed one (daemon/voice/base.py): the
 # model asks, `receive()` yields a `ToolCall`, and the conversation runs it through
@@ -2631,7 +2756,7 @@ async def test_a_model_that_never_answers_gives_the_microphone_back() -> None:
     conv = conversation(session, opening_text="벨라")
     await conv._send_opening(session)
     # The hold has expired without any audio ever arriving.
-    conv._opening_answer_until = asyncio.get_running_loop().time() - 0.01
+    conv._answer_hold_until = asyncio.get_running_loop().time() - 0.01
 
     async def mic() -> Any:
         yield b"speak"
@@ -2655,6 +2780,121 @@ async def test_an_audio_opening_does_not_hold_the_microphone() -> None:
     await conv._forward_microphone(session, mic())
 
     assert session.sent == [b"pcm", b"more"]
+
+
+async def test_the_microphone_is_held_until_an_ordinary_answer_starts() -> None:
+    """The same hold the wake-word answer gets, on every other turn.
+
+    `_send_opening` armed it for the opening and `_answering_tool` covers a tool
+    round, which left the ordinary turn - the common one - streaming the room to
+    the server for the whole time the model is composing. Any sound landing there
+    reads as the user starting a new turn and the server cancels the answer, and
+    because nothing was generating yet no `interrupted` is emitted: the session
+    reports zero barge-ins and the owner just gets silence (measured on the owner's
+    own day, 2026-08-26: 5 of 47 spoken turns unanswered, three of them in one
+    session whose report said `0 interruption(s)`).
+    """
+    session = FakeSession()
+    conv = conversation(session)
+    await conv._on_transcript(session, Transcript(text="뭐 하고 있어?", role="user", final=True))
+
+    async def mic() -> Any:
+        yield b"breath"  # the model has not started answering: held
+        conv._on_audio(asyncio.get_running_loop().time(), 480)  # first audio arrives
+        yield b"after"   # the room is the owner's again
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"after"], (
+        "the room was streamed into a turn the model had not answered yet - the "
+        "exact audio the server answers by cancelling the turn"
+    )
+
+
+async def test_a_turn_the_model_never_answers_gives_the_microphone_back() -> None:
+    """Bounded, for the same reason the opening hold is: a model that is not coming
+    back must not leave the owner unable to ask again."""
+    session = FakeSession()
+    conv = conversation(session)
+    await conv._on_transcript(session, Transcript(text="뭐 하고 있어?", role="user", final=True))
+    conv._answer_hold_until = asyncio.get_running_loop().time() - 0.01
+
+    async def mic() -> Any:
+        yield b"asking again"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"asking again"]
+
+
+async def test_the_hold_is_armed_before_recall_settles() -> None:
+    """Ordering, not presence, and the two are easy to confuse.
+
+    `_settle_recall` is awaited on the owner's transcript and puts context on the
+    wire; arming after it would leave the microphone streaming the room for however
+    long recall takes, on every single turn - the window this hold exists to close,
+    reopened by a tidy-up that groups the arming with the face publish below it.
+    Every other test here would stay green."""
+    session = FakeSession()
+    conv = conversation(session)
+    armed_when_recall_ran: list[bool] = []
+    original = conv._settle_recall
+
+    async def spy(session_: Any, text: str) -> Any:
+        armed_when_recall_ran.append(conv._answer_hold_until > 0.0)
+        return await original(session_, text)
+
+    conv._settle_recall = spy  # type: ignore[method-assign]
+    await conv._on_transcript(session, Transcript(text="뭐 하고 있어?", role="user", final=True))
+
+    assert armed_when_recall_ran == [True], (
+        "recall ran with the microphone still open to the room"
+    )
+
+
+async def test_a_late_user_transcript_does_not_hold_the_microphone_mid_answer() -> None:
+    """The hold must not become a six-second barge-in switch.
+
+    A *user* transcript routinely finalises after the daemon has already started
+    replying - the timing is non-deterministic on this provider, which is why the
+    face publisher below it is guarded by the playback clock too. `_on_transcript`
+    clears `_generating` as it goes, so arming the hold unconditionally there would
+    shut the microphone for the rest of the answer on a clock the owner never set,
+    and with barge-in on (the default) that is the owner unable to cut in.
+    """
+    session = FakeSession()
+    conv = conversation(session)
+    # The answer is already being heard: audio arrived and has not finished playing.
+    conv._on_audio(asyncio.get_running_loop().time(), 48_000)
+    await conv._on_transcript(session, Transcript(text="아니 잠깐만", role="user", final=True))
+
+    async def mic() -> Any:
+        yield b"cutting in"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"cutting in"], (
+        "a transcript that settled mid-answer armed the hold and took barge-in with it"
+    )
+
+
+async def test_the_assistants_own_transcript_does_not_hold_the_microphone() -> None:
+    """The hold is armed by the *owner* finishing a turn. Arming it on the
+    assistant's transcript - which settles at the end of an answer - would shut the
+    microphone for the seconds right after the daemon stops speaking, which is
+    exactly when the owner talks."""
+    session = FakeSession()
+    conv = conversation(session)
+    await conv._on_transcript(
+        session, Transcript(text="네, 듣고 있어요.", role="assistant", final=True)
+    )
+
+    async def mic() -> Any:
+        yield b"the owner replies"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"the owner replies"]
 
 
 async def test_half_duplex_holds_the_microphone_until_the_speaker_runs_dry() -> None:
@@ -2904,6 +3144,103 @@ async def test_no_bus_means_no_behaviour_change() -> None:
     assert audio.played
 
 
+# --- the pump has to be *told* about the turn, not merely able to be -----------
+
+
+async def test_a_gap_between_chunks_does_not_reach_the_page_as_idle() -> None:
+    """Drives the real `_face_pump` task, because the call site is the bug surface.
+
+    `SpeechClock.pump` grew a `generating` hold and `tests/test_face.py` proves the
+    hold works - and deleting `generating=self._generating` from `_face_pump` still
+    passed every one of those tests. Same shape as the wiring hops this file already
+    guards: something calls it, nothing asserted with what.
+
+    20ms of audio - shorter than one 40ms tick - then a turn that has not ended.
+    Every tick in that gap finds the queue dry while the model is still producing,
+    which is the start of every real answer.
+    """
+    bus = RecordingBus()
+    session = FakeSession(b"\x00" * 960, Hang())   # 20ms at 24kHz/16-bit, then a gap
+    conv = conversation(session, FakeAudio(), face=bus)
+
+    task = asyncio.create_task(conv.run())
+    await asyncio.sleep(0.2)                       # ~5 pump ticks inside the gap
+    # Read mid-conversation: `run()`'s `finally` flushes the face to idle on every
+    # shutdown, so a version of this that looked after the task finished would pass
+    # with the fix reverted.
+    mid_conversation = list(bus.activities)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert mid_conversation == ["speaking"], (
+        f"a gap between chunks was published as the end of speech: {mid_conversation}"
+    )
+
+
+async def test_an_answer_ending_hands_the_face_to_listening_not_idle() -> None:
+    """The call site again, not the capability. `SpeechClock.pump` grew `resting` and
+    `tests/test_face.py` proves it works; `_face_pump` has to actually pass it, and a
+    version that did not looked identical to every test that existed.
+
+    Measured on a live 6-turn session: `speaking -> idle -> listening` at the end of
+    all six turns, the `idle` lasting under a second before the next microphone chunk
+    overwrote it. Half the remaining sub-second noise, at exactly the moment the owner
+    is watching for the mouth to stop.
+    """
+    bus = RecordingBus()
+    session = FakeSession(b"\x00" * 4800, Hang())   # 100ms of audio, then the turn holds
+    conv = conversation(session, FakeAudio(), face=bus)
+
+    task = asyncio.create_task(conv.run())
+    await asyncio.sleep(0.05)
+    conv._generating = False          # the turn is done producing; the queue drains
+    await asyncio.sleep(0.2)
+    mid_conversation = list(bus.activities)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert "idle" not in mid_conversation, (
+        f"an answer ending published idle inside a live conversation: {mid_conversation}"
+    )
+    assert mid_conversation[-1] == "listening"
+
+
+# --- a late user transcript must not put `thinking` over a live answer --------
+
+
+async def test_a_user_transcript_settling_mid_answer_does_not_publish_thinking() -> None:
+    """Measured on a live session, not imagined: the SSE stream carried a lone
+    `thinking` frame in the middle of two separate spoken turns, 40ms wide, wiped by
+    `_face_pump`'s next tick.
+
+    A *user* transcript finalises whenever the provider gets round to it, routinely
+    after the daemon has started replying. `_on_transcript` then published
+    `thinking` unconditionally - false on its face (the daemon is talking), and
+    destructive rather than merely wrong, because the page has to wait for a neutral
+    moment before every non-speaking clip and a blip cancels the wait it was already
+    serving. Guarded against `_playback_until`, the same clock the `listening`
+    publisher already answers to.
+    """
+    bus = RecordingBus()
+    conv = conversation(FakeSession(), FakeAudio(), face=bus)
+    conv._face = bus
+    loop = asyncio.get_running_loop()
+
+    # The answer is audibly under way.
+    conv._playback_until = loop.time() + 5.0
+    bus.set_activity("speaking")
+    await conv._on_transcript(FakeSession(), Transcript(text="물어봤어", role="user", final=True))
+    assert bus.state.activity == "speaking", "the daemon is speaking, not thinking"
+    assert "thinking" not in bus.activities
+
+    # Once the room is quiet again, the same transcript means what it always meant.
+    conv._playback_until = loop.time() - 1.0
+    await conv._on_transcript(
+        FakeSession(), Transcript(text="또 물어봤어", role="user", final=True)
+    )
+    assert bus.state.activity == "thinking"
+
+
 # --- review findings: barge-in and the mic loop must not fight the face -------
 
 
@@ -3020,6 +3357,11 @@ async def test_face_pump_ticks_the_falling_edge_on_a_real_clock() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    assert bus.activities == ["speaking", "idle"], (
+    # `listening`, not `idle`: the falling edge lands on the caller's resting state
+    # and inside a live conversation that is listening (see
+    # `test_an_answer_ending_hands_the_face_to_listening_not_idle`). What this test
+    # is for is unchanged - that the timer reaches the falling edge at all, on its
+    # own monotonic clock.
+    assert bus.activities == ["speaking", "listening"], (
         "the timer never ticked the falling edge on its own real clock"
     )

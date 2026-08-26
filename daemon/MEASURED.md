@@ -438,6 +438,24 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   to be quiet in general catches it, and **an entity name is a search query only for
   names the web knows the way its owner does** — for the rest the search is discarded
   work and the line is an ordinary check-in.
+- **The first proactive utterance ever spoken went to Telegram while the owner sat at
+  the keyboard, and neither half was wrong (2026-08-26).** `gate_snapshot` on the row:
+  `"why": "ok"`, `"delivery": "both"`, `idle_seconds: 0.06`, screen unlocked, mic and
+  output free - the gate read presence correctly and asked for the speaker. The `route`
+  column says `telegram`, and the log says why: `speaker: refusing to speak while this
+  process holds the microphone`. `Speaker.say`'s rule is right (a speaker talking into a
+  live gate is the gate hearing the daemon), the gate's reading was right, and the two
+  had no way to say either thing to each other - so the failure was invisible from both
+  sides and from the utterance row, which records the achieved route but not that a
+  route was achievable. Fixed by `daemon/mic_floor.py`; live-verified on this Mac with a
+  real capture stream and a real `say`, gate standing down and frames climbing again
+  afterwards (290 -> 636). **Two things worth keeping from it.** A verdict field and an
+  outcome column that disagree is not a lie either one told, and it is the shape to look
+  for when a feature works in tests and does nothing in the room. And the acceptance
+  tests written for the fix passed on a build where `_wake_round` never called the code
+  they exercised - they drove the helper directly - which is `tests/CLAUDE.md`'s
+  documented blind spot arriving on schedule; four seams were mutation-checked before
+  the fix was believed.
 - **Half-duplex was leaking the daemon's own voice into memory as the owner's words,
   and the tell is that every leak is a *tail* (2026-08-19).** `DAEMON_VOICE_BARGE_IN=
   false` was set and `apple audio: ... echo cancellation on` was in the log, yet
@@ -715,6 +733,130 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   else that changes over the run's wall-clock span. Every number above
   inherits that confound. Interleaving the two arms trial-by-trial, not a
   larger n, is what a retry needs before its p-value means anything either.
+- **The wake->voice handover had a 107 ms hole, and CoreAudio deadlocked in it
+  (2026-08-26).** The owner's report was "she suddenly stopped answering, and
+  calling again does nothing". The resident had logged `wake: heard '벨라'` and
+  `opening a voice session` at 15:07:26 and then never another voice line - while
+  Telegram kept answering, the scheduler kept ticking and `/health` kept saying
+  `status: ok`, `wake_gate: running`. The tell was one missing line: every working
+  wake round logs `apple audio: engine at 48000 Hz ...` within 0.3-0.6 s of opening
+  the session, and this one never did, so the wedge was inside `_build`, before the
+  log.
+
+  `sample` of the resident named it. Four threads, all at `__psynch_mutexwait` for
+  100% of a 3 s sample, in a closed cycle:
+
+  | thread | doing | waiting on |
+  |---|---|---|
+  | `com.apple.audio.IOThread.client` | PortAudio `startStopCallback` -> `AudioUnitGetProperty` | the AudioUnit recursive mutex |
+  | `AVAudioIOUnit` queue | property listener -> `_GetHWFormat` -> `GetPropertyDataSize` | the HAL mutex, held by the row above |
+  | `engine` queue | `AVAudioEngineImpl::IOBindingChanged` | the AVAudioEngine mutex |
+  | `voice-mic-release` (Python) | `Pa_StopStream` -> `AudioDeviceStop` | the HAL mutex |
+
+  So the wake gate's PortAudio stop and the session's VoiceProcessing engine were
+  running **at the same time** and took the two locks in opposite orders. v0.1.45
+  and v0.1.47 had moved the stop and the open onto detached threads, which is why
+  the daemon stayed up instead of freezing - it converted a total freeze into a
+  daemon that is alive and permanently deaf, which `/health` cannot tell from a
+  quiet house.
+
+  **Why they overlapped is the part worth keeping.** `_wake_round` broke out of
+  `async for event in gate.listen()`, and breaking out of an `async for` does not
+  finalise the generator - CPython drops the last reference and schedules `aclose()`
+  for a later loop turn. `close_gate()` returned in **1 ms** (measured: the two log
+  lines are 15:07:26,499 and ,500) because `SoundDeviceAudio.close()` only ever
+  closed the *speaker*. The microphone was still being let go, by a thread that had
+  not started yet, while `run_voice` was already building the engine.
+
+  **The hole is 107 ms wide.** Measured on the owner's Mac against real PortAudio,
+  with the resident holding the device too: `aclose()` returns at the same
+  millisecond the first block arrives, and `wait_for_input_release()` then takes
+  **0.107 s** for the stop and close to actually finish. That is the whole race
+  window, and nothing was waiting on it. With no competing client a stop is that
+  fast, which is also why the 2 s bound on the wait is a wedge detector rather than
+  a latency cost.
+
+- **An ordinary spoken turn had the same unguarded window the opening and the tool
+  round had each already been given (2026-08-26).** The owner's report was "she
+  goes quiet, and if I ask again she answers". Counted off the day's own
+  conversation log rather than from feel: **5 of 47 spoken turns got no answer at
+  all** (11%), and 6 more answers were cut off mid-sentence. The distribution is why
+  it reads as random - per session 1, 1, 0, 0, 3, 0 - and why a good session proves
+  nothing: at 11% a clean six-turn session is a coin flip (0.89^6 = 50%), which is
+  exactly the session that arrived while this was being investigated, with the owner
+  reporting it as fixed when nothing had been changed.
+
+  Between the owner's transcript settling and the model's first audio, the
+  microphone was still streaming the room to the server, which reads it as the owner
+  opening a *new* turn and cancels the one it was composing. Two shapes, one cause:
+  cancelled **before** the first chunk it is silent and leaves no trace at all -
+  `gemini_live._decode_content` only raises `Interrupted` while it is already
+  generating - and the 06:00 session proves that half, **7 turns, 3 unanswered, and
+  its own report saying `0 interruption(s)`**. Cancelled **during** playback it
+  truncates the answer and does log a barge-in. The leaked tails then land under
+  `inputTranscription`, i.e. as the owner: `los ladros`, `the lock`, `ella` - the
+  same mangled-residual signature as the 2026-08-19 entry above, Spanish and all.
+
+  `_answer_hold_until` (was `_opening_answer_until`) is now armed on every settled
+  owner transcript, not only the wake-word opening - except on a turn the owner
+  *barged in* with, where the answer to the previous turn is still playing. That
+  exception is a limit, not a gap left open by accident: one microphone cannot be
+  both open for the interruption and shut for the answer that follows it. So
+  half-duplex (`DAEMON_VOICE_BARGE_IN=false`, what these numbers were taken under)
+  is fully covered and the default is not, and **nobody has measured what the
+  uncovered case costs** - a barge-in-on day would need its own count.
+
+  **Not yet measured live**: the
+  fix is argued from the two cases already fixed the same way, and the honest check
+  is the same 30-trial-per-arm shape the `realtimeInput.text` entry above needed -
+  count unanswered turns, do not run one session and call it settled.
+- **The admin's restart button hung 6 of 8 times on one day, and what it left behind
+  was not a stopped daemon but a live one with no HTTP surface.** Read off the
+  resident's own log for 2026-08-26: eight `Shutting down` lines, and six of them
+  reached `Waiting for connections to close.` and never printed another word. The
+  gaps to the next `Application startup complete` were 16s, 27s, 29s, 29s, 3m and
+  **40m** — every one of them ended by something external, never by the process.
+  Meanwhile the stuck process kept working: at 17:03:32, eighty seconds into a
+  shutdown it never finished, it woke on '연락' and opened a full voice session.
+  The wake loop, the embedder and Telegram's long poll all survive a graceful
+  shutdown; only the listening socket does not. So the symptom the owner sees is
+  the console frozen on "applying…" (its `pollBack` retries `/health` forever, and
+  `/health` stopped listening), while the daemon is still talking to them.
+
+  **Cause: one endpoint that never ends, plus a wait with no bound.** `/face/stream`
+  is server-sent events, so its response is open for as long as the face page is.
+  Uvicorn's `connection.shutdown()` cannot close a connection whose response is
+  still open — it clears `keep_alive` and waits — and `timeout_graceful_shutdown`
+  defaults to `None`, i.e. `while self.server_state.connections: await sleep(0.1)`,
+  forever. One open face page is enough. Reproduced deterministically against real
+  uvicorn and the real handler: no stream open, exit in **0.18s**; one stream open,
+  **still alive after 15s**; `timeout_graceful_shutdown=3`, exit in **3.18s**.
+
+  **The bound alone was a fix that logged an error on every success, so it is the
+  backstop and not the mechanism.** Reaching it makes uvicorn print `Cancel 1
+  running task(s), timeout graceful shutdown exceeded` at **ERROR** — and
+  `daemon/cli.py::_LOG_NOISE` does not filter it (checked), correctly, since that
+  filter exists to never hide a real error. So the owner's normal settings save
+  would have printed an ERROR line meaning "working as designed", every time,
+  which is the fastest way to teach someone to stop reading them. Measured on the
+  assembled app with a face page open: bound only → **3.19s** and that ERROR line;
+  `FaceBus.close()` from `admin/restart.py::schedule_exit` before the signal →
+  **0.40s**, and `Waiting for connections to close.` never appears at all. The
+  bound stays for the SIGTERMs no endpoint sees coming — `launchctl`, logout,
+  `daemon update` — and for the next endless response somebody adds.
+
+  **Where the close check goes is a two-sided constraint, and both sides were
+  measured.** In `FaceBus._events`, after the wait it deadlocks (the wake that
+  carried the close has already been cleared and nothing will set it again); after
+  the yielded batch it drops whatever was published in the same tick as the close
+  — a one-shot queued just before `close()` never reached the page, caught by a
+  test written before the placement was. It goes at the top of the loop, guarded on
+  an empty mailbox.
+
+  **The tell, for next time: a shutdown that stops logging is not a shutdown that
+  finished.** `Waiting for connections to close.` is the last line either way, and
+  nothing downstream of it says which. `Application shutdown complete.` is the line
+  that means the process is actually leaving; grep for its *absence*.
 - **The resident cannot see homebrew, so `shutil.which` is not binary discovery.**
   Measured 2026-08-26 on the live `ai.daemon.default` job: `PATH` is
   `/usr/bin:/bin:/usr/sbin:/sbin` while `ollama` is at `/opt/homebrew/bin/ollama`.

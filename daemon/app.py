@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
-from daemon import __version__
+from daemon import __version__, mic_floor
 from daemon.channels.base import Channel
 from daemon.clock import now_iso
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
@@ -37,7 +37,8 @@ from daemon.config import (
     ConfigError,
     Settings,
 )
-from daemon.llm.base import Provider
+from daemon.face import MOOD_TOOL, MOOD_VOICE_INSTRUCTION
+from daemon.llm.base import Provider, ToolSpec
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
 from daemon.memory.base import MemoryWriter, Recall
@@ -913,7 +914,11 @@ def open_store(settings: Settings) -> Iterator[Any]:
 
 
 async def build_proactive_tick(
-    settings: Settings, *, speak: bool = False, bridge: Any = None
+    settings: Settings,
+    *,
+    speak: bool = False,
+    bridge: Any = None,
+    wake_loop: bool = False,
 ) -> tuple[ProactiveTick, Callable[[], Awaitable[None]]]:
     """A tick and the coroutine that releases what it holds.
 
@@ -1043,9 +1048,23 @@ async def build_proactive_tick(
             speaker = LocalSpeaker()
             closers.append(speaker.aclose)
 
+        # The floor, only where a wake round could answer it. `wake_loop` is passed
+        # by `_proactive_tick` and by nothing else, because it is a fact about *this
+        # process* that no setting can stand in for: `daemon proactive --speak` sets
+        # `speak=True` too (`daemon/cli.py`) and has no wake loop at all, and
+        # `settings.wake_enabled` stays true on a resident whose wake task was never
+        # created - no on-device recognizer, a microphone grant this build cannot
+        # use. An earlier version of this comment claimed `speak` told those apart.
+        # It does not (PR #115 review), and the cost of believing it was a ten-second
+        # stall on every line from a command a person is watching run.
+        ask_for_the_floor = None
+        if wake_loop and speak and settings.voice_enabled and settings.wake_enabled:
+            ask_for_the_floor = mic_floor.request
+
         delivery = ProactiveDelivery(
             store,
             FileMemoryWriter(settings.data_dir, store),
+            ask_for_the_floor=ask_for_the_floor,
             channel=channel,
             speaker=speaker,
         )
@@ -1158,7 +1177,15 @@ async def _proactive_tick(
     """
     bridge = get_bridge() if get_bridge is not None else None
     try:
-        tick, close = await build_proactive_tick(settings, speak=True, bridge=bridge)
+        # `wake_loop=True` because this is the resident, the only process that runs
+        # one. Not conditioned on the task being *alive*: a resident whose wake task
+        # died or was never created answers nothing, `mic_floor.request` reports
+        # `no-listener` after its take timeout, and `ProactiveDelivery._say` uses the
+        # speaker directly - correct, and self-correcting, at the cost of one ten-
+        # second wait per line in a state `daemon doctor` already reports.
+        tick, close = await build_proactive_tick(
+            settings, speak=True, bridge=bridge, wake_loop=True
+        )
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
         logger.error("proactive tick could not start: %s", exc)
         return
@@ -1387,6 +1414,36 @@ async def _build_voice_runtime(
     )
 
 
+def _mood_declaration() -> ToolSpec:
+    """`set_mood` as the model is told about it. **Declared, never registered.**
+
+    A `ToolSpec` is how a model is offered anything at all, so this rides the
+    function-calling channel - that is transport, not a claim that it is a tool. What
+    makes it not one is that `daemon/tools/` has no entry for it and
+    `daemon/voice/conversation.py` answers it before `ToolRunner` is reached, which is
+    what CONTRACTS 12's exemption rests on (docs/adr/0018).
+
+    Flat on purpose - one enum string. `evals/voice_write_nudge_spike.py` measured that
+    nested argument schemas are what the voice model fakes rather than calls, and
+    `evals/voice_set_mood_spike.py` measured this shape at 24/24 over the live socket.
+    """
+    return ToolSpec(
+        name=MOOD_TOOL,
+        description=(
+            "Set the facial expression shown on the companion's own face. Call this "
+            "when you genuinely feel amused, sulky or curious about what was just "
+            "said. It changes nothing except the expression."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "mood": {"type": "string", "enum": ["amused", "sulky", "curious"]}
+            },
+            "required": ["mood"],
+        },
+    )
+
+
 async def run_voice(
     settings: Settings,
     *,
@@ -1522,13 +1579,32 @@ async def run_voice(
         # gate offers tools only to it. Empty when tools are off, which leaves the
         # session declaring none and so never yielding a tool call.
         tool_specs = companion.specs(origin="owner", surface="voice")
+        # `set_mood` is declared here rather than by `Companion.specs`, and only with a
+        # face attached, for two separate reasons. It is not a tool - it never reaches
+        # `ToolRunner` and leaves no audit row (docs/adr/0018, CONTRACTS 12) - so it has
+        # no business in the list a registry builds. And declaring it without a face
+        # would offer the model a switch wired to nothing. This module is the one
+        # allowed to assemble (CONTRACTS 4), and it is the only place that has both.
+        mood_specs = [_mood_declaration()] if face is not None else []
+        tool_specs = (*tool_specs, *mood_specs)
         # The tool contract rides with the persona in the system instruction, so the
         # endpoint getting tools inherits the rules the text path already has instead
         # of being written without them - which is exactly how voice came to have no
         # index() call (daemon/companion.py, TOOL_CONTRACT). Only when there is a tool
         # to use: 200 tokens of rules about a capability the model lacks buys nothing.
+        #
+        # `MOOD_VOICE_INSTRUCTION` only when the switch is actually on offer, same
+        # rule: an instruction about a tool the model does not have is pure tax, and
+        # its "never say this out loud" sentence is load-bearing (0/32 spoken aloud,
+        # `evals/voice_set_mood_spike.py`) rather than decorative.
         instruction_parts = [
-            block for block in (seed, TOOL_CONTRACT if tool_specs else "") if block
+            block
+            for block in (
+                seed,
+                TOOL_CONTRACT if tool_specs else "",
+                MOOD_VOICE_INSTRUCTION if mood_specs else "",
+            )
+            if block
         ]
         system_instruction = "\n\n".join(instruction_parts) or None
         audio = build_voice_audio()
@@ -1892,22 +1968,73 @@ async def _wake_round(
         # `running` (see WakeGate's dead-stream handling).
         state.wake_gate = gate
     fired = None
+    # Held rather than iterated anonymously, because the handover depends on *when*
+    # this generator is finalised. `async for gate.listen()` leaves that to the
+    # garbage collector: breaking out drops the last reference, CPython schedules the
+    # `aclose()` on a later loop turn, and `record`'s `finally` - the one that hands
+    # the microphone to its release thread - had not run yet by the time the session
+    # below built a second CoreAudio client on the same device. That race deadlocked
+    # the resident (see `close_gate` and daemon/voice/audio.py:wait_for_input_release).
+    listening = gate.listen()
+    released = True
     try:
-        async for event in gate.listen():
+        async for event in listening:
             fired = event
             break
     finally:
         if state is not None:
             state.wake_gate = None
         # Before the conversation, not after: this is what hands the microphone over
-        # and stops the gate hearing what happens next.
+        # and stops the gate hearing what happens next. `aclose()` first, so the
+        # release is under way and `close_gate` has something to wait for.
         with suppress(Exception):
-            await close_gate()
+            await listening.aclose()
+        try:
+            released = await close_gate()
+        except Exception:
+            # Fail closed, and this is the one place in the round that does. Every
+            # other guard here starts from "carry on" because losing a round is worse
+            # than the failure it is guarding; this one is the opposite, because what
+            # a swallowed error costs is not a round but the guarantee - `released`
+            # would stay True, the handover would race exactly as it used to, and
+            # nothing anywhere would say so. A daemon that opens no session is noticed
+            # on the first wake word; a daemon that deadlocks once a day is not.
+            logger.exception("wake: releasing the microphone failed; not opening a session")
+            released = False
+    if not released:
+        # The microphone never came back. Opening a session now means building a
+        # VoiceProcessing engine on a device that is already wedged, which is what
+        # turned a stuck stop into a daemon that never heard another word - so the
+        # round is lost instead, loudly, and the caller comes back around.
+        if fired is not None:
+            # Said here rather than left to `close_gate`'s device error, because the
+            # gate has already logged `wake: heard ...` and a reader would otherwise
+            # see a matched wake word followed by silence with nothing joining them.
+            logger.error(
+                "wake: heard %r but dropping it - the microphone never came back",
+                fired.heard,
+            )
+        # `mic_floor.take` hands over a debt as well as a line: the taker owes the
+        # future exactly one answer, and a line nobody takes sits out its own timeout
+        # instead of falling back to Telegram now, while it is still worth saying.
+        taken = mic_floor.take()
+        if taken is not None:
+            logger.error("wake: not speaking a waiting line - the microphone is wedged")
+            mic_floor.answer(taken[1], False)
+        # Paced on the way out for the reason WAKE_RETRY_SECONDS exists: the next
+        # round opens a fresh capture on the same wedged device and parks another
+        # thread on it, and an unpaced return would do that as fast as the process
+        # can manage.
+        await asyncio.sleep(WAKE_RETRY_SECONDS)
+        return
     if fired is None:
         # The stream ended without a wake word - a closed device, a test's scripted
-        # audio running out, or the gate's own dead-stream watchdog asking to be
-        # rebuilt. Not an error, but not a reason to spin either; the caller's own
-        # guard handles the pacing.
+        # audio running out, the gate's own dead-stream watchdog asking to be
+        # rebuilt, or proactivity asking for the microphone. Not an error, but not a
+        # reason to spin either; the caller's own guard handles the pacing.
+        taken = mic_floor.take()
+        if taken is not None:
+            await _speak_unprompted(settings, taken, shared)
         return
     logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
     # The segment that fired the gate goes with it - but only when it carries more
@@ -1942,6 +2069,78 @@ async def _wake_round(
     )
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
+    await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
+
+
+async def _speak_unprompted(
+    settings: Settings, taken: tuple[str, asyncio.Future[bool]], shared: VoiceRuntime | None
+) -> None:
+    """Say a proactive line at this machine, then listen for the answer.
+
+    Reached only from `_wake_round`, after its `finally` has closed the gate - so
+    the microphone is already free, released by the one sequence in this process
+    that is allowed to release it. Nothing here opens or closes a capture stream.
+
+    The line is spoken by `LocalSpeaker` and **not** handed to the voice session as
+    an opening. `opening_text` is a prompt the model answers
+    (`daemon/voice/conversation.py`), so a session asked to deliver this line would
+    say its own version of it - and the line it replaced has already been judged,
+    length-capped and refused for URLs by `daemon/proactivity/judge.py`. Speaking a
+    paraphrase would put an unchecked sentence in the owner's room while the checks
+    passed on a sentence nobody heard.
+
+    Then a session, with no opening at all, because the daemon has just spoken
+    first and the owner is most likely to answer in the next few seconds - the one
+    moment a gate rebuild would miss. It opens listening rather than talking, and
+    *normally* it knows what was just said: `deliver` runs `_say` -> `_send` ->
+    `_log`, so the conversation-log row lands while this function is still
+    connecting a websocket, and `continuity_block` picks it up. Normally, not
+    always - a slow Telegram (`telegram.py` allows each request 40 s) can push
+    `_log` past the connect, and the session then opens without the line in its
+    context and the owner's reply answers nothing. Left as a race rather than
+    fixed by reordering `deliver`: logging before the route is known would put an
+    utterance that reached nobody into the log and the silence clock and then
+    delete its row, which is a hygiene-rule-1 violation (PLAN 4.2) and a worse
+    failure than a rarely-missing continuity block (PR #115 review).
+
+    `IDLE_TIMEOUT_SECONDS` bounds the cost at
+    30 seconds of silence, which is what makes this affordable on a per-minute
+    session that may well go unanswered.
+
+    A session is opened only if the line was actually spoken. Listening for an
+    answer to something the room never heard is the same billed minute for none of
+    the reason.
+    """
+    text, future = taken
+    spoke = False
+    try:
+        from daemon.proactivity.speaker import LocalSpeaker
+
+        speaker = LocalSpeaker()
+        try:
+            spoke = await speaker.say(text)
+        finally:
+            await speaker.aclose()
+    except Exception:
+        # Never raises into the wake loop: a failed line costs the utterance its
+        # speaker, and `mic_floor.request` is already falling back to the channel.
+        # Raising here would cost the round, and a round is the microphone.
+        logger.exception("wake: could not speak a proactive line")
+    finally:
+        # Owed unconditionally - `mic_floor.request` is sitting on this future, and
+        # dropping it turns its fallback into a ten-second delay for no reason.
+        mic_floor.answer(future, spoke)
+
+    if not spoke:
+        return
+    logger.info("wake: spoke first; listening for an answer")
+    try:
+        await run_voice(settings, shared=shared)
+    except Exception:
+        logger.exception("wake: the session opened after speaking first failed")
+    # Same handover the wake path takes, for the same reason: let the session's
+    # Voice-Processing unit finish releasing the microphone before the next round
+    # opens a fresh capture on it. See WAKE_REARM_SETTLE_SECONDS.
     await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
 
 
@@ -2081,7 +2280,7 @@ def build_voice_audio() -> AudioIO:
 
 async def build_wake_gate(
     settings: Settings,
-) -> tuple[WakeGate, Callable[[], Awaitable[None]]]:
+) -> tuple[WakeGate, Callable[[], Awaitable[bool]]]:
     """The always-on gate and the coroutine that releases the microphone.
 
     A gate rather than a bare stream of events, because `WakeGate.counters` is the
@@ -2114,9 +2313,30 @@ async def build_wake_gate(
         cooldown_seconds=settings.wake_cooldown_seconds,
     )
 
-    async def close() -> None:
+    async def close() -> bool:
+        """Release the device and wait for it to actually be gone. True if it is.
+
+        Two halves, and the second is the one the handover needs. `audio.close()`
+        is the speaker; the microphone is let go by `record`'s `finally`, which hands
+        the stream to a detached thread and returns - so without the wait this
+        returns while `Pa_StopStream` is still inside CoreAudio. Anything that then
+        opens a second client on the same device races it, and the two deadlock
+        (daemon/voice/audio.py:wait_for_input_release). The caller must have closed
+        the gate's stream before calling this, or there is nothing to wait on yet.
+        """
         with suppress(Exception):
             await audio.close()
+        # Not suppressed, unlike the speaker close above: this one's answer is the
+        # whole point of the call, and an error swallowed here reads as "released"
+        # (see `_wake_round`, which fails closed on it).
+        released = await audio.wait_for_input_release()
+        if not released:
+            logger.error(
+                "wake: the microphone did not come back after the gate let it go; "
+                "the capture device is wedged inside CoreAudio and nothing in this "
+                "process can free it - a restart is the only fix"
+            )
+        return released
 
     return gate, close
 
