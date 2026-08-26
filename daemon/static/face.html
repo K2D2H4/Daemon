@@ -13,7 +13,9 @@
   2. SINGLE-SIDED CROSSFADE. Only the incoming element's opacity animates, on top,
      while the outgoing one stays fully opaque underneath until the fade finishes.
      Fading both at once leaves a moment where neither is opaque, the background shows
-     through, and the brightness dips - which reads worse than a hard cut.
+     through, and the brightness dips - which reads worse than a hard cut. The hide
+     that follows the fade has to check the element is still the outgoing one: come
+     back to it within fadeMs and the stale timer blanks BOTH layers (see show()).
   3. NO rAF TIMEKEEPING. <video> playback is native, unlike requestAnimationFrame,
      which throttles in a backgrounded window - rAF only nudges playbackRate, so
      being throttled makes it update less often rather than drift. Native playback
@@ -75,6 +77,15 @@ const IDLES = ["idle1", "idle2", "idle3"];
 const FLOURISHES = ["flourish_arms"];
 const FLOURISH_MIN_MS = 40000, FLOURISH_MAX_MS = 120000;
 const LOUD_ENTER = 0.62, LOUD_HOLD_MS = 500;
+// LOUD_ENTER is NOT settled, and the value here is not a measurement. It sits on
+// the raw scale daemon/face.py's _rms produces, where a full-scale sine only
+// reaches 0.707 - louder than speech ever gets - and it used to be compared
+// against the raw per-tick level, which spec 3.4 itself calls too jittery to use
+// directly: one sub-threshold 40ms tick reset the whole hold. It is compared
+// against the smoothed envelope now, which is the right signal; the right
+// THRESHOLD needs data nobody has. Spec open question 3 ("keep speaking_loud?")
+// is supposed to be settled by v1's own measurements and v1 was recording none,
+// so logEnvelope() below prints one summary per speaking turn.
 const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 // activity -> clip, with the fallback chain from spec §3.7 applied at load time.
@@ -108,6 +119,10 @@ let env = 0;                  // smoothed level
 let loudSince = 0;
 let flourishAt = 0;
 let oneShotUntil = 0;
+let oneShotIsFlourish = false;  // spec 3.6: a flourish means nothing, so any
+                               // activity change cuts it. A mood does not (spec
+                               // 3.2) - that is the daemon saying something, and
+                               // only speaking may cut it
 let pendingWaitTimer = 0;     // task 9 (3rd follow-up): setTimeout handle for a
                                // pending wait-for-next-neutral-moment delay, if any
                                // is outstanding - see neutralWaitMs()/toActivity()
@@ -160,7 +175,11 @@ async function prime(stem) {
   // A pause we did not ask for: measured live, Chrome pauses muted background video
   // to save power even in a merely-occluded window, not just a backgrounded one.
   // A paused clip never fires `ended`, so nothing else here would ever notice.
-  v.addEventListener("pause", () => { if (v === showing) ensurePlaying(); });
+  // `!v.ended`: `pause` fires BEFORE `ended` per the HTML spec, so a clip
+  // reaching its own end arrives here looking exactly like a browser-imposed
+  // pause - and play() at currentTime == duration restarts it from 0, underneath
+  // the crossfade the `ended` listener above is about to start.
+  v.addEventListener("pause", () => { if (v === showing && !v.ended) ensurePlaying(); });
 }
 
 // --- POSE-MATCHED ENTRY (task 9) --------------------------------------------
@@ -236,6 +255,13 @@ function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {
     next.style.opacity = "1";
     showing = next;
     if (prev) setTimeout(() => {         // hidden behind an already-opaque layer
+      // ...unless it is back in front. Switch away and back inside fadeMs and
+      // this stale timer hides the element that is now `showing`, leaving BOTH
+      // layers transparent and the page on flat #19191B until something
+      // switches to a different element again. Not a rare race: with tools at
+      // the default mode=full a read_file round finishes well inside 400ms, so
+      // thinking -> working -> thinking blanks the face.
+      if (prev === showing) return;
       prev.style.opacity = "0";
       prev.pause();
     }, fadeMs);
@@ -276,11 +302,15 @@ function ensurePlaying() {
 
 function advance() {
   // A finished clip: one-shots hand back to the activity, idle reshuffles.
-  // (A wait-for-neutral-moment delay, task 9's 3rd follow-up, no longer routes
-  // through here - it fires its own setTimeout in toActivity(), below, rather
-  // than waiting for this clip's `ended`, since the neutral moment it is
-  // waiting for is not necessarily the clip's own end any more.)
+  // The pending wait goes first: idle clips are shown with loop:false, so a wait
+  // scheduled against the outgoing clip's own timeline outlives that clip ending
+  // and would fire up to NEUTRAL_WAIT_CAP_MS later, over whatever this switched to.
+  // (The wait is *scheduled* in toActivity(), on its own setTimeout rather than
+  // this clip's `ended`, since the neutral moment it waits for is not
+  // necessarily the clip's own end - but it still has to be cancelled here.)
+  clearPendingWait();
   oneShotUntil = 0;
+  oneShotIsFlourish = false;
   if (queuedActivity !== null) {
     // spec 3.6: a non-speaking activity change arrived mid-one-shot and was held
     // instead of dropped or applied over the gesture; the one-shot has now
@@ -291,25 +321,39 @@ function advance() {
     toActivity(act);
     return;
   }
+  // Spec 1 wants one every 40-120s for as long as idle lasts, because that is
+  // what breaks an 8s loop's period. scheduleFlourish() used to be reachable only
+  // from toActivity(), so entering idle armed exactly one: tick() zeroed
+  // flourishAt when it fired and nothing ever set it again.
+  if (activity === "idle") scheduleFlourish();
   const stem = clipFor(activity);
   if (stem) show(stem, { loop: activity !== "idle" });
 }
 
 function toActivity(act) {
-  if (oneShotUntil && act !== "speaking") {
-    // spec 3.6: only a transition to speaking may cut an in-flight one-shot - the
-    // mouth cannot lag the audio, but idle/listening/thinking/working have no such
-    // claim. Remember it instead; advance() (above) applies it once the one-shot's
-    // own `ended` fires. This also settles the wait/one-shot interaction: a
-    // one-shot already in flight blocks a *new* wait from starting here (this
-    // check runs first), and playOneShot() (below) always clears a pending wait,
-    // so a one-shot always wins over a wait that was already pending.
+  if (oneShotUntil && !oneShotIsFlourish && act !== "speaking") {
+    // A MOOD in flight (spec 3.2): only a transition to speaking may cut it - the
+    // mouth cannot lag the audio, and idle/listening/thinking/working have no such
+    // claim over something the daemon is actually saying. Remember it instead;
+    // advance() (above) applies it once the one-shot's own `ended` fires.
+    //
+    // A FLOURISH goes the other way (spec 3.6): decoration with no trigger and no
+    // meaning, so any activity change cuts it rather than holding `listening`
+    // behind six seconds of gesture nobody asked for. The two spec sections
+    // contradicted each other on this and this page used to cite 3.6 for the
+    // opposite of what 3.6 says; both now say this split.
+    //
+    // It also settles the wait/one-shot interaction: a one-shot already in flight
+    // blocks a *new* wait from starting here (this check runs first), and
+    // playOneShot() (below) always clears a pending wait, so a one-shot always
+    // wins over a wait that was already pending.
     queuedActivity = act;
     return;
   }
   queuedActivity = null;
   activity = act;
   oneShotUntil = 0;
+  oneShotIsFlourish = false;
   clearPendingWait();           // any earlier deferred wait is moot now
   scheduleFlourish();
   const fadeMs = SLOW_FADE_ACTIVITIES.has(act) ? FADE_SLOW_MS : FADE_MS;
@@ -337,11 +381,29 @@ function toActivity(act) {
   show(stem, { loop: act !== "idle", fadeMs });
 }
 
-function playOneShot(stem) {
+function playOneShot(stem, { flourish = false } = {}) {
   if (!have.has(stem)) return;           // no clip, no expression - never substitute idle
   oneShotUntil = Infinity;
+  oneShotIsFlourish = flourish;  // see toActivity(): only a flourish yields to an
+                                 // activity change
   clearPendingWait();            // a fresh one-shot supersedes any pending wait
   show(stem, { loop: false });
+}
+
+// --- what the envelope actually does, for spec open question 3 --------------
+let envSamples = [];
+function logEnvelope() {
+  // One line per speaking turn: enough to answer "does the envelope ever reach
+  // a high band at all", which is what decides both LOUD_ENTER and whether
+  // speaking_loud earns its place. Two samples is not a distribution.
+  if (envSamples.length < 2) { envSamples = []; return; }
+  const s = envSamples.slice().sort((a, b) => a - b);
+  const at = q => s[Math.min(s.length - 1, Math.floor(q * s.length))];
+  console.log(
+    `face: envelope over ${s.length} ticks - min ${at(0).toFixed(3)}, ` +
+    `median ${at(0.5).toFixed(3)}, p90 ${at(0.9).toFixed(3)}, ` +
+    `max ${s[s.length - 1].toFixed(3)} (LOUD_ENTER ${LOUD_ENTER})`);
+  envSamples = [];
 }
 
 function scheduleFlourish() {
@@ -361,7 +423,7 @@ function tick() {
   if (flourishAt && performance.now() > flourishAt && activity === "idle") {
     flourishAt = 0;
     const f = FLOURISHES.filter(s => have.has(s));
-    if (f.length) playOneShot(f[Math.floor(Math.random() * f.length)]);
+    if (f.length) playOneShot(f[Math.floor(Math.random() * f.length)], { flourish: true });
   }
   requestAnimationFrame(tick);
 }
@@ -373,12 +435,21 @@ async function boot() {
   // 404 (no table built yet) and a network hiccup both leave transitions null,
   // which poseMatchTime() already treats as "fall back to frame 0" (rule 4).
   transitions = await fetch("/face/transitions").then(r => r.ok ? r.json() : null).catch(() => null);
-  if (!have.size) {
+  // Two hints, because a partial set is supposed to work (spec 3.7) and one of
+  // its shapes did not: with clips present but no idle clip, boot's own
+  // toActivity("idle") has nothing to show and the page rendered flat #19191B
+  // with no explanation at all. The hint sits behind every <video> (they carry a
+  // z-index, it does not), so whatever the set DOES have still covers it the
+  // moment the daemon does something.
+  const noIdle = have.size > 0 && !clipFor("idle");
+  if (!have.size || noIdle) {
     hint.hidden = false;
-    hint.innerHTML =
-      "No clips yet. Put them in <code>&lt;data_dir&gt;/face/</code> " +
-      "&mdash; see <code>docs/superpowers/specs/2026-08-25-face-design.md</code> §4.";
-    return;
+    hint.innerHTML = noIdle
+      ? "No idle clip. Add <code>idle1</code>, <code>idle2</code> or <code>idle3</code> " +
+        "to <code>&lt;data_dir&gt;/face/</code> &mdash; the rest of the set still plays."
+      : "No clips yet. Put them in <code>&lt;data_dir&gt;/face/</code> " +
+        "&mdash; see <code>docs/superpowers/specs/2026-08-25-face-design.md</code> §4.";
+    if (!have.size) return;
   }
   await Promise.all([...have].map(prime));
   toActivity("idle");
@@ -388,11 +459,19 @@ async function boot() {
   es.onmessage = (m) => {
     const e = JSON.parse(m.data);
     if (e.kind === "shot") { playOneShot(e.clip); return; }
-    if (e.activity !== activity) toActivity(e.activity);
+    // `queuedActivity ?? activity`: while a mood one-shot holds a change,
+    // `activity` still names the one before it, so comparing against `activity`
+    // alone let a change back and forth during the one-shot apply the stale half
+    // of it afterwards.
+    const cur = queuedActivity ?? activity;
+    if (e.activity !== cur) toActivity(e.activity);
     const target = e.activity === "speaking" ? e.level : 0;
     env += (target - env) * (target > env ? ATTACK : RELEASE);
-    if (e.level >= LOUD_ENTER) { if (!loudSince) loudSince = performance.now(); }
+    // On `env`, not `e.level`: see LOUD_ENTER's own note above.
+    if (env >= LOUD_ENTER) { if (!loudSince) loudSince = performance.now(); }
     else loudSince = 0;
+    if (e.activity === "speaking") envSamples.push(env);
+    else logEnvelope();
   };
 
   // The other half of self-healing: becoming visible again is exactly when the

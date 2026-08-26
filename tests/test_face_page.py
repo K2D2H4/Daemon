@@ -130,11 +130,15 @@ def test_the_wait_is_for_the_next_neutral_moment_and_is_bounded():
         assert f'"{act}"' in pool, f"{act} should be wait-eligible per the generalised spec 3.2"
 
 
-def test_a_one_shot_can_only_be_cut_by_speaking():
-    # spec 3.6: an in-flight one-shot runs to completion unless the activity
-    # changes to speaking (the mouth cannot lag the audio) - idle, listening,
-    # thinking and working have no such claim and must be held, not dropped or
-    # applied mid-gesture. Scoped to toActivity()'s own body, comments stripped.
+def test_a_mood_can_only_be_cut_by_speaking_but_a_flourish_yields_to_anything():
+    # The spec contradicted itself here - 3.2 said an in-flight one-shot is cut
+    # only by speaking, 3.6 said any activity change cuts a flourish - and this
+    # page cited 3.6 for the opposite of what 3.6 says. Settled as a split, and
+    # both sections now say it: a MOOD is the daemon saying something and only
+    # speaking (whose mouth cannot lag the audio) may cut it; a FLOURISH is
+    # decoration with no trigger and no meaning, so holding `listening` behind
+    # six seconds of it is wrong. Scoped to toActivity()'s own body, comments
+    # stripped.
     start = PAGE.index("function toActivity(act) {")
     end = PAGE.index("\n}\n", start)
     body = _without_line_comments(PAGE[start:end])
@@ -142,8 +146,20 @@ def test_a_one_shot_can_only_be_cut_by_speaking():
         "blocking a switch must be conditioned on a one-shot being in flight AND "
         "the target activity not being speaking"
     )
+    assert "!oneShotIsFlourish" in body, (
+        "a flourish must not block an activity change the way a mood does"
+    )
     assert "queuedActivity = act" in body, (
         "a blocked activity change must be remembered, not silently dropped"
+    )
+
+    # And the flourish has to be *marked* as one where it is started, or the
+    # exemption above can never fire.
+    start = PAGE.index("function tick() {")
+    end = PAGE.index("\n}\n", start)
+    tick_body = _without_line_comments(PAGE[start:end])
+    assert "{ flourish: true }" in tick_body, (
+        "the random idle flourish must tell playOneShot() what it is"
     )
 
     # And advance() must actually apply the queued activity once the one-shot
@@ -276,4 +292,115 @@ def test_pose_match_lookup_falls_back_to_frame_zero_when_absent():
     )
     assert "transitions.bucket" in body, (
         "bucketing must use the table's own bucket size, not a hardcoded one"
+    )
+
+
+# --- whole-branch review: what the page tests could not see -------------------
+#
+# All of the guards below are code-shape checks, scoped to one function body with
+# comments stripped, and that is a real limit rather than a preference: this suite
+# is pure Python and CI installs no JS runtime (.github/workflows/ci.yml has no
+# node step), so none of them can observe the behaviour they are about. Each was
+# checked by hand against a stubbed-DOM harness under node - every one of these
+# seven reproduced as a real defect there and stopped reproducing after the fix -
+# and each assertion below goes red if the single line it names is deleted. That
+# is the most they do.
+
+
+def test_the_deferred_hide_checks_the_element_is_still_outgoing():
+    # show() schedules the outgoing element's hide at fadeMs. Switch away and back
+    # inside that window and the stale timer hides the element that is now
+    # `showing`, leaving BOTH layers transparent - a flat #19191B page until
+    # something switches to a different element again. With tools at the default
+    # mode=full a read_file round finishes well inside 400ms, so
+    # thinking -> working -> thinking hits it.
+    start = PAGE.index("function show(stem")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert "prev === showing" in body, (
+        "the deferred hide must check `prev` is still the outgoing element before "
+        "hiding it"
+    )
+
+
+def test_the_self_heal_does_not_restart_a_clip_that_has_ended():
+    # `pause` fires before `ended` per the HTML spec, so a clip reaching its own
+    # end arrives at the pause listener looking exactly like a browser-imposed
+    # pause - and play() at currentTime == duration replays it from 0, underneath
+    # the crossfade `ended` is about to start.
+    start = PAGE.index("async function prime(stem) {")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert "!v.ended" in body, (
+        "the pause listener must exclude a clip that ended, not just one that was "
+        "paused"
+    )
+
+
+def test_advance_clears_a_pending_wait_and_rearms_the_flourish():
+    # Two separate defects in one function, both about state that outlives the
+    # clip advance() is replacing. The wait is scheduled against the OUTGOING
+    # clip's timeline and idle clips are shown with loop:false, so it survives
+    # that clip ending and fires up to NEUTRAL_WAIT_CAP_MS later over whatever
+    # replaced it. And scheduleFlourish() used to be reachable only from
+    # toActivity(), so entering idle armed exactly one flourish ever: tick()
+    # zeroes flourishAt when it fires and nothing set it again - against spec 1's
+    # one every 40-120s, which is what breaks an 8s loop's period.
+    start = PAGE.index("function advance() {")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert "clearPendingWait()" in body, (
+        "a wait timed against the outgoing clip must not outlive it"
+    )
+    assert "scheduleFlourish()" in body, (
+        "returning to an idle loop must arm the next flourish, or idle gets one "
+        "flourish per entry rather than one every 40-120s"
+    )
+
+
+def _onmessage_body():
+    """The SSE handler's own body, comments stripped."""
+    start = PAGE.index("es.onmessage = (m) => {")
+    end = PAGE.index("\n  };", start)
+    return _without_line_comments(PAGE[start:end])
+
+
+def test_a_queued_activity_cannot_go_stale():
+    # toActivity() does not update `activity` when it queues a change behind a
+    # mood, so comparing an incoming event against `activity` alone let a change
+    # back and forth during the one-shot apply the stale half of it afterwards.
+    assert "queuedActivity ?? activity" in _onmessage_body(), (
+        "the incoming activity must be compared against the queued one when there "
+        "is a queued one"
+    )
+
+
+def test_the_loud_switch_reads_the_envelope_and_the_envelope_is_recorded():
+    # Two things, both from the same measurement gap. LOUD_ENTER gated on the raw
+    # per-tick level, which spec 3.4 itself calls too jittery to use directly -
+    # one sub-threshold 40ms tick reset the hold - so it reads the smoothed
+    # envelope now. The threshold is deliberately NOT retuned: spec open question
+    # 3 ("keep speaking_loud?") is supposed to be settled by v1's own data and
+    # nothing was recording any, so the page logs the distribution instead.
+    body = _onmessage_body()
+    assert "env >= LOUD_ENTER" in body, (
+        "the loud switch must read the smoothed envelope, not the raw level"
+    )
+    assert "logEnvelope()" in body, (
+        "the envelope distribution must be recorded somewhere, or open question 3 "
+        "stays unanswerable"
+    )
+    assert "envSamples.push(env)" in body, "a summary of nothing is not data"
+
+
+def test_a_partial_set_with_no_idle_clip_still_explains_itself():
+    # Spec 3.7 promises a partial set works. The hint only appeared when the set
+    # was completely empty, so clips present but no idle clip rendered a flat
+    # background with no explanation at all - boot's own toActivity("idle") has
+    # nothing to show.
+    start = PAGE.index("async function boot() {")
+    end = PAGE.index("\n}\n", start)
+    body = _without_line_comments(PAGE[start:end])
+    assert 'clipFor("idle")' in body, (
+        "the hint must also cover a set that has clips but no idle clip"
     )
