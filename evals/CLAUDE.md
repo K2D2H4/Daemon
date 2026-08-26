@@ -19,6 +19,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `screen_frame_arrival_spike.py` | why voice answered "what's on my screen" from nothing — a `realtimeInput.video` frame never arrives inside a tool round, and the fix is the image part *after* the tool response (0/20 → 19/20) |
 | `proactive_topic_spike.py` | docs/adr/0015's own reversal test — does a `topic` line read differently with a search result in the prompt than without one, on the owner's real entities and persona, arms interleaved trial-by-trial and compared directly (Fisher exact, never a threshold pooled from both) |
 | `face_mood_tag_spike.py` | spec open question 4 — does the configured provider actually attach a leading `[mood:...]` tag, reliably and well-formed? It scores `daemon/face.py:MOOD_INSTRUCTION` **as imported**, not a copy, so it measures the string the text path really sends. Answering yes on one install is what shipped it; re-run it on another provider, another model, or after any edit to that string |
+| `voice_set_mood_spike.py` | whether a flat `set_mood` is callable on the *voice* path at all, asked before anyone edits CONTRACTS 12 — 48 live audio sessions: call rate **24/24**, mood correct **24/24**, false positives **0/8**, spoken aloud **0/32**. The mechanism is not the obstacle, so the remaining question is purely the contract one, and this script does not answer it |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py
