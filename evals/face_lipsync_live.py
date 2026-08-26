@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import contextlib
 import json
 import os
@@ -134,12 +133,32 @@ class FrameReader:
                 if response.status_code != 200:
                     self.closed_at = loop.time()
                     return
-                async for line in response.aiter_lines():
-                    if line.startswith("data:"):
-                        self.frames.append(base64.b64decode(line[5:].strip()))
+                # multipart/x-mixed-replace, parsed by the declared Content-Length
+                # rather than by scanning for the next boundary: a JPEG is binary and
+                # may contain the boundary bytes, and a scanner would truncate exactly
+                # the frames this is meant to measure.
+                buf = b""
+                async for chunk in response.aiter_bytes():
+                    buf += chunk
+                    while True:
+                        head_end = buf.find(b"\r\n\r\n")
+                        if head_end < 0:
+                            break
+                        head = buf[:head_end]
+                        length = None
+                        for hline in head.split(b"\r\n"):
+                            if hline.lower().startswith(b"content-length"):
+                                length = int(hline.split(b":")[1])
+                        if length is None:
+                            if b"--\r\n" in head or head.endswith(b"--"):
+                                buf = b""
+                            break
+                        body_at = head_end + 4
+                        if len(buf) < body_at + length:
+                            break
+                        self.frames.append(buf[body_at : body_at + length])
                         self.arrivals.append(loop.time())
-                    elif line.startswith(":"):
-                        self.keepalives += 1
+                        buf = buf[body_at + length :]
         self.closed_at = loop.time()
 
 
@@ -209,7 +228,6 @@ def write_video(
     began: float,
     *,
     cache_dir: Path,
-    box: tuple[int, int, int, int],
     fps: float,
     wav: Path | None,
 ) -> None:
@@ -223,15 +241,19 @@ def write_video(
     stretch a 20fps stream into 24fps of playback and make a mouth that drops frames
     look like a mouth that is late.
 
-    So: output frame *t* is driving frame *t* with the newest crop that had arrived by
-    `began + t/fps`. The audio muxed underneath starts at `began` too, which is what
-    makes "does the mouth match the sound" a question this file can be wrong about.
+    So: output frame *t* is the newest RENDERED frame that had arrived by
+    `began + t/fps`, falling back to the driving clip's own frame before the first one
+    lands. The audio muxed underneath starts at `began` too, which is what makes "does
+    the mouth match the sound" a question this file can be wrong about.
+
+    The rendered frame is used whole. An earlier version pasted a crop onto the driving
+    frame here, which mirrored a transport that no longer exists - and reproducing that
+    paste in the harness would hide the very seam it was written to reveal.
     """
     import cv2
 
     driving = np.load(cache_dir / "frames.npy", mmap_mode="r")
     height, width = driving.shape[1:3]
-    x1, y1, x2, y2 = box
     silent = out.with_suffix(".silent.mp4")
     writer = cv2.VideoWriter(
         str(silent), cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height)
@@ -243,10 +265,7 @@ def write_video(
         while nxt < len(arrivals) and arrivals[nxt] <= at:
             crop = cv2.imdecode(np.frombuffer(frames[nxt], dtype=np.uint8), cv2.IMREAD_COLOR)
             nxt += 1
-        frame = np.array(driving[index % driving.shape[0]])
-        if crop is not None:
-            frame[y1:y2, x1:x2] = crop
-        writer.write(frame)
+        writer.write(crop if crop is not None else np.array(driving[index % driving.shape[0]]))
     writer.release()
     if wav is None:
         silent.rename(out)
@@ -336,7 +355,9 @@ async def main() -> int:
             "lip-sync did not assemble, so there is nothing to measure. This is a "
             "'could not check' result, not a pass."
         )
-    box = tuple(manifest["lipsync"]["box"])
+    # No box any more: a frame is the whole composited image. Assert the manifest does
+    # not offer one, because a box reappearing would mean the crop transport is back.
+    assert "box" not in manifest["lipsync"], manifest["lipsync"]
     clip_dir = Path(args.data_dir) / "face" / "lipsync" / manifest["lipsync"]["clip"]
     fps = float(json.loads((clip_dir / "boxes.json").read_text())["fps"])
 
@@ -437,7 +458,6 @@ async def main() -> int:
             phase1_arrivals,
             phase1_began,
             cache_dir=clip_dir,
-            box=box,
             fps=fps,
             wav=args.wav,
         )
@@ -462,7 +482,6 @@ async def main() -> int:
                     "cached_after_idle": round(idle_cache, 1),
                 },
                 "keepalives": reader.keepalives,
-                "box": list(box),
                 "fps": fps,
                 "feed_rate_x_realtime": args.rate,
             },

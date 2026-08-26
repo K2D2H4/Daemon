@@ -200,6 +200,17 @@ class Renderer:
         """Latched on the first engine failure. The caller drops back to v1 clips
         and logs once; retrying per frame would fill the log at 24Hz."""
 
+    @property
+    def holding(self) -> bool:
+        """Is a frame already rendered and waiting to go out?
+
+        The render loop needs this to pace: a call while this is true costs nothing and
+        publishes the held frame, and a call while it is false is a model step. Without
+        it the loop has to infer which it got by timing the call, which is how both
+        frames of a pair ended up 10ms apart.
+        """
+        return self._pending is not None
+
     def render(self, *, frame_index: int, origin: float, fps: float) -> None:
         """Render `frame_index` and publish it. Never raises."""
         if self.failed:

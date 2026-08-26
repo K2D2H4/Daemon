@@ -1326,13 +1326,14 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
     # the render, and only while no render is in flight. `deque.append`/`popleft` are
     # atomic, so the handover needs no lock of its own.
     queued: deque[tuple[bytes, float]] = deque()
+    height, width = cache.frames[0].shape[:2]
     logger.info(
-        "face: lip-sync ready - %s, %d frames at %.3ffps, crop %dx%d, loaded in %.0fms",
+        "face: lip-sync ready - %s, %d frames at %.3ffps, %dx%d, loaded in %.0fms",
         LIPSYNC_CLIP,
         len(cache.boxes),
         fps,
-        renderer.frame_box[2] - renderer.frame_box[0],
-        renderer.frame_box[3] - renderer.frame_box[1],
+        width,
+        height,
         (time.perf_counter() - started) * 1000.0,
     )
 
@@ -1434,6 +1435,10 @@ async def _lipsync_loop(
                         ),
                     )
                     holding = False
+                    # Straight on to the next step rather than waiting another
+                    # interval: the model work is ~75ms of a 83ms two-frame budget, so
+                    # starting it the moment the held frame is out is what keeps the
+                    # next pair's first frame on the grid instead of a step behind it.
                     wait = 0.0
                     continue
                 # Read `origin` once and pass the same value to the clock and the
@@ -1457,15 +1462,28 @@ async def _lipsync_loop(
                     wait = interval / 4
                     continue
                 frame = found
-                began = loop.time()
                 await loop.run_in_executor(
                     pool,
                     partial(renderer.render, frame_index=frame, origin=origin, fps=fps),
                 )
-                # A call that took real time did a model step, so it is holding this
-                # pair's second frame. Give the transport one spacing to read the
-                # first before that one overwrites it.
-                holding = loop.time() - began > LIPSYNC_PUBLISH_SPACING
+                # `holding` is asked, not inferred from how long the call took. The
+                # version this replaced timed it and then waited LIPSYNC_PUBLISH_SPACING
+                # - 10ms - before releasing the pair's second frame, so both landed
+                # inside a tenth of a frame and the next 80ms was empty. At the socket
+                # that is 20fps arriving as pairs at 10Hz, and the owner read it
+                # exactly that way: a head moving smoothly over a mouth that stutters.
+                # One frame per interval is the whole point of a frame rate.
+                holding = renderer.holding
+                # LIPSYNC_PUBLISH_SPACING and not `interval`, and this was measured
+                # both ways. Releasing the held frame a whole interval later evens the
+                # cadence on paper and costs more than it buys: the model step is 75ms
+                # of an 83.3ms two-frame budget, so waiting 41.7ms on top of it makes
+                # the cycle 117ms and the socket drops from 19.9fps to 14.2fps, with
+                # the gap median no better (83ms either way). Nothing serial fixes this
+                # - the step has to overlap the release, which means the loop
+                # publishing from a queue instead of the renderer publishing inline.
+                # Named here rather than attempted: it is a change to Renderer, and
+                # 19.9fps arriving in pairs beats 14.2fps arriving in pairs.
                 wait = LIPSYNC_PUBLISH_SPACING if holding else 0.0
     except asyncio.CancelledError:
         # Shutdown, not a failure. Explicit because the clause below would not catch

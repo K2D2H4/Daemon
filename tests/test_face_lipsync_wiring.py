@@ -148,10 +148,15 @@ class FakeRenderer:
     def __init__(self) -> None:
         self.failed = False
         self.calls: list[tuple[int, float, float]] = []
-        self.frame_box = (10, 20, 30, 40)
+        self.holding = False
+        """Alternates, like the real one: a model step leaves the pair's second frame
+        held, and the next call publishes it and does no work. The loop paces off this
+        rather than off how long the call took, so a fake that always reported False
+        would let the loop release both frames of a pair inside one tick again."""
 
     def render(self, *, frame_index: int, origin: float, fps: float) -> None:
         self.calls.append((frame_index, origin, fps))
+        self.holding = not self.holding
 
 
 class FakeClock:
@@ -217,7 +222,11 @@ async def test_the_loop_renders_the_newest_frame_whose_audio_has_arrived(monkeyp
     face.set_activity("speaking")
     renderer, clock, ring = FakeRenderer(), FakeClock([0, 1, 2, None, 7, None]), FakeRing()
     await _run_loop(face, renderer, clock, ring, deque(), stop_after=0.3)
-    assert [call[0] for call in renderer.calls] == [2, 7]
+    # Each model step is followed one interval later by the release of the pair's
+    # second frame, at the same index - so a step at 2 and a step at 7 read as
+    # [2, 2, 7, 7]. The releases cost no model work; they are what makes the socket
+    # see one frame per interval instead of two 10ms apart.
+    assert [call[0] for call in renderer.calls] == [2, 2, 7, 7]
     assert all(call[1] == ring.origin for call in renderer.calls)
     assert all(call[2] == FPS for call in renderer.calls)
 
@@ -232,7 +241,11 @@ async def test_a_tick_whose_audio_has_not_arrived_renders_nothing(monkeypatch):
     face.set_activity("speaking")
     renderer, clock, ring = FakeRenderer(), FakeClock([None, None, 4]), FakeRing()
     await _run_loop(face, renderer, clock, ring, deque(), stop_after=0.2)
-    assert [call[0] for call in renderer.calls] == [4]
+    # Two calls, not one, and the second is not a second step: a model step leaves the
+    # pair's second frame held, and the loop releases it one interval later at the same
+    # index. Asserting a single call here is what let both frames of a pair go out
+    # 10ms apart.
+    assert [call[0] for call in renderer.calls] == [4, 4]
 
 
 async def test_the_clock_is_asked_in_the_event_loop_s_own_time(monkeypatch):
