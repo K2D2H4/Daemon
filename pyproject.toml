@@ -95,11 +95,11 @@ mcp = [
     "mcp>=1.9,<2",
 ]
 face = [
-    # Only needed once face lip-sync (MuseTalk) is wired in and turned on -
-    # `daemon/face_lipsync/render.py` imports cv2 directly, and unlike voice/mcp
-    # nothing under `daemon/app.py` constructs a Renderer yet
-    # (tests/test_reachable.py's PENDING_CLASSES), but the tests import it
-    # unconditionally, so CI needs this extra even before wiring lands.
+    # Needed when face lip-sync (MuseTalk) is turned on: `daemon/app.py`'s
+    # `_build_lipsync` constructs the whole render path behind
+    # `DAEMON_FACE_LIPSYNC_ENABLED`, and `daemon/face_lipsync/render.py` imports cv2
+    # directly. CI needs the extra regardless, because the tests import that module
+    # unconditionally.
     # opencv-python-headless, not opencv-python: this runs on a server with no
     # display, so the GUI/Qt bindings the non-headless wheel links against are
     # dead weight neither install nor CI has any use for.

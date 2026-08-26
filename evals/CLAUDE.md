@@ -19,6 +19,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `screen_frame_arrival_spike.py` | why voice answered "what's on my screen" from nothing — a `realtimeInput.video` frame never arrives inside a tool round, and the fix is the image part *after* the tool response (0/20 → 19/20) |
 | `face_mood_tag_spike.py` | spec open question 4 — does the configured provider actually attach a leading `[mood:...]` tag, reliably and well-formed, under a candidate persona instruction nothing in this codebase ships yet |
 | `face_lipsync_prepare.py` | the offline preprocessing step — one driving mp4 in, the cache `daemon/face_lipsync` reads at runtime out. Apple Vision for the landmarks; still needs torch and a MuseTalk checkout for the VAE and the BiSeNet mask, which are deliberately not daemon dependencies |
+| `face_lipsync_live.py` | whether the *assembled* daemon puts a mouth on a real socket — `create_app` + the MLX engine + the prepared cache + uvicorn + `/face/frames`, driven by a wav through the real `SpeechClock`. Writes an mp4 to look at, because the pass mark is a person looking at it |
 | `face_lipsync_numerics.py` | whether the product loader keeps real MLX weights in MLX layout — not whether the model runs, which it never does here — the published weights are diffusers-keyed but MLX-laid-out, and a second transpose is silent |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 

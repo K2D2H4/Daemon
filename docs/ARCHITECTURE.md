@@ -479,3 +479,14 @@ means the publish is a comparison. `daemon/face_routes.py` mounts alongside the
 admin router and serves it: `daemon/static/face.html` is the page, an SSE stream
 carries the bus, and clips play from `<data_dir>/face/` - unshipped, so a fresh
 install shows no face until something is dropped there.
+
+The mouth has a second implementation behind `DAEMON_FACE_LIPSYNC_ENABLED`, off by
+default. `daemon/face_lipsync/` renders it from the audio being spoken - MuseTalk's
+UNet, whisper's encoder and TAESD, all in MLX - and imports nothing from `daemon/`,
+so `daemon/app.py` is the only file that names it (CONTRACTS 4). `_build_lipsync`
+assembles the clip cache, the engine, a PCM ring and a renderer when the weights and
+a prepared cache are both present; `SpeechClock` feeds the ring through the
+`pcm_sink` the voice conversation already accepts, an in-process task renders one
+frame per tick while the bus says `speaking`, and `/face/frames` streams the crop
+box the page lays over the driving clip. Anything missing - the switch, the weights,
+the cache - degrades to the pre-rendered clips with one log line.
