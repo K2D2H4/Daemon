@@ -1939,8 +1939,14 @@ class Wizard:
             if value:
                 updates[need.key] = value
 
-        # The answered provider, not a default: `needs_for`'s `DAEMON_OLLAMA_MODEL`
-        # need only fires when the provider itself is `ollama`, and this mirrors it.
+        # The answered provider, not a default, and `{**merged, **updates}` rather
+        # than `merged`: both of `_wants_local_chat_model`'s inputs can have been
+        # decided in *this* run - the provider a moment ago, the background-judge
+        # toggle in step 2 - so the frozen `merged` would ask the question on the
+        # old answers. (The comment here used to say the `DAEMON_OLLAMA_MODEL` need
+        # "only fires when the provider itself is ollama". That was the drift
+        # `_wants_local_chat_model` exists to end: it fires whenever the judge is
+        # local too, which is the default.)
         self._check_ollama(provider, {**merged, **updates})
 
         if not updates:

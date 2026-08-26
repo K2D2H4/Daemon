@@ -138,6 +138,7 @@ class Recorder:
             ollama=ollama,
             pull=no_pull,
             updates=no_network,
+            health=no_health,
         )
 
 

@@ -93,7 +93,11 @@ async def test_a_raising_ollama_readiness_is_logged_not_swallowed(
         await _backfill(recall, asyncio.create_task(broken()))
 
     assert recall.calls == 0
-    assert caplog.text.strip() != ""
+    # The message, not just "something was logged": any future ERROR line inside
+    # `_backfill`'s try would have satisfied a non-empty check even with the
+    # readiness path's own logging deleted, which is the regression this pins.
+    assert "backfill stopped" in caplog.text
+    assert "never raises" in caplog.text, "the cause has to survive into the log"
 
 
 class FakeOllama:

@@ -3,7 +3,9 @@
 ## Owns
 
 One process: a FastAPI control plane, an in-process APScheduler, a channel loop — assembled
-in `app.py`, which owns every concrete-implementation import here.
+in `app.py`, which owns the concrete-implementation imports. One exception, and it is in
+the table below: `daemon run` in `cli.py` builds the `LocalOllama` it hands `create_app`,
+because a `create_app` that built its own would have every lifespan test probe localhost.
 
 ## Layout
 

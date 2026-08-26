@@ -54,12 +54,22 @@ Measured 2026-08-26: the resident launchd job runs with
 `shutil.which("ollama")` succeeds in a terminal and finds nothing in the service
 this code actually runs in."""
 
-LOCAL_HOSTNAMES = frozenset({"localhost", ""})
+LOCAL_HOSTNAMES = frozenset({"localhost"})
 
 
 def is_local(base_url: str) -> bool:
-    """Does this URL name the machine we are running on?"""
-    host = urlparse(base_url).hostname or ""
+    """Does this URL name the machine we are running on?
+
+    A URL with no hostname is not local. `urlparse` reads a scheme-less
+    `192.168.1.50:11434` as scheme `192.168.1.50` with no host at all, so counting
+    an absent hostname as loopback opened this gate for exactly the remote address
+    it exists to refuse - measured, both `192.168.1.50:11434` and
+    `ollama.internal:11434` answered True, and the daemon would have started an
+    empty local server while the real remote one carried on unused.
+    """
+    host = urlparse(base_url).hostname
+    if host is None:
+        return False
     if host in LOCAL_HOSTNAMES:
         return True
     try:
@@ -85,12 +95,20 @@ async def _probe(base_url: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
             response = await client.get(f"{base_url.rstrip('/')}/api/tags")
-    except Exception:
+    except Exception as exc:
         # Broad on purpose: httpx.InvalidURL (e.g. a non-numeric port from a
         # typo'd .env) is an Exception, not an httpx.HTTPError, and
         # ollama_base_url has no validator (config.py) - a malformed URL must
         # close this gate like any other, not raise past ensure_running's
         # "never raises" promise.
+        #
+        # Logged rather than discarded: swallowing it silently made a typo'd
+        # DAEMON_OLLAMA_BASE_URL report "ollama did not answer within 30s", so the
+        # owner went looking at a healthy Ollama and never learned their .env was
+        # unparseable. debug, not warning - a closed gate is already reported by
+        # `ensure_running`, and every failed poll of a cold start comes through
+        # here too.
+        logger.debug("ollama probe at %s failed: %s", base_url, exc)
         return False
     return response.status_code == 200
 
@@ -153,6 +171,19 @@ class LocalOllama:
         logger.info("started %s serve (pid %s)", binary, self._process.pid)
         if await self._wait_until_ready():
             return True
+        # Two different failures, and naming the wrong one sends the owner to the
+        # wrong place: a child that exited at once is a broken start (a port already
+        # bound, a half-installed binary), not a slow one, and reporting it as a 30s
+        # timeout hides both the cause and the exit code - the only trace there is,
+        # since stdout and stderr go to DEVNULL.
+        exit_code = self._exit_code()
+        if exit_code is not None:
+            logger.warning(
+                "the ollama we started exited with %s before answering; recall stays "
+                "keyword-only",
+                exit_code,
+            )
+            return False
         logger.warning(
             "ollama did not answer within %.0fs of being started; recall stays "
             "keyword-only until it does",
@@ -161,12 +192,27 @@ class LocalOllama:
         return False
 
     async def _wait_until_ready(self) -> bool:
+        """Poll until it answers, the child dies, or the budget runs out.
+
+        Watching `returncode` is what makes a broken start diagnosable. `_spawn`
+        raises nothing when the binary launches and exits immediately - a port
+        already bound by an Ollama.app still coming up at login, a half-installed
+        binary - and `stdout`/`stderr` go to DEVNULL, so without this the only
+        report was "did not answer within 30s" thirty seconds later, naming a
+        timeout where the truth was an instant exit with a code.
+        """
         deadline = asyncio.get_running_loop().time() + READY_TIMEOUT_SECONDS
         while asyncio.get_running_loop().time() < deadline:
             if await self._probe(self._base_url):
                 return True
+            if self._exit_code() is not None:
+                return False
             await asyncio.sleep(POLL_SECONDS)
         return False
+
+    def _exit_code(self) -> int | None:
+        """The code the child we spawned exited with, or None while it is alive."""
+        return None if self._process is None else self._process.returncode
 
     async def aclose(self) -> None:
         """Stop only what this object started.

@@ -182,6 +182,17 @@ def test_is_local_accepts_loopback_and_rejects_another_host() -> None:
     assert is_local("https://ollama.internal.example:11434") is False
 
 
+def test_a_scheme_less_remote_address_is_not_local() -> None:
+    """The gate's worst failure, because it fails towards acting. `urlparse` reads
+    `192.168.1.50:11434` as scheme `192.168.1.50` with no hostname at all, so
+    counting an absent hostname as loopback let the daemon start an empty local
+    server for an address the owner meant as remote - while the real one carried
+    on unused, which is the exact outcome this gate exists to prevent."""
+    assert is_local("192.168.1.50:11434") is False
+    assert is_local("ollama.internal:11434") is False
+    assert is_local("") is False
+
+
 async def test_a_malformed_port_closes_the_gate_instead_of_raising() -> None:
     """`urlparse(...).hostname` never touches the port, so `is_local` passes a
     base_url like this straight through - it is the real `_probe` (unmocked
@@ -196,3 +207,33 @@ async def test_a_malformed_port_closes_the_gate_instead_of_raising() -> None:
     )
 
     assert await local.ensure_running() is False
+
+
+async def test_a_child_that_exits_at_once_is_not_waited_out(caplog: Any) -> None:
+    """A spawn can succeed and the process still be gone a moment later - port
+    11434 already bound by an Ollama.app coming up at login, a half-installed
+    binary. `_spawn` raises nothing, and stdout/stderr go to DEVNULL, so without
+    watching `returncode` the only report was "did not answer within 30s" thirty
+    seconds later: a timeout named where the truth was an instant exit."""
+    import logging
+
+    dead = FakeProcess()
+    dead.returncode = 1
+
+    async def spawn(binary: str) -> FakeProcess:
+        return dead
+
+    local = LocalOllama(
+        "http://127.0.0.1:11434",
+        find=lambda: "/opt/homebrew/bin/ollama",
+        probe=_unreachable,
+        spawn=spawn,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert await local.ensure_running() is False
+
+    assert "exited with 1" in caplog.text
+    assert "did not answer within" not in caplog.text, (
+        "reporting a timeout for a process that was already gone is the bug"
+    )
