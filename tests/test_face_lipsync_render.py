@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from daemon.face_lipsync import Cache, composite
-from daemon.face_lipsync.render import Renderer
+from daemon.face_lipsync.render import Renderer, restore_detail
 from daemon.face_lipsync.ring import PcmRing, Slot
 
 # Deliberately non-square, with a different margin on every side - not the
@@ -274,3 +274,133 @@ def test_the_engine_receives_a_window_addressed_by_the_real_origin():
     assert not np.array_equal(engine.audio_calls[0], engine.audio_calls[1]), (
         "the same frame_index at two different origins must read different audio"
     )
+
+
+# --- detail restoration ---------------------------------------------------------
+#
+# Every test above uses an all-black driving frame, which has no high-frequency
+# residual at all - so restore_detail is a no-op there and those ten tests pass
+# whether it is wired into _render or deleted from it. These use a textured frame,
+# which is the only way to see it.
+
+
+def _textured(h, w):
+    """Fine checkerboard: energy at exactly the scale DETAIL_SIGMA separates."""
+    y, x = np.mgrid[0:h, 0:w]
+    return np.repeat((((x + y) % 2) * 90 + 70).astype(np.uint8)[..., None], 3, axis=2)
+
+
+def _lap(img):
+    return cv2.Laplacian(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+
+
+def test_restore_detail_is_a_noop_on_a_flat_frame():
+    """No texture to borrow means nothing is borrowed - not a scaled or shifted
+    version of the mouth, exactly the mouth."""
+    frame = np.full((200, 160, 3), 90, np.uint8)
+    mouth = np.full((120, 60, 3), 200, np.uint8)
+    assert np.array_equal(restore_detail(mouth, frame, BOX), mouth)
+
+
+def test_restore_detail_adds_the_frames_texture():
+    frame = np.zeros((200, 160, 3), np.uint8)
+    frame[BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
+    mouth = np.full((120, 60, 3), 128, np.uint8)
+    out = restore_detail(mouth, frame, BOX)
+    assert _lap(out) > _lap(mouth) * 10
+
+
+def test_restore_detail_does_not_wrap_around_uint8():
+    """The whole point of going via float32 and clipping. Naive uint8 addition
+    turns an over-bright pixel black and an under-dark one white, which would show
+    up as salt-and-pepper speckle on the mouth rather than as a soft error."""
+    frame = np.zeros((200, 160, 3), np.uint8)
+    frame[BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
+    for level in (0, 255):
+        out = restore_detail(np.full((120, 60, 3), level, np.uint8), frame, BOX)
+        assert out.min() >= 0 and out.max() <= 255
+        if level == 255:
+            assert out.max() == 255          # clipped, not wrapped to near-zero
+        else:
+            assert out.min() == 0
+
+
+def test_restore_detail_preserves_shape_and_dtype():
+    frame = np.zeros((200, 160, 3), np.uint8)
+    frame[BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
+    mouth = np.full((120, 60, 3), 128, np.uint8)
+    out = restore_detail(mouth, frame, BOX)
+    assert out.shape == mouth.shape and out.dtype == np.uint8
+
+
+def _frame_with_dot(at, value=255):
+    """A single bright pixel at `at` (row, col) *within the box*, on flat mid-grey.
+
+    A lone dot is the only fixture that pins position and sign at once, which the
+    earlier "did the Laplacian go up" assertions could not: reading a shifted
+    region still raises high-frequency energy, and so does adding the residual
+    with its sign flipped.
+    """
+    frame = np.full((200, 160, 3), 128, np.uint8)
+    frame[BOX[1] + at[0], BOX[0] + at[1]] = value
+    return frame
+
+
+def test_restore_detail_puts_the_texture_where_it_came_from():
+    """Reads `box`, aligned. A region shifted by even a few pixels moves the dot."""
+    at = (30, 15)
+    out = restore_detail(np.full((120, 60, 3), 128, np.uint8), _frame_with_dot(at), BOX)
+    gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+    assert np.unravel_index(int(gray.argmax()), gray.shape) == at
+
+
+def test_restore_detail_adds_the_residual_and_does_not_subtract_it():
+    """Sign. A bright spot in the driving frame must make that spot *brighter*;
+    inverting the residual darkens it instead, while leaving every "detail went up"
+    measure looking fine."""
+    at = (30, 15)
+    flat = np.full((120, 60, 3), 128, np.uint8)
+    out = restore_detail(flat, _frame_with_dot(at), BOX)
+    assert int(out[at][0]) > 128
+    dark = restore_detail(flat, _frame_with_dot(at, value=0), BOX)
+    assert int(dark[at][0]) < 128
+
+
+def test_larger_sigma_transfers_more():
+    """Sigma is the ghosting knob: it has to move detail monotonically, or the
+    value picked by inspecting the most-open frames means nothing."""
+    frame = np.zeros((200, 160, 3), np.uint8)
+    frame[BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
+    mouth = np.full((120, 60, 3), 128, np.uint8)
+    small = np.abs(
+        restore_detail(mouth, frame, BOX, sigma=0.6).astype(int) - 128
+    ).mean()
+    large = np.abs(
+        restore_detail(mouth, frame, BOX, sigma=3.0).astype(int) - 128
+    ).mean()
+    assert large > small
+
+
+def test_render_actually_restores_detail():
+    """The wiring test. With a textured driving frame the published JPEG must match
+    the restored composite, not the plain one."""
+    cache = _cache()
+    cache.frames[0, BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
+    ring = _distinct_tone_ring()
+    slot = Slot()
+    r = Renderer(engine=FakeEngine(), cache=cache, ring=ring, slot=slot)
+    r.render(frame_index=0, origin=0.0, fps=24.0)
+
+    got = cv2.imdecode(np.frombuffer(slot.get(), np.uint8), cv2.IMREAD_COLOR)
+    flat = np.full((120, 60, 3), 200, np.uint8)
+    plain = composite(cache.frames[0], flat, BOX, CROP_BOX, cache.masks[0])
+    restored = composite(
+        cache.frames[0],
+        restore_detail(flat, cache.frames[0], BOX),
+        BOX,
+        CROP_BOX,
+        cache.masks[0],
+    )
+    d_plain = np.abs(got.astype(int) - plain.astype(int)).mean()
+    d_restored = np.abs(got.astype(int) - restored.astype(int)).mean()
+    assert d_restored < d_plain / 2, (d_restored, d_plain)
