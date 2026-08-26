@@ -619,6 +619,26 @@ def test_supervised_restart_schedules_a_graceful_exit(
     assert resp.json() == {"restarted": True, "supervised": True}
 
 
+def test_supervised_restart_releases_the_face_stream_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exit this endpoint promises did not happen while a face page was open:
+    `/face/stream` is a response uvicorn cannot close, so the process sat in
+    `Waiting for connections to close` and launchd never revived it (measured, 6 of
+    8 restarts - daemon/MEASURED.md). So the bus is closed before the signal, and
+    the endpoint has to actually reach it - not just not error."""
+    app = create_app(_settings(tmp_path))
+    monkeypatch.setattr("daemon.admin.routes.is_supervised", lambda *a, **k: True)
+    monkeypatch.setattr("daemon.admin.restart._raise_sigterm", lambda: None)
+    closed: list[bool] = []
+    monkeypatch.setattr(app.state.face, "close", lambda: closed.append(True))
+
+    with TestClient(app, base_url=LOOPBACK) as client:
+        assert client.post("/admin/api/restart").status_code == 200
+
+    assert closed == [True], "the restart never released the face stream"
+
+
 def test_is_supervised_reads_the_supervisor_markers() -> None:
     assert is_supervised({}) is False
     assert is_supervised({"XPC_SERVICE_NAME": "ai.daemon.default"}) is True
