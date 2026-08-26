@@ -379,7 +379,6 @@ def test_a_queued_activity_cannot_go_stale():
 # session, this page's own ATTACK/RELEASE replayed over the captured levels. The
 # thresholds below are checked against these, not against taste.
 ENV_MEDIAN, ENV_P90, ENV_MAX = 0.233, 0.272, 0.315
-LONGEST_IDLE_GAP_S = 36.0
 
 
 def _const(name):
@@ -406,16 +405,24 @@ def test_the_loud_threshold_is_reachable_by_the_signal_it_is_compared_against():
     )
 
 
-def test_the_flourish_window_can_open_in_a_gap_that_actually_occurs():
-    """`flourish_arms` was equally unreachable, for the mirror-image reason: the
-    minimum wait was 40s and the longest uninterrupted idle stretch in a live
-    session was 36s, so the window never opened at all.
+def test_an_idle_clip_ending_does_not_push_the_flourish_deadline_away():
+    """Why `flourish_arms` never appeared, and it was not the interval.
+
+    `advance()` runs on every idle clip's `ended`, and an idle clip is about 8s while
+    the flourish wait is tens of seconds. Re-arming unconditionally there moved the
+    deadline further out than the clock advanced, so it could never be reached -
+    measured in a live page, flourishAt went 37.3s -> 73.1s while performance.now()
+    went 7.1s -> 35.7s. Re-arm only when disarmed: entering idle arms it, and tick()
+    zeroes it after one fires.
     """
-    lo, hi = _const("FLOURISH_MIN_MS") / 1000, _const("FLOURISH_MAX_MS") / 1000
-    assert lo <= LONGEST_IDLE_GAP_S, (
-        f"FLOURISH_MIN_MS={lo}s exceeds the longest measured idle stretch "
-        f"{LONGEST_IDLE_GAP_S}s - flourish_arms can never fire"
+    body = _without_line_comments(PAGE)
+    m = re.search(r'if \(activity === "idle"([^)]*)\)\s*scheduleFlourish\(\)', body)
+    assert m, "advance() no longer re-arms the flourish at all - tick() zeroes it once"
+    assert "!flourishAt" in m.group(1), (
+        "advance() re-arms the flourish unconditionally; an 8s idle clip ending then "
+        "pushes the deadline past where the clock can reach it"
     )
+    lo, hi = _const("FLOURISH_MIN_MS") / 1000, _const("FLOURISH_MAX_MS") / 1000
     assert lo < hi, "the flourish window has to be a window"
 
 

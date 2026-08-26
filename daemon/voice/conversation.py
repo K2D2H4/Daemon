@@ -777,7 +777,13 @@ class VoiceConversation:
         loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(0.04)
-            self._speech.pump(loop.time(), generating=self._generating)
+            # `resting="listening"`: the microphone is live for the whole of an open
+            # voice conversation, so an answer ending means listening, not idle.
+            # `idle` here was a zero-length blip the next microphone chunk
+            # immediately overwrote - measured at the end of every turn.
+            self._speech.pump(
+                loop.time(), generating=self._generating, resting="listening"
+            )
 
     # --- transcripts --------------------------------------------------------
 

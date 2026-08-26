@@ -2937,6 +2937,34 @@ async def test_a_gap_between_chunks_does_not_reach_the_page_as_idle() -> None:
     )
 
 
+async def test_an_answer_ending_hands_the_face_to_listening_not_idle() -> None:
+    """The call site again, not the capability. `SpeechClock.pump` grew `resting` and
+    `tests/test_face.py` proves it works; `_face_pump` has to actually pass it, and a
+    version that did not looked identical to every test that existed.
+
+    Measured on a live 6-turn session: `speaking -> idle -> listening` at the end of
+    all six turns, the `idle` lasting under a second before the next microphone chunk
+    overwrote it. Half the remaining sub-second noise, at exactly the moment the owner
+    is watching for the mouth to stop.
+    """
+    bus = RecordingBus()
+    session = FakeSession(b"\x00" * 4800, Hang())   # 100ms of audio, then the turn holds
+    conv = conversation(session, FakeAudio(), face=bus)
+
+    task = asyncio.create_task(conv.run())
+    await asyncio.sleep(0.05)
+    conv._generating = False          # the turn is done producing; the queue drains
+    await asyncio.sleep(0.2)
+    mid_conversation = list(bus.activities)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert "idle" not in mid_conversation, (
+        f"an answer ending published idle inside a live conversation: {mid_conversation}"
+    )
+    assert mid_conversation[-1] == "listening"
+
+
 # --- a late user transcript must not put `thinking` over a live answer --------
 
 
@@ -3089,6 +3117,11 @@ async def test_face_pump_ticks_the_falling_edge_on_a_real_clock() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    assert bus.activities == ["speaking", "idle"], (
+    # `listening`, not `idle`: the falling edge lands on the caller's resting state
+    # and inside a live conversation that is listening (see
+    # `test_an_answer_ending_hands_the_face_to_listening_not_idle`). What this test
+    # is for is unchanged - that the timer reaches the falling edge at all, on its
+    # own monotonic clock.
+    assert bus.activities == ["speaking", "listening"], (
         "the timer never ticked the falling edge on its own real clock"
     )
