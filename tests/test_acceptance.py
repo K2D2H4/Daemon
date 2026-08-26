@@ -2220,8 +2220,12 @@ async def test_the_wake_round_hands_a_waiting_line_to_the_speaker(
             return
             yield  # pragma: no cover - makes this an async generator
 
-    async def close_gate() -> None:
+    async def close_gate() -> bool:
+        # True is "the device really came back", which is what `build_wake_gate`'s
+        # closer now answers: the round refuses to open anything on a microphone
+        # whose release never finished (daemon/voice/audio.py:wait_for_input_release).
         closed.append(True)
+        return True
 
     async def fake_build(settings: Any) -> tuple[Any, Any]:
         return StoodDownGate(), close_gate

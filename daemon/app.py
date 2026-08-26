@@ -1910,17 +1910,39 @@ async def _wake_round(
         # `running` (see WakeGate's dead-stream handling).
         state.wake_gate = gate
     fired = None
+    # Held rather than iterated anonymously, because the handover depends on *when*
+    # this generator is finalised. `async for gate.listen()` leaves that to the
+    # garbage collector: breaking out drops the last reference, CPython schedules the
+    # `aclose()` on a later loop turn, and `record`'s `finally` - the one that hands
+    # the microphone to its release thread - had not run yet by the time the session
+    # below built a second CoreAudio client on the same device. That race deadlocked
+    # the resident (see `close_gate` and daemon/voice/audio.py:wait_for_input_release).
+    listening = gate.listen()
+    released = True
     try:
-        async for event in gate.listen():
+        async for event in listening:
             fired = event
             break
     finally:
         if state is not None:
             state.wake_gate = None
         # Before the conversation, not after: this is what hands the microphone over
-        # and stops the gate hearing what happens next.
+        # and stops the gate hearing what happens next. `aclose()` first, so the
+        # release is under way and `close_gate` has something to wait for.
         with suppress(Exception):
-            await close_gate()
+            await listening.aclose()
+        with suppress(Exception):
+            released = await close_gate()
+    if not released:
+        # The microphone never came back. Opening a session now means building a
+        # VoiceProcessing engine on a device that is already wedged, which is what
+        # turned a stuck stop into a daemon that never heard another word - so the
+        # round is lost instead, loudly, and the caller comes back around. Paced on
+        # the way out for the reason WAKE_RETRY_SECONDS exists: the next round opens
+        # a fresh capture on the same wedged device and parks another thread on it,
+        # and an unpaced return would do that as fast as the process can manage.
+        await asyncio.sleep(WAKE_RETRY_SECONDS)
+        return
     if fired is None:
         # The stream ended without a wake word - a closed device, a test's scripted
         # audio running out, the gate's own dead-stream watchdog asking to be
@@ -2174,7 +2196,7 @@ def build_voice_audio() -> AudioIO:
 
 async def build_wake_gate(
     settings: Settings,
-) -> tuple[WakeGate, Callable[[], Awaitable[None]]]:
+) -> tuple[WakeGate, Callable[[], Awaitable[bool]]]:
     """The always-on gate and the coroutine that releases the microphone.
 
     A gate rather than a bare stream of events, because `WakeGate.counters` is the
@@ -2207,9 +2229,29 @@ async def build_wake_gate(
         cooldown_seconds=settings.wake_cooldown_seconds,
     )
 
-    async def close() -> None:
+    async def close() -> bool:
+        """Release the device and wait for it to actually be gone. True if it is.
+
+        Two halves, and the second is the one the handover needs. `audio.close()`
+        is the speaker; the microphone is let go by `record`'s `finally`, which hands
+        the stream to a detached thread and returns - so without the wait this
+        returns while `Pa_StopStream` is still inside CoreAudio. Anything that then
+        opens a second client on the same device races it, and the two deadlock
+        (daemon/voice/audio.py:wait_for_input_release). The caller must have closed
+        the gate's stream before calling this, or there is nothing to wait on yet.
+        """
         with suppress(Exception):
             await audio.close()
+        released = True
+        with suppress(Exception):
+            released = await audio.wait_for_input_release()
+        if not released:
+            logger.error(
+                "wake: the microphone did not come back after the gate let it go; "
+                "the capture device is wedged inside CoreAudio and nothing in this "
+                "process can free it - a restart is the only fix"
+            )
+        return released
 
     return gate, close
 

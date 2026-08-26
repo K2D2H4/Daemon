@@ -388,6 +388,112 @@ async def test_a_wedged_stream_stop_does_not_freeze_teardown() -> None:
     assert stream.closed
 
 
+async def test_the_input_release_can_be_waited_for_after_aclose() -> None:
+    """The handover the wake gate needs, and the one `aclose()` cannot give it.
+
+    The release runs on a detached thread precisely so a wedged `Pa_StopStream`
+    cannot take the loop with it, which means `aclose()` returns while the stop is
+    still inside CoreAudio. That is right for a microphone nobody wants back, and
+    wrong for the wake->voice handover: the next thing the daemon does there is build
+    a macOS VoiceProcessing engine on the same device, and the two clients then take
+    CoreAudio's HAL mutex and the AudioUnit's recursive mutex in opposite orders.
+    Sampled on the resident (2026-08-26): four threads at `__psynch_mutexwait`, one
+    under `Pa_StopStream` and one under `AVAudioIOUnit::IOUnitPropertyListener`,
+    wedged until the process was killed - the daemon stayed up and never heard
+    another word.
+
+    So the caller needs something to wait on that outlasts the generator. Bounded and
+    reported, never raised: a release that will not finish is a device already lost,
+    and the caller's job is to know that, not to hang on it."""
+    stopping = threading.Event()
+
+    class SlowStream(FakeStream):
+        def stop(self) -> None:
+            stopping.wait(5.0)  # still inside Pa_StopStream when aclose() returns
+            super().stop()
+
+    class SlowBackend(FakeSoundDevice):
+        def RawInputStream(self, **kwargs: Any) -> FakeStream:  # noqa: N802
+            stream = SlowStream(**kwargs)
+            self.inputs.append(stream)
+            return stream
+
+    backend = SlowBackend()
+    io = SoundDeviceAudio(backend=backend)
+    blocks = io.record()
+
+    async def push() -> None:
+        await asyncio.sleep(0)
+        backend.inputs[0].feed(b"\x00\x00")
+
+    task = asyncio.create_task(push())
+    async with asyncio.timeout(5):
+        async for _ in blocks:
+            break
+    await task
+    async with asyncio.timeout(5):
+        await blocks.aclose()
+
+    (stream,) = backend.inputs
+    assert not stream.closed, "the premise: aclose() returns before the device is let go"
+
+    waiting = asyncio.create_task(io.wait_for_input_release())
+    await asyncio.sleep(0)
+    assert not waiting.done(), "the wait returned while the stop was still running"
+
+    stopping.set()
+    async with asyncio.timeout(5):
+        assert await waiting is True
+    assert stream.closed, "the wait came back before the device was released"
+
+
+async def test_waiting_for_a_wedged_input_release_gives_up_and_says_so() -> None:
+    """A stop that never returns must cost the caller a bounded wait and a `False`,
+    not the round. The handover is better off knowing the device is gone than
+    hanging on it - and better off than today's alternative, which was to open a
+    second CoreAudio client on top of it."""
+    never_returns = threading.Event()
+
+    class WedgingStream(FakeStream):
+        def stop(self) -> None:
+            never_returns.wait()
+            super().stop()
+
+    class WedgingBackend(FakeSoundDevice):
+        def RawInputStream(self, **kwargs: Any) -> FakeStream:  # noqa: N802
+            stream = WedgingStream(**kwargs)
+            self.inputs.append(stream)
+            return stream
+
+    backend = WedgingBackend()
+    io = SoundDeviceAudio(backend=backend)
+    blocks = io.record()
+
+    async def push() -> None:
+        await asyncio.sleep(0)
+        backend.inputs[0].feed(b"\x00\x00")
+
+    task = asyncio.create_task(push())
+    async with asyncio.timeout(5):
+        async for _ in blocks:
+            break
+    await task
+    await blocks.aclose()
+
+    try:
+        async with asyncio.timeout(5):
+            assert await io.wait_for_input_release(within=0.05) is False
+    finally:
+        never_returns.set()  # let the parked thread finish so it does not outlive us
+
+
+async def test_waiting_with_nothing_to_release_is_free() -> None:
+    """The ordinary case - no stream was ever opened, or the last one is long gone -
+    must not cost a thread hop on the handover's latency path."""
+    io = SoundDeviceAudio(backend=FakeSoundDevice())
+    assert await io.wait_for_input_release() is True
+
+
 async def test_a_wedged_stream_open_does_not_freeze_the_loop() -> None:
     """The other face of the daemon-freeze regression - the one v0.1.45 did not cover.
 

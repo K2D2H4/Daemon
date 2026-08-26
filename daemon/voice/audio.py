@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -54,6 +55,15 @@ reported periodically rather than logged one by one."""
 CLOSE_TIMEOUT_SECONDS = 2.0
 """How long `close` waits for the speaker to come back before giving up on
 closing the device. See `close`."""
+
+INPUT_RELEASE_TIMEOUT_SECONDS = 2.0
+"""How long `wait_for_input_release` waits for a detached microphone release.
+
+Generous rather than tuned: with no other client on the device a `Pa_StopStream`
+returns in well under a millisecond, so anything still running after two seconds is
+not slow, it is wedged - and the caller needs to be told that rather than kept
+waiting. Same value as the speaker's for the same reason, not because the two
+measure the same thing."""
 
 _STOP = b""
 """Sentinel that ends the playback writer. Safe as a queue value because `play`
@@ -128,6 +138,9 @@ class SoundDeviceAudio:
         self._device = asyncio.Lock()
         self.dropped_blocks = 0
         """Microphone blocks thrown away because the consumer fell behind."""
+        self._releases: list[threading.Thread] = []
+        """Detached release threads nobody has waited for yet. See
+        `wait_for_input_release`, which is the only reader and empties it."""
 
     def _module(self) -> Any:
         if self._backend is None:
@@ -189,12 +202,16 @@ class SoundDeviceAudio:
             # rather than `to_thread` so a wedged release parks one thread instead of
             # burning a pool worker that playback needs. The thread holds `stream`, so
             # it is not collected mid-release.
-            threading.Thread(
+            thread = threading.Thread(
                 target=_release_input_stream,
                 args=(stream,),
                 name="voice-mic-release",
                 daemon=True,
-            ).start()
+            )
+            # Remembered before it is started, so `wait_for_input_release` cannot miss
+            # a release that finishes between the two lines.
+            self._releases.append(thread)
+            thread.start()
 
         with mic_hold.hold():
             # The open runs off the loop on its own thread, for the same reason the
@@ -252,6 +269,41 @@ class SoundDeviceAudio:
                     opened.cancel()
                 elif not opened.cancelled() and opened.exception() is None:
                     release_off_loop(opened.result())
+
+    async def wait_for_input_release(
+        self, within: float = INPUT_RELEASE_TIMEOUT_SECONDS
+    ) -> bool:
+        """Wait for every detached microphone release to finish. True if they did.
+
+        `record`'s `finally` hands the stream to a thread and returns, so `aclose()`
+        is the moment the daemon *stopped using* the microphone, not the moment
+        CoreAudio got it back. Anything that opens a second client on the same device
+        needs the later of the two: the wake gate's PortAudio stream and a session's
+        macOS VoiceProcessing engine, started while the first was still stopping,
+        deadlocked the pair of them on the resident (see `_release_input_stream` and
+        `daemon/app.py:_wake_round`).
+
+        Never raises and never blocks the loop - the join runs on a worker, and a
+        release that outlives the bound is reported as `False` rather than waited on
+        forever, because a stop that has not returned by then is a device already
+        lost and the caller has a decision to make about that.
+
+        `within` rather than `timeout`: what is bounded is a `Thread.join`, and an
+        `asyncio.timeout` around it - which is what the name `timeout` invites, and
+        what ASYNC109 would have this be - cannot cancel a join. It would abandon the
+        worker and report a lie.
+        """
+        pending, self._releases = self._releases, []
+        if not pending:
+            return True
+
+        def join_all() -> bool:
+            deadline = time.monotonic() + within
+            for thread in pending:
+                thread.join(max(0.0, deadline - time.monotonic()))
+            return not any(thread.is_alive() for thread in pending)
+
+        return await asyncio.to_thread(join_all)
 
     async def play(self, chunk: bytes) -> None:
         """Queue a chunk. Returns immediately.
