@@ -10,7 +10,15 @@ checked by `evals/face_lipsync_numerics.py`, against the real weights, by hand,
 outside CI.
 """
 
-from daemon.face_lipsync.loader import needs_split, rename, unet_config
+import numpy as np
+
+from daemon.face_lipsync.loader import (
+    needs_split,
+    rename,
+    taesd_rename,
+    taesd_to_mlx,
+    unet_config,
+)
 
 
 def test_attention_projections_are_renamed():
@@ -48,3 +56,78 @@ def test_musetalk_config_differs_from_stable_diffusion_in_exactly_three_fields()
     # up_block_types is reversed, as mlx-examples' own loader does
     assert got["up_block_types"][0] == "CrossAttnUpBlock2D"
     assert got["up_block_types"][-1] == "UpBlock2D"
+
+
+# --- TAESD, which answers the transpose question the other way ------------------
+#
+# The UNet's weights are pre-converted and must be left alone; TAESD's come from
+# upstream PyTorch and must be transposed. Both failure modes are silent - the model
+# runs and returns an image of the right shape either way - so these are the only
+# place in CI where the distinction is checked. Numerics against the real decoder are
+# in `evals/face_lipsync_numerics.py`.
+
+# The real decoder's structure, from diffusers' own module tree: 19 slots, of which
+# these 13 carry parameters. Three convolutions are bias-free.
+_DECODER_SLOTS = (0, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18)
+_BLOCK_SLOTS = (2, 3, 4, 7, 8, 9, 12, 13, 14, 17)
+
+
+def test_a_blocks_three_convolutions_keep_their_identity():
+    """diffusers indexes them 0/2/4 inside a Sequential whose 1 and 3 are ReLUs.
+    Renumbering them 0/1/2 would load the second convolution's weights into the
+    third and still run."""
+    assert taesd_rename("decoder.layers.2.conv.0.weight") == "layer_2.conv0.weight"
+    assert taesd_rename("decoder.layers.2.conv.2.bias") == "layer_2.conv2.bias"
+    assert taesd_rename("decoder.layers.2.conv.4.weight") == "layer_2.conv4.weight"
+
+
+def test_plain_convolutions_map_straight_through():
+    assert taesd_rename("decoder.layers.0.weight") == "layer_0.weight"
+    assert taesd_rename("decoder.layers.6.weight") == "layer_6.weight"
+    assert taesd_rename("decoder.layers.18.bias") == "layer_18.bias"
+
+
+def test_the_encoder_half_is_dropped_not_mapped():
+    """It ships in the same file and is dead weight - loading it would double the
+    resident cost of a model chosen for being small."""
+    assert taesd_rename("encoder.layers.0.weight") is None
+    assert taesd_rename("encoder.layers.4.conv.0.weight") is None
+
+
+def test_every_real_decoder_key_maps_somewhere_distinct():
+    """A collision would leave one parameter filled twice and another never filled,
+    which `Decoder.update` does not complain about."""
+    keys = []
+    for i in _DECODER_SLOTS:
+        if i in _BLOCK_SLOTS:
+            keys += [
+                f"decoder.layers.{i}.conv.{c}.{p}"
+                for c in (0, 2, 4)
+                for p in ("weight", "bias")
+            ]
+        else:
+            keys += [f"decoder.layers.{i}.weight", f"decoder.layers.{i}.bias"]
+    mapped = [taesd_rename(k) for k in keys]
+    assert all(m is not None for m in mapped)
+    assert len(set(mapped)) == len(mapped)
+
+
+def test_the_transpose_is_out_height_width_in_and_not_its_mirror():
+    """(0, 2, 3, 1), not (0, 3, 2, 1). Both produce a 4-D array MLX accepts and a
+    square kernel makes them indistinguishable by shape, so this uses distinct
+    extents on every axis."""
+    w = np.zeros((5, 4, 3, 2), np.float32)          # out, in, kH, kW
+    assert taesd_to_mlx("decoder.layers.0.weight", w).shape == (5, 3, 2, 4)
+
+
+def test_biases_are_not_transposed():
+    b = np.zeros((64,), np.float32)
+    assert taesd_to_mlx("decoder.layers.0.bias", b).shape == (64,)
+
+
+def test_the_transpose_decision_is_by_rank_not_by_name():
+    """Matching on "weight" in the key would also catch a bias if diffusers ever
+    renamed one, and a 1-D transpose(0, 2, 3, 1) raises rather than degrading."""
+    odd = np.zeros((7, 6, 5, 4), np.float32)
+    assert taesd_to_mlx("anything.at.all", odd).shape == (7, 5, 4, 6)
+    assert taesd_to_mlx("decoder.layers.0.weight", np.zeros((3,), np.float32)).shape == (3,)
