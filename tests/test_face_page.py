@@ -375,13 +375,56 @@ def test_a_queued_activity_cannot_go_stale():
     )
 
 
+# Envelope measured off the running resident's /face/stream, one live 8-turn voice
+# session, this page's own ATTACK/RELEASE replayed over the captured levels. The
+# thresholds below are checked against these, not against taste.
+ENV_MEDIAN, ENV_P90, ENV_MAX = 0.233, 0.272, 0.315
+LONGEST_IDLE_GAP_S = 36.0
+
+
+def _const(name):
+    """The numeric value of a top-level `const NAME = <number>` in the page."""
+    m = re.search(rf"\b{name}\s*=\s*([0-9.]+)", _without_line_comments(PAGE))
+    assert m, f"{name} is gone from the page"
+    return float(m.group(1))
+
+
+def test_the_loud_threshold_is_reachable_by_the_signal_it_is_compared_against():
+    """`speaking_loud` shipped unreachable: LOUD_ENTER was 0.62 against an envelope
+    whose measured maximum is 0.315, so a rendered clip could never play once. The
+    guard is the measurement, not a literal - any threshold above what the signal
+    reaches is the same bug again, however it got there.
+    """
+    loud = _const("LOUD_ENTER")
+    assert loud <= ENV_MAX, (
+        f"LOUD_ENTER={loud} is above the measured envelope maximum {ENV_MAX} - "
+        "speaking_loud can never engage"
+    )
+    assert loud > ENV_MEDIAN, (
+        f"LOUD_ENTER={loud} is at or below the median {ENV_MEDIAN} - speaking_loud "
+        "would be the normal case rather than the emphatic one"
+    )
+
+
+def test_the_flourish_window_can_open_in_a_gap_that_actually_occurs():
+    """`flourish_arms` was equally unreachable, for the mirror-image reason: the
+    minimum wait was 40s and the longest uninterrupted idle stretch in a live
+    session was 36s, so the window never opened at all.
+    """
+    lo, hi = _const("FLOURISH_MIN_MS") / 1000, _const("FLOURISH_MAX_MS") / 1000
+    assert lo <= LONGEST_IDLE_GAP_S, (
+        f"FLOURISH_MIN_MS={lo}s exceeds the longest measured idle stretch "
+        f"{LONGEST_IDLE_GAP_S}s - flourish_arms can never fire"
+    )
+    assert lo < hi, "the flourish window has to be a window"
+
+
 def test_the_loud_switch_reads_the_envelope_and_the_envelope_is_recorded():
-    # Two things, both from the same measurement gap. LOUD_ENTER gated on the raw
-    # per-tick level, which spec 3.4 itself calls too jittery to use directly -
-    # one sub-threshold 40ms tick reset the hold - so it reads the smoothed
-    # envelope now. The threshold is deliberately NOT retuned: spec open question
-    # 3 ("keep speaking_loud?") is supposed to be settled by v1's own data and
-    # nothing was recording any, so the page logs the distribution instead.
+    # LOUD_ENTER gated on the raw per-tick level, which spec 3.4 itself calls too
+    # jittery to use directly - one sub-threshold 40ms tick reset the hold - so it
+    # reads the smoothed envelope now. The threshold itself is now a measurement;
+    # the two tests above hold it to that. logEnvelope() stays because one session
+    # on one voice is what those numbers are, and the next move needs more.
     body = _onmessage_body()
     assert "env >= LOUD_ENTER" in body, (
         "the loud switch must read the smoothed envelope, not the raw level"
