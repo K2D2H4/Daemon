@@ -415,6 +415,27 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   (ADR 0016) - `silence` measured **30/30 spoke, 0/30 demanding shape** (n=30,
   `gemini-3.6-flash`). The scarcity this entry measured was real and is why both ADRs
   exist; it is no longer a description of what the judge does.
+- **The proactive search buys content on two entity names out of six, and invented a
+  whole new failure on the other four (2026-08-26).** ADR 0015's reversal test was first
+  run before ADR 0016 flipped the judge's default, so it measured a prompt that no longer
+  ships; the re-run is the number that counts. Live search results for six of this owner's
+  real entities, `gemini-3.6-flash`, n=30, every line hand-audited because
+  `_carries_concrete_fact` scores any Latin run as content and would have passed a
+  contentless opener that merely names the entity. **The predicted failure barely
+  happened**: obvious chaff was still declined with no help from any instruction —
+  `Sendbird` (a job posting, an Instagram page, a salary table) silent 5/5, `ReadyTalk`
+  (`Breakfast is ready talk to ya later.`) silent 5/5, `Kiwi` (the bird, the fruit)
+  silent 5/5. **A different failure did**: `Daemon` returns House of the Dragon's Daemon
+  Targaryen, and 3 of 5 lines asked the owner — whose `Daemon` is this project — whether
+  he was waiting for season 3. Chaff is declined because it reads as chaff; a namesake
+  reads as material, and the model has plenty to say about the wrong subject. Naming the
+  shapes in `topics.render` (a namesake person or character, a same-named product, a
+  dictionary entry for the word) put `Daemon` at 5/5 on the project and 0/5 on the
+  character, and `Kiwi` back on the owner's own. Two lessons worth more than the fix:
+  a confidently wrong line is a worse failure mode than an empty one and no instruction
+  to be quiet in general catches it, and **an entity name is a search query only for
+  names the web knows the way its owner does** — for the rest the search is discarded
+  work and the line is an ordinary check-in.
 - **Half-duplex was leaking the daemon's own voice into memory as the owner's words,
   and the tell is that every leak is a *tail* (2026-08-19).** `DAEMON_VOICE_BARGE_IN=
   false` was set and `apple audio: ... echo cancellation on` was in the log, yet

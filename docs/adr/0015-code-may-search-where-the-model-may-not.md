@@ -111,6 +111,33 @@ goes back and the three offline generators stay.
 Four ADRs in this file were overturned by measurement. This one names its own
 test in advance so it can be the fifth without an argument.
 
+**Run 2026-08-25 (n=30 paired, `gemini-3.6-flash`): not overturned, but weaker
+than this ADR implies.** With the search, a topic line carried a concrete fact
+6/30 and 3/30 on two interleaved runs; without it, **0/30 both times**. No URL
+reached an utterance in 60 trials. So the line does not read the same either
+way, and the reversal condition is not met.
+
+**Re-run 2026-08-26, after ADR 0016 flipped the judge's default, and this is
+the number to carry forward.** The first run measured search-vs-no-search under
+a prompt that no longer exists. Re-measured against live results for six of the
+owner's real entities, the search pays off on **two of six**: `Emil Kowalski`
+(`Animation Best Practices 정리글 보셨어요?`) and `llm-wiki` (`AI가 알아서
+지식베이스 정리해주는 도구들 요즘 좀 보이더라고요`). For the other four the titles
+are discarded as belonging to a different subject of the same name, and the line
+that survives — `요즘 데몬 작업은 잘 돼가요?` — is one the daemon could have said
+with no search at all.
+
+That is the honest shape of it: the search earns its boundary change on entity
+names the web knows *as the owner knows them*, and buys nothing on names that
+collide with something famous. It is not "reads the same either way", so this
+decision stands. But anyone re-reading this ADR to justify widening the surface
+further should start from two-of-six, not from 6/30-vs-0/30.
+
+The same re-run found what the titles cost when they are *not* discarded, which
+is recorded in `daemon/proactivity/topics.py:render` rather than here because
+the fix lives there: `Daemon` returns House of the Dragon, and before the frame
+named the same-name shapes, 3 of 5 lines asked this owner about season 3.
+
 **A separate note, added after five rounds of hardening `has_url` (2026-08-25):**
 a `topic` candidate whose own entity name reads as a pointer (`daemon/proactivity/judge.py:has_url`
 returns true for it) is dropped before the search or the model call runs — it is

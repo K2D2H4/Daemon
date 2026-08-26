@@ -102,6 +102,41 @@ def test_the_link_instruction_names_concrete_shapes() -> None:
         assert shape in block, f"{shape!r} not named in the frame"
 
 
+def test_the_same_name_instruction_names_concrete_shapes() -> None:
+    """The measured failure this frame exists to stop is not an empty opener - it
+    is a confident line about *someone else's* subject. Whole-branch review,
+    n=30 against live search results: `Daemon` returns House of the Dragon's
+    Daemon Targaryen, and 3 of 5 lines asked this owner - whose `Daemon` is his
+    own project - about season 3. Obvious chaff was already declined without any
+    help (`Sendbird` -> a salary table, silent 5/5; `Kiwi` -> the bird and the
+    fruit, silent 5/5), so a generic "say nothing if there is nothing here" was
+    both useless against this and in direct conflict with `judge.SYSTEM`, whose
+    default is now to speak (ADR 0016).
+
+    Same reasoning as `test_the_link_instruction_names_concrete_shapes` above:
+    the shapes are named because this frame's own round-1 finding is that the
+    abstract version gets ignored. After naming them, the same probe put
+    `Daemon` at 5/5 on the project and 0/5 on the TV character.
+    """
+    block = topics.render("Daemon", ["What makes Daemon Targaryen likable"], "ab12")
+
+    for shape in ("같은 이름", "등장인물", "사전", "없는 셈"):
+        assert shape in block, f"{shape!r} not named in the frame"
+
+
+def test_unusable_titles_hand_the_turn_back_rather_than_forcing_silence() -> None:
+    """Discarding the titles must not also decide the utterance. With nothing
+    usable left, a `topic` candidate becomes an ordinary check-in about a thing
+    the owner actually wrote down - which is the shape he asked for - so the
+    frame sends the model back to the reason instead of overriding
+    `judge.SYSTEM`. The old wording ("아무 말도 하지 않는 것이 정답이다") decided it
+    here, one prompt contradicting itself two blocks apart."""
+    block = topics.render("Daemon", ["What makes Daemon Targaryen likable"], "ab12")
+
+    assert "이유에 적힌 것만 가지고 판단해라" in block
+    assert "아무 말도 하지 않는 것이 정답이다" not in block
+
+
 def test_no_titles_means_no_block() -> None:
     """A candidate whose search found nothing must be dropped, not spoken. Four
     content-free topic openers a day is `재미난 얘기 있어요?` with a different noun."""
