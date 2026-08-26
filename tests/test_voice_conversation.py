@@ -2827,6 +2827,31 @@ async def test_a_turn_the_model_never_answers_gives_the_microphone_back() -> Non
     assert session.sent == [b"asking again"]
 
 
+async def test_the_hold_is_armed_before_recall_settles() -> None:
+    """Ordering, not presence, and the two are easy to confuse.
+
+    `_settle_recall` is awaited on the owner's transcript and puts context on the
+    wire; arming after it would leave the microphone streaming the room for however
+    long recall takes, on every single turn - the window this hold exists to close,
+    reopened by a tidy-up that groups the arming with the face publish below it.
+    Every other test here would stay green."""
+    session = FakeSession()
+    conv = conversation(session)
+    armed_when_recall_ran: list[bool] = []
+    original = conv._settle_recall
+
+    async def spy(session_: Any, text: str) -> Any:
+        armed_when_recall_ran.append(conv._answer_hold_until > 0.0)
+        return await original(session_, text)
+
+    conv._settle_recall = spy  # type: ignore[method-assign]
+    await conv._on_transcript(session, Transcript(text="뭐 하고 있어?", role="user", final=True))
+
+    assert armed_when_recall_ran == [True], (
+        "recall ran with the microphone still open to the room"
+    )
+
+
 async def test_a_late_user_transcript_does_not_hold_the_microphone_mid_answer() -> None:
     """The hold must not become a six-second barge-in switch.
 

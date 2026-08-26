@@ -822,7 +822,8 @@ class VoiceConversation:
             # the face publisher under it for another, and they must agree - both are
             # asking "is the daemon talking right now", and the playback clock is the
             # authority on that here exactly as it is in `_forward_microphone`.
-            answering = asyncio.get_running_loop().time() < self._playback_until
+            loop = asyncio.get_running_loop()
+            answering = loop.time() < self._playback_until
             if not answering:
                 # The owner has finished; the answer has not started. Until it does,
                 # the room must not reach the server, or the server reads it as the
@@ -838,9 +839,16 @@ class VoiceConversation:
                 # arming here would hold the microphone through the rest of the answer
                 # - barge-in switched off for six seconds by a clock the owner never
                 # touched.
-                self._answer_hold_until = (
-                    asyncio.get_running_loop().time() + ANSWER_HOLD_SECONDS
-                )
+                #
+                # Which leaves a turn the owner *barged in* with unguarded, and that
+                # is a limit rather than an oversight: the same microphone cannot be
+                # both open for the interruption and shut for the answer that follows
+                # it. Half-duplex (`DAEMON_VOICE_BARGE_IN=false`) has no such turns and
+                # is fully covered; with barge-in on, an interrupting turn keeps the
+                # cancellation window this guard closes everywhere else. Nothing has
+                # measured how often that costs an answer - the owner's own numbers
+                # were taken half-duplex (daemon/MEASURED.md).
+                self._answer_hold_until = loop.time() + ANSWER_HOLD_SECONDS
             if self._face is not None and not answering:
                 # The owner's utterance just settled - the request is now fully
                 # made, and whatever answer is coming has not arrived yet. The same

@@ -2275,8 +2275,11 @@ async def test_a_round_that_ends_with_an_empty_mailbox_speaks_nothing(
             yield  # pragma: no cover
 
     async def fake_build(settings: Any) -> tuple[Any, Any]:
-        async def close_gate() -> None:
-            return None
+        async def close_gate() -> bool:
+            # True is "the device really came back". Returning `None` here read as a
+            # wedged microphone and made `_wake_round` return before `mic_floor.take`
+            # was ever reached - so this test passed while proving nothing.
+            return True
 
         return EndedGate(), close_gate
 

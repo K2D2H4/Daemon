@@ -70,6 +70,13 @@ class FakeAudio:
     async def close(self) -> None:
         self.closed += 1
 
+    async def wait_for_input_release(self, within: float | None = None) -> bool:
+        # No detached release to wait for without a real PortAudio stream, so the
+        # device is already back. Present rather than absent on purpose: the gate's
+        # closer calls this unguarded, so a fake missing it fails the round loudly
+        # instead of quietly reporting a microphone it never checked.
+        return True
+
 
 @dataclass
 class FakeRecognizer:

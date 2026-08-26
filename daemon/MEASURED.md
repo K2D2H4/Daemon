@@ -798,7 +798,15 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   same mangled-residual signature as the 2026-08-19 entry above, Spanish and all.
 
   `_answer_hold_until` (was `_opening_answer_until`) is now armed on every settled
-  owner transcript, not only the wake-word opening. **Not yet measured live**: the
+  owner transcript, not only the wake-word opening - except on a turn the owner
+  *barged in* with, where the answer to the previous turn is still playing. That
+  exception is a limit, not a gap left open by accident: one microphone cannot be
+  both open for the interruption and shut for the answer that follows it. So
+  half-duplex (`DAEMON_VOICE_BARGE_IN=false`, what these numbers were taken under)
+  is fully covered and the default is not, and **nobody has measured what the
+  uncovered case costs** - a barge-in-on day would need its own count.
+
+  **Not yet measured live**: the
   fix is argued from the two cases already fixed the same way, and the honest check
   is the same 30-trial-per-arm shape the `realtimeInput.text` entry above needed -
   count unanswered turns, do not run one session and call it settled.

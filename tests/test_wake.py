@@ -983,6 +983,92 @@ async def test_a_wake_round_lets_the_microphone_go_before_the_session_opens(
     ], "the session was built on a microphone the gate had not finished releasing"
 
 
+async def test_a_closer_that_raises_is_not_read_as_a_released_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed, because the alternative is the silent one.
+
+    `released` starts True so that the ordinary path reads well, which means any
+    swallowed error - a closer that raises, a backend with no
+    `wait_for_input_release` at all - leaves it True and the protection quietly
+    gone, with the log saying nothing. A daemon that opens no sessions is noticed on
+    the first wake word; a daemon that raced again is noticed weeks later, if ever.
+    """
+    _, microphone = fake_machine(monkeypatch)
+    app = app_module()
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+
+    real_build = app.build_wake_gate  # captured before the patch, or this recurses
+
+    async def exploding_build(_settings: Any) -> tuple[Any, Any]:
+        gate, _close = await real_build(_settings)
+
+        async def close_gate() -> bool:
+            raise RuntimeError("the closer is broken")
+
+        return gate, close_gate
+
+    async def fake_run_voice(_settings: Any, **kwargs: Any) -> int:
+        microphone.log.append("voice session opened")
+        return 0
+
+    monkeypatch.setattr(app, "build_wake_gate", exploding_build)
+    monkeypatch.setattr(app, "run_voice", fake_run_voice)
+    monkeypatch.setattr(app, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    await app._wake_round(settings)
+
+    assert "voice session opened" not in microphone.log
+
+
+async def test_a_dropped_wake_word_says_it_was_dropped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The gate logs `wake: heard ...` from `daemon.voice.wake` before the round
+    decides anything, so a round that then throws the event away in silence leaves a
+    log that reads as a matched wake word followed by an unrelated device error -
+    the "went deaf with nothing saying why" shape `_wake_forever` exists to remove."""
+    _, microphone = fake_machine(monkeypatch)
+    microphone.release_finishes = False
+    app = app_module()
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+    monkeypatch.setattr(app, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    with caplog.at_level("ERROR"):
+        await app._wake_round(settings)
+
+    assert "루시" in caplog.text, "the log never says which wake word went unanswered"
+
+
+async def test_a_wedged_microphone_answers_a_waiting_proactive_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`mic_floor.take`'s contract is that the taker owes the future exactly one
+    answer, and its docstring says a dropped one "turns a fallback into a
+    two-and-a-half-minute stall". Returning early on a wedged device skipped the
+    take entirely, so the line sat out its own timeout instead of being told at once
+    that the microphone is gone and it should go to Telegram."""
+    from daemon import mic_floor
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    _, microphone = fake_machine(monkeypatch)
+    microphone.blocks = []
+    microphone.release_finishes = False
+    app = app_module()
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+    monkeypatch.setattr(app, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+    await app._wake_round(settings)
+
+    async with asyncio.timeout(1):
+        assert await asked == "not-spoken", "the waiting line was left to time out"
+
+
 async def test_a_proactive_line_also_waits_for_the_microphone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1046,13 +1132,20 @@ async def test_a_wake_round_does_not_open_a_session_on_a_wedged_microphone(
 
     monkeypatch.setattr(app, "run_voice", fake_run_voice)
     monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
-    # The lost round is paced on the way out (a fresh capture on a wedged device
-    # parks another thread), and this test is not the place to spend that floor.
-    monkeypatch.setattr(app, "WAKE_RETRY_SECONDS", 0.0)
+    # Small rather than zero: the floor itself is asserted below, and the real 5 s is
+    # not worth spending to prove a `>=`.
+    monkeypatch.setattr(app, "WAKE_RETRY_SECONDS", 0.05)
 
+    started = asyncio.get_running_loop().time()
     await app._wake_round(settings)
+    elapsed = asyncio.get_running_loop().time() - started
 
     assert "voice session opened" not in microphone.log
+    # And paced on the way out. Without the floor `_wake_forever` comes straight back
+    # around, opens a fresh capture on the same wedged device and parks another
+    # `voice-mic-open` thread on the mutex that is already stuck. Asserted because
+    # deleting that sleep looks exactly like removing a redundant line.
+    assert elapsed >= 0.05, "a lost round returned unpaced"
 
 
 # --- configuration a person can actually write --------------------------------

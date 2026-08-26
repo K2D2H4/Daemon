@@ -1931,16 +1931,42 @@ async def _wake_round(
         # release is under way and `close_gate` has something to wait for.
         with suppress(Exception):
             await listening.aclose()
-        with suppress(Exception):
+        try:
             released = await close_gate()
+        except Exception:
+            # Fail closed, and this is the one place in the round that does. Every
+            # other guard here starts from "carry on" because losing a round is worse
+            # than the failure it is guarding; this one is the opposite, because what
+            # a swallowed error costs is not a round but the guarantee - `released`
+            # would stay True, the handover would race exactly as it used to, and
+            # nothing anywhere would say so. A daemon that opens no session is noticed
+            # on the first wake word; a daemon that deadlocks once a day is not.
+            logger.exception("wake: releasing the microphone failed; not opening a session")
+            released = False
     if not released:
         # The microphone never came back. Opening a session now means building a
         # VoiceProcessing engine on a device that is already wedged, which is what
         # turned a stuck stop into a daemon that never heard another word - so the
-        # round is lost instead, loudly, and the caller comes back around. Paced on
-        # the way out for the reason WAKE_RETRY_SECONDS exists: the next round opens
-        # a fresh capture on the same wedged device and parks another thread on it,
-        # and an unpaced return would do that as fast as the process can manage.
+        # round is lost instead, loudly, and the caller comes back around.
+        if fired is not None:
+            # Said here rather than left to `close_gate`'s device error, because the
+            # gate has already logged `wake: heard ...` and a reader would otherwise
+            # see a matched wake word followed by silence with nothing joining them.
+            logger.error(
+                "wake: heard %r but dropping it - the microphone never came back",
+                fired.heard,
+            )
+        # `mic_floor.take` hands over a debt as well as a line: the taker owes the
+        # future exactly one answer, and a line nobody takes sits out its own timeout
+        # instead of falling back to Telegram now, while it is still worth saying.
+        taken = mic_floor.take()
+        if taken is not None:
+            logger.error("wake: not speaking a waiting line - the microphone is wedged")
+            mic_floor.answer(taken[1], False)
+        # Paced on the way out for the reason WAKE_RETRY_SECONDS exists: the next
+        # round opens a fresh capture on the same wedged device and parks another
+        # thread on it, and an unpaced return would do that as fast as the process
+        # can manage.
         await asyncio.sleep(WAKE_RETRY_SECONDS)
         return
     if fired is None:
@@ -2242,9 +2268,10 @@ async def build_wake_gate(
         """
         with suppress(Exception):
             await audio.close()
-        released = True
-        with suppress(Exception):
-            released = await audio.wait_for_input_release()
+        # Not suppressed, unlike the speaker close above: this one's answer is the
+        # whole point of the call, and an error swallowed here reads as "released"
+        # (see `_wake_round`, which fails closed on it).
+        released = await audio.wait_for_input_release()
         if not released:
             logger.error(
                 "wake: the microphone did not come back after the gate let it go; "

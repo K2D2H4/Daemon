@@ -487,6 +487,116 @@ async def test_waiting_for_a_wedged_input_release_gives_up_and_says_so() -> None
         never_returns.set()  # let the parked thread finish so it does not outlive us
 
 
+async def test_waiting_covers_a_release_that_has_not_started_yet() -> None:
+    """The hole the first version of this left, and the narrowest one that matters.
+
+    When the generator is closed while the open is still in flight, `record`'s
+    finally only *cancels* the future - no release thread exists yet, because there
+    is no stream yet. A wait that looks for threads therefore found none, answered
+    True, and let the caller build a second CoreAudio client; the open then finished,
+    `deliver` saw a cancelled future and started the release right underneath it.
+    That is the same overlap the whole change exists to remove, reached through the
+    dead-stream rebuild instead of through an ordinary handover.
+
+    So the thing waited on has to be "this recording has let the device go", which is
+    knowable at `aclose()`, and not "a thread exists", which is not."""
+    opening = threading.Event()
+
+    class SlowToOpen(FakeStream):
+        def start(self) -> None:
+            opening.wait(5.0)  # still inside Pa_StartStream when the gate gives up
+            super().start()
+
+    constructed = threading.Event()
+
+    class SlowBackend(FakeSoundDevice):
+        def RawInputStream(self, **kwargs: Any) -> FakeStream:  # noqa: N802
+            stream = SlowToOpen(**kwargs)
+            self.inputs.append(stream)
+            constructed.set()
+            return stream
+
+    backend = SlowBackend()
+    io = SoundDeviceAudio(backend=backend)
+    blocks = io.record()
+    reading = asyncio.create_task(anext(blocks))
+
+    # Wait for the open thread to have really constructed the stream before giving up
+    # on the read. A bare timeout raced it instead of waiting: when the give-up landed
+    # before the generator reached `await opened`, `aclose()` raised "already
+    # running", `suppress` ate it, the `finally` never ran, and there was nothing
+    # registered to wait on - so this passed on macOS and failed on CI for a reason
+    # that had nothing to do with the behaviour under test.
+    assert await asyncio.to_thread(constructed.wait, 5.0), "the open never started"
+
+    # The watchdog, in miniature: give up on the read while the open is still parked
+    # on its worker thread. Awaited, so the generator has finished unwinding its
+    # `finally` before anything below asks what it left behind.
+    reading.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await reading
+
+    waiting = asyncio.create_task(io.wait_for_input_release())
+    # Long enough for the wait's own worker hop to finish and the task to be resumed.
+    # A single `sleep(0)` cannot: the wait runs in a thread, so an already-answered
+    # wait is still pending one turn later and the assertion below passes for free -
+    # which is how a false all-clear survived this test on macOS and only showed up on
+    # CI, two assertions further down.
+    await asyncio.sleep(0.05)
+    assert not waiting.done(), "the wait passed a recording whose device is still open"
+
+    opening.set()  # the open completes, hands back a live stream, and it is released
+    async with asyncio.timeout(5):
+        assert await waiting is True
+    (stream,) = backend.inputs
+    assert stream.closed, "the wait came back before the late release had finished"
+
+
+async def test_a_second_wait_does_not_forget_a_release_that_never_finished() -> None:
+    """A bound that expires is not permission to stop tracking it.
+
+    The first version emptied the list before waiting, so the wedged release was
+    dropped and the very next call answered True with `Pa_StopStream` still inside
+    CoreAudio - a false all-clear, which is the single thing this method exists to
+    prevent the caller acting on."""
+    never_returns = threading.Event()
+
+    class WedgingStream(FakeStream):
+        def stop(self) -> None:
+            never_returns.wait()
+            super().stop()
+
+    class WedgingBackend(FakeSoundDevice):
+        def RawInputStream(self, **kwargs: Any) -> FakeStream:  # noqa: N802
+            stream = WedgingStream(**kwargs)
+            self.inputs.append(stream)
+            return stream
+
+    backend = WedgingBackend()
+    io = SoundDeviceAudio(backend=backend)
+    blocks = io.record()
+
+    async def push() -> None:
+        await asyncio.sleep(0)
+        backend.inputs[0].feed(b"\x00\x00")
+
+    task = asyncio.create_task(push())
+    async with asyncio.timeout(5):
+        async for _ in blocks:
+            break
+    await task
+    await blocks.aclose()
+
+    try:
+        async with asyncio.timeout(5):
+            assert await io.wait_for_input_release(within=0.05) is False
+            assert await io.wait_for_input_release(within=0.05) is False, (
+                "the second call forgot the wedged release and reported the device free"
+            )
+    finally:
+        never_returns.set()  # let the parked thread finish so it does not outlive us
+
+
 async def test_waiting_with_nothing_to_release_is_free() -> None:
     """The ordinary case - no stream was ever opened, or the last one is long gone -
     must not cost a thread hop on the handover's latency path."""

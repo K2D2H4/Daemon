@@ -98,19 +98,25 @@ def _sounddevice() -> Any:
     return sounddevice
 
 
-def _release_input_stream(stream: Any) -> None:
+def _release_input_stream(stream: Any, done: threading.Event) -> None:
     """Stop and close a PortAudio input stream, off the event loop.
 
     Runs on a detached daemon thread from `record`'s finally: the stop can deadlock
     inside CoreAudio, and on the loop thread that froze the whole daemon (see the
     call site). Never raises - the thread has nobody to report to, and a stream that
     will not close is a leaked microphone, not a crash.
+
+    `done` is set on the way out however it goes, including the failure: a stop that
+    raised has still stopped using the device, and leaving the flag clear would tell
+    `wait_for_input_release` the microphone is wedged when it is merely broken.
     """
     try:
         stream.stop()
         stream.close()
     except Exception:
         logger.exception("audio: could not release the microphone stream")
+    finally:
+        done.set()
 
 
 class SoundDeviceAudio:
@@ -138,9 +144,13 @@ class SoundDeviceAudio:
         self._device = asyncio.Lock()
         self.dropped_blocks = 0
         """Microphone blocks thrown away because the consumer fell behind."""
-        self._releases: list[threading.Thread] = []
-        """Detached release threads nobody has waited for yet. See
-        `wait_for_input_release`, which is the only reader and empties it."""
+        self._releases: list[threading.Event] = []
+        """One flag per finished `record`, set once that recording has let the device
+        go. Flags rather than the release threads themselves, because at the moment
+        a recording ends there is not always a thread yet: an open still in flight is
+        cancelled and released later by `deliver`, and a wait that looked for threads
+        saw none and wrongly reported the microphone free. See
+        `wait_for_input_release`, the only reader."""
 
     def _module(self) -> Any:
         if self._backend is None:
@@ -192,6 +202,12 @@ class SoundDeviceAudio:
         # stopped. The device itself lingers for about a second afterwards either
         # way (see WAKE_REARM_SETTLE_SECONDS in daemon/app.py), which the probe
         # reads as a brief, self-healing busy rather than as ours.
+        # Set once this recording has let the microphone go, on every path out -
+        # released, never opened, or opened too late for anyone to read. Registered
+        # with the instance in the `finally` below and awaited by
+        # `wait_for_input_release`, which is what the wake->voice handover blocks on.
+        let_go = threading.Event()
+
         def release_off_loop(stream: Any) -> None:
             # Stop and close on a detached daemon thread. `stream.stop()` is
             # `Pa_StopStream` -> CoreAudio `AudioOutputUnitStop` -> a HAL mutex, and
@@ -202,16 +218,12 @@ class SoundDeviceAudio:
             # rather than `to_thread` so a wedged release parks one thread instead of
             # burning a pool worker that playback needs. The thread holds `stream`, so
             # it is not collected mid-release.
-            thread = threading.Thread(
+            threading.Thread(
                 target=_release_input_stream,
-                args=(stream,),
+                args=(stream, let_go),
                 name="voice-mic-release",
                 daemon=True,
-            )
-            # Remembered before it is started, so `wait_for_input_release` cannot miss
-            # a release that finishes between the two lines.
-            self._releases.append(thread)
-            thread.start()
+            ).start()
 
         with mic_hold.hold():
             # The open runs off the loop on its own thread, for the same reason the
@@ -239,6 +251,17 @@ class SoundDeviceAudio:
                 else:
                     opened.set_result(stream)
 
+            def failed(exc: BaseException) -> None:
+                # Same "nobody is waiting any more" case as `deliver`'s, and it needs
+                # saying for the same reason: `set_exception` on a future the finally
+                # already cancelled raises `InvalidStateError` inside the callback, and
+                # `let_go` would never be set - so the handover would wait out its whole
+                # bound and call a device that was never opened wedged.
+                if opened.cancelled():
+                    let_go.set()
+                else:
+                    opened.set_exception(exc)
+
             def open_stream() -> None:
                 try:
                     stream = sd.RawInputStream(
@@ -250,7 +273,7 @@ class SoundDeviceAudio:
                     )
                     stream.start()
                 except Exception as exc:  # handed to the awaiter, like any open failure
-                    loop.call_soon_threadsafe(opened.set_exception, exc)
+                    loop.call_soon_threadsafe(failed, exc)
                 else:
                     loop.call_soon_threadsafe(deliver, stream)
 
@@ -265,10 +288,30 @@ class SoundDeviceAudio:
                 # states: the open never finished (cancel the future, and `deliver`
                 # releases the stream when it finally arrives); it finished with a live
                 # stream (release it); or it failed (nothing to release).
+                # Registered here rather than at the top, because this is the point
+                # at which "has this recording let the device go" becomes a question
+                # anyone can ask - and the answer has to be pending, not absent, for
+                # the middle case below.
+                self._releases.append(let_go)
                 if not opened.done():
+                    # `deliver` or `failed` will resolve `let_go`; nothing here can,
+                    # because there is no stream yet to release.
                     opened.cancel()
-                elif not opened.cancelled() and opened.exception() is None:
+                elif opened.cancelled():
+                    # Also still in flight. Cancelling the *task* that awaits this
+                    # generator cancels the future it is parked on, so the finally can
+                    # arrive to find `opened` already cancelled without anyone here
+                    # having asked - and that is indistinguishable, from this line,
+                    # from the branch above. Treating it as "nothing was ever taken"
+                    # and setting `let_go` was a false all-clear of exactly the kind
+                    # this whole mechanism exists to prevent: the open thread is still
+                    # running and will hand a live stream to `deliver`, which releases
+                    # it *after* the caller has been told the device is free.
+                    pass
+                elif opened.exception() is None:
                     release_off_loop(opened.result())
+                else:
+                    let_go.set()  # the open raised: no device was ever taken
 
     async def wait_for_input_release(
         self, within: float = INPUT_RELEASE_TIMEOUT_SECONDS
@@ -283,27 +326,40 @@ class SoundDeviceAudio:
         deadlocked the pair of them on the resident (see `_release_input_stream` and
         `daemon/app.py:_wake_round`).
 
-        Never raises and never blocks the loop - the join runs on a worker, and a
-        release that outlives the bound is reported as `False` rather than waited on
-        forever, because a stop that has not returned by then is a device already
-        lost and the caller has a decision to make about that.
+        What is waited on is one flag per finished recording, not the release threads:
+        a recording whose open was still in flight when it was closed has no thread
+        yet and gets one later, from `deliver`, so a wait that counted threads saw
+        none and reported the device free while it was about to be stopped.
 
-        `within` rather than `timeout`: what is bounded is a `Thread.join`, and an
+        Never blocks the loop - the wait runs on a worker - and a release that
+        outlives the bound is reported as `False` rather than waited on forever,
+        because a stop that has not returned by then is a device already lost and the
+        caller has a decision to make about that. Unfinished flags go back on the
+        list, so the answer stays `False` until it is actually true rather than
+        flipping on the next call.
+
+        `within` rather than `timeout`: what is bounded is an `Event.wait`, and an
         `asyncio.timeout` around it - which is what the name `timeout` invites, and
-        what ASYNC109 would have this be - cannot cancel a join. It would abandon the
+        what ASYNC109 would have this be - cannot cancel it. It would abandon the
         worker and report a lie.
         """
         pending, self._releases = self._releases, []
         if not pending:
             return True
 
-        def join_all() -> bool:
+        def wait_all() -> bool:
             deadline = time.monotonic() + within
-            for thread in pending:
-                thread.join(max(0.0, deadline - time.monotonic()))
-            return not any(thread.is_alive() for thread in pending)
+            for flag in pending:
+                flag.wait(max(0.0, deadline - time.monotonic()))
+            return all(flag.is_set() for flag in pending)
 
-        return await asyncio.to_thread(join_all)
+        released = await asyncio.to_thread(wait_all)
+        if not released:
+            # Put the unfinished ones back. Dropping them would make the *next* call
+            # answer True with a `Pa_StopStream` still running - the same false
+            # all-clear this method exists to stop the caller acting on.
+            self._releases[:0] = [flag for flag in pending if not flag.is_set()]
+        return released
 
     async def play(self, chunk: bytes) -> None:
         """Queue a chunk. Returns immediately.

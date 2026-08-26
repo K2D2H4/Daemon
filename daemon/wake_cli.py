@@ -60,7 +60,10 @@ from daemon.tui import Row, heading, status, table, wrap
 if TYPE_CHECKING:  # protocols only - nothing here constructs an implementation
     from daemon.voice.base import AudioIO, SpeechRecognizer, WakeEvent
 
-Closer = Callable[[], Awaitable[None]]
+Closer = Callable[[], Awaitable[bool]]
+"""Releases the gate's device and answers whether it actually came back. The bool
+is load-bearing - `daemon/app.py:_wake_round` refuses to open a session on a
+`False` - so a closer that forgets to return one reads as a wedged microphone."""
 
 
 class GateCounters(Protocol):
