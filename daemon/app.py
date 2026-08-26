@@ -892,7 +892,7 @@ async def build_proactive_tick(
                 # orphan per tick, the same reason the app lifespan closes its own
                 # bridge ahead of the store (see `_lifespan` above).
                 closers.append(bridge.aclose)
-        judge = Judge(gateway, data_dir=settings.data_dir, bridge=bridge, store=store)
+        judge = Judge(gateway, data_dir=settings.data_dir, bridge=bridge)
 
         channel = None
         try:

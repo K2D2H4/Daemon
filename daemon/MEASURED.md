@@ -368,7 +368,11 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   above, all before v0.1.54. **A generator whose reason is nothing but elapsed time
   cannot produce speech**, so the 288 ticks a day that generate one are spending a
   model call to be refused. That is PLAN 6.2's asymmetric default working, and it is
-  also the whole of type C's contribution.
+  also the whole of type C's contribution. **Superseded 2026-08-26** —
+  [docs/adr/0016](../docs/adr/0016-proactive-default-flips-to-speaking.md) flips
+  this: `silence` and `pattern_time` now speak on an elapsed-time-only reason by
+  design, so this bullet's "cannot produce speech" is what the old prompt did, not
+  what the current one does.
 - **Lowering `ASSOCIATION_MIN_AGE_DAYS` was proposed and the measurement killed it
   (2026-08-18).** At floors 7/10/14 days against 884 embedded messages, type E
   surfaced 3/2/0 candidates. What it surfaced at 7 days was the owner's own
@@ -379,6 +383,12 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   similarity is real and the association is worthless, and the judge said so 20/20
   on both. So E's floor is not what stops E; **this install's conversation is almost
   entirely tool commands**, and E quotes owner messages. The constant was left at 30.
+  **Still relevant 2026-08-26, narrowed** —
+  [docs/adr/0016](../docs/adr/0016-proactive-default-flips-to-speaking.md) flips the
+  judge's default to speaking and deleted the clause that produced this 20/20; a
+  narrower clause was carved back out specifically for a quoted line that is an
+  instruction to the daemon, so this finding is expected to still hold, but has not
+  been re-measured against the new prompt.
 - **Type B is starved by the same fact, and its lexicon is not the problem
   (2026-08-18).** 463 owner utterances, **0** matching `_EMOTIONS`. Widening the scan
   to 30 emotion words that are deliberately *not* in the lexicon (피곤·귀찮·실망·후회·

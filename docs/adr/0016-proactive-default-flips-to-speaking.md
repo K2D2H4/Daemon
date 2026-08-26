@@ -56,7 +56,7 @@ wrong, not the model's willingness to talk.
 
 ## Decision
 
-Three changes to `SYSTEM`, all in `daemon/proactivity/judge.py`:
+Four changes to `SYSTEM`, all in `daemon/proactivity/judge.py`:
 
 1. **The default flips.** `say`에 문장을 넣는 것이 대부분의 정답이다, not the
    reverse. The two-condition AND'd gate is gone. Declining is not deleted - a
@@ -73,20 +73,73 @@ Three changes to `SYSTEM`, all in `daemon/proactivity/judge.py`:
    the owner's own `data/persona/seed.md` states the same rule for the persona
    as a whole. `daemon/proactivity/judge.py` was the one place in this repo
    that rule had not reached.
-3. **The `silence` worked example now speaks.** It used to be this file's only
-   demonstration of the behaviour being reversed - a reason with nothing but
-   elapsed hours, answered `{"say": ""}`. It now answers `{"say": "뭐하세요?"}`.
-   `pattern_time`'s example is left declining on purpose, so the few-shot set
-   still shows silence as a real, reachable answer rather than a dead branch.
+3. **Both `silence` and `pattern_time`'s worked examples now speak.** They used
+   to be this file's only demonstrations of the behaviour being reversed - a
+   reason with nothing but elapsed hours or a bare frequency, each answered
+   `{"say": ""}`. Round 1 of this task flipped only `silence`'s and left
+   `pattern_time` declining on purpose; review caught that this left the prose
+   ("an elapsed-time-only reason is enough for an ordinary check-in") and the
+   nearest worked example of exactly that reason shape contradicting each
+   other, distinguished only by a kind label the prose never mentions - the
+   thing that actually teaches a few-shot prompt the wrong generalisation.
+   Both now answer with an ordinary opener.
+4. **A narrow clause survives from the deleted condition 2, scoped to quoted
+   commands.** Old condition 2 - *그 사건·감정·기억에 대해 유저에게 물을 것이
+   실제로 있다* - was not only what made `silence`/`pattern_time` decline; it
+   was also the only thing stopping `association`'s quoted owner text from
+   becoming an opener when that text was actually a command, not a memory.
+   `daemon/MEASURED.md` (2026-08-18) already found `association_candidates`
+   surfacing exactly this - `'오늘 날짜가 어떻게됨?'`, `'이내용들 옵시디언
+   위키에도 좀 넣어줄래?'` - and the old judge declined it 20/20. Deleting the
+   whole condition to fix items 1-3 would have reopened this the moment type E
+   goes live: `ASSOCIATION_MIN_AGE_DAYS` is 30 days and this install's history
+   is about 20, so this was imminent, not hypothetical. The new rule is narrow
+   on purpose - it says nothing about the other four kinds, whose reasons never
+   quote the owner verbatim - so the flip stays in force everywhere it does not
+   apply.
 
-Also (secondary, and load-bearing that it stays secondary): `Judge` gained an
-optional `store` dependency so `daemon/persona/tics.py`'s `verbal_tics` - already
-measured on the text and voice loops at 18/30 → 6/30 repeats, p=0.0017 - can name
-the daemon's own recently overused proactive phrases and ask it to say the same
-thing a different way. This changes *how* the model phrases a line it has already
-decided to say; it does not add a second reason to decline, and the owner was
-explicit that repetition was never his complaint - the fix on offer here is for
-the register of the question, not for how often it repeats itself.
+## Built and removed: the tic-avoidance block
+
+Round 1 of this task also wired `daemon/persona/tics.py`'s `verbal_tics` into
+the judge (an optional `store` dependency, a narrow `UtteranceReader` protocol,
+two new `Store` read methods, a third system message when a habit was found).
+Mechanically it was sound - a string, appended only when non-empty, wrapped so a
+failure costs the block and never the turn, and `tools_offered=0` untouched. It
+did not survive review, and the reason is specific to *this* output space, not a
+flaw in `daemon/persona/tics.py` itself.
+
+`tics.block`'s text ends: *"떠오르는 게 이것들뿐이면 더 할 말이 없다는 뜻이니,
+또 꺼내는 대신 말을 줄여라"* ("if these are all that come to mind, that means
+you have nothing left to say - say less instead of reaching for them again"). In
+`daemon/companion.py`, where it was designed and measured, the output space is free
+text, and "say less" means a shorter reply - a style note. In the judge, the
+output space is exactly `{"say": <sentence>}` or `{"say": ""}`, and `SYSTEM`
+itself defines the empty string as precisely *"할 말이 하나도 없을 때"* - so in
+this file the same sentence hands the model the decline finding verbatim, as the
+last system message before the reason. Worse, it fires exactly where this ADR is
+supposed to work: `뭐하세요?` on a `silence` reason, said three times running,
+becomes a named tic - which forbids the plain phrasing the flip just legalised
+and leaves the ornamental shape (`무슨 재밌는 일 없어요?`) as one of the few ways
+left to satisfy both "say something" and "don't repeat that."
+
+It is also the one part of the round-1 diff that could *subtract* utterances,
+in a task whose entire point is adding them, over something the owner explicitly
+said was not his complaint - and no measurement taken during round 1 could have
+caught it: `proactive_utterances` was empty for the whole of this project's
+history until this flip starts working, so the block evaluated to `""` in every
+test and every one of PLAN 6.2's and MEASURED.md's spikes. It only goes live
+after the change it would have undermined starts shipping lines.
+
+Reverted in full: the `store` parameter and `UtteranceReader` protocol on
+`Judge`, `_tics_block`, `daemon/app.py`'s `store=store` argument, and the two `Store`
+methods (`recent_utterance_texts`, `recent_owner_lines`) - kept only as far as
+they stayed reachable, and once their one caller was gone, nothing in the
+running app called them, so they went too rather than sitting as tested,
+unreachable methods (`tests/test_reachable.py`'s own stated blind spot). Anyone
+re-adding tic avoidance to this file needs to solve the collision above first -
+most directly, a judge-specific instruction that "say less" here means "decline"
+is exactly the pressure this ADR removes, so any reuse of `tics.block` in this
+output space needs its own text, not `daemon/companion.py`'s.
 
 ## What this does not touch
 
@@ -111,6 +164,11 @@ for first.
 - The daily budget and cooldown ([ADR 0015](0015-code-may-search-where-the-model-may-not.md):
   5/day, 90-minute cooldown) are the only remaining ceiling on volume. They were
   never measured against a judge that actually speaks, because none ever had.
+- `association`'s protection against quoted commands is narrower than before -
+  scoped to a quoted line that reads as an instruction, rather than the general
+  "is there something to ask about" old condition 2 provided. `daemon/MEASURED.md`'s
+  20/20 finding is expected to still hold under the new clause but has not been
+  re-measured against it.
 
 ## What would overturn this
 
@@ -125,7 +183,7 @@ rather than on the demanding shape this ADR targets, that is the label data §6.
 never had, and it should move the default back.
 
 This is deliberately a single prompt block in one file, not a new mechanism -
-`SYSTEM`'s constant, the two changed examples, and the tests that pin its wording.
+`SYSTEM`'s constant, its worked examples, and the tests that pin its wording.
 Reverting it is one text change and a test update, the same size as the change
 itself. `docs/adr/README.md`'s note about a recurring shape in this file applies
 here too: several of these decisions were correct at the time they were measured

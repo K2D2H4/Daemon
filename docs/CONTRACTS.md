@@ -90,7 +90,11 @@ live-share pump's transport, which has no tool round in it.
    make zero *LLM* calls - same distinction non-negotiable 2 draws, and the same
    allowance: type E's `association_candidates` awaits the embedder every tick,
    which is not a call that thinks. Exactly one LLM call, and only for candidates
-   that already passed the gate.
+   that already passed the gate. (This headline names the call *count*, not what
+   the one call answers when it runs - [ADR 0016](adr/0016-proactive-default-flips-to-speaking.md)
+   changed the judge's own default from declining to speaking without touching
+   this rule's shape: stages 1-2 are still zero calls, stage 3 is still exactly
+   one, only for a candidate the gate already passed.)
 
 8. **Timestamps** are ISO-8601 UTC with `Z`, stored as TEXT. Use one helper,
    do not scatter `datetime.now()` calls.

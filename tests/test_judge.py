@@ -99,22 +99,52 @@ def test_the_banned_shape_is_demanding_not_contentless() -> None:
     # inventing new phrasing for the same idea.
     assert "화제를 내놓으라고 요구하지 않는다" in SYSTEM
 
+    # The old framing is gone, not just outnumbered by the new one. Re-adding
+    # "그런 문장이 떠오르면 그게 곧 {"say": ""} 다." beside the now-acceptable list
+    # above would leave every assertion so far green while the model still read
+    # an instruction to decline these five phrases - this is the assertion that
+    # actually pins the framing changed, not just that new text was appended.
+    assert "빈 말" not in SYSTEM
+    assert '그게 곧 {"say": ""}' not in SYSTEM
 
-def test_the_silence_example_now_speaks() -> None:
+
+def test_the_elapsed_time_examples_now_speak() -> None:
     """The clearest sign the reversal actually landed in the few-shot set, not
-    just the prose above it: the `silence` worked example - the exact reason
-    shape the owner's own "그냥 아무말이나 좋으니" was about - used to be this
-    file's example of declining, and leaving it declining would have shown the
-    model one behaviour in prose and the opposite one in the example it
-    actually imitates.
-
-    `pattern_time`'s example is left declining on purpose (not asserted here as
-    a decline, but not touched either) - see judge.py's "Task 6" comment above
-    `SYSTEM` for why one worked decline stays in the mix.
+    just the prose above it. `silence` and `pattern_time` are the two kinds
+    PLAN 6.2.1 named as reasons with nothing but elapsed time or frequency, and
+    both worked examples used to answer `{"say": ""}` - the exact behaviour
+    being reversed. Both must now speak: leaving one declining while the prose
+    says an elapsed-time-only reason is enough would show the model two
+    contradictory answers to the same shape of input, distinguished only by a
+    kind label the prose never mentions - the thing that makes a few-shot
+    prompt actually teach the wrong generalisation.
     """
-    example = SYSTEM.split("이유 (silence): ", 1)[1].split("\n예) 이유 (pattern_time)", 1)[0]
-    assert '{"say": ""}' not in example
-    assert '{"say": "' in example
+    for kind in ("silence", "pattern_time"):
+        start = f"이유 ({kind}): "
+        example = SYSTEM.split(start, 1)[1].split("\n예) 이유", 1)[0]
+        assert '{"say": ""}' not in example, f"{kind}'s example still declines"
+        assert '{"say": "' in example, f"{kind}'s example does not speak"
+
+
+def test_a_quoted_command_is_not_a_memory() -> None:
+    """Carved back out of the flip, not left as collateral damage: the clause
+    that used to be old condition 2 was also the only thing stopping
+    `association` from turning a quoted owner *command* into a wistful opener.
+    `daemon/MEASURED.md` (2026-08-18) already found `association_candidates`
+    surfacing command history - '오늘 날짜가 어떻게됨?', '이내용들 옵시디언
+    위키에도 좀 넣어줄래?' - and the old judge declined it 20/20 on exactly this
+    clause. `ASSOCIATION_MIN_AGE_DAYS=30` and this install's history is about 20
+    days, so this is imminent rather than hypothetical - see judge.py's "Round 2"
+    comment above `SYSTEM`.
+    """
+    assert "지시나 질문이었다면 추억이 아니다" in SYSTEM
+    assert "오늘 날짜가 어떻게됨?" in SYSTEM
+
+    # A worked decline example for exactly this shape, not just the prose rule -
+    # matching this file's own pattern of pairing every rule with an example.
+    example = SYSTEM.split("이유 (association): 2026년 05월 10일", 1)[1]
+    example = example.split("\n예) 이유", 1)[0]
+    assert '{"say": ""}' in example
 
 
 def judge_for(
@@ -123,7 +153,6 @@ def judge_for(
     *,
     fail: bool = False,
     seed: str | None = SEED,
-    store: object | None = None,
 ) -> tuple[Judge, FakeProvider]:
     if seed is not None:
         (data_dir / "persona" / "seed.md").write_text(seed, encoding="utf-8")
@@ -133,7 +162,7 @@ def judge_for(
     gateway = LLMGateway(
         {provider.name: provider}, {Task.PROACTIVE_JUDGE: Route(provider.name, "gemma3:4b")}
     )
-    return Judge(gateway, data_dir, store=store), provider  # type: ignore[arg-type]
+    return Judge(gateway, data_dir), provider
 
 
 def system_text(provider: FakeProvider) -> str:
@@ -271,100 +300,6 @@ async def test_an_enormous_reason_is_bounded(data_dir: Path) -> None:
     await judge.decide(Candidate(kind="emotional", reason="힘들다 " * 2000))
 
     assert len(user_text(provider)) < 600
-
-
-# --- the tic-avoidance block (persona/tics.py), task 6 -----------------------
-
-
-class _FakeUtteranceReader:
-    """Stands in for `daemon.memory.store.Store` - no sqlite, no disk."""
-
-    def __init__(self, *, said: list[str] | None = None, heard: list[str] | None = None) -> None:
-        self.said = said or []
-        self.heard = heard or []
-
-    def recent_utterance_texts(self, limit: int) -> list[str]:
-        return self.said[-limit:]
-
-    def recent_owner_lines(self, limit: int) -> list[str]:
-        return self.heard[-limit:]
-
-
-async def test_no_store_means_no_tic_block(data_dir: Path) -> None:
-    """The default for every existing caller (`Judge(gateway, data_dir)`, no
-    `store`) and the honest one: this feature did not exist before task 6, and
-    every install that has not been touched by it must behave exactly as before."""
-    judge, provider = judge_for(data_dir)
-
-    await judge.decide(OPEN_LOOP)
-
-    assert "verbal-tics" not in system_text(provider)
-
-
-async def test_a_repeated_phrase_reaches_the_prompt(data_dir: Path) -> None:
-    """The whole point of wiring `tics.verbal_tics` in: a phrase the daemon has
-    said three times running and the owner has never said becomes a named,
-    avoidable habit in the prompt - the same mechanism `companion.py` already
-    uses for the text and voice loops (measured there: 18/30 -> 6/30, p=0.0017)."""
-    store = _FakeUtteranceReader(
-        said=["재밌는 일 없었어?", "오늘 재밌는 일 없었어?", "뭐 재밌는 일 없었어?"],
-        heard=["오늘 회의 있었어", "발표 준비중이야"],
-    )
-    judge, provider = judge_for(data_dir, store=store)
-
-    await judge.decide(OPEN_LOOP)
-
-    assert "verbal-tics" in system_text(provider)
-    assert "재밌는 일" in system_text(provider)
-
-
-async def test_no_repetition_means_no_block(data_dir: Path) -> None:
-    """`MIN_TURNS` (persona/tics.py) is 3: two prior lines, however similar, are
-    not yet a habit, and the block must not appear at all - `tics.block` already
-    returns "" here, and this checks `_tics_block` passes that through rather
-    than adding a system turn that says nothing."""
-    store = _FakeUtteranceReader(said=["뭐하세요?", "뭐해?"], heard=["안녕"])
-    judge, provider = judge_for(data_dir, store=store)
-
-    await judge.decide(OPEN_LOOP)
-
-    assert "verbal-tics" not in system_text(provider)
-
-
-async def test_the_tic_block_never_costs_a_second_model_call(data_dir: Path) -> None:
-    """The owner said repetition was never his complaint, so naming a tic must
-    not become a second reason to call the model twice or to decline - it can
-    only ever change *how* the model says something, never *whether*
-    `decide` speaks. One call, same as every other path through this file."""
-    store = _FakeUtteranceReader(
-        said=["재밌는 일 없었어?"] * 5, heard=["회의 있었어"]
-    )
-    judge, provider = judge_for(data_dir, store=store)
-
-    await judge.decide(OPEN_LOOP)
-
-    assert len(provider.calls) == 1
-
-
-async def test_a_broken_store_costs_the_block_not_the_turn(data_dir: Path) -> None:
-    """`companion.py`'s `_tics_or_empty` wraps the same call for the same reason
-    (spec's Error handling section: never fail a turn over an annotation) -
-    `_tics_block` keeps that shape rather than letting a store error reach
-    `decide` and turn a working judge into a silent one."""
-
-    class _BrokenReader:
-        def recent_utterance_texts(self, limit: int) -> list[str]:
-            raise RuntimeError("sqlite is not available in this test")
-
-        def recent_owner_lines(self, limit: int) -> list[str]:
-            return []
-
-    judge, provider = judge_for(data_dir, store=_BrokenReader())
-
-    utterance = await judge.decide(OPEN_LOOP)
-
-    assert utterance  # still spoke - the broken store cost the block, not the turn
-    assert "verbal-tics" not in system_text(provider)
 
 
 # --- the reply treated as hostile --------------------------------------------
