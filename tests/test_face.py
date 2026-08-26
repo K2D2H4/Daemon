@@ -160,16 +160,24 @@ class RecordingBus(FaceBus):
         super().__init__()
         self.activities: list[str] = []
         self.shots: list[str] = []
+        self.order: list[str] = []
+        """Both kinds interleaved, because the order between them is load-bearing on
+        its own: a mood published before `speaking` is cut by it and spends about 0ms
+        on screen (spec 3.2), so "both happened" is not the same assertion as "in this
+        order". `tests/test_loop.py` grows its own subclass for this and could use
+        this list instead."""
 
     def set_activity(self, activity):  # type: ignore[override]
         before = self.state.activity
         super().set_activity(activity)
         if activity != before:
             self.activities.append(activity)
+            self.order.append(f"activity:{activity}")
 
     def one_shot(self, clip):  # type: ignore[override]
         super().one_shot(clip)
         self.shots.append(clip)
+        self.order.append(f"shot:{clip}")
 
 
 def test_a_recording_bus_sees_transitions_a_subscriber_may_coalesce_away():

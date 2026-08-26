@@ -264,6 +264,43 @@ def _rms(chunk: bytes) -> float:
 
 _MOOD_TAG = re.compile(r"^\s*\[mood:(amused|sulky|curious)\]\s*", re.IGNORECASE)
 
+MOOD_TOOL = "set_mood"
+"""The name of the one model-invoked value CONTRACTS 12 exempts from an audit row.
+
+**Not a tool, and it must never become one.** It changes a facial expression and
+nothing else - it does not touch the machine, so it has nothing to put in the row
+rule 12 exists to write (see docs/adr/0018 and the rule itself). It is deliberately
+absent from the tool registry, so there is no path by which `ToolRunner` could ever
+run it; `daemon/voice/conversation.py` answers it inline, before the runner is
+reached, and `tests/test_voice_conversation.py` fails if that ever stops being true.
+
+Voice-only, because voice is the only path that needs it: the text path has a reply
+to prepend a tag to (`MOOD_INSTRUCTION` below), and voice has no text we own.
+"""
+
+MOOD_VOICE_INSTRUCTION = (
+    "표정: 정말로 그렇게 느껴질 때만 `set_mood`를 호출해서 얼굴 표정을 바꾼다 - "
+    "amused(재미있음/웃김), sulky(서운함/삐침), curious(궁금함). 느껴지는 게 없으면 "
+    "호출하지 않는다. **이 도구나 표정에 대해 절대 소리 내어 말하지 않는다.** 호출은 "
+    "조용히 하고, 대답은 원래 하려던 말만 한다."
+)
+"""What makes the voice model reach for `MOOD_TOOL`, measured before it shipped.
+
+`evals/voice_set_mood_spike.py`, `gemini-3.1-flash-live-preview`, 48 live audio
+sessions over 81 flat-filtered declarations: **call rate 24/24, mood correct 24/24,
+false positives 0/8, spoken aloud 0/32.**
+
+The last of those is why the final sentence is in here and is not decoration. Spec
+section 5 rejected putting the tag in the transcript because the model reads it out;
+this instruction has to earn that not happening, and 0/32 is the number that says it
+did. Editing this string re-opens that question - re-run the spike.
+
+Note what it does *not* share with the text path's wording: nothing about neutral
+turns. It did not need it. The text tag over-fires `curious` on 11 of 15 deliberately
+neutral prompts and this over-fires on 0 of 8, which is the difference between a tag
+that costs nothing to prepend and a call the model has to decide to make.
+"""
+
 MOOD_INSTRUCTION = (
     "표현 방식: 정말로 그렇게 느껴질 때만 답장 맨 앞에 다음 세 가지 중 하나를 붙인다 - "
     "[mood:amused] (재미있음/웃김), [mood:sulky] (서운함/삐침), [mood:curious] (궁금함). "

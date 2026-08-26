@@ -785,6 +785,98 @@ async def test_the_user_speaking_first_is_not_a_barge_in() -> None:
     assert audio.played == [b"\x01"]
 
 
+# --- set_mood: the exemption CONTRACTS 12 was split for (ADR 0018) ------------
+# These three ARE the rule, not coverage of it. Rule 12 keeps its wording and
+# `set_mood` sits outside it only because the runner never sees the call, the registry
+# has no entry to route, and the argument is checked rather than trusted. Each of those
+# is asserted here, because "every executed tool call leaves an audit row" having a
+# named exception is a door and this is the lock on it.
+
+
+def _mood_call(mood: str, call_id: str = "m1") -> ToolCall:
+    return ToolCall(id=call_id, name="set_mood", arguments={"mood": mood})
+
+
+async def test_set_mood_never_reaches_the_runner_and_leaves_no_audit_row(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The mechanism the exemption rests on. Driven through the real `ToolRunner` and
+    the real store, so the audit table is read back rather than reasoned about - a
+    version of this that mocked the runner would pass even if the call went through
+    it."""
+    runner, store = tool_runner(db, tmp_path)
+    bus = RecordingBus()
+    session = FakeSession(
+        Calls(_mood_call("amused")),
+        b"\x01",
+        Says("assistant", "그거 진짜 웃기네"),
+        Turn(),
+    )
+    await run(conversation(session, tools=runner, face=bus))
+
+    rows = store.recent_tool_calls()
+    assert [row["tool"] for row in rows] == [], f"set_mood wrote an audit row: {rows}"
+    assert bus.shots == ["amused"], "the expression did not reach the face either"
+
+
+async def test_the_expression_is_not_in_the_tool_registry_at_all(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The second half: no entry means no policy decision and no execution path, so
+    there is no route by which a row could be skipped rather than absent."""
+    runner, _store = tool_runner(db, tmp_path)
+    names = {spec.name for spec in runner.specs()}
+    # The precondition matters: a `specs()` that came back empty would satisfy the
+    # real assertion below while proving nothing at all.
+    assert "read_file" in names, "precondition: the real registry is populated"
+    assert "set_mood" not in names
+
+
+async def test_a_mood_the_model_invented_is_dropped_but_still_answered(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """An enum in a declaration is a request, not a guarantee. And the call is still
+    answered: the session blocks until it is, so refusing would cost the answer rather
+    than the expression."""
+    runner, _store = tool_runner(db, tmp_path)
+    bus = RecordingBus()
+    session = FakeSession(
+        Calls(_mood_call("smug")),
+        b"\x01",
+        Says("assistant", "응, 알았어"),
+        Turn(),
+    )
+    convo = conversation(session, tools=runner, face=bus)
+    await run(convo)
+
+    assert bus.shots == [], "an unknown mood reached the face"
+    assert session.tool_responses, "the call was never answered - the turn would hang"
+
+
+async def test_the_expression_waits_for_the_audio_it_belongs_to(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """A blocking tool call arrives *before any audio* (daemon/voice/base.py), and
+    `speaking` is the one transition allowed to cut a one-shot (spec 3.2) - so a mood
+    published on arrival is cut by the answer it was about and spends roughly 0ms on
+    screen. The text path learned this first; the ordering has to hold here too."""
+    runner, _store = tool_runner(db, tmp_path)
+    bus = RecordingBus()
+    session = FakeSession(
+        Calls(_mood_call("sulky")),
+        b"\x01",
+        Says("assistant", "치, 알았어"),
+        Turn(),
+    )
+    await run(conversation(session, tools=runner, face=bus))
+
+    assert bus.shots == ["sulky"]
+    assert "speaking" in bus.activities, "precondition: the answer was heard"
+    assert bus.order.index("activity:speaking") < bus.order.index("shot:sulky"), (
+        "the mood was published before speaking, so the page would cut it instantly"
+    )
+
+
 # --- tools --------------------------------------------------------------------
 # A spoken tool call is the same event as a typed one (daemon/voice/base.py): the
 # model asks, `receive()` yields a `ToolCall`, and the conversation runs it through
