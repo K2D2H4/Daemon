@@ -1141,14 +1141,10 @@ def needs_for(env: Mapping[str, str]) -> list[Need]:
                 "no default, so a choice is never confused with a fallback.",
             )
         )
-    if provider == OLLAMA or proactive_judge_local:
-        # Not just `provider == OLLAMA`: `Task.PROACTIVE_JUDGE` routes to ollama
-        # whenever `proactive_judge_local` is true (config.py's routing table),
-        # regardless of what `provider` is - so a hosted install that keeps the
-        # judge local (the default) still reads this model every five minutes.
-        # Missing that case left the judge silently on `Settings.ollama_model`'s
-        # built-in default, `qwen3:14b` - the slow reasoning model `Need.blocking`
-        # above measures at ~11.8s against gemma3's ~1.7s.
+    if _wants_local_chat_model(provider, env):
+        # See `_wants_local_chat_model`'s docstring for why this is not just
+        # `provider == OLLAMA`, and why `_check_ollama` shares this predicate
+        # rather than re-deriving it.
         needs.append(
             Need(
                 key="DAEMON_OLLAMA_MODEL",
@@ -1390,6 +1386,23 @@ def _record(updates: dict[str, str], key: str, chosen: str, current: str) -> Non
 
 def _truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _wants_local_chat_model(provider: str, env: Mapping[str, str]) -> bool:
+    """Does this install load a local chat model - for conversation, the
+    five-minute proactive judge, or both?
+
+    Not just `provider == OLLAMA`: `Task.PROACTIVE_JUDGE` routes to ollama
+    whenever `DAEMON_PROACTIVE_JUDGE_LOCAL` is true (config.py's routing table,
+    defaulting to True), regardless of what `provider` is - so a hosted install
+    that keeps the judge local (the default) still reads this model every five
+    minutes. `needs_for` asks for the model on this predicate and `_check_ollama`
+    checks for it on the same predicate; a version of this rule that only lived
+    in one of them is exactly the drift that let a hosted install's judge fall
+    back to `Settings.ollama_model`'s built-in default, the slow reasoning model
+    `Need.blocking` measures at ~11.8s against gemma3's ~1.7s.
+    """
+    return provider == OLLAMA or _truthy(env.get("DAEMON_PROACTIVE_JUDGE_LOCAL", "true"))
 
 
 # --- .env reading and writing ------------------------------------------------
@@ -2425,13 +2438,11 @@ class Wizard:
 
         say(status(theme, "ok", f"Ollama {state.detail}"))
         wanted = [embed_model]
-        if provider == OLLAMA or _truthy(env.get("DAEMON_PROACTIVE_JUDGE_LOCAL", "true")):
-            # Not `provider == OLLAMA` alone (ledger Ruling 5). config.py:1146 routes
-            # the proactive judge to ollama when *either* axis says local, and
-            # `proactive_judge_local` defaults to True - so a gemini user on defaults
-            # loads this model for the five-minute judge. `VOICE_ANSWERS` in
-            # tests/test_setup.py answers the local-model question on a gemini path
-            # for exactly this reason.
+        if _wants_local_chat_model(provider, env):
+            # Same predicate `needs_for` asked the question on - see
+            # `_wants_local_chat_model`'s docstring. `VOICE_ANSWERS` in
+            # tests/test_setup.py answers the local-model question on a gemini
+            # path for exactly this reason.
             wanted.append(env.get("DAEMON_OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL)
         missing = [model for model in wanted if not _installed(state.models, model)]
         for model in wanted:
@@ -2452,7 +2463,18 @@ class Wizard:
         if embed_model in missing:
             say("  Without it, recall drops to keyword-only - Korean worst of all.")
             if self.prompt.ask_yes_no(f"  Pull {embed_model} now? (1.2GB)", default=False):
-                if self.checks.pull(embed_model):
+                try:
+                    ok = self.checks.pull(embed_model)
+                except KeyboardInterrupt:
+                    # `pull_model` inherits the terminal, so Ctrl-C during a
+                    # multi-minute download is the SIGINT hitting this process,
+                    # not something the wizard chose - and `_check_ollama` runs
+                    # before `_confirm`/`write_private_file`, so an uncaught one
+                    # here would discard every answer already given, key
+                    # included. Same reasoning as the `OSError` catch in
+                    # `pull_model` itself: setup degrades, it does not crash.
+                    ok = False
+                if ok:
                     say(status(theme, "ok", f"{embed_model}: pulled"))
                     missing = [model for model in missing if model != embed_model]
                 else:

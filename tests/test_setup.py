@@ -61,6 +61,21 @@ def no_health(base_url: str) -> HealthState:
     raise AssertionError("a test reached the real /health")
 
 
+def no_pull(model: str) -> bool:
+    """The default `pull` probe for tests that are not about pulling a model.
+
+    Like `no_network`/`no_health`: `Checks.pull` defaults to the real
+    `pull_model`, which shells out to `ollama pull` and downloads a real 1.16GB
+    model. `working_checks()` and `Recorder.checks()` both claim every model is
+    already installed, so nothing *should* ever reach this - but that safety is
+    only as good as those fixtures staying in sync with `DEFAULT_EMBED_MODEL` and
+    `DEFAULT_OLLAMA_MODEL`, and a desync here used to mean an extra printed line.
+    After the embed-model pull question, a desync means a real download. This
+    turns that into a named failure instead.
+    """
+    raise AssertionError("a test reached the real ollama pull")
+
+
 def working_checks() -> Checks:
     """Every provider says yes. Records nothing; use `Recorder` for that."""
     return Checks(
@@ -71,6 +86,7 @@ def working_checks() -> Checks:
         ollama=lambda url: OllamaState(
             True, f"reachable at {url} (v0.5.0)", ("gemma3:4b", "bge-m3")
         ),
+        pull=no_pull,
         updates=no_network,
         health=no_health,
     )
@@ -120,6 +136,7 @@ class Recorder:
             gemini=gemini,
             telegram=telegram,
             ollama=ollama,
+            pull=no_pull,
             updates=no_network,
         )
 
@@ -451,7 +468,15 @@ def test_turning_the_background_judge_off_does_not_make_ollama_a_condition(
 def test_a_hosted_provider_still_gets_the_embed_model_checked(tmp_path: Path) -> None:
     """The gap that cost the owner fifteen hours. `Task.EMBED` is always ollama,
     so 'nothing here needs a local chat model' was true and irrelevant: the embed
-    model is needed under every provider, and setup never looked."""
+    model is needed under every provider, and setup never looked.
+
+    Also the coverage for the failed-pull branch: `pull` always returns `False`
+    here (this is what a user with `ollama` installed but off their PATH sees),
+    and "y" accepts the offer, so `checks.pull` is actually called - unlike
+    `test_a_hosted_judge_means_the_chat_model_is_not_checked` and
+    `test_a_local_judge_means_the_chat_model_is_checked_under_gemini`, which
+    both decline and never reach it.
+    """
     checks = Checks(
         anthropic=lambda key, model: Verdict(True, "key works"),
         gemini=lambda key: Verdict(True, "key works"),
@@ -459,13 +484,15 @@ def test_a_hosted_provider_still_gets_the_embed_model_checked(tmp_path: Path) ->
         ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ()),
         pull=lambda model: False,
     )
-    # "n" declines the embed-model pull, "y" is the final "Write it" review -
-    # `_check_ollama` runs before that confirm, so the new pull question is not
-    # the list's last answer.
-    result = drive(tmp_path, GEMINI_ANSWERS + ["n", "y"], checks=checks)
+    # "y" accepts the embed-model pull (which fails, since `pull` always
+    # returns `False`), "y" is the final "Write it" review - `_check_ollama`
+    # runs before that confirm, so the new pull question is not the list's
+    # last answer.
+    result = drive(tmp_path, GEMINI_ANSWERS + ["y", "y"], checks=checks)
 
     assert result.code == 0
     assert "bge-m3" in result.out
+    assert "bge-m3: pull failed" in result.out
 
 
 def test_a_hosted_judge_means_the_chat_model_is_not_checked(tmp_path: Path) -> None:
@@ -581,6 +608,10 @@ def test_missing_chat_models_are_printed_as_commands_not_run(tmp_path: Path) -> 
     assert result.code == 0
     assert "ollama pull gemma3:4b" in result.out
     assert "they are large" in result.out
+    # The embed model pulled successfully, so it drops out of the "run these
+    # yourself" homework list - only the chat model, which stays printed-only,
+    # belongs there.
+    assert "ollama pull bge-m3" not in result.out
 
 
 def test_unreachable_ollama_is_a_warning_not_a_dead_end(tmp_path: Path) -> None:
