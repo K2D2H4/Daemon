@@ -188,3 +188,126 @@ def test_playback_recovers_from_an_external_pause_or_a_rejected_switch():
     end = PAGE.index("\n}\n", start)
     heal_body = _without_line_comments(PAGE[start:end])
     assert ".play()" in heal_body, "recovery must actually attempt to resume playback"
+
+
+# --- the lip-synced mouth ---------------------------------------------------
+# Static-text guards, and they stop there for the reason the file already says: this
+# suite has no JS runtime (no node step in .github/workflows/ci.yml), so it can pin
+# the shape of the mechanism and not that it works. What it works or fails at is a
+# window with a face in it, which is where §8 of the lip-sync design puts the pass
+# mark anyway.
+
+
+def _body(signature):
+    """A named function's own body, comments stripped, so a guard answers to the code
+    rather than to prose that happens to mention the same identifier."""
+    start = PAGE.index(signature)
+    return _without_line_comments(PAGE[start : PAGE.index("\n}\n", start)])
+
+
+def test_the_mouth_is_an_overlay_that_is_allowed_to_die():
+    # The failure this exists for: the renderer can latch `failed` mid-sentence and
+    # then publish nothing. An <img> fed a stream that stopped keeps showing its last
+    # frame and fires no event, so a page that treated lip-sync as a mode it had
+    # switched into would hold a frozen mouth over a face that is still talking.
+    # Two separate questions, and the split is the point - see mouthReady/mouthLive.
+    assert "function mouthReady()" in PAGE
+    live = _body("function mouthLive()")
+    assert "MOUTH_STALE_MS" in live, (
+        "liveness has to be decided by the age of the last frame; a boolean set when "
+        "the stream opened cannot tell a dead renderer from a quiet one"
+    )
+
+    stream = _body("function mouthStream() {")
+    assert "onerror" in stream and "EventSource.CLOSED" in stream, (
+        "the definite end of the stream is EventSource giving up (readyState CLOSED "
+        "after /face/frames answers 503), not the first dropped connection"
+    )
+    assert "mouthDead" in stream, "giving up has to be recorded, or nothing falls back"
+
+
+def test_a_dead_mouth_falls_back_to_the_v1_speaking_clip():
+    # clipFor() is the one place the fallback can live: tick() already re-asks it every
+    # frame while speaking, so flipping mouthDead crossfades to speaking_soft through
+    # the existing single-sided crossfade rather than through a second code path.
+    start = PAGE.index('if (act === "speaking")')
+    branch = _without_line_comments(PAGE[start : PAGE.index("\n  }\n", start)])
+    assert "mouthReady()" in branch and "mouthClip" in branch, (
+        "the driving clip has to be the speaking clip while lip-sync is alive - the "
+        "crops are that clip's own pixels, so speaking_soft under them is a different head"
+    )
+    assert "speaking_soft" in branch, (
+        "and the v1 chain must still be there underneath, unreachable only while the "
+        "mouth is alive"
+    )
+
+
+def test_the_driving_clip_is_never_rate_modulated():
+    # v1's mouth IS playbackRate (spec 3.4). Left on while lip-sync drives the clip it
+    # slides the pose under the crop away from the pose the renderer composited into
+    # it, which is a seam at the crop border rather than a mouth.
+    body = _body("function tick() {")
+    assert "mouthReady()" in body and "playbackRate" in body, (
+        "tick() must pin the driving clip to 1.0x while the lip-synced mouth is the "
+        "speaking path, not modulate it as v1 does"
+    )
+
+
+def test_the_crop_is_not_taken_off_the_screen_by_rAF():
+    # Measured, by getting it wrong first: with the visibility toggle inside tick(),
+    # killing the renderer left the overlay stuck mid-fade at opacity 0.13 and it never
+    # came off - rAF does not throttle in an occluded window, it stops. Header note 3
+    # tolerates that for playbackRate because being late there is cosmetic; being late
+    # here is a frozen mouth over a talking face, which is the whole failure the
+    # fallback exists for. So the crop's visibility must be event-driven.
+    assert "refreshMouth" not in _body("function tick() {"), (
+        "the overlay's visibility must not depend on rAF running"
+    )
+    stream = _body("function mouthStream() {")
+    assert "setTimeout" in stream and "MOUTH_STALE_MS" in stream, (
+        "a frame failing to arrive is an event too, and a timer is what survives a "
+        "backgrounded tab (clamped to ~1s, not stopped)"
+    )
+    assert "refreshMouth" in stream, "an arriving frame is what puts the crop on screen"
+    # And every other place the answer can change has to say so, or the crop outlives
+    # the state that justified it: a mood one-shot replacing the driving clip, the
+    # activity leaving speaking, and becoming visible after rAF was stopped.
+    for where in ("function toActivity(act) {", "function playOneShot(stem) {",
+                  "function advance() {"):
+        assert "refreshMouth" in _body(where), f"{where} must refresh the overlay"
+    start = PAGE.index('addEventListener("visibilitychange"')
+    handler = _without_line_comments(PAGE[start : PAGE.index("});", start)])
+    assert "refreshMouth" in handler, (
+        "becoming visible is when a stale overlay has to be corrected"
+    )
+
+
+def test_the_frame_stream_is_only_opened_when_the_daemon_offers_one():
+    # /face/manifest answers `false` for all three ways there is no mouth (switch off,
+    # no renderer, latched failed), so the page never has to infer it from a failed
+    # request - and must not open a connection that is going to 503.
+    body = _body("async function boot() {")
+    assert "manifest.lipsync" in body, "the switch is read from the manifest, not guessed"
+    assert "mouthStream()" in body and "videoWidth" in body, (
+        "the stream opens only behind the manifest AND a driving clip that actually "
+        "decoded - there is nothing to lay a crop over otherwise"
+    )
+
+
+def test_the_crop_is_placed_through_the_clips_own_letterboxing():
+    # The box arrives in the driving clip's pixels (1080x1620) and the clip is drawn
+    # with object-fit: contain, so the same fit - scale by the tighter axis, centre the
+    # remainder - has to be applied or the mouth lands somewhere near the jaw.
+    body = _body("function layoutMouth() {")
+    assert "videoWidth" in body and "Math.min" in body, (
+        "the crop box must be scaled by object-fit: contain's own factor"
+    )
+    assert "mouthBox" in body, "and positioned from the manifest's box, not a constant"
+
+
+def test_the_mouth_overlay_cannot_fall_behind_a_clip():
+    # show() hands each incoming clip ++z, so a fixed z-index on a sibling of #stage
+    # would eventually lose. #stage carrying its own z-index makes it a stacking
+    # context, which contains that counter for good.
+    assert "#stage { position: fixed; inset: 0; z-index: 0; }" in PAGE
+    assert "#mouth" in PAGE and "z-index: 1" in PAGE

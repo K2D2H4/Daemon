@@ -64,8 +64,11 @@ PENDING_CLASSES: dict[str, str] = {
     #
     # Not empty any more. Face lip-sync (MuseTalk, `daemon/face_lipsync/*`, branch
     # `claude/face-lipsync-phase2`) built five classes and nothing under `daemon/`
-    # constructs any of them - wiring them in (`daemon/app.py`, the PCM sink, the
-    # MJPEG transport, the config switch) is deliberately a second, not-yet-written
+    # constructs any of them. The transport and the config switch that used to be
+    # listed here are done - `/face/frames` and `DAEMON_FACE_LIPSYNC_ENABLED` - and
+    # neither constructs anything, on purpose: the route takes an injected slot-like
+    # source. What is left is `daemon/app.py`'s assembly, the PCM sink and the render
+    # loop, deliberately a second, not-yet-written
     # plan; `docs/superpowers/plans/2026-08-26-face-lipsync-engine.md` is the one
     # that built these five. Face lip-sync sits outside docs/PLAN.md's M0-M5
     # roadmap (§8.2) entirely, so there is no milestone letter to give it yet -
@@ -86,7 +89,7 @@ PENDING_CLASSES: dict[str, str] = {
     ),
     "Slot": (
         "the face lip-sync wiring plan (same plan as LipsyncEngine above; not on "
-        "the M0-M5 roadmap) - read by the MJPEG transport it adds"
+        "the M0-M5 roadmap) - read by the transport `/face/frames` already is"
     ),
     "Renderer": (
         "the face lip-sync wiring plan (same plan as LipsyncEngine above; not on "

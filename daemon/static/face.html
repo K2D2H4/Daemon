@@ -3,7 +3,14 @@
 <title>face</title>
 <!--
   Self-contained, offline, one file - the same posture as the admin shell. It talks to
-  three routes on its own origin and loads nothing else.
+  four routes on its own origin and loads nothing else.
+
+  Two mouths, and only one of them is here. v1's is this file's own: a speaking clip
+  whose playbackRate follows the level (spec 3.4), which cannot make a phoneme. The
+  other is rendered by the daemon and arrives on /face/frames as one crop box per
+  video frame, laid back over the clip it was cut from. It is off by default, and
+  everything below treats it as an overlay that can vanish mid-sentence rather than as
+  a mode the page switches into - see mouthReady/mouthLive.
 
   Three details here are the whole difference between "alive" and "wrong", and all
   three were learned by getting them wrong first:
@@ -20,27 +27,41 @@
      is not immune to the browser either, though (spec 3.8 claimed it was, and that
      was wrong): Chrome pauses muted background video to save power even in a
      merely-occluded window, measured live - see ensurePlaying(), below.
+     And "throttles" is generous: in an occluded window rAF stops outright, measured
+     while building the lip-sync overlay. Anything whose LATENESS is a defect rather
+     than a cosmetic lag therefore cannot live in tick() - see refreshMouth().
 -->
 <style>
   :root { --bg: #19191B; }
   html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
-  #stage { position: fixed; inset: 0; }
+  /* z-index 0 makes #stage a stacking context, which is the only way #mouth stays
+     above every clip: show() hands the incoming clip ++z, so a fixed number on a
+     sibling would eventually lose the race. Contained here, it never can. */
+  #stage { position: fixed; inset: 0; z-index: 0; }
   video {
     position: absolute; inset: 0; width: 100%; height: 100%;
     object-fit: contain; opacity: 0; transition: opacity 180ms linear;
   }
+  /* The lip-synced mouth: one crop box of the driving clip, laid back over the clip
+     it came from at the geometry /face/manifest reports. Positioned in JS because it
+     has to travel through object-fit: contain's own letterboxing (layoutMouth). */
+  #mouth {
+    position: fixed; opacity: 0; transition: opacity 180ms linear;
+    z-index: 1; pointer-events: none;
+  }
   #hint {
     position: fixed; inset: 0; display: grid; place-items: center; padding: 2rem;
     color: #8a8a90; font: 13px/1.7 -apple-system, system-ui, sans-serif;
-    text-align: center;
+    text-align: center; z-index: 2;
   }
   #hint code { color: #d8d8dc; }
   @media (prefers-reduced-motion: reduce) {
-    video { transition: none; }
+    video, #mouth { transition: none; }
   }
 </style>
 
 <div id="stage"></div>
+<img id="mouth" alt="" draggable="false">
 <div id="hint" hidden></div>
 
 <script>
@@ -72,6 +93,15 @@ const FLOURISHES = ["flourish_arms"];
 const FLOURISH_MIN_MS = 40000, FLOURISH_MAX_MS = 120000;
 const LOUD_ENTER = 0.62, LOUD_HOLD_MS = 500;
 const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const MOUTH_STALE_MS = 250;   // How long the last lip-sync frame stays believable.
+                               // Frames arrive every 41.67ms, but a gap of a tick or
+                               // two is normal, not broken: a model step covers two
+                               // frames and cannot start until the second one's audio
+                               // has arrived, so the renderer answers "not yet" on
+                               // some ticks by design (/face/frames). Six frames
+                               // clears that; much longer and a renderer that latched
+                               // failed mid-sentence reads as a frozen face, which is
+                               // the exact thing the fallback exists to prevent.
 
 // activity -> clip, with the fallback chain from spec §3.7 applied at load time.
 const FOR_ACTIVITY = {
@@ -94,6 +124,7 @@ const WAIT_ACTIVITIES = new Set(["listening", "thinking", "working", "idle"]);
 
 const stage = document.getElementById("stage");
 const hint = document.getElementById("hint");
+const mouth = document.getElementById("mouth");
 const els = new Map();        // stem -> <video>
 let have = new Set();
 let showing = null;           // the <video> currently opaque
@@ -107,6 +138,39 @@ let pendingWaitFade = 0;      // set only while waiting out spec 3.2's WAIT_MS d
 let queuedActivity = null;    // spec 3.6: a non-speaking activity change held until an
                                // in-flight one-shot finishes, rather than dropped or
                                // acted on mid-gesture
+let mouthClip = null;         // driving clip stem from /face/manifest; null = no lip-sync
+let mouthBox = null;          // [x1,y1,x2,y2] in that clip's own pixels
+let mouthAt = 0;              // performance.now() of the last frame that arrived
+let mouthDead = false;        // the frame stream is not coming back: revert to v1
+let mouthShown = false;       // last opacity written, so refreshMouth writes on change
+let mouthTimer = 0;           // the staleness watchdog, re-armed by every frame
+
+// --- lip-sync mouth: is it this page's speaking path, and is it live? -------
+// Two questions, not one. `mouthReady` decides which clip plays *under* the crop and
+// so must not flicker - a clip switch mid-sentence is worse than a still mouth. Only
+// `mouthLive` gates the crop itself, so a gap of a few frames hides the overlay and
+// leaves the clip alone, and the page never has to choose between a frozen mouth and
+// a clip that changes twice a second.
+function mouthReady() { return !!mouthClip && !mouthDead; }
+function mouthLive() { return mouthReady() && performance.now() - mouthAt < MOUTH_STALE_MS; }
+
+// Whether the crop is on screen, recomputed from state and written only on change.
+// Deliberately NOT called from tick(): rAF does not merely throttle in a backgrounded
+// or occluded window, it stops (measured - see the header note and ensurePlaying), and
+// the one thing that must never wait on it is the mouth going AWAY. A frozen crop over
+// a clip is the exact failure the fallback exists for, so a frame arriving and a frame
+// failing to arrive are both handled where they happen: onmessage, and the timer it
+// re-arms. Measured while getting this wrong: with the visibility toggle inside tick(),
+// killing the renderer left the overlay stuck mid-fade at opacity 0.13 for good.
+function refreshMouth() {
+  const on = activity === "speaking" && !oneShotUntil && mouthLive();
+  if (on === mouthShown) return;
+  mouthShown = on;
+  // Single-sided, spec 3.2: only the crop's opacity animates, over a clip that is
+  // already fully opaque underneath - in both directions, so neither the fade in nor
+  // the fall back to clips can dip to the page background.
+  mouth.style.opacity = on ? "1" : "0";
+}
 
 function first(list) { return (list || []).find(s => have.has(s)) || null; }
 
@@ -119,6 +183,10 @@ function clipFor(act) {
     return (pick.length ? pick : pool)[Math.floor(Math.random() * (pick.length ? pick.length : pool.length))];
   }
   if (act === "speaking") {
+    // Lip-sync drives ONE clip and the crops are that clip's own pixels frame for
+    // frame, so speaking_soft underneath would put a different head around the mouth.
+    // The v1 chain below stays live and is what a dead frame stream falls back to.
+    if (mouthReady()) return mouthClip;
     const loud = loudSince && performance.now() - loudSince > LOUD_HOLD_MS;
     // spec 3.7: speaking_loud -> speaking_soft -> idle. The first two links are
     // this branch's own ordering; reusing FOR_ACTIVITY[act] for the last link keeps
@@ -179,6 +247,54 @@ function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {
   });
 }
 
+// --- LIP-SYNC OVERLAY -------------------------------------------------------
+function layoutMouth() {
+  const v = mouthClip && els.get(mouthClip);
+  if (!mouthBox || !v || !v.videoWidth) return;
+  // The clip is letterboxed by object-fit: contain, so the crop box has to travel
+  // through the same fit before it is CSS pixels - centred, and scaled by whichever
+  // axis is the tighter fit. Only two inputs, and neither changes per frame: the
+  // viewport (hence the resize listener) and the clip's intrinsic size, which is
+  // already known by the time boot() calls this because prime() awaited it. Per-frame
+  // layout is exactly what this page's design note is about not doing.
+  const s = Math.min(innerWidth / v.videoWidth, innerHeight / v.videoHeight);
+  const ox = (innerWidth - v.videoWidth * s) / 2;
+  const oy = (innerHeight - v.videoHeight * s) / 2;
+  const [x1, y1, x2, y2] = mouthBox;
+  mouth.style.left = `${ox + x1 * s}px`;
+  mouth.style.top = `${oy + y1 * s}px`;
+  mouth.style.width = `${(x2 - x1) * s}px`;
+  mouth.style.height = `${(y2 - y1) * s}px`;
+}
+
+function mouthStream() {
+  const es = new EventSource("/face/frames");   // reconnects on its own, like /face/stream
+  es.onmessage = (m) => {
+    // The payload is base64 JPEG of the crop box and nothing else. Assigning src is
+    // all the page does per frame: the browser decodes it off the main thread, which
+    // is why this is an <img> over the clip and not a canvas the page draws into.
+    mouth.src = `data:image/jpeg;base64,${m.data}`;
+    mouthAt = performance.now();
+    // setTimeout and not rAF: a background tab clamps a timer to about a second
+    // instead of stopping it, so the crop still comes off the screen when the
+    // renderer stops - late, but it comes off.
+    clearTimeout(mouthTimer);
+    mouthTimer = setTimeout(refreshMouth, MOUTH_STALE_MS);
+    refreshMouth();
+  };
+  es.onerror = () => {
+    // CLOSED, not CONNECTING, is the definite answer. A renderer that latches failed
+    // ends the response, which EventSource retries on its own; the retry lands on
+    // /face/frames' 503, and a non-200 makes EventSource fail the connection for
+    // good. So this fires exactly once the mouth is not coming back - after which
+    // clipFor("speaking") returns to speaking_soft and tick() crossfades to it.
+    // The gap is EventSource's own retry delay (~3s), spent playing the driving clip
+    // with a hidden overlay: a face still playing a clip, just not the speaking one.
+    if (es.readyState === EventSource.CLOSED) mouthDead = true;
+    refreshMouth();
+  };
+}
+
 // --- SELF-HEALING PLAYBACK ---------------------------------------------------
 function ensurePlaying() {
   // Two independent ways the browser strands the page (both measured live, not
@@ -201,6 +317,7 @@ function advance() {
   // deferred wait (toActivity, below) also lands here once the outgoing clip
   // reaches its own end, carrying the fade speed that call already chose.
   oneShotUntil = 0;
+  refreshMouth();               // the gesture is over; the driving clip may be back
   if (queuedActivity !== null) {
     // spec 3.6: a non-speaking activity change arrived mid-one-shot and was held
     // instead of dropped or applied over the gesture; the one-shot has now
@@ -234,6 +351,8 @@ function toActivity(act) {
   oneShotUntil = 0;
   pendingWaitFade = 0;          // any earlier deferred wait is moot now
   scheduleFlourish();
+  refreshMouth();               // leaving speaking takes the crop off the screen, and
+                                 // arriving at it puts one back if frames are current
   const fadeMs = SLOW_FADE_ACTIVITIES.has(act) ? FADE_SLOW_MS : FADE_MS;
   // !showing.paused excludes a clip that has already reached its end (paused,
   // non-looping - e.g. a one-shot whose `ended` just fired and landed us here via
@@ -251,13 +370,26 @@ function toActivity(act) {
     }
   }
   const stem = clipFor(act);
-  if (stem) show(stem, { loop: act !== "idle", fadeMs });
+  if (!stem) return;
+  if (act === "speaking" && stem === mouthClip) {
+    // The renderer indexes the driving clip from frame 0 at every re-anchor - a new
+    // turn is a re-anchor (FrameClock) - so the page has to be at frame 0 too, or the
+    // pose around the crop is not the pose the crop was drawn into. show() already
+    // rewinds a clip it is switching TO; this covers the case it bails on, where the
+    // driving clip is an idle clip that is already the one on screen and the playhead
+    // is the only thing that has to move.
+    const v = els.get(stem);
+    if (v === showing) { v.currentTime = 0; return; }
+  }
+  show(stem, { loop: act !== "idle", fadeMs });
 }
 
 function playOneShot(stem) {
   if (!have.has(stem)) return;           // no clip, no expression - never substitute idle
   oneShotUntil = Infinity;
   pendingWaitFade = 0;          // a fresh one-shot supersedes any pending wait
+  refreshMouth();               // a mood gesture is not the driving clip: a crop cut
+                                 // from idle2 over `amused` is somebody else's mouth
   show(stem, { loop: false });
 }
 
@@ -270,7 +402,12 @@ function scheduleFlourish() {
 // --- mouth: envelope -> playbackRate ---------------------------------------
 function tick() {
   if (showing && activity === "speaking") {
-    const rate = RATE_MIN + (RATE_MAX - RATE_MIN) * env;
+    // 1.0x while lip-sync drives the clip. The crops are frame-for-frame that clip's
+    // own pixels, so modulating its rate slides the pose under the crop away from the
+    // pose the renderer composited into it - v1's envelope IS the mouth, and here it
+    // would be the seam. Pinned rather than skipped so a fallback to speaking_soft
+    // does not inherit whatever rate the driving clip was left on.
+    const rate = mouthReady() ? 1 : RATE_MIN + (RATE_MAX - RATE_MIN) * env;
     if (Math.abs(showing.playbackRate - rate) > 0.01) showing.playbackRate = rate;
     const want = clipFor("speaking");
     if (want && showing.dataset.stem !== want && !oneShotUntil) show(want);
@@ -295,6 +432,22 @@ async function boot() {
     return;
   }
   await Promise.all([...have].map(prime));
+
+  // Lip-sync, if the daemon says so. The manifest answers `false` for all three ways
+  // there is no mouth - switch off, no renderer wired, renderer latched failed - so
+  // the page never has to infer it from a failed request, and a driving clip whose
+  // bytes are missing or undecodable is a fourth (videoWidth stays 0 and there is
+  // nothing to lay the crop over). Any of them leaves v1 running, untouched.
+  const ls = manifest.lipsync;
+  const driver = ls && els.get(ls.clip);
+  if (ls && driver && driver.videoWidth) {
+    mouthClip = ls.clip;
+    mouthBox = ls.box;
+    layoutMouth();
+    addEventListener("resize", layoutMouth);
+    mouthStream();
+  }
+
   toActivity("idle");
   requestAnimationFrame(tick);
 
@@ -312,7 +465,9 @@ async function boot() {
   // The other half of self-healing: becoming visible again is exactly when the
   // browser will actually let a previously-withheld play() succeed.
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") ensurePlaying();
+    // refreshMouth too: rAF stopped while hidden, so the clip under the crop may be
+    // the wrong one and the crop itself may be a frame from before the tab was hidden.
+    if (document.visibilityState === "visible") { ensurePlaying(); refreshMouth(); }
   });
 }
 

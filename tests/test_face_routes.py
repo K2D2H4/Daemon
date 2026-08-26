@@ -1,12 +1,21 @@
-"""The face routes: a page, a stream, and clip bytes.
+"""The face routes: a page, a stream, clip bytes, and lip-sync frames.
 
 The stream is the interesting one. It carries three things on one channel and its
 first line must be a snapshot rather than a change, because a reconnect in the middle
 of a reply otherwise shows an idle face over a speaking daemon.
+
+The frames are the other interesting one, and everything worth asserting about them is
+what the page is told when there is nothing to send: switch off, nothing wired, a
+renderer that has failed, and a renderer that simply has not drawn yet are four
+different sentences and only one of them is an error the owner should care about. All
+four have to leave the page able to fall back to the clips, so each test below ends by
+checking the signal the page actually keys off.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 
 import httpx
@@ -74,11 +83,11 @@ def test_manifest_lists_available_clips(app):
     settings = app.state.settings
     r = TestClient(app).get("/face/manifest")
     assert r.status_code == 200
-    assert r.json() == {"clips": []}
+    assert r.json() == {"clips": [], "lipsync": False}
     _clip(settings, "idle1")
     _clip(settings, "speaking_soft")
     r = TestClient(app).get("/face/manifest")
-    assert r.json() == {"clips": ["idle1", "speaking_soft"]}
+    assert r.json() == {"clips": ["idle1", "speaking_soft"], "lipsync": False}
 
 
 async def test_the_stream_opens_with_a_snapshot(app):
@@ -145,3 +154,241 @@ def test_clips_lists_every_stem_the_page_expects(app):
         "curious",
         "flourish_arms",
     }
+
+
+# --- lip-sync frames -------------------------------------------------------
+
+
+class FakeFrames:
+    """A `LipsyncFrames` with no model behind it - and a real `Slot`'s semantics.
+
+    `get()` returns the newest frame and only the newest, which is the whole point of
+    the slot the renderer writes into: a reader that falls behind loses movement rather
+    than accumulating a backlog that arrives late. Tests that need two frames on the
+    wire therefore have to publish them over time, the way the render loop does, not
+    stack them up first.
+
+    Nothing here imports `daemon.face_lipsync`, on purpose: the route names no part of
+    that package (CONTRACTS 4), so its tests must not either, or they would prove the
+    route works against the one object the layering says it must not depend on.
+    """
+
+    def __init__(self, *, clip: str = "idle2", box=(245, 300, 835, 890)) -> None:
+        self.failed = False
+        self.clip = clip
+        self.box = box
+        self._frame: bytes | None = None
+
+    def put(self, frame: bytes) -> None:
+        self._frame = frame
+
+    def get(self) -> bytes | None:
+        return self._frame
+
+
+# Bytes that are not valid UTF-8 and never will be. A frame is binary on a channel
+# that is defined as text, so "did the transport mangle it" is the question worth
+# asking, and a printable payload cannot ask it.
+FRAME = b"\xff\xd8\xff\xe0" + bytes(range(256)) + b"\xff\xd9"
+
+
+def _with_lipsync(app, source=None, *, enabled: bool = True):
+    """Flip the switch, inject the source, and shorten the keepalive.
+
+    Settings are rebuilt rather than mutated so the test sees exactly the object a
+    real boot would build from `.env`. The keepalive is shortened for the reason every
+    stream test in this file does it: `httpx.ASGITransport` holds the first chunk until
+    a second one exists, so production's 20s would be a stall rather than a test.
+    """
+    app.state.settings = _settings(
+        app.state.settings.data_dir, face_lipsync_enabled=enabled
+    )
+    app.state.keepalive_seconds = 0.05
+    if source is not None:
+        app.state.face_frames = source
+    return app
+
+
+
+
+async def _transcript(app, drive):
+    """Everything `/face/frames` put on the wire, as lines, with `drive` running beside it.
+
+    `drive` MUST end by latching `source.failed`, and that is not a convenience: this
+    version of `httpx.ASGITransport` runs the ASGI app **to completion** and only then
+    hands back a response (it has no streaming path at all), so a request against a
+    generator that never returns does not merely buffer - it never opens. Two things
+    follow, and both are the reason this helper exists rather than `client.stream`:
+
+    - the driver task has to be created BEFORE the request, because the `async with`
+      body of a streamed request is not reached until the app is already done;
+    - `wait_for` turns "the response never ended" into a failing test instead of a
+      suite that hangs, which is exactly the property the latched-`failed` path needs.
+
+    What this cannot show is that a frame reached the page *promptly*; the transcript
+    proves order and content, not latency. That is what running the real thing is for.
+    """
+    task = asyncio.create_task(drive())
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://face") as c:
+            r = await asyncio.wait_for(c.get("/face/frames"), 5.0)
+    finally:
+        task.cancel()
+    assert r.status_code == 200
+    assert "text/event-stream" in r.headers["content-type"]
+    return r.text.splitlines()
+
+
+def _frames_in(lines):
+    """The JPEGs the page would have received, decoded back out of the data lines."""
+    return [base64.b64decode(ln[5:].strip()) for ln in lines if ln.startswith("data:")]
+
+
+def test_frames_say_the_switch_is_off_rather_than_just_failing(app):
+    """The default install. 503 is right, and so is saying which of three reasons.
+
+    The status is load-bearing beyond diagnostics: a non-200 is what makes the page's
+    `EventSource` fail the connection for good instead of retrying it forever.
+    """
+    r = TestClient(app).get("/face/frames")
+    assert r.status_code == 503
+    # The env key, verbatim, because that is the line the reader has to change.
+    assert "DAEMON_FACE_LIPSYNC_ENABLED" in r.text
+    # And the page is told the same thing without having to make a failing request.
+    assert TestClient(app).get("/face/manifest").json()["lipsync"] is False
+
+
+def test_frames_distinguish_a_missing_renderer_from_a_closed_switch(app):
+    """Switch on, nothing wired: the owner has not fetched the weights yet.
+
+    This is the install that would otherwise look broken - the switch says yes and
+    there is no mouth - so the 503 has to name the cache it is missing rather than
+    repeat the switch back at someone who has already set it.
+    """
+    _with_lipsync(app)
+    r = TestClient(app).get("/face/frames")
+    assert r.status_code == 503
+    assert "no renderer" in r.text
+    assert "DAEMON_FACE_LIPSYNC_ENABLED" not in r.text
+    assert TestClient(app).get("/face/manifest").json()["lipsync"] is False
+
+
+def test_a_latched_failure_stops_both_surfaces_advertising_a_mouth(app):
+    """`Renderer.failed` latches, so the page must be able to go back to the clips.
+
+    The healthy assertion first is the point: the same source advertises a mouth until
+    it fails and refuses afterwards, so this is the latch being observed rather than a
+    route that was never working in the first place.
+    """
+    source = FakeFrames()
+    source.put(FRAME)
+    _with_lipsync(app, source)
+    assert TestClient(app).get("/face/manifest").json()["lipsync"] == {
+        "clip": "idle2",
+        "box": [245, 300, 835, 890],
+    }
+
+    source.failed = True
+    r = TestClient(app).get("/face/frames")
+    assert r.status_code == 503
+    assert "failed" in r.text
+    # No stale mouth on the manifest either, so a page booting after the failure
+    # never opens the stream at all and plays clips from the first frame.
+    assert TestClient(app).get("/face/manifest").json()["lipsync"] is False
+
+
+def test_the_manifest_tells_the_page_where_to_put_the_crops(app):
+    """Geometry rides on the manifest, not on the frames: the page positions one
+    `<img>` from this once and the frames are then only pixels. One box for the whole
+    clip, so the overlay is never re-placed frame to frame."""
+    _with_lipsync(app, FakeFrames(clip="idle3", box=(10, 20, 600, 610)))
+    body = TestClient(app).get("/face/manifest").json()
+    assert body["lipsync"] == {"clip": "idle3", "box": [10, 20, 600, 610]}
+
+
+async def test_a_quiet_renderer_keeps_the_stream_open_and_sends_no_frame(app):
+    """Idle is not an error, and neither is an alternate tick.
+
+    A model step covers two frames and cannot start until the second one's audio has
+    arrived, so the source answers "nothing new" on some ticks by design; between turns
+    it answers that for minutes. What goes out then is keepalive comments, which are
+    not events, so nothing reaches the page's `onmessage` and its overlay ages out and
+    fades instead of holding a mouth that is no longer being drawn.
+    """
+    source = FakeFrames()          # never fed: no frame has ever existed
+
+    async def drive():
+        await asyncio.sleep(0.25)  # ~50 poll turns, ~5 keepalives at 0.05
+        source.failed = True
+
+    _with_lipsync(app, source)
+    lines = await _transcript(app, drive)
+
+    assert not _frames_in(lines), "a quiet renderer must not produce a frame"
+    assert ":" in lines, "a silent stream still has to prove it is alive"
+
+
+async def test_the_frames_reach_the_page_byte_for_byte_and_in_order(app):
+    """The JPEGs the renderer published, base64'd, in the order it published them.
+
+    Fed from a task rather than pre-loaded because that is how they really arrive - the
+    slot holds one frame, so stacking three up first would only ever deliver the third.
+    Three frames spread over time also mean the transcript could not have come from a
+    single read of the slot.
+    """
+    source = FakeFrames()
+
+    async def drive():
+        for n in range(3):
+            await asyncio.sleep(0.02)
+            source.put(FRAME + bytes([n]))
+        await asyncio.sleep(0.05)
+        source.failed = True
+
+    _with_lipsync(app, source)
+    lines = await _transcript(app, drive)
+
+    assert _frames_in(lines) == [FRAME + bytes([n]) for n in range(3)]
+
+
+async def test_the_same_frame_is_never_sent_twice(app):
+    """The slot is latest-wins, so an unchanged slot means "nothing new", not "send it
+    again". A transport that re-sent would spend 55KB a poll on a still mouth."""
+    source = FakeFrames()
+    source.put(FRAME)
+
+    async def drive():
+        # ~40 poll turns over an unchanged slot, then a second, distinct frame, so the
+        # assertion is about de-duplication and not about the loop having stalled.
+        await asyncio.sleep(0.2)
+        source.put(FRAME + b"next")
+        await asyncio.sleep(0.05)
+        source.failed = True
+
+    _with_lipsync(app, source)
+    lines = await _transcript(app, drive)
+
+    assert _frames_in(lines) == [FRAME, FRAME + b"next"]
+
+
+async def test_a_failure_mid_stream_ends_the_response(app):
+    """The one signal the page gets that the mouth is not coming back.
+
+    Every test above leans on this, and `_transcript` fails on a hang rather than on a
+    wrong value, which is the failure that matters: a renderer latching `failed` under
+    an open stream would otherwise leave an `<img>` holding a frozen mouth over a
+    speaking face, with nothing else for the page to learn it from - the manifest is
+    only read at boot. Here it is asserted on its own so the reason is named once.
+    """
+    source = FakeFrames()
+    source.put(FRAME)
+
+    async def drive():
+        await asyncio.sleep(0.05)
+        source.failed = True
+
+    _with_lipsync(app, source)
+    lines = await _transcript(app, drive)
+
+    assert _frames_in(lines) == [FRAME], "the frame it already had should still go out"

@@ -660,6 +660,25 @@ class Settings(BaseSettings):
     """Maximum dhash Hamming distance for two frames to count as duplicates and be
     skipped, so an unchanging screen does not resend the same frame every tick."""
 
+    face_lipsync_enabled: bool = Field(default=False, alias="DAEMON_FACE_LIPSYNC_ENABLED")
+    """Whether the face's mouth is rendered from the audio it is speaking.
+
+    Off by default, and for a different reason than DAEMON_BROWSER_ENABLED,
+    DAEMON_SCREEN_ENABLED and DAEMON_VOICE_ENABLED above: those are reach decisions,
+    and this one is a cost decision. It reads nothing new and shows nothing `/face`
+    does not already show - it wants 1.70GB of pre-converted weights on disk and
+    realises 1.62GB of them for 693ms the first time it speaks
+    (2026-08-25-face-design.md, "전송과 로딩"; the 1.8/1.75GB the earlier prose quoted
+    predates that measurement). An install that never turns it on should pay nothing
+    for it existing - the same reasoning that has `daemon/app.py` import the face
+    routes lazily.
+
+    A live toggle on purpose (2026-08-26-face-lipsync-design.md §6): the pass mark is
+    whether the mouth *feels* right, and that can only be judged by turning it off and
+    on inside one conversation. `/face/manifest` answers with it so the page follows
+    the switch rather than guessing, and turning it off leaves the pre-rendered clips
+    of face v1 - they are not a fallback, they are still the other half of the face."""
+
     data_dir: Path = Field(default=Path("./data"), alias="DAEMON_DATA_DIR")
 
     host: str = Field(default="127.0.0.1", alias="DAEMON_HOST")
