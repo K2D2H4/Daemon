@@ -75,17 +75,34 @@ const ATTACK = 0.30;          // fast open
 const RELEASE = 0.06;         // slow close - real mouths are asymmetric
 const IDLES = ["idle1", "idle2", "idle3"];
 const FLOURISHES = ["flourish_arms"];
-const FLOURISH_MIN_MS = 40000, FLOURISH_MAX_MS = 120000;
-const LOUD_ENTER = 0.62, LOUD_HOLD_MS = 500;
-// LOUD_ENTER is NOT settled, and the value here is not a measurement. It sits on
-// the raw scale daemon/face.py's _rms produces, where a full-scale sine only
-// reaches 0.707 - louder than speech ever gets - and it used to be compared
-// against the raw per-tick level, which spec 3.4 itself calls too jittery to use
-// directly: one sub-threshold 40ms tick reset the whole hold. It is compared
-// against the smoothed envelope now, which is the right signal; the right
-// THRESHOLD needs data nobody has. Spec open question 3 ("keep speaking_loud?")
-// is supposed to be settled by v1's own measurements and v1 was recording none,
-// so logEnvelope() below prints one summary per speaking turn.
+const FLOURISH_MIN_MS = 15000, FLOURISH_MAX_MS = 60000;
+// Was 40-120s, which spec open question 6 admitted was a guess. The guess was
+// wrong in a way that made the clip unreachable in use rather than merely rare:
+// scheduleFlourish() arms only while `idle` and any other activity disarms it, and
+// across a live 8-turn session the longest uninterrupted idle stretch was **36s**
+// (then 12s, then nothing above 1s). Every gap was shorter than the minimum wait,
+// so `flourish_arms` could not fire once - not because the conversation was busy,
+// but because the window never opened.
+//
+// 15-60s fits the gaps that actually occur while still averaging under the "once a
+// minute breaks the loop's visible period" the spec wanted it for. Left alone for
+// minutes, the face now flourishes several times rather than never.
+const LOUD_ENTER = 0.27, LOUD_HOLD_MS = 500;
+// Now a measurement. Taken off the running resident's own /face/stream through a
+// live 8-turn voice session, with this file's ATTACK/RELEASE filter replayed over
+// the captured levels so the number sits on the same `env` scale the comparison
+// below uses: 295 samples, median 0.233, p75 0.254, **p90 0.272**, p99 0.307,
+// max 0.315. The old 0.62 cleared *nothing* - `speaking_loud` was a rendered clip
+// that could not play. 0.27 is that p90, and with LOUD_HOLD_MS it engaged 4 times
+// across those 8 turns (0.26 -> 8, 0.25 -> 16, which is fidgeting, and 0.30 -> 1).
+//
+// What the same data says about spec open question 3 ("keep speaking_loud?"): this
+// speaker has **no loud mode**. The whole envelope lives in 0.23-0.32 on a scale
+// where a full-scale sine reaches 0.707, so this threshold selects her loudest
+// decile rather than detecting loudness in any absolute sense. Kept because the
+// clip exists and the top decile is a real, repeatable part of the signal - but
+// one session, one voice, one provider. logEnvelope() below still prints a summary
+// per speaking turn, and that is still the thing to read before moving this.
 const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 // activity -> clip, with the fallback chain from spec §3.7 applied at load time.
