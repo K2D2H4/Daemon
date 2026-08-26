@@ -229,6 +229,51 @@ def test_level_is_published_for_when_the_chunk_is_audible_not_when_it_arrived():
     assert loud > 0.5, "by now the loud chunk is audible"
 
 
+def test_a_short_first_chunk_does_not_flicker_the_face_to_idle():
+    """The start-of-answer flicker, measured off a live session's own stream.
+
+    A turn's first chunk is routinely shorter than the 40ms pump interval, so the
+    tick right after it finds the queue dry while the model is still producing.
+    Published as a falling edge that reads `speaking -> idle -> speaking` inside one
+    second, and the page turns each of those into a clip switch.
+    """
+    bus = RecordingBus()
+    clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
+    clock.fed(_pcm(0.02), at=100.0)            # 20ms - shorter than one tick
+    clock.pump(100.0, generating=True)
+    clock.pump(100.04, generating=True)        # queue dry, turn still producing
+    clock.fed(_pcm(0.5), at=100.05)
+    clock.pump(100.08, generating=True)
+
+    assert bus.state.activity == "speaking"
+    assert bus.activities == ["speaking"], "one rising edge, and no dip through idle"
+
+
+def test_the_gap_is_silent_but_still_speaking():
+    """Holding the edge must not also hold the mouth open on stale loudness."""
+    bus = RecordingBus()
+    clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
+    clock.fed(_pcm(0.02, amplitude=32000), at=100.0)
+    clock.pump(100.0, generating=True)
+    assert bus.state.level > 0.5
+    clock.pump(100.04, generating=True)
+    assert bus.state.activity == "speaking"
+    assert bus.state.level == 0.0, "a gap is silence, even though the turn goes on"
+
+
+def test_the_falling_edge_is_still_exact_once_the_turn_is_over():
+    """The hold is a flag, not a debounce: with the turn done, the end of speech is
+    the same instant it always was - no lateness bought for the flicker fix."""
+    bus = RecordingBus()
+    clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
+    clock.fed(_pcm(0.5), at=100.0)
+    clock.pump(100.0, generating=True)
+    clock.pump(100.49, generating=False)
+    assert bus.state.activity == "speaking"
+    clock.pump(100.51, generating=False)
+    assert bus.state.activity == "idle"
+
+
 def test_level_returns_to_zero_once_playback_is_over():
     bus = RecordingBus()
     clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)

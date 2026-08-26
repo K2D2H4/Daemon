@@ -777,7 +777,7 @@ class VoiceConversation:
         loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(0.04)
-            self._speech.pump(loop.time())
+            self._speech.pump(loop.time(), generating=self._generating)
 
     # --- transcripts --------------------------------------------------------
 
@@ -791,10 +791,25 @@ class VoiceConversation:
         # also the signal that this turn's audio is done.
         self._generating = False
         if transcript.role == "user":
-            if self._face is not None:
+            if self._face is not None and not (
+                asyncio.get_running_loop().time() < self._playback_until
+            ):
                 # The owner's utterance just settled - the request is now fully
                 # made, and whatever answer is coming has not arrived yet. The same
                 # settling that lets recall start is what tells the face to wait.
+                #
+                # Unless the answer is already being heard. A *user* transcript
+                # routinely finalises after the daemon has started replying - the
+                # timing is non-deterministic on this provider - and publishing
+                # `thinking` then is simply false: the daemon is talking, not
+                # thinking. It also does visible damage rather than none, because
+                # `_face_pump` overwrites it 40ms later while the page has already
+                # committed to switching clips, and every non-speaking activity has
+                # to wait for a neutral moment it now never reaches (measured off a
+                # live session: a lone `thinking` frame in the middle of two
+                # separate spoken turns). Guarded against the playback clock, the
+                # same authority - and for the same reason - as the `listening`
+                # publisher in `_forward_microphone`.
                 self._face.set_activity("thinking")
             await self._settle_recall(session, transcript.text)
         await self._record(transcript)

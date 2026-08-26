@@ -170,10 +170,15 @@ class SpeechClock:
 
         audible_until = max(audible_until, arrival) + len(chunk) / (rate * width)
 
-    `speaking` is then true for `now < audible_until` and nothing else. No debounce:
-    a queue that momentarily empties mid-utterance leaves that instant in the future,
-    so the face does not flicker, and the instant it passes is exact rather than
-    guessed.
+    `speaking` is then true for `now < audible_until` and nothing else, so the instant
+    it passes is exact rather than guessed. No debounce, and there still is none.
+
+    That arithmetic alone was claimed here to make flicker impossible, and it does
+    not: it holds mid-utterance, where the model runs ahead of real time and the
+    backlog never empties, but not at the *start*, where one chunk shorter than the
+    caller's tick interval is the whole queue. Measured off a live session's SSE
+    stream: 34 of 79 activity changes were sub-second noise. `pump(generating=...)`
+    is what closes that, and its docstring carries the rest.
     """
 
     __slots__ = ("_bus", "_pending", "_rate", "_until", "_width")
@@ -194,13 +199,38 @@ class SpeechClock:
         self._until = starts + seconds
         self._pending.append((self._until, _rms(chunk)))
 
-    def pump(self, at: float) -> None:
-        """Publish whatever is audible at `at`. Call this on a timer."""
+    def pump(self, at: float, *, generating: bool = False) -> None:
+        """Publish whatever is audible at `at`. Call this on a timer.
+
+        `generating` is "the model is still producing this turn". While it is true
+        a dry queue is a *gap between chunks*, not the end of speech, so the falling
+        edge is held: level drops to zero, `speaking` stays.
+
+        Without it the face flickers at the start of every answer, which is not a
+        hypothetical - measured off a live session's own SSE stream, 34 of 79
+        activity changes were sub-second noise, `idle` the most common. The first
+        chunk of a turn is routinely shorter than the 40ms pump interval, so `fed()`
+        puts `_until` barely ahead of `at` and the very next tick finds the queue
+        dry: `speaking -> idle -> speaking` inside one second. Mid-utterance the
+        queue does not dry out, because the model generates faster than real time
+        (28.4s of audio in about 19s - `daemon/voice/conversation.py`), which is why
+        the start is where this bites.
+
+        Deliberately not a debounce. A timed hold would make the *end* of speech
+        late by however long the hold is, and this class exists to publish an exact
+        instant rather than a guessed one. Holding on a flag the caller already
+        maintains keeps the falling edge exact whenever it is real.
+        """
         while len(self._pending) > 1 and self._pending[0][0] <= at:
             self._pending.popleft()
         if at < self._until:
             self._bus.set_activity("speaking")
             self._bus.set_level(self._pending[0][1] if self._pending else 0.0)
+            return
+        if generating:
+            # Between chunks: silent, but still this turn. `_pending` is left alone -
+            # the loop above already trimmed it to at most one entry.
+            self._bus.set_level(0.0)
             return
         self._pending.clear()
         self._bus.set_level(0.0)
