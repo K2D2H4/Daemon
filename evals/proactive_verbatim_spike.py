@@ -28,7 +28,9 @@ Two cells, same line, same persona, N sessions each. The only thing that varies 
 what the opening asks for:
 
   A. baseline - `CALLED_BY_NAME`-shaped instruction to speak in character
-  B. verbatim - the same, plus "say this sentence exactly, changing nothing"
+  B. verbatim - `conversation.speak_verbatim(LINE, nonce)`, imported, not copied:
+     "say this sentence exactly, changing nothing", with the line fenced under a
+     per-call nonce the way `proactivity/topics.py` fences search titles
 
 Scored on the assistant transcript against the intended line, three ways, because
 "the same" has three useful meanings here:
@@ -47,6 +49,20 @@ report failure for a session that said the sentence perfectly.
 Needs GEMINI_API_KEY (+ DAEMON_GEMINI_LIVE_MODEL). No microphone, no speaker: the
 line is handed over with `send_text`, which is the production path a proactive
 opening would use. Not a test - it needs a key and the network (tests/CLAUDE.md).
+
+## What this does *not* measure
+
+**A far easier prompt than production sends.** This opens a bare session: the
+four-line `SEED` below, no tools, and nothing before the opening. The daemon opens
+`app.run_voice`'s: `companion.persona()` (the owner's seed *plus* every learned
+rule), `TOOL_CONTRACT`, the voice tool declarations, and the time, continuity and
+verbal-tic blocks as `clientContent` immediately before the opening. The tic block
+argues with this one on purpose - `daemon/persona/tics.py` says "do not use them in
+this reply; say what you mean some other way", and the case where it fires is
+exactly the case where the judged line contains a phrase it named, so the model can
+get "reword this" and "한 글자도 바꾸지 말고" in adjacent turns. Whatever number
+comes out below is evidence about the *wording in principle*. The production prompt
+is strictly harder and nobody has measured it.
 """
 
 from __future__ import annotations
@@ -55,6 +71,7 @@ import argparse
 import asyncio
 import os
 import re
+import secrets
 import sys
 import unicodedata
 from pathlib import Path
@@ -62,6 +79,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# Imported rather than copied, after the path insert above and for the reason
+# `face_mood_tag_spike.py` gives at its own import: the string this scores has to be
+# the string the daemon sends. A copy drifts, and the drift is invisible - the
+# reworded install prompt would go on quoting a number measured against wording it
+# no longer uses. This file held its own copy until PR #126's review found the
+# `evals/CLAUDE.md` row already claiming otherwise.
+from daemon.voice.conversation import speak_verbatim  # noqa: E402
 
 TURN_BUDGET_S = 25.0
 MAX_TURNS = 4
@@ -84,11 +109,12 @@ BASELINE = (
     f"상대의 대답을 기다려라. 이 지시문 자체는 읽지 마라.\n\n{LINE}"
 )
 
-VERBATIM = (
-    "아래 문장을 **그대로** 소리 내어 말해라. 한 글자도 바꾸지 말고, 더하지도 빼지도 "
-    "마라. 인사도, 설명도, 다른 말도 붙이지 마라. 문장을 말한 뒤에는 멈추고 상대의 "
-    f"대답을 기다려라. 이 지시문 자체는 읽지 마라.\n\n{LINE}"
-)
+VERBATIM = speak_verbatim(LINE, secrets.token_hex(4))
+"""`conversation.SPEAK_VERBATIM` as the daemon renders it, fence and all.
+
+One nonce for the whole run rather than one per session: what varies between cells
+is the instruction, and re-rolling it per session would vary two things at once.
+Production rolls a fresh one per line (`app._speak_unprompted`)."""
 
 _PUNCT = re.compile(r"[\s.,!?~…·「」“”\"'()]+")
 

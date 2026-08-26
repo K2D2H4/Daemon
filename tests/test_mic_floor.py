@@ -54,9 +54,14 @@ async def test_a_taker_that_speaks_it_is_reported_back() -> None:
 
 @pytest.mark.asyncio
 async def test_a_taker_that_could_not_speak_is_not_a_missing_listener() -> None:
-    """A wake loop that took the line and could not say it has the microphone, so
-    the caller must *not* go around it to the speaker - which would refuse anyway,
-    and on the wrong reasoning."""
+    """A wake loop that took the line and could not say it gets one answer of its
+    own, distinct from nobody taking it: the caller must *not* go around it to the
+    speaker.
+
+    Not because the microphone is still held - it is not, `daemon/mic_floor.py`
+    retracts that reading - but for the two reasons in `ProactiveDelivery._say`: a
+    second attempt moments later hits whatever made the first one fail, and the
+    wake loop is already rebuilding its gate."""
 
     async def waiter() -> str:
         return await mic_floor.request("한마디", wait_seconds=5.0)

@@ -174,12 +174,26 @@ class VoiceSession(Protocol):
     async def send_text(self, text: str) -> None:
         """Send text as a turn, with no user audio.
 
-        **Not verbatim text-to-speech.** `realtimeInput.text` is a prompt: the
-        model answers it rather than reading it out, and Live API has no
-        verbatim path at all (`clientContent` is restricted to seeding history on
-        current models). Say-this-exactly belongs to `AudioIO`'s local speaker,
-        which is also the path a proactive utterance takes when the user is at
-        the machine (docs/PLAN.md 6.3) - and which never leaves the device."""
+        **Not verbatim text-to-speech**, as a mechanism: this is a prompt, the
+        model answers it rather than reading it out, and Live API has no verbatim
+        path at all (`clientContent` is restricted to seeding history on current
+        models).
+
+        What that used to conclude here - "say-this-exactly belongs to `AudioIO`'s
+        local speaker, which never leaves the device" - is **retracted** (PR #126,
+        and this is a protocol file, so it is retracted out loud). The mechanism
+        does not have to be verbatim for the *sentence* to come back unchanged:
+        asked for that in the prompt, it does. `evals/proactive_verbatim_spike.py`,
+        8 live sessions per cell on the shipping model, puts a plain instruction at
+        exact 0/8 - the line survives and the model adds a question of its own -
+        and `conversation.SPEAK_VERBATIM` at 8/8. So a proactive line at the machine
+        now goes out through this method, in the voice the owner chose, and
+        `/usr/bin/say` is the fallback (`daemon/app.py:_speak_unprompted`).
+
+        Which is a measurement about wording, not a guarantee from the transport:
+        nothing in this protocol makes a model comply, so a caller that needs the
+        sentence back intact owes it a measured instruction and a fence, and owes
+        the measurement a re-run on every model it ships against."""
         ...
 
     async def send_tool_response(self, results: Sequence[ToolResult]) -> None:
