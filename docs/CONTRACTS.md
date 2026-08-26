@@ -15,6 +15,8 @@ daemon/
   app.py              single-process entrypoint (FastAPI + APScheduler)
   companion.py        what the daemon can do, for both endpoints. Read this before
                       adding a capability to loop.py or voice/conversation.py.
+  ollama_process.py   the local Ollama the daemon starts for embeddings. Only
+                      app.py imports it (rule 4).
   llm/
     base.py           Provider protocol, Message, Completion. FROZEN.
     gateway.py        LLMGateway: routes Task -> Provider
