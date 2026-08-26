@@ -34,6 +34,7 @@ from daemon.memory.store import Store
 from daemon.proactivity.base import Candidate
 from daemon.proactivity.candidates import (
     MAX_PER_KIND,
+    TOPIC_TTL_HOURS,
     CandidateReader,
     association_candidates,
     dedup_key,
@@ -731,6 +732,24 @@ def test_the_quietest_topic_comes_up_first(store: Store, reader: SqlReader) -> N
     assert [c.payload["entity"] for c in produced] == ["Sendbird", "llm-wiki"]
     assert all(c.kind == "topic" for c in produced)
     assert "Sendbird" in produced[0].reason
+
+
+def test_a_topic_candidate_is_not_immortal(store: Store, reader: SqlReader) -> None:
+    """Whole-branch review: `topic_candidates` was the only generator building a
+    `Candidate` with neither `due_at` nor `expires_at`, so an unfired row (the
+    normal outcome with no `tavily` configured - `Judge._topic_block` returns ""
+    and `decide` drops the candidate every time) never expired and came back
+    forever, `tick.py`'s `_rest` pushing it 90 minutes at a time. `due_at=now`
+    matches every other generator except `open_loop`, which alone waits for a
+    future moment; `expires_at` bounds the row the same way the other four are
+    bounded, see `TOPIC_TTL_HOURS`'s docstring for the number."""
+    now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)
+    entity_touched(store, "Sendbird", at=datetime(2026, 8, 1, tzinfo=UTC))
+
+    candidate = topic_candidates(reader, now)[0]
+
+    assert candidate.due_at == now
+    assert candidate.expires_at == now + timedelta(hours=TOPIC_TTL_HOURS)
 
 
 def test_a_topic_raised_recently_is_not_raised_again(store: Store, reader: SqlReader) -> None:

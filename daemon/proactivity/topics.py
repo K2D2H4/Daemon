@@ -55,6 +55,8 @@ import logging
 import re
 from typing import Any, Protocol
 
+from daemon.tools.base import ToolError
+
 logger = logging.getLogger(__name__)
 
 MAX_TITLES = 3
@@ -114,6 +116,20 @@ async def search_titles(bridge: Bridge, entity: str) -> list[str]:
     (see `TIME_RANGE`'s docstring): it does not change what the query *says*,
     only which window of the web it is allowed to answer from, which is what
     this server's schema actually offers in place of a `"news"` topic.
+
+    `ToolError` is downgraded to a message-only warning, not `logger.exception`'s
+    full traceback. Whole-branch review: the shipped default has `tools_enabled`
+    on with no `tavily` server configured, so `bridge.call` raises
+    `ToolError("the MCP server 'tavily' is not connected")` (`daemon/tools/mcp.py`)
+    on *every* `topic` candidate this generator ever produces - not a bug, the
+    ordinary "not configured" state `_build_tools`'s own docstring already names
+    for this feature. At ~16 retries a day per unfired candidate (`TOPIC_TTL_HOURS`),
+    that was ~160 ERROR-level tracebacks a day on a default install for an
+    expected, already-classified failure (`ToolError`'s own docstring: "a tool
+    refused or failed in a way the model should be told about" - ordinary, not a
+    bug). Anything outside `ToolError` - a bug in this function's own JSON
+    handling, an exception the bridge did not wrap - is genuinely unexpected and
+    keeps the traceback.
     """
     try:
         raw = await bridge.call(
@@ -121,6 +137,9 @@ async def search_titles(bridge: Bridge, entity: str) -> list[str]:
             TOOL,
             {"query": entity, "max_results": MAX_TITLES, "time_range": TIME_RANGE},
         )
+    except ToolError as exc:
+        logger.warning("topics: search unavailable for %r: %s", entity, exc)
+        return []
     except Exception:
         logger.exception("topics: search failed for %r", entity)
         return []

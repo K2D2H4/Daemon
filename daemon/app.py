@@ -106,6 +106,23 @@ PROACTIVE_TICK_MINUTES = 5
 passes the gate - so the cost of the interval is a few sqlite reads and three
 subprocess probes, not a model call."""
 
+PROACTIVE_TOOLS_BUILD_TIMEOUT = 60.0
+"""Ceiling on `build_proactive_tick`'s own `_build_tools` call, for the one path
+that still makes it: no reusable bridge was handed in (`daemon proactive`, which
+runs with no lifespan at all, or a resident tick fired before `app.state.mcp`
+exists). Whole-branch review: `MCPBridge.start` connects every configured
+server, and while `session.initialize()`/`session.list_tools()` each carry their
+own `STARTUP_TIMEOUT` (30s, `daemon/tools/mcp.py`), the transport's own connect
+step (`stdio_client`/`streamablehttp_client` entering their context) has none -
+so a pathological server can wedge `_bring_up` before either inner timeout ever
+starts counting. `_proactive_tick`'s job is registered `max_instances=1`, so a
+tick that never returns is not one missed round, it is every later tick silently
+skipped forever - this project's signature defect, reachable from an unrelated
+MCP server misbehaving. 60s leaves headroom under the 5-minute
+`PROACTIVE_TICK_MINUTES` cadence even for several slow-but-working servers, and
+a timeout here costs exactly what a missing bridge already costs: `topic`
+candidates drop for this one tick, the other five generators are unaffected."""
+
 REFLECT_HOUR = 4
 """Local hour for the nightly pass. Late enough that the day is over, early enough
 that the morning's first message already sees what it concluded."""
@@ -279,11 +296,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Registered only when the user asked for it. A job that wakes every five
         # minutes to decide against speaking is cheap but not free, and its absence
         # is a clearer statement of "off" than a disabled job that still fires.
+        #
+        # `_get_lifespan_bridge` is a closure, not `app.state.mcp` itself:
+        # `scheduler.add_job`'s `args` are captured now, before the rest of this
+        # function has necessarily built `app.state.mcp` (it is set further down,
+        # only once `io` succeeds) - so the job needs something that reads the
+        # attribute fresh on every fire, not its value at registration time. Every
+        # fire after that reuses whatever live bridge the lifespan is currently
+        # holding instead of `_proactive_tick` connecting and tearing down every
+        # configured MCP server itself, every five minutes (whole-branch review;
+        # see `build_proactive_tick`'s `bridge` parameter).
+        def _get_lifespan_bridge() -> Any:
+            return getattr(app.state, "mcp", None)
+
         scheduler.add_job(
             _proactive_tick,
             "interval",
             minutes=PROACTIVE_TICK_MINUTES,
-            args=[settings],
+            args=[settings, _get_lifespan_bridge],
             id="proactivity",
             max_instances=1,
             coalesce=True,
@@ -814,7 +844,7 @@ def open_store(settings: Settings) -> Iterator[Any]:
 
 
 async def build_proactive_tick(
-    settings: Settings, *, speak: bool = False
+    settings: Settings, *, speak: bool = False, bridge: Any = None
 ) -> tuple[ProactiveTick, Callable[[], Awaitable[None]]]:
     """A tick and the coroutine that releases what it holds.
 
@@ -826,6 +856,18 @@ async def build_proactive_tick(
 
     The speaker is built only when the user asked for it *and* the platform can do
     it. Everything else degrades to Telegram, which is the safe direction.
+
+    `bridge`, when given, is a live MCP bridge this call does **not** own - the
+    resident's `app.state.mcp`, connected once by `_lifespan` and closed only at
+    shutdown. `_proactive_tick` passes it on every scheduled fire so a tick reuses
+    the connections already up instead of connecting and tearing every configured
+    server down 288 times a day (whole-branch review: `_build_tools` unconditionally
+    called `bridge.start(registry)`, a stdio child process per server, then
+    `bridge.aclose()` at the end of the very same tick). `None` - the default, and
+    what `daemon proactive` passes, since the CLI runs with no lifespan and no
+    `app.state` to reuse at all - falls back to building, and owning, and later
+    closing, a bridge of its own, bounded by `PROACTIVE_TOOLS_BUILD_TIMEOUT` so a
+    wedged MCP server costs this one tick rather than the scheduler.
     """
     from daemon.fs import harden_existing
     from daemon.memory.store import Store
@@ -882,17 +924,45 @@ async def build_proactive_tick(
         # With no bridge, `Judge` drops every `topic` candidate and the other
         # four generators are unaffected - the same degrade path a missing or
         # unconfigured MCP server already takes.
-        bridge = None
+        tick_bridge = None
         if settings.tools_enabled and settings.tools_mode != "off":
-            tools_runner, bridge, _tools_status = await _build_tools(settings, store)
-            if tools_runner is not None:
-                closers.append(tools_runner.aclose)
             if bridge is not None:
-                # A stdio MCP server is a child process - one left running is an
-                # orphan per tick, the same reason the app lifespan closes its own
-                # bridge ahead of the store (see `_lifespan` above).
-                closers.append(bridge.aclose)
-        judge = Judge(gateway, data_dir=settings.data_dir, bridge=bridge)
+                # Reused, owned by the caller - never added to `closers`. Closing
+                # a bridge this tick did not build would tear down every MCP
+                # server the rest of the running app depends on the moment this
+                # one tick ends, orphaning `app.state.mcp` for everything else
+                # that reaches for it until the next full restart.
+                tick_bridge = bridge
+            else:
+                try:
+                    tools_runner, tick_bridge, _tools_status = await asyncio.wait_for(
+                        _build_tools(settings, store),
+                        timeout=PROACTIVE_TOOLS_BUILD_TIMEOUT,
+                    )
+                except TimeoutError:
+                    # An MCP server that hangs on connect must cost this tick's
+                    # `topic` candidates, never the scheduler itself - see
+                    # `PROACTIVE_TOOLS_BUILD_TIMEOUT`'s docstring for why an
+                    # unbounded wait here is this project's signature defect
+                    # waiting to happen. Same degrade path as no bridge at all.
+                    logger.warning(
+                        "proactive: tool layer did not come up within %.0fs; "
+                        "continuing without it this tick",
+                        PROACTIVE_TOOLS_BUILD_TIMEOUT,
+                    )
+                    tick_bridge = None
+                else:
+                    if tools_runner is not None:
+                        closers.append(tools_runner.aclose)
+                    if tick_bridge is not None:
+                        # A stdio MCP server is a child process - one left running
+                        # is an orphan per tick, the same reason the app lifespan
+                        # closes its own bridge ahead of the store (see
+                        # `_lifespan` above). Only reached on this, the "this
+                        # tick built its own" branch - a reused bridge is never
+                        # closed here (see the comment above).
+                        closers.append(tick_bridge.aclose)
+        judge = Judge(gateway, data_dir=settings.data_dir, bridge=tick_bridge)
 
         channel = None
         try:
@@ -1003,7 +1073,9 @@ async def build_persona_evolution(
     )
 
 
-async def _proactive_tick(settings: Settings) -> None:
+async def _proactive_tick(
+    settings: Settings, get_bridge: Callable[[], Any] | None = None
+) -> None:
     """The five-minute round. Catches everything, for the same reason the reflection
     tick does: a job that raises inside APScheduler is logged once and then the
     schedule carries on, which reads as a working loop that has silently decided
@@ -1011,9 +1083,18 @@ async def _proactive_tick(settings: Settings) -> None:
 
     Logged at INFO even when nothing happened, because "it stayed silent" is the
     output people need to be able to check.
+
+    `get_bridge`, when given, is called fresh on every fire to read whatever the
+    lifespan's `app.state.mcp` currently is - a callable rather than the bridge
+    itself, because `scheduler.add_job` captures its `args` once at registration
+    time, before `_lifespan` has necessarily finished building `app.state.mcp`
+    (see `_lifespan`'s own registration call). `None` (the default, and what every
+    test constructing this function directly gets) means `build_proactive_tick`
+    builds its own bridge, exactly as it always has.
     """
+    bridge = get_bridge() if get_bridge is not None else None
     try:
-        tick, close = await build_proactive_tick(settings, speak=True)
+        tick, close = await build_proactive_tick(settings, speak=True, bridge=bridge)
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
         logger.error("proactive tick could not start: %s", exc)
         return

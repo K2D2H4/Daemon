@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
+
+import pytest
 
 from daemon.proactivity import topics
+from daemon.tools.base import ToolError
 
 
 def test_titles_are_capped_in_count_and_length() -> None:
@@ -119,6 +123,17 @@ class _FakeBridge:
         return self.reply
 
 
+class _FakeToolErrorBridge:
+    """Raises the exact exception `daemon.tools.mcp.MCPBridge.call` raises for a
+    server that is not connected - the shipped-default, no-`tavily` case."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    async def call(self, server: str, name: str, arguments: dict) -> str:
+        raise ToolError(self.message)
+
+
 async def test_search_titles_calls_tavily_with_the_entity_as_the_query() -> None:
     """The query is `entities.name` and nothing else - never web text, never model
     output, never a value derived from either."""
@@ -147,6 +162,43 @@ async def test_a_failed_search_returns_nothing_rather_than_raising() -> None:
     bridge = _FakeBridge(fail=True)
 
     assert await topics.search_titles(bridge, "Sendbird") == []
+
+
+async def test_no_tavily_server_is_a_warning_not_an_error_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Whole-branch review: the shipped default has tools on with no `tavily`
+    server configured, so `bridge.call` raises `ToolError("...is not connected")`
+    on *every* `topic` candidate - not a bug, the ordinary "not configured" state.
+    `logger.exception` at ERROR was ~160 tracebacks a day on a default install for
+    exactly this expected case. This is the fix: a `ToolError` degrades to a
+    message-only WARNING, no traceback."""
+    bridge = _FakeToolErrorBridge("the MCP server 'tavily' is not connected")
+
+    with caplog.at_level(logging.WARNING, logger="daemon.proactivity.topics"):
+        titles = await topics.search_titles(bridge, "Sendbird")
+
+    assert titles == []
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("not connected" in r.message for r in warnings)
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert not any(r.exc_info for r in caplog.records), "no traceback for an expected ToolError"
+
+
+async def test_a_genuinely_unexpected_failure_keeps_its_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The other half of the same fix: anything that is not `ToolError` - a bug,
+    not an anticipated tool-level failure - still logs at ERROR with a traceback,
+    unchanged from before."""
+    bridge = _FakeBridge(fail=True)
+
+    with caplog.at_level(logging.WARNING, logger="daemon.proactivity.topics"):
+        titles = await topics.search_titles(bridge, "Sendbird")
+
+    assert titles == []
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors and errors[0].exc_info is not None
 
 
 async def test_an_unreadable_reply_returns_nothing() -> None:

@@ -1833,3 +1833,21 @@ def test_reflect_says_how_much_came_off_a_tool_rather_than_the_conversation(
     assert cli.main(["reflect", "--date", "2026-08-03", "--force"]) == 0
 
     assert "1 from tool(s)" in capsys.readouterr().out
+
+
+def test_doctor_names_topic_as_the_uncapped_sixth_kind(data_dir: Path) -> None:
+    """Whole-branch review: `_proactivity_check` used to build `kinds` only from
+    `settings.proactive_kind_budgets.items()`, which has no `topic` entry by
+    design (`config.py`: the owner rejected a per-kind quota for it as
+    artificial) - so `daemon doctor` showed five capped kinds and never
+    mentioned the uncapped sixth, leaving a real capability invisible
+    (CONTRACTS rule 12)."""
+    (data_dir / "persona").mkdir()
+    (data_dir / "persona" / "seed.md").write_text("씨앗", encoding="utf-8")
+    settings = Settings(
+        _env_file=None, DAEMON_DATA_DIR=str(data_dir), DAEMON_PROACTIVE_ENABLED=True
+    )
+
+    check = cli._proactivity_check(settings)
+
+    assert "topic uncapped" in check.detail

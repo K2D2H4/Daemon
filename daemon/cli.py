@@ -1525,9 +1525,15 @@ def _proactivity_check(settings: Settings) -> Check:
 
     speaker = "speaker on" if settings.voice_enabled else "telegram only"
     quiet = settings.proactive_quiet_hours or "no quiet window"
+    # `topic` (ADR 0015) deliberately has no entry in `proactive_kind_budgets`
+    # (see that field's docstring: the owner rejected a per-kind quota for it as
+    # artificial) - appended by hand so `daemon doctor` names all six kinds, not
+    # just the five capped ones, which used to leave the uncapped kind invisible
+    # here (whole-branch review).
     kinds = ", ".join(
         f"{kind} {cap}" for kind, cap in settings.proactive_kind_budgets.items()
     )
+    kinds = f"{kinds}, topic uncapped"
     # `topic` (ADR 0015) is the one candidate kind that reaches the network - one
     # read-only search per gate-passed candidate, via the MCP bridge, bypassing
     # `tools/policy.py` entirely (it never goes through ToolRunner). `app.py`'s
