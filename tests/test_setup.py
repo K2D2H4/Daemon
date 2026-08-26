@@ -68,7 +68,9 @@ def working_checks() -> Checks:
         gemini=lambda key: Verdict(True, "key works"),
         openai=lambda key, model: Verdict(True, "key works"),
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
-        ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ("gemma3:4b",)),
+        ollama=lambda url: OllamaState(
+            True, f"reachable at {url} (v0.5.0)", ("gemma3:4b", "bge-m3")
+        ),
         updates=no_network,
         health=no_health,
     )
