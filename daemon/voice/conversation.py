@@ -172,11 +172,16 @@ measured over repeated trials, this wording never leaked into the reply, while a
 Korean-language variant of it leaked the word "context" into one.
 """
 
-OPENING_ANSWER_HOLD_SECONDS = 6.0
-"""How long the microphone is held while the model owes an answer to the wake
-word. Long enough to cover a slow first turn (measured: 1.1 s with no microphone
+ANSWER_HOLD_SECONDS = 6.0
+"""How long the microphone is held while the model owes an answer.
+
+Long enough to cover a slow first turn (measured: 1.1 s with no microphone
 attached, 11.77 s with one), short enough that a model which never answers hands
-the room back well inside the idle budget."""
+the room back well inside the idle budget. The bound only bites on a turn that is
+never answered at all - any audio arriving clears the hold - which is why one
+number serves the opening and an ordinary turn alike. It was chosen against the
+opening, where the session handshake is included; nothing has measured an ordinary
+turn's own compose time, so here it is inherited rather than fitted."""
 
 PLAYBACK_BYTES_PER_FRAME = 2
 """16-bit mono, which is what every `AudioIO` here plays (daemon/voice/audio.py).
@@ -331,9 +336,9 @@ class VoiceConversation:
         called `_playing` and used to decide barge-ins, and neither survived contact
         with the provider - see `_offer` and `_watch_partials`."""
 
-        self._opening_answer_until = 0.0
-        """Loop-clock deadline for holding the microphone after an opening the model
-        still owes an answer to.
+        self._answer_hold_until = 0.0
+        """Loop-clock deadline for holding the microphone while the model owes an
+        answer - to the wake word, or to any turn the owner has just finished.
 
         Measured, and the measurement is the whole justification: the same opening
         text answered in **1.1 s** against a session with no microphone attached, and
@@ -346,7 +351,17 @@ class VoiceConversation:
         the daemon was deaf. The owner has just said the wake word and is waiting;
         holding the room out of the socket until the answer starts costs nothing they
         were going to say. Bounded, because a model that never answers must not take
-        the microphone with it."""
+        the microphone with it.
+
+        The wake word was only the first place this was found. An ordinary turn has
+        the same window - the owner stops talking, the model composes, and until its
+        first audio the room is still going to the server - and it stayed uncovered
+        while the opening and the tool round (`_answering_tool`) each got a guard.
+        On the owner's day of 2026-08-26, 5 of 47 spoken turns got no answer at all,
+        three of them in one session whose own report said `0 interruption(s)` - the
+        same silent cancellation, in the case that happens on every single turn.
+        Armed in `_on_transcript` when the owner's transcript settles, which is the
+        moment the request is fully made and the answer is not yet on its way."""
 
         self._answering_tool = False
         """Whether a tool call is between "the model asked" and "the model spoke".
@@ -510,7 +525,7 @@ class VoiceConversation:
                 # called by name deserves an answer, not silence.
                 await session.send_text(self._opening_text)
                 loop = asyncio.get_running_loop()
-                self._opening_answer_until = loop.time() + OPENING_ANSWER_HOLD_SECONDS
+                self._answer_hold_until = loop.time() + ANSWER_HOLD_SECONDS
         except Exception:
             logger.exception("voice: could not hand over the utterance that opened the session")
 
@@ -678,15 +693,15 @@ class VoiceConversation:
                     # microphone resumes - barge-in over the spoken result works
                     # exactly as before.
                     continue
-                if self._opening_answer_until and not self._generating:
-                    if asyncio.get_running_loop().time() < self._opening_answer_until:
-                        # The answer to the wake word has not started yet; see
-                        # `_opening_answer_until`. Dropped, not queued - stale room
+                if self._answer_hold_until and not self._generating:
+                    if asyncio.get_running_loop().time() < self._answer_hold_until:
+                        # The model owes an answer and has not begun it; see
+                        # `_answer_hold_until`. Dropped, not queued - stale room
                         # audio helps nobody once the answer is under way.
                         continue
                     # Bound reached: the model is not answering, so the microphone
                     # goes back to the owner rather than staying held.
-                    self._opening_answer_until = 0.0
+                    self._answer_hold_until = 0.0
                 if not self._barge_in_enabled and (
                     self._generating
                     or self._answering_tool
@@ -756,7 +771,7 @@ class VoiceConversation:
         """
         self._played_bytes += size
         # The answer has started, so the microphone goes back to the room.
-        self._opening_answer_until = 0.0
+        self._answer_hold_until = 0.0
         if self._first_audio_at is None:
             self._first_audio_at = at
         seconds = size / (self._audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME)
@@ -802,9 +817,39 @@ class VoiceConversation:
         # also the signal that this turn's audio is done.
         self._generating = False
         if transcript.role == "user":
-            if self._face is not None and not (
-                asyncio.get_running_loop().time() < self._playback_until
-            ):
+            # Whether the answer to this turn is already being heard. Read once and
+            # used twice: it decides the hold immediately below for one reason and
+            # the face publisher under it for another, and they must agree - both are
+            # asking "is the daemon talking right now", and the playback clock is the
+            # authority on that here exactly as it is in `_forward_microphone`.
+            loop = asyncio.get_running_loop()
+            answering = loop.time() < self._playback_until
+            if not answering:
+                # The owner has finished; the answer has not started. Until it does,
+                # the room must not reach the server, or the server reads it as the
+                # owner opening a *new* turn and cancels the one it was about to
+                # answer - the silent failure `_answer_hold_until` documents. Armed
+                # before recall rather than after, because the window this closes
+                # starts here: recall settling is time the microphone would otherwise
+                # still be streaming.
+                #
+                # Skipped when the answer is already playing, and that is not a
+                # refinement: a *user* transcript routinely finalises after the daemon
+                # has started replying, `_generating` was cleared three lines up, and
+                # arming here would hold the microphone through the rest of the answer
+                # - barge-in switched off for six seconds by a clock the owner never
+                # touched.
+                #
+                # Which leaves a turn the owner *barged in* with unguarded, and that
+                # is a limit rather than an oversight: the same microphone cannot be
+                # both open for the interruption and shut for the answer that follows
+                # it. Half-duplex (`DAEMON_VOICE_BARGE_IN=false`) has no such turns and
+                # is fully covered; with barge-in on, an interrupting turn keeps the
+                # cancellation window this guard closes everywhere else. Nothing has
+                # measured how often that costs an answer - the owner's own numbers
+                # were taken half-duplex (daemon/MEASURED.md).
+                self._answer_hold_until = loop.time() + ANSWER_HOLD_SECONDS
+            if self._face is not None and not answering:
                 # The owner's utterance just settled - the request is now fully
                 # made, and whatever answer is coming has not arrived yet. The same
                 # settling that lets recall start is what tells the face to wait.

@@ -733,3 +733,80 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   else that changes over the run's wall-clock span. Every number above
   inherits that confound. Interleaving the two arms trial-by-trial, not a
   larger n, is what a retry needs before its p-value means anything either.
+- **The wake->voice handover had a 107 ms hole, and CoreAudio deadlocked in it
+  (2026-08-26).** The owner's report was "she suddenly stopped answering, and
+  calling again does nothing". The resident had logged `wake: heard '벨라'` and
+  `opening a voice session` at 15:07:26 and then never another voice line - while
+  Telegram kept answering, the scheduler kept ticking and `/health` kept saying
+  `status: ok`, `wake_gate: running`. The tell was one missing line: every working
+  wake round logs `apple audio: engine at 48000 Hz ...` within 0.3-0.6 s of opening
+  the session, and this one never did, so the wedge was inside `_build`, before the
+  log.
+
+  `sample` of the resident named it. Four threads, all at `__psynch_mutexwait` for
+  100% of a 3 s sample, in a closed cycle:
+
+  | thread | doing | waiting on |
+  |---|---|---|
+  | `com.apple.audio.IOThread.client` | PortAudio `startStopCallback` -> `AudioUnitGetProperty` | the AudioUnit recursive mutex |
+  | `AVAudioIOUnit` queue | property listener -> `_GetHWFormat` -> `GetPropertyDataSize` | the HAL mutex, held by the row above |
+  | `engine` queue | `AVAudioEngineImpl::IOBindingChanged` | the AVAudioEngine mutex |
+  | `voice-mic-release` (Python) | `Pa_StopStream` -> `AudioDeviceStop` | the HAL mutex |
+
+  So the wake gate's PortAudio stop and the session's VoiceProcessing engine were
+  running **at the same time** and took the two locks in opposite orders. v0.1.45
+  and v0.1.47 had moved the stop and the open onto detached threads, which is why
+  the daemon stayed up instead of freezing - it converted a total freeze into a
+  daemon that is alive and permanently deaf, which `/health` cannot tell from a
+  quiet house.
+
+  **Why they overlapped is the part worth keeping.** `_wake_round` broke out of
+  `async for event in gate.listen()`, and breaking out of an `async for` does not
+  finalise the generator - CPython drops the last reference and schedules `aclose()`
+  for a later loop turn. `close_gate()` returned in **1 ms** (measured: the two log
+  lines are 15:07:26,499 and ,500) because `SoundDeviceAudio.close()` only ever
+  closed the *speaker*. The microphone was still being let go, by a thread that had
+  not started yet, while `run_voice` was already building the engine.
+
+  **The hole is 107 ms wide.** Measured on the owner's Mac against real PortAudio,
+  with the resident holding the device too: `aclose()` returns at the same
+  millisecond the first block arrives, and `wait_for_input_release()` then takes
+  **0.107 s** for the stop and close to actually finish. That is the whole race
+  window, and nothing was waiting on it. With no competing client a stop is that
+  fast, which is also why the 2 s bound on the wait is a wedge detector rather than
+  a latency cost.
+
+- **An ordinary spoken turn had the same unguarded window the opening and the tool
+  round had each already been given (2026-08-26).** The owner's report was "she
+  goes quiet, and if I ask again she answers". Counted off the day's own
+  conversation log rather than from feel: **5 of 47 spoken turns got no answer at
+  all** (11%), and 6 more answers were cut off mid-sentence. The distribution is why
+  it reads as random - per session 1, 1, 0, 0, 3, 0 - and why a good session proves
+  nothing: at 11% a clean six-turn session is a coin flip (0.89^6 = 50%), which is
+  exactly the session that arrived while this was being investigated, with the owner
+  reporting it as fixed when nothing had been changed.
+
+  Between the owner's transcript settling and the model's first audio, the
+  microphone was still streaming the room to the server, which reads it as the owner
+  opening a *new* turn and cancels the one it was composing. Two shapes, one cause:
+  cancelled **before** the first chunk it is silent and leaves no trace at all -
+  `gemini_live._decode_content` only raises `Interrupted` while it is already
+  generating - and the 06:00 session proves that half, **7 turns, 3 unanswered, and
+  its own report saying `0 interruption(s)`**. Cancelled **during** playback it
+  truncates the answer and does log a barge-in. The leaked tails then land under
+  `inputTranscription`, i.e. as the owner: `los ladros`, `the lock`, `ella` - the
+  same mangled-residual signature as the 2026-08-19 entry above, Spanish and all.
+
+  `_answer_hold_until` (was `_opening_answer_until`) is now armed on every settled
+  owner transcript, not only the wake-word opening - except on a turn the owner
+  *barged in* with, where the answer to the previous turn is still playing. That
+  exception is a limit, not a gap left open by accident: one microphone cannot be
+  both open for the interruption and shut for the answer that follows it. So
+  half-duplex (`DAEMON_VOICE_BARGE_IN=false`, what these numbers were taken under)
+  is fully covered and the default is not, and **nobody has measured what the
+  uncovered case costs** - a barge-in-on day would need its own count.
+
+  **Not yet measured live**: the
+  fix is argued from the two cases already fixed the same way, and the honest check
+  is the same 30-trial-per-arm shape the `realtimeInput.text` entry above needed -
+  count unanswered turns, do not run one session and call it settled.

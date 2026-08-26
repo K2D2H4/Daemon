@@ -2756,7 +2756,7 @@ async def test_a_model_that_never_answers_gives_the_microphone_back() -> None:
     conv = conversation(session, opening_text="벨라")
     await conv._send_opening(session)
     # The hold has expired without any audio ever arriving.
-    conv._opening_answer_until = asyncio.get_running_loop().time() - 0.01
+    conv._answer_hold_until = asyncio.get_running_loop().time() - 0.01
 
     async def mic() -> Any:
         yield b"speak"
@@ -2780,6 +2780,121 @@ async def test_an_audio_opening_does_not_hold_the_microphone() -> None:
     await conv._forward_microphone(session, mic())
 
     assert session.sent == [b"pcm", b"more"]
+
+
+async def test_the_microphone_is_held_until_an_ordinary_answer_starts() -> None:
+    """The same hold the wake-word answer gets, on every other turn.
+
+    `_send_opening` armed it for the opening and `_answering_tool` covers a tool
+    round, which left the ordinary turn - the common one - streaming the room to
+    the server for the whole time the model is composing. Any sound landing there
+    reads as the user starting a new turn and the server cancels the answer, and
+    because nothing was generating yet no `interrupted` is emitted: the session
+    reports zero barge-ins and the owner just gets silence (measured on the owner's
+    own day, 2026-08-26: 5 of 47 spoken turns unanswered, three of them in one
+    session whose report said `0 interruption(s)`).
+    """
+    session = FakeSession()
+    conv = conversation(session)
+    await conv._on_transcript(session, Transcript(text="뭐 하고 있어?", role="user", final=True))
+
+    async def mic() -> Any:
+        yield b"breath"  # the model has not started answering: held
+        conv._on_audio(asyncio.get_running_loop().time(), 480)  # first audio arrives
+        yield b"after"   # the room is the owner's again
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"after"], (
+        "the room was streamed into a turn the model had not answered yet - the "
+        "exact audio the server answers by cancelling the turn"
+    )
+
+
+async def test_a_turn_the_model_never_answers_gives_the_microphone_back() -> None:
+    """Bounded, for the same reason the opening hold is: a model that is not coming
+    back must not leave the owner unable to ask again."""
+    session = FakeSession()
+    conv = conversation(session)
+    await conv._on_transcript(session, Transcript(text="뭐 하고 있어?", role="user", final=True))
+    conv._answer_hold_until = asyncio.get_running_loop().time() - 0.01
+
+    async def mic() -> Any:
+        yield b"asking again"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"asking again"]
+
+
+async def test_the_hold_is_armed_before_recall_settles() -> None:
+    """Ordering, not presence, and the two are easy to confuse.
+
+    `_settle_recall` is awaited on the owner's transcript and puts context on the
+    wire; arming after it would leave the microphone streaming the room for however
+    long recall takes, on every single turn - the window this hold exists to close,
+    reopened by a tidy-up that groups the arming with the face publish below it.
+    Every other test here would stay green."""
+    session = FakeSession()
+    conv = conversation(session)
+    armed_when_recall_ran: list[bool] = []
+    original = conv._settle_recall
+
+    async def spy(session_: Any, text: str) -> Any:
+        armed_when_recall_ran.append(conv._answer_hold_until > 0.0)
+        return await original(session_, text)
+
+    conv._settle_recall = spy  # type: ignore[method-assign]
+    await conv._on_transcript(session, Transcript(text="뭐 하고 있어?", role="user", final=True))
+
+    assert armed_when_recall_ran == [True], (
+        "recall ran with the microphone still open to the room"
+    )
+
+
+async def test_a_late_user_transcript_does_not_hold_the_microphone_mid_answer() -> None:
+    """The hold must not become a six-second barge-in switch.
+
+    A *user* transcript routinely finalises after the daemon has already started
+    replying - the timing is non-deterministic on this provider, which is why the
+    face publisher below it is guarded by the playback clock too. `_on_transcript`
+    clears `_generating` as it goes, so arming the hold unconditionally there would
+    shut the microphone for the rest of the answer on a clock the owner never set,
+    and with barge-in on (the default) that is the owner unable to cut in.
+    """
+    session = FakeSession()
+    conv = conversation(session)
+    # The answer is already being heard: audio arrived and has not finished playing.
+    conv._on_audio(asyncio.get_running_loop().time(), 48_000)
+    await conv._on_transcript(session, Transcript(text="아니 잠깐만", role="user", final=True))
+
+    async def mic() -> Any:
+        yield b"cutting in"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"cutting in"], (
+        "a transcript that settled mid-answer armed the hold and took barge-in with it"
+    )
+
+
+async def test_the_assistants_own_transcript_does_not_hold_the_microphone() -> None:
+    """The hold is armed by the *owner* finishing a turn. Arming it on the
+    assistant's transcript - which settles at the end of an answer - would shut the
+    microphone for the seconds right after the daemon stops speaking, which is
+    exactly when the owner talks."""
+    session = FakeSession()
+    conv = conversation(session)
+    await conv._on_transcript(
+        session, Transcript(text="네, 듣고 있어요.", role="assistant", final=True)
+    )
+
+    async def mic() -> Any:
+        yield b"the owner replies"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"the owner replies"]
 
 
 async def test_half_duplex_holds_the_microphone_until_the_speaker_runs_dry() -> None:
