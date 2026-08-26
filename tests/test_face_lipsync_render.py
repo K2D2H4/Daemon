@@ -27,13 +27,24 @@ CROP_W = CROP_BOX[2] - CROP_BOX[0]
 
 
 class FakeEngine:
-    """Returns a solid colour per requested frame, and records what it was asked."""
+    """Returns a solid colour per requested frame, and records what it was asked.
+
+    `audio_calls` keeps a copy of every window handed to `mouths` - added because
+    the renderer<->ring seam had zero coverage without it: every test in this file
+    fed the ring pure silence and this class discarded `audio` outright, so
+    `self._ring.window(...)` could be passed the wrong frame_index, a hardcoded
+    origin, or replaced with a hardcoded array of zeros and all 27 tests here would
+    still pass (see the three seam tests below, which is what these fields exist
+    to make possible).
+    """
 
     def __init__(self) -> None:
         self.calls: list[list[int]] = []
+        self.audio_calls: list[np.ndarray] = []
 
     def mouths(self, audio, frame_indices):
         self.calls.append(list(frame_indices))
+        self.audio_calls.append(audio.copy())
         return [np.full((256, 256, 3), 200, np.uint8) for _ in frame_indices]
 
 
@@ -46,6 +57,25 @@ def _cache(n=4):
         crop_boxes=[CROP_BOX] * n,
         masks=masks,
     )
+
+
+def _tone(ms: int, value: int, rate: int = 24_000) -> bytes:
+    """Distinctive constant-value waveform - `tests/test_face_lipsync_ring.py`'s
+    helper, duplicated rather than imported because this file otherwise has no
+    dependency on that one."""
+    samples = np.full(int(rate * ms / 1000), value, dtype=np.int16)
+    return samples.tobytes()
+
+
+def _distinct_tone_ring(seconds=2.0):
+    """A ring fed a new tone value every 100ms, so two different windows read
+    different content - unlike `b"\\x00\\x00" * 24_000` (every other fixture in
+    this file), where any array of the right shape is indistinguishable from the
+    real one."""
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=seconds)
+    for step in range(20):
+        ring.feed(_tone(100, value=1000 * (step + 1)), audible_at=step * 0.1)
+    return ring
 
 
 def _cache_with_distinct_frames(n=4):
@@ -184,3 +214,63 @@ def test_rendering_never_writes_into_a_read_only_cache_or_leaks_a_stale_frame():
     assert published is not None
     second = cv2.imdecode(np.frombuffer(published, np.uint8), cv2.IMREAD_COLOR)
     assert abs(int(second[0, 0, 0]) - 100) < 10    # index 2's own, not index 0's
+
+
+# --- the renderer<->ring audio seam -------------------------------------------
+#
+# Every test above feeds the ring silence and none of them look at `audio_calls`,
+# so none of them can tell a correct `self._ring.window(frame_index=frame_index,
+# fps=fps, origin=origin)` call in `render.py` from one that passes the cycled
+# clip index instead of `frame_index`, hardcodes `origin=0.0`, or skips the ring
+# entirely and hands the engine a hardcoded silent array. The three tests below
+# each target exactly one of those.
+
+
+def test_the_engine_receives_real_audio_not_silence():
+    """Catches `self._ring.window(...)` being replaced by a hardcoded
+    `np.zeros(4800)` - indistinguishable from correct in every other test here,
+    since they all feed the ring silence too."""
+    engine = FakeEngine()
+    ring = _distinct_tone_ring()
+    r = Renderer(engine=engine, cache=_cache(n=6), ring=ring, slot=Slot())
+    r.render(frame_index=8, origin=0.3, fps=24.0)
+    assert r.failed is False
+    assert np.any(engine.audio_calls[0] != 0.0), "the engine should see real audio"
+
+
+def test_the_engine_receives_a_window_addressed_by_frame_index_not_the_cycled_clip_index():
+    """Catches `window(frame_index=i, ...)` where `i = frame_index % n` - the
+    realistic mutation, since `i` is already in scope on the surrounding lines and
+    "tidying" them to share one variable looks like cleanup.
+
+    Frame indices 8 and 14 are a cache cycle apart (`n=6`, so both give clip index
+    2) but ask for different real audio; a correct call tells them apart, `i` does
+    not, so a fixed `i` makes the two calls receive an identical window instead.
+    """
+    engine = FakeEngine()
+    ring = _distinct_tone_ring()
+    cache = _cache(n=6)
+    r = Renderer(engine=engine, cache=cache, ring=ring, slot=Slot())
+    r.render(frame_index=8, origin=0.0, fps=24.0)
+    r.render(frame_index=14, origin=0.0, fps=24.0)   # 14 % 6 == 8 % 6 == 2
+    assert r.failed is False
+    assert not np.array_equal(engine.audio_calls[0], engine.audio_calls[1]), (
+        "frame_index=8 and frame_index=14 both cycle to clip index 2, but ask for "
+        "different audio - using the clip index in the window call would make "
+        "these two identical"
+    )
+
+
+def test_the_engine_receives_a_window_addressed_by_the_real_origin():
+    """Catches `window(..., origin=0.0)` hardcoded regardless of the caller's own
+    origin - the same shape of bug as the frame_index case above, one argument
+    over."""
+    engine = FakeEngine()
+    ring = _distinct_tone_ring()
+    r = Renderer(engine=engine, cache=_cache(n=6), ring=ring, slot=Slot())
+    r.render(frame_index=8, origin=0.0, fps=24.0)
+    r.render(frame_index=8, origin=0.5, fps=24.0)
+    assert r.failed is False
+    assert not np.array_equal(engine.audio_calls[0], engine.audio_calls[1]), (
+        "the same frame_index at two different origins must read different audio"
+    )
