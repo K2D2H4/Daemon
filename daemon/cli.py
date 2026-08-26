@@ -156,6 +156,11 @@ def build_parser() -> argparse.ArgumentParser:
     add("uninstall", group="setup", help="stop the OS service and remove its unit file")
     add("status", group="every day", help="is the service installed and running")
     add("face", group="every day", help="open the face - a live status page - in its own window")
+    add(
+        "face-transitions",
+        group="now and then",
+        help="rebuild the pose-match table the face uses to enter a loop clip mid-pose",
+    )
     log = add(
         "log",
         group="every day",
@@ -427,6 +432,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         inserted = _reindex(settings)
         print(f"reindexed {inserted} message(s) the mirror was missing")
         return OK
+    if command == "face-transitions":
+        return _face_transitions(settings)
     if command == "proactive":
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
         return asyncio.run(_proactive(settings, speak=args.speak))
@@ -759,6 +766,32 @@ def _face() -> int:
             # docstring).
             continue
     print(url)
+    return OK
+
+
+def _face_transitions(settings: Settings) -> int:
+    """Rebuild the pose-match table (Task 9) and write it to the face dir.
+
+    `face_match.write_table` shells out to `ffmpeg` once per clip; a missing
+    binary raises `FileNotFoundError` - an `OSError`, not a nonzero exit - the
+    same shape `_face()` guards around `open`/Chrome (module docstring: print
+    what was found, don't raise a traceback). Unlike `_face()` this genuinely
+    cannot proceed without ffmpeg, so it reports the problem and stops rather
+    than falling back to anything.
+    """
+    from daemon.face_match import write_table
+    from daemon.face_routes import face_dir
+
+    try:
+        path = write_table(face_dir(settings))
+    except OSError:
+        print("daemon: ffmpeg not found - install it and try again", file=sys.stderr)
+        return PROBLEM
+    # Re-read rather than re-run build_table: writing already computed it once,
+    # and ffmpeg per clip is the expensive part.
+    table = json.loads(path.read_text(encoding="utf-8"))
+    pairs = sum(len(dests) for dests in table["match"].values())
+    print(f"{path} ({pairs} pair(s))")
     return OK
 
 

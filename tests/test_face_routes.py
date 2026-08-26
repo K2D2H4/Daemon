@@ -130,6 +130,23 @@ async def test_the_stream_carries_a_one_shot(app):
                     break
 
 
+def test_transitions_are_served_when_present_and_404_otherwise(app):
+    """Task 9 rule 4: no table on disk must be a clean 404, not an error - the
+    page's fallback to `currentTime = 0` depends on that, and the table is
+    derived from the owner's own clips so it never ships in the repo."""
+    client = TestClient(app)
+    assert client.get("/face/transitions").status_code == 404
+
+    settings = app.state.settings
+    d = face_dir(settings)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "transitions.json").write_text('{"version": 1, "match": {}}', encoding="utf-8")
+
+    r = client.get("/face/transitions")
+    assert r.status_code == 200
+    assert r.json() == {"version": 1, "match": {}}
+
+
 def test_clips_lists_every_stem_the_page_expects(app):
     assert set(CLIPS) == {
         "idle1",

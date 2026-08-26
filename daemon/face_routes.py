@@ -97,6 +97,21 @@ async def manifest(request: Request) -> dict[str, Any]:
     return {"clips": list(available_clips(request.app.state.settings))}
 
 
+@router.get("/face/transitions")
+async def transitions(request: Request) -> Response:
+    """Serve `daemon face-transitions`' pose-match table if it has been built,
+    404 otherwise - same posture as `/face/clips/{name}`: check, then serve,
+    never guess. Task 9 rule 4: the page's own fallback to `currentTime = 0`
+    depends on a fresh install (no table yet) getting a clean 404 here, not an
+    error - the table is derived from the owner's own clips, so it is never
+    checked into the repo.
+    """
+    path = face_dir(request.app.state.settings) / "transitions.json"
+    if not path.is_file():
+        return Response(status_code=404)
+    return FileResponse(path, media_type="application/json")
+
+
 @router.get("/face/stream")
 async def stream(request: Request) -> StreamingResponse:
     """Server-sent events: the current state (snapshot on open), then all future

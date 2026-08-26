@@ -757,6 +757,43 @@ def test_face_prints_the_url_when_open_is_not_on_path(
     assert "127.0.0.1:8787/face" in capsys.readouterr().out
 
 
+def test_face_transitions_reports_the_path_and_pair_count(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    written = tmp_path / "transitions.json"
+    written.write_text(
+        json.dumps({"match": {"idle1": {"idle2": [0.1]}, "idle2": {"idle1": [0.2, 0.3]}}})
+    )
+    # face_match.write_table is the expensive (ffmpeg-shelling) part; the command
+    # re-reads its output for the pair count rather than re-running it.
+    monkeypatch.setattr("daemon.face_match.write_table", lambda face_dir: written)
+
+    assert cli.main(["face-transitions"]) == 0
+    out = capsys.readouterr().out
+    assert str(written) in out
+    # Pair count is ordered (A, B) entries - idle1->idle2 and idle2->idle1 - not
+    # the number of per-bucket seek values inside either one.
+    assert "2 pair(s)" in out
+
+
+def test_face_transitions_reports_a_problem_when_ffmpeg_is_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`face_match._frames` shells out to ffmpeg; a missing binary raises
+    `FileNotFoundError` - an `OSError`, not a nonzero exit (same shape as the two
+    `face` tests above). Raising it directly from `write_table`, not from a
+    `subprocess.run` stand-in that merely returns a failure code, is the point:
+    a mocked nonzero exit would never exercise this path at all."""
+
+    def missing(face_dir: Path) -> Path:
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr("daemon.face_match.write_table", missing)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    assert "ffmpeg" in capsys.readouterr().err
+
+
 def test_a_broken_config_stops_a_command_that_needs_it(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
