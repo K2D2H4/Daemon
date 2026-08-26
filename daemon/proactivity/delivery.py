@@ -77,7 +77,7 @@ class ProactiveDelivery:
         *,
         channel: Channel | None = None,
         speaker: Speaker | None = None,
-        ask_for_the_floor: Callable[[str], Awaitable[bool]] | None = None,
+        ask_for_the_floor: Callable[[str], Awaitable[str]] | None = None,
     ) -> None:
         self._store = store
         self._memory = memory
@@ -157,7 +157,15 @@ class ProactiveDelivery:
         like a speaker that refused.
         """
         if self._ask_for_the_floor is not None:
-            return await self._ask_for_the_floor(text)
+            outcome = await self._ask_for_the_floor(text)
+            if outcome != "no-listener":
+                return outcome == "spoke"
+            # Nobody took it, so nothing in this process is holding the microphone
+            # either and the speaker below will work. PR #115 review: an install
+            # with the wake word configured but its loop not running - no recognizer,
+            # a mic grant this build cannot use, a task that died - would otherwise
+            # have gone quiet on the local machine while a speaker that worked was
+            # never tried, and nothing would have said why.
         if self._speaker is None:
             # The gate should not have chosen a speaker route without one, but a
             # mismatch here must not lose the Telegram half.

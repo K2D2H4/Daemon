@@ -317,9 +317,9 @@ async def test_the_speaker_is_reached_through_the_mic_floor_when_one_is_wired(
     asked: list[str] = []
     speaker = FakeSpeaker()
 
-    async def floor(text: str) -> bool:
+    async def floor(text: str) -> str:
         asked.append(text)
-        return True
+        return "spoke"
 
     delivery, _ = delivery_for(
         store, data_dir, channel=FakeChannel(), speaker=speaker, ask_for_the_floor=floor
@@ -339,8 +339,8 @@ async def test_a_floor_that_could_not_speak_leaves_the_channel_carrying_it(
     refused, and when the synthesiser failed. All three mean the same thing here:
     the words still have to reach the owner."""
 
-    async def floor(text: str) -> bool:
-        return False
+    async def floor(text: str) -> str:
+        return "not-spoken"
 
     channel = FakeChannel()
     delivery, _ = delivery_for(
@@ -367,3 +367,47 @@ async def test_with_no_floor_wired_the_speaker_is_still_called_directly(
 
     assert speaker.said == ["발표 어떻게 됐어?"]
     assert result.route == "both"
+
+
+async def test_no_listener_falls_through_to_the_speaker(store: Store, data_dir: Path) -> None:
+    """The wake word is configured but its loop is not running - no on-device
+    recognizer, a microphone grant this build cannot use, a task that died. Nobody
+    takes the line, so nothing is holding the microphone and the speaker works.
+
+    PR #115 review: the first version collapsed this into the same `False` as "the
+    wake loop tried and could not", and proactivity went silent on the local machine
+    while a speaker that would have worked was never called - with nothing saying
+    why, because from the outside it looked exactly like the bug this whole change
+    was fixing."""
+    speaker = FakeSpeaker()
+
+    async def floor(text: str) -> str:
+        return "no-listener"
+
+    delivery, _ = delivery_for(
+        store, data_dir, channel=FakeChannel(), speaker=speaker, ask_for_the_floor=floor
+    )
+
+    result = await delivery.deliver(candidate(store), SAID, verdict("both"), now=NOW)
+
+    assert speaker.said == ["발표 어떻게 됐어?"], "the speaker was never tried"
+    assert result.route == "both"
+
+
+async def test_not_spoken_does_not_go_around_the_wake_loop(store: Store, data_dir: Path) -> None:
+    """The other half of the distinction: a wake loop that took the line and could
+    not say it still *has* the microphone, so reaching for the speaker here would
+    be refused anyway - and on reasoning that would be wrong the day it was not."""
+    speaker = FakeSpeaker()
+
+    async def floor(text: str) -> str:
+        return "not-spoken"
+
+    delivery, _ = delivery_for(
+        store, data_dir, channel=FakeChannel(), speaker=speaker, ask_for_the_floor=floor
+    )
+
+    result = await delivery.deliver(candidate(store), SAID, verdict("both"), now=NOW)
+
+    assert speaker.said == []
+    assert result.route == "telegram"

@@ -840,7 +840,11 @@ def open_store(settings: Settings) -> Iterator[Any]:
 
 
 async def build_proactive_tick(
-    settings: Settings, *, speak: bool = False, bridge: Any = None
+    settings: Settings,
+    *,
+    speak: bool = False,
+    bridge: Any = None,
+    wake_loop: bool = False,
 ) -> tuple[ProactiveTick, Callable[[], Awaitable[None]]]:
     """A tick and the coroutine that releases what it holds.
 
@@ -970,12 +974,17 @@ async def build_proactive_tick(
             speaker = LocalSpeaker()
             closers.append(speaker.aclose)
 
-        # The floor, only when a wake loop could answer it. `speak` is the flag the
-        # resident sets and `daemon proactive` does not: from a terminal there is no
-        # wake round to take the request, so asking would cost the utterance ten
-        # seconds and then fall back to the speaker it could have used directly.
+        # The floor, only where a wake round could answer it. `wake_loop` is passed
+        # by `_proactive_tick` and by nothing else, because it is a fact about *this
+        # process* that no setting can stand in for: `daemon proactive --speak` sets
+        # `speak=True` too (`daemon/cli.py`) and has no wake loop at all, and
+        # `settings.wake_enabled` stays true on a resident whose wake task was never
+        # created - no on-device recognizer, a microphone grant this build cannot
+        # use. An earlier version of this comment claimed `speak` told those apart.
+        # It does not (PR #115 review), and the cost of believing it was a ten-second
+        # stall on every line from a command a person is watching run.
         ask_for_the_floor = None
-        if speak and settings.voice_enabled and settings.wake_enabled:
+        if wake_loop and speak and settings.voice_enabled and settings.wake_enabled:
             ask_for_the_floor = mic_floor.request
 
         delivery = ProactiveDelivery(
@@ -1094,7 +1103,15 @@ async def _proactive_tick(
     """
     bridge = get_bridge() if get_bridge is not None else None
     try:
-        tick, close = await build_proactive_tick(settings, speak=True, bridge=bridge)
+        # `wake_loop=True` because this is the resident, the only process that runs
+        # one. Not conditioned on the task being *alive*: a resident whose wake task
+        # died or was never created answers nothing, `mic_floor.request` reports
+        # `no-listener` after its take timeout, and `ProactiveDelivery._say` uses the
+        # speaker directly - correct, and self-correcting, at the cost of one ten-
+        # second wait per line in a state `daemon doctor` already reports.
+        tick, close = await build_proactive_tick(
+            settings, speak=True, bridge=bridge, wake_loop=True
+        )
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
         logger.error("proactive tick could not start: %s", exc)
         return

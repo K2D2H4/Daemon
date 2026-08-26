@@ -1892,7 +1892,7 @@ async def test_a_proactive_line_reaches_the_speaker_through_the_wake_loop(
     assert taken is not None
     await _speak_unprompted(settings, taken, None)
 
-    assert await asked is True, "delivery was never told the line was spoken"
+    assert await asked == "spoke", "delivery was never told the line was spoken"
     assert said == [line], "the judged line must reach the speaker unchanged"
     assert sessions == [True], "she spoke first and then did not listen for the answer"
 
@@ -1941,7 +1941,7 @@ async def test_a_line_that_could_not_be_spoken_opens_no_session(
 
     await _speak_unprompted(settings, taken, None)
 
-    assert await asked is False, "delivery must fall back to the channel"
+    assert await asked == "not-spoken", "delivery must fall back to the channel"
     assert sessions == [], "a session was opened for a line nobody heard"
 
 
@@ -1981,7 +1981,7 @@ async def test_a_speaker_that_raises_still_answers_the_waiting_line(
 
     await _speak_unprompted(settings, taken, None)  # must not raise
 
-    assert await asked is False
+    assert await asked == "not-spoken"
 
 
 @pytest.mark.asyncio
@@ -2041,7 +2041,7 @@ async def test_the_wake_round_hands_a_waiting_line_to_the_speaker(
     await _wake_round(settings)
 
     assert spoken == ["한마디"], "the round ended without handing the line over"
-    assert await asked is True
+    assert await asked == "spoke"
 
 
 @pytest.mark.asyncio
@@ -2086,3 +2086,131 @@ async def test_a_round_that_ends_with_an_empty_mailbox_speaks_nothing(
     )
 
     assert spoken == []
+
+
+def test_the_real_gate_reads_the_real_mailbox() -> None:
+    """`build_wake_gate` never passes `floor_wanted`, so the resident depends
+    entirely on the default - and every other test injects its own predicate, so
+    changing that default to `lambda: False` unwires the gate from the mailbox with
+    the whole suite still green (PR #115 review, verified by mutation).
+
+    Asserts identity against `mic_floor.pending` for the same reason
+    `test_e_the_app_exposes_the_catchup_lock` asserts identity rather than type: a
+    different predicate of the right shape would pass a callable check and still
+    leave the daemon unable to speak aloud."""
+    from daemon import mic_floor
+    from daemon.voice.wake import WakeGate
+
+    class Silent:
+        sample_rate = 16_000
+
+        def record(self) -> Any:  # pragma: no cover - never started here
+            raise AssertionError("this test must not open a capture stream")
+
+    class Vad:
+        sample_rate = 16_000
+        frame_samples = 512
+
+    gate = WakeGate(Silent(), Vad(), object(), ("벨라",))
+
+    assert gate._floor_wanted is mic_floor.pending
+
+
+@pytest.mark.asyncio
+async def test_the_resident_tick_wires_delivery_to_the_real_mailbox(
+    tmp_path: Path,
+) -> None:
+    """The other half the suite could not see: deleting the two lines in
+    `build_proactive_tick` that set `ask_for_the_floor` broke nothing, because
+    `test_delivery.py` injects its own fake and `test_reachable.py` cannot help -
+    `mic_floor.request` is a function, so being *named* in `app.py` is all it looks
+    for.
+
+    Also pins the condition itself. `wake_loop` is what separates the resident from
+    `daemon proactive --speak`, which sets `speak=True` too and has no wake round to
+    answer - an earlier comment claimed `speak` told them apart, and it does not."""
+    from daemon import mic_floor
+    from daemon.app import build_proactive_tick
+
+    (tmp_path / "persona").mkdir()
+    (tmp_path / "persona" / "seed.md").write_text("씨앗", encoding="utf-8")
+    overrides = dict(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        DAEMON_VOICE_ENABLED=True,
+        DAEMON_WAKE_ENABLED=True,
+        DAEMON_WAKE_ALIASES="벨라",
+        GEMINI_API_KEY="k",
+        DAEMON_GEMINI_LIVE_MODEL="gemini-3.1-flash-live-preview",
+    )
+
+    tick, closing = await build_proactive_tick(
+        Settings(**overrides), speak=True, wake_loop=True
+    )
+    try:
+        assert tick._delivery._ask_for_the_floor is mic_floor.request
+    finally:
+        await closing()
+
+    # The CLI's own call, which must not: nobody there could ever take the request.
+    tick2, closing2 = await build_proactive_tick(Settings(**overrides), speak=True)
+    try:
+        assert tick2._delivery._ask_for_the_floor is None
+    finally:
+        await closing2()
+
+
+@pytest.mark.asyncio
+async def test_the_session_opened_after_speaking_is_given_no_opening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The safety argument of this whole change, which had no test behind it.
+
+    `opening_text` is a prompt the model answers (`daemon/voice/conversation.py`),
+    so a session handed the line would say its own version - and the judge's
+    length cap and URL refusal would have passed on a sentence nobody heard, while
+    the sentence the room *did* hear went through none of them. Verified by
+    mutation: passing `opening_text=text` here breaks nothing else in the suite."""
+    from daemon import mic_floor
+    from daemon.app import _speak_unprompted
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    opened: list[dict[str, Any]] = []
+
+    class FakeSpeaker:
+        async def say(self, text: str) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fake_run_voice(settings: Any, **kwargs: Any) -> int:
+        opened.append(kwargs)
+        return 0
+
+    import daemon.app as app_module
+    import daemon.proactivity.speaker as speaker_module
+
+    monkeypatch.setattr(speaker_module, "LocalSpeaker", FakeSpeaker)
+    monkeypatch.setattr(app_module, "run_voice", fake_run_voice)
+    monkeypatch.setattr(app_module, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+    taken = mic_floor.take()
+    assert taken is not None
+
+    await _speak_unprompted(settings, taken, None)
+
+    assert await asked == "spoke"
+    assert len(opened) == 1
+    assert not opened[0].get("opening_text"), "the model would say its own version of the line"
+    assert not opened[0].get("opening_audio")
