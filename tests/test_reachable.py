@@ -201,6 +201,15 @@ WIRED_CLASSES = (
     # own methods build the other two), so `_constructed` cannot see them and
     # listing them here would just fail the way a stale PENDING entry does.
     "FaceBus",
+
+    # The local Ollama the daemon starts at boot when nothing else already answers
+    # (`daemon/ollama_process.py`). `create_app` only ever takes one by injection -
+    # on purpose, so every test that does not pass one stays off the network - so
+    # the one real construction site is `daemon/cli.py`'s `_serve`
+    # (`LocalOllama(settings.ollama_base_url)`), the `daemon run` call site. That
+    # single line is the entire feature; this entry is what makes dropping it a
+    # failing test instead of a silent regression.
+    "LocalOllama",
 )
 
 

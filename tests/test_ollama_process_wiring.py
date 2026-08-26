@@ -109,3 +109,51 @@ def test_no_ollama_injected_means_no_start_task(tmp_path: Path) -> None:
     app = create_app(_settings_for(tmp_path), channel=_Idle(), memory=_Mem())
     with TestClient(app):
         assert app.state.ollama_task is None
+
+
+class HangingOllama:
+    """`ensure_running` that never resolves for the life of the test, so a
+    correctly wired backfill can be caught still waiting on it."""
+
+    async def ensure_running(self) -> bool:
+        await asyncio.Event().wait()  # never set; the test ends before this returns
+        return True  # pragma: no cover
+
+    async def aclose(self) -> None:
+        pass
+
+
+def test_the_lifespan_actually_hands_the_backfill_its_ollama_readiness(
+    tmp_path: Path,
+) -> None:
+    """Both tests above inject `channel`/`memory`, which is correct - it is what
+    keeps them off the network - but it has a side effect worth closing
+    separately: with both injected, `_build_io` never runs, and `_build_io` is
+    the *only* thing that would otherwise overwrite the un-injected `recall`
+    (`app.state.recall`) with something real. So neither test above exercises
+    `if recall is not None:` at all, and neither would notice
+    `_backfill(recall, app.state.ollama_task)` regressing to the old
+    `_backfill(recall)` - every one of their assertions is about `local_ollama`,
+    not about what `_backfill` was given.
+
+    Injecting `recall` directly closes that gap without touching the network:
+    `_build_io` only runs when `channel` or `memory` is `None`, and `recall` is
+    a separate keyword read straight off `app.state` either way. With a real
+    `recall` present and a `local_ollama` whose `ensure_running` never resolves,
+    correct wiring leaves the backfill parked awaiting `app.state.ollama_task`
+    for the life of the `with` block - so `recall.calls` stays 0. Drop the
+    second argument and `_backfill` skips the wait entirely and calls
+    `recall.backfill` immediately, exactly the bug this whole change exists to
+    remove, just observed one layer out from the two tests above."""
+    recall = RecordingRecall()
+
+    app = create_app(
+        _settings_for(tmp_path),
+        channel=_Idle(),
+        memory=_Mem(),
+        recall=recall,
+        local_ollama=HangingOllama(),
+    )
+    with TestClient(app) as client:
+        assert client.get("/health").json()["status"] == "ok"
+        assert recall.calls == 0  # still parked behind a local_ollama that never answers
