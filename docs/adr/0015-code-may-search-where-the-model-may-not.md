@@ -70,9 +70,14 @@ output — rather than by trusting the fence around the input:
 4. **A URL in the utterance is a decline.** The vector worth fearing is not
    exfiltration — proactive delivery goes to the paired owner or the local
    speaker — it is this daemon's trusted voice telling its owner where to go.
-5. One search per gate-passed candidate, never per tick, so non-negotiable 7's
-   cost shape holds: deterministic generation, deterministic gate, then exactly
-   one expensive step.
+5. One search per gate-passed candidate **per attempt**, never per tick, so
+   non-negotiable 7's cost shape holds: deterministic generation, deterministic
+   gate, then exactly one expensive step. (Corrected 2026-08-26 by the
+   whole-branch review, which caught that "per candidate" was wrong: a candidate
+   the judge drops is rested and comes due again, so it is re-searched at the
+   cooldown cadence. That was unbounded until the same review gave `topic` a
+   `TOPIC_TTL_HOURS` expiry - roughly 16 attempts, then the row retires. The cost
+   shape per tick was always right; the total per candidate was not.)
 
 Defence 4 is the load-bearing one. The others reduce what gets in; only that one
 bounds what gets out, and this repo has already watched a fence lose — the
@@ -83,9 +88,12 @@ the model imitated them anyway, measurably, until the phrases were named.
 
 - `daemon/proactivity/candidates.py` stops being purely deterministic-from-the-database.
   Its module docstring's claim that every reason is built from *"its own lexicons,
-  clock times and dates"* becomes true of three generators and false of the fourth.
+  clock times and dates"* becomes true of four of the six generators and false of
+  `topic` - `association` was already the first exception. (Count corrected
+  2026-08-26; the docstring itself was updated in the same review, which is the
+  consequence this bullet predicted.)
 - A failed or disabled search drops the `topic` candidate and leaves the other
-  three generators working. Proactivity degrades to today's behaviour, not to an
+  five generators working. Proactivity degrades to today's behaviour, not to an
   error.
 - The daily budget drops 8 → 5 and the cooldown rises 30 → 90 minutes. Not
   because the budget was ever binding — at 0 utterances nothing was binding — but

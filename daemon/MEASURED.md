@@ -231,6 +231,12 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   (A): a tie is not evidence for removing a muzzle that costs six lines and no latency,
   and the task this measurement was for says plainly that changing code because it was
   expected to is worse than reporting no change needed with evidence.
+  **Superseded 2026-08-26 by docs/adr/0016-proactive-default-flips-to-speaking.md.**
+  Both worked examples now answer with a line, so the muzzle this entry argued for
+  keeping no longer exists. Nothing above was overturned - the 2026-08-11 tie stands,
+  and it was never the reason the muzzle came off. What removed it was the owner
+  saying the shape he had objected to was the *demanding* question
+  (`무슨 재밌는 일 없어요?`), not the ordinary check-in the examples were muzzling.
 - **A live-data preview of the type-E generator turned up conversational chaff among
   its own candidates, and the judge caught it without being told to.**
   `association_candidates` (`daemon/proactivity/candidates.py`) quotes the owner's own
@@ -243,6 +249,13 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   filter of its own, but on this model the judge's own content criterion ("구체적인
   사건·감정·기억이 내용으로 적혀 있다") already screens chaff before anyone hears it, so
   nothing in this run argues for adding one now.
+  **The mechanism this conclusion rests on was removed 2026-08-26** (ADR 0016): that
+  content criterion is the clause the flip deleted, so "the judge already screens
+  chaff" stopped being a reason to leave `association_candidates` unfiltered. A
+  narrower rule was carved back out in its place, and re-measured on this same
+  material - a reason built from the owner's command history declines **0/30 spoke**
+  (n=30, `gemini-3.6-flash`, 2026-08-26). The conclusion holds; the thing holding it
+  up is now a named carve-out rather than a general criterion.
 - **The C rhythm was accepted on the machine, not in the suite (2026-08-11).** Every
   routing rule was driven against a live `Reading` from this Mac, with the daemon's
   own microphone hold declared the way the wake listener declares it:
@@ -397,6 +410,11 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   So of the five generators, exactly one (A) can currently produce a reason the judge
   will speak on, which is the shape PLAN 6.2 warns about: a competent assistant
   rather than a companion. That is not a tuning gap.
+  **Both halves of that sentence changed 2026-08-26.** There are now six generators
+  (`topic`, ADR 0015), and `silence` and `pattern_time` speak rather than decline
+  (ADR 0016) - `silence` measured **30/30 spoke, 0/30 demanding shape** (n=30,
+  `gemini-3.6-flash`). The scarcity this entry measured was real and is why both ADRs
+  exist; it is no longer a description of what the judge does.
 - **Half-duplex was leaking the daemon's own voice into memory as the owner's words,
   and the tell is that every leak is a *tail* (2026-08-19).** `DAEMON_VOICE_BARGE_IN=
   false` was set and `apple audio: ... echo cancellation on` was in the log, yet
