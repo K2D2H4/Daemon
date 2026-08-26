@@ -145,17 +145,27 @@ class MlxEngine:
         return stacked.reshape(1, WINDOW * HIDDEN_STATES, FEATURE_DIM) + self._audio_pe
 
     def mouths(
-        self, audio: np.ndarray, frame_indices: Sequence[int]
+        self, windows: Sequence[np.ndarray], frame_indices: Sequence[int]
     ) -> list[np.ndarray]:
-        features = self._features(audio)
-        out = []
-        for index in frame_indices:
-            latent = self._latents[index % self._latents.shape[0]][None]
-            pred = self._unet(latent, self._timestep, features)
-            image = self._taesd(pred)
-            rgb = np.array(mx.clip(image / 2.0 + 0.5, 0.0, 1.0) * 255.0)
-            out.append(rgb.round().astype(np.uint8)[0][..., ::-1])
-        return out
+        """Batched on purpose - see `BATCH` in `render.py` for the arithmetic.
+
+        Everything downstream of the features runs as one batch: the UNet at N=2 is
+        29.29ms/frame against 41.55ms alone, which is the whole reason the protocol
+        takes a sequence. The decoder and the trip back to numpy batch too, though
+        they barely care (4.26 vs 4.76ms, 0.92 vs 0.93ms).
+        """
+        if len(windows) != len(frame_indices):
+            raise ValueError(
+                f"{len(windows)} windows for {len(frame_indices)} frames - one each"
+            )
+        features = mx.concatenate([self._features(w) for w in windows])
+        latents = mx.concatenate(
+            [self._latents[i % self._latents.shape[0]][None] for i in frame_indices]
+        )
+        images = self._taesd(self._unet(latents, self._timestep, features))
+        rgb = np.array(mx.clip(images / 2.0 + 0.5, 0.0, 1.0) * 255.0)
+        bgr = rgb.round().astype(np.uint8)[..., ::-1]
+        return [bgr[i] for i in range(bgr.shape[0])]
 
 
 def _reject_duplicates(mapped: list[tuple[str, mx.array]]) -> None:

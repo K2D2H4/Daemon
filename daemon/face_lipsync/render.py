@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from daemon.face_lipsync import Cache, LipsyncEngine, composite
+from daemon.face_lipsync.audio import CONTEXT_MS
 from daemon.face_lipsync.ring import PcmRing, Slot
 
 logger = logging.getLogger(__name__)
@@ -55,15 +56,37 @@ def restore_detail(
     return np.clip(mouth.astype(np.float32) + high, 0, 255).astype(np.uint8)
 
 
-class Renderer:
-    """One frame at a time. The loop that calls this lives in `daemon/app.py`.
+BATCH = 2
+"""Frames computed per model step, and this is arithmetic rather than taste.
 
-    N=1 is the shipped shape - `_render` always calls `mouths(audio, [i])` - even
-    though the spec calls N=2 the only viable batch. Widening to N=2 is not a
-    protocol change here: it would need `mouths` to take two windows rather than
-    one audio array (two frames are two whisper indices apart, so a single array
-    cannot express both), and it would mean revisiting `Slot`'s latest-wins
-    semantics too.
+Measured on the assembled engine: at N=1 a frame costs 49.3ms against a 41.67ms
+budget - UNet 41.55, TAESD 4.72, convert 0.93, features 2.12 - so 24fps is not
+reachable one frame at a time on any of it. At N=2 the UNet drops to 29.29ms/frame
+and the whole two-frame step is 72.21ms, i.e. 36.10ms/frame with 13% headroom.
+
+N=3 is not the next step up: the batch cannot start until its last frame's audio has
+arrived, so widening costs `(N-1) x 41.67ms` of latency and N=3 misses the 250ms
+ceiling by 7.6ms.
+"""
+
+
+class Renderer:
+    """Two frames per model step, released one frame apart.
+
+    The loop that calls this lives in `daemon/app.py` and still calls `render` once
+    per displayed frame. Alternate calls do no model work at all: a step computes
+    `frame_index` and `frame_index + 1`, publishes the first, and holds the second
+    for the next call.
+
+    That holding is not a convenience. `Slot` is latest-wins and never queues, so
+    putting both frames of a batch in it at once would overwrite the first before
+    anything read it - the mouth would advance two frames at a time and read as
+    12fps however fast the model ran.
+
+    The cost is the batch-fill wait the spec names: a step needs audio through
+    `frame_index + 1`'s window, which is 41.67ms past what `frame_index` alone
+    needs. `PcmRing.window` zero-fills what has not arrived, so a loop that calls
+    this too eagerly gets a mouth conditioned on silence rather than an error.
     """
 
     def __init__(
@@ -79,6 +102,8 @@ class Renderer:
         self._ring = ring
         self._slot = slot
         self._buffer = np.empty_like(cache.frames[0])
+        self._pending: bytes | None = None
+        """The batch's second frame, waiting for the next call. See the class docstring."""
         self.failed = False
         """Latched on the first engine failure. The caller drops back to v1 clips
         and logs once; retrying per frame would fill the log at 24Hz."""
@@ -94,21 +119,41 @@ class Renderer:
             self.failed = True
 
     def _render(self, *, frame_index: int, origin: float, fps: float) -> None:
+        if self._pending is not None:
+            self._slot.put(self._pending)
+            self._pending = None
+            return
         n = len(self._cache.boxes)
-        i = frame_index % n
-        audio = self._ring.window(frame_index=frame_index, fps=fps, origin=origin)
-        mouth = self._engine.mouths(audio, [i])[0]
-        x1, y1, x2, y2 = self._cache.boxes[i]
-        sized = cv2.resize(mouth, (x2 - x1, y2 - y1))
-        sized = restore_detail(sized, self._cache.frames[i], self._cache.boxes[i])
-        out = composite(
-            self._cache.frames[i],
-            sized,
-            self._cache.boxes[i],
-            self._cache.crop_boxes[i],
-            self._cache.masks[i],
-            out=self._buffer,
-        )
-        ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        if ok:
-            self._slot.put(buf.tobytes())
+        indices = [frame_index + step for step in range(BATCH)]
+        windows = [
+            self._ring.window(
+                frame_index=index, fps=fps, origin=origin, context_ms=CONTEXT_MS
+            )
+            for index in indices
+        ]
+        mouths = self._engine.mouths(windows, [index % n for index in indices])
+        encoded: list[bytes] = []
+        for index, mouth in zip(indices, mouths, strict=True):
+            i = index % n
+            box = self._cache.boxes[i]
+            x1, y1, x2, y2 = box
+            sized = cv2.resize(mouth, (x2 - x1, y2 - y1))
+            sized = restore_detail(sized, self._cache.frames[i], box)
+            out = composite(
+                self._cache.frames[i],
+                sized,
+                box,
+                self._cache.crop_boxes[i],
+                self._cache.masks[i],
+                out=self._buffer,
+            )
+            # Encode inside the loop: `out` is one reusable buffer, so the second
+            # composite overwrites the first frame's pixels.
+            ok, buf = cv2.imencode(
+                ".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            )
+            if ok:
+                encoded.append(buf.tobytes())
+        if encoded:
+            self._slot.put(encoded[0])
+            self._pending = encoded[1] if len(encoded) > 1 else None

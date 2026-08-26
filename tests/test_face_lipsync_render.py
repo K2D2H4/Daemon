@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from daemon.face_lipsync import Cache, composite
-from daemon.face_lipsync.render import Renderer, restore_detail
+from daemon.face_lipsync.render import BATCH, Renderer, restore_detail
 from daemon.face_lipsync.ring import PcmRing, Slot
 
 # Deliberately non-square, with a different margin on every side - not the
@@ -29,23 +29,32 @@ CROP_W = CROP_BOX[2] - CROP_BOX[0]
 class FakeEngine:
     """Returns a solid colour per requested frame, and records what it was asked.
 
-    `audio_calls` keeps a copy of every window handed to `mouths` - added because
+    `window_calls` keeps a copy of every window handed to `mouths` - added because
     the renderer<->ring seam had zero coverage without it: every test in this file
-    fed the ring pure silence and this class discarded `audio` outright, so
+    fed the ring pure silence and this class discarded the audio outright, so
     `self._ring.window(...)` could be passed the wrong frame_index, a hardcoded
-    origin, or replaced with a hardcoded array of zeros and all 27 tests here would
-    still pass (see the three seam tests below, which is what these fields exist
-    to make possible).
+    origin, or replaced with a hardcoded array of zeros and every test here would
+    still pass (see the seam tests below, which is what these fields exist to make
+    possible).
+
+    One entry per `mouths` call, holding that call's whole batch - the renderer
+    hands over `BATCH` windows at a time, and a batch whose windows are all the
+    same frame's audio is its own failure mode.
     """
 
     def __init__(self) -> None:
         self.calls: list[list[int]] = []
-        self.audio_calls: list[np.ndarray] = []
+        self.window_calls: list[list[np.ndarray]] = []
 
-    def mouths(self, audio, frame_indices):
+    def mouths(self, windows, frame_indices):
         self.calls.append(list(frame_indices))
-        self.audio_calls.append(audio.copy())
+        self.window_calls.append([w.copy() for w in windows])
         return [np.full((256, 256, 3), 200, np.uint8) for _ in frame_indices]
+
+    @property
+    def first_windows(self):
+        """The first window of each batch - what the old `audio_calls` meant."""
+        return [batch[0] for batch in self.window_calls]
 
 
 def _cache(n=4):
@@ -186,7 +195,9 @@ def test_the_driving_clip_cycles_rather_than_running_out():
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
     r = Renderer(engine=engine, cache=_cache(n=4), ring=ring, slot=slot)
     r.render(frame_index=9, origin=0.0, fps=24.0)
-    assert engine.calls[-1] == [1]   # 9 % 4 == 1 - a clamp would give 3 instead
+    # frames 9 and 10 of a 4-frame clip: 1 then 2. A clamp would give 3, and a
+    # batch that forgot to advance would give [1, 1].
+    assert engine.calls[-1] == [1, 2]
 
 
 def test_rendering_never_writes_into_a_read_only_cache_or_leaks_a_stale_frame():
@@ -207,6 +218,14 @@ def test_rendering_never_writes_into_a_read_only_cache_or_leaks_a_stale_frame():
     assert published is not None
     first = cv2.imdecode(np.frombuffer(published, np.uint8), cv2.IMREAD_COLOR)
     assert abs(int(first[0, 0, 0]) - 0) < 10       # index 0's own background
+
+    # The next call publishes the batch's held second frame, which is index 1 -
+    # and it must carry index 1's own background, not index 0's, even though both
+    # were composited through the one shared buffer.
+    r.render(frame_index=1, origin=0.0, fps=24.0)
+    assert r.failed is False
+    held = cv2.imdecode(np.frombuffer(slot.get(), np.uint8), cv2.IMREAD_COLOR)
+    assert abs(int(held[0, 0, 0]) - 50) < 10       # index 1's own
 
     r.render(frame_index=2, origin=0.0, fps=24.0)
     assert r.failed is False
@@ -235,7 +254,7 @@ def test_the_engine_receives_real_audio_not_silence():
     r = Renderer(engine=engine, cache=_cache(n=6), ring=ring, slot=Slot())
     r.render(frame_index=8, origin=0.3, fps=24.0)
     assert r.failed is False
-    assert np.any(engine.audio_calls[0] != 0.0), "the engine should see real audio"
+    assert np.any(engine.first_windows[0] != 0.0), "the engine should see real audio"
 
 
 def test_the_engine_receives_a_window_addressed_by_frame_index_not_the_cycled_clip_index():
@@ -250,11 +269,13 @@ def test_the_engine_receives_a_window_addressed_by_frame_index_not_the_cycled_cl
     engine = FakeEngine()
     ring = _distinct_tone_ring()
     cache = _cache(n=6)
-    r = Renderer(engine=engine, cache=cache, ring=ring, slot=Slot())
-    r.render(frame_index=8, origin=0.0, fps=24.0)
-    r.render(frame_index=14, origin=0.0, fps=24.0)   # 14 % 6 == 8 % 6 == 2
-    assert r.failed is False
-    assert not np.array_equal(engine.audio_calls[0], engine.audio_calls[1]), (
+    # A renderer each: a second call on the same one would only drain the held
+    # frame and never reach the engine.
+    for index in (8, 14):                            # 14 % 6 == 8 % 6 == 2
+        r = Renderer(engine=engine, cache=cache, ring=ring, slot=Slot())
+        r.render(frame_index=index, origin=0.0, fps=24.0)
+        assert r.failed is False
+    assert not np.array_equal(engine.first_windows[0], engine.first_windows[1]), (
         "frame_index=8 and frame_index=14 both cycle to clip index 2, but ask for "
         "different audio - using the clip index in the window call would make "
         "these two identical"
@@ -267,11 +288,12 @@ def test_the_engine_receives_a_window_addressed_by_the_real_origin():
     over."""
     engine = FakeEngine()
     ring = _distinct_tone_ring()
-    r = Renderer(engine=engine, cache=_cache(n=6), ring=ring, slot=Slot())
-    r.render(frame_index=8, origin=0.0, fps=24.0)
-    r.render(frame_index=8, origin=0.5, fps=24.0)
-    assert r.failed is False
-    assert not np.array_equal(engine.audio_calls[0], engine.audio_calls[1]), (
+    cache = _cache(n=6)
+    for origin in (0.0, 0.5):
+        r = Renderer(engine=engine, cache=cache, ring=ring, slot=Slot())
+        r.render(frame_index=8, origin=origin, fps=24.0)
+        assert r.failed is False
+    assert not np.array_equal(engine.first_windows[0], engine.first_windows[1]), (
         "the same frame_index at two different origins must read different audio"
     )
 
@@ -404,3 +426,84 @@ def test_render_actually_restores_detail():
     d_plain = np.abs(got.astype(int) - plain.astype(int)).mean()
     d_restored = np.abs(got.astype(int) - restored.astype(int)).mean()
     assert d_restored < d_plain / 2, (d_restored, d_plain)
+
+
+# --- batching, and the frame it has to hold back --------------------------------
+#
+# BATCH=2 exists because N=1 costs 49.3ms against a 41.67ms budget. It brings two
+# failure modes nothing above can see: a batch whose windows are the same frame's
+# audio twice, and a held second frame that never gets published - which would look
+# like 12fps however fast the model ran, because Slot is latest-wins.
+
+
+def test_a_batch_asks_for_a_different_window_per_frame():
+    """Handing the same window to both frames is the cheap-looking mistake here:
+    the shapes match, the render succeeds, and the second frame's mouth is simply
+    41.67ms stale."""
+    engine = FakeEngine()
+    r = Renderer(
+        engine=engine, cache=_cache(n=6), ring=_distinct_tone_ring(), slot=Slot()
+    )
+    r.render(frame_index=8, origin=0.0, fps=24.0)
+    batch = engine.window_calls[0]
+    assert len(batch) == BATCH
+    assert not np.array_equal(batch[0], batch[1]), (
+        "consecutive frames sit two whisper indices apart and must read different "
+        "audio - identical windows mean one window was reused"
+    )
+
+
+def test_two_calls_run_the_model_once_and_publish_two_different_frames():
+    """The whole point of holding the second frame. Publishing both at once would
+    overwrite the first before anything read it."""
+    slot = Slot()
+    engine = FakeEngine()
+    cache = _cache_with_distinct_frames()
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
+    ring.feed(_tone(2000, value=9000), audible_at=0.0)
+    r = Renderer(engine=engine, cache=cache, ring=ring, slot=slot)
+
+    r.render(frame_index=0, origin=0.0, fps=24.0)
+    first = slot.get()
+    r.render(frame_index=1, origin=0.0, fps=24.0)
+    second = slot.get()
+
+    assert len(engine.calls) == 1, "the second call must do no model work"
+    assert first is not None and second is not None
+    assert first != second, "the held frame must not be a copy of the published one"
+
+
+def test_the_held_frame_is_published_before_the_next_batch_starts():
+    """Out of order, the mouth would jump forward and then back."""
+    slot = Slot()
+    engine = FakeEngine()
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
+    ring.feed(_tone(2000, value=9000), audible_at=0.0)
+    r = Renderer(engine=engine, cache=_cache(n=6), ring=ring, slot=slot)
+
+    r.render(frame_index=0, origin=0.0, fps=24.0)      # batch for 0,1 -> publishes 0
+    assert engine.calls == [[0, 1]]
+    r.render(frame_index=1, origin=0.0, fps=24.0)      # drains 1, no model work
+    assert engine.calls == [[0, 1]]
+    r.render(frame_index=2, origin=0.0, fps=24.0)      # new batch for 2,3
+    assert engine.calls == [[0, 1], [2, 3]]
+
+
+def test_a_latched_failure_stops_publishing_rather_than_repeating_a_frame():
+    """`render` never raises, and after it latches it must go quiet - a renderer
+    that kept draining a stale pending frame would freeze the mouth mid-word
+    instead of letting the page fall back to clip playback."""
+
+    class Broken:
+        def mouths(self, windows, frame_indices):
+            raise RuntimeError("engine gone")
+
+    slot = Slot()
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
+    ring.feed(_tone(2000, value=9000), audible_at=0.0)
+    r = Renderer(engine=Broken(), cache=_cache(n=6), ring=ring, slot=slot)
+    r.render(frame_index=0, origin=0.0, fps=24.0)
+    assert r.failed is True
+    assert slot.get() is None
+    r.render(frame_index=1, origin=0.0, fps=24.0)
+    assert slot.get() is None

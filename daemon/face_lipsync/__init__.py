@@ -21,24 +21,32 @@ class LipsyncEngine(Protocol):
     """
 
     def mouths(
-        self, audio: np.ndarray, frame_indices: Sequence[int]
+        self, windows: Sequence[np.ndarray], frame_indices: Sequence[int]
     ) -> list[np.ndarray]:
         """256x256 BGR mouths, one per index, in the same order.
 
-        `audio` is `PcmRing.window()`'s own output and nothing else: float32,
+        **One window per frame, and this took two windows rather than one array on
+        purpose.** Consecutive video frames sit two whisper indices apart, so a
+        single array cannot express both frames' conditioning; and deriving the
+        second frame's offset inside the engine would put this module's index
+        arithmetic in two places. Handing over both windows costs one extra
+        encoder pass - measured 4.27ms for the pair against 2.12ms for one, which
+        is inside the frame budget either way.
+
+        Each window is `PcmRing.window()`'s own output and nothing else: float32,
         `-1..1`, at `PcmRing.sample_rate` (24kHz in production -
         `daemon/voice/audio.py`'s OUTPUT_SAMPLE_RATE) - not the 16kHz whisper's
         own mel front-end assumes. An implementation that feeds this straight to
         whisper without resampling first gets a 1.5x-stretched, late mouth.
 
-        It is longer than the 200ms the model conditions on, and **the model's
-        window is the tail**. The lead-in is `audio.CONTEXT_MS` of preceding
-        audio, which whisper needs and the earlier version of this docstring got
-        wrong by promising exactly 200ms: log-mel clamps at `log_spec.max() - 8`
-        and rescales, so a bare 200ms slice normalises against its own peak and
-        came out anti-correlated (cosine -0.29) with the same audio inside a
-        stream. An implementation must therefore locate its ten whisper indices at
-        the END of what it is given, not the start.
+        A window is longer than the 200ms the model conditions on, and **the
+        model's window is the tail**. The lead-in is `audio.CONTEXT_MS` of
+        preceding audio, which whisper needs and an earlier version of this
+        docstring got wrong by promising exactly 200ms: log-mel clamps at
+        `log_spec.max() - 8` and rescales, so a bare 200ms slice normalises
+        against its own peak and came out anti-correlated (cosine -0.29) with the
+        same audio inside a stream. An implementation must therefore locate its ten
+        whisper indices at the END of each window, not the start.
         """
         ...
 
