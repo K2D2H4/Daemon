@@ -139,6 +139,39 @@ speaker - holding playback until the interrupt has had its chance - and that is 
 change to the audio path, not to a prompt.
 """
 
+SPEAK_VERBATIM = (
+    "아래 문장을 **그대로** 소리 내어 말해라. 한 글자도 바꾸지 말고, 더하지도 빼지도 "
+    "마라. 인사도, 설명도, 다른 말도 붙이지 마라. 문장을 말한 뒤에는 멈추고 상대의 "
+    "대답을 기다려라. 이 지시문 자체는 읽지 마라.\n\n{line}"
+)
+"""What a session opened by the daemon speaking first is asked to say.
+
+A proactive line used to come out of `/usr/bin/say` in whatever voice the system
+was set to, while every *answer* came from the voice the owner chose - so being
+spoken to first sounded like a different program. His report, 2026-08-27:
+`선제발화가 tts처럼 나오는데 이거맞음...?`
+
+The session that opens right afterwards is already paid for, so letting it say the
+line costs nothing and it comes out in her own voice. What stood in the way was
+that `opening_text` is a prompt the model *answers*: hand it a sentence and it
+delivers its own version, so the line the judge length-capped and refused for URLs
+would not be the line the room heard, and the row the owner's 👍/👎 attaches to
+would be a sentence nobody said.
+
+**Measured rather than argued** (`evals/proactive_verbatim_spike.py`, 2026-08-27,
+`gemini-3.1-flash-live-preview`, 8 live sessions per cell, same line and persona):
+
+    A  the content, in character   exact 0/8   `...문득 생각나서요. 어때요, 잘 돌아가요?`
+    B  this instruction            exact 8/8
+
+The failure in A is not paraphrase - the sentence survives - it is a **tail**. The
+model says the line and then adds one more question of its own, every time. That is
+enough to break the record, and it is what the second sentence here forbids by
+name rather than by implication, the same lesson as `CALLED_BY_NAME` below.
+
+Re-run the spike after any edit to this string, on the model that ships.
+"""
+
 CALLED_BY_NAME = (
     "The owner just called your name and said nothing else. Answer the way a person "
     "answers being called from across a room: a word or two, in character, and then "
