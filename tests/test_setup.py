@@ -620,6 +620,7 @@ def test_unreachable_ollama_is_a_warning_not_a_dead_end(tmp_path: Path) -> None:
         gemini=lambda key: Verdict(True, "key works"),
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
         ollama=lambda url: OllamaState(False, f"not reachable at {url}"),
+        pull=no_pull,
     )
     result = drive(tmp_path, [TOOLS_YES, "1", "n", "gemma3:4b", GOOD_TOKEN, "y"], checks=checks)
 
@@ -650,6 +651,7 @@ def test_a_rejected_key_is_re_asked_and_the_bad_one_is_never_written(
         gemini=lambda key: Verdict(True, "key works"),
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
+        pull=no_pull,
     )
     result = drive(
         tmp_path,
@@ -682,6 +684,7 @@ def test_the_key_is_checked_against_the_configured_model(tmp_path: Path) -> None
         gemini=lambda key: Verdict(True, "ok"),
         telegram=lambda token: Verdict(True, "ok"),
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
+        pull=no_pull,
     )
     existing = "DAEMON_PROVIDER=anthropic\nDAEMON_ANTHROPIC_MODEL=claude-opus-4-1\n"
     drive(
@@ -700,6 +703,7 @@ def test_giving_up_on_a_key_writes_nothing(tmp_path: Path) -> None:
         gemini=lambda key: Verdict(True, "ok"),
         telegram=lambda token: Verdict(True, "ok"),
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
+        pull=no_pull,
     )
     answers = [
         TOOLS_YES, "anthropic", "", "n", "gemma3:4b", "bad1", "bad2", "bad3",
