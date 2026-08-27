@@ -54,7 +54,7 @@ from daemon.tasks import Task
 if TYPE_CHECKING:  # the wake gate, used only in the signatures below
     from daemon.face import FaceBus
     from daemon.face_lipsync import Cache
-    from daemon.face_lipsync.render import FrameClock, Renderer
+    from daemon.face_lipsync.render import ClipClock, FrameClock, Renderer
     from daemon.face_lipsync.ring import PcmRing, Slot
     from daemon.voice.base import AudioIO, SpeechRecognizer
     from daemon.voice.wake import WakeGate
@@ -1096,17 +1096,21 @@ class Lipsync:
 
 
 class _LipsyncFrames:
-    """`face_routes.LipsyncFrames` over a `Renderer` and its `Slot`.
+    """`face_routes.LipsyncFrames` over a `Renderer`, its `Slot` and its `ClipClock`.
 
     Four members and no more, which is the protocol's whole point. It exists because
-    the two objects that hold those members are deliberately separate: `Slot` is
-    `put`/`get` with no idea what wrote it, and `Renderer` knows the geometry and
-    whether it has given up. Joining them is assembly, so it happens here.
+    the three objects that hold those members are deliberately separate: `Slot` is
+    `put`/`get` with no idea what wrote it, `Renderer` knows whether it has given up,
+    and `ClipClock` knows only where the driving clip is. Joining them is assembly, so
+    it happens here.
     """
 
-    def __init__(self, *, renderer: Renderer, slot: Slot, clip: str) -> None:
+    def __init__(
+        self, *, renderer: Renderer, slot: Slot, clip: str, driver: ClipClock
+    ) -> None:
         self._renderer = renderer
         self._slot = slot
+        self._driver = driver
         self.clip = clip
         # No box. Every JPEG is the whole composited frame now, so there is no
         # rectangle for the page to place - and reading `renderer.frame_box` here after
@@ -1121,6 +1125,16 @@ class _LipsyncFrames:
 
     def get(self) -> bytes | None:
         return self._slot.get()
+
+    def position(self) -> float:
+        """Where the driving clip is now, in seconds, for the page to seek to.
+
+        Read at the moment the manifest is built rather than cached, and the route is
+        `async`, so `loop.time()` here is the same clock the renderer stepped against
+        a millisecond ago. Over loopback the page stamps its own arrival ~2ms later,
+        which is a twentieth of a frame.
+        """
+        return self._driver.position(asyncio.get_running_loop().time())
 
 
 def _load_lipsync_cache(directory: Path) -> tuple[Cache, float]:
@@ -1238,7 +1252,7 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
         # is a daemon that will not start because of a face.
         from daemon.face_lipsync.audio import CONTEXT_MS
         from daemon.face_lipsync.engine import load as load_engine
-        from daemon.face_lipsync.render import FrameClock, Renderer
+        from daemon.face_lipsync.render import ClipClock, FrameClock, Renderer
         from daemon.face_lipsync.ring import PcmRing, Slot
         from daemon.voice.audio import OUTPUT_SAMPLE_RATE
 
@@ -1263,7 +1277,15 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
             sample_rate=OUTPUT_SAMPLE_RATE, width=2, seconds=LIPSYNC_RING_SECONDS
         )
         slot = Slot()
-        renderer = Renderer(engine=engine, cache=cache, ring=ring)
+        # The page's playhead, as a function of `loop.time()`. Anchored here, once, so
+        # the clip's position is a small readable number rather than a remainder of
+        # seconds-since-boot; any fixed instant would define the same clock. There is a
+        # running loop - the lifespan is what calls this - and it has to be that loop's
+        # clock, because that is the one the audio is stamped with.
+        driver = ClipClock(
+            fps=fps, frames=len(cache.boxes), epoch=asyncio.get_running_loop().time()
+        )
+        renderer = Renderer(engine=engine, cache=cache, ring=ring, clip=driver)
         clock = FrameClock(fps=fps)
         # One model step on THIS thread before the render loop ever uses another one,
         # and it is a requirement rather than a warm-up. **MLX aborts the process** -
@@ -1314,7 +1336,9 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
         await _lipsync_loop(face, renderer, clock, ring, queued, slot, fps=fps)
 
     return Lipsync(
-        frames=_LipsyncFrames(renderer=renderer, slot=slot, clip=LIPSYNC_CLIP),
+        frames=_LipsyncFrames(
+            renderer=renderer, slot=slot, clip=LIPSYNC_CLIP, driver=driver
+        ),
         sink=partial(_queue_pcm, queued),
         run=run,
     )

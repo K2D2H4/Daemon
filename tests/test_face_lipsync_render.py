@@ -15,6 +15,7 @@ from daemon.face_lipsync.render import (
     BATCH,
     DISPLAY_LEAD,
     MOTION_BLEND,
+    ClipClock,
     FrameClock,
     Renderer,
     detail_weight,
@@ -84,6 +85,25 @@ def _cache(n=4):
         boxes=[BOX] * n,
         crop_boxes=[CROP_BOX] * n,
         masks=masks,
+    )
+
+
+def _renderer(*, engine, cache, ring, epoch=0.0, fps=24.0):
+    """`Renderer`, with its clip clock anchored where every test here starts.
+
+    The driving index is no longer `audio index + DISPLAY_LEAD`: the page stopped
+    rewinding the driving clip at the start of a turn, so the renderer reads the
+    frame on screen off a free-running `ClipClock` instead (see its docstring, and
+    `Renderer.step`). `epoch=0.0` against the `origin=0.0` these tests feed makes
+    `ClipClock.index(origin)` answer 0, which is exactly the case the old arithmetic
+    described - so every assertion below is still about the thing it was written
+    about, and what the clock adds on top has its own tests at the bottom of this file.
+    """
+    return Renderer(
+        engine=engine,
+        cache=cache,
+        ring=ring,
+        clip=ClipClock(fps=fps, frames=len(cache.boxes), epoch=epoch),
     )
 
 
@@ -169,7 +189,7 @@ def test_the_encoded_frame_contains_the_engines_mouth_pixels():
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
     encoded = _jpegs(
-        Renderer(engine=engine, cache=_cache(), ring=ring), frame_index=0
+        _renderer(engine=engine, cache=_cache(), ring=ring), frame_index=0
     )
     assert encoded
     frame = cv2.imdecode(np.frombuffer(encoded[0], np.uint8), cv2.IMREAD_COLOR)
@@ -191,7 +211,7 @@ def test_the_payload_is_the_whole_composited_frame():
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
     encoded = _jpegs(
-        Renderer(engine=FakeEngine(), cache=cache, ring=ring), frame_index=0
+        _renderer(engine=FakeEngine(), cache=cache, ring=ring), frame_index=0
     )
     got = cv2.imdecode(np.frombuffer(encoded[0], np.uint8), cv2.IMREAD_COLOR)
     assert got.shape[:2] == cache.frames[0].shape[:2]
@@ -207,7 +227,7 @@ def test_a_failing_engine_does_not_take_the_renderer_down():
 
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
-    r = Renderer(engine=Broken(), cache=_cache(), ring=ring)
+    r = _renderer(engine=Broken(), cache=_cache(), ring=ring)
     assert r.step(frame_index=0, origin=0.0, fps=24.0) is None   # must not raise
     assert r.failed is True
 
@@ -227,7 +247,7 @@ def test_a_latched_failure_stops_calling_the_engine_rather_than_retrying():
     engine = CountingBroken()
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
-    r = Renderer(engine=engine, cache=_cache(), ring=ring)
+    r = _renderer(engine=engine, cache=_cache(), ring=ring)
     r.step(frame_index=0, origin=0.0, fps=24.0)
     assert engine.calls == 1
     r.step(frame_index=1, origin=0.0, fps=24.0)
@@ -238,7 +258,7 @@ def test_the_driving_clip_cycles_rather_than_running_out():
     engine = FakeEngine()
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
-    r = Renderer(engine=engine, cache=_cache(n=4), ring=ring)
+    r = _renderer(engine=engine, cache=_cache(n=4), ring=ring)
     r.step(frame_index=9, origin=0.0, fps=24.0)
     # Audio frames 9 and 10 land on driving frames 15 and 16 (DISPLAY_LEAD=6), which
     # on a 4-frame clip is 3 then 0. A clamp would give [3, 3] and a missing modulo
@@ -260,7 +280,7 @@ def test_encoding_never_writes_into_a_read_only_cache_or_leaks_a_stale_frame():
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
     cache = _cache_with_distinct_frames(n=16, level=15)
-    r = Renderer(engine=engine, cache=cache, ring=ring)
+    r = _renderer(engine=engine, cache=cache, ring=ring)
 
     pair = _jpegs(r, frame_index=0)
     assert r.failed is False
@@ -293,7 +313,7 @@ def test_the_engine_receives_real_audio_not_silence():
     since they all feed the ring silence too."""
     engine = FakeEngine()
     ring = _distinct_tone_ring()
-    r = Renderer(engine=engine, cache=_cache(n=6), ring=ring)
+    r = _renderer(engine=engine, cache=_cache(n=6), ring=ring)
     r.step(frame_index=8, origin=0.3, fps=24.0)
     assert r.failed is False
     assert np.any(engine.first_windows[0] != 0.0), "the engine should see real audio"
@@ -312,7 +332,7 @@ def test_the_engine_receives_a_window_addressed_by_frame_index_not_the_cycled_cl
     ring = _distinct_tone_ring()
     cache = _cache(n=6)
     for index in (8, 14):                            # 14 % 6 == 8 % 6 == 2
-        r = Renderer(engine=engine, cache=cache, ring=ring)
+        r = _renderer(engine=engine, cache=cache, ring=ring)
         r.step(frame_index=index, origin=0.0, fps=24.0)
         assert r.failed is False
     assert not np.array_equal(engine.first_windows[0], engine.first_windows[1]), (
@@ -330,7 +350,7 @@ def test_the_engine_receives_a_window_addressed_by_the_real_origin():
     ring = _distinct_tone_ring()
     cache = _cache(n=6)
     for origin in (0.0, 0.5):
-        r = Renderer(engine=engine, cache=cache, ring=ring)
+        r = _renderer(engine=engine, cache=cache, ring=ring)
         r.step(frame_index=8, origin=origin, fps=24.0)
         assert r.failed is False
     assert not np.array_equal(engine.first_windows[0], engine.first_windows[1]), (
@@ -467,7 +487,7 @@ def test_encode_actually_restores_detail():
     # driving frame for any texture to be injected now, so a 200 mouth over a 115
     # texture would be suppressed outright and this test would pass for the wrong
     # reason - by comparing two identical composites.
-    r = Renderer(engine=_Mouths([115, 115]), cache=cache, ring=ring)
+    r = _renderer(engine=_Mouths([115, 115]), cache=cache, ring=ring)
     encoded = _jpegs(r, frame_index=0)
 
     got = cv2.imdecode(np.frombuffer(encoded[0], np.uint8), cv2.IMREAD_COLOR)
@@ -501,7 +521,7 @@ def test_a_batch_asks_for_a_different_window_per_frame():
     the shapes match, the step succeeds, and the second frame's mouth is simply
     41.67ms stale."""
     engine = FakeEngine()
-    r = Renderer(engine=engine, cache=_cache(n=6), ring=_distinct_tone_ring())
+    r = _renderer(engine=engine, cache=_cache(n=6), ring=_distinct_tone_ring())
     r.step(frame_index=8, origin=0.0, fps=24.0)
     batch = engine.window_calls[0]
     assert len(batch) == BATCH
@@ -520,7 +540,7 @@ def test_one_step_yields_two_different_frames_in_order():
     engine = FakeEngine()
     ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
     ring.feed(_tone(2000, value=9000), audible_at=0.0)
-    r = Renderer(engine=engine, cache=_cache_with_distinct_frames(), ring=ring)
+    r = _renderer(engine=engine, cache=_cache_with_distinct_frames(), ring=ring)
 
     pair = _jpegs(r, frame_index=0)
 
@@ -538,7 +558,7 @@ def test_consecutive_steps_ask_for_contiguous_pairs():
     ring.feed(_tone(2000, value=9000), audible_at=0.0)
     # n=8, not 6: with a clip exactly DISPLAY_LEAD frames long the lead would cancel
     # out modulo the length and this would pass whether it was applied or not.
-    r = Renderer(engine=engine, cache=_cache(n=8), ring=ring)
+    r = _renderer(engine=engine, cache=_cache(n=8), ring=ring)
 
     r.step(frame_index=0, origin=0.0, fps=24.0)
     assert engine.calls == [[6, 7]]
@@ -558,7 +578,7 @@ def test_the_mouth_is_drawn_on_the_frame_the_page_will_be_showing():
     """
     engine = FakeEngine()
     cache = _cache_with_distinct_frames(n=16, level=15)
-    r = Renderer(engine=engine, cache=cache, ring=_distinct_tone_ring())
+    r = _renderer(engine=engine, cache=cache, ring=_distinct_tone_ring())
 
     pair = _jpegs(r, frame_index=0)
 
@@ -574,10 +594,110 @@ def test_the_mouth_is_drawn_on_the_frame_the_page_will_be_showing():
     # And the audio is still addressed by the audio index: frame 0's window, not
     # frame 6's, or the mouth would be a quarter-second ahead of the sound.
     ring = _distinct_tone_ring()
-    at_audio = Renderer(engine=(e2 := FakeEngine()), cache=cache, ring=ring)
+    at_audio = _renderer(engine=(e2 := FakeEngine()), cache=cache, ring=ring)
     at_audio.step(frame_index=0, origin=0.0, fps=24.0)
     direct = ring.window(frame_index=0, fps=24.0, origin=0.0, context_ms=2000.0)
     assert np.array_equal(e2.window_calls[0][0], direct)
+
+
+def test_the_driving_index_follows_the_clip_clock_and_not_the_turn():
+    """The half of `DISPLAY_LEAD` that stopped being true when the page stopped
+    rewinding.
+
+    The page plays the driving clip on a loop and never seeks it, so a turn that
+    begins 100 seconds into a session begins on whatever frame is up - not on frame 0.
+    A renderer that still counted from the turn would composite onto a frame the page
+    passed a minute and a half ago, which is a whole different pose under a crossfade
+    the owner reported as "a different clip starting".
+
+    Two turns, one clock: the same audio index has to land on a different driving
+    frame, and by exactly the number of frames the clip advanced between them.
+    """
+    cache = _cache(n=1_000_000)          # long enough that nothing here wraps
+    engine = FakeEngine()
+    ring = _distinct_tone_ring(seconds=200.0)
+    r = _renderer(engine=engine, cache=cache, ring=ring)
+
+    r.step(frame_index=0, origin=0.0, fps=24.0)
+    r.step(frame_index=0, origin=100.0, fps=24.0)
+
+    first, second = engine.calls
+    assert first == [DISPLAY_LEAD, DISPLAY_LEAD + 1]
+    assert second == [2400 + DISPLAY_LEAD, 2400 + DISPLAY_LEAD + 1], (
+        "100 seconds of a 24fps clip is 2400 frames; a turn starting there has to be "
+        "drawn there, or the pose under the overlay is the one from a minute ago"
+    )
+
+
+def test_the_audio_index_stays_relative_to_the_turn():
+    """And the other half must NOT move with it.
+
+    `PcmRing.window` measures from `origin`, so audio index 0 is this turn's first
+    audio wherever the clip happens to be. Carrying the clip's offset into the window
+    too would ask the ring for audio 100 seconds before the turn started and get
+    silence back - a mouth that never opens, with nothing raising.
+    """
+    ring = _distinct_tone_ring(seconds=200.0)
+    engine = FakeEngine()
+    r = _renderer(engine=engine, cache=_cache(n=1_000_000), ring=ring)
+
+    r.step(frame_index=0, origin=100.0, fps=24.0)
+
+    direct = ring.window(frame_index=0, fps=24.0, origin=100.0, context_ms=2000.0)
+    assert np.array_equal(engine.window_calls[0][0], direct)
+
+
+def test_the_clip_clock_answers_the_same_instant_in_frames_and_in_seconds():
+    """`index` is what the renderer draws on; `position` is what the page seeks to.
+
+    They are the same clock read in two units, and the page's `<video>` shows the
+    frame containing its `currentTime` - so a position that fell in a different frame
+    from the index would put the overlay on a pose the clip is not holding.
+    """
+    clock = ClipClock(fps=24.0, frames=193, epoch=1000.0)
+
+    assert clock.index(1000.0) == 0
+    assert clock.position(1000.0) == 0.0
+    assert clock.index(1000.0 + 10.5 / 24.0) == 10
+
+    # Sampled across forty wraps rather than at one point: the index runs on and the
+    # position comes back, and the pair has to keep naming the same frame the whole
+    # way. Off a frame boundary on purpose - both sides floor, and a time that lands
+    # exactly on one is decided by the last bit of a float rather than by this code.
+    for tick in range(400):
+        at = 1000.0 + tick * 0.83 + 0.021
+        assert clock.index(at) % 193 == int(clock.position(at) * 24.0)
+
+
+def test_the_turn_is_anchored_to_the_nearest_frame_and_not_the_last_one_passed():
+    """`index` floors and `nearest` rounds, and `Renderer.step` wants the second.
+
+    The turn's start does not land on a frame boundary, and the fraction it lands at is
+    discarded by a floor and never recovered - `step` adds whole frame counts to this,
+    so every frame of the turn inherits it. `round(x) + k` is the right quantisation of
+    `x + k`; `floor(x) + k` is half a frame late on average.
+
+    An arithmetic claim, not a measured one, and `ClipClock.nearest` says why the
+    socket cannot settle it either way.
+
+    Half a frame either side of the boundary, so a floor and a round have to disagree.
+    """
+    clock = ClipClock(fps=24.0, frames=193, epoch=0.0)
+    just_after = 10.4 / 24.0
+    just_before = 10.6 / 24.0
+    assert clock.index(just_after) == 10 and clock.nearest(just_after) == 10
+    assert clock.index(just_before) == 10, "on screen, this is still frame 10"
+    assert clock.nearest(just_before) == 11, "but frame 11 is the one it is closest to"
+
+
+def test_the_clip_clock_never_reports_a_position_outside_the_clip():
+    """A `<video>` seeked past its own duration lands at the end and stops being the
+    frame the renderer drew on. Checked across a wrap rather than at one point."""
+    clock = ClipClock(fps=24.0, frames=193, epoch=0.0)
+    period = 193 / 24.0
+    for tick in range(500):
+        at = tick * 0.37
+        assert 0.0 <= clock.position(at) < period
 
 
 def test_a_latched_failure_stops_both_halves_rather_than_repeating_a_frame():
@@ -591,7 +711,7 @@ def test_a_latched_failure_stops_both_halves_rather_than_repeating_a_frame():
 
     ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
     ring.feed(_tone(2000, value=9000), audible_at=0.0)
-    r = Renderer(engine=Broken(), cache=_cache(n=6), ring=ring)
+    r = _renderer(engine=Broken(), cache=_cache(n=6), ring=ring)
     assert r.step(frame_index=0, origin=0.0, fps=24.0) is None
     assert r.failed is True
     assert r.step(frame_index=1, origin=0.0, fps=24.0) is None
@@ -605,7 +725,7 @@ def test_a_failing_composite_latches_too_rather_than_raising_into_the_thread():
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
     cache = _cache()
-    r = Renderer(engine=engine, cache=cache, ring=ring)
+    r = _renderer(engine=engine, cache=cache, ring=ring)
     step = r.step(frame_index=0, origin=0.0, fps=24.0)
     assert step is not None
     # A degenerate box, the shape a mismatched prepared cache would have: cv2.resize
@@ -735,7 +855,7 @@ def test_a_mouth_is_mixed_with_the_one_before_it():
     cache = _cache()
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
-    r = Renderer(engine=_Mouths([0, 200]), cache=cache, ring=ring)
+    r = _renderer(engine=_Mouths([0, 200]), cache=cache, ring=ring)
     first, second = _encoded_mouth(r, cache, None)
     assert abs(first - 0) < 20, "the first mouth has nothing to mix with"
     # 0.55*200 + 0.45*0 = 110, not 200. JPEG is lossy, so allow room - but nowhere
@@ -749,7 +869,7 @@ def test_the_blend_starts_over_at_a_turn_boundary():
     cache = _cache()
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
-    r = Renderer(engine=_Mouths([0, 0, 200, 200]), cache=cache, ring=ring)
+    r = _renderer(engine=_Mouths([0, 0, 200, 200]), cache=cache, ring=ring)
     _encoded_mouth(r, cache, None, first=0)          # leaves a dark mouth behind
     fresh, _ = _encoded_mouth(r, cache, None, first=90)   # a jump: new turn
     assert abs(fresh - 200) < 20, (
@@ -771,7 +891,7 @@ def test_the_borrowed_texture_is_not_damped_by_the_blend():
     cache.frames[1, BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
-    r = Renderer(engine=_Mouths([0, 200]), cache=cache, ring=ring)
+    r = _renderer(engine=_Mouths([0, 200]), cache=cache, ring=ring)
     step = r.step(frame_index=0, origin=0.0, fps=24.0)
     jpegs = r.encode(step)
     blended = cv2.imdecode(np.frombuffer(jpegs[1], np.uint8), cv2.IMREAD_COLOR)
@@ -828,7 +948,7 @@ def test_the_injection_weight_is_averaged_over_the_utterance():
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
     # Two mouths far apart, so this frame's own weight and the running one differ a lot.
-    r = Renderer(engine=_Mouths([115, 250]), cache=cache, ring=ring)
+    r = _renderer(engine=_Mouths([115, 250]), cache=cache, ring=ring)
     step = r.step(frame_index=0, origin=0.0, fps=24.0)
     r.encode(step)
 
@@ -852,7 +972,7 @@ def test_the_injection_weight_restarts_at_a_turn_boundary():
         cache.frames[k, BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60, amp=18)
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
-    r = Renderer(engine=_Mouths([115, 115]), cache=cache, ring=ring)
+    r = _renderer(engine=_Mouths([115, 115]), cache=cache, ring=ring)
     r.encode(r.step(frame_index=0, origin=0.0, fps=24.0))
 
     far = np.full((256, 256, 3), 250, np.uint8)

@@ -588,20 +588,34 @@ async def test_a_raising_tick_is_logged_rather_than_silently_orphaned(monkeypatc
 # --- the two seams ----------------------------------------------------------
 
 
-def test_the_frames_source_is_exactly_what_the_transport_asks_for():
-    """`face_routes.LipsyncFrames` is four members, and they live on two objects that
-    are deliberately kept apart - `Slot` is `put`/`get` and knows nothing about
-    geometry, `Renderer` knows the geometry and nothing about who reads it. Joining
-    them is assembly, so this is the join.
+async def test_the_frames_source_is_exactly_what_the_transport_asks_for():
+    """`face_routes.LipsyncFrames` is four members, and they live on three objects that
+    are deliberately kept apart - `Slot` is `put`/`get` and knows nothing about who
+    reads it, `Renderer` knows whether it has given up, and `ClipClock` knows only
+    where the driving clip is. Joining them is assembly, so this is the join.
+
+    `async` for `position` alone: it reads `loop.time()`, so a sync test would call it
+    with no running loop and never find out whether the assembly wired the clock in at
+    all - which is the failure this file exists for.
     """
+    from daemon.face_lipsync.render import ClipClock
     from daemon.face_lipsync.ring import Slot
 
     renderer, slot = FakeRenderer(), Slot()
-    frames = _LipsyncFrames(renderer=renderer, slot=slot, clip="idle2")
+    epoch = asyncio.get_running_loop().time()
+    frames = _LipsyncFrames(
+        renderer=renderer,
+        slot=slot,
+        clip="idle2",
+        driver=ClipClock(fps=24.0, frames=193, epoch=epoch - 4.0),
+    )
     assert frames.clip == "idle2"
     assert not hasattr(frames, "box"), (
         "a box here would mean the page is placing a crop again"
     )
+    # Four seconds after the epoch, on the clock this is actually being asked on -
+    # a `position` wired to a different clock, or to none, cannot come out here.
+    assert 4.0 <= frames.position() < 4.2
     assert frames.get() is None
     slot.put(b"jpeg")
     assert frames.get() == b"jpeg"

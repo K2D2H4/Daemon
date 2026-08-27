@@ -15,10 +15,15 @@ look at.
 ## What is real and what is not
 
 Real: `create_app` and its lifespan, `_build_lipsync`, the MLX engine, the prepared
-`idle2` cache, `PcmRing`, `FrameClock`, `Renderer`, `Slot`, uvicorn on a real port,
-`/face/manifest` and `/face/frames` over a real HTTP connection, and `SpeechClock` -
-the same object `daemon/voice/conversation.py` builds, fed with `loop.time()` stamps
-and pumped at 25Hz exactly as `_face_pump` does.
+`idle2` cache, `PcmRing`, `FrameClock`, `ClipClock`, `Renderer`, `Slot`, uvicorn on a
+real port, `/face/manifest` and `/face/frames` over a real HTTP connection, and
+`SpeechClock` - the same object `daemon/voice/conversation.py` builds, fed with
+`loop.time()` stamps and pumped at 25Hz exactly as `_face_pump` does.
+
+The one thing this stands in for is the browser. `Playhead` reproduces the page's own
+playhead arithmetic against the same `/face/manifest` anchor, so "is the mouth on the
+frame the page is showing" is answerable without one - and `--watch` is still there
+because a person looking at a real window is the pass mark and this is not.
 
 Not real: Gemini Live and PortAudio. The audio comes from a wav file instead of a
 socket, and nothing is played out of a speaker. That seam is deliberate and it is the
@@ -251,34 +256,93 @@ def _tell_tale(driving: np.ndarray, crop_boxes: list[Box]) -> Box:
     return at[0], at[1], at[0] + size, at[1] + size
 
 
+class Playhead:
+    """Where `daemon/static/face.html` has its driving clip, at any wall-clock moment.
+
+    The page's own arithmetic, reproduced here on purpose rather than shared: this
+    file measures the page, so a helper imported from the page's own source would only
+    prove the renderer agrees with itself. `/face/manifest` hands over the clip's
+    position once and the page anchors it to its own clock; so does this, at the same
+    instant, over the same loopback connection.
+
+    Anchored ONCE, at construction, and never re-read - which is what makes a drift
+    between the two clocks show up here as a growing lag instead of being quietly
+    corrected away.
+    """
+
+    def __init__(self, *, position: float, at: float, fps: float, frames: int) -> None:
+        self._epoch = at - position
+        self._fps = fps
+        self._period = frames / fps
+
+    def index(self, at: float) -> float:
+        """Frames since the anchor, unwrapped and fractional - the fraction is the
+        point, because a lag of half a frame is a real answer and rounding it away
+        would report a precision this cannot have."""
+        return (at - self._epoch) * self._fps
+
+    def position(self, at: float) -> float:
+        return (at - self._epoch) % self._period
+
+
+async def read_playhead(base_url: str, *, fps: float, frames: int) -> Playhead:
+    """Anchor a `Playhead` off `/face/manifest`, exactly as the page's `boot()` does -
+    stamping the arrival, not the request."""
+    loop = asyncio.get_running_loop()
+    async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as client:
+        manifest = (await client.get("/face/manifest")).json()
+    at = loop.time()
+    return Playhead(
+        position=manifest["lipsync"]["position"], at=at, fps=fps, frames=frames
+    )
+
+
 def report_alignment(
     frames: list[bytes],
     arrivals: list[float],
-    began: float,
     *,
+    page: Playhead,
     cache_dir: Path,
     fps: float,
 ) -> dict:
     """Which driving frame each JPEG carries, against the one the page is showing.
 
-    The page runs the driving clip from frame 0 at 1.0x from the moment `speaking`
-    arrives, and lays the rendered frame over it - so at the 180ms crossfade in
-    `daemon/static/face.html` the two are dissolved into each other. If the renderer
-    is N frames behind the playhead, that dissolve is between two poses N frames
-    apart in the avatar's own motion, and N is what this measures. It is also the
-    audio-to-mouth lag, because a frame's driving index and its audio window index
-    are the same number.
+    The page runs the driving clip at 1.0x and **never rewinds it** - speech begins on
+    the frame that is already up - and lays the rendered frame over it, so at the 180ms
+    crossfade in `daemon/static/face.html` the two are dissolved into each other. If
+    the renderer is N frames off the playhead, that dissolve is between two poses N
+    frames apart in the avatar's own motion, and N is what this measures.
 
-    Two numbers in one, and which one this is depends on
-    `render.py:DISPLAY_LEAD`. With no lead the driving index and the audio index are
-    the same number, so this is both the pose offset and the audio-to-mouth lag. With
-    the lead applied this is the *residual* pose offset - the thing the crossfade
-    dissolves across, and it should read near zero - and the audio lag is this plus
-    `DISPLAY_LEAD`.
+    That "never rewinds" is why this takes a `Playhead` rather than the turn's start.
+    It used to model the page as frame 0 at the moment `speaking` arrived, which was
+    true of the page it was written against and is the exact assumption the owner saw
+    fail: idle rotated between three clips and the driving clip was rewound at every
+    turn, so speech began by swapping the head. Both are gone, and the page is now
+    wherever the daemon's clip clock says (`render.py:ClipClock`) - so this has to ask
+    the same clock, the same way the page does, or it would be measuring the renderer
+    against a page that no longer exists.
+
+    Two numbers in one, and which one this is depends on `render.py:DISPLAY_LEAD`.
+    With no lead the driving index and the audio index are the same number, so this is
+    both the pose offset and the audio-to-mouth lag. With the lead applied this is the
+    *residual* pose offset - the thing the crossfade dissolves across, and it should
+    read near zero - and the audio lag is this plus `DISPLAY_LEAD`.
 
     The frame is identified rather than trusted: `_tell_tale` finds a patch the
     composite never touches, and the driving frame whose patch is closest is the one
     this JPEG was built on.
+
+    **Half a frame is this number's noise floor, and one run cannot tell you otherwise.**
+    Three runs back to back on the same build, same machine, same wav: phase 1 read
+    +0.37, +0.61, +0.41 frames and phase 2 read -0.42, -0.41, -0.71. Nothing about the
+    clocks changed between them. What moves is the pipeline's own latency - this is the
+    arrival time at the socket against the playhead, so it is `DISPLAY_LEAD` (a
+    constant 6) against however long that particular turn actually took, and the first
+    utterance of a run is reliably slower than the second. Read a single reading inside
+    +-0.7 frames as "the two clocks agree", and go looking only if a run leaves that
+    band or if phase 2 walks steadily further from phase 1 across a long session -
+    that second one would be drift, which is the failure this anchoring can actually
+    have.
     """
     import cv2
 
@@ -293,9 +357,9 @@ def report_alignment(
         image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
         patch = image[y1:y2, x1:x2].astype(np.float32).reshape(-1)
         index = int(np.abs(book - patch).mean(axis=1).argmin())
-        # Unwrap the clip's cycle: the page's playhead does not wrap at 193 in one
-        # utterance, but the renderer's index is taken modulo the clip length.
-        elapsed = (at - began) * fps
+        # Unwrap the clip's cycle: the page's playhead runs on, but the renderer's
+        # index is taken modulo the clip length.
+        elapsed = page.index(at)
         cycles = round((elapsed - index) / driving.shape[0])
         lags.append(elapsed - (index + cycles * driving.shape[0]))
     stats = {
@@ -313,30 +377,46 @@ def report_alignment(
     return stats
 
 
+IDLE_MARGIN = 3.0
+"""Seconds of idle `write_video` puts on either side of the utterance.
+
+Not padding. The thing being judged is the HANDOVER - "nothing about the body moves at
+the instant speech begins" - and a video that starts at the first word has cut away the
+half of it that shows whether that is true. Three seconds is long enough for an eye to
+have settled on the pose before it has to notice whether the pose changed.
+"""
+
+
 def write_video(
     out: Path,
     frames: list[bytes],
     arrivals: list[float],
     began: float,
     *,
+    page: Playhead,
     cache_dir: Path,
     fps: float,
     wav: Path | None,
+    margin: float = IDLE_MARGIN,
 ) -> None:
-    """The deliverable: what the page would have shown, as one mp4.
+    """The deliverable: what the page would have shown, as one mp4 - idle, speech, idle.
 
     Built on a wall-clock timeline rather than one frame per received frame, and that
-    is the whole point of it being honest. The page runs the driving clip at 1.0x from
-    the start of the turn and lays whatever crop last arrived over it, so a frame the
-    renderer skipped shows as the previous crop held one frame longer - not as the
-    video running slow. Writing one output frame per received frame would instead
-    stretch a 20fps stream into 24fps of playback and make a mouth that drops frames
-    look like a mouth that is late.
+    is the whole point of it being honest. The page runs the driving clip at 1.0x and
+    lays whatever frame last arrived over it, so a frame the renderer skipped shows as
+    the previous one held a frame longer - not as the video running slow. Writing one
+    output frame per received frame would instead stretch a 20fps stream into 24fps of
+    playback and make a mouth that drops frames look like a mouth that is late.
 
-    So: output frame *t* is the newest RENDERED frame that had arrived by
-    `began + t/fps`, falling back to the driving clip's own frame before the first one
-    lands. The audio muxed underneath starts at `began` too, which is what makes "does
-    the mouth match the sound" a question this file can be wrong about.
+    So: output frame *t* is the newest RENDERED frame that had arrived by that instant,
+    and outside the utterance it is the driving clip at `Playhead.index` - the same
+    free-running playhead the page has, which is what puts the two handovers in this
+    video at the frame they really happen on.
+
+    **The handovers are hard cuts here and the page dissolves them over 180ms.** That
+    is deliberate and it is the stricter test: a dissolve hides a pose mismatch of a
+    few frames, and a cut cannot. If the body moves at either boundary of this video,
+    it moves.
 
     The rendered frame is used whole. An earlier version pasted a crop onto the driving
     frame here, which mirrored a transport that no longer exists - and reproducing that
@@ -350,24 +430,38 @@ def write_video(
     writer = cv2.VideoWriter(
         str(silent), cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height)
     )
-    total = int((arrivals[-1] - began) * fps) + 1
-    nxt, crop = 0, None
+    start = min(began, arrivals[0]) - margin
+    total = int((arrivals[-1] + margin - start) * fps) + 1
+    nxt, rendered = 0, None
     for index in range(total):
-        at = began + index / fps
+        at = start + index / fps
         while nxt < len(arrivals) and arrivals[nxt] <= at:
-            crop = cv2.imdecode(np.frombuffer(frames[nxt], dtype=np.uint8), cv2.IMREAD_COLOR)
+            rendered = cv2.imdecode(
+                np.frombuffer(frames[nxt], dtype=np.uint8), cv2.IMREAD_COLOR
+            )
             nxt += 1
-        writer.write(crop if crop is not None else np.array(driving[index % driving.shape[0]]))
+        # Past the last arrival the overlay comes off and the clip is what is left -
+        # the second handover, and the one where a mismatch is easiest to see because
+        # the mouth stops moving at the same instant.
+        clip = rendered is None or at > arrivals[-1]
+        writer.write(
+            np.array(driving[int(page.index(at)) % driving.shape[0]])
+            if clip
+            else rendered
+        )
     writer.release()
     if wav is None:
         silent.rename(out)
         print(f"  wrote {out} ({len(frames)} frames, no audio track)")
         return
     # Muxed rather than left silent: the judgement being asked for is whether the
-    # mouth matches the sound, and a silent video cannot be wrong about that.
+    # mouth matches the sound, and a silent video cannot be wrong about that. Delayed
+    # by the lead-in, or the sound would start over the idle stretch the lead-in exists
+    # to show.
+    delay = int(max(0.0, began - start) * 1000)
     done = subprocess.run(
         ["ffmpeg", "-y", "-i", str(silent), "-i", str(wav), "-c:v", "copy",
-         "-c:a", "aac", "-shortest", str(out)],
+         "-af", f"adelay={delay}|{delay}", "-c:a", "aac", "-shortest", str(out)],
         capture_output=True,
         check=False,
     )
@@ -376,7 +470,10 @@ def write_video(
         print(f"  wrote {out} (ffmpeg mux failed, video only)")
         return
     silent.unlink()
-    print(f"  wrote {out} ({len(frames)} frames at {fps}fps, audio muxed)")
+    print(
+        f"  wrote {out} ({len(frames)} frames at {fps}fps, audio muxed, "
+        f"{margin}s of idle either side)"
+    )
 
 
 async def main() -> int:
@@ -455,6 +552,11 @@ async def main() -> int:
 
     face = app.state.face
     sink = app.state.face_pcm_sink
+    # Anchored the way the page's boot() anchors, and before anything speaks: from here
+    # on this harness knows where the page's <video> is without ever asking again, which
+    # is what makes a drift between the two clocks visible instead of self-correcting.
+    page = await read_playhead(base, fps=fps, frames=len(json.loads(
+        (clip_dir / "boxes.json").read_text())["boxes"]))
     reader = FrameReader()
     reading = asyncio.create_task(reader.run(base))
     await asyncio.sleep(0.3)
@@ -497,6 +599,8 @@ async def main() -> int:
     await speak(clock, pcm, rate=rate, ahead=args.rate)
     await asyncio.sleep(args.seconds / args.rate + 0.5)
     results.append(report_phase("phase 2", reader, mark, began))
+    phase2_frames = list(reader.frames[mark:])
+    phase2_arrivals = list(reader.arrivals[mark:])
 
     print("\nphase 3 - barge-in: a fresh SpeechClock mid-utterance")
     mark, began = len(reader.frames), loop.time()
@@ -544,10 +648,26 @@ async def main() -> int:
 
     alignment = {}
     if phase1_frames:
+        # Both utterances, and phase 2 is the one that matters most now. The page does
+        # not rewind, so a second turn after an idle gap begins wherever the clip has
+        # run to - which is the case the old "frame 0 at the turn start" model could
+        # not even express. If phase 2 reads worse than phase 1, the two clocks are
+        # drifting apart across the gap between them, and that is the failure mode
+        # this whole anchoring scheme has.
         print("\nthe overlay against the clip the page is playing under it:")
+        print("  phase 1:")
         alignment = report_alignment(
-            phase1_frames, phase1_arrivals, phase1_began, cache_dir=clip_dir, fps=fps
+            phase1_frames, phase1_arrivals, page=page, cache_dir=clip_dir, fps=fps
         )
+        if phase2_frames:
+            print("  phase 2 (a turn boundary, mid-clip):")
+            alignment = {
+                "phase1": alignment,
+                "phase2": report_alignment(
+                    phase2_frames, phase2_arrivals, page=page, cache_dir=clip_dir,
+                    fps=fps,
+                ),
+            }
 
     if phase1_frames:
         print("\nthe thing to look at:")
@@ -556,6 +676,7 @@ async def main() -> int:
             phase1_frames,
             phase1_arrivals,
             phase1_began,
+            page=page,
             cache_dir=clip_dir,
             fps=fps,
             wav=args.wav,

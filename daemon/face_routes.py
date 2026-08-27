@@ -66,10 +66,10 @@ explaining that."""
 
 
 class LipsyncFrames(Protocol):
-    """The lip-sync renderer as `/face/frames` sees it, and nothing more.
+    """The lip-sync renderer as `/face` sees it, and nothing more.
 
-    Three members, because three is what a transport needs once the page stops
-    compositing. `daemon/app.py` builds whatever satisfies this; nothing here knows
+    Four members, because four is what the page needs once it stops compositing AND
+    stops rewinding. `daemon/app.py` builds whatever satisfies this; nothing here knows
     that a model, a driving-clip cache or a PCM ring exist, which is what keeps this
     file free of `daemon.face_lipsync` (CONTRACTS 4) and what lets the tests drive the
     route with a dozen-line fake.
@@ -110,6 +110,20 @@ class LipsyncFrames(Protocol):
         behind the reader is, which is worse than dropping movement. Repeating the
         same bytes between polls is normal rather than a fault: the producer paces one
         frame in here per 41.67ms and this side polls eight times as often.
+        """
+        ...
+
+    def position(self) -> float:
+        """Where the driving clip's playhead is now, in seconds from its start.
+
+        The page plays that clip on a loop and never rewinds it, so speech begins on
+        the frame that is already up rather than on frame 0 - which is the whole
+        reason this member exists. The renderer composites onto the frame IT believes
+        is on screen, so the page has to be showing that frame, and it can only know
+        which one that is by being told once and running from there.
+
+        Seconds, not a frame index, because a `<video>`'s `currentTime` is seconds and
+        the page must not be made to know the clip's frame rate to use this.
         """
         ...
 
@@ -169,20 +183,22 @@ def _lipsync_unavailable(app: Any) -> str:
 
 
 def lipsync_manifest(app: Any) -> dict[str, Any] | bool:
-    """What `/face/manifest` says about lip-sync: False, or where to put the crops.
+    """What `/face/manifest` says about lip-sync: False, or the clip and where it is.
 
     False is the switch, the missing renderer and the failed renderer at once - see
-    `_lipsync`. The geometry rides here rather than on the frames themselves because
-    `<img>` cannot read a multipart part's headers; it is static anyway (`box`), and
-    the page re-asks after every spoken turn, which is what makes the switch a live
-    toggle instead of a restart.
+    `_lipsync`.
+
+    `position` is the page's one and only anchor onto the daemon's clip clock, so it is
+    read here, per request, on the same `loop.time()` the renderer is stepping against
+    - never cached. A value a second old would put the page a second, 24 frames, away
+    from the pose every rendered frame is drawn into.
     """
     source = _lipsync(app)
     if source is None:
         return False
     # No box: the page no longer positions anything, and reporting one it cannot use
     # would be the only remaining trace of the crop transport.
-    return {"clip": source.clip}
+    return {"clip": source.clip, "position": source.position()}
 
 
 def face_dir(settings: Any) -> Path:

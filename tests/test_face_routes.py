@@ -172,9 +172,10 @@ class FakeFrames:
     route works against the one object the layering says it must not depend on.
     """
 
-    def __init__(self, *, clip: str = "idle2") -> None:
+    def __init__(self, *, clip: str = "idle2", position: float = 0.0) -> None:
         self.failed = False
         self.clip = clip
+        self._position = position
         self._frame: bytes | None = None
 
     def put(self, frame: bytes) -> None:
@@ -182,6 +183,11 @@ class FakeFrames:
 
     def get(self) -> bytes | None:
         return self._frame
+
+    def position(self) -> float:
+        """Where the driving clip's playhead is. Fixed here; in production it is a
+        clock, and the page anchors its own `<video>` to whatever this says."""
+        return self._position
 
 
 # Bytes that are not valid UTF-8 and never will be. A frame is binary on a channel
@@ -306,6 +312,7 @@ def test_a_latched_failure_stops_both_surfaces_advertising_a_mouth(app):
     _with_lipsync(app, source)
     assert TestClient(app).get("/face/manifest").json()["lipsync"] == {
         "clip": "idle2",
+        "position": 0.0,
     }
 
     source.failed = True
@@ -317,13 +324,21 @@ def test_a_latched_failure_stops_both_surfaces_advertising_a_mouth(app):
     assert TestClient(app).get("/face/manifest").json()["lipsync"] is False
 
 
-def test_the_manifest_names_the_driving_clip_and_no_geometry(app):
+def test_the_manifest_names_the_driving_clip_and_where_its_playhead_is(app):
     """This used to carry a box for the page to place a crop with. The frames are whole
     composited images now, so there is nothing to place - and a box the page cannot use
-    would be the last trace of the transport that drew a rectangle across the head."""
-    _with_lipsync(app, FakeFrames(clip="idle3"))
+    would be the last trace of the transport that drew a rectangle across the head.
+
+    What it carries instead is the one thing the page genuinely cannot work out for
+    itself: where the driving clip is. The page never rewinds that clip, so speech
+    starts on whatever frame is already up - and the renderer composites onto the frame
+    ITS clock says that is. Without this number the two are anchored to different
+    instants and every rendered mouth lands on a pose the page is not holding, which is
+    the "different clip started" the owner reported.
+    """
+    _with_lipsync(app, FakeFrames(clip="idle3", position=4.25))
     body = TestClient(app).get("/face/manifest").json()
-    assert body["lipsync"] == {"clip": "idle3"}
+    assert body["lipsync"] == {"clip": "idle3", "position": 4.25}
 
 
 async def test_a_quiet_renderer_keeps_the_stream_open_and_sends_no_frame(app):

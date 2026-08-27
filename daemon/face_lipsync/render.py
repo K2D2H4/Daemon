@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 import cv2
@@ -207,6 +208,88 @@ class FrameClock:
         return frame
 
 
+class ClipClock:
+    """Where the driving clip's playhead is, at any moment on the loop's clock.
+
+    **The page never rewinds that clip.** Speech begins on the clip that is already
+    playing, at the position it is already at - which is the whole point, because the
+    alternative is what the owner saw: idle rotates through `idle1/idle2/idle3` and
+    only `idle2` can be lip-synced, so the first word of every reply swapped the head,
+    the pose and the framing, and even an `idle2 -> idle2` handover jumped back to
+    frame 0. Both halves of that are gone (`daemon/static/face.html`), and what
+    replaces them is this: the driving frame on screen is a function of wall time and
+    nothing else.
+
+    So both sides need the same function, and it lives here rather than being written
+    out twice. `index` is what the renderer composites onto; `position` is what the
+    page seeks its `<video>` to, in the `currentTime` units a `<video>` speaks -
+    handed over once through `/face/manifest`, after which the page free-runs on its
+    own playback and re-reads this only where a seek is invisible (behind the opaque
+    overlay, or on the browser-imposed pause `ensurePlaying` already recovers from).
+
+    `at` is `loop.time()`, the same clock `FrameClock` and the audio stamps use, for
+    the same reason: `daemon.clock.now()` here type-checks, runs, and puts the pose an
+    arbitrary offset from the page.
+
+    `epoch` is arbitrary - any fixed instant defines the same clock - and
+    `daemon/app.py` takes it when the renderer is built, so the clip's position is
+    small and readable rather than a monotonic seconds-since-boot remainder.
+    """
+
+    __slots__ = ("_epoch", "_fps", "_period")
+
+    def __init__(self, *, fps: float, frames: int, epoch: float) -> None:
+        self._fps = fps
+        self._epoch = epoch
+        self._period = frames / fps
+
+    def index(self, at: float) -> int:
+        """The driving frame on screen at `at`, unwrapped - `Renderer.encode` takes it
+        modulo the clip length, exactly as it already did with the turn-relative one.
+
+        Floored, not rounded, because that is what a `<video>` does with its own
+        `currentTime`: it shows the frame the instant falls *inside*. Rounding would
+        disagree with the page for half of every frame period. On an exact frame
+        boundary the answer is decided by the last bit of the subtraction rather than
+        by anything here - a 4e-14s residue is enough to floor one frame low - and
+        that is left alone: the pair is only ever as close as `DISPLAY_LEAD` rounds
+        5.81 to 6, and no real instant lands on a boundary.
+        """
+        return math.floor((at - self._epoch) * self._fps)
+
+    def nearest(self, at: float) -> int:
+        """The driving frame CLOSEST to `at`, which is a different question.
+
+        `index` answers "what is on screen", so it floors. `Renderer.step` is asking
+        something else - which frame this turn's audio lines up with - and it then adds
+        whole frame counts to that answer, so a floor there hands every frame of the
+        turn the same discarded fraction: `round(x) + k` is the right quantisation of
+        `x + k`, and `floor(x) + k` is that same value biased half a frame late on
+        average. Arithmetic, not measurement.
+
+        **And it is deliberately not claimed as a measurement, because the measurement
+        cannot see it.** This was changed on a reading of +0.4 to +0.6 frames at the
+        socket that looked like exactly this bias; re-measuring afterwards moved the
+        *other* phase from -0.42 to -0.71, which it could not have if that were the
+        cause. What that reading actually is, over three runs, is in
+        `evals/face_lipsync_live.py:report_alignment` - per-turn pipeline latency,
+        which moves about half a frame on its own. So this stands on being the correct
+        rounding and nothing else; half a frame is well under what the socket can
+        resolve, and the handover measured clean with the floor in place too.
+        """
+        return round((at - self._epoch) * self._fps)
+
+    def position(self, at: float) -> float:
+        """Seconds into the clip at `at`, `0 <= position < frames / fps`.
+
+        The same instant `index` answers for, in the units a `<video>` reads. The two
+        agree by construction because a `<video>` shows the frame containing its
+        `currentTime`, and this clip's `duration` is exactly `frames / fps` (measured
+        in Chrome: 8.041667s against 193/24, to the last digit either reports).
+        """
+        return (at - self._epoch) % self._period
+
+
 WEIGHT_BLEND = 0.25
 """Weight of the current frame in the running average `restore_detail` is handed.
 
@@ -232,9 +315,9 @@ DISPLAY_LEAD = 6
 """How many driving frames AHEAD of its own audio a mouth is composited onto.
 
 Not a fudge factor - it reconciles two clocks on the same clip.
-`daemon/static/face.html` rewinds the driving clip to frame 0 when `speaking` arrives
-and plays it at 1.0x, so at wall time T the page is showing frame
-`(T - turn_start) * fps`. A frame conditioned on the audio at index k cannot reach
+`daemon/static/face.html` plays the driving clip at 1.0x and never rewinds it, so at
+wall time T the page is showing frame `ClipClock.index(T)`. A frame conditioned on the
+audio at index k cannot reach
 the socket before `k/fps + 242ms`: the model's window ends 80ms past its own frame,
 the batch's second frame needs 41.67ms more, and the step and the two JPEGs are
 another 89ms. Measured at the socket over a 9-second utterance, the overlay ran a
@@ -244,27 +327,33 @@ median **5.81 frames (242ms)** behind the page's playhead - first frame 6.35, la
 That matters for the 180ms crossfade the page brings the overlay in on: for 180ms it
 dissolves between two poses of the same avatar a quarter-second apart in its own
 motion. **How big that is depends on where in the clip the handover lands, and the
-average is the wrong number.** The page rewinds to 0, so it always lands in the
-clip's first ten frames, and `idle2` is nearly still there: the 6-frame gap costs
-0.34-0.47 mean|diff| over the whole frame at frames 6-10, against **3.55 averaged
-across the clip and up to 5.65 mid-clip**. So on the shipped avatar the ghost is
-faint in magnitude - and it is still worth removing, for two reasons the mean hides.
+average is the wrong number.** When this was written the page rewound to 0, so the
+handover always landed in the clip's first ten frames, and `idle2` is nearly still
+there: the 6-frame gap cost 0.34-0.47 mean|diff| over the whole frame at frames 6-10,
+against **3.55 averaged across the clip and up to 5.65 mid-clip**. That is why it read
+as faint on the shipped avatar, and it was kept anyway on two arguments the mean hides.
 
-It is **structured**: without the lead, the dissolve's difference from the clip is a
-halo over the forehead, the hairline, the cheeks and the jaw as well as the mouth;
-with it, the difference is the mouth and nothing else (measured 0.27 -> 0.11 mean at
-the midpoint of the fade, and the residue goes from a whole-face haze to the lip box
-alone). A structured error is what an eye reads, not a mean. And it is **insurance
-priced at nothing**: the smallness is a property of one clip's first ten frames,
-which nobody chose for it - a different driving clip, or a turn that begins where the
-page has not rewound, puts the same dissolve somewhere the gap costs 3-5.7 instead of
-0.4.
+The first is that the error is **structured**: without the lead, the dissolve's
+difference from the clip is a halo over the forehead, the hairline, the cheeks and the
+jaw as well as the mouth; with it, the difference is the mouth and nothing else
+(measured 0.27 -> 0.11 mean at the midpoint of the fade, and the residue goes from a
+whole-face haze to the lip box alone). A structured error is what an eye reads, not a
+mean. The second was **insurance priced at nothing** - that the smallness was a
+property of one clip's first ten frames, which nobody chose for it, and that "a turn
+that begins where the page has not rewound puts the same dissolve somewhere the gap
+costs 3-5.7 instead of 0.4."
+
+That sentence is now the ordinary case rather than the hypothetical one. The page
+stopped rewinding, so a turn begins wherever the clip already was, and the insurance
+is the main line: uncorrected, this dissolve would cost 3.55 on average and 5.65 at
+its worst instead of 0.4.
 
 So the audio index and the driving index are two questions, and this answers the
-second: the mouth for audio frame k is generated from, and composited into, driving
-frame `k + DISPLAY_LEAD` - the frame the page will be showing when it arrives.
-MuseTalk pairs any audio with any reference frame (the latent carries the pose, the
-audio carries the phoneme), so the pair is exactly as coherent as before.
+second: the mouth for audio frame k is generated from, and composited into, the
+driving frame the page will be showing when it arrives - `ClipClock.index(origin)`
+plus k, plus this. MuseTalk pairs any audio with any reference frame (the latent
+carries the pose, the audio carries the phoneme), so the pair is exactly as coherent
+as before.
 
 **A constant, and deliberately not `(now - origin) * fps` per step.** The driving
 index has to advance evenly or the head judders, and a wall-clock reading jitters by
@@ -337,10 +426,15 @@ class Renderer:
         engine: LipsyncEngine,
         cache: Cache,
         ring: PcmRing,
+        clip: ClipClock,
     ) -> None:
         self._engine = engine
         self._cache = cache
         self._ring = ring
+        self._clip = clip
+        """Where the page's own playhead is. Required rather than defaulted, because
+        the default that would read naturally - "the turn starts at frame 0" - is
+        exactly the assumption this stopped being able to make."""
         self._buffer = np.empty_like(cache.frames[0])
         self._previous: np.ndarray | None = None
         """Last mouth encoded, for `MOTION_BLEND`. float32, the model's own 256."""
@@ -378,7 +472,16 @@ class Renderer:
             # The window is addressed by the audio index and the reference frame by the
             # display index. One number answered both until DISPLAY_LEAD, which is why
             # the page was dissolving between two poses a quarter-second apart.
-            shown = [index + DISPLAY_LEAD for index in audio]
+            #
+            # The audio index stays turn-relative because it has to: `PcmRing.window`
+            # measures from `origin`, so index 0 IS the first audio of this turn. The
+            # display index cannot be, because the clip it indexes never restarted -
+            # so it is taken from the clock the page is following, anchored at this
+            # turn's origin. `index(origin) + k` and `index(origin + k/fps)` are the
+            # same integer, which is why one reading of the clock per step is enough
+            # and the pair still advances by exactly one frame.
+            began = self._clip.nearest(origin)
+            shown = [began + index + DISPLAY_LEAD for index in audio]
             return Step(
                 indices=shown,
                 mouths=self._engine.mouths(windows, [index % n for index in shown]),

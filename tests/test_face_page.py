@@ -255,6 +255,120 @@ def test_a_dead_mouth_falls_back_to_the_v1_speaking_clip():
     )
 
 
+def test_idle_does_not_rotate_while_lip_sync_is_alive():
+    """The owner's report, in one line of code.
+
+    `clipFor("idle")` picked at random out of idle1/idle2/idle3 and `clipFor("speaking")`
+    could only ever answer `mouthClip` (idle2), so four times in five the first word of
+    a reply crossfaded to a different head, a different pose and a different framing.
+    "그냥 새로운 클립이 재생되는 느낌" was not a feeling about the render - a new clip
+    was being played.
+
+    Pinned inside the idle branch, comments stripped, so the prose above the code
+    cannot satisfy it. And the branch has to keep its rotation underneath: a renderer
+    that dies mid-session leaves `mouthReady()` false, and idle going back to three
+    clips is the v1 face rather than a degraded one.
+    """
+    start = PAGE.index('if (act === "idle")')
+    branch = _without_line_comments(PAGE[start : PAGE.index("\n  }\n", start)])
+    assert "mouthReady()" in branch and "return mouthClip" in branch, (
+        "while lip-sync drives a clip, idle has to BE that clip - anything else means "
+        "speech begins by swapping the head"
+    )
+    assert "IDLES" in branch and "Math.random" in branch, (
+        "and the rotation must still be there for a dead or absent renderer"
+    )
+
+    # The rotation used to be what ended an idle clip: show() left `loop` off for idle
+    # so `ended` fired and advance() picked another. With nothing on the other side of
+    # that `ended`, leaving it off parks the face on the last frame for good.
+    body = _without_line_comments(_body("function loops(act) {"))
+    assert 'act !== "idle"' in body and "mouthReady()" in body
+
+
+def test_speech_begins_on_the_clip_that_is_already_playing():
+    """The second half of the same report, and the one a matching clip still had.
+
+    `toActivity` used to rewind the driving clip to frame 0 on `speaking`, because the
+    renderer indexed that clip from 0 at every turn. So even idle2 -> idle2 - the one
+    case where nothing needed to change - threw the playhead back to the top, which is
+    a pose jump on its own. The renderer follows the page's free-running playhead now
+    (`render.py:ClipClock`), so there is nothing left to move and `show()`'s own
+    `next === showing` guard makes the whole handover a no-op.
+    """
+    body = _body("function toActivity(act) {")
+    assert not re.search(r"currentTime\s*=[^=]", body), (
+        "moving a playhead here is the pose jump this was reported as; the driving "
+        "clip's is the daemon's, not this function's. Reading one is fine and the "
+        "WAIT_MS window does - what must not come back is an assignment"
+    )
+
+    # show() still rewinds a clip it is genuinely switching TO - that one has no
+    # position of its own - but must not rewind the driving clip, which does.
+    body = _body("function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {")
+    assert "isDriver(stem) ? driverAt() : 0" in body, (
+        "an ordinary clip starts at 0; the driving clip starts wherever the daemon's "
+        "clock says it is, or the pose under the overlay is not the pose it was drawn "
+        "for"
+    )
+
+
+def test_the_page_follows_the_daemons_clip_clock_rather_than_its_own():
+    """Which frame the page is showing has one answer and the daemon owns it.
+
+    It has to: the renderer needs that answer for a quarter-second in the FUTURE
+    (`render.py:DISPLAY_LEAD`), which only a clock can give, and this page has no
+    channel back to be asked on. So `/face/manifest` hands the position over once and
+    the page anchors it to its own `performance.now()`.
+
+    The stamp has to be taken when the manifest ARRIVES. Priming a dozen clips takes
+    hundreds of milliseconds, and anchoring after them would put the page that many
+    frames away from every pose the renderer draws into.
+    """
+    body = _body("async function boot() {")
+    manifest_at = body.index("manifestAt = performance.now()")
+    assert manifest_at < body.index("prime"), (
+        "the position is as of the response, so it has to be stamped before priming, "
+        "not after it"
+    )
+    assert "driverEpoch = manifestAt - (ls.position || 0)" in body, (
+        "the anchor is the manifest's position against the page's own clock"
+    )
+
+    # And the one thing measured to move the <video> off that clock has to put it
+    # back: between pauses a playing clip holds to performance.now() within 0.002
+    # frames over 8s, and every pause costs 0.2-0.4 frames that never return.
+    heal = _body("function ensurePlaying() {")
+    assert "isDriver" in heal and "driverAt()" in heal, (
+        "resuming a clip that is a quarter-second behind the pose the renderer is "
+        "drawing into is a backgrounded tab coming back with the mouth on the wrong face"
+    )
+
+
+def test_the_overlay_waits_for_a_frame_belonging_to_this_turn():
+    """`speaking` arrives at once; this turn's first rendered frame cannot for ~250ms.
+
+    Whatever is on the canvas in between belongs to the LAST utterance - a pose from
+    wherever that sentence ended - and fading it in is the same "a different clip
+    started" by another route. So the overlay is gated on a frame having arrived, and
+    the queue is dropped at the boundary so the frame that lifts the gate is this
+    turn's rather than the last one's leftovers.
+    """
+    assert "function mouthLive() { return mouthReady() && mouthFresh; }" in PAGE
+
+    turn = _body("function toActivity(act) {")
+    assert "mouthFresh = false" in turn and "mouthQueue.shift().close()" in turn, (
+        "a turn boundary has to reset the gate AND drop the last turn's frames, or "
+        "the gate is lifted by a mouth for a sentence that has finished"
+    )
+
+    # Lifted from the decode callback and not from presentMouth(), because rAF stops
+    # outright in an occluded window and a microtask does not - the same split
+    # test_the_crop_is_not_taken_off_the_screen_by_rAF pins from the other side.
+    decode = _body("function decodeFrame(bytes) {")
+    assert "mouthFresh = true" in decode and "refreshMouth()" in decode
+
+
 def test_the_driving_clip_is_never_rate_modulated():
     # v1's mouth IS playbackRate (spec 3.4). Left on while lip-sync drives the clip it
     # slides the pose under the crop away from the pose the renderer composited into
