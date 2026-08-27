@@ -17,6 +17,7 @@ from daemon.face_lipsync.render import (
     MOTION_BLEND,
     FrameClock,
     Renderer,
+    detail_weight,
     restore_detail,
 )
 from daemon.face_lipsync.ring import PcmRing
@@ -63,6 +64,16 @@ class FakeEngine:
     def first_windows(self):
         """The first window of each batch - what the old `audio_calls` meant."""
         return [batch[0] for batch in self.window_calls]
+
+
+def _restored(mouth, frame, box, **kw):
+    """`restore_detail` as the renderer calls it: with this frame's own weight.
+
+    The renderer hands it a weight averaged over the utterance instead - that
+    smoothing is its own behaviour and has its own test. Everything here is about
+    what the injection does to one frame.
+    """
+    return restore_detail(mouth, frame, box, detail_weight(mouth, frame, box), **kw)
 
 
 def _cache(n=4):
@@ -358,14 +369,14 @@ def test_restore_detail_is_a_noop_on_a_flat_frame():
     version of the mouth, exactly the mouth."""
     frame = np.full((200, 160, 3), 90, np.uint8)
     mouth = np.full((120, 60, 3), 200, np.uint8)
-    assert np.array_equal(restore_detail(mouth, frame, BOX), mouth)
+    assert np.array_equal(_restored(mouth, frame, BOX), mouth)
 
 
 def test_restore_detail_adds_the_frames_texture():
     frame = np.zeros((200, 160, 3), np.uint8)
     frame[BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
     mouth = np.full((120, 60, 3), 128, np.uint8)
-    out = restore_detail(mouth, frame, BOX)
+    out = _restored(mouth, frame, BOX)
     assert _lap(out) > _lap(mouth) * 10
 
 
@@ -376,7 +387,7 @@ def test_restore_detail_does_not_wrap_around_uint8():
     frame = np.zeros((200, 160, 3), np.uint8)
     frame[BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
     for level in (0, 255):
-        out = restore_detail(np.full((120, 60, 3), level, np.uint8), frame, BOX)
+        out = _restored(np.full((120, 60, 3), level, np.uint8), frame, BOX)
         assert out.min() >= 0 and out.max() <= 255
         if level == 255:
             assert out.max() == 255          # clipped, not wrapped to near-zero
@@ -388,7 +399,7 @@ def test_restore_detail_preserves_shape_and_dtype():
     frame = np.zeros((200, 160, 3), np.uint8)
     frame[BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
     mouth = np.full((120, 60, 3), 128, np.uint8)
-    out = restore_detail(mouth, frame, BOX)
+    out = _restored(mouth, frame, BOX)
     assert out.shape == mouth.shape and out.dtype == np.uint8
 
 
@@ -412,7 +423,7 @@ def _frame_with_dot(at, value=160):
 def test_restore_detail_puts_the_texture_where_it_came_from():
     """Reads `box`, aligned. A region shifted by even a few pixels moves the dot."""
     at = (30, 15)
-    out = restore_detail(np.full((120, 60, 3), 128, np.uint8), _frame_with_dot(at), BOX)
+    out = _restored(np.full((120, 60, 3), 128, np.uint8), _frame_with_dot(at), BOX)
     gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
     assert np.unravel_index(int(gray.argmax()), gray.shape) == at
 
@@ -423,9 +434,9 @@ def test_restore_detail_adds_the_residual_and_does_not_subtract_it():
     measure looking fine."""
     at = (30, 15)
     flat = np.full((120, 60, 3), 128, np.uint8)
-    out = restore_detail(flat, _frame_with_dot(at), BOX)
+    out = _restored(flat, _frame_with_dot(at), BOX)
     assert int(out[at][0]) > 128
-    dark = restore_detail(flat, _frame_with_dot(at, value=96), BOX)
+    dark = _restored(flat, _frame_with_dot(at, value=96), BOX)
     assert int(dark[at][0]) < 128
 
 
@@ -436,10 +447,10 @@ def test_larger_sigma_transfers_more():
     frame[BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
     mouth = np.full((120, 60, 3), 128, np.uint8)
     small = np.abs(
-        restore_detail(mouth, frame, BOX, sigma=0.6).astype(int) - 128
+        _restored(mouth, frame, BOX, sigma=0.6).astype(int) - 128
     ).mean()
     large = np.abs(
-        restore_detail(mouth, frame, BOX, sigma=3.0).astype(int) - 128
+        _restored(mouth, frame, BOX, sigma=3.0).astype(int) - 128
     ).mean()
     assert large > small
 
@@ -464,7 +475,7 @@ def test_encode_actually_restores_detail():
     plain = composite(cache.frames[shown], flat, BOX, CROP_BOX, cache.masks[shown])
     restored = composite(
         cache.frames[shown],
-        restore_detail(flat, cache.frames[shown], BOX),
+        _restored(flat, cache.frames[shown], BOX),
         BOX,
         CROP_BOX,
         cache.masks[shown],
@@ -769,7 +780,7 @@ def test_the_borrowed_texture_is_not_damped_by_the_blend():
     i = step.indices[1] % len(cache.boxes)
     want = composite(
         cache.frames[i],
-        restore_detail(flat, cache.frames[i], BOX),
+        _restored(flat, cache.frames[i], BOX),
         BOX,
         CROP_BOX,
         cache.masks[i],
@@ -797,11 +808,55 @@ def test_the_texture_is_suppressed_where_the_mouth_has_moved_away():
     agrees = np.full((120, 60, 3), 115, np.uint8)      # the texture's own mean
     differs = np.full((120, 60, 3), 250, np.uint8)     # an open mouth over a closed one
 
-    kept = restore_detail(agrees, frame, BOX)
+    kept = _restored(agrees, frame, BOX)
     assert _lap(kept) > _lap(agrees) * 10, "texture must flow where the two agree"
 
-    dropped = restore_detail(differs, frame, BOX)
+    dropped = _restored(differs, frame, BOX)
     assert np.array_equal(dropped, differs), (
         "a mouth this far from the driving frame must get no borrowed texture at all - "
         "that texture is a picture of a different mouth"
+    )
+
+
+def test_the_injection_weight_is_averaged_over_the_utterance():
+    """Recomputed per frame, the borrowed texture's strength moves every frame - a
+    spatial operation modulated at frame rate, which the owner read as a vibration in
+    its own right and ranked below the smoothed version."""
+    cache = _cache()
+    for k in range(len(cache.boxes)):
+        cache.frames[k, BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60, amp=18)
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
+    ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
+    # Two mouths far apart, so this frame's own weight and the running one differ a lot.
+    r = Renderer(engine=_Mouths([115, 250]), cache=cache, ring=ring)
+    step = r.step(frame_index=0, origin=0.0, fps=24.0)
+    r.encode(step)
+
+    second = step.mouths[1]
+    i = step.indices[1] % len(cache.boxes)
+    alone = detail_weight(second, cache.frames[i], cache.boxes[i])
+    running = r._weight(second, i, step.indices[1] + 1)
+    assert not np.allclose(running, alone), (
+        "the second frame's weight must carry the first frame's, not be recomputed"
+    )
+    assert running.mean() > alone.mean(), (
+        "a mouth that has just moved away should still be carrying the weight from "
+        "when it had not"
+    )
+
+
+def test_the_injection_weight_restarts_at_a_turn_boundary():
+    """Averaged over one utterance, like the motion blend - not across the gap."""
+    cache = _cache()
+    for k in range(len(cache.boxes)):
+        cache.frames[k, BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60, amp=18)
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
+    ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
+    r = Renderer(engine=_Mouths([115, 115]), cache=cache, ring=ring)
+    r.encode(r.step(frame_index=0, origin=0.0, fps=24.0))
+
+    far = np.full((256, 256, 3), 250, np.uint8)
+    fresh = r._weight(far, 0, 900)          # a jump: new turn
+    assert np.allclose(fresh, detail_weight(far, cache.frames[0], cache.boxes[0])), (
+        "a new turn must not inherit the previous utterance's weight"
     )

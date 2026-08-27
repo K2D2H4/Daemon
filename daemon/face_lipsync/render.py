@@ -55,6 +55,7 @@ def restore_detail(
     mouth: np.ndarray,
     frame: np.ndarray,
     box: tuple[int, int, int, int],
+    weight: np.ndarray,
     sigma: float = DETAIL_SIGMA,
 ) -> np.ndarray:
     """Add the driving frame's fine texture back onto a generated mouth.
@@ -86,14 +87,32 @@ def restore_detail(
     they do not. The owner ranked it least-ghosting of three arms and read its
     sharpness as unchanged.
 
+    **`weight` is passed in rather than derived here, and that is not tidiness.** A
+    version of this recomputed it from the current frame alone, so the strength of the
+    borrowed texture pulsed at frame rate - a spatial operation modulated every frame,
+    which is a vibration source in its own right. The owner picked the smoothed one
+    over it. `Renderer` keeps that average; `detail_weight` computes one frame's.
+
     `mouth` must already be `box`-sized, as `composite` requires.
     """
     x1, y1, x2, y2 = box
     orig = frame[y1:y2, x1:x2].astype(np.float32)
     high = orig - cv2.GaussianBlur(orig, (0, 0), sigma)
-    disagreement = np.abs(mouth.astype(np.float32) - orig).mean(axis=2)
-    weight = np.clip(1.0 - disagreement / DETAIL_CUTOFF, 0.0, 1.0)[..., None]
-    return np.clip(mouth.astype(np.float32) + high * weight, 0, 255).astype(np.uint8)
+    scaled = cv2.resize(weight, (x2 - x1, y2 - y1))[..., None]
+    return np.clip(mouth.astype(np.float32) + high * scaled, 0, 255).astype(np.uint8)
+
+
+def detail_weight(mouth: np.ndarray, frame: np.ndarray, box: tuple[int, int, int, int]):
+    """How much borrowed texture each pixel may take, at the model's own 256.
+
+    At 256 and not at `box` on purpose: the box breathes with the face (608-726px
+    across one clip), and a map that changes size every frame cannot be averaged with
+    the one before it. This one can, which is what `Renderer` does with it.
+    """
+    x1, y1, x2, y2 = box
+    small = cv2.resize(frame[y1:y2, x1:x2], (256, 256)).astype(np.float32)
+    disagreement = np.abs(cv2.resize(mouth, (256, 256)).astype(np.float32) - small)
+    return np.clip(1.0 - disagreement.mean(axis=2) / DETAIL_CUTOFF, 0.0, 1.0)
 
 
 DETAIL_CUTOFF = 40.0
@@ -187,6 +206,14 @@ class FrameClock:
         self._frame += 1
         return frame
 
+
+WEIGHT_BLEND = 0.25
+"""Weight of the current frame in the running average `restore_detail` is handed.
+
+Lower than `MOTION_BLEND` on purpose. This is not smoothing the picture - it is
+smoothing how strongly a texture is applied to it, and that strength has no business
+changing at frame rate. Where the mouth is, and where it is not, moves slowly.
+"""
 
 MOTION_BLEND = 0.55
 """Weight of the new mouth against the one before it, applied before `restore_detail`.
@@ -317,6 +344,12 @@ class Renderer:
         self._buffer = np.empty_like(cache.frames[0])
         self._previous: np.ndarray | None = None
         """Last mouth encoded, for `MOTION_BLEND`. float32, the model's own 256."""
+        self._smoothed: np.ndarray | None = None
+        """Running average of the injection weight - see `restore_detail`."""
+        self._weight_at = -1
+        """Continuity marker for `_smoothed`, separate from `_continues_at` on purpose:
+        `_blend` runs first and advances that one, so sharing it made this reset on
+        every frame and the average never accumulated at all."""
         self._continues_at = -1
         """The display index the next mouth must carry to count as continuous. A turn
         restarts at 0, so a jump here is a turn boundary and the blend starts over
@@ -355,6 +388,28 @@ class Renderer:
             self.failed = True
             return None
 
+    def _weight(self, mouth: np.ndarray, clip_index: int, index: int) -> np.ndarray:
+        """This frame's injection weight, averaged with the frames before it.
+
+        Averaged because the un-averaged version pulsed: recomputed per frame, the
+        borrowed texture's strength moved every frame and the owner read that as a
+        vibration. Held at 256 so the average is possible at all - the box the texture
+        lands in changes size frame to frame, this does not.
+
+        Restarts with `_blend` on a turn boundary: the average is over one utterance.
+        """
+        current = detail_weight(
+            mouth, self._cache.frames[clip_index], self._cache.boxes[clip_index]
+        )
+        if self._smoothed is None or index != self._weight_at:
+            self._smoothed = current
+        else:
+            self._smoothed = (
+                WEIGHT_BLEND * current + (1.0 - WEIGHT_BLEND) * self._smoothed
+            )
+        self._weight_at = index + 1
+        return self._smoothed
+
     def _blend(self, mouth: np.ndarray, index: int) -> np.ndarray:
         """Mix `mouth` with the one before it, `MOTION_BLEND` of the new one.
 
@@ -385,7 +440,9 @@ class Renderer:
                 x1, y1, x2, y2 = box
                 blended = self._blend(mouth, index)
                 sized = cv2.resize(blended, (x2 - x1, y2 - y1))
-                sized = restore_detail(sized, self._cache.frames[i], box)
+                sized = restore_detail(
+                    sized, self._cache.frames[i], box, self._weight(blended, i, index)
+                )
                 out = composite(
                     self._cache.frames[i],
                     sized,
