@@ -20,6 +20,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `face_mood_tag_spike.py` | spec open question 4 — does the configured provider actually attach a leading `[mood:...]` tag, reliably and well-formed, under a candidate persona instruction nothing in this codebase ships yet |
 | `face_lipsync_prepare.py` | the offline preprocessing step — one driving mp4 in, the cache `daemon/face_lipsync` reads at runtime out. Apple Vision for the landmarks; still needs torch and a MuseTalk checkout for the VAE and the BiSeNet mask, which are deliberately not daemon dependencies |
 | `face_lipsync_live.py` | whether the *assembled* daemon puts a mouth on a real socket — `create_app` + the MLX engine + the prepared cache + uvicorn + `/face/frames`, driven by a wav through the real `SpeechClock`. Writes an mp4 to look at, because the pass mark is a person looking at it |
+| `face_lipsync_idle_spike.py` | whether the idle mouth should be pre-rendered too, so the switch to speech carries no quality step — **no**, and not because of sharpness: over 88 conditioning windows including digital zero, this engine never renders `idle2`'s sealed resting mouth, it parts the lips and shows teeth |
 | `face_lipsync_numerics.py` | whether the product loader keeps real MLX weights in MLX layout — not whether the model runs, which it never does here — the published weights are diffusers-keyed but MLX-laid-out, and a second transpose is silent |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
@@ -300,6 +301,62 @@ Four things worth knowing before trusting the output:
 and this does not reach that. The VAE is not the blocker — `FaceParsing` (BiSeNet plus a
 torchvision transform) is, and nothing here replaces it. Porting sd-vae's encoder to MLX
 would drop `diffusers` and a 335MB download and leave torch exactly where it is.
+
+## face_lipsync_idle_spike.py
+
+```bash
+python3 -m evals.face_lipsync_idle_spike --data-dir ~/Daemon/data \
+    --wav ~/spikes/musetalk-stage1/in/ko_24k.wav
+```
+
+Needs the weights and a prepared clip cache; never in CI. It renders the whole driving
+clip four times — digital zero, synthetic room tone at −60 and −40 dBFS, and real
+speech — through the real `MlxEngine` and the real `Renderer`, so `restore_detail`, the
+composite and the q85 JPEG are all in the path, and every number is taken on the
+JPEG-decoded frame because that is what the page shows.
+
+The proposal was the owner's and it was the right shape: while idle the page plays the
+raw driving clip, so the instant speech starts a real mouth becomes a generated one in
+one frame. Composite the idle mouth as well and the switch has nothing to give away.
+Silence is deterministic and the clip is a fixed loop, so it can be rendered once,
+offline, at prepare time — no model runs while idle, which spec §7 requires.
+
+**As arithmetic it worked.** Measured 2026-08-27 on `idle2`, on the pixels the paste
+actually rewrites, medians of mean|diff| per frame: the step at the switch is **9.03
+today and would be 4.47**, against **1.88** for one frame of the clip's own motion. It
+halves a jump of 4.8× ordinary motion down to 2.4×.
+
+**It is what it pays for the resting face that kills it.** Over **88** conditioning
+windows — digital zero, both room tones, and 85 windows of real Korean speech — every
+one renders the clip's sealed resting frames with the lips **parted and a sliver of
+teeth showing**. Not one closed the mouth. `idle2` is mostly at rest (frames 104–192 are
+a continuous sealed stretch), so a pre-rendered idle leaves the avatar sitting
+mouth-open the whole time the daemon is not speaking. Looked at, at the size the page
+actually shows, it is not subtle and it is not a sharpness question: the composed,
+faintly smiling resting face becomes a slack one. So the discontinuity would be traded
+for a permanently degraded resting face. **Not built** —
+`evals/face_lipsync_prepare.py` is unchanged and writes no idle frames.
+
+Two measurement traps it had to get past, both of which this project has fallen into
+before:
+
+- **A ratio over a wide box lies.** The blend region is 319×319 and the paste copies
+  most of it back from the original unchanged, so the same generated mouth reads
+  **99.6%** of the original's sharpness there and **56%** over the derived 94×65 lip
+  box. A published 87% for this feature was diluted the same way and its tight box gave
+  48%. `lip_box` derives the box from the renders instead of carrying a constant.
+- **A Laplacian across two mouth poses is not a comparison.** Over all frames the speech
+  render reads 99.2% against the silence render's 78.0%, which looks like silence being
+  the problem and is not — an open mouth has a dark interior and teeth, so it has more
+  contrast to measure. Paired by pose the two are the same thing, **58.6% and 56.0%**.
+  That is the one part of the premise that held: a silence-rendered mouth does not sit
+  *between* the original and the speaking render, it sits *on top of* the speaking
+  render. If the resting pose were right, the switch would carry no quality step at all.
+
+What is not ruled out, and all three are the owner's call: making the engine hold a
+sealed mouth on this avatar (a model question, not a preprocessing one), accepting the
+step and shortening the crossfade, or driving idle from a clip whose mouth is never
+sealed so there is no resting pose to lose.
 
 ## Common changes
 
