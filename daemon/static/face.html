@@ -30,6 +30,12 @@
      And "throttles" is generous: in an occluded window rAF stops outright, measured
      while building the lip-sync overlay. Anything whose LATENESS is a defect rather
      than a cosmetic lag therefore cannot live in tick() - see refreshMouth().
+     The lip-synced frames themselves DO present from tick(), and that is not a
+     contradiction: a late frame there is a cosmetic lag over a window nobody is
+     looking at, and rAF stopping only holds the last frame that was already up.
+     What must never wait on rAF is the mouth going AWAY, which is still
+     event-driven. See presentMouth() and refreshMouth(), which are separate for
+     exactly this reason.
 -->
 <style>
   :root { --bg: #19191B; }
@@ -46,7 +52,11 @@
      replaces, so there is nothing to position and nothing to line up. Two earlier
      versions of this laid a crop of the mouth over the playing clip and both drew a
      visible rectangle - a JPEG has no alpha, so its edge is hard however small it is,
-     and the clip underneath is never on the frame the renderer drew. */
+     and the clip underneath is never on the frame the renderer drew.
+     A <canvas>, not an <img>, for the reason presentMouth() gives - and object-fit
+     applies to it identically (verified in Chrome: a 1080x1620 canvas letterboxes
+     into a 900x1000 box at 666px wide, against 667px of arithmetic), so this is the
+     same geometry the <img> had and there is still nothing to line up. */
   #mouth {
     position: fixed; inset: 0; width: 100%; height: 100%;
     object-fit: contain; opacity: 0; transition: opacity 180ms linear;
@@ -64,7 +74,7 @@
 </style>
 
 <div id="stage"></div>
-<img id="mouth" alt="" draggable="false">
+<canvas id="mouth"></canvas>
 <div id="hint" hidden></div>
 
 <script>
@@ -105,6 +115,40 @@ const MOUTH_STALE_MS = 250;   // How long the last lip-sync frame stays believab
                                // clears that; much longer and a renderer that latched
                                // failed mid-sentence reads as a frozen face, which is
                                // the exact thing the fallback exists to prevent.
+const MOUTH_PERIOD_MS = 1000 / 24;  // The renderer's own frame period, and so the rate
+                               // presentMouth() puts frames up at. NOT a running
+                               // estimate of the rate they ARRIVE at: they arrive at
+                               // 23.5-24.0fps and wander, and a clock that chased that
+                               // came out worse (65.4% of frames on the modal dwell
+                               // against 81.7% - simulated over real arrival stamps,
+                               // so treat the gap as the finding and not the figures).
+                               // The reason is not about the source at all: 41.67ms is
+                               // a whole number of refreshes at 120Hz and 2.5 at 60Hz,
+                               // and either repeating pattern reads better than a
+                               // period that beats against the display.
+const MOUTH_CATCH_UP = 2;     // Queue depth presentMouth() will hold before it stops
+                               // waiting for the slot and presents on every tick until
+                               // it is level again. Measured, and the difference
+                               // between a fix and half of one. At 1, a burst of two
+                               // frames inside one slot forced the second out early
+                               // immediately - 42% of frames went up ahead of their
+                               // slot, and the page landed at 51% on the modal dwell
+                               // with 25% of pairs changing duration and a worst dwell
+                               // of 82ms, barely better than the <img> it replaced. At
+                               // 2 a burst pair is absorbed and only a real backlog
+                               // moves the clock: 72.5%, 13.6%, and 51ms.
+                               // Holding an early frame is not added lag, it is the
+                               // correction: the renderer draws for AUDIBLE time, so a
+                               // frame that arrived early is a frame that would have
+                               // led the sound. 3 was tried and the run was void - the
+                               // machine was loaded and the renderer itself fell to
+                               // 15fps - so 2 is where the evidence actually reaches.
+const MOUTH_QUEUE_MAX = 4;    // Decoded frames held at once. A bound, not a buffer:
+                               // presentMouth() drains one per period and the queue
+                               // sits around MOUTH_CATCH_UP, but rAF STOPS in an
+                               // occluded window while the socket keeps delivering,
+                               // and an ImageBitmap of a 1080x1620 frame is ~7MB.
+                               // Four caps that at 28MB.
 
 // activity -> clip, with the fallback chain from spec §3.7 applied at load time.
 const FOR_ACTIVITY = {
@@ -144,6 +188,13 @@ let queuedActivity = null;    // spec 3.6: a non-speaking activity change held u
 let mouthClip = null;         // driving clip stem from /face/manifest; null = no lip-sync
 let mouthDead = false;        // the frame stream is not coming back: revert to v1
 let mouthShown = false;       // last opacity written, so refreshMouth writes on change
+let mouthCtx = null;          // #mouth's 2d context, taken once on the first frame
+let mouthQueue = [];          // decoded frames waiting for a slot, oldest first
+let mouthDueAt = 0;           // earliest time the next frame may go up (presentMouth)
+let mouthSeq = 0;             // frames handed to the decoder, in arrival order
+let mouthQueuedSeq = 0;       // highest one that reached the queue, so a decode that
+                               // finishes out of order is dropped rather than shown
+                               // after the frame that overtook it
 
 // --- lip-sync mouth: is it this page's speaking path, and is it live? -------
 // Two questions, not one. `mouthReady` decides which clip plays *under* the crop and
@@ -253,23 +304,146 @@ function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {
   });
 }
 
-// --- LIP-SYNC OVERLAY -------------------------------------------------------
+// --- LIP-SYNC OVERLAY: arrival and presentation are two clocks --------------
+// Measured on the assembled stack in a real browser, 120Hz display, and this is the
+// whole reason the transport below is not one line of `mouth.src = "/face/frames"`
+// any more. An <img> fed multipart/x-mixed-replace repaints whenever a PART ARRIVES,
+// and arrival is a socket event: median gap 43.1ms but p90 61.4ms, a quarter of the
+// gaps under 25ms and a quarter over 60ms. The average rate was right - 23.8fps on
+// screen - and the screen was not. 37.4% of frames changed duration by a whole 17ms
+// from the frame before them, and 21% sat there longer than a source frame lasts, up
+// to 83ms. The <video> the page plays at idle never exceeded 41.7ms once, 79.3% of
+// its frames sitting for exactly one source period. Same rate, different regularity,
+// and irregular presentation is what reads as a dropped frame rate - which is exactly
+// what the switch into speech was reported as.
+//
+// So the two clocks are separated: the socket fills a queue, and tick() - which runs
+// on the compositor's own clock - puts ONE frame up per MOUTH_PERIOD_MS. Measured the
+// same way afterwards, on the same stack: 72.5% of frames on the modal dwell against
+// 57.5%, 13.6% of pairs changing duration against 37.4%, the spread of dwell times
+// down from 11.4ms to 4.4ms, and the longest a frame sits down from 83ms to 51ms -
+// 99.9% of them inside a one-refresh band around the source period. Nothing is
+// dropped to get that: 967 of the 968 frames that arrived were drawn.
+//
+// A simulation over the same arrival stamps said this would land at 82% and 16% and
+// that the queue depth below would not matter. Both halves were wrong in the browser
+// and the second one badly - see MOUTH_CATCH_UP. The numbers above are the measured
+// ones; the simulation is recorded here only because it is the reason the queue is
+// shallow and there is no deliberate lead in front of it.
+
 function mouthStream() {
-  // One assignment, and the browser does the rest: multipart/x-mixed-replace replaces
-  // the image in place as each part arrives, decoding natively off the main thread.
-  // The SSE version this replaced had to base64 the payload - +33% on the wire (180KB
-  // becomes 241KB) and a quarter-megabyte JS string to decode 24 times a second, on
-  // the thread that also runs the clip crossfades.
-  mouth.src = "/face/frames";
-  mouth.onerror = () => {
-    // The response ended: either the renderer latched `failed` and the route closed
-    // the stream, or it now answers 503. Either way the mouth is not coming back, so
-    // clipFor("speaking") goes to speaking_soft and tick() crossfades to it. Unlike
-    // EventSource an <img> does not retry, which is what we want here - the fallback
-    // is the pre-rendered clips, not a reconnect loop against a latched failure.
+  // fetch, not an <img>: the parts have to be decoded into something this page can
+  // choose WHEN to draw, and an <img> draws them itself. Everything the <img> was
+  // good at survives - the bytes stay raw (the SSE version this all replaced had to
+  // base64 them, +33% on the wire and a quarter-megabyte JS string 24 times a second)
+  // and createImageBitmap still decodes off the main thread, so the thread running
+  // the crossfades never touches a 180KB JPEG.
+  return readFrames().catch((err) => {
+    console.warn(`face: the frame stream failed - ${err}`);
+  }).finally(() => {
+    // The response ending IS the signal, exactly as the <img>'s `error` was: either
+    // the renderer latched `failed` and the route closed the stream, or it answered
+    // 503. Either way the mouth is not coming back, so clipFor("speaking") goes to
+    // speaking_soft and tick() crossfades to it. No reconnect - the fallback is the
+    // pre-rendered clips, not a retry loop against a latched failure.
     mouthDead = true;
+    while (mouthQueue.length) mouthQueue.shift().close();
     refreshMouth();
-  };
+  });
+}
+
+async function readFrames() {
+  const response = await fetch("/face/frames");
+  if (!response.ok || !response.body) {
+    // Say which of the three reasons it was. /face/frames puts that in the body on
+    // purpose and an <img> could never read it, so this failure used to reach the
+    // owner as a face that quietly stopped lip-syncing and nothing else.
+    const why = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status}: ${why.trim() || "no reason given"}`);
+  }
+  const reader = response.body.getReader();
+  let buf = new Uint8Array(0);
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    const merged = new Uint8Array(buf.length + value.length);
+    merged.set(buf);
+    merged.set(value, buf.length);
+    buf = merged;
+    for (;;) {
+      // By the declared Content-Length, never by scanning for the next boundary: a
+      // JPEG is binary and may contain the boundary bytes, and a scanner would
+      // truncate exactly the frames this exists to show.
+      const head = headerEnd(buf);
+      if (head < 0) break;
+      const length = contentLength(buf, head);
+      if (length === null) return;        // the closing boundary; nothing follows it
+      if (buf.length < head + 4 + length) break;
+      decodeFrame(buf.slice(head + 4, head + 4 + length));
+      buf = buf.slice(head + 4 + length);
+    }
+  }
+}
+
+function headerEnd(buf) {
+  // Only the first 256 bytes: a part's headers are short and always sit at offset 0,
+  // because readFrames() drops each part's bytes as it consumes them. Scanning the
+  // whole buffer would mean re-walking a 180KB payload on every socket chunk.
+  const limit = Math.min(buf.length - 3, 256);
+  for (let i = 0; i < limit; i++) {
+    if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function contentLength(buf, head) {
+  const found = /content-length:\s*(\d+)/i.exec(
+    new TextDecoder().decode(buf.subarray(0, head))
+  );
+  return found ? Number(found[1]) : null;
+}
+
+function decodeFrame(bytes) {
+  const seq = ++mouthSeq;
+  createImageBitmap(new Blob([bytes], { type: "image/jpeg" })).then((bitmap) => {
+    // Decodes run concurrently, so one can finish after a later one. Showing it then
+    // would run the mouth backwards for a frame; dropping it costs 41ms of mouth.
+    // Against mouthQueuedSeq, not mouthSeq: mouthSeq has already counted every frame
+    // still being decoded, so comparing with it would discard all of them.
+    if (seq < mouthQueuedSeq) { bitmap.close(); return; }
+    mouthQueuedSeq = seq;
+    mouthQueue.push(bitmap);
+    while (mouthQueue.length > MOUTH_QUEUE_MAX) mouthQueue.shift().close();
+  }).catch(() => { /* a truncated part; the next one is 41ms away */ });
+}
+
+// One frame per MOUTH_PERIOD_MS, from tick(), so presentation lands on the
+// compositor's clock instead of the socket's. Called from tick() and nowhere else -
+// unlike refreshMouth(), which must NOT be, because a frame arriving late is a
+// cosmetic lag and the mouth failing to leave is a frozen face.
+function presentMouth(now) {
+  if (!mouthQueue.length) return;      // nothing new: hold what is already up
+  // Wait for the slot, unless frames are piling up - a queue past MOUTH_CATCH_UP means
+  // this clock has fallen behind the renderer's, and the way back is to catch up
+  // rather than to drop, which is why nothing here throws a frame away.
+  if (now < mouthDueAt && mouthQueue.length <= MOUTH_CATCH_UP) return;
+  const bitmap = mouthQueue.shift();
+  if (mouth.width !== bitmap.width || mouth.height !== bitmap.height) {
+    // Assigning either dimension clears the canvas, so only on a real change.
+    mouth.width = bitmap.width;
+    mouth.height = bitmap.height;
+  }
+  if (!mouthCtx) mouthCtx = mouth.getContext("2d");
+  mouthCtx.drawImage(bitmap, 0, 0);
+  bitmap.close();                      // ~7MB each; the GC is too slow to be the plan
+  mouthDueAt += MOUTH_PERIOD_MS;
+  // A hole in the stream leaves the slot in the past. Re-anchoring rather than
+  // letting it catch up is the point: without this the frames buffered during the
+  // hole would all go up on consecutive ticks, which is the burst the queue exists
+  // to absorb, arriving on screen instead of in the socket.
+  if (mouthDueAt < now) mouthDueAt = now + MOUTH_PERIOD_MS;
 }
 
 // --- SELF-HEALING PLAYBACK ---------------------------------------------------
@@ -377,7 +551,14 @@ function scheduleFlourish() {
 }
 
 // --- mouth: envelope -> playbackRate ---------------------------------------
-function tick() {
+function tick(now) {
+  // Re-armed FIRST, so nothing below can end the loop. It used to be re-armed last,
+  // which was safe while the body only nudged playbackRate; presentMouth() draws a
+  // decoded bitmap, and a single throw there would have left a page that looks alive,
+  // never crossfades again and never runs another flourish - permanently frozen, with
+  // no error anyone would go looking for.
+  requestAnimationFrame(tick);
+  presentMouth(now);          // early, so the draw has the whole frame budget ahead
   if (showing && activity === "speaking") {
     // 1.0x while lip-sync drives the clip. The crops are frame-for-frame that clip's
     // own pixels, so modulating its rate slides the pose under the crop away from the
@@ -394,7 +575,6 @@ function tick() {
     const f = FLOURISHES.filter(s => have.has(s));
     if (f.length) playOneShot(f[Math.floor(Math.random() * f.length)]);
   }
-  requestAnimationFrame(tick);
 }
 
 // --- wire ------------------------------------------------------------------

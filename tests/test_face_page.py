@@ -213,17 +213,29 @@ def test_the_mouth_is_an_overlay_that_is_allowed_to_die():
     assert "function mouthReady()" in PAGE
 
     # The per-frame staleness clock this used to require is gone with the transport.
-    # An <img> fed multipart/x-mixed-replace gives the page no per-frame event to time
-    # from - Chrome fires `load` once for the whole stream - so there is nothing to age.
     # What replaces it is narrower and does not need one: the overlay is gated on
     # `activity === "speaking"` from the activity stream, and the renderer only draws
     # while speaking.
+    #
+    # This used to check for the <img>'s `onerror`, which was the right check for a
+    # transport the page no longer uses: presentation now has to be timed separately
+    # from arrival (see test_the_frame_is_presented_on_a_clock_of_its_own), and an
+    # <img> draws its own parts the moment they land. The property being pinned is
+    # unchanged - the response ENDING is what falls back - so what moved is only where
+    # the signal comes from: a rejected or exhausted fetch instead of an `error` event.
     stream = _body("function mouthStream() {")
-    assert "onerror" in stream, "the end of the stream is what falls back"
+    assert "finally" in stream, (
+        "the response ending is the fallback signal whether it ended by failing or by "
+        "running out, so the record of it cannot hang off the failure path alone"
+    )
     assert "mouthDead" in stream, "giving up has to be recorded, or nothing falls back"
-    assert 'mouth.src = "/face/frames"' in stream, (
-        "the browser has to be the one streaming it; a page assigning data: URIs per "
-        "frame is the base64 path this replaced"
+    assert "close()" in stream, (
+        "and the frames still queued have to be released - an ImageBitmap is ~7MB and "
+        "nothing will ever come to draw them"
+    )
+    assert "fetch" in stream or 'fetch("/face/frames")' in _body("async function readFrames() {"), (
+        "the page has to be reading the stream itself now; it is the only way to "
+        "decide WHEN each frame is drawn rather than let the transport decide"
     )
 
 
@@ -247,7 +259,7 @@ def test_the_driving_clip_is_never_rate_modulated():
     # v1's mouth IS playbackRate (spec 3.4). Left on while lip-sync drives the clip it
     # slides the pose under the crop away from the pose the renderer composited into
     # it, which is a seam at the crop border rather than a mouth.
-    body = _body("function tick() {")
+    body = _body("function tick(now) {")
     assert "mouthReady()" in body and "playbackRate" in body, (
         "tick() must pin the driving clip to 1.0x while the lip-synced mouth is the "
         "speaking path, not modulate it as v1 does"
@@ -261,8 +273,17 @@ def test_the_crop_is_not_taken_off_the_screen_by_rAF():
     # tolerates that for playbackRate because being late there is cosmetic; being late
     # here is a frozen mouth over a talking face, which is the whole failure the
     # fallback exists for. So the crop's visibility must be event-driven.
-    assert "refreshMouth" not in _body("function tick() {"), (
+    #
+    # tick() does now DRAW the lip-synced frames, and that is the opposite case rather
+    # than a loosening of this one: a frame drawn late is a cosmetic lag in a window
+    # nobody is looking at, and rAF stopping leaves the frame that was already up. The
+    # two must stay separate functions, which is what the pair of assertions below pins.
+    body = _body("function tick(now) {")
+    assert "refreshMouth" not in body, (
         "the overlay's visibility must not depend on rAF running"
+    )
+    assert "presentMouth" in body, (
+        "and the frames themselves must, or presentation is back on the socket's clock"
     )
     # No timer here any more: with the browser streaming the image there is no
     # per-frame callback to re-arm one from, and nothing to age out. Everything that
@@ -279,6 +300,61 @@ def test_the_crop_is_not_taken_off_the_screen_by_rAF():
     assert "refreshMouth" in handler, (
         "becoming visible is when a stale overlay has to be corrected"
     )
+
+
+def test_the_frame_is_presented_on_a_clock_of_its_own():
+    """Measured in a real browser against the assembled stack, and the reason the
+    overlay is a <canvas> rather than an <img>.
+
+    Fed straight into an <img>, the frames were repainted whenever a part ARRIVED, and
+    arrival is a socket event: median gap 43.1ms but p90 61.4ms, a quarter of the gaps
+    under 25ms and a quarter over 60ms. The rate was fine - 23.8fps on screen - and the
+    cadence was not: 37.4% of frames changed duration by a whole 17ms from the frame
+    before, and 21% stayed up longer than a source frame lasts, to 83ms. The <video>
+    the page plays at idle never exceeded 41.7ms once. Same rate, different regularity,
+    and that is what got reported as the frame rate dropping when speech starts.
+
+    So arrival must not be allowed to decide presentation. Three things carry that and
+    none of them is inferable from the others: something to draw into on the page's own
+    schedule, a queue between the socket and the draw, and a due time that the draw
+    waits for.
+
+    Re-measuring this needs a real browser and there is no eval for it - Playwright is
+    not a dependency of this project and adding one for a page guard was not thought
+    worth it. Two traps if you write one anyway. Fingerprinting the presented frame by
+    drawImage()-ing the element into a scratch canvas is accurate for an <img> and NOT
+    for a <canvas> or a <video>: those are GPU-backed, and the copy invented 1939
+    transitions out of 968 frames. Read a canvas through its OWN context's
+    getImageData, take a video's cadence from requestVideoFrameCallback, and check
+    every method against the arrival count, because nothing can be presented more
+    often than it arrived. And check the renderer's own fps first: under machine load
+    it fell to 15fps here, which looks exactly like a page that got worse.
+    """
+    assert "<canvas id=\"mouth\">" in PAGE, (
+        "an <img> repaints itself when a part lands; only a canvas lets the page pick "
+        "the moment"
+    )
+    body = _body("function presentMouth(now) {")
+    assert "mouthQueue" in body, "arrival has to be able to run ahead of presentation"
+    assert "mouthDueAt" in body and "MOUTH_PERIOD_MS" in body, (
+        "and presentation has to be paced by the renderer's frame period rather than "
+        "by whenever the socket happened to deliver"
+    )
+    assert "drawImage" in body, "something has to actually reach the screen"
+    # Nothing may be discarded on the way: the complaint is about cadence, and a fix
+    # that evened it out by throwing frames away would be a real drop in frame rate
+    # rather than an apparent one.
+    assert "mouthQueue.shift()" in body and "MOUTH_CATCH_UP" in body, (
+        "a queue past MOUTH_CATCH_UP means this clock is behind the renderer's, and "
+        "the way back has to be catching up, never dropping"
+    )
+    # Off the main thread. The thread that draws is the thread that runs the clip
+    # crossfades, and a 180KB JPEG decoded on it 24 times a second is the cost the
+    # multipart <img> was chosen over SSE to avoid in the first place.
+    assert "createImageBitmap" in _body("function decodeFrame(bytes) {"), (
+        "decoding has to stay off the thread that composites"
+    )
+    assert "data:image" not in PAGE, "and the base64 path must not come back"
 
 
 def test_the_frame_stream_is_only_opened_when_the_daemon_offers_one():
