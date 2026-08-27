@@ -35,6 +35,7 @@ from daemon import app as app_module
 from daemon.app import _build_lipsync, _lipsync_loop, _LipsyncFrames, create_app
 from daemon.config import Settings
 from daemon.face import FaceBus
+from daemon.face_lipsync.render import ClipClock
 
 FPS = 24.0
 
@@ -257,11 +258,19 @@ class RecordingSlot:
         return [b - a for a, b in zip(self.at, self.at[1:], strict=False)]
 
 
+IDLE_FRAMES = [f"idle-{i}".encode() for i in range(6)]
+"""Stand-ins for the clip's own frames, distinguishable from a rendered one so a test
+can tell which half of the publisher produced what."""
+
+
 async def _run_loop(face, renderer, clock, ring, queued, *, stop_after: float, slot=None):
     """Drive `_lipsync_loop` for `stop_after` seconds, then cancel it."""
     slot = RecordingSlot() if slot is None else slot
+    driver = ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0)
     task = asyncio.create_task(
-        _lipsync_loop(face, renderer, clock, ring, queued, slot, fps=FPS)
+        _lipsync_loop(
+            face, renderer, clock, ring, queued, slot, driver, IDLE_FRAMES, fps=FPS
+        )
     )
     await asyncio.sleep(stop_after)
     task.cancel()
@@ -421,7 +430,8 @@ async def test_the_falling_edge_drops_a_pair_the_next_turn_must_not_show(monkeyp
     # the queue hovers at one frame and the leak would be intermittent.
     task = asyncio.create_task(
         _lipsync_loop(
-            face, renderer, PacedClock(fps=FPS * 2), ring, deque(), slot, fps=FPS
+            face, renderer, PacedClock(fps=FPS * 2), ring, deque(), slot,
+            ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0), IDLE_FRAMES, fps=FPS
         )
     )
     await asyncio.sleep(0.15)
@@ -533,7 +543,10 @@ async def test_the_end_of_speech_hands_back_the_gpu_cache(monkeypatch):
     face.set_activity("speaking")
     renderer, clock, ring = FakeRenderer(), FakeClock([0]), FakeRing()
     task = asyncio.create_task(
-        _lipsync_loop(face, renderer, clock, ring, deque(), RecordingSlot(), fps=FPS)
+        _lipsync_loop(
+            face, renderer, clock, ring, deque(), RecordingSlot(),
+            ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0), IDLE_FRAMES, fps=FPS,
+        )
     )
     await asyncio.sleep(0.1)
     assert not released, "nothing to release while it is still speaking"
@@ -555,7 +568,11 @@ async def test_a_latched_failure_ends_the_loop(monkeypatch, caplog):
     renderer.failed = True
     with caplog.at_level(logging.WARNING, logger="daemon.app"):
         await asyncio.wait_for(
-            _lipsync_loop(face, renderer, clock, ring, deque(), RecordingSlot(), fps=FPS),
+            _lipsync_loop(
+                face, renderer, clock, ring, deque(), RecordingSlot(),
+                ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0), IDLE_FRAMES,
+                fps=FPS,
+            ),
             1.0,
         )
     assert not renderer.calls
@@ -579,7 +596,8 @@ async def test_a_raising_tick_is_logged_rather_than_silently_orphaned(monkeypatc
     # `wait_for` returning is the assertion.
     await asyncio.wait_for(
         _lipsync_loop(
-            FaceBus(), renderer, clock, Exploding(), queued, RecordingSlot(), fps=FPS
+            FaceBus(), renderer, clock, Exploding(), queued, RecordingSlot(),
+            ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0), IDLE_FRAMES, fps=FPS
         ),
         1.0,
     )
@@ -750,3 +768,51 @@ async def test_the_voice_path_carries_the_sink_to_the_conversation(monkeypatch):
     assert code == 0
     assert captured["pcm_sink"] is sink
     assert captured["face"] is face
+
+
+# --- idle goes out on the same stream, for a colour reason ----------------------
+
+
+async def test_an_idle_face_still_publishes_the_clips_own_frames(monkeypatch):
+    """Nothing is rendered while idle, but something is still sent.
+
+    The page used to play the driving clip in a `<video>` at idle and show this canvas
+    only while speaking. Chrome's decode of the untagged mp4 disagrees with its decode
+    of our JPEGs - measured R +3.0, G +2.1, B +1.2, against a JPEG path faithful to our
+    bytes within 0.2 - so the entire picture, background included, shifted darker and
+    off-hue the instant speech began. One decoder is the only fix that does not depend
+    on guessing how a browser will read an untagged file.
+    """
+    monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
+    face = FaceBus()
+    face.set_activity("idle")
+    renderer, clock, ring = FakeRenderer(), FakeClock([0] * 20), FakeRing()
+    slot = await _run_loop(face, renderer, clock, ring, deque(), stop_after=0.3)
+
+    assert not renderer.calls, "an idle face must still never reach the model"
+    assert slot.puts, "and must still be publishing - that is the whole point"
+    assert all(p in IDLE_FRAMES for p in slot.puts), (
+        f"idle must publish the clip's own frames, got {slot.puts[:3]}"
+    )
+    assert len(set(slot.puts)) > 1, (
+        "and it must advance through the clip rather than repeating one frame"
+    )
+
+
+async def test_speaking_with_nothing_ready_publishes_nothing_rather_than_the_clip(
+    monkeypatch,
+):
+    """The failure the branch order exists to prevent: falling through to the clip's
+    own frame mid-sentence would shut the mouth for a frame in the middle of a word.
+    Holding the slot's last frame is a mouth one frame stale, which is not the same
+    thing at all."""
+    monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
+    face = FaceBus()
+    face.set_activity("speaking")
+    renderer, ring = FakeRenderer(), FakeRing()
+    # A clock that never grants: the queue stays empty for the whole run.
+    slot = await _run_loop(face, renderer, FakeClock([]), ring, deque(), stop_after=0.25)
+
+    assert not any(p in IDLE_FRAMES for p in slot.puts), (
+        f"a speaking face must never be handed a clip frame, got {slot.puts[:3]}"
+    )

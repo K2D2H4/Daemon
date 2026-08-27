@@ -387,6 +387,36 @@ class Step:
     """256x256 BGR, straight out of `LipsyncEngine.mouths`, one per index."""
 
 
+def encode_clip(cache: Cache) -> list[bytes]:
+    """Every driving-clip frame as a JPEG, encoded once.
+
+    The page shows these while nothing is being said, in place of playing the clip in
+    a `<video>`, and that is a colour fix rather than a convenience. Measured in Chrome
+    on this machine: the browser's decode of the untagged mp4 comes out R +3.0, G +2.1,
+    B +1.2 against the same frames arriving as JPEG - which the browser decodes to our
+    bytes within 0.2. So the two players disagree, the JPEG is the faithful one, and
+    the whole picture used to shift darker and off-hue the moment speech started. The
+    owner saw it as "어두워지면서 채도가 좀 올라가는" across the entire frame, background
+    included.
+
+    It is not a range problem (that would move all three channels by the same +8.7) and
+    not a BT.601/709 matrix choice (neither matches). It is the browser colour-managing
+    an untagged video against a P3 display, and there is no way to tell it not to
+    without re-encoding the clips - which changes their pixels (mean luma 62.94 ->
+    59.82) and would still be one browser's guess. Removing the second decoder is the
+    only fix that does not depend on guessing right.
+
+    Encoded once at load, not per frame: the clip is fixed, so these bytes never
+    change. ~180KB each, so ~35MB for a 193-frame clip, against 2.45ms of CPU per frame
+    forever if they were encoded live.
+    """
+    out = []
+    for frame in cache.frames:
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        out.append(buf.tobytes() if ok else b"")
+    return out
+
+
 class Renderer:
     """Two frames per model step, in two halves that run on different threads.
 

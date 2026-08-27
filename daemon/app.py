@@ -1252,7 +1252,12 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
         # is a daemon that will not start because of a face.
         from daemon.face_lipsync.audio import CONTEXT_MS
         from daemon.face_lipsync.engine import load as load_engine
-        from daemon.face_lipsync.render import ClipClock, FrameClock, Renderer
+        from daemon.face_lipsync.render import (
+            ClipClock,
+            FrameClock,
+            Renderer,
+            encode_clip,
+        )
         from daemon.face_lipsync.ring import PcmRing, Slot
         from daemon.voice.audio import OUTPUT_SAMPLE_RATE
 
@@ -1286,6 +1291,10 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
             fps=fps, frames=len(cache.boxes), epoch=asyncio.get_running_loop().time()
         )
         renderer = Renderer(engine=engine, cache=cache, ring=ring, clip=driver)
+        # Encoded once, held for the life of the process: the clip is fixed, so these
+        # bytes never change. ~35MB for 193 frames against 2.45ms of CPU per idle frame
+        # forever if they were encoded live.
+        idle_frames = encode_clip(cache)
         clock = FrameClock(fps=fps)
         # One model step on THIS thread before the render loop ever uses another one,
         # and it is a requirement rather than a warm-up. **MLX aborts the process** -
@@ -1333,7 +1342,9 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
     )
 
     async def run() -> None:
-        await _lipsync_loop(face, renderer, clock, ring, queued, slot, fps=fps)
+        await _lipsync_loop(
+            face, renderer, clock, ring, queued, slot, driver, idle_frames, fps=fps
+        )
 
     return Lipsync(
         frames=_LipsyncFrames(
@@ -1351,6 +1362,8 @@ async def _lipsync_loop(
     ring: PcmRing,
     queued: deque[tuple[bytes, float]],
     slot: Slot,
+    driver: ClipClock,
+    idle_frames: list[bytes],
     *,
     fps: float,
 ) -> None:
@@ -1448,15 +1461,31 @@ async def _lipsync_loop(
         target = loop.time()
         try:
             while True:
-                frame = await ready.get()
                 delay = target - loop.time()
                 if delay > 0:
                     await asyncio.sleep(delay)
+                frame: bytes | None = None
                 if face.state.activity == "speaking":
                     # Checked here and not only at the falling edge: this half can be
                     # holding a frame it took out of the queue before the turn ended,
                     # and a frame whose sound has already finished playing is not a
-                    # frame anyone wants to see.
+                    # frame anyone wants to see. An empty queue mid-sentence publishes
+                    # nothing rather than falling through to the clip below - the slot
+                    # holds its last frame, which is a mouth one frame stale instead of
+                    # a mouth that shut mid-word.
+                    try:
+                        frame = ready.get_nowait()
+                    except asyncio.QueueEmpty:
+                        frame = None
+                else:
+                    # Idle goes out on this same grid, as the clip's own frame encoded
+                    # once at load. The page used to play the clip in a `<video>` here
+                    # and Chrome's decode of it disagrees with its decode of our JPEGs -
+                    # measured R +3.0, G +2.1, B +1.2 - so the whole picture shifted
+                    # darker and off-hue the moment speech started. One decoder, no
+                    # shift. See `render.encode_clip`.
+                    frame = idle_frames[driver.index(loop.time()) % len(idle_frames)]
+                if frame is not None:
                     slot.put(frame)
                 target = max(target + interval, loop.time() + interval / 2)
         except asyncio.CancelledError:
