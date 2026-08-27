@@ -163,6 +163,19 @@ class FrameClock:
         return frame
 
 
+MOTION_BLEND = 0.55
+"""Weight of the new mouth against the one before it, applied before `restore_detail`.
+
+The owner's report was that the mouth "moves too fast" - not that it trembled. Measured
+against real talking footage the generated mouth's per-frame motion really is larger:
+independent per-frame generation has none of the inertia a face has, so every frame is
+free to jump. Three arms were rendered against the same audio and the owner chose this
+one over 0.7 and over no blend at all, calling it natural enough.
+
+That is the opposite of an earlier verdict on the same idea, and the difference is
+where it sits in the pipeline rather than the number - see `Renderer._blend`.
+"""
+
 DISPLAY_LEAD = 6
 """How many driving frames AHEAD of its own audio a mouth is composited onto.
 
@@ -277,6 +290,12 @@ class Renderer:
         self._cache = cache
         self._ring = ring
         self._buffer = np.empty_like(cache.frames[0])
+        self._previous: np.ndarray | None = None
+        """Last mouth encoded, for `MOTION_BLEND`. float32, the model's own 256."""
+        self._continues_at = -1
+        """The display index the next mouth must carry to count as continuous. A turn
+        restarts at 0, so a jump here is a turn boundary and the blend starts over
+        rather than mixing in a pose from the previous utterance."""
         self.failed = False
         """Latched on the first failure in either half. The caller drops back to v1
         clips and logs once; retrying per frame would fill the log at 24Hz."""
@@ -311,6 +330,23 @@ class Renderer:
             self.failed = True
             return None
 
+    def _blend(self, mouth: np.ndarray, index: int) -> np.ndarray:
+        """Mix `mouth` with the one before it, `MOTION_BLEND` of the new one.
+
+        Before `restore_detail`, and that ordering is the whole reason this is usable.
+        Smoothing on its own was ranked "거의 못써먹을 수준" by the owner when it was the
+        last thing to touch the pixels: it took the teeth with the judder. Applied
+        first, it settles the mouth's *structure*, and the driving frame's own texture
+        goes back on top afterwards - so the crispness that the mix removed is restored
+        from a source the mix never touched. Same alpha, opposite verdict.
+        """
+        current = mouth.astype(np.float32)
+        if self._previous is not None and index == self._continues_at:
+            current = MOTION_BLEND * current + (1.0 - MOTION_BLEND) * self._previous
+        self._previous = current
+        self._continues_at = index + 1
+        return current.astype(np.uint8)
+
     def encode(self, step: Step) -> list[bytes]:
         """One whole-frame JPEG per mouth, in the pair's own order. Never raises."""
         if self.failed:
@@ -322,7 +358,8 @@ class Renderer:
                 i = index % n
                 box = self._cache.boxes[i]
                 x1, y1, x2, y2 = box
-                sized = cv2.resize(mouth, (x2 - x1, y2 - y1))
+                blended = self._blend(mouth, index)
+                sized = cv2.resize(blended, (x2 - x1, y2 - y1))
                 sized = restore_detail(sized, self._cache.frames[i], box)
                 out = composite(
                     self._cache.frames[i],

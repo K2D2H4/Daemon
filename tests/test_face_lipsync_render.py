@@ -14,6 +14,7 @@ from daemon.face_lipsync.audio import latest_audio_ms
 from daemon.face_lipsync.render import (
     BATCH,
     DISPLAY_LEAD,
+    MOTION_BLEND,
     FrameClock,
     Renderer,
     restore_detail,
@@ -669,3 +670,98 @@ def test_a_backward_jump_also_restarts():
     assert clock.due(now=31.0, origin=30.0) == 0
     assert clock.due(now=31.0, origin=30.0) == 1
     assert clock.due(now=1.0, origin=0.0) == 0
+
+
+# --- motion blending, and the ordering that makes it usable --------------------
+
+
+class _Mouths:
+    """An engine whose mouth colour is chosen per call, so a blend is observable."""
+
+    def __init__(self, values):
+        self.values = list(values)
+        self.at = 0
+
+    def mouths(self, windows, frame_indices):
+        out = []
+        for _ in frame_indices:
+            v = self.values[min(self.at, len(self.values) - 1)]
+            self.at += 1
+            out.append(np.full((256, 256, 3), v, np.uint8))
+        return out
+
+
+def _encoded_mouth(renderer, cache, values, *, first=0):
+    """Render two frames and return the mouth value each published frame carries."""
+    step = renderer.step(frame_index=first, origin=0.0, fps=24.0)
+    assert step is not None
+    got = []
+    for jpeg in renderer.encode(step):
+        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        got.append(int(frame[80, 70, 0]))
+    return got
+
+
+def test_a_mouth_is_mixed_with_the_one_before_it():
+    """The owner's report was that the mouth moves too fast - each frame free to jump,
+    because independent per-frame generation has none of a face's inertia."""
+    cache = _cache()
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
+    ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
+    r = Renderer(engine=_Mouths([0, 200]), cache=cache, ring=ring)
+    first, second = _encoded_mouth(r, cache, None)
+    assert abs(first - 0) < 20, "the first mouth has nothing to mix with"
+    # 0.55*200 + 0.45*0 = 110, not 200. JPEG is lossy, so allow room - but nowhere
+    # near enough to confuse a blended 110 with an unblended 200.
+    assert abs(second - int(MOTION_BLEND * 200)) < 25, second
+
+
+def test_the_blend_starts_over_at_a_turn_boundary():
+    """A turn restarts frame indices at 0. Carrying the last mouth of the previous
+    utterance across would open the new one on a stale pose."""
+    cache = _cache()
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
+    ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
+    r = Renderer(engine=_Mouths([0, 0, 200, 200]), cache=cache, ring=ring)
+    _encoded_mouth(r, cache, None, first=0)          # leaves a dark mouth behind
+    fresh, _ = _encoded_mouth(r, cache, None, first=90)   # a jump: new turn
+    assert abs(fresh - 200) < 20, (
+        f"a new turn must not mix in the previous one's pose, got {fresh}"
+    )
+
+
+def test_the_borrowed_texture_is_not_damped_by_the_blend():
+    """The ordering, and it is the whole reason this is shippable.
+
+    Smoothing as the LAST thing to touch the pixels was ranked unusable by the owner -
+    it took the teeth with the judder. Here it runs first and `restore_detail` puts the
+    driving frame's own texture back on top, from a source the mix never touched. If
+    the two were swapped, that texture would be mixed away too - so this asserts it
+    arrives at full strength on a frame that was definitely blended.
+    """
+    cache = _cache()
+    cache.frames[0, BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
+    cache.frames[1, BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
+    ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
+    r = Renderer(engine=_Mouths([0, 200]), cache=cache, ring=ring)
+    step = r.step(frame_index=0, origin=0.0, fps=24.0)
+    jpegs = r.encode(step)
+    blended = cv2.imdecode(np.frombuffer(jpegs[1], np.uint8), cv2.IMREAD_COLOR)
+
+    flat = np.full((120, 60, 3), int(MOTION_BLEND * 200), np.uint8)
+    i = step.indices[1] % len(cache.boxes)
+    want = composite(
+        cache.frames[i],
+        restore_detail(flat, cache.frames[i], BOX),
+        BOX,
+        CROP_BOX,
+        cache.masks[i],
+    )
+    x1, y1, x2, y2 = CROP_BOX
+    got_lap = _lap(blended[y1:y2, x1:x2])
+    want_lap = _lap(want[y1:y2, x1:x2])
+    assert got_lap > want_lap * 0.7, (
+        f"texture arrived damped: {got_lap:.1f} against {want_lap:.1f} - the blend "
+        "is running after restore_detail, not before it"
+    )
