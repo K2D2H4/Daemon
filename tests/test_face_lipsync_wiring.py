@@ -35,7 +35,7 @@ from daemon import app as app_module
 from daemon.app import _build_lipsync, _lipsync_loop, _LipsyncFrames, create_app
 from daemon.config import Settings
 from daemon.face import FaceBus
-from daemon.face_lipsync.render import ClipClock
+from daemon.face_lipsync.render import RELEASE_FRAMES, ClipClock
 
 FPS = 24.0
 
@@ -162,6 +162,10 @@ class FakeRenderer:
         is that it must never feed one while a step is reading it."""
         self._step_seconds = step_seconds
         """Blocking time per step, for the tests about overlap. A real one is ~73ms."""
+        self.released: list[tuple[int, int]] = []
+        """Every `release` call, so a test can see the ramp's length and its indices."""
+        self.releases = 0
+        """How many ramp frames this fake will answer with before returning `None`."""
         self.label = "a"
         """Stamped into every encoded frame. A test that flips this between two turns
         can tell which turn a frame in the slot came from, which frame indices cannot
@@ -180,6 +184,15 @@ class FakeRenderer:
     def encode(self, step: int) -> list[bytes]:
         self.encoded.append(step)
         return [f"{self.label}{step}-0".encode(), f"{self.label}{step}-1".encode()]
+
+    def release(self, *, index: int, step: int) -> bytes | None:
+        """The falling edge's ramp. `None` past `self.releases`, which is how the real
+        one answers once its held mouth is spent - the loop then falls through to the
+        clip."""
+        self.released.append((index, step))
+        if step > self.releases:
+            return None
+        return f"{self.label}r{step}".encode()
 
 
 class FakeClock:
@@ -816,3 +829,89 @@ async def test_speaking_with_nothing_ready_publishes_nothing_rather_than_the_cli
     assert not any(p in IDLE_FRAMES for p in slot.puts), (
         f"a speaking face must never be handed a clip frame, got {slot.puts[:3]}"
     )
+
+
+async def _run_edges(face, renderer, clock, ring, *, speak: float, then_idle: float):
+    """Speak, fall silent, and keep publishing - the two edges in one run."""
+    slot = RecordingSlot()
+    driver = ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0)
+    task = asyncio.create_task(
+        _lipsync_loop(
+            face, renderer, clock, ring, deque(), slot, driver, IDLE_FRAMES, fps=FPS
+        )
+    )
+    await asyncio.sleep(speak)
+    face.set_activity("idle")
+    await asyncio.sleep(then_idle)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    return slot
+
+
+async def test_the_falling_edge_ramps_the_mouth_out_before_the_clip_takes_over(
+    monkeypatch,
+):
+    """The end of an utterance is a dissolve, not a cut.
+
+    Speech stops and the next frame used to be the clip untouched - a generated mouth
+    replaced by a real one between two frames, measured as a 5.97px step in the mouth
+    region against a 2.46px median during speech, and seen as the mouth "갑자기 확
+    닫히는" snap. It is structural: `evals/face_lipsync_idle_spike.py` measured all 88
+    conditioning windows and not one renders this avatar's resting mouth closed, so the
+    last generated frame is always parted where the clip's own is sealed.
+    """
+    monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
+    face = FaceBus()
+    face.set_activity("speaking")
+    renderer = FakeRenderer()
+    renderer.releases = RELEASE_FRAMES
+    clock, ring = FakeClock([0, 1, 2, 3] + [None] * 60), FakeRing()
+    slot = await _run_edges(
+        face, renderer, clock, ring, speak=0.2, then_idle=RELEASE_FRAMES / FPS + 0.25
+    )
+
+    ramp = [p.decode() for p in slot.puts if p.startswith(b"ar")]
+    assert ramp == [f"ar{i}" for i in range(1, RELEASE_FRAMES + 1)], ramp
+    last_ramp = max(i for i, p in enumerate(slot.puts) if p.startswith(b"ar"))
+    first_clip = next(i for i, p in enumerate(slot.puts) if p in IDLE_FRAMES)
+    assert last_ramp < first_clip, (
+        f"the clip took over at {first_clip}, before the ramp ended at {last_ramp}"
+    )
+    # The index handed over is the page's own playhead, so it advances rather than
+    # counting up from wherever the utterance stopped.
+    handed = [index for index, _ in renderer.released]
+    assert handed == sorted(handed), handed
+
+
+async def test_a_barge_in_mid_ramp_starts_the_next_ramp_over(monkeypatch):
+    """A ramp that kept its place would hand the next utterance a half-spent one, so
+    the second falling edge would cut where the first dissolved."""
+    monkeypatch.setattr(app_module, "release_lipsync_memory", lambda: None)
+    face = FaceBus()
+    face.set_activity("speaking")
+    renderer = FakeRenderer()
+    renderer.releases = RELEASE_FRAMES
+    clock, ring = FakeClock([0, 1, 2, 3] + [None] * 60), FakeRing()
+    slot = RecordingSlot()
+    driver = ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0)
+    task = asyncio.create_task(
+        _lipsync_loop(
+            face, renderer, clock, ring, deque(), slot, driver, IDLE_FRAMES, fps=FPS
+        )
+    )
+    await asyncio.sleep(0.15)
+    face.set_activity("idle")
+    await asyncio.sleep(3 / FPS)          # part-way into the ramp
+    face.set_activity("speaking")         # barge-in
+    await asyncio.sleep(0.1)
+    face.set_activity("idle")
+    await asyncio.sleep(RELEASE_FRAMES / FPS + 0.25)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    steps = [step for _, step in renderer.released]
+    assert steps.count(1) == 2, f"each falling edge must start the ramp at 1, got {steps}"
+    assert max(steps) <= RELEASE_FRAMES, steps
+

@@ -1418,7 +1418,7 @@ async def _lipsync_loop(
     failure into `failed`; this is for everything else, and the publisher carries the
     same guard because a task nobody awaits is exactly the shape that goes unnoticed.
     """
-    from daemon.face_lipsync.render import BATCH
+    from daemon.face_lipsync.render import BATCH, RELEASE_FRAMES
 
     loop = asyncio.get_running_loop()
     interval = 1.0 / fps
@@ -1459,6 +1459,13 @@ async def _lipsync_loop(
         the one before it too closely.
         """
         target = loop.time()
+        released = 0
+        """How far into the falling edge's ramp we are. Reset by every speaking pass,
+        so a barge-in mid-ramp starts the next one over."""
+        spoke = False
+        """Whether there has been anything to release yet. Without it the first ticks
+        of a fresh process would each pay an executor hop to be told there is no held
+        mouth."""
         try:
             while True:
                 delay = target - loop.time()
@@ -1466,6 +1473,8 @@ async def _lipsync_loop(
                     await asyncio.sleep(delay)
                 frame: bytes | None = None
                 if face.state.activity == "speaking":
+                    spoke = True
+                    released = 0
                     # Checked here and not only at the falling edge: this half can be
                     # holding a frame it took out of the queue before the turn ended,
                     # and a frame whose sound has already finished playing is not a
@@ -1478,13 +1487,29 @@ async def _lipsync_loop(
                     except asyncio.QueueEmpty:
                         frame = None
                 else:
-                    # Idle goes out on this same grid, as the clip's own frame encoded
-                    # once at load. The page used to play the clip in a `<video>` here
-                    # and Chrome's decode of it disagrees with its decode of our JPEGs -
-                    # measured R +3.0, G +2.1, B +1.2 - so the whole picture shifted
-                    # darker and off-hue the moment speech started. One decoder, no
-                    # shift. See `render.encode_clip`.
-                    frame = idle_frames[driver.index(loop.time()) % len(idle_frames)]
+                    index = driver.index(loop.time())
+                    if spoke and released < RELEASE_FRAMES:
+                        # The utterance just ended. Speech stops and the frame after it
+                        # is the clip untouched, so a generated mouth is replaced by a
+                        # real one between two frames - measured as a 5.97px step in the
+                        # mouth region against a 2.46px median during speech, and seen
+                        # as the mouth "갑자기 확 닫히는" snap. `release` ramps the paste
+                        # to nothing instead, which takes the step to 2.26px; the
+                        # dissolve is the closing motion, because a closed mouth is what
+                        # shows through. One frame per tick, and on the same executor as
+                        # `encode` because they share the renderer's frame buffer.
+                        released += 1
+                        frame = await loop.run_in_executor(
+                            cpu, partial(renderer.release, index=index, step=released)
+                        )
+                    if frame is None:
+                        # Idle goes out on this same grid, as the clip's own frame
+                        # encoded once at load. The page used to play the clip in a
+                        # `<video>` here and Chrome's decode of it disagrees with its
+                        # decode of our JPEGs - measured R +3.0, G +2.1, B +1.2 - so the
+                        # whole picture shifted darker and off-hue the moment speech
+                        # started. One decoder, no shift. See `render.encode_clip`.
+                        frame = idle_frames[index % len(idle_frames)]
                 if frame is not None:
                     slot.put(frame)
                 target = max(target + interval, loop.time() + interval / 2)

@@ -311,6 +311,13 @@ That is the opposite of an earlier verdict on the same idea, and the difference 
 where it sits in the pipeline rather than the number - see `Renderer._blend`.
 """
 
+RELEASE_FRAMES = 10
+"""How many frames the mouth takes to hand itself back to the driving clip.
+
+417ms at 24fps. Ranked by the owner against 0 and 5 on a 2.4x side-by-side of the
+falling edge; 10 was "제일 자연스럽네". See `Renderer.release`."""
+
+
 DISPLAY_LEAD = 6
 """How many driving frames AHEAD of its own audio a mouth is composited onto.
 
@@ -559,6 +566,94 @@ class Renderer:
         self._previous = current
         self._continues_at = index + 1
         return current.astype(np.uint8)
+
+    def release(
+        self, *, index: int, step: int, count: int = RELEASE_FRAMES
+    ) -> bytes | None:
+        """One frame of an utterance's tail: the last mouth dissolving into the artist's.
+
+        Speech stops and the frame after it is the driving clip untouched, so a
+        generated mouth is replaced by a real one between two frames. The owner saw it
+        as the mouth "갑자기 확 닫히는" snap, and it is structural rather than a timing
+        fault: `evals/face_lipsync_idle_spike.py` measured all 88 conditioning windows,
+        digital zero included, and **not one renders this avatar's resting mouth
+        closed** - every one leaves the lips parted with a sliver of teeth, where the
+        clip's own mouth is cleanly sealed. So the last generated frame is always at
+        least slightly open and the next one is shut, and no better audio alignment
+        removes that step.
+
+        Ramping `composite`'s `strength` to zero removes it, and the dissolve *is* the
+        closing motion, because a closed mouth is what shows through underneath.
+        Measured on the mouth region, mean step from one frame to the next: the
+        handover was **5.97px against a 2.46px median during speech**, and at count 10
+        it is **2.26px** - no longer distinguishable from an ordinary speaking frame.
+        (The 5-6px steps three to six frames later are the clip's own motion; they are
+        just as large with no ramp at all, which is how they were ruled out.)
+
+        **No model step pays for it.** The alternative - keep the engine running on the
+        trailing silence and fade that - costs `count` UNet steps to animate a mouth
+        that the same 88-window measurement says will sit open with its teeth showing,
+        so it buys motion that is wrong rather than motion that is late.
+
+        **One frame per call, on purpose.** Rendering all `count` at the falling edge
+        measured ~84ms, which is two publish ticks holding one frame at exactly the
+        moment this exists to smooth. This costs one composite, the same as a speaking
+        frame's `encode`.
+
+        `index` is the driving frame to composite onto - the caller passes the page's
+        own playhead each tick rather than counting up from a captured start, so a late
+        tick still lands on the frame the page is showing. `step` is 1..`count` and
+        drives the strength alone.
+
+        The mouth is `_previous`, held: the last thing `_blend` produced. It is stale by
+        up to `count` frames of head motion, which is why the ramp is short and why
+        staleness costs less every frame - the alpha it is multiplied by is already on
+        its way to nothing. The injection weight is `_smoothed`, held for the same
+        reason `_weight` averages it in the first place: recomputing it per frame is
+        itself a vibration source.
+
+        Returns a whole-frame JPEG like `encode`, and shares `_buffer` with it, so the
+        same rule applies - one thread, never concurrent with `encode`. `daemon/app.py`
+        submits both to the same single-worker executor, which is what serialises them.
+        """
+        if self.failed or self._previous is None or self._smoothed is None:
+            return None
+        if step < 1 or step > count:
+            return None
+        try:
+            i = index % len(self._cache.boxes)
+            box = self._cache.boxes[i]
+            x1, y1, x2, y2 = box
+            sized = restore_detail(
+                cv2.resize(np.clip(self._previous, 0, 255).astype(np.uint8), (x2 - x1, y2 - y1)),
+                self._cache.frames[i],
+                box,
+                self._smoothed,
+            )
+            out = composite(
+                self._cache.frames[i],
+                sized,
+                box,
+                self._cache.crop_boxes[i],
+                self._cache.masks[i],
+                out=self._buffer,
+                # Ends one step short of zero, because the frame after the last of
+                # these is the clip itself - which is strength 0 already.
+                strength=1.0 - step / (count + 1),
+            )
+            ok, buf = cv2.imencode(
+                ".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            )
+            if step == count:
+                # The tail is done: drop the held mouth so a new turn cannot blend
+                # against it and so a repeated call cannot render a stale frame.
+                self._previous = None
+                self._smoothed = None
+            return buf.tobytes() if ok else None
+        except Exception:
+            logger.exception("face: lip-sync release failed, falling back to clips")
+            self.failed = True
+            return None
 
     def encode(self, step: Step) -> list[bytes]:
         """One whole-frame JPEG per mouth, in the pair's own order. Never raises."""

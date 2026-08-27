@@ -15,6 +15,7 @@ from daemon.face_lipsync.render import (
     BATCH,
     DISPLAY_LEAD,
     MOTION_BLEND,
+    RELEASE_FRAMES,
     ClipClock,
     FrameClock,
     Renderer,
@@ -980,3 +981,77 @@ def test_the_injection_weight_restarts_at_a_turn_boundary():
     assert np.allclose(fresh, detail_weight(far, cache.frames[0], cache.boxes[0])), (
         "a new turn must not inherit the previous utterance's weight"
     )
+
+
+# --- release: the falling edge's ramp ---------------------------------------
+
+
+def test_release_without_a_held_mouth_answers_none():
+    """A process that has composited nothing has nothing to hand back, and the loop
+    reads `None` as "fall through to the clip" - which is what it did before this
+    existed. Without this guard the first ticks of every fresh process would try."""
+    r = _renderer(engine=FakeEngine(), cache=_cache(), ring=_distinct_tone_ring())
+    assert r.release(index=0, step=1) is None
+
+
+def test_release_ramps_the_paste_out_of_the_frame():
+    """Every ramp frame sits nearer the untouched clip frame than the one before it.
+
+    This is the defect stated as an assertion. The old behaviour went from a full
+    paste to no paste between two frames, and because this engine cannot render this
+    avatar's mouth closed - all 88 conditioning windows measured, not one does - the
+    last generated frame is always parted where the clip's own mouth is sealed. The
+    owner saw that as the mouth "갑자기 확 닫히는".
+    """
+    cache = _cache_with_distinct_frames()
+    r = _renderer(engine=FakeEngine(), cache=cache, ring=_distinct_tone_ring())
+    _jpegs(r, frame_index=0)  # gives the renderer a mouth to hold
+
+    plain = cache.frames[1]
+    distances = []
+    for step in range(1, RELEASE_FRAMES + 1):
+        payload = r.release(index=1, step=step)
+        assert payload is not None, f"step {step} produced nothing"
+        got = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
+        distances.append(np.abs(got.astype(int) - plain.astype(int)).mean())
+
+    assert distances == sorted(distances, reverse=True), distances
+    # And it arrives rather than merely leaning that way: a ramp that shrank by a hair
+    # each step would satisfy monotonicity and still snap at the end.
+    assert distances[-1] < distances[0] / 3, distances
+
+
+def test_release_ends_by_forgetting_the_mouth():
+    """The last ramp frame drops the held mouth, so a repeat cannot render a stale one
+    and the next turn cannot blend against a mouth from the last."""
+    cache = _cache_with_distinct_frames()
+    r = _renderer(engine=FakeEngine(), cache=cache, ring=_distinct_tone_ring())
+    _jpegs(r, frame_index=0)
+    for step in range(1, RELEASE_FRAMES + 1):
+        assert r.release(index=1, step=step) is not None
+    assert r.release(index=1, step=1) is None
+
+
+def test_release_refuses_steps_outside_the_ramp_without_spending_the_mouth():
+    """A step of 0 or past the end is a caller bug, not a frame. Refusing it must not
+    consume the held mouth, or one bad call would cost the whole ramp."""
+    cache = _cache_with_distinct_frames()
+    r = _renderer(engine=FakeEngine(), cache=cache, ring=_distinct_tone_ring())
+    _jpegs(r, frame_index=0)
+    assert r.release(index=1, step=0) is None
+    assert r.release(index=1, step=RELEASE_FRAMES + 1) is None
+    assert r.release(index=1, step=1) is not None
+
+
+def test_release_composites_onto_the_index_it_is_handed():
+    """The loop passes the page's own playhead every tick rather than counting up from
+    the frame the utterance ended on, so that a late tick still lands on the frame the
+    page is showing. The index therefore has to be honoured."""
+    cache = _cache_with_distinct_frames()
+    r = _renderer(engine=FakeEngine(), cache=cache, ring=_distinct_tone_ring())
+    _jpegs(r, frame_index=0)
+    payload = r.release(index=3, step=RELEASE_FRAMES)
+    got = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
+    # Outside the crop box the frame is untouched at any strength, and frame 3's
+    # background is 150 where every other index is at least 50 away.
+    assert abs(int(got[0, 0, 0]) - 150) < 6, got[0, 0]
