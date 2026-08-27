@@ -32,6 +32,7 @@ separate interpreter and run this tool with that one:
 
   * `pyobjc-framework-Vision` - macOS landmarks, no model download, no torch.
   * `torch`, `diffusers`, `transformers`, `opencv-python`, `numpy`, `safetensors`.
+  * `scipy` - one `savgol_filter` call, for `--smooth`; see `smooth_boxes`.
   * a **MuseTalk checkout** - `--musetalk` - for `musetalk.models.vae`,
     `musetalk.utils.blending` and `musetalk.utils.face_parsing`.
   * its **weights**, under `<--weights>/models/` as `download_weights.sh` lays them
@@ -223,7 +224,7 @@ interpreter and run this tool with that one:
 
   uv venv ~/.venvs/face-prepare --python 3.11
   VIRTUAL_ENV=~/.venvs/face-prepare uv pip install \\
-      torch diffusers transformers opencv-python numpy safetensors \\
+      torch diffusers transformers opencv-python numpy safetensors scipy \\
       pyobjc-framework-Vision
   ~/.venvs/face-prepare/bin/python -m evals.face_lipsync_prepare ...
 
@@ -270,6 +271,59 @@ def musetalk_bbox(
         int(points[:, 0].max()),
         min(y2 + EXTRA_MARGIN, height),
     )
+
+
+SMOOTH_WINDOW = 9
+"""Default box-smoothing window. Measured; see `smooth_boxes`."""
+
+
+def smooth_boxes(
+    boxes: list[tuple[int, int, int, int]], window: int
+) -> list[tuple[int, int, int, int]]:
+    """Savitzky-Golay the box series, wrapping at the loop point. 0 or 1 disables it.
+
+    Vision's per-frame boxes carry detector noise on top of the real head motion, and
+    the second difference tells them apart: over idle2's 193 frames the per-frame edge
+    shift is **1.08px** but the *jerk* is **1.42px**. Real motion has a smooth
+    trajectory, so its jerk is small - a jerk larger than the shift is noise. Every
+    frame therefore resamples its reference crop from a slightly different rectangle,
+    **0.89px/frame at the model's 256**, and a different reference latent generates a
+    different mouth. That is a vibration source, and the owner sees it as residual
+    tremor after the jitter causes inside the render were exhausted.
+
+    It costs nothing to remove, because the avatar is a **fixed clip**: the whole series
+    is known here, so the filter is centred (no runtime lag, no runtime work at all) and
+    it wraps - idle2 loops seamlessly, its wrap-pair frame difference 1.33 against 0.82
+    for a typical adjacent pair.
+
+    Sweep on idle2, jerk against how far the smoothed box departs from the detected one:
+
+        w=5   shift 0.84  jerk 0.57  departure max 2.1px
+        w=9   shift 0.72  jerk 0.28  departure max 3.7px
+        w=15  shift 0.67  jerk 0.17  departure max 5.0px
+        w=31  shift 0.60  jerk 0.09  departure max 6.1px
+
+    The jerk falls 5x by w=9 while the shift only falls a third - noise leaving, motion
+    staying. Past that the departure grows faster than the jerk gain. w=9's 3.7px
+    maximum is inside Vision's own per-frame scatter (the box formula's landmarks
+    disagree with FAN's by +-1.4 to +-1.7px), so the box is no less faithful to the face
+    than the raw one; it is only less noisy.
+
+    Everything downstream inherits this - the reference latents, the BiSeNet masks and
+    the crop boxes are all derived from `boxes` - which is why this is the one place to
+    do it and why it cannot drift out of step with the paste-back.
+    """
+    if window < 3:
+        return boxes
+    # Inside the function, like every other heavy import here: CI imports this module
+    # for its reachability check and must not need the operator's interpreter.
+    from scipy.signal import savgol_filter
+
+    series = np.asarray(boxes, dtype=float)
+    if window > len(series):
+        raise SystemExit(f"--smooth {window} exceeds the clip's {len(series)} frames")
+    smoothed = savgol_filter(series, window, 2, axis=0, mode="wrap")
+    return [tuple(int(round(v)) for v in box) for box in smoothed]
 
 
 def check_geometry(
@@ -373,6 +427,13 @@ def main() -> int:
         default=None,
         help="the directory holding models/ (default: --musetalk, upstream's layout)",
     )
+    parser.add_argument(
+        "--smooth",
+        type=int,
+        default=SMOOTH_WINDOW,
+        help=f"Savitzky-Golay window over the box series (default {SMOOTH_WINDOW}, "
+        "0 disables); see smooth_boxes for the measurement",
+    )
     args = parser.parse_args()
 
     clip = args.clip.expanduser().resolve()
@@ -430,6 +491,15 @@ def main() -> int:
         boxes.append(musetalk_bbox(every, half_y, height))
     print(f"Vision landmarks + boxes: {time.perf_counter() - start:.1f}s")
 
+    raw_jerk = float(np.abs(np.diff(np.asarray(boxes, dtype=float), axis=0, n=2)).mean())
+    boxes = smooth_boxes(boxes, args.smooth)
+    kept_jerk = float(np.abs(np.diff(np.asarray(boxes, dtype=float), axis=0, n=2)).mean())
+    print(
+        f"box smoothing: window {args.smooth}, jerk {raw_jerk:.2f} -> {kept_jerk:.2f}px"
+        if args.smooth >= 3
+        else f"box smoothing: off, jerk {raw_jerk:.2f}px"
+    )
+
     vae = VAE(model_path="models/sd-vae")
     vae.vae.to(device)
     vae.device = device
@@ -468,6 +538,7 @@ def main() -> int:
                 "fps": fps,
                 "size": [width, height],
                 "boxes": [list(box) for box in boxes],
+                "smooth": args.smooth,
                 "crop_boxes": [list(box) for box in crop_boxes],
             },
             indent=1,
