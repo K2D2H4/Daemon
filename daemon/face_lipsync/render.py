@@ -73,13 +73,38 @@ def restore_detail(
     the lip region, but that number ran *opposite* to the owner's own ranking of
     three renders - it buys the metric by destroying the detail.
 
+    **The texture is weighted down where the two pictures disagree, and that is what
+    stopped the mouth ghosting.** The driving frame's mouth is CLOSED. Borrowing its
+    high frequencies wholesale stamps a closed lip line onto an open mouth, every
+    frame, which reads as an afterimage - and no temporal filter can remove it,
+    because it is re-applied after the filter and re-derived from scratch each frame.
+    Two arms that mathematically cannot ghost (a temporal median, which never averages
+    two poses, and a blend of only the low frequencies, which takes every edge from
+    the current frame) both still showed it; turning this off removed it. So the
+    injection is scaled by how far the generated mouth has moved from the driving one:
+    full strength on cheeks and chin where they agree, off inside an open mouth where
+    they do not. The owner ranked it least-ghosting of three arms and read its
+    sharpness as unchanged.
+
     `mouth` must already be `box`-sized, as `composite` requires.
     """
     x1, y1, x2, y2 = box
     orig = frame[y1:y2, x1:x2].astype(np.float32)
     high = orig - cv2.GaussianBlur(orig, (0, 0), sigma)
-    return np.clip(mouth.astype(np.float32) + high, 0, 255).astype(np.uint8)
+    disagreement = np.abs(mouth.astype(np.float32) - orig).mean(axis=2)
+    weight = np.clip(1.0 - disagreement / DETAIL_CUTOFF, 0.0, 1.0)[..., None]
+    return np.clip(mouth.astype(np.float32) + high * weight, 0, 255).astype(np.uint8)
 
+
+DETAIL_CUTOFF = 40.0
+"""Mean per-channel difference at which the borrowed texture is fully suppressed.
+
+Not a tuned constant so much as a scale: below it the generated mouth and the driving
+frame are the same picture and the texture belongs; at it they are different pictures
+and the texture is the wrong one. An open mouth over a closed one clears this easily -
+teeth against lips is most of the 0-255 range - while the cheeks and chin the paste
+also covers sit far below it.
+"""
 
 BATCH = 2
 """Frames computed per model step, and this is arithmetic rather than taste.

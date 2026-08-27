@@ -335,10 +335,18 @@ def test_the_engine_receives_a_window_addressed_by_the_real_origin():
 # which is the only way to see it.
 
 
-def _textured(h, w):
-    """Fine checkerboard: energy at exactly the scale DETAIL_SIGMA separates."""
+def _textured(h, w, amp=45):
+    """Fine checkerboard: energy at exactly the scale DETAIL_SIGMA separates.
+
+    `amp` is its swing about mid-grey. It matters because `restore_detail` scales the
+    borrowed texture down by how far the mouth is from the driving frame, so a
+    checkerboard swinging further than DETAIL_CUTOFF reads as disagreement in its own
+    right and suppresses itself - which is correct behaviour and a useless fixture.
+    """
     y, x = np.mgrid[0:h, 0:w]
-    return np.repeat((((x + y) % 2) * 90 + 70).astype(np.uint8)[..., None], 3, axis=2)
+    return np.repeat(
+        (((x + y) % 2) * 2 * amp + (115 - amp)).astype(np.uint8)[..., None], 3, axis=2
+    )
 
 
 def _lap(img):
@@ -384,7 +392,7 @@ def test_restore_detail_preserves_shape_and_dtype():
     assert out.shape == mouth.shape and out.dtype == np.uint8
 
 
-def _frame_with_dot(at, value=255):
+def _frame_with_dot(at, value=160):
     """A single bright pixel at `at` (row, col) *within the box*, on flat mid-grey.
 
     A lone dot is the only fixture that pins position and sign at once, which the
@@ -392,6 +400,10 @@ def _frame_with_dot(at, value=255):
     region still raises high-frequency energy, and so does adding the residual
     with its sign flipped.
     """
+    # 160 rather than 255: `restore_detail` scales the borrowed texture down where
+    # the generated mouth and the driving frame disagree, and a lone 255 pixel against
+    # a flat 128 mouth IS that disagreement - it would suppress the very dot being
+    # measured. 160 stays inside DETAIL_CUTOFF, so position and sign stay readable.
     frame = np.full((200, 160, 3), 128, np.uint8)
     frame[BOX[1] + at[0], BOX[0] + at[1]] = value
     return frame
@@ -413,7 +425,7 @@ def test_restore_detail_adds_the_residual_and_does_not_subtract_it():
     flat = np.full((120, 60, 3), 128, np.uint8)
     out = restore_detail(flat, _frame_with_dot(at), BOX)
     assert int(out[at][0]) > 128
-    dark = restore_detail(flat, _frame_with_dot(at, value=0), BOX)
+    dark = restore_detail(flat, _frame_with_dot(at, value=96), BOX)
     assert int(dark[at][0]) < 128
 
 
@@ -438,13 +450,17 @@ def test_encode_actually_restores_detail():
     cache = _cache()
     # The driving frame audio frame 0 actually lands on - DISPLAY_LEAD ahead of it.
     shown = DISPLAY_LEAD % len(cache.boxes)
-    cache.frames[shown, BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60)
+    cache.frames[shown, BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60, amp=18)
     ring = _distinct_tone_ring()
-    r = Renderer(engine=FakeEngine(), cache=cache, ring=ring)
+    # 115 is the checkerboard's own mean. The mouth has to broadly AGREE with the
+    # driving frame for any texture to be injected now, so a 200 mouth over a 115
+    # texture would be suppressed outright and this test would pass for the wrong
+    # reason - by comparing two identical composites.
+    r = Renderer(engine=_Mouths([115, 115]), cache=cache, ring=ring)
     encoded = _jpegs(r, frame_index=0)
 
     got = cv2.imdecode(np.frombuffer(encoded[0], np.uint8), cv2.IMREAD_COLOR)
-    flat = np.full((120, 60, 3), 200, np.uint8)
+    flat = np.full((120, 60, 3), 115, np.uint8)
     plain = composite(cache.frames[shown], flat, BOX, CROP_BOX, cache.masks[shown])
     restored = composite(
         cache.frames[shown],
@@ -764,4 +780,28 @@ def test_the_borrowed_texture_is_not_damped_by_the_blend():
     assert got_lap > want_lap * 0.7, (
         f"texture arrived damped: {got_lap:.1f} against {want_lap:.1f} - the blend "
         "is running after restore_detail, not before it"
+    )
+
+
+def test_the_texture_is_suppressed_where_the_mouth_has_moved_away():
+    """The ghost fix, and the thing every temporal filter failed to remove.
+
+    The driving frame's mouth is CLOSED. Injecting its high frequencies wholesale
+    stamps a closed lip line onto an open mouth every frame - re-derived after any
+    smoothing, so a temporal median and a low-frequency-only blend, neither of which
+    can average two poses, both still showed it. The injection is therefore scaled by
+    how far the mouth has moved: full where the two agree, off where they do not.
+    """
+    frame = np.zeros((200, 160, 3), np.uint8)
+    frame[BOX[1] : BOX[3], BOX[0] : BOX[2]] = _textured(120, 60, amp=18)
+    agrees = np.full((120, 60, 3), 115, np.uint8)      # the texture's own mean
+    differs = np.full((120, 60, 3), 250, np.uint8)     # an open mouth over a closed one
+
+    kept = restore_detail(agrees, frame, BOX)
+    assert _lap(kept) > _lap(agrees) * 10, "texture must flow where the two agree"
+
+    dropped = restore_detail(differs, frame, BOX)
+    assert np.array_equal(dropped, differs), (
+        "a mouth this far from the driving frame must get no borrowed texture at all - "
+        "that texture is a picture of a different mouth"
     )
