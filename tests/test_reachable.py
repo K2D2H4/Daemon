@@ -79,6 +79,18 @@ PENDING_CLASSES: dict[str, str] = {
     # `test_the_lipsync_path_is_reachable_from_settings` below, which asserts the two
     # things a factory-built engine can still be checked for: that `app.py` calls the
     # loader, and that it reads the switch.
+    #
+    # And the clip policy, for as long as the loop that would drive it is unwritten.
+    # `daemon/face_clips.py` is the whole of it - `wanted` and the two clip sets are
+    # declared in `PENDING_IMPORTS` below rather than here, because they are not
+    # classes and not one seam either.
+    "ClipQueue": (
+        "the multi-clip lip-sync plan's task 4 "
+        "(docs/superpowers/plans/2026-08-31-face-lipsync-multiclip.md), which builds "
+        "one queue per render loop in `daemon/app.py:_lipsync_loop` - the face is a "
+        "separate track and sits outside docs/PLAN.md's M0-M5 roadmap entirely, so "
+        "there is no milestone letter to give it"
+    ),
 }
 
 PENDING_WIRING = {
@@ -127,6 +139,30 @@ Not a "load-bearing seams only" list. The file's whole subject is built-tested-
 unreachable, and picking which unreachable symbols to track by how important they
 feel is how the untracked one turns out to be the one that mattered - here, the
 rule-12 visibility read."""
+
+PENDING_IMPORTS: dict[str, str] = {
+    "face_clips": (
+        "the multi-clip lip-sync plan's task 4 "
+        "(docs/superpowers/plans/2026-08-31-face-lipsync-multiclip.md) - `wanted` and "
+        "the clip sets are pure policy and `daemon/app.py` is what will ask them which "
+        "clip is up. The face is a separate track, outside docs/PLAN.md's M0-M5 "
+        "roadmap, so there is no milestone letter to give it"
+    ),
+}
+"""A whole module under `daemon/` that nothing under `daemon/` imports.
+
+The third shape of the same defect, and it needs its own dict because neither of the
+two above can hold it. `PENDING_CLASSES` only holds types, and `PENDING_WIRING` matches
+on a bare substring - which `daemon/face_clips.py:wanted` cannot survive. "wanted" is a
+word this codebase writes in nine other files (a local in `app.py`, prose in
+`timesense.py`), and even narrowing the key to "wanted(" still catches
+`voice/wake.py`'s `self._floor_wanted()`. Widening `allowed` until those pass would put
+`app.py` - the one file whose mention is the thing being waited for - on the list of
+files allowed to mention it, which is the check deleting itself.
+
+A module name collides with nothing, so that is what is tracked. The value is the
+owning milestone, read the same way as every dict above; the module's own file is the
+only place allowed to mention it, and no allowlist is needed to say so."""
 
 WIRED_CLASSES = (
     # What both endpoints do their work through. Named here because a capability
@@ -422,6 +458,31 @@ def test_declared_wiring_gaps_are_still_gaps(name: str) -> None:
     )
 
 
+@pytest.mark.parametrize("name", sorted(PENDING_IMPORTS))
+def test_declared_module_gaps_are_still_gaps(name: str) -> None:
+    """The other direction for a module nothing imports yet.
+
+    When the plan's task 4 writes `from daemon import face_clips` this fails, which is
+    the reminder to delete the entry rather than leave a closed gap declared open. The
+    module's own file is excluded and nothing else is: a policy module is reachable
+    exactly when some other file under `daemon/` names it.
+    """
+    importers = sorted(
+        path.name for path, text in _sources() if name in text and path.stem != name
+    )
+    assert not importers, (
+        f"daemon/{name}.py is now named in {importers} - remove it from PENDING_IMPORTS. "
+        f"{PENDING_IMPORTS[name]}"
+    )
+
+
+def test_every_declared_module_gap_names_a_real_module() -> None:
+    """Same reason as the seam check below: a gap declared against a module nothing
+    defines cannot close, and would sit here reading as work someone still owes."""
+    for name in PENDING_IMPORTS:
+        assert (DAEMON / f"{name}.py").exists(), f"daemon/{name}.py does not exist"
+
+
 def test_every_declared_wiring_gap_names_a_real_seam() -> None:
     """A gap declared against a name nothing defines is a gap that cannot close,
     and it would sit here reading as work someone still owes."""
@@ -553,7 +614,12 @@ def test_the_lipsync_path_is_reachable_from_settings() -> None:
 def test_every_pending_entry_names_its_milestone() -> None:
     """A gap without an owner is just a gap."""
     wiring = {name: reason for name, (reason, _allowed) in PENDING_WIRING.items()}
-    for label, reason in (*PENDING_TASKS.items(), *PENDING_CLASSES.items(), *wiring.items()):
+    for label, reason in (
+        *PENDING_TASKS.items(),
+        *PENDING_CLASSES.items(),
+        *PENDING_IMPORTS.items(),
+        *wiring.items(),
+    ):
         assert re.search(r"M\d", reason), f"{label} is pending with no milestone: {reason!r}"
 
 
