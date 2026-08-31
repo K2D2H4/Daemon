@@ -611,21 +611,26 @@ def test_the_page_follows_the_daemons_clip_clock_rather_than_its_own():
     )
 
 
-def test_the_overlay_waits_for_a_frame_belonging_to_this_turn():
-    """`speaking` arrives at once; this turn's first rendered frame cannot for ~250ms.
+def test_the_overlay_waits_only_for_its_first_frame():
+    """An empty canvas must not fade in over a clip, and that is now the whole gate.
 
-    Whatever is on the canvas in between belongs to the LAST utterance - a pose from
-    wherever that sentence ended - and fading it in is the same "a different clip
-    started" by another route. So the overlay is gated on a frame having arrived, and
-    the queue is dropped at the boundary so the frame that lifts the gate is this
-    turn's rather than the last one's leftovers.
+    It used to be cleared at every activity change, because a frame arriving after
+    `speaking` could be the LAST utterance's - a pose from wherever that sentence ended.
+    The daemon driving every prepared clip removes that at the source: frames arrive
+    continuously and are always of the clip that is up, so there is no stale frame to
+    hide from, and clearing the gate per turn would only blink the canvas off at each
+    change - the flicker ADR 0020's task set out to remove.
+
+    The queue is still dropped at a boundary, for the reason it always was: an
+    ImageBitmap is ~7MB and a mouth for a finished sentence is never wanted again.
     """
     assert "function mouthLive() { return mouthReady() && mouthFresh; }" in PAGE
 
     turn = _body("function toActivity(act) {")
-    assert "mouthFresh = false" in turn and "mouthQueue.shift().close()" in turn, (
-        "a turn boundary has to reset the gate AND drop the last turn's frames, or "
-        "the gate is lifted by a mouth for a sentence that has finished"
+    assert "mouthQueue.shift().close()" in turn, "the boundary still drops the queue"
+    assert "mouthFresh = false" not in turn, (
+        "clearing the gate per turn takes the canvas off screen until the next frame "
+        "decodes, which with every clip driven is a blink rather than protection"
     )
 
     # Lifted from the decode callback and not from presentMouth(), because rAF stops
@@ -665,22 +670,64 @@ def test_the_crop_is_not_taken_off_the_screen_by_rAF():
     assert "presentMouth" in body, (
         "and the frames themselves must, or presentation is back on the socket's clock"
     )
-    # No timer here any more: with the browser streaming the image there is no
-    # per-frame callback to re-arm one from, and nothing to age out. Everything that
-    # can change the answer still has to say so, which is what the loop below checks -
-    # and that set now carries the whole job rather than sharing it with a watchdog.
-    # And every other place the answer can change has to say so, or the crop outlives
-    # the state that justified it: a mood one-shot replacing the driving clip, the
-    # activity leaving speaking, and becoming visible after rAF was stopped.
-    for where in ("function toActivity(act) {",
-                  "function playOneShot(stem, { flourish = false } = {}) {",
-                  "function advance() {"):
-        assert "refreshMouth" in _body(where), f"{where} must refresh the overlay"
+    # No timer here, and a shorter list of callers than this test used to carry. The
+    # answer is `mouthLive()` and nothing else can move it now: the activity cannot
+    # (`refreshMouth` no longer reads it) and a one-shot cannot (the daemon plays those
+    # as its own clip). What is left is the first frame decoding, and correcting a write
+    # that rAF may have left mid-fade.
+    assert "refreshMouth" in _body("function decodeFrame(bytes) {"), (
+        "the first frame arriving is what lifts the gate, and it has to say so"
+    )
     start = PAGE.index('addEventListener("visibilitychange"')
     handler = _without_line_comments(PAGE[start : PAGE.index("});", start)])
     assert "refreshMouth" in handler, (
         "becoming visible is when a stale overlay has to be corrected"
     )
+
+
+def test_the_canvas_is_on_for_every_activity_and_every_mood():
+    """The colour fix, finished - and the assertion is a negative on purpose.
+
+    Chrome's decode of the untagged mp4 disagrees with its decode of our JPEGs (measured
+    R +3.0, G +2.1, B +1.2), so every moment this canvas goes on or off shifts the whole
+    picture. The first fix published idle as frames, closing idle<->speaking; a real
+    conversation crosses listening->speaking, where the canvas was still off, and the
+    owner watched the shift come back on every turn of a live session. Anything that
+    reintroduces a gate here reintroduces that, so the gate's absence is what is pinned.
+    """
+    body = _body("function refreshMouth() {")
+    assert "const on = mouthLive();" in body
+    assert "activity ===" not in body, "an activity gate is the colour shift coming back"
+    assert "oneShotUntil" not in body, "so is a mood exception - the daemon drives those"
+
+
+def test_the_page_does_not_play_a_gesture_the_daemon_is_already_playing():
+    """A mood is queued to the current clip's end and arrives already composited, with
+    the frame's own header moving `mouthClip`. Playing it here as well would put a
+    second, unsynchronised copy of the same expression under the canvas."""
+    body = _body("function playOneShot(stem, { flourish = false } = {}) {")
+    assert "if (mouthReady()) return;" in body
+
+
+def test_the_page_learns_the_clip_from_the_frame_that_is_of_it():
+    """Off the part's own header, not a second channel. An activity event and the frames
+    it implies do not arrive together, so a page told over `/face/stream` would hold the
+    wrong clip under the canvas for as long as the two disagreed - and that clip is the
+    entire fallback when the frames stop. A part header cannot disagree with its body.
+    """
+    assert "function partClip(buf, head)" in PAGE
+    assert "x-face-clip" in PAGE.lower()
+    reader = _body("async function readFrames() {")
+    assert "partClip(buf, head)" in reader and "mouthClip = clip" in reader
+
+
+def test_while_the_daemon_drives_it_chooses_the_clip_for_every_activity():
+    """It composites onto the frame it believes is up, so the page following anything
+    else puts a different head under the mouth. The chains below it are the v1 fallback
+    and ADR 0017 still governs them, which is why they are still here."""
+    body = _body("function clipFor(act) {")
+    assert "if (mouthReady()) return mouthClip;" in body
+    assert "FOR_ACTIVITY" in body, "the fallback chain must survive for a dead renderer"
 
 
 def test_the_frame_is_presented_on_a_clock_of_its_own():

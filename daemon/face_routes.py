@@ -375,6 +375,17 @@ async def frames(request: Request) -> Response:
                 yield (
                     b"--" + BOUNDARY + b"\r\n"
                     b"Content-Type: image/jpeg\r\n"
+                    # Which clip this frame was composited into, travelling WITH the
+                    # frame rather than on `/face/stream`. The page lays its own
+                    # `<video>` of that clip underneath as the fallback for a renderer
+                    # that stops, and it now changes while the response is open - so a
+                    # second channel would race it: an activity event and the frames it
+                    # implies do not arrive together, and the page would put the wrong
+                    # clip under a frame for as long as the two disagreed. A part header
+                    # cannot disagree with its own body. The page already parses these
+                    # headers itself (`headerEnd`/`contentLength`), so this costs it a
+                    # regex and no round trip.
+                    b"X-Face-Clip: " + source.clip.encode() + b"\r\n"
                     b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n"
                     + frame + b"\r\n"
                 )

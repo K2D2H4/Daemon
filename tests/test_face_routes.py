@@ -507,6 +507,47 @@ async def test_a_quiet_renderer_keeps_the_stream_open_and_sends_no_frame(app):
     )
 
 
+async def test_every_part_names_the_clip_its_frame_was_composited_into(app):
+    """The page lays a `<video>` of that clip under the canvas as its fallback, and the
+    clip changes while this response is open.
+
+    On the part rather than on `/face/stream`, and that is the point: an activity event
+    and the frames it implies do not arrive together, so a page told over the other
+    channel would hold the wrong clip under the canvas for as long as the two disagreed
+    - and that clip is the whole fallback if the frames stop. A part header cannot
+    disagree with its own body.
+    """
+    source = FakeFrames()
+    source.clip = "listening"
+
+    async def drive():
+        await asyncio.sleep(0.02)
+        source.put(FRAME + b"a")
+        await asyncio.sleep(0.05)
+        # The daemon reached a clip boundary mid-response. Every part from here on has
+        # to say so, or the page keeps `listening` under a frame of `amused`.
+        source.clip = "amused"
+        source.put(FRAME + b"b")
+        await asyncio.sleep(0.05)
+        source.failed = True
+
+    _with_lipsync(app, source)
+    lines = await _transcript(app, drive)
+
+    named = []
+    for part in lines.split(b"--" + BOUNDARY + b"\r\n")[1:]:
+        head, _, _rest = part.partition(b"\r\n\r\n")
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"x-face-clip"):
+                named.append(line.split(b":")[1].strip().decode())
+    assert named, "no part named its clip at all"
+    assert named[0] == "listening", f"the first frame was of listening, not {named[0]}"
+    assert "amused" in named, "the clip changed mid-response and no part said so"
+    assert named == sorted(named, key=["listening", "amused"].index), (
+        "the names have to follow the frames, not arrive in some other order"
+    )
+
+
 async def test_the_frames_reach_the_page_byte_for_byte_and_in_order(app):
     """The JPEGs the renderer published, base64'd, in the order it published them.
 

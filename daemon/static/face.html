@@ -227,8 +227,11 @@ let mouthSeq = 0;             // frames handed to the decoder, in arrival order
 let mouthQueuedSeq = 0;       // highest one that reached the queue, so a decode that
                                // finishes out of order is dropped rather than shown
                                // after the frame that overtook it
-let mouthFresh = false;       // a frame rendered for THIS turn has been decoded - see
-                               // mouthLive() and toActivity()
+let mouthFresh = false;       // a frame has been decoded since the stream opened, so
+                               // there is something true to show. No longer cleared per
+                               // turn: the daemon drives every clip now and publishes
+                               // continuously, so there is no such thing as a frame
+                               // belonging to the previous utterance
 let driverEpoch = 0;          // page-clock seconds at which the driving clip's playhead
                                // read 0, from /face/manifest - see driverAt()
 
@@ -269,20 +272,17 @@ function isDriver(stem) { return mouthReady() && stem === mouthClip; }
 // leaves the clip alone, and the page never has to choose between a frozen mouth and
 // a clip that changes twice a second.
 function mouthReady() { return !!mouthClip && !mouthDead; }
-// No staleness clock any more, and not for want of one: an <img> fed
-// multipart/x-mixed-replace gives the page no per-frame event to time from (Chrome
-// fires `load` once for the whole stream). It does not need one - `refreshMouth`
-// already gates on `activity === "speaking"`, which the activity stream delivers, and
-// the renderer only draws while speaking. The frames stopping for good is a separate
-// signal: the response ends and `onerror` below fires.
+// No staleness clock any more, and not for want of one: the page gets no per-frame
+// event to time from. It does not need one - the frames stopping for good is its own
+// signal, because the response ends and `onerror` below fires.
 //
-// It needs the RISING edge, though, and that is `mouthFresh`. `speaking` arrives the
-// instant the daemon starts talking; the first frame rendered for that turn cannot
-// arrive for a quarter of a second (render.py:DISPLAY_LEAD's arithmetic). Without this
-// the page spends that quarter-second fading in the canvas as it stands - which is the
-// LAST frame of the previous utterance, a pose from wherever that sentence happened to
-// end. Ten frames of a stale head dissolving over a live one, at exactly the moment
-// this whole change exists to keep still. Off until there is something true to show.
+// `mouthFresh` is now only the first rising edge: an empty canvas must not fade in over
+// a clip before there is anything in it. It used to be cleared on every activity change,
+// to keep the LAST frame of the previous utterance from dissolving over a live head at
+// the start of the next one - a real defect, and one the daemon driving every clip
+// removes at the source. Frames arrive continuously and are always of the clip that is
+// up, so there is no stale frame to hide from; clearing this per turn would only blink
+// the canvas off at each change, which is the flicker this whole task removes.
 function mouthLive() { return mouthReady() && mouthFresh; }
 
 // Whether the crop is on screen, recomputed from state and written only on change.
@@ -294,18 +294,18 @@ function mouthLive() { return mouthReady() && mouthFresh; }
 // re-arms. Measured while getting this wrong: with the visibility toggle inside tick(),
 // killing the renderer left the overlay stuck mid-fade at opacity 0.13 for good.
 function refreshMouth() {
-  // Idle counts too, and that is a colour fix rather than a widening. The daemon now
-  // sends the driving clip's own frames while nothing is being said, so this canvas
-  // carries both states and the <video> underneath is only the fallback. It used to
-  // show the clip at idle and the canvas while speaking, and Chrome's decode of the
-  // untagged mp4 disagrees with its decode of our JPEGs - measured R +3.0, G +2.1,
-  // B +1.2 - so the whole picture, background included, shifted darker and off-hue
-  // the instant speech began. One decoder, no shift.
+  // Every activity, and no one-shot exception. This is the colour fix finished.
   //
-  // A mood one-shot still takes the canvas away: those are a different clip, and the
-  // frame stream has no idea they are playing.
-  const on = (activity === "speaking" || activity === "idle")
-    && !oneShotUntil && mouthLive();
+  // Chrome's decode of the untagged mp4 disagrees with its decode of our JPEGs -
+  // measured R +3.0, G +2.1, B +1.2 - so any moment this canvas goes on or off, the
+  // whole picture shifts darker and off-hue. The first fix published idle as frames too,
+  // which closed the idle<->speaking boundary; a real conversation crosses
+  // listening->speaking, where the canvas was still off, and the owner saw the shift
+  // come back on every turn of a live session. It is closed for good here because the
+  // daemon drives every prepared clip, so there is no activity and no mood for which
+  // the frames are not the right picture. The <video> underneath is the fallback and
+  // nothing else - see mouthDead.
+  const on = mouthLive();
   if (on === mouthShown) return;
   mouthShown = on;
   // Single-sided, spec 3.2: only the crop's opacity animates, over a clip that is
@@ -335,6 +335,11 @@ let transitions = null;       // task 9: the pose-match table from /face/transit
                                // frame 0, same as today)
 
 function clipFor(act) {
+  // While the daemon is driving, it owns this decision for every activity - it
+  // composites onto the frame it believes is up, so the page following anything else
+  // would put a different head under the mouth. The chains below are the v1 fallback
+  // and ADR 0017 still governs them.
+  if (mouthReady()) return mouthClip;
   if (act === "idle") {
     // While lip-sync is alive, idle IS the driving clip and does not rotate. The
     // owner's report was that speech "just feels like a different clip starting", and
@@ -583,6 +588,15 @@ async function readFrames() {
       const length = contentLength(buf, head);
       if (length === null) return;        // the closing boundary; nothing follows it
       if (buf.length < head + 4 + length) break;
+      const clip = partClip(buf, head);
+      if (clip && clip !== mouthClip) {
+        // The daemon moved the clip. Follow it so the <video> underneath is the one the
+        // frames are of - it is invisible while the canvas is up, and it is the whole
+        // fallback if the frames stop. No fade: the canvas covers it either way, and a
+        // crossfade here would only cost a decode.
+        mouthClip = clip;
+        if (have.has(clip)) show(clip, { loop: loops(activity), fadeMs: 0 });
+      }
       decodeFrame(buf.slice(head + 4, head + 4 + length));
       buf = buf.slice(head + 4 + length);
     }
@@ -607,6 +621,17 @@ function contentLength(buf, head) {
     new TextDecoder().decode(buf.subarray(0, head))
   );
   return found ? Number(found[1]) : null;
+}
+
+function partClip(buf, head) {
+  // The clip this frame was composited into, off the part's own headers. Travelling
+  // with the frame is the point: an activity event and the frames it implies do not
+  // arrive together, so a second channel would leave the wrong clip under the canvas
+  // for as long as the two disagreed.
+  const found = /x-face-clip:\s*([a-z0-9_]+)/i.exec(
+    new TextDecoder().decode(buf.subarray(0, head))
+  );
+  return found ? found[1] : null;
 }
 
 function decodeFrame(bytes) {
@@ -760,14 +785,12 @@ function toActivity(act) {
   oneShotIsFlourish = false;
   clearPendingWait();           // any earlier deferred wait is moot now
   scheduleFlourish();
-  // A turn boundary in both directions. Whatever is on the canvas belongs to the last
-  // utterance and is about to be the wrong pose, and whatever is still in the queue is
-  // a mouth for a sentence that has finished - see mouthLive(). Dropped rather than
-  // drawn: an ImageBitmap is ~7MB and nothing here will ever want these again.
-  mouthFresh = false;
+  // The queue is still dropped at a turn boundary - an ImageBitmap is ~7MB and a frame
+  // for a sentence that has finished is never wanted again - but `mouthFresh` is NOT
+  // cleared with it any more. Clearing it took the canvas off screen until the next
+  // frame decoded, which with the daemon driving every clip is a blink at every
+  // activity change rather than protection from a stale pose. See mouthLive().
   while (mouthQueue.length) mouthQueue.shift().close();
-  refreshMouth();               // leaving speaking takes the crop off the screen, and
-                                 // arriving at it waits for this turn's first frame
   const fadeMs = SLOW_FADE_ACTIVITIES.has(act) ? FADE_SLOW_MS : FADE_MS;
   const stem = clipFor(act);
   if (!stem) return;
@@ -795,6 +818,11 @@ function toActivity(act) {
 
 function playOneShot(stem, { flourish = false } = {}) {
   if (!have.has(stem)) return;           // no clip, no expression - never substitute idle
+  // While the daemon is driving, the gesture is ITS clip to play: it queues the mood to
+  // the current clip's own end and the frames arrive already composited onto it, with
+  // the header moving `mouthClip` when they do. Playing it here as well would put a
+  // second, unsynchronised copy of the same expression under the canvas.
+  if (mouthReady()) return;
   oneShotUntil = Infinity;
   oneShotIsFlourish = flourish;  // see toActivity(): only a flourish yields to an
                                  // activity change
