@@ -65,14 +65,18 @@ of the baseline, and only three of ninety pairs exceed the baseline's own worst 
 0.01–0.04. No crossfade, no pose-match table and no neutral wait are needed to achieve
 it — those exist to make a *mid-clip* switch survivable, and this design has none.
 
-**Waiting for a "near-neutral moment" does not reliably buy smoothness.**
+**Waiting for a "near-neutral moment" does not reliably buy smoothness *for a one-shot*.**
 `face_match.py`'s neutral flag is measured against *each clip's own frame 0*, not a pose
 shared across clips, so "neutral for `idle2`" does not imply "close to `amused`'s frame
 0" — `idle2@1.75s` is flagged neutral and is 8.94 from it. The buckets are 0.5s (12
 frames) and the flag means *some* frame in the slice is near neutral, not the frame the
 cut lands on; the runtime only knows the bucket, so that imprecision is the mechanism's
 and not the measurement's. `face_match.py`'s hub-and-spoke docstring reads stronger than
-what the data supports.
+what the data supports. **Scope, because the table is narrower than that
+heading:** both one-shot rows measure entry at frame 0, which is what a one-shot must
+do. ADR 0017's loop-to-loop path is neutral-wait *then pose-matched* entry, and nothing
+here measures it — 0017's own numbers still govern that half, and this plan does not
+touch it.
 
 **The cost is expression latency, and it was accepted knowingly.** A one-shot queued to
 the clip end arrives after half a clip on average: 4.0s behind idle1/2/3, 3.1s behind

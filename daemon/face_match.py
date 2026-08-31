@@ -132,12 +132,34 @@ p90 well under a couple of seconds for every loop clip but flourish_arms)
 barely moved between the two, so the choice inside that band is not load-
 bearing. 0.20 is the midpoint of the two endpoints actually measured, not a
 third, untested value - splitting the difference rather than committing to
-either edge those two runs happened to use."""
+either edge those two runs happened to use.
+
+What the flag does *not* say is where a cut lands. A bucket is true when *some*
+frame in its BUCKET-second slice qualifies - 12 frames of the played clip - and
+the runtime only ever sees the bucket, so the frame a transition actually lands
+on need not be one of the qualifying ones. Measured against real joins, that
+costs: cutting at a near-neutral moment into a one-shot's frame 0 runs to p90
+5.06 and max 8.95 against a 2.14 loop-point worst case, with 34% of samples over
+it ([ADR 0020](../docs/adr/0020-lip-sync-makes-a-clip-ambient.md)). The
+imprecision is the mechanism's, not the measurement's, which is why this flag is
+a heuristic about the clip and not a promise about the join."""
 
 ONE_SHOTS = frozenset({"amused", "sulky", "curious", "flourish_arms"})
-"""Mood one-shots and the idle flourish: each is an arc from the shared neutral
-pose and back (design spec §1's "hub-and-spoke"), so entering one mid-arc, at
-whatever pose the outgoing loop left off on, would destroy the arc (rule 3).
+"""Mood one-shots and the idle flourish: each is an arc from its own neutral
+start pose and back (design spec §1's "hub-and-spoke"), so entering one mid-arc,
+at whatever pose the outgoing loop left off on, would destroy the arc (rule 3).
+That reason is unchanged, and it is why a one-shot never appears in `match`.
+
+This used to read "an arc from the *shared* neutral pose", which claimed more
+than anything here measures. `neutral` is computed against *each clip's own*
+frame 0 (see NEUTRAL_THRESHOLD_FRACTION), so a bucket flagged neutral in one
+clip says nothing about its distance from a *different* clip's frame 0 - the
+pose a one-shot has to be entered at. Measured: `idle2@1.75s` is flagged
+neutral and sits 8.94 from `amused`'s frame 0, against a loop-point baseline of
+1.14 median and 2.14 worst case
+([ADR 0020](../docs/adr/0020-lip-sync-makes-a-clip-ambient.md)). Hub-and-spoke
+is how the clips were authored; it is not a distance this module checks.
+
 Hardcoded rather than imported: `daemon/face.py`'s `Mood` literal and the
 flourish list in `daemon/static/face.html` both know this split, but this module
 may import neither - only `face_routes`'s flat `CLIPS` tuple, which does not
