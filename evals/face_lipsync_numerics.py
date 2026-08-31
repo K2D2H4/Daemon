@@ -52,8 +52,18 @@ failed - and it did: the split there collided on `.bias` keys, and mlx's
 `tree_unflatten` answers a duplicate key with unbounded recursion rather than an
 error naming the key.
 
-This does not run the model or recompute the spike's cosine similarity; it checks
-structural facts a running model would depend on. Never run in CI.
+**The second half does run the model, once, for a question CI equally cannot ask.**
+`MlxEngine` now holds one latent table per prepared clip and `mouths` selects with a
+`clip` keyword, because the 1.6GB of UNet/TAESD/whisper weights say nothing about
+which clip is on screen and the tables are 1.3-3.0MB each. Two ways for that to be
+silently wrong: a second clip's table perturbs the first clip's mouth (it must not -
+the arrays are independent, so the same request must be bit-identical to what a
+single-clip engine returned), or the keyword is accepted and ignored, in which case
+every clip renders `idle2`'s mouth and nothing raises. The first needs two builds to
+compare; the second needs two clips in one build. Both are here, and neither is
+reachable from CI, which has no weights and no mlx wheel.
+
+It does not recompute the spike's cosine similarity against PyTorch. Never run in CI.
 """
 
 from __future__ import annotations
@@ -62,6 +72,8 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from daemon.face_lipsync.loader import (
     needs_split,
     needs_squeeze,
@@ -69,6 +81,100 @@ from daemon.face_lipsync.loader import (
     split_names,
     unet_config,
 )
+
+
+def _clip_selection(mx, root: Path, models: Path) -> int:
+    """Build the engine twice and ask whether a second clip changed the first's mouth.
+
+    Sequential rather than side by side: each build holds 1.7GB of UNet, so the first
+    engine is dropped before the second is made. The comparison is on the returned
+    uint8 mouths, where equality IS bit equality - there is no tolerance to choose,
+    because selecting a row out of a dict of arrays cannot be approximately right.
+
+    Deterministic audio, generated here: a 220Hz tone of exactly `CONTEXT_MS` plus one
+    200ms window, which is what `PcmRing.window` hands over in production. Two windows
+    and two frame indices, because `BATCH` is 2 and a batched call is the only one the
+    render loop ever makes.
+    """
+    from daemon.face_lipsync.audio import CONTEXT_MS
+    from daemon.face_lipsync.engine import load
+
+    others = sorted(
+        d.name
+        for d in root.iterdir()
+        if d.is_dir() and d.name != "idle2" and (d / "latents.safetensors").exists()
+    )
+    idle2 = root / "idle2" / "latents.safetensors"
+    if not idle2.exists() or not others:
+        print("MISSING CLIP CACHES - the selection check did not run, this is not a pass:")
+        print(f"  idle2 latents: {idle2} {'found' if idle2.exists() else 'NOT FOUND'}")
+        print(f"  other prepared clips with latents: {others or 'none'}")
+        print(
+            "Each is built by hand, once per clip: "
+            "`python3 -m evals.face_lipsync_prepare`. Two clips are the minimum this "
+            "check needs - one to select, one to prove the selection is a choice."
+        )
+        return 1
+    other = others[0]
+    # Named rather than counted as "the ten prepared clips": this finds every
+    # directory under the cache root that holds a latents file, and a machine that
+    # has done this work also has backups of one (`idle2-raw-backup`, on the owner's).
+    print(f"  driving: idle2, second table: {other}")
+    print(f"  latents found under {root}: {', '.join(['idle2'] + others)}")
+
+    # 24kHz because that is what the ring holds - `daemon/voice/audio.py`'s
+    # OUTPUT_SAMPLE_RATE, not whisper's 16kHz, which `resample_to_whisper` reaches.
+    rate = 24_000
+    samples = int(rate * (CONTEXT_MS + 200.0) / 1000.0)
+    time = np.arange(samples, dtype=np.float32) / rate
+    windows = [
+        (0.25 * np.sin(2.0 * np.pi * 220.0 * (time + shift))).astype(np.float32)
+        for shift in (0.0, 0.02)
+    ]
+    indices = [7, 8]
+
+    def build(latents: dict[str, Path]):
+        return load(
+            unet_weights=models / "unet.safetensors",
+            unet_config_json=models / "musetalk.json",
+            taesd_weights=models / "taesd.safetensors",
+            whisper_repo="mlx-community/whisper-tiny-mlx",
+            latents=latents,
+            sample_rate=rate,
+        )
+
+    print("  building the single-clip engine", flush=True)
+    engine = build({"idle2": idle2})
+    single = engine.mouths(windows, indices, clip="idle2")
+    del engine
+    mx.clear_cache()
+
+    print("  building the two-clip engine", flush=True)
+    engine = build({"idle2": idle2, other: root / other / "latents.safetensors"})
+    both = engine.mouths(windows, indices, clip="idle2")
+    elsewhere = engine.mouths(windows, indices, clip=other)
+
+    for i, (one, two) in enumerate(zip(single, both, strict=True)):
+        if not np.array_equal(one, two):
+            differing = int(np.count_nonzero(one != two))
+            print(
+                f"FAIL frame {indices[i]} of idle2 changed when a second clip's "
+                f"latents were loaded: {differing} of {one.size} bytes differ, "
+                f"max |delta| {int(np.abs(one.astype(int) - two.astype(int)).max())}"
+            )
+            return 1
+    print(f"  idle2 bit-identical with {other} loaded ({len(both)} frames)")
+
+    # The other direction: if `clip` were accepted and ignored, every frame above
+    # would still match and every clip would render idle2's mouth.
+    if all(np.array_equal(a, b) for a, b in zip(both, elsewhere, strict=True)):
+        print(
+            f"FAIL clip={other} returned idle2's mouths exactly - the keyword is "
+            "being ignored, or both tables hold the same latents"
+        )
+        return 1
+    print(f"  clip={other} selects its own latents (mouths differ, as they must)")
+    return 0
 
 
 def main() -> int:
@@ -86,11 +192,12 @@ def main() -> int:
         )
         return 1
 
-    root = Path("data/face/lipsync/models")
-    config_path = root / "musetalk.json"
-    weights_path = root / "unet.safetensors"
+    root = Path("data/face/lipsync")
+    models = root / "models"
+    config_path = models / "musetalk.json"
+    weights_path = models / "unet.safetensors"
 
-    print(f"weights root: {root}")
+    print(f"weights root: {models}")
     missing = [path for path in (config_path, weights_path) if not path.exists()]
     if missing:
         print("MISSING WEIGHTS - nothing was checked, this is not a pass:")
@@ -164,7 +271,9 @@ def main() -> int:
             print(f"  {key}: {shape}")
         return 1
     print(f"  proj_in/proj_out/conv_shortcut rank OK ({len(linear_like)} tensors)")
-    return 0
+
+    print("one engine, latents per clip", flush=True)
+    return _clip_selection(mx, root, models)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ CI must never touch a gigabyte of weights.
 
 import cv2
 import numpy as np
+import pytest
 
 from daemon.face_lipsync import Cache, composite
 from daemon.face_lipsync.audio import latest_audio_ms
@@ -17,6 +18,7 @@ from daemon.face_lipsync.render import (
     MOTION_BLEND,
     RELEASE_FRAMES,
     ClipClock,
+    Driver,
     FrameClock,
     Renderer,
     detail_weight,
@@ -56,10 +58,12 @@ class FakeEngine:
     def __init__(self) -> None:
         self.calls: list[list[int]] = []
         self.window_calls: list[list[np.ndarray]] = []
+        self.clips: list[str] = []
 
-    def mouths(self, windows, frame_indices):
+    def mouths(self, windows, frame_indices, *, clip):
         self.calls.append(list(frame_indices))
         self.window_calls.append([w.copy() for w in windows])
+        self.clips.append(clip)
         return [np.full((256, 256, 3), 200, np.uint8) for _ in frame_indices]
 
     @property
@@ -78,8 +82,8 @@ def _restored(mouth, frame, box, **kw):
     return restore_detail(mouth, frame, box, detail_weight(mouth, frame, box), **kw)
 
 
-def _cache(n=4):
-    frames = np.zeros((n, 200, 160, 3), np.uint8)
+def _cache(n=4, height=200):
+    frames = np.zeros((n, height, 160, 3), np.uint8)
     masks = np.full((n, CROP_H, CROP_W), 255, np.uint8)
     return Cache(
         frames=frames,
@@ -89,8 +93,32 @@ def _cache(n=4):
     )
 
 
-def _renderer(*, engine, cache, ring, epoch=0.0, fps=24.0):
+def _silent_ring(seconds=2.0, rate=24_000):
+    """A second of digital zero, which is what most tests here want from the ring.
+
+    The default for `_renderer` so a test about the driver does not have to say
+    anything about audio. Where the audio itself is the subject, the test builds
+    `_distinct_tone_ring` instead and passes it in.
+    """
+    ring = PcmRing(sample_rate=rate, width=2, seconds=seconds)
+    ring.feed(b"\x00\x00" * rate, audible_at=0.0)
+    return ring
+
+
+def _driver(name, *, n=4, height=200, epoch=0.0, fps=24.0):
+    """One `Driver`: a named clip, its prepared frames, and its own playhead."""
+    cache = _cache(n=n, height=height)
+    return Driver(
+        name=name, cache=cache, clip=ClipClock(fps=fps, frames=n, epoch=epoch)
+    )
+
+
+def _renderer(*, engine, cache=None, ring=None, driver=None, epoch=0.0, fps=24.0):
     """`Renderer`, with its clip clock anchored where every test here starts.
+
+    `cache=` builds the driver, which is what all but the switch tests want: they
+    predate `Driver` and are about what the compositing does to one clip's frames,
+    not about which clip is up. `driver=` is for the tests that need to name two.
 
     The driving index is no longer `audio index + DISPLAY_LEAD`: the page stopped
     rewinding the driving clip at the start of a turn, so the renderer reads the
@@ -100,11 +128,16 @@ def _renderer(*, engine, cache, ring, epoch=0.0, fps=24.0):
     described - so every assertion below is still about the thing it was written
     about, and what the clock adds on top has its own tests at the bottom of this file.
     """
+    if driver is None:
+        driver = Driver(
+            name="idle2",
+            cache=cache,
+            clip=ClipClock(fps=fps, frames=len(cache.boxes), epoch=epoch),
+        )
     return Renderer(
         engine=engine,
-        cache=cache,
-        ring=ring,
-        clip=ClipClock(fps=fps, frames=len(cache.boxes), epoch=epoch),
+        driver=driver,
+        ring=ring if ring is not None else _silent_ring(),
     )
 
 
@@ -223,7 +256,7 @@ def test_a_failing_engine_does_not_take_the_renderer_down():
     which it can only do if the frame that failed does not propagate."""
 
     class Broken:
-        def mouths(self, audio, frame_indices):
+        def mouths(self, audio, frame_indices, *, clip):
             raise RuntimeError("weights went away")
 
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
@@ -241,7 +274,7 @@ def test_a_latched_failure_stops_calling_the_engine_rather_than_retrying():
         def __init__(self) -> None:
             self.calls = 0
 
-        def mouths(self, audio, frame_indices):
+        def mouths(self, audio, frame_indices, *, clip):
             self.calls += 1
             raise RuntimeError("weights went away")
 
@@ -707,7 +740,7 @@ def test_a_latched_failure_stops_both_halves_rather_than_repeating_a_frame():
     the page fall back to clip playback."""
 
     class Broken:
-        def mouths(self, windows, frame_indices):
+        def mouths(self, windows, frame_indices, *, clip):
             raise RuntimeError("engine gone")
 
     ring = PcmRing(sample_rate=24_000, width=2, seconds=4.0)
@@ -830,7 +863,7 @@ class _Mouths:
         self.values = list(values)
         self.at = 0
 
-    def mouths(self, windows, frame_indices):
+    def mouths(self, windows, frame_indices, *, clip):
         out = []
         for _ in frame_indices:
             v = self.values[min(self.at, len(self.values) - 1)]
@@ -1057,3 +1090,48 @@ def test_release_composites_onto_the_index_it_is_handed():
     # Outside the crop box the frame is untouched at any strength, and frame 3's
     # background is 150 where every other index is at least 50 away.
     assert abs(int(got[0, 0, 0]) - 150) < 6, got[0, 0]
+
+
+# --- changing which clip is driven ----------------------------------------------
+#
+# Every clip the face plays has a prepared cache, so the mouth is rendered onto
+# whichever one is up rather than onto the single clip speech used to switch to.
+# What moves between clips is the `Driver`; what must NOT move is the continuity a
+# turn boundary already resets.
+
+
+def test_switching_the_driving_clip_restarts_the_motion_blend():
+    """`_previous` is the last mouth encoded and `_blend` mixes it into the next
+    one. Carried across a clip change it mixes a pose from a different head - the
+    same discontinuity a turn boundary already resets for."""
+    r = _renderer(engine=_Mouths([0, 200]), driver=_driver("idle2"))
+    _encoded_mouth(r, r._driver.cache, None)
+    assert r._previous is not None
+    r.switch(_driver("listening"))
+    assert r._previous is None
+    assert r._smoothed is None, "the injection weight average belongs to one clip too"
+
+
+def test_switching_refuses_a_cache_of_a_different_geometry():
+    """`_buffer` is `np.empty_like(cache.frames[0])` and is reused. All ten prepared
+    clips are 1080x1620 (measured); a cache that is not must fail loudly here
+    rather than corrupt a composite."""
+    r = _renderer(engine=_Mouths([0]), driver=_driver("idle2"))
+    before = r._buffer.shape
+    r.switch(_driver("listening"))
+    assert r._buffer.shape == before
+    with pytest.raises(ValueError, match="geometry"):
+        r.switch(_driver("odd", height=720))
+
+
+def test_the_mouth_after_a_switch_is_generated_for_the_new_clip():
+    """The engine holds one latent table per clip and `mouths` selects with the
+    name. A switch that moved the frames but not the name would composite `amused`'s
+    pixels with `idle2`'s mouth - the failure this keyword exists to prevent, and
+    invisible to every geometry check because both caches are the same shape."""
+    engine = FakeEngine()
+    r = _renderer(engine=engine, driver=_driver("idle2"))
+    _jpegs(r, frame_index=0)
+    r.switch(_driver("listening"))
+    _jpegs(r, frame_index=0)
+    assert engine.clips == ["idle2", "listening"]

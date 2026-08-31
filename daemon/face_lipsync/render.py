@@ -446,6 +446,27 @@ def encode_clip(cache: Cache) -> list[bytes]:
     return out
 
 
+@dataclass(frozen=True, slots=True)
+class Driver:
+    """The clip being rendered onto: its name, its prepared frames, and where its
+    playhead is. One object because these three are never independently correct - a
+    cache paired with another clip's clock composites the mouth onto the wrong pose,
+    and a name that has moved on selects another clip's reference latents.
+    """
+
+    name: str
+    """Which prepared clip this is. Travels to `LipsyncEngine.mouths` as `clip`, and
+    is what `daemon/app.py` tells the page it is showing."""
+
+    cache: Cache
+    """That clip's own prepared frames, boxes and masks."""
+
+    clip: ClipClock
+    """Where the page's own playhead is. Required rather than defaulted, because the
+    default that would read naturally - "the turn starts at frame 0" - is exactly the
+    assumption this stopped being able to make."""
+
+
 class Renderer:
     """Two frames per model step, in two halves that run on different threads.
 
@@ -483,18 +504,16 @@ class Renderer:
         self,
         *,
         engine: LipsyncEngine,
-        cache: Cache,
+        driver: Driver,
         ring: PcmRing,
-        clip: ClipClock,
     ) -> None:
         self._engine = engine
-        self._cache = cache
+        self._driver = driver
+        """The clip being rendered onto, and the only thing a clip change moves - see
+        `switch`. One attribute rather than three, so a half-applied change (new
+        frames, old name) has nowhere to exist."""
         self._ring = ring
-        self._clip = clip
-        """Where the page's own playhead is. Required rather than defaulted, because
-        the default that would read naturally - "the turn starts at frame 0" - is
-        exactly the assumption this stopped being able to make."""
-        self._buffer = np.empty_like(cache.frames[0])
+        self._buffer = np.empty_like(driver.cache.frames[0])
         self._previous: np.ndarray | None = None
         """Last mouth encoded, for `MOTION_BLEND`. float32, the model's own 256."""
         self._smoothed: np.ndarray | None = None
@@ -511,6 +530,37 @@ class Renderer:
         """Latched on the first failure in either half. The caller drops back to v1
         clips and logs once; retrying per frame would fill the log at 24Hz."""
 
+    def switch(self, driver: Driver) -> None:
+        """Render onto a different clip from here on.
+
+        No crossfade, and that is a measurement rather than an omission: the caller
+        only ever switches at a clip's own end, and end -> the next clip's frame 0
+        measures 1.41 median downscaled whole-frame mean absolute difference against
+        the 1.14 of a clip's own loop point - the join the face has always made every
+        few seconds and that the owner has never remarked on. Over the ten prepared
+        clips, 3 of the 90 ordered pairs exceed that baseline's own worst case (2.14),
+        by 0.01-0.04. There is nothing for a fade to hide. (A cut in the middle of a
+        clip is a different question and up to ten times worse - 7.98 median - which
+        is why the caller only ever calls this at a clip's end.)
+
+        Everything reset here is per-clip continuity, and each was a measured defect
+        when it survived a turn boundary: `_previous` mixes the last mouth into the
+        next (`_blend`), `_smoothed` averages the injection weight (`_weight`). Their
+        two markers go with them, or the first frame of the new clip counts as
+        continuous with the last frame of the old one and blends against a mouth this
+        head never made.
+        """
+        if driver.cache.frames[0].shape != self._driver.cache.frames[0].shape:
+            raise ValueError(
+                f"geometry changed: {driver.name} is {driver.cache.frames[0].shape} "
+                f"against {self._driver.cache.frames[0].shape}"
+            )
+        self._driver = driver
+        self._previous = None
+        self._smoothed = None
+        self._weight_at = -1
+        self._continues_at = -1
+
     def step(self, *, frame_index: int, origin: float, fps: float) -> Step | None:
         """`BATCH` mouths from `frame_index` on, or `None`. Never raises.
 
@@ -520,7 +570,7 @@ class Renderer:
         if self.failed:
             return None
         try:
-            n = len(self._cache.boxes)
+            n = len(self._driver.cache.boxes)
             audio = [frame_index + offset for offset in range(BATCH)]
             windows = [
                 self._ring.window(
@@ -539,11 +589,15 @@ class Renderer:
             # turn's origin. `index(origin) + k` and `index(origin + k/fps)` are the
             # same integer, which is why one reading of the clock per step is enough
             # and the pair still advances by exactly one frame.
-            began = self._clip.nearest(origin)
+            began = self._driver.clip.nearest(origin)
             shown = [began + index + DISPLAY_LEAD for index in audio]
             return Step(
                 indices=shown,
-                mouths=self._engine.mouths(windows, [index % n for index in shown]),
+                mouths=self._engine.mouths(
+                    windows,
+                    [index % n for index in shown],
+                    clip=self._driver.name,
+                ),
             )
         except Exception:
             logger.exception("face: lip-sync engine failed, falling back to clips")
@@ -561,7 +615,7 @@ class Renderer:
         Restarts with `_blend` on a turn boundary: the average is over one utterance.
         """
         current = detail_weight(
-            mouth, self._cache.frames[clip_index], self._cache.boxes[clip_index]
+            mouth, self._driver.cache.frames[clip_index], self._driver.cache.boxes[clip_index]
         )
         if self._smoothed is None or index != self._weight_at:
             self._smoothed = current
@@ -643,21 +697,21 @@ class Renderer:
         if step < 1 or step > count:
             return None
         try:
-            i = index % len(self._cache.boxes)
-            box = self._cache.boxes[i]
+            i = index % len(self._driver.cache.boxes)
+            box = self._driver.cache.boxes[i]
             x1, y1, x2, y2 = box
             sized = restore_detail(
                 cv2.resize(np.clip(self._previous, 0, 255).astype(np.uint8), (x2 - x1, y2 - y1)),
-                self._cache.frames[i],
+                self._driver.cache.frames[i],
                 box,
                 self._smoothed,
             )
             out = composite(
-                self._cache.frames[i],
+                self._driver.cache.frames[i],
                 sized,
                 box,
-                self._cache.crop_boxes[i],
-                self._cache.masks[i],
+                self._driver.cache.crop_boxes[i],
+                self._driver.cache.masks[i],
                 out=self._buffer,
                 # Ends one step short of zero, because the frame after the last of
                 # these is the clip itself - which is strength 0 already.
@@ -683,22 +737,22 @@ class Renderer:
             return []
         try:
             encoded: list[bytes] = []
-            n = len(self._cache.boxes)
+            n = len(self._driver.cache.boxes)
             for index, mouth in zip(step.indices, step.mouths, strict=True):
                 i = index % n
-                box = self._cache.boxes[i]
+                box = self._driver.cache.boxes[i]
                 x1, y1, x2, y2 = box
                 blended = self._blend(mouth, index)
                 sized = cv2.resize(blended, (x2 - x1, y2 - y1))
                 sized = restore_detail(
-                    sized, self._cache.frames[i], box, self._weight(blended, i, index)
+                    sized, self._driver.cache.frames[i], box, self._weight(blended, i, index)
                 )
                 out = composite(
-                    self._cache.frames[i],
+                    self._driver.cache.frames[i],
                     sized,
                     box,
-                    self._cache.crop_boxes[i],
-                    self._cache.masks[i],
+                    self._driver.cache.crop_boxes[i],
+                    self._driver.cache.masks[i],
                     out=self._buffer,
                 )
                 # Encode inside the loop: `out` is one reusable buffer, so the second

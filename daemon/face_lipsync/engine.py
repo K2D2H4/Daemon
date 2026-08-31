@@ -103,14 +103,20 @@ class MlxEngine:
         unet: UNetModel,
         taesd: Decoder,
         whisper_encoder: nn.Module,
-        latents: mx.array,
+        latents: dict[str, mx.array],
         sample_rate: int,
     ) -> None:
         self._unet = unet
         self._taesd = taesd
         self._enc = whisper_encoder
-        self._latents = latents.astype(DTYPE)
-        """(n, 32, 32, 8) in MLX layout, one per driving frame, prepared offline."""
+        self._latents = {
+            clip: table.astype(DTYPE) for clip, table in latents.items()
+        }
+        """Per clip: (n, 32, 32, 8) in MLX layout, one per driving frame of THAT clip,
+        prepared offline. Keyed by clip name because this is the engine's only
+        clip-dependent state - everything above is 1.6GB of clip-independent weights,
+        and each of these tables is 1.3-3.0MB (the ten prepared caches, measured), so
+        ten clips share one engine and `mouths` selects rather than reloads."""
         self._rate = sample_rate
         self._timestep = mx.array([0])
         """MuseTalk is single-step inpainting: there is no schedule to walk."""
@@ -145,7 +151,11 @@ class MlxEngine:
         return stacked.reshape(1, WINDOW * HIDDEN_STATES, FEATURE_DIM) + self._audio_pe
 
     def mouths(
-        self, windows: Sequence[np.ndarray], frame_indices: Sequence[int]
+        self,
+        windows: Sequence[np.ndarray],
+        frame_indices: Sequence[int],
+        *,
+        clip: str,
     ) -> list[np.ndarray]:
         """Batched on purpose - see `BATCH` in `render.py` for the arithmetic.
 
@@ -159,8 +169,13 @@ class MlxEngine:
                 f"{len(windows)} windows for {len(frame_indices)} frames - one each"
             )
         features = mx.concatenate([self._features(w) for w in windows])
+        # A clip this engine was not given is a KeyError here, loudly, on the first
+        # frame: `daemon/app.py` builds a driver only for a clip whose whole cache is
+        # present, so a name reaching this that has no table is an assembly bug and
+        # nothing a fallback could paper over correctly.
+        table = self._latents[clip]
         latents = mx.concatenate(
-            [self._latents[i % self._latents.shape[0]][None] for i in frame_indices]
+            [table[i % table.shape[0]][None] for i in frame_indices]
         )
         images = self._taesd(self._unet(latents, self._timestep, features))
         rgb = np.array(mx.clip(images / 2.0 + 0.5, 0.0, 1.0) * 255.0)
@@ -187,10 +202,15 @@ def load(
     unet_config_json: Path,
     taesd_weights: Path,
     whisper_repo: str,
-    latents: Path,
+    latents: dict[str, Path],
     sample_rate: int,
 ) -> MlxEngine:
-    """Build an engine from files on disk. Never called at import time."""
+    """Build an engine from files on disk. Never called at import time.
+
+    `latents` is `{clip name: latents.safetensors}` - one entry per prepared clip,
+    read eagerly because the whole set is smaller than the models are and a lazy read
+    would land on the render thread mid-utterance.
+    """
     config = unet_config(json.loads(unet_config_json.read_text(encoding="utf-8")))
     unet = UNetModel(UNetConfig(**config))
     mapped: list[tuple[str, mx.array]] = []
@@ -221,7 +241,9 @@ def load(
         unet=unet,
         taesd=taesd,
         whisper_encoder=load_whisper(whisper_repo, dtype=mx.float16).encoder,
-        latents=mx.load(str(latents))["latents"],
+        latents={
+            clip: mx.load(str(path))["latents"] for clip, path in latents.items()
+        },
         sample_rate=sample_rate,
     )
     mx.eval(unet.parameters(), taesd.parameters())

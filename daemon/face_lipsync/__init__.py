@@ -21,9 +21,22 @@ class LipsyncEngine(Protocol):
     """
 
     def mouths(
-        self, windows: Sequence[np.ndarray], frame_indices: Sequence[int]
+        self,
+        windows: Sequence[np.ndarray],
+        frame_indices: Sequence[int],
+        *,
+        clip: str,
     ) -> list[np.ndarray]:
         """256x256 BGR mouths, one per index, in the same order.
+
+        `clip` names which prepared clip `frame_indices` index into, and it is
+        keyword-only because it is the one argument here that is not per-frame -
+        `windows` and `frame_indices` are parallel sequences and this is not. **One
+        engine serves every clip.** The UNet, TAESD and whisper weights are 1.6GB and
+        say nothing about which clip is on screen; the reference latents are the only
+        per-clip tensor and are 1.3-3.0MB each (measured over the owner's ten prepared
+        caches), so holding all ten costs less than a tenth of one copy of the models
+        and a clip change is a tensor selection rather than a reload.
 
         **One window per frame, and this took two windows rather than one array on
         purpose.** Consecutive video frames sit two whisper indices apart, so a

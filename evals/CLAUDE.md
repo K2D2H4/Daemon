@@ -24,7 +24,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `face_lipsync_prepare.py` | the offline preprocessing step — one driving mp4 in, the cache `daemon/face_lipsync` reads at runtime out. Apple Vision for the landmarks; still needs torch and a MuseTalk checkout for the VAE and the BiSeNet mask, which are deliberately not daemon dependencies |
 | `face_lipsync_live.py` | whether the *assembled* daemon puts a mouth on a real socket — `create_app` + the MLX engine + the prepared cache + uvicorn + `/face/frames`, driven by a wav through the real `SpeechClock`. Writes an mp4 to look at, because the pass mark is a person looking at it |
 | `face_lipsync_idle_spike.py` | whether the idle mouth should be pre-rendered too, so the switch to speech carries no quality step — **no**, and not because of sharpness: over 88 conditioning windows including digital zero, this engine never renders `idle2`'s sealed resting mouth, it parts the lips and shows teeth |
-| `face_lipsync_numerics.py` | whether the product loader keeps real MLX weights in MLX layout — not whether the model runs, which it never does here — the published weights are diffusers-keyed but MLX-laid-out, and a second transpose is silent |
+| `face_lipsync_numerics.py` | whether the product loader keeps real MLX weights in MLX layout, and whether one engine's per-clip latents are selected by the key it is handed — it does now run the model, twice, to prove `idle2` is bit-identical with a second clip's table loaded and that a second clip's mouths differ — the published weights are diffusers-keyed but MLX-laid-out, and a second transpose is silent |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py

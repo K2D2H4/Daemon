@@ -10,6 +10,8 @@ checked by `evals/face_lipsync_numerics.py`, against the real weights, by hand,
 outside CI.
 """
 
+import inspect
+
 import numpy as np
 
 from daemon.face_lipsync.loader import (
@@ -21,6 +23,21 @@ from daemon.face_lipsync.loader import (
     taesd_to_mlx,
     unet_config,
 )
+
+
+def test_the_engine_is_told_which_clip_s_latents_to_use():
+    """The UNet, TAESD and whisper weights are 1.6GB and clip-independent; the
+    latents are 1.3-3.0MB (measured over the ten prepared caches) and are the only
+    per-clip tensor. One engine, ten latent sets - not ten engines.
+
+    Checked on the protocol rather than on `MlxEngine`, because `mlx` has no Linux
+    wheel and CI is ubuntu: importing the engine here would fail on the runner.
+    """
+    from daemon.face_lipsync import LipsyncEngine
+
+    sig = inspect.signature(LipsyncEngine.mouths)
+    assert "clip" in sig.parameters
+    assert sig.parameters["clip"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_attention_projections_are_renamed():
