@@ -3603,6 +3603,51 @@ async def test_a_barge_in_stops_the_face_from_speaking_too() -> None:
     )
 
 
+async def test_the_audio_after_a_barge_in_still_reaches_the_lipsync_sink() -> None:
+    """The rebuild above has to carry the sink, and nothing said so.
+
+    `pcm_sink` was passed into the `SpeechClock` built in `__init__` and never kept,
+    so the clock `_barge_in` rebuilds could only be given `face`, `sample_rate` and
+    `bytes_per_frame` - from the first barge-in of a session onwards, `fed()` had no
+    sink and the lip-sync ring was never fed again. Nothing reports that: `_until`
+    still advances, so the face still reads `speaking` and `_lipsync_loop` keeps
+    stepping the model, `PcmRing.window` clamps rather than raising, and the page
+    shows a mouth conditioned on silence with `Renderer.failed` unlatched. Every
+    assertion in tests/test_face_lipsync_wiring.py is about the sink *arriving*, and
+    it does arrive - it stops surviving, one interruption in.
+
+    Barge-in is on by default (`DAEMON_VOICE_BARGE_IN`) and this daemon interrupts
+    itself on tool calls, so "after the first barge-in" is an ordinary turn.
+    """
+    fed: list[tuple[int, float]] = []
+
+    def sink(chunk: bytes, at: float) -> None:
+        # The first byte tags which chunk this was; the whole chunk in the failure
+        # message would be 48_000 bytes of it.
+        fed.append((chunk[0], at))
+
+    bus = RecordingBus()
+    session = FakeSession(
+        b"\x00" * 48_000,  # 1s of the answer at the playback rate
+        Cuts(),  # the owner cuts in, and `_barge_in` rebuilds the clock
+        b"\x01" * 4_800,  # the answer to what they said
+        Turn(),
+    )
+    conv = conversation(session, FakeAudio(), face=bus, pcm_sink=sink)
+    await run(conv)
+
+    assert conv.interruptions == 1, "precondition: the provider really did report a cut"
+    assert [which for which, _at in fed] == [0x00, 0x01], (
+        "the chunk after the barge-in never reached the ring"
+    )
+    # And the rebuild the sink now rides through is still a rebuild: the abandoned
+    # second of backlog must not push this chunk's audible instant a second out, or
+    # the mouth would be fed samples a second before the ring is asked for them.
+    assert fed[1][1] - fed[0][1] < 0.5, (
+        "the post-barge-in chunk was stamped behind the backlog the cut threw away"
+    )
+
+
 async def test_listening_never_overrides_speaking_while_the_answer_plays() -> None:
     """With barge-in on (the default), mic chunks cross *while the daemon is
     speaking* on purpose - that is what makes barge-in possible, and this test

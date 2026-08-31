@@ -526,6 +526,9 @@ class VoiceConversation:
         rather than redone does not seed the same memories twice."""
 
         self._face = face
+        self._pcm_sink = pcm_sink
+        """Kept, not merely passed on: `_barge_in` rebuilds the clock below and has
+        to hand the new one the same sink."""
         self._speech = (
             None
             if face is None
@@ -533,7 +536,7 @@ class VoiceConversation:
                 face,
                 sample_rate=self._audio.playback_sample_rate,
                 bytes_per_frame=PLAYBACK_BYTES_PER_FRAME,
-                pcm_sink=pcm_sink,
+                pcm_sink=self._pcm_sink,
             )
         )
         """`pcm_sink` rides on this rather than on its own tap.
@@ -1301,6 +1304,13 @@ class VoiceConversation:
                 self._face,
                 sample_rate=self._audio.playback_sample_rate,
                 bytes_per_frame=PLAYBACK_BYTES_PER_FRAME,
+                # The sink has to survive the rebuild, because leaving it behind is
+                # a downgrade rather than a reset: a clock with no sink advances
+                # `_until` exactly the same, so the face still reads `speaking` and
+                # the render loop still steps the model - off a ring nothing has fed
+                # since the cut. A mouth rendered from silence, and neither
+                # `Renderer.failed` nor a log line says so.
+                pcm_sink=self._pcm_sink,
             )
             self._speech.pump(asyncio.get_running_loop().time())
 
