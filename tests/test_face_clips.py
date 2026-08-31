@@ -157,6 +157,51 @@ def test_the_last_want_before_the_boundary_wins():
     assert q.due(at=8.04) == "thinking"
 
 
+def test_a_gesture_plays_once_and_hands_back_what_it_interrupted():
+    """A mood is an arc, not a state, and nothing on this side fires `ended`.
+
+    The owner watched `amused` (5.46s) repeat four times through one 20-second answer.
+    The cause is the speaking rule meeting a gesture: `wanted("speaking", ...)` answers
+    with the clip already up, because clips must not change mid-utterance - and once a
+    one-shot IS the clip up, that rule reads as "hold this expression", so it loops at
+    its own boundary with nobody asking it to leave. The page's v1 never had this: it
+    showed a one-shot with `loop: false` and `advance()` handed back on `ended`.
+
+    So the queue remembers what the gesture interrupted and returns there at its end.
+    """
+    lengths = {"listening": 6.29, "amused": 5.46, "idle2": 8.04}
+    q = ClipQueue(current="listening", ends_at=6.29, lengths=lengths)
+    q.want("amused", one_shot=True)
+    assert q.due(at=6.29) == "amused"
+    # One arc, then back - not a second pass at 5.46 + 5.46.
+    assert q.due(at=6.29 + 5.46) == "listening"
+    assert q.current == "listening"
+
+
+def test_a_gesture_interrupted_by_a_second_gesture_still_returns_to_the_loop():
+    """Two moods inside one answer is ordinary. The hand-back target is what the FIRST
+    gesture interrupted, not the gesture before it - returning to `amused` after `sulky`
+    would be a third expression nobody asked for."""
+    lengths = {"thinking": 6.04, "amused": 5.46, "sulky": 3.71}
+    q = ClipQueue(current="thinking", ends_at=6.04, lengths=lengths)
+    q.want("amused", one_shot=True)
+    assert q.due(at=6.04) == "amused"
+    q.want("sulky", one_shot=True)
+    assert q.due(at=6.04 + 5.46) == "sulky"
+    assert q.due(at=6.04 + 5.46 + 3.71) == "thinking"
+
+
+def test_an_activity_want_beats_the_hand_back_at_the_same_boundary():
+    """If the activity moved on while the gesture played, the face goes where the
+    conversation is - not back to a pose that is no longer true."""
+    lengths = {"listening": 6.29, "amused": 5.46, "thinking": 6.04}
+    q = ClipQueue(current="listening", ends_at=6.29, lengths=lengths)
+    q.want("amused", one_shot=True)
+    assert q.due(at=6.29) == "amused"
+    q.want("thinking")
+    assert q.due(at=6.29 + 5.46) == "thinking"
+
+
 def test_a_one_shot_outranks_an_activity_want_at_the_same_boundary():
     """A mood is the daemon saying something; an activity is ambient. If both are
     waiting at the boundary the expression goes first and the activity is still

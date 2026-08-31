@@ -183,11 +183,29 @@ class ClipQueue:
         self._ends_at = ends_at
         self._shot: str | None = None
         self._clip: str | None = None
+        self._after_shot: str | None = None
+        """What a gesture interrupted, to return to when its arc is done.
+
+        A mood is an arc and not a state, and nothing on this side fires `ended` - so
+        without this a one-shot that became the driving clip simply loops. The owner
+        watched `amused` (5.46s) repeat four times through one 20-second answer. It is
+        the speaking rule meeting a gesture: `wanted("speaking", ...)` answers with the
+        clip already up, because clips must not change mid-utterance, and once a one-shot
+        IS that clip the rule reads as "hold this expression"."""
 
     @property
     def current(self) -> str:
         """The clip being rendered onto, which is `wanted`'s `current`."""
         return self._current
+
+    @property
+    def returning_to(self) -> str | None:
+        """The clip a gesture in flight will hand back to, or `None`.
+
+        Read by nothing in production yet; it is here because a queue whose state can
+        only be inferred from what `due` happens to return is a queue nobody can debug.
+        """
+        return self._after_shot
 
     @property
     def pending_shot(self) -> str | None:
@@ -242,9 +260,21 @@ class ClipQueue:
             return None
 
         if self._shot is not None:
+            # Only from a loop clip: a gesture interrupted by a second gesture must
+            # still return to what the FIRST one interrupted, or the face plays a third
+            # expression nobody asked for.
+            if self._current not in ONE_SHOT_CLIPS:
+                self._after_shot = self._current
             stem, self._shot = self._shot, None
         elif self._clip is not None:
             stem, self._clip = self._clip, None
+            # The activity moved on while the gesture played, so the face goes where the
+            # conversation is rather than back to a pose that is no longer true.
+            self._after_shot = None
+        elif self._after_shot is not None:
+            # The arc is over. This branch is what keeps a one-shot from ever reaching
+            # the loop below - which is the whole defect it exists for.
+            stem, self._after_shot = self._after_shot, None
         else:
             length = self._lengths[self._current]
             while self._ends_at <= at:
