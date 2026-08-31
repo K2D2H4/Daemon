@@ -432,34 +432,54 @@ class Step:
     """256x256 BGR, straight out of `LipsyncEngine.mouths`, one per index."""
 
 
-def encode_clip(cache: Cache) -> list[bytes]:
-    """Every driving-clip frame as a JPEG, encoded once.
+def encode_still(frame: np.ndarray) -> bytes:
+    """One driving-clip frame as a JPEG, for the tick that is publishing it.
 
-    The page shows these while nothing is being said, in place of playing the clip in
-    a `<video>`, and that is a colour fix rather than a convenience. Measured in Chrome
-    on this machine: the browser's decode of the untagged mp4 comes out R +3.0, G +2.1,
+    The page shows these while nothing is being said, in place of playing the clip in a
+    `<video>`, and that is a colour fix rather than a convenience. Measured in Chrome on
+    this machine: the browser's decode of the untagged mp4 comes out R +3.0, G +2.1,
     B +1.2 against the same frames arriving as JPEG - which the browser decodes to our
-    bytes within 0.2. So the two players disagree, the JPEG is the faithful one, and
-    the whole picture used to shift darker and off-hue the moment speech started. The
-    owner saw it as "어두워지면서 채도가 좀 올라가는" across the entire frame, background
+    bytes within 0.2. So the two players disagree, the JPEG is the faithful one, and the
+    whole picture used to shift darker and off-hue the moment speech started. The owner
+    saw it as "어두워지면서 채도가 좀 올라가는" across the entire frame, background
     included.
 
     It is not a range problem (that would move all three channels by the same +8.7) and
     not a BT.601/709 matrix choice (neither matches). It is the browser colour-managing
-    an untagged video against a P3 display, and there is no way to tell it not to
-    without re-encoding the clips - which changes their pixels (mean luma 62.94 ->
-    59.82) and would still be one browser's guess. Removing the second decoder is the
-    only fix that does not depend on guessing right.
+    an untagged video against a P3 display, and there is no way to tell it not to without
+    re-encoding the clips - which changes their pixels (mean luma 62.94 -> 59.82) and
+    would still be one browser's guess. Removing the second decoder is the only fix that
+    does not depend on guessing right.
 
-    Encoded once at load, not per frame: the clip is fixed, so these bytes never
-    change. ~180KB each, so ~35MB for a 193-frame clip, against 2.45ms of CPU per frame
-    forever if they were encoded live.
+    **Per frame, and this replaced a whole-clip strip encoded on first use.** That was
+    right for one driving clip and turned over at ten. Measured: 9.10ms median here for
+    a 1080x1620 frame at quality 85 (p95 10.99), which is 22% of an idle tick where the
+    model does not run at all - against a **1051ms** burst for one clip's strip, once per
+    clip, ten times a session. The owner felt it as "첫 발화 시작할 때 아주 잠깐 멈추는
+    느낌", and it measured at the socket as a **539.8ms** gap where the warm steady state
+    is 41.7ms median and 90ms worst.
+
+    The burst is what costs, not the disk. A separate executor did not help and the page
+    cache was already warm when it was measured: the strip is a 151-iteration Python loop
+    and each iteration copies 5.25MB out of the memory-mapped store with the GIL held, so
+    the event loop cannot run through it. One frame per tick holds the GIL for one such
+    copy and releases it for the encode.
+
+    The old docstring justified the strip against "2.45ms of CPU per frame forever if
+    they were encoded live". That figure was wrong: 2.45ms is this file's own measured
+    cost of *sending* a whole frame rather than a crop (see the transport note above),
+    not of encoding one. Encoding is 9.10ms, and it is still the cheaper side.
+
+    The speaking half has always encoded per frame - `Renderer.encode` is 8.43ms a frame
+    including two of these reads and both JPEGs - so this is idle doing what speech
+    already did, not a new risk taken on for it.
     """
-    out = []
-    for frame in cache.frames:
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        out.append(buf.tobytes() if ok else b"")
-    return out
+    ok, payload = cv2.imencode(
+        ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+    )
+    if not ok:
+        raise RuntimeError("cv2 refused to encode a driving frame")
+    return payload.tobytes()
 
 
 @dataclass(frozen=True, slots=True)

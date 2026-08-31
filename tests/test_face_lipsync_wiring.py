@@ -307,6 +307,20 @@ IDLE_FRAMES = [f"idle-{i}".encode() for i in range(6)]
 can tell which half of the publisher produced what."""
 
 
+@pytest.fixture(autouse=True)
+def _stills_are_the_frames(monkeypatch):
+    """`encode_still` is cv2 against a real 1080x1620 array; these tests have neither.
+
+    Patched on `render` and not on `app`: `_lipsync_loop` imports it inside the function
+    (CI is ubuntu and `render` pulls in cv2), so the name resolves at call time from
+    there. Identity, so a fake cache's frame IS the byte string a test asserts on - which
+    is what lets `IDLE_FRAMES` still mean what it always meant here.
+    """
+    import daemon.face_lipsync.render as render_module
+
+    monkeypatch.setattr(render_module, "encode_still", lambda frame: frame)
+
+
 def _driving(frames=None):
     """The single-clip world these tests were written in, in the shape the loop now takes.
 
@@ -330,7 +344,7 @@ def _driving(frames=None):
         clip=ClipClock(fps=FPS, frames=len(frames), epoch=0.0),
     )
     return (
-        _Driving(driver=driver, frames=list(frames)),
+        _Driving(driver=driver),
         {"idle2": (cache, FPS)},
         {"idle2": len(frames) / FPS},
     )
@@ -358,14 +372,14 @@ def _driving_two():
         cache = SimpleNamespace(boxes=list(range(4)), frames=list(frames))
         return cache, frames
 
-    cache2, frames2 = one("idle2")
+    cache2, _frames2 = one("idle2")
     cache1, _frames1 = one("idle1")
     cache_mood, _frames_mood = one("amused")
     driver = Driver(
         name="idle2", cache=cache2, clip=ClipClock(fps=FPS, frames=4, epoch=0.0)
     )
     return (
-        _Driving(driver=driver, frames=frames2),
+        _Driving(driver=driver),
         {"idle2": (cache2, FPS), "idle1": (cache1, FPS), "amused": (cache_mood, FPS)},
         {"idle2": 4 / FPS, "idle1": 4 / FPS, "amused": 4 / FPS},
     )
@@ -384,11 +398,6 @@ async def test_a_mood_queued_while_speaking_reaches_the_boundary(monkeypatch):
     `in` on a Future raises `RuntimeError: await wasn't used with future`, which took the
     render loop down on the first spoken turn with the whole suite green.
     """
-    import daemon.face_lipsync.render as render_module
-
-    monkeypatch.setattr(
-        render_module, "encode_clip", lambda cache: list(cache.frames)
-    )
     face = FaceBus()
     face.set_activity("speaking")
     renderer = FakeRenderer(allow_switch=True)

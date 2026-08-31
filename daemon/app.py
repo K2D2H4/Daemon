@@ -1305,8 +1305,13 @@ class _Driving:
     """
 
     driver: Driver
-    frames: list[bytes]
-    """This clip's own stills, encoded once on first use - see `_encode_for`."""
+    """The only field, and it used to carry this clip's stills as pre-encoded JPEGs too.
+
+    They are encoded on demand now, one per idle tick, because ten clips turned that
+    bill over: a clip's whole strip is a **1051ms** burst, once per clip, and the owner
+    felt it as "첫 발화 시작할 때 아주 잠깐 멈추는 느낌" - measured at the socket as a
+    539.8ms gap. See `render.encode_still`, which carries why the burst and not the disk
+    is what costs."""
 
 
 class _LipsyncFrames:
@@ -1506,7 +1511,6 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
             Driver,
             FrameClock,
             Renderer,
-            encode_clip,
         )
         from daemon.face_lipsync.ring import PcmRing, Slot
         from daemon.voice.audio import OUTPUT_SAMPLE_RATE
@@ -1561,10 +1565,7 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
             ),
         )
         renderer = Renderer(engine=engine, driver=driver, ring=ring)
-        # Encoded per clip on first use, not all ten at boot. The bytes never change
-        # once made - a clip is fixed - but ~35MB and ~470ms per 193-frame clip is a
-        # bill this process should only pay for clips a session actually reaches.
-        driving = _Driving(driver=driver, frames=encode_clip(cache))
+        driving = _Driving(driver=driver)
         # How long each clip runs, which is the only thing `ClipQueue` needs to know
         # where a boundary is. Read off the caches rather than tabulated: the
         # durations are the owner's footage, not a constant of this design.
@@ -1710,7 +1711,7 @@ async def _lipsync_loop(
         RELEASE_FRAMES,
         ClipClock,
         Driver,
-        encode_clip,
+        encode_still,
     )
 
     loop = asyncio.get_running_loop()
@@ -1733,18 +1734,6 @@ async def _lipsync_loop(
     process has been up - `position` is a place inside the clip and `at` is seconds since
     boot, so `due()` found every boundary already past and rolled its own `while` forward
     a million times on the first tick. The pacing tests caught it as a dropped frame."""
-    encoded: dict[str, list[bytes]] = {driving.driver.name: driving.frames}
-    """Each clip's stills, encoded before its first use and kept - bytes never change."""
-    pending_stills: dict[str, asyncio.Future[list[bytes]]] = {}
-    """Stills encodes in flight, so a boundary that arrives early awaits rather than
-    restarts one.
-
-    Not `encoding`, which is what this was called for one live run: the publish loop
-    below already binds that name to its own per-step future, so this dict was rebound
-    to a `Future` and `stem in encoding` reached `Future.__await__` outside an await -
-    `RuntimeError: await wasn't used with future`, which took the render loop down on the
-    first spoken turn. Every wiring test passed because they all prepare ONE clip, so
-    `stem in encoded` short-circuits true and the poisoned half is never evaluated."""
     shots: deque[str] = deque()
     """One-shots the bus published, waiting for a boundary. A deque and not a slot
     because two moods inside one clip is ordinary, and `ClipQueue` decides which
@@ -1841,13 +1830,23 @@ async def _lipsync_loop(
                             cpu, partial(renderer.release, index=index, step=released)
                         )
                     if frame is None:
-                        # Idle goes out on this same grid, as the clip's own frame
-                        # encoded once at load. The page used to play the clip in a
-                        # `<video>` here and Chrome's decode of it disagrees with its
-                        # decode of our JPEGs - measured R +3.0, G +2.1, B +1.2 - so the
-                        # whole picture shifted darker and off-hue the moment speech
-                        # started. One decoder, no shift. See `render.encode_clip`.
-                        frame = driving.frames[index % len(driving.frames)]
+                        # Idle goes out on this same grid, as the clip's own frame. The
+                        # page used to play the clip in a `<video>` here and Chrome's
+                        # decode of it disagrees with its decode of our JPEGs - measured
+                        # R +3.0, G +2.1, B +1.2 - so the whole picture shifted darker
+                        # and off-hue the moment speech started. One decoder, no shift.
+                        #
+                        # Encoded here, one frame per tick, rather than a whole clip
+                        # strip held from its first use. Measured 9.10ms median for a
+                        # 1080x1620 frame at quality 85 - 22% of an idle budget where
+                        # nothing else runs, against a 1051ms burst plus a ~1GB cold
+                        # read per clip the other way. On this executor and not inline
+                        # because a voice session can be open while the face is idle
+                        # (activity `listening`), and that websocket shares this loop.
+                        cache = driving.driver.cache
+                        frame = await loop.run_in_executor(
+                            cpu, encode_still, cache.frames[index % len(cache.boxes)]
+                        )
                 if frame is not None:
                     slot.put(frame)
                 target = max(target + interval, loop.time() + interval / 2)
@@ -1864,30 +1863,9 @@ async def _lipsync_loop(
             ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="face-lipsync-cpu"
             ) as cpu,
-            # A third thread, and the reason is that the second one is the frame rate.
-            # `Renderer.encode` is 8.43ms of the 41.67ms budget and runs on `cpu`;
-            # encoding a clip's ~190 stills is ~470ms. Sharing the executor put that
-            # behind the render queue and the mouth stopped for half a second at every
-            # first-time clip change - which the owner saw as intermittent lag.
-            ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="face-lipsync-stills"
-            ) as stills,
         ):
             pacer = asyncio.create_task(publish(), name="face-lipsync-publish")
             watcher = asyncio.create_task(watch_shots(), name="face-lipsync-shots")
-
-            def prefetch(stem: str) -> None:
-                """Start a clip's stills before its boundary arrives.
-
-                The queue gives up to a whole clip of notice - 8.04s for an idle against
-                ~470ms of encoding - so by the time the switch is due the bytes are
-                usually already there and `switch_to` awaits nothing.
-                """
-                if stem in encoded or stem in pending_stills:
-                    return
-                pending_stills[stem] = loop.run_in_executor(
-                    stills, encode_clip, caches[stem][0]
-                )
 
             async def switch_to(stem: str) -> None:
                 """Move the render onto `stem`, from its frame 0.
@@ -1898,15 +1876,6 @@ async def _lipsync_loop(
                 as far as either half can see.
                 """
                 clip_cache, clip_fps = caches[stem]
-                frames = encoded.get(stem)
-                if frames is None:
-                    # Normally already done by `prefetch`. Awaited here rather than
-                    # assumed, for the boundary that arrives sooner than 470ms - the
-                    # outgoing clip keeps publishing meanwhile, because `driving` is not
-                    # swapped until the stills exist.
-                    prefetch(stem)
-                    frames = await pending_stills.pop(stem)
-                    encoded[stem] = frames
                 new = Driver(
                     name=stem,
                     cache=clip_cache,
@@ -1918,17 +1887,15 @@ async def _lipsync_loop(
                 )
                 renderer.switch(new)
                 driving.driver = new
-                driving.frames = frames
                 # One line per switch, at INFO. The owner judges this by eye and the
                 # first question after "it looked wrong" is always which clip was up -
                 # three of the ten have never had a mouth rendered onto them in any
                 # path, so a report without the clip name cannot be acted on.
                 logger.info(
-                    "face: driving %s (%.2fs, %d frames)%s",
+                    "face: driving %s (%.2fs, %d frames)",
                     stem,
                     lengths[stem],
                     len(clip_cache.boxes),
-                    "" if stem in encoded else " - stills were not ready",
                 )
                 # Frames rendered for the outgoing clip must not be published over the
                 # incoming one - the same reason a turn boundary drains this.
@@ -1960,13 +1927,6 @@ async def _lipsync_loop(
                         pick=random.choice,
                     )
                     clip_queue.want(want)
-                    # Before asking for the boundary, not after: both of these are what
-                    # a switch would need, and starting them now is what keeps the
-                    # switch itself free of a half-second encode. Free when the answer
-                    # is the clip already up, which it usually is.
-                    prefetch(want)
-                    if clip_queue.pending_shot:
-                        prefetch(clip_queue.pending_shot)
                     boundary = clip_queue.due(at=loop.time())
                     if boundary is not None:
                         await switch_to(boundary)
