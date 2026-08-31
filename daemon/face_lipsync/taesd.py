@@ -6,9 +6,37 @@ is 55% of a batch-1 frame - larger on its own than the whole 41.67ms budget for 
 64.0ms measured, which is what makes the frame rate arithmetically possible at all.
 
 It costs detail: on the 256 output TAESD keeps 39% of the driving clip's lip detail
-where sd-vae keeps 63%. That is paid back by `render.restore_detail`, not by reverting
-the decoder - at the product's display size the two decoders differ by 7 points, and
-buying those back costs 58.6ms/frame.
+where sd-vae keeps 63%. At the product's display size the two differ by 7 points.
+
+**The swap is closed, and here is the number that closes it.** The 58.6ms/frame this
+file used to cite was diffusers on MPS, and MLX is where this engine lives precisely
+because MLX was faster for the UNet - so "sd-vae in MLX has never been timed" stayed an
+open question for as long as the file said 58.6. Measured 2026-08-31, both decoders in
+one process on the same `(2, 32, 32, 4)` latents at this module's own dtype:
+
+    TAESD    4.21ms/frame   (median 8.42ms per BATCH=2 pair, p95 8.58)
+    sd-vae  35.87ms/frame   (median 71.73ms per pair, p95 73.13)
+
+MLX does help - **+31.66ms against the +58.6ms that first rejected it, nearly half** -
+and it is still far outside the budget. The model half is 35.93ms/frame with TAESD in it;
+swapping puts it at **67.59ms/frame against 41.67ms**, a 62% overrun that takes 24fps to
+14.8fps. Halving it again would not fit. Do not re-cost this on the strength of a faster
+machine without re-deriving the whole budget, which is what the earlier note asked for
+and what these numbers now answer.
+
+Two obstacles cost an hour to rediscover, so they are written down rather than left for
+the next attempt. `mlx-examples`' own `Autoencoder` passes `layers_per_block + 1` to the
+decoder - a diffusers VAE decoder has one more resnet per block than the encoder - so
+building its `Decoder` by hand fails with `List index 2 is out of bounds`. And MuseTalk's
+`sd-vae` checkpoint is diffusers **0.4.2**, which predates the `to_q`/`to_k`/`to_v`/
+`to_out.0` names `map_vae_weights` knows: its attention keys are `query`/`key`/`value`/
+`proj_attn`, 16 of them across both halves, and they must be renamed by exact path
+segment - matching "key" as a substring rewrites unrelated paths. The measurement itself
+was throwaway; it needs the spike's vendored `mlxsd/` and its 334MB `sd-vae` weights,
+neither of which is in this repo.
+
+The detail gap is what `render.restore_detail` was meant to pay back - though see its own
+docstring for how little of that it is measured to actually do.
 
 The key mapping and the transpose live in `loader.py`, deliberately next to the
 UNet's - because the two have OPPOSITE answers on transposing and confusing them
