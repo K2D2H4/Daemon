@@ -1735,8 +1735,16 @@ async def _lipsync_loop(
     a million times on the first tick. The pacing tests caught it as a dropped frame."""
     encoded: dict[str, list[bytes]] = {driving.driver.name: driving.frames}
     """Each clip's stills, encoded before its first use and kept - bytes never change."""
-    encoding: dict[str, asyncio.Future[list[bytes]]] = {}
-    """Encodes in flight, so a boundary that arrives early awaits rather than restarts."""
+    pending_stills: dict[str, asyncio.Future[list[bytes]]] = {}
+    """Stills encodes in flight, so a boundary that arrives early awaits rather than
+    restarts one.
+
+    Not `encoding`, which is what this was called for one live run: the publish loop
+    below already binds that name to its own per-step future, so this dict was rebound
+    to a `Future` and `stem in encoding` reached `Future.__await__` outside an await -
+    `RuntimeError: await wasn't used with future`, which took the render loop down on the
+    first spoken turn. Every wiring test passed because they all prepare ONE clip, so
+    `stem in encoded` short-circuits true and the poisoned half is never evaluated."""
     shots: deque[str] = deque()
     """One-shots the bus published, waiting for a boundary. A deque and not a slot
     because two moods inside one clip is ordinary, and `ClipQueue` decides which
@@ -1875,9 +1883,9 @@ async def _lipsync_loop(
                 ~470ms of encoding - so by the time the switch is due the bytes are
                 usually already there and `switch_to` awaits nothing.
                 """
-                if stem in encoded or stem in encoding:
+                if stem in encoded or stem in pending_stills:
                     return
-                encoding[stem] = loop.run_in_executor(
+                pending_stills[stem] = loop.run_in_executor(
                     stills, encode_clip, caches[stem][0]
                 )
 
@@ -1897,7 +1905,7 @@ async def _lipsync_loop(
                     # outgoing clip keeps publishing meanwhile, because `driving` is not
                     # swapped until the stills exist.
                     prefetch(stem)
-                    frames = await encoding.pop(stem)
+                    frames = await pending_stills.pop(stem)
                     encoded[stem] = frames
                 new = Driver(
                     name=stem,

@@ -169,12 +169,21 @@ class FakeRenderer:
     """
 
     def switch(self, driver) -> None:
-        """Recorded, not implemented: with one prepared clip the policy has nothing to
-        switch to, so a call here means the loop moved a clip these tests never asked it
-        to - which is worth failing on rather than absorbing."""
-        raise AssertionError(f"the loop switched to {driver.name!r} with one clip prepared")
+        """Recorded when the test prepared more than one clip, and a failure otherwise.
 
-    def __init__(self, *, step_seconds: float = 0.0) -> None:
+        With one prepared clip the policy has nothing to switch to, so a call there means
+        the loop moved a clip the test never asked it to - worth failing on rather than
+        absorbing.
+        """
+        if not self.allow_switch:
+            raise AssertionError(
+                f"the loop switched to {driver.name!r} with one clip prepared"
+            )
+        self.switched.append(driver.name)
+
+    def __init__(self, *, step_seconds: float = 0.0, allow_switch: bool = False) -> None:
+        self.allow_switch = allow_switch
+        self.switched: list[str] = []
         self.failed = False
         self.calls: list[tuple[int, float, float]] = []
         self.encoded: list[int] = []
@@ -324,6 +333,83 @@ def _driving(frames=None):
         _Driving(driver=driver, frames=list(frames)),
         {"idle2": (cache, FPS)},
         {"idle2": len(frames) / FPS},
+    )
+
+
+def _driving_two():
+    """Two prepared clips, which is the world every other test in this file is not.
+
+    They are all single-clip, and that is exactly how a name collision reached a live
+    run: `prefetch` reads `stem in encoded or stem in pending_stills`, and with one clip
+    the first half short-circuits true so the second is never evaluated. It was bound to
+    a `Future` by the publish loop's own local of the same name, and `in` on a Future
+    raises `RuntimeError: await wasn't used with future` - which took the render loop
+    down on the first spoken turn with the whole suite green.
+
+    Short clips (4 frames, 1/6th of a second) so a boundary arrives inside a test.
+    """
+    from types import SimpleNamespace
+
+    from daemon.app import _Driving
+    from daemon.face_lipsync.render import Driver
+
+    def one(name):
+        frames = [f"{name}-{i}".encode() for i in range(4)]
+        cache = SimpleNamespace(boxes=list(range(4)), frames=list(frames))
+        return cache, frames
+
+    cache2, frames2 = one("idle2")
+    cache1, _frames1 = one("idle1")
+    cache_mood, _frames_mood = one("amused")
+    driver = Driver(
+        name="idle2", cache=cache2, clip=ClipClock(fps=FPS, frames=4, epoch=0.0)
+    )
+    return (
+        _Driving(driver=driver, frames=frames2),
+        {"idle2": (cache2, FPS), "idle1": (cache1, FPS), "amused": (cache_mood, FPS)},
+        {"idle2": 4 / FPS, "idle1": 4 / FPS, "amused": 4 / FPS},
+    )
+
+
+async def test_a_mood_queued_while_speaking_reaches_the_boundary(monkeypatch):
+    """Speaking AND a clip whose stills do not exist yet - the one combination that
+    reached a live run, and the one no other test here can make.
+
+    Every other test prepares a single clip, so `prefetch`'s
+    `stem in encoded or stem in pending_stills` short-circuits on the first half and the
+    second is never evaluated. Reaching it needs a clip that is wanted but not yet
+    encoded, which during speech only a mood one-shot produces - `wanted("speaking")`
+    answers with the clip already up. And the failure needed the model half to have run
+    first, because that is what bound a `Future` to the name this dict used to share:
+    `in` on a Future raises `RuntimeError: await wasn't used with future`, which took the
+    render loop down on the first spoken turn with the whole suite green.
+    """
+    import daemon.face_lipsync.render as render_module
+
+    monkeypatch.setattr(
+        render_module, "encode_clip", lambda cache: list(cache.frames)
+    )
+    face = FaceBus()
+    face.set_activity("speaking")
+    renderer = FakeRenderer(allow_switch=True)
+    slot = RecordingSlot()
+    task = asyncio.create_task(
+        _lipsync_loop(
+            face, renderer, PacedClock(fps=FPS), FakeRing(), deque(), slot,
+            *_driving_two(), fps=FPS,
+        )
+    )
+    await asyncio.sleep(0.12)          # let the model half run and rebind its own local
+    assert renderer.encoded, "the model half never ran, so the collision cannot appear"
+    face.one_shot("amused")            # a clip with a cache and no stills yet
+    await asyncio.sleep(0.4)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not renderer.failed, "the loop latched failed rather than switching"
+    assert "amused" in renderer.switched, (
+        f"the mood never reached the renderer - switched to {renderer.switched}"
     )
 
 
