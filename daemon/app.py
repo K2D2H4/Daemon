@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import secrets
 import sys
 import time
@@ -44,6 +45,7 @@ from daemon.config import (
     Settings,
 )
 from daemon.face import MOOD_TOOL, MOOD_VOICE_INSTRUCTION
+from daemon.face_clips import ClipQueue, wanted
 from daemon.llm.base import Provider, ToolSpec
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
@@ -57,7 +59,7 @@ from daemon.tasks import Task
 if TYPE_CHECKING:  # the wake gate, used only in the signatures below
     from daemon.face import FaceBus
     from daemon.face_lipsync import Cache
-    from daemon.face_lipsync.render import ClipClock, FrameClock, Renderer
+    from daemon.face_lipsync.render import Driver, FrameClock, Renderer
     from daemon.face_lipsync.ring import PcmRing, Slot
     from daemon.voice.base import AudioIO, SpeechRecognizer
     from daemon.voice.wake import WakeGate
@@ -1193,14 +1195,30 @@ async def build_persona_evolution(
 # from `daemon/` and nothing outside this module imports it). What it assembles is
 # described in docs/superpowers/specs/2026-08-26-face-lipsync-design.md.
 
-LIPSYNC_CLIP = "idle2"
-"""The driving clip lip-sync renders onto, by the stem `/face/clips/{name}` serves.
+LIPSYNC_FIRST_CLIP = "idle2"
+"""Which prepared clip the face starts on, before the first boundary moves it.
 
-One clip, not a choice per activity: the mouth is generated for *these* frames from
-*these* reference latents, so the page has to lay the crop over this clip and no
-other (`face_routes.LipsyncFrames.clip`). `idle2` is the shipped avatar and the only
-prepared cache; a second one would be a second `evals/face_lipsync_prepare.py` run
-and a config field, and neither buys anything until there is a reason to switch."""
+`idle2` when it is prepared, else whichever sorts first. It is the best case for a
+driving clip among the idles - movement 4.77 against `idle1`'s 0.46, which is why it was
+the one clip the single-clip build drove - and starting there means the first thing a
+page sees is the clip every earlier judgement was made against. Nothing else depends on
+it: `face_clips.wanted` moves the face at the first clip boundary if the activity says
+otherwise."""
+
+LIPSYNC_ARTEFACTS = ("frames.npy", "masks.npz", "boxes.json", "latents.safetensors")
+"""What `evals/face_lipsync_prepare.py` writes, and all four are required.
+
+A directory under `<data_dir>/face/lipsync/` is a driveable clip when it has all four
+AND `<data_dir>/face/<name>.mp4` exists. Both halves matter. `models/` and a spike's
+output directory have none of them; `idle2-raw-backup/` has three - it is the box
+backup, kept so a re-smooth can be undone without the prep venv - and would otherwise
+become a clip named after a backup. The mp4 requirement keeps the driveable set equal to
+the servable set: `face_routes.py` serves `/face/clips/{name}` off that file, and it is
+what the page falls back to when the renderer latches `failed`.
+
+Ten clips are prepared today. There is no constant naming them here on purpose: which
+caches exist is the owner's data, and rule 4 is omission - a clip that was never
+prepared is absent, never interpolated or substituted."""
 
 LIPSYNC_WHISPER_REPO = "mlx-community/whisper-tiny-mlx"
 """The audio encoder, by HuggingFace repo id rather than a path.
@@ -1275,6 +1293,22 @@ class Lipsync:
     """The render loop, as a coroutine the lifespan turns into one task."""
 
 
+@dataclass
+class _Driving:
+    """What the two halves of the render loop agree is on screen right now.
+
+    Mutable and shared on purpose. `publish` reads it every frame interval to index the
+    clip and to find that clip's encoded stills; the model half writes it when
+    `ClipQueue` says a boundary has been reached. Both run on the event loop, so the
+    swap is never seen half-done - and it is written in ONE place (the model half),
+    because `Renderer.switch` mutates renderer state that the executor threads read.
+    """
+
+    driver: Driver
+    frames: list[bytes]
+    """This clip's own stills, encoded once on first use - see `_encode_for`."""
+
+
 class _LipsyncFrames:
     """`face_routes.LipsyncFrames` over a `Renderer`, its `Slot` and its `ClipClock`.
 
@@ -1285,13 +1319,13 @@ class _LipsyncFrames:
     it happens here.
     """
 
-    def __init__(
-        self, *, renderer: Renderer, slot: Slot, clip: str, driver: ClipClock
-    ) -> None:
+    def __init__(self, *, renderer: Renderer, slot: Slot, driving: _Driving) -> None:
         self._renderer = renderer
         self._slot = slot
-        self._driver = driver
-        self.clip = clip
+        self._driving = driving
+        """The live holder, not a copy of its name: the clip changes while this object
+        is on `app.state.face_frames`, and a page told the wrong one falls back to a
+        `<video>` of a clip the frames are not of."""
         # No box. Every JPEG is the whole composited frame now, so there is no
         # rectangle for the page to place - and reading `renderer.frame_box` here after
         # it was removed would have been an AttributeError on the first real build,
@@ -1314,7 +1348,30 @@ class _LipsyncFrames:
         a millisecond ago. Over loopback the page stamps its own arrival ~2ms later,
         which is a twentieth of a frame.
         """
-        return self._driver.position(asyncio.get_running_loop().time())
+        return self._driving.driver.clip.position(asyncio.get_running_loop().time())
+
+    @property
+    def clip(self) -> str:
+        """Which clip the frames are currently of. Read through, never cached."""
+        return self._driving.driver.name
+
+
+def _prepared_clips(root: Path, face_dir: Path) -> list[str]:
+    """Which clips under `root` are driveable, sorted so a log line is stable.
+
+    Both conditions, for the reasons `LIPSYNC_ARTEFACTS` gives. Nothing is loaded here -
+    this only decides what is worth loading, so a directory that fails is never opened.
+    """
+    found = []
+    for entry in sorted(root.iterdir() if root.is_dir() else []):
+        if not entry.is_dir():
+            continue
+        if not all((entry / name).is_file() for name in LIPSYNC_ARTEFACTS):
+            continue
+        if not (face_dir / f"{entry.name}.mp4").is_file():
+            continue
+        found.append(entry.name)
+    return found
 
 
 def _load_lipsync_cache(directory: Path) -> tuple[Cache, float]:
@@ -1397,21 +1454,16 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
         return None
     root = Path(settings.data_dir) / "face" / "lipsync"
     models = root / "models"
-    clip_dir = root / LIPSYNC_CLIP
     needed = {
         "the MLX UNet": models / "unet.safetensors",
         "its config": models / "musetalk.json",
         "the TAESD decoder": models / "taesd.safetensors",
-        "the clip's reference latents": clip_dir / "latents.safetensors",
-        "the clip's frames": clip_dir / "frames.npy",
-        "the clip's blend masks": clip_dir / "masks.npz",
-        "the clip's boxes": clip_dir / "boxes.json",
     }
     missing = {what: path for what, path in needed.items() if not path.exists()}
     if missing:
         # One line, naming the first thing that is absent and the directory it belongs
         # in. Not a warning per file: an install that has fetched none of this would
-        # print seven, and the owner's question is "where do I put them", once.
+        # print three, and the owner's question is "where do I put them", once.
         what, path = next(iter(missing.items()))
         logger.info(
             "face: lip-sync is on but not assembled - %s is missing (%s). The face "
@@ -1420,6 +1472,23 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
             what,
             path,
             models,
+        )
+        return None
+    # `root.parent` rather than importing `face_routes.face_dir`: it is the same
+    # `<data_dir>/face`, and this module already computed it one line above.
+    prepared = _prepared_clips(root, root.parent)
+    if not prepared:
+        # Separate from the weights above because the answer is a different command.
+        # Named as its own absence rather than folded into the seven-file list this
+        # used to print: with the weights in place and no cache, the owner has one
+        # thing left to run and it is not a download.
+        logger.info(
+            "face: lip-sync is on and the weights are in place, but no clip under %s "
+            "has a prepared cache with a matching mp4. The face will play its "
+            "pre-rendered clips. A cache is built by `python3 -m "
+            "evals.face_lipsync_prepare <clip>.mp4 --out %s/<clip>`.",
+            root,
+            root,
         )
         return None
 
@@ -1434,6 +1503,7 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
         from daemon.face_lipsync.engine import load as load_engine
         from daemon.face_lipsync.render import (
             ClipClock,
+            Driver,
             FrameClock,
             Renderer,
             encode_clip,
@@ -1441,13 +1511,25 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
         from daemon.face_lipsync.ring import PcmRing, Slot
         from daemon.voice.audio import OUTPUT_SAMPLE_RATE
 
-        cache, fps = _load_lipsync_cache(clip_dir)
+        caches = {name: _load_lipsync_cache(root / name) for name in prepared}
+        rates = {fps for _, fps in caches.values()}
+        assert len(rates) == 1, (
+            f"the prepared clips were shot at different rates ({sorted(rates)}), and "
+            "one FrameClock paces them all - reprepare them at one fps"
+        )
+        fps = rates.pop()
         engine = load_engine(
             unet_weights=models / "unet.safetensors",
             unet_config_json=models / "musetalk.json",
             taesd_weights=models / "taesd.safetensors",
             whisper_repo=LIPSYNC_WHISPER_REPO,
-            latents=clip_dir / "latents.safetensors",
+            # One engine, one latent table per clip. The UNet, TAESD and whisper
+            # weights are 1.6GB and say nothing about which clip they are drawing; the
+            # latents are 1.25-3.02 MiB measured over these ten, so holding them all
+            # is ~25MB and a switch is a dict lookup rather than a reload.
+            latents={
+                name: root / name / "latents.safetensors" for name in prepared
+            },
             # The rate the ring holds and therefore the rate the engine has to
             # resample from - the voice path's playback rate, not whisper's 16kHz.
             # `resample_to_whisper` refuses anything else rather than stretching the
@@ -1467,14 +1549,29 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
         # seconds-since-boot; any fixed instant would define the same clock. There is a
         # running loop - the lifespan is what calls this - and it has to be that loop's
         # clock, because that is the one the audio is stamped with.
-        driver = ClipClock(
-            fps=fps, frames=len(cache.boxes), epoch=asyncio.get_running_loop().time()
+        first = LIPSYNC_FIRST_CLIP if LIPSYNC_FIRST_CLIP in caches else prepared[0]
+        cache, _ = caches[first]
+        driver = Driver(
+            name=first,
+            cache=cache,
+            clip=ClipClock(
+                fps=fps,
+                frames=len(cache.boxes),
+                epoch=asyncio.get_running_loop().time(),
+            ),
         )
-        renderer = Renderer(engine=engine, cache=cache, ring=ring, clip=driver)
-        # Encoded once, held for the life of the process: the clip is fixed, so these
-        # bytes never change. ~35MB for 193 frames against 2.45ms of CPU per idle frame
-        # forever if they were encoded live.
-        idle_frames = encode_clip(cache)
+        renderer = Renderer(engine=engine, driver=driver, ring=ring)
+        # Encoded per clip on first use, not all ten at boot. The bytes never change
+        # once made - a clip is fixed - but ~35MB and ~470ms per 193-frame clip is a
+        # bill this process should only pay for clips a session actually reaches.
+        driving = _Driving(driver=driver, frames=encode_clip(cache))
+        # How long each clip runs, which is the only thing `ClipQueue` needs to know
+        # where a boundary is. Read off the caches rather than tabulated: the
+        # durations are the owner's footage, not a constant of this design.
+        lengths = {
+            name: len(clip_cache.boxes) / clip_fps
+            for name, (clip_cache, clip_fps) in caches.items()
+        }
         clock = FrameClock(fps=fps)
         # One model step on THIS thread before the render loop ever uses another one,
         # and it is a requirement rather than a warm-up. **MLX aborts the process** -
@@ -1493,7 +1590,7 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
         # window comes from the ring while it is still empty, so it is the right
         # length and all zeros without inventing a shape here.
         silent = ring.window(frame_index=0, fps=fps, origin=0.0, context_ms=CONTEXT_MS)
-        engine.mouths([silent, silent], [0, 0])
+        engine.mouths([silent, silent], [0, 0], clip=first)
     except Exception:
         # Loud and once. A broken cache, a mismapped weight file or a missing extra
         # must cost the mouth and nothing else: the voice session, the text loop and
@@ -1512,9 +1609,11 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
     queued: deque[tuple[bytes, float]] = deque()
     height, width = cache.frames[0].shape[:2]
     logger.info(
-        "face: lip-sync ready - %s, %d frames at %.3ffps, %dx%d, loaded in %.0fms",
-        LIPSYNC_CLIP,
-        len(cache.boxes),
+        "face: lip-sync ready - %d clips (%s), starting on %s, %.3ffps, %dx%d, "
+        "loaded in %.0fms",
+        len(prepared),
+        ", ".join(prepared),
+        first,
         fps,
         width,
         height,
@@ -1523,13 +1622,20 @@ def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
 
     async def run() -> None:
         await _lipsync_loop(
-            face, renderer, clock, ring, queued, slot, driver, idle_frames, fps=fps
+            face,
+            renderer,
+            clock,
+            ring,
+            queued,
+            slot,
+            driving,
+            caches,
+            lengths,
+            fps=fps,
         )
 
     return Lipsync(
-        frames=_LipsyncFrames(
-            renderer=renderer, slot=slot, clip=LIPSYNC_CLIP, driver=driver
-        ),
+        frames=_LipsyncFrames(renderer=renderer, slot=slot, driving=driving),
         sink=partial(_queue_pcm, queued),
         run=run,
     )
@@ -1542,8 +1648,9 @@ async def _lipsync_loop(
     ring: PcmRing,
     queued: deque[tuple[bytes, float]],
     slot: Slot,
-    driver: ClipClock,
-    idle_frames: list[bytes],
+    driving: _Driving,
+    caches: dict[str, tuple[Cache, float]],
+    lengths: dict[str, float],
     *,
     fps: float,
 ) -> None:
@@ -1598,12 +1705,53 @@ async def _lipsync_loop(
     failure into `failed`; this is for everything else, and the publisher carries the
     same guard because a task nobody awaits is exactly the shape that goes unnoticed.
     """
-    from daemon.face_lipsync.render import BATCH, RELEASE_FRAMES
+    from daemon.face_lipsync.render import (
+        BATCH,
+        RELEASE_FRAMES,
+        ClipClock,
+        Driver,
+        encode_clip,
+    )
 
     loop = asyncio.get_running_loop()
     interval = 1.0 / fps
     ready: asyncio.Queue[bytes] = asyncio.Queue()
     turn = 0
+    available = frozenset(caches)
+    clip_queue = ClipQueue(
+        current=driving.driver.name,
+        ends_at=loop.time()
+        + lengths[driving.driver.name]
+        - driving.driver.clip.position(loop.time()),
+        lengths=lengths,
+    )
+    """When the clip on screen next reaches its own end, on `loop.time()`'s clock.
+
+    The remainder, not the length: the clock was anchored in `_build_lipsync` and this
+    loop starts a moment later, so the first boundary is what is LEFT of the clip.
+    Writing it as `position() + length` types and runs and is wrong by however long this
+    process has been up - `position` is a place inside the clip and `at` is seconds since
+    boot, so `due()` found every boundary already past and rolled its own `while` forward
+    a million times on the first tick. The pacing tests caught it as a dropped frame."""
+    encoded: dict[str, list[bytes]] = {driving.driver.name: driving.frames}
+    """Each clip's stills, encoded on first use and kept - the bytes never change."""
+    shots: deque[str] = deque()
+    """One-shots the bus published, waiting for a boundary. A deque and not a slot
+    because two moods inside one clip is ordinary, and `ClipQueue` decides which
+    survives rather than this hand-off."""
+
+    async def watch_shots() -> None:
+        """Put every one-shot the bus publishes in front of `clip_queue`.
+
+        An activity is readable as state (`face.state.activity`); a one-shot is not - it
+        is an event, and nothing else in this loop would ever see one. Its own task
+        because `subscribe()` parks on a wake, and awaiting it inline would stop the
+        render between moods.
+        """
+        async for event in face.subscribe():
+            clip = getattr(event, "clip", None)
+            if clip is not None:
+                shots.append(clip)
     """Bumped on every falling edge. A pair whose encode outlived its own utterance is
     dropped rather than published into the next one - the last turn's mouth finishing
     somebody else's sentence, at exactly the moment the page fades the face in."""
@@ -1667,7 +1815,7 @@ async def _lipsync_loop(
                     except asyncio.QueueEmpty:
                         frame = None
                 else:
-                    index = driver.index(loop.time())
+                    index = driving.driver.clip.index(loop.time())
                     if spoke and released < RELEASE_FRAMES:
                         # The utterance just ended. Speech stops and the frame after it
                         # is the clip untouched, so a generated mouth is replaced by a
@@ -1689,7 +1837,7 @@ async def _lipsync_loop(
                         # decode of our JPEGs - measured R +3.0, G +2.1, B +1.2 - so the
                         # whole picture shifted darker and off-hue the moment speech
                         # started. One decoder, no shift. See `render.encode_clip`.
-                        frame = idle_frames[index % len(idle_frames)]
+                        frame = driving.frames[index % len(driving.frames)]
                 if frame is not None:
                     slot.put(frame)
                 target = max(target + interval, loop.time() + interval / 2)
@@ -1708,6 +1856,41 @@ async def _lipsync_loop(
             ) as cpu,
         ):
             pacer = asyncio.create_task(publish(), name="face-lipsync-publish")
+            watcher = asyncio.create_task(watch_shots(), name="face-lipsync-shots")
+
+            async def switch_to(stem: str) -> None:
+                """Move the render onto `stem`, from its frame 0.
+
+                Called only from this half. `Renderer.switch` mutates state the executor
+                threads read and `publish` is its own task, so doing it here - between
+                awaits, with nothing of ours in flight - is what makes the swap atomic
+                as far as either half can see.
+                """
+                clip_cache, clip_fps = caches[stem]
+                stills = encoded.get(stem)
+                if stills is None:
+                    # On the CPU executor: ~470ms for a 193-frame clip, and this loop
+                    # shares the event loop with the voice websocket. The outgoing clip
+                    # keeps publishing meanwhile, because `driving` is not swapped until
+                    # the stills exist.
+                    stills = await loop.run_in_executor(cpu, encode_clip, clip_cache)
+                    encoded[stem] = stills
+                new = Driver(
+                    name=stem,
+                    cache=clip_cache,
+                    clip=ClipClock(
+                        fps=clip_fps,
+                        frames=len(clip_cache.boxes),
+                        epoch=loop.time(),
+                    ),
+                )
+                renderer.switch(new)
+                driving.driver = new
+                driving.frames = stills
+                # Frames rendered for the outgoing clip must not be published over the
+                # incoming one - the same reason a turn boundary drains this.
+                while not ready.empty():
+                    ready.get_nowait()
             try:
                 speaking = False
                 sent: int | None = None
@@ -1720,6 +1903,24 @@ async def _lipsync_loop(
                     while queued:
                         chunk, audible_at = queued.popleft()
                         ring.feed(chunk, audible_at)
+                    # Clip policy, every iteration and not only while speaking:
+                    # `ClipQueue.due` is also what notices the current clip looping, and
+                    # a queue that missed a loop would apply the next want wherever it
+                    # arrived - the mid-clip cut ADR 0020 exists to avoid.
+                    while shots:
+                        clip_queue.want(shots.popleft(), one_shot=True)
+                    clip_queue.want(
+                        wanted(
+                            face.state.activity,
+                            pending_shot=clip_queue.pending_shot,
+                            current=clip_queue.current,
+                            available=available,
+                            pick=random.choice,
+                        )
+                    )
+                    boundary = clip_queue.due(at=loop.time())
+                    if boundary is not None:
+                        await switch_to(boundary)
                     if face.state.activity != "speaking":
                         if speaking:
                             speaking = False
@@ -1795,6 +1996,7 @@ async def _lipsync_loop(
                     wait = 0.0
             finally:
                 pacer.cancel()
+                watcher.cancel()
     except asyncio.CancelledError:
         # Shutdown, not a failure. Explicit because the clause below would not catch
         # it anyway and a reader should not have to know that.

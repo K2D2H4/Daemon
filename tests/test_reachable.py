@@ -80,17 +80,9 @@ PENDING_CLASSES: dict[str, str] = {
     # things a factory-built engine can still be checked for: that `app.py` calls the
     # loader, and that it reads the switch.
     #
-    # And the clip policy, for as long as the loop that would drive it is unwritten.
-    # `daemon/face_clips.py` is the whole of it - `wanted` and the two clip sets are
-    # declared in `PENDING_IMPORTS` below rather than here, because they are not
-    # classes and not one seam either.
-    "ClipQueue": (
-        "the multi-clip lip-sync plan's task 4 "
-        "(docs/superpowers/plans/2026-08-31-face-lipsync-multiclip.md), which builds "
-        "one queue per render loop in `daemon/app.py:_lipsync_loop` - the face is a "
-        "separate track and sits outside docs/PLAN.md's M0-M5 roadmap entirely, so "
-        "there is no milestone letter to give it"
-    ),
+    # `ClipQueue` was here until the multi-clip plan's task 4, and this test failing
+    # on it is what said so: `daemon/app.py:_lipsync_loop` builds one per render loop
+    # now. Deleting the entry is the file working.
 }
 
 PENDING_WIRING = {
@@ -141,13 +133,11 @@ feel is how the untracked one turns out to be the one that mattered - here, the
 rule-12 visibility read."""
 
 PENDING_IMPORTS: dict[str, str] = {
-    "face_clips": (
-        "the multi-clip lip-sync plan's task 4 "
-        "(docs/superpowers/plans/2026-08-31-face-lipsync-multiclip.md) - `wanted` and "
-        "the clip sets are pure policy and `daemon/app.py` is what will ask them which "
-        "clip is up. The face is a separate track, outside docs/PLAN.md's M0-M5 "
-        "roadmap, so there is no milestone letter to give it"
-    ),
+    # `face_clips` was the first and only entry, declared by the multi-clip plan's task
+    # 3 and closed by its task 4: `daemon/app.py` imports `wanted` and `ClipQueue` and
+    # asks them which clip is up once per publish tick. This test failing on it is what
+    # said the gap had closed, which is the whole reason the dict exists - so it stays,
+    # empty, rather than being deleted along with its one entry.
 }
 """A whole module under `daemon/` that nothing under `daemon/` imports.
 

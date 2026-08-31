@@ -25,6 +25,7 @@ import json
 import logging
 import time
 from collections import deque
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
@@ -74,6 +75,12 @@ def _lay_out(tmp_path: Path, *, skip: str = "") -> Path:
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"not really a model")
+    # And the mp4 the cache was prepared from. `_prepared_clips` requires both, so that
+    # the set lip-sync can drive equals the set `/face/clips/{name}` can serve - the
+    # page falls back to that file when the renderer latches `failed`. Without it a
+    # cache directory is skipped rather than loaded, which is a different degradation
+    # from the one each of these tests is about.
+    (tmp_path / "face" / "idle2.mp4").write_bytes(b"not really a clip")
     return root
 
 
@@ -103,14 +110,23 @@ def test_the_switch_on_with_nothing_fetched_degrades_in_one_line(tmp_path, caplo
 
 
 def test_a_missing_clip_cache_is_not_the_same_as_missing_weights(tmp_path, caplog):
-    """Weights fetched, no clip prepared. Still a degradation, and the line has to
-    name the file that is actually absent - the owner who has already downloaded
-    1.7GB should not be told to download it again."""
+    """Weights fetched, no clip prepared. Still a degradation, and the line has to send
+    the owner who already downloaded 1.7GB to a command rather than back to a download.
+
+    It no longer names one absent file, and that is the multi-clip change rather than a
+    weakening: with ten possible caches under one directory there is no single missing
+    path to name, so the line says none of them is complete and gives the command that
+    completes one. The distinction this test exists for is intact - a reader can still
+    tell this from the weights line, which is what `skip` used to prove by filename.
+    """
     _lay_out(tmp_path, skip="idle2/frames.npy")
     settings = _settings(tmp_path, face_lipsync_enabled=True)
     with caplog.at_level(logging.INFO, logger="daemon.app"):
         assert _build_lipsync(settings, FaceBus()) is None
-    assert "frames.npy" in caplog.records[0].getMessage()
+    message = caplog.records[0].getMessage()
+    assert "no clip" in message, "the absence has to be the clips, not the weights"
+    assert "unet.safetensors" not in message, "the weights are present; do not send him back"
+    assert "face_lipsync_prepare" in message, "and it has to name what builds one"
 
 
 def test_a_broken_cache_costs_the_mouth_and_not_the_process(tmp_path, caplog):
@@ -151,6 +167,12 @@ class FakeRenderer:
     those reached the `Slot` and when - the pacing that used to be inside `Renderer`
     is the loop's now, so it has to be visible from out here.
     """
+
+    def switch(self, driver) -> None:
+        """Recorded, not implemented: with one prepared clip the policy has nothing to
+        switch to, so a call here means the loop moved a clip these tests never asked it
+        to - which is worth failing on rather than absorbing."""
+        raise AssertionError(f"the loop switched to {driver.name!r} with one clip prepared")
 
     def __init__(self, *, step_seconds: float = 0.0) -> None:
         self.failed = False
@@ -276,13 +298,41 @@ IDLE_FRAMES = [f"idle-{i}".encode() for i in range(6)]
 can tell which half of the publisher produced what."""
 
 
+def _driving(frames=None):
+    """The single-clip world these tests were written in, in the shape the loop now takes.
+
+    Every test in this file is about the *pacing* of the two halves - which frame reached
+    the slot and when - not about which clip is up, so one prepared clip is the right
+    harness. `_Driving`/`caches`/`lengths` is what `_lipsync_loop` reads now, in place of
+    the bare `ClipClock` and frame list it used to take, and with a single entry the
+    clip policy has nothing to switch to: `wanted` answers with the clip already up and
+    `ClipQueue` drops that want, so these tests see the same loop they always did.
+    """
+    from types import SimpleNamespace
+
+    from daemon.app import _Driving
+    from daemon.face_lipsync.render import Driver
+
+    frames = IDLE_FRAMES if frames is None else frames
+    cache = SimpleNamespace(boxes=list(range(len(frames))), frames=list(frames))
+    driver = Driver(
+        name="idle2",
+        cache=cache,
+        clip=ClipClock(fps=FPS, frames=len(frames), epoch=0.0),
+    )
+    return (
+        _Driving(driver=driver, frames=list(frames)),
+        {"idle2": (cache, FPS)},
+        {"idle2": len(frames) / FPS},
+    )
+
+
 async def _run_loop(face, renderer, clock, ring, queued, *, stop_after: float, slot=None):
     """Drive `_lipsync_loop` for `stop_after` seconds, then cancel it."""
     slot = RecordingSlot() if slot is None else slot
-    driver = ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0)
     task = asyncio.create_task(
         _lipsync_loop(
-            face, renderer, clock, ring, queued, slot, driver, IDLE_FRAMES, fps=FPS
+            face, renderer, clock, ring, queued, slot, *_driving(), fps=FPS
         )
     )
     await asyncio.sleep(stop_after)
@@ -444,7 +494,7 @@ async def test_the_falling_edge_drops_a_pair_the_next_turn_must_not_show(monkeyp
     task = asyncio.create_task(
         _lipsync_loop(
             face, renderer, PacedClock(fps=FPS * 2), ring, deque(), slot,
-            ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0), IDLE_FRAMES, fps=FPS
+            *_driving(), fps=FPS
         )
     )
     await asyncio.sleep(0.15)
@@ -558,7 +608,7 @@ async def test_the_end_of_speech_hands_back_the_gpu_cache(monkeypatch):
     task = asyncio.create_task(
         _lipsync_loop(
             face, renderer, clock, ring, deque(), RecordingSlot(),
-            ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0), IDLE_FRAMES, fps=FPS,
+            *_driving(), fps=FPS,
         )
     )
     await asyncio.sleep(0.1)
@@ -583,8 +633,7 @@ async def test_a_latched_failure_ends_the_loop(monkeypatch, caplog):
         await asyncio.wait_for(
             _lipsync_loop(
                 face, renderer, clock, ring, deque(), RecordingSlot(),
-                ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0), IDLE_FRAMES,
-                fps=FPS,
+                *_driving(), fps=FPS,
             ),
             1.0,
         )
@@ -610,7 +659,7 @@ async def test_a_raising_tick_is_logged_rather_than_silently_orphaned(monkeypatc
     await asyncio.wait_for(
         _lipsync_loop(
             FaceBus(), renderer, clock, Exploding(), queued, RecordingSlot(),
-            ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0), IDLE_FRAMES, fps=FPS
+            *_driving(), fps=FPS
         ),
         1.0,
     )
@@ -634,12 +683,11 @@ async def test_the_frames_source_is_exactly_what_the_transport_asks_for():
 
     renderer, slot = FakeRenderer(), Slot()
     epoch = asyncio.get_running_loop().time()
-    frames = _LipsyncFrames(
-        renderer=renderer,
-        slot=slot,
-        clip="idle2",
-        driver=ClipClock(fps=24.0, frames=193, epoch=epoch - 4.0),
+    driving, _caches, _lengths = _driving()
+    driving.driver = replace(
+        driving.driver, clip=ClipClock(fps=24.0, frames=193, epoch=epoch - 4.0)
     )
+    frames = _LipsyncFrames(renderer=renderer, slot=slot, driving=driving)
     assert frames.clip == "idle2"
     assert not hasattr(frames, "box"), (
         "a box here would mean the page is placing a crop again"
@@ -839,10 +887,9 @@ async def test_speaking_with_nothing_ready_publishes_nothing_rather_than_the_cli
 async def _run_edges(face, renderer, clock, ring, *, speak: float, then_idle: float):
     """Speak, fall silent, and keep publishing - the two edges in one run."""
     slot = RecordingSlot()
-    driver = ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0)
     task = asyncio.create_task(
         _lipsync_loop(
-            face, renderer, clock, ring, deque(), slot, driver, IDLE_FRAMES, fps=FPS
+            face, renderer, clock, ring, deque(), slot, *_driving(), fps=FPS
         )
     )
     await asyncio.sleep(speak)
@@ -899,10 +946,9 @@ async def test_a_barge_in_mid_ramp_starts_the_next_ramp_over(monkeypatch):
     renderer.releases = RELEASE_FRAMES
     clock, ring = FakeClock([0, 1, 2, 3] + [None] * 60), FakeRing()
     slot = RecordingSlot()
-    driver = ClipClock(fps=FPS, frames=len(IDLE_FRAMES), epoch=0.0)
     task = asyncio.create_task(
         _lipsync_loop(
-            face, renderer, clock, ring, deque(), slot, driver, IDLE_FRAMES, fps=FPS
+            face, renderer, clock, ring, deque(), slot, *_driving(), fps=FPS
         )
     )
     await asyncio.sleep(0.15)

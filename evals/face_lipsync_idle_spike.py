@@ -170,7 +170,9 @@ def rewritten(cache, size: tuple[int, int]) -> tuple[np.ndarray, tuple[int, int,
     return full[:, box[1] : box[3], box[0] : box[2]], box
 
 
-def render_clip(engine, cache, pcm: np.ndarray | None, *, fps: float, box) -> dict[int, np.ndarray]:
+def render_clip(
+    engine, cache, pcm: np.ndarray | None, *, fps: float, box, clip_name: str
+) -> dict[int, np.ndarray]:
     """Every driving frame, composited and JPEG'd through the real `Renderer`.
 
     `pcm` of `None` is the digital-zero arm: an unfed ring answers `window()` with
@@ -179,13 +181,24 @@ def render_clip(engine, cache, pcm: np.ndarray | None, *, fps: float, box) -> di
     """
     import cv2
 
-    from daemon.face_lipsync.render import BATCH, Renderer
+    from daemon.face_lipsync.render import BATCH, ClipClock, Driver, Renderer
     from daemon.face_lipsync.ring import PcmRing
 
     ring = PcmRing(sample_rate=RATE, width=2, seconds=30.0)
     if pcm is not None:
         ring.feed(pcm.tobytes(), 0.0)
-    renderer = Renderer(engine=engine, cache=cache, ring=ring)
+    # `Driver` bundles the clip, its frames and its clock, because a cache with another
+    # clip's clock composites into the wrong pose. This spike drives one clip, so the
+    # epoch is 0 and the name is only what the engine keys its latents by.
+    renderer = Renderer(
+        engine=engine,
+        driver=Driver(
+            name=clip_name,
+            cache=cache,
+            clip=ClipClock(fps=fps, frames=len(cache.boxes), epoch=0.0),
+        ),
+        ring=ring,
+    )
     n = len(cache.boxes)
     out: dict[int, np.ndarray] = {}
     for first in range(0, n, BATCH):
@@ -375,7 +388,7 @@ def main() -> int:
         unet_config_json=models / "musetalk.json",
         taesd_weights=models / "taesd.safetensors",
         whisper_repo=WHISPER_REPO,
-        latents=clip_dir / "latents.safetensors",
+        latents={clip_dir.name: clip_dir / "latents.safetensors"},
         sample_rate=RATE,
     )
 
@@ -392,7 +405,9 @@ def main() -> int:
         }
     }
     for name, pcm in arms.items():
-        states[name] = render_clip(engine, cache, pcm, fps=fps, box=region)
+        states[name] = render_clip(
+            engine, cache, pcm, fps=fps, box=region, clip_name=clip_dir.name
+        )
         print(f"  rendered {name}")
 
     # --- the step at the switch, on two nested pixel sets ------------------------
@@ -446,11 +461,19 @@ def main() -> int:
 
     # --- is there ANY window that renders a sealed mouth? ------------------------
     if not args.no_sweep:
-        from daemon.face_lipsync.render import Renderer
+        from daemon.face_lipsync.render import ClipClock, Driver, Renderer
 
         ring = PcmRing(sample_rate=RATE, width=2, seconds=30.0)
         ring.feed(read_pcm(args.wav)[: RATE * 25].tobytes(), 0.0)
-        renderer = Renderer(engine=engine, cache=cache, ring=ring)
+        renderer = Renderer(
+            engine=engine,
+            driver=Driver(
+                name=clip_dir.name,
+                cache=cache,
+                clip=ClipClock(fps=fps, frames=n, epoch=0.0),
+            ),
+            ring=ring,
+        )
         # The four frames whose own mouth is most sealed, by how little of the MOUTH
         # box is dark - the lip box sits too low to see an aperture (see `openness`).
         resting = sorted(sorted(range(n), key=lambda i: openness(mouth("original", i)))[:4])
@@ -471,7 +494,9 @@ def main() -> int:
             for i in resting:
                 step = Step(
                     indices=[i] * len(pair),
-                    mouths=engine.mouths([windows[k] for k in pair], [i] * len(pair)),
+                    mouths=engine.mouths(
+                        [windows[k] for k in pair], [i] * len(pair), clip=clip_dir.name
+                    ),
                 )
                 for key, payload in zip(pair, renderer.encode(step), strict=True):
                     image = cv2.imdecode(
