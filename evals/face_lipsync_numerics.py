@@ -83,6 +83,56 @@ from daemon.face_lipsync.loader import (
 )
 
 
+def _second_clip_on_a_worker_thread(mx, root: Path, models: Path) -> int:
+    """Whether rendering a clip the warm-up never touched survives off the loading thread.
+
+    This is the one failure in this engine that **no unit test can reach**: every test
+    under `tests/` injects a fake engine, and the real one aborts the PROCESS rather than
+    raising - `libc++abi: terminating due to uncaught exception of type
+    std::runtime_error: There is no Stream(cpu, 1) in current thread`, which no `except`
+    sees. It killed the assembled daemon on 2026-08-31 on the first clip change of the
+    first spoken turn, with the whole suite green.
+
+    The shape reproduced here is `daemon/app.py`'s exactly: warm up ONE clip on the
+    loading thread, then ask a worker for a different one, which is what
+    `_lipsync_loop`'s model executor does after `ClipQueue` reaches a boundary. The fix
+    it guards is `load()` evaluating every clip's latents on the loading thread; remove
+    that and this returns non-zero by dying.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from daemon.face_lipsync.audio import CONTEXT_MS
+    from daemon.face_lipsync.engine import load
+    from daemon.face_lipsync.ring import PcmRing
+
+    clips = [name for name in ("idle2", "listening", "amused") if (root / name).is_dir()]
+    if len(clips) < 2:
+        print("second clip on a worker thread: needs two prepared caches - skipped")
+        return 0
+    print("a clip the warm-up never touched, rendered off the loading thread")
+    engine = load(
+        unet_weights=models / "unet.safetensors",
+        unet_config_json=models / "musetalk.json",
+        taesd_weights=models / "taesd.safetensors",
+        whisper_repo="mlx-community/whisper-tiny-mlx",
+        latents={name: root / name / "latents.safetensors" for name in clips},
+        # 24kHz because that is what the ring holds - `daemon/voice/audio.py`'s
+        # OUTPUT_SAMPLE_RATE, the same value `_clip_selection` above uses.
+        sample_rate=24_000,
+    )
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=30.0)
+    window = ring.window(frame_index=0, fps=24.0, origin=0.0, context_ms=CONTEXT_MS)
+    engine.mouths([window, window], [0, 0], clip=clips[0])
+    print(f"  warmed up {clips[0]} on this thread, as daemon/app.py does")
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        for name in clips[1:]:
+            got = worker.submit(
+                engine.mouths, [window, window], [0, 0], clip=name
+            ).result()
+            print(f"  clip={name} on a worker thread: ok {got[0].shape}")
+    return 0
+
+
 def _clip_selection(mx, root: Path, models: Path) -> int:
     """Build the engine twice and ask whether a second clip changed the first's mouth.
 
@@ -273,7 +323,10 @@ def main() -> int:
     print(f"  proj_in/proj_out/conv_shortcut rank OK ({len(linear_like)} tensors)")
 
     print("one engine, latents per clip", flush=True)
-    return _clip_selection(mx, root, models)
+    rc = _clip_selection(mx, root, models)
+    if rc:
+        return rc
+    return _second_clip_on_a_worker_thread(mx, root, models)
 
 
 if __name__ == "__main__":

@@ -150,6 +150,15 @@ class MlxEngine:
         stacked = mx.stack(states, axis=2)          # (1, WINDOW, 5, 384)
         return stacked.reshape(1, WINDOW * HIDDEN_STATES, FEATURE_DIM) + self._audio_pe
 
+    def tables(self) -> tuple[mx.array, ...]:
+        """Every clip's latents, for the caller to `mx.eval` on the loading thread.
+
+        Exposed rather than evaluated in `__init__` because `load` is where the other
+        `mx.eval` already is, and one place that forces the whole engine onto the
+        loading thread is easier to keep true than two.
+        """
+        return tuple(self._latents.values())
+
     def mouths(
         self,
         windows: Sequence[np.ndarray],
@@ -246,5 +255,18 @@ def load(
         },
         sample_rate=sample_rate,
     )
-    mx.eval(unet.parameters(), taesd.parameters())
+    # The latents go in this eval too, and with more than one clip that is a
+    # requirement rather than tidiness. **MLX aborts the process** - `libc++abi:
+    # terminating due to uncaught exception of type std::runtime_error: There is no
+    # Stream(cpu, 1) in current thread`, not a Python exception anything could catch -
+    # when an array is first *evaluated* on a thread that has no stream. `mx.load`
+    # here is lazy, so without this the second clip's table is first evaluated inside
+    # `mouths` on the render loop's model thread, and the daemon dies on the first
+    # clip change of the first spoken turn. Measured 2026-08-31 against the live path:
+    # it survived every unit test, because those inject a fake engine.
+    #
+    # `daemon/app.py`'s warm-up `mouths` call covers the same ground for the FIRST
+    # clip only - it is one clip's latents plus the graph - which is why that comment
+    # says a full call is needed and this one says every table.
+    mx.eval(unet.parameters(), taesd.parameters(), *engine.tables())
     return engine
