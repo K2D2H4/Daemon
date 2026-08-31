@@ -385,8 +385,13 @@ def test_the_overall_budget_still_wins() -> None:
 def test_a_kind_absent_from_the_table_is_bound_only_by_the_daily_total() -> None:
     """`pattern_time`'s own ceiling is 1; a kind with no entry at all - the shape a
     future generator would arrive in before anyone adds it a line here - must not
-    silently inherit a limit of zero and be blocked forever."""
-    history = FakeHistory(counts={"unlisted_kind": 5})
+    silently inherit a limit of zero and be blocked forever.
+
+    The count stays below `proactive_daily_budget`'s default (5, task-4) with
+    headroom to spare - this test is about the missing per-kind ceiling, not
+    about the daily total, which `test_the_budget_rule_works_against_the_real_store`
+    and friends already cover."""
+    history = FakeHistory(counts={"unlisted_kind": 2})
     candidate = Candidate(kind="unlisted_kind", reason="아직 표에 없는 유형")
 
     assert gate_for(history).judge(candidate, PRESENT, now=NOW).allowed

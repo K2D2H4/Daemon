@@ -13,7 +13,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from conftest import FakeProvider
@@ -23,6 +23,7 @@ from daemon.app import create_app
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
 from daemon.config import Route, Settings
+from daemon.face import MOOD_INSTRUCTION, Mood, split_mood
 from daemon.llm.base import Completion, ImageBlock, Message, ProviderError, ToolCall
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import FAILURE_NOTICE, ConversationLoop
@@ -1051,9 +1052,17 @@ async def test_a_mood_tag_becomes_an_event_and_leaves_no_trace(data_dir: Path) -
     assert [m.content for m in memory.records if m.role == "assistant"] == ["그래서 웃었어"]
 
 
-async def test_the_expression_is_published_before_speaking_starts(data_dir: Path) -> None:
-    """A person's face moves just ahead of their words, and the tag arrives in time
-    to allow it - so the one-shot must be published before the activity flips."""
+async def test_the_expression_is_published_after_speaking_starts(data_dir: Path) -> None:
+    """The reverse of what this used to assert, and the spec is corrected to match.
+
+    Spec 3.6's "the expression lands first" was written for the voice path, where
+    the audio genuinely arrives after the tag. On the text path there is no audio
+    for the mouth to lag: `_speak` publishes both in one synchronous block, so
+    they reach the page in the same event either way - and `speaking` is the one
+    transition allowed to cut a one-shot (spec 3.2), so shot-first put the mood on
+    screen for about 0ms. Published this way round the page plays the mood over
+    the speaking loop and hands back to it when the arc ends.
+    """
     order: list[str] = []
 
     class Ordered(RecordingBus):
@@ -1072,7 +1081,7 @@ async def test_the_expression_is_published_before_speaking_starts(data_dir: Path
         face=Ordered(),
     ).run()
 
-    assert order.index("shot:sulky") < order.index("activity:speaking")
+    assert order == ["activity:thinking", "activity:speaking", "shot:sulky", "activity:idle"]
 
 
 async def test_a_reply_with_no_tag_publishes_no_one_shot(
@@ -1147,6 +1156,69 @@ async def test_the_approval_resume_reply_also_gets_its_mood_tag_stripped(
     assert [m.content for m in memory.records if m.role == "assistant"] == ["다 됐어"]
 
 
+def _system_texts(messages: list[Any]) -> list[str]:
+    return [m.content for m in messages if m.role == "system"]
+
+
+async def test_the_model_is_asked_for_the_mood_tag_when_a_face_is_attached(
+    data_dir: Path,
+) -> None:
+    """The other half of `split_mood`. Stripping a tag is worth nothing if nothing
+    ever asks for one - which is exactly where this feature sat until
+    `evals/face_mood_tag_spike.py` measured that asking works."""
+    provider = FakeProvider()
+    channel = FakeChannel([inbound("웃겨?")])
+
+    await ConversationLoop(
+        channel,
+        gateway_for(provider),
+        Companion(FakeMemory(), data_dir=data_dir),
+        face=RecordingBus(),
+    ).run()
+
+    assert MOOD_INSTRUCTION in _system_texts(provider.calls[0])
+
+
+async def test_no_face_means_the_model_is_never_asked_for_a_mood(data_dir: Path) -> None:
+    """A text-only install pays nothing for a face it does not have. Without the
+    gate this is two hundred tokens on every turn asking for a tag `_speak` would
+    strip and no page would ever draw."""
+    provider = FakeProvider()
+    channel = FakeChannel([inbound("웃겨?")])
+
+    await ConversationLoop(
+        channel, gateway_for(provider), Companion(FakeMemory(), data_dir=data_dir)
+    ).run()
+
+    assert all("mood:" not in text for text in _system_texts(provider.calls[0]))
+
+
+async def test_the_approval_resume_is_asked_for_a_mood_too(data_dir: Path) -> None:
+    """`_assemble_after_tool` builds its own message list from scratch, so it can
+    forget this independently of the ordinary turn - and did, in the draft where
+    only `_speak` was covered."""
+    provider = FakeProvider()
+    channel = FakeChannel([inbound("/approve A3F2K9QT")])
+    companion = ApprovingCompanion(FakeMemory(), data_dir=data_dir, tools=object())
+
+    await ConversationLoop(
+        channel, gateway_for(provider), companion, face=RecordingBus()
+    ).run()
+
+    assert MOOD_INSTRUCTION in _system_texts(provider.calls[0])
+
+
+def test_the_instruction_and_the_parser_still_agree() -> None:
+    """Two halves of one contract in two files (`daemon/face.py`). If a reworded
+    instruction stops naming a mood, or names one the parser will not accept, the
+    face goes quiet and every reply still looks perfectly fine."""
+    # Off the `Mood` type itself, so a fourth mood added to the Literal without a
+    # matching line in the instruction fails here rather than on screen.
+    for mood in get_args(Mood):
+        assert f"[mood:{mood}]" in MOOD_INSTRUCTION
+        assert split_mood(f"[mood:{mood}] 본문") == ("본문", mood)
+
+
 # --- the M1a gate -----------------------------------------------------------
 
 
@@ -1156,6 +1228,7 @@ async def test_the_exchange_lands_in_the_markdown_log(
     """docs/PLAN.md 8.2, M1a gate: message it, it answers, and the exchange is in
     memory/log/YYYY-MM-DD.md. Everything but the channel is real here."""
     from daemon.clock import now
+    from daemon.memory.log import local_date
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
 
@@ -1175,7 +1248,10 @@ async def test_the_exchange_lands_in_the_markdown_log(
         channel, gateway_for(fake_provider), Companion(memory, data_dir=data_dir)
     ).run()
 
-    today = f"{now():%Y-%m-%d}.md"
+    # local_date, not a UTC strftime: the writer names the file by the owner's
+    # calendar day, so a UTC-formatted expectation is wrong for the nine hours a
+    # day KST runs ahead of UTC - and longer in zones further east.
+    today = f"{local_date(now())}.md"
     logs = sorted(p.name for p in (data_dir / "memory" / "log").glob("*.md"))
     assert logs == [today]
     written = (data_dir / "memory" / "log" / today).read_text(encoding="utf-8")

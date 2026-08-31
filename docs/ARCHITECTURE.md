@@ -50,6 +50,7 @@ flowchart LR
     LOG["log.py<br/>markdown · fsynced"]
     STORE["store.py<br/>sqlite · provenance"]
     RECALL["recall.py<br/>Lane 1 · no LLM call"]
+    OLLP["ollama_process.py<br/>starts the local embedder · app.py + cli.py only"]
     CUR["curated.py<br/>core.md · rewritten whole"]
     ENT["entities.py<br/>notes · wiki-linked · appended"]
   end
@@ -62,6 +63,7 @@ flowchart LR
 
   CLI --> APP
   APP --> TG & LOOP & VC
+  APP --> OLLP
   TG <--> PAIR
   TG -->|InboundMessage| LOOP
   LOOP --> GW --> OLL & HOST
@@ -479,6 +481,15 @@ means the publish is a comparison. `daemon/face_routes.py` mounts alongside the
 admin router and serves it: `daemon/static/face.html` is the page, an SSE stream
 carries the bus, and clips play from `<data_dir>/face/` - unshipped, so a fresh
 install shows no face until something is dropped there.
+
+One more route, `/face/transitions`, serves a table the page uses to decide
+*when* to cross from one clip to the next and *where* to enter the next one.
+`daemon/face_match.py` builds it offline from the owner's own clips -
+`daemon face-transitions`, never on the request path - and writes it to
+`<data_dir>/face/transitions.json`, so the route 404s until that has been run
+and the page falls back to cutting at frame 0. Which of its two mechanisms
+leads is the decision worth knowing:
+[ADR 0017](adr/0017-the-neutral-moment-not-the-matched-pose.md).
 
 The mouth has a second implementation behind `DAEMON_FACE_LIPSYNC_ENABLED`, off by
 default. `daemon/face_lipsync/` renders it from the audio being spoken - MuseTalk's

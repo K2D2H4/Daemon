@@ -12,6 +12,13 @@ Endpoints (docs/design/2026-08-07-m5-admin-web-design.md, "JSON API"):
     GET   /admin/api/activity     the merged decision log (proactivity, tools, reflection)
     GET   /admin/api/proactive/today   today's rounds, budget and timeline marks
     GET   /admin/api/tools/log    tool calls and refusals with their policy decision
+    GET   /admin/api/memory       curated facts, entity notes, the reflection history
+    GET   /admin/api/persona      the anchor, learned rules with evidence, diaries
+    GET   /admin/api/persona/seed the seed for editing, unbudgeted; 409 if undecodable
+    PUT   /admin/api/persona/seed {text, sha256} -> {saved, sha256, lines, backup}
+    POST  /admin/api/persona/forget  {id, why} -> {retired, id}; 409 on a diverged file
+    POST  /admin/api/reflect      {} -> {results: [...]}; runs under the shared catch-up lock
+    POST  /admin/api/persona/evolve  {force} -> {date, skipped, ...}; same lock
 
     --- Phase 2, all behind DAEMON_MCP_ENABLED (409 with guidance when off) ---
     GET    /admin/api/mcp/catalog          the trusted catalog (no commands/urls)
@@ -54,17 +61,31 @@ from daemon.admin.activity import (
     tool_log_payload,
 )
 from daemon.admin.mcp_oauth import OAuthError, complete_oauth_flow, start_oauth_flow
+from daemon.admin.mind import memory_payload, persona_payload
 from daemon.admin.restart import is_supervised, schedule_exit
+from daemon.admin.seed_io import (
+    SeedConflict,
+    SeedRejected,
+    SeedUnreadable,
+    read_seed,
+    write_seed,
+)
 from daemon.admin.settings_io import (
     PatchError,
     apply_patch,
     current_settings_payload,
     write_env_secret,
 )
-from daemon.app import health_payload, open_store
+from daemon.app import (
+    health_payload,
+    open_store,
+    run_persona_evolution_now,
+    run_reflection_now,
+)
 from daemon.config import GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES, VOICE_PROVIDERS
 from daemon.llm.base import Message, ProviderError
 from daemon.mcp_catalog import CATALOG, lookup
+from daemon.persona.rules import LearnedFileDiverged, LearnedRules
 from daemon.setup import check_anthropic, check_gemini, check_openai
 from daemon.tasks import Task
 from daemon.tools.mcp import (
@@ -321,10 +342,14 @@ async def patch_settings(request: Request) -> JSONResponse:
 
 
 @router.post("/api/restart")
-async def restart() -> JSONResponse:
+async def restart(request: Request) -> JSONResponse:
     """Exit gracefully so the supervisor revives us on the new config - but only
     if a supervisor exists. Otherwise say so plainly rather than killing a process
-    nothing will bring back (decision 3)."""
+    nothing will bring back (decision 3).
+
+    The face bus goes to `schedule_exit`, which closes it before the signal: an open
+    `/face/stream` is a response uvicorn cannot close, and it used to hold the exit
+    this endpoint promises. `getattr` because a test app need not have built one."""
     if not is_supervised():
         return JSONResponse(
             {
@@ -337,7 +362,7 @@ async def restart() -> JSONResponse:
             },
             status_code=409,
         )
-    schedule_exit()
+    schedule_exit(getattr(request.app.state, "face", None))
     return JSONResponse({"restarted": True, "supervised": True})
 
 
@@ -406,6 +431,216 @@ async def tools_log(request: Request, limit: int = 60) -> JSONResponse:
     with open_store(settings) as store:
         payload = tool_log_payload(store, limit=clamp_limit(limit))
     return JSONResponse(payload)
+
+
+# --- Memory and Persona: what she knows, and what she worked out -------------
+# The read half. Not on the 15-second poll the browser runs for health/activity:
+# these change once a day and carry ~12 KB of markdown, so `index.html` loads them
+# on tab entry, on an explicit refresh, and after a write.
+
+
+@router.get("/api/memory")
+async def memory(request: Request) -> JSONResponse:
+    """Curated facts, entity notes, and the reflection history with its artifacts."""
+    settings = request.app.state.settings
+    with open_store(settings) as store:
+        payload = memory_payload(store, settings.data_dir)
+    return JSONResponse(payload)
+
+
+@router.get("/api/persona")
+async def persona(request: Request) -> JSONResponse:
+    """The anchor readout, learned rules with their evidence, observations, diaries."""
+    settings = request.app.state.settings
+    with open_store(settings) as store:
+        payload = persona_payload(store, settings.data_dir, settings)
+    return JSONResponse(payload)
+
+
+@router.get("/api/persona/seed")
+async def persona_seed(request: Request) -> JSONResponse:
+    """The seed as the editor must load it: whole, and with the hash a save needs.
+
+    Deliberately *not* `/api/persona`'s copy of the same file. That one shares a
+    64 KB body budget with the diaries and comes back `text: None` once they fill
+    it (`daemon/admin/mind.py:_file_view`), which an editor would show as an empty
+    box over a file full of text - and then save.
+    """
+    settings = request.app.state.settings
+    try:
+        view = read_seed(settings.data_dir)
+    except SeedUnreadable as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return JSONResponse(
+        {
+            "text": view.text,
+            "sha256": view.sha256,
+            "exists": view.exists,
+            "file": view.file,
+        }
+    )
+
+
+# The write half: four handles. Three call a function the CLI already calls, and
+# none of them adds or edits a learned rule - `persona/learned.md` is AI-owned
+# (docs/CONTRACTS.md non-negotiable 5) and retiring is the one thing a human was
+# ever able to ask for (`daemon persona forget`).
+#
+# The fourth writes `seed.md`, which no route used to do. docs/adr/0019 is the
+# record: the anchor is that no *model output* reaches the seed, and this handler
+# writes one string that arrived on the request and calls nothing that thinks.
+# `daemon/admin/seed_io.py` carries the refusals; there is no second write path,
+# and `tests/test_admin_seed.py` fails if one appears.
+
+
+@router.put("/api/persona/seed")
+async def persona_seed_save(request: Request) -> JSONResponse:
+    """Replace `persona/seed.md` with what the owner typed.
+
+    No `catchup_lock`, unlike the three handlers below it. Nothing else in the
+    daemon writes this file, and the passes that *read* it (`persona/evolve.py`,
+    `proactivity/judge.py`, `load_persona` on every turn) get the old text or the
+    new one from an atomic replace - never a half-written file. A lock here would
+    serialise the save behind a reflection run for no property it needs.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "body must be an object"}, status_code=400)
+    text = body.get("text")
+    if not isinstance(text, str):
+        raise HTTPException(status_code=400, detail="text must be a string")
+    expected = body.get("sha256")
+    if not isinstance(expected, str):
+        # Required, not defaulted. A missing hash standing for "there was no
+        # file" is the one reading that overwrites, and it is exactly what a
+        # client that forgot the field sends.
+        raise HTTPException(
+            status_code=400, detail="sha256 is required - reload the seed and save again"
+        )
+
+    settings = request.app.state.settings
+    try:
+        saved = write_seed(settings.data_dir, text, expected_sha256=expected)
+    except SeedRejected as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except (SeedConflict, SeedUnreadable) as exc:
+        # 409 and the exception's own words, the same shape `forget` uses for a
+        # diverged `learned.md`: a refusal with a fix in it, not a broken button.
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not write the seed: {exc}") from None
+    return JSONResponse(
+        {"saved": True, "sha256": saved.sha256, "lines": saved.lines, "backup": saved.backup}
+    )
+
+
+@router.post("/api/persona/forget")
+async def persona_forget(request: Request) -> JSONResponse:
+    """Retire one learned rule. The browser's `daemon persona forget`."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "body must be an object"}, status_code=400)
+    raw_id = body.get("id")
+    # `bool` is an `int` subclass and JSON numbers with a fraction decode as
+    # `float`, so a bare `int(...)` coercion also accepts `true` (-> 1) and
+    # `3.9` (-> 3) - either retires a rule the caller never named.
+    if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+        raise HTTPException(status_code=400, detail="id must be a rule id")
+    rule_id = raw_id
+    why = str(body.get("why") or "").strip()
+    if not why:
+        # Required for the same reason the CLI requires it: a rule that vanished
+        # with no reason is indistinguishable from one that vanished by accident.
+        raise HTTPException(status_code=400, detail="why is required")
+
+    settings = request.app.state.settings
+    with open_store(settings) as store:
+        try:
+            # Same lock reflect_now/persona_evolve take: `retire` snapshots the
+            # active rows, then awaits a file read and a threaded write, and
+            # nothing in `diverged_bodies` catches a mirror row that outran the
+            # snapshot - only the other direction (file has an orphan the mirror
+            # doesn't). Without this lock, a weekly `add()` finishing inside that
+            # window would have its new bullets silently dropped by this rewrite.
+            async with request.app.state.catchup_lock:
+                retired = await LearnedRules(settings.data_dir, store).retire(rule_id, why=why)
+        except LearnedFileDiverged as diverged:
+            # 409, and the exception's own words. This is a refusal with a fix -
+            # the file holds bullets the mirror does not know, and rewriting it
+            # would drop them (daemon/cli.py:1237-1239). A generic failure here
+            # reads as a broken button.
+            raise HTTPException(status_code=409, detail=str(diverged)) from None
+    if not retired:
+        raise HTTPException(status_code=404, detail=f"no active rule with id {rule_id}")
+    return JSONResponse({"retired": True, "id": rule_id})
+
+
+@router.post("/api/reflect")
+async def reflect_now(request: Request) -> JSONResponse:
+    """Run the reflection pass over every unreflected day, now.
+
+    Takes `app.state.catchup_lock` - the same lock the 04:00 cron and the boot
+    catch-up take. Two `run(date)` for one day double-write its append-only
+    artifact and its observations (daemon/app.py:232-237).
+    """
+    settings = request.app.state.settings
+    try:
+        results = await run_reflection_now(settings, request.app.state.catchup_lock)
+    except Exception as exc:  # noqa: BLE001 - a person is waiting for the answer
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+    return JSONResponse(
+        {
+            "results": [
+                {
+                    "date": r.date,
+                    "status": r.status,
+                    "messages_read": r.messages_read,
+                    "facts": r.facts,
+                    "entities": r.entities,
+                    "observations": r.observations,
+                    "problems": list(r.problems),
+                }
+                for r in results
+            ]
+        }
+    )
+
+
+@router.post("/api/persona/evolve")
+async def persona_evolve(request: Request) -> JSONResponse:
+    """Run the weekly persona pass now - the only way to see it without waiting
+    for Monday 05:00. Same lock, same reason as `reflect_now`."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "body must be an object"}, status_code=400)
+    force = bool(body.get("force"))
+    settings = request.app.state.settings
+    try:
+        result = await run_persona_evolution_now(
+            settings, request.app.state.catchup_lock, force=force
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from None
+    return JSONResponse(
+        {
+            "date": result.date,
+            "skipped": result.skipped,
+            "observations_read": result.observations_read,
+            "proposed": result.proposed,
+            "added": result.added,
+            "retired": result.retired,
+            "problems": list(result.problems),
+        }
+    )
 
 
 # --- MCP (Phase 2), all behind DAEMON_MCP_ENABLED ----------------------------

@@ -61,6 +61,21 @@ def no_health(base_url: str) -> HealthState:
     raise AssertionError("a test reached the real /health")
 
 
+def no_pull(model: str) -> bool:
+    """The default `pull` probe for tests that are not about pulling a model.
+
+    Like `no_network`/`no_health`: `Checks.pull` defaults to the real
+    `pull_model`, which shells out to `ollama pull` and downloads a real 1.16GB
+    model. `working_checks()` and `Recorder.checks()` both claim every model is
+    already installed, so nothing *should* ever reach this - but that safety is
+    only as good as those fixtures staying in sync with `DEFAULT_EMBED_MODEL` and
+    `DEFAULT_OLLAMA_MODEL`, and a desync here used to mean an extra printed line.
+    After the embed-model pull question, a desync means a real download. This
+    turns that into a named failure instead.
+    """
+    raise AssertionError("a test reached the real ollama pull")
+
+
 def working_checks() -> Checks:
     """Every provider says yes. Records nothing; use `Recorder` for that."""
     return Checks(
@@ -68,7 +83,10 @@ def working_checks() -> Checks:
         gemini=lambda key: Verdict(True, "key works"),
         openai=lambda key, model: Verdict(True, "key works"),
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
-        ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ("gemma3:4b",)),
+        ollama=lambda url: OllamaState(
+            True, f"reachable at {url} (v0.5.0)", ("gemma3:4b", "bge-m3")
+        ),
+        pull=no_pull,
         updates=no_network,
         health=no_health,
     )
@@ -118,7 +136,9 @@ class Recorder:
             gemini=gemini,
             telegram=telegram,
             ollama=ollama,
+            pull=no_pull,
             updates=no_network,
+            health=no_health,
         )
 
 
@@ -198,6 +218,33 @@ The wizard used to skip a decided answer entirely, which made it unreachable: th
 only way to change one was to hand-edit the file. It now shows the current
 value and asks anyway, so a re-run is how you change your mind - and every test
 that drives a re-run answers one more question than it used to.
+"""
+
+GEMINI_ANSWERS = [TOOLS_YES, "gemini", "", "n", "gemma3:4b", GOOD_GEMINI, "", ""]
+"""Gemini as the provider, background kept local (so the five-minute judge still
+reads a local model even though chat does not), voice off, the local model, the
+key, the text model id (Enter - nothing listed this account's models), then
+Enter at the Telegram token (skippable).
+
+Stops at the last `needs_for` question, one short of `_check_ollama`. Every
+caller appends what its own scenario adds from there: the embed-model pull
+question when Ollama is reachable (it always is missing `bge-m3` in these
+checks, so the question is always asked), then `"y"` at the final "Write it"
+review - `_check_ollama` runs *before* that confirm (`Wizard.run`), so the new
+pull question is not the last question in the flow, and leaving it unanswered
+is a Cancelled that costs the whole run its exit code, not just its own
+warning. Verified by running `daemon setup` against these very checks and
+reading the transcript back, per the plan's own warning that a guessed answer
+here fails loud but confusing - `test_an_unreachable_ollama_does_not_offer_to_pull`
+is the one caller that skips the pull answer, because an unreachable Ollama
+never asks it.
+"""
+
+GEMINI_JUDGE_HOSTED_ANSWERS = [TOOLS_YES, "gemini", "n", "n", GOOD_GEMINI, "", ""]
+"""Gemini, background answered "n" - hosted, not local - so `DAEMON_OLLAMA_MODEL`
+drops out of `needs_for` entirely and the key follows voice directly. Everything
+after the key lines up with `GEMINI_ANSWERS`: text model id, then the Telegram
+token.
 """
 
 
@@ -410,26 +457,162 @@ def test_turning_the_background_judge_off_does_not_make_ollama_a_condition(
     )
 
     assert result.code == 0
-    assert recorder.ollama == []
     assert "DAEMON_OLLAMA_MODEL" not in result.out
-    # It still says embeddings are local, because they always are.
-    assert "Recall embeddings are always local" in result.out
+    # No local judge and a hosted provider: nothing here needs the *chat* model,
+    # but the embed model is always ollama (`Task.EMBED`), so `_check_ollama`
+    # still runs - once, for the base url the embed check reads.
+    assert recorder.ollama == ["http://127.0.0.1:11434"]
+    assert "gemma3:4b" not in result.out
+    assert "bge-m3: installed" in result.out
 
 
-def test_missing_ollama_models_are_printed_as_commands_not_run(tmp_path: Path) -> None:
+def test_a_hosted_provider_still_gets_the_embed_model_checked(tmp_path: Path) -> None:
+    """The gap that cost the owner fifteen hours. `Task.EMBED` is always ollama,
+    so 'nothing here needs a local chat model' was true and irrelevant: the embed
+    model is needed under every provider, and setup never looked.
+
+    Also the coverage for the failed-pull branch: `pull` always returns `False`
+    here (this is what a user with `ollama` installed but off their PATH sees),
+    and "y" accepts the offer, so `checks.pull` is actually called - unlike
+    `test_a_hosted_judge_means_the_chat_model_is_not_checked` and
+    `test_a_local_judge_means_the_chat_model_is_checked_under_gemini`, which
+    both decline and never reach it.
+    """
+    checks = Checks(
+        anthropic=lambda key, model: Verdict(True, "key works"),
+        gemini=lambda key: Verdict(True, "key works"),
+        telegram=lambda token: Verdict(True, "connected to @test_bot"),
+        ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ()),
+        pull=lambda model: False,
+    )
+    # "y" accepts the embed-model pull (which fails, since `pull` always
+    # returns `False`), "y" is the final "Write it" review - `_check_ollama`
+    # runs before that confirm, so the new pull question is not the list's
+    # last answer.
+    result = drive(tmp_path, GEMINI_ANSWERS + ["y", "y"], checks=checks)
+
+    assert result.code == 0
+    assert "bge-m3" in result.out
+    assert "bge-m3: pull failed" in result.out
+
+
+def test_a_hosted_judge_means_the_chat_model_is_not_checked(tmp_path: Path) -> None:
+    """Hosted provider AND hosted judge: nothing on this machine loads a chat
+    model, so checking one would be noise."""
+    checks = Checks(
+        gemini=lambda key: Verdict(True, "key works"),
+        telegram=lambda token: Verdict(True, "connected to @test_bot"),
+        ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ()),
+        pull=lambda model: False,
+    )
+    result = drive(tmp_path, GEMINI_JUDGE_HOSTED_ANSWERS + ["n", "y"], checks=checks)
+
+    assert result.code == 0
+    assert "gemma3:4b: not pulled yet" not in result.out
+
+
+def test_a_local_judge_means_the_chat_model_is_checked_under_gemini(tmp_path: Path) -> None:
+    """The case the plan originally got backwards. `proactive_judge_local`
+    defaults to True, so a gemini user on defaults loads a local model for the
+    five-minute judge - and setup has to say when it is missing."""
+    checks = Checks(
+        gemini=lambda key: Verdict(True, "key works"),
+        telegram=lambda token: Verdict(True, "connected to @test_bot"),
+        ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ()),
+        pull=lambda model: False,
+    )
+    result = drive(tmp_path, GEMINI_ANSWERS + ["n", "y"], checks=checks)
+
+    assert result.code == 0
+    assert "gemma3:4b: not pulled yet" in result.out
+
+
+def test_declining_the_embed_model_pull_is_not_an_error(tmp_path: Path) -> None:
+    pulled: list[str] = []
+
+    def pull(model: str) -> bool:
+        pulled.append(model)
+        return True
+
+    checks = Checks(
+        gemini=lambda key: Verdict(True, "key works"),
+        telegram=lambda token: Verdict(True, "connected to @test_bot"),
+        ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ()),
+        pull=pull,
+    )
+    result = drive(tmp_path, GEMINI_ANSWERS + ["n", "y"], checks=checks)
+
+    assert result.code == 0
+    assert pulled == []
+    assert result.env_path.exists()
+
+
+def test_accepting_the_embed_model_pull_runs_it(tmp_path: Path) -> None:
+    pulled: list[str] = []
+
+    def pull(model: str) -> bool:
+        pulled.append(model)
+        return True
+
+    checks = Checks(
+        gemini=lambda key: Verdict(True, "key works"),
+        telegram=lambda token: Verdict(True, "connected to @test_bot"),
+        ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ()),
+        pull=pull,
+    )
+    result = drive(tmp_path, GEMINI_ANSWERS + ["y", "y"], checks=checks)
+
+    assert result.code == 0
+    assert pulled == ["bge-m3"]
+
+
+def test_an_unreachable_ollama_does_not_offer_to_pull(tmp_path: Path) -> None:
+    """Nothing to pull *into*. Offering a 1.2GB download to a dead server is a
+    question with no right answer."""
+    pulled: list[str] = []
+
+    def pull(model: str) -> bool:
+        pulled.append(model)
+        return True
+
+    checks = Checks(
+        gemini=lambda key: Verdict(True, "key works"),
+        telegram=lambda token: Verdict(True, "connected to @test_bot"),
+        ollama=lambda url: OllamaState(False, f"not reachable at {url}"),
+        pull=pull,
+    )
+    # No pull question this time - Ollama is down, so only the final "Write it"
+    # review is left after `GEMINI_ANSWERS`.
+    result = drive(tmp_path, GEMINI_ANSWERS + ["y"], checks=checks)
+
+    assert result.code == 0
+    assert pulled == []
+    assert "https://ollama.com" in result.out
+
+
+def test_missing_chat_models_are_printed_as_commands_not_run(tmp_path: Path) -> None:
     checks = Checks(
         anthropic=lambda key, model: Verdict(True, "key works"),
         gemini=lambda key: Verdict(True, "key works"),
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
         # Ollama is up but empty: the interesting case, and the common one.
         ollama=lambda url: OllamaState(True, f"reachable at {url} (v0.5.0)", ()),
+        pull=lambda model: True,
     )
-    result = drive(tmp_path, [TOOLS_YES, "1", "n", "gemma3:4b", GOOD_TOKEN, "y"], checks=checks)
+    # "y" accepts the embed-model pull (so `bge-m3` is no longer missing by the
+    # time the "run these yourself" list prints), "y" is the final "Write it"
+    # review.
+    result = drive(
+        tmp_path, [TOOLS_YES, "1", "n", "gemma3:4b", GOOD_TOKEN, "y", "y"], checks=checks
+    )
 
     assert result.code == 0
     assert "ollama pull gemma3:4b" in result.out
-    assert "ollama pull bge-m3" in result.out
     assert "they are large" in result.out
+    # The embed model pulled successfully, so it drops out of the "run these
+    # yourself" homework list - only the chat model, which stays printed-only,
+    # belongs there.
+    assert "ollama pull bge-m3" not in result.out
 
 
 def test_unreachable_ollama_is_a_warning_not_a_dead_end(tmp_path: Path) -> None:
@@ -438,6 +621,7 @@ def test_unreachable_ollama_is_a_warning_not_a_dead_end(tmp_path: Path) -> None:
         gemini=lambda key: Verdict(True, "key works"),
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
         ollama=lambda url: OllamaState(False, f"not reachable at {url}"),
+        pull=no_pull,
     )
     result = drive(tmp_path, [TOOLS_YES, "1", "n", "gemma3:4b", GOOD_TOKEN, "y"], checks=checks)
 
@@ -468,6 +652,7 @@ def test_a_rejected_key_is_re_asked_and_the_bad_one_is_never_written(
         gemini=lambda key: Verdict(True, "key works"),
         telegram=lambda token: Verdict(True, "connected to @test_bot"),
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
+        pull=no_pull,
     )
     result = drive(
         tmp_path,
@@ -500,6 +685,7 @@ def test_the_key_is_checked_against_the_configured_model(tmp_path: Path) -> None
         gemini=lambda key: Verdict(True, "ok"),
         telegram=lambda token: Verdict(True, "ok"),
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
+        pull=no_pull,
     )
     existing = "DAEMON_PROVIDER=anthropic\nDAEMON_ANTHROPIC_MODEL=claude-opus-4-1\n"
     drive(
@@ -518,6 +704,7 @@ def test_giving_up_on_a_key_writes_nothing(tmp_path: Path) -> None:
         gemini=lambda key: Verdict(True, "ok"),
         telegram=lambda token: Verdict(True, "ok"),
         ollama=lambda url: OllamaState(True, "reachable", ("gemma3:4b", "bge-m3")),
+        pull=no_pull,
     )
     answers = [
         TOOLS_YES, "anthropic", "", "n", "gemma3:4b", "bad1", "bad2", "bad3",

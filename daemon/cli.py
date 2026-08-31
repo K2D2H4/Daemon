@@ -63,6 +63,34 @@ _GROUP_ORDER = (
 Ordered by how often a command is typed, so the top of the list is the part an
 owner actually uses."""
 
+SHUTDOWN_GRACE_SECONDS = 3.0
+"""How long a SIGTERM waits for in-flight responses before cutting them.
+
+Uvicorn's default is `None`, which means wait forever - correct only for an app
+whose every response ends. `/face/stream` (`daemon/face_routes.py`) is server-sent
+events, so it never does, and `connection.shutdown()` cannot close a connection
+whose response is still open: it clears `keep_alive` and waits. So one open face
+page pinned the process in `Waiting for connections to close` and it never exited.
+
+Measured cost of that: the admin's own restart button. `admin/restart.py` exits
+only because a supervisor will revive the process - but the process never exited,
+launchd never revived it, and the console sat on "applying…" forever polling a
+`/health` that had already stopped listening. Nothing in the log said so; it just
+stopped after the shutdown line.
+
+3 seconds because the slowest legitimate request here is `GET /admin/api/settings`
+at ~1.5s (two provider model listings), so a real request still finishes and only
+the endless ones are cut. Lifespan teardown still runs afterwards, so the channel,
+the sqlite handle and the MCP subprocesses close as before.
+
+**A backstop, not the mechanism.** The admin's own restart closes the face bus
+first (`admin/restart.py::schedule_exit`), so its streams end and the connections
+close on their own - reaching this bound logs uvicorn's `Cancel N running task(s)`
+at ERROR, and on the owner's normal path that would be an error line meaning
+"working as designed" on every settings save. This exists for the SIGTERMs no
+endpoint sees coming - `launchctl`, logout, `daemon update`, `daemon restart` - and
+for the next endless response somebody adds without reading this."""
+
 _LOG_LINES = 50
 """How much history `daemon log` shows before it starts following."""
 
@@ -156,6 +184,11 @@ def build_parser() -> argparse.ArgumentParser:
     add("uninstall", group="setup", help="stop the OS service and remove its unit file")
     add("status", group="every day", help="is the service installed and running")
     add("face", group="every day", help="open the face - a live status page - in its own window")
+    add(
+        "face-transitions",
+        group="now and then",
+        help="rebuild the pose-match table the face uses to enter a loop clip mid-pose",
+    )
     log = add(
         "log",
         group="every day",
@@ -427,6 +460,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         inserted = _reindex(settings)
         print(f"reindexed {inserted} message(s) the mirror was missing")
         return OK
+    if command == "face-transitions":
+        return _face_transitions(settings)
     if command == "proactive":
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
         return asyncio.run(_proactive(settings, speak=args.speak))
@@ -762,6 +797,68 @@ def _face() -> int:
     return OK
 
 
+def _face_transitions(settings: Settings) -> int:
+    """Rebuild the pose-match table (Task 9) and write it to the face dir.
+
+    Four failure shapes are handled here rather than left to raise a traceback
+    (module docstring: print what was found, don't raise one), and they are
+    four rather than one because `except OSError` alone said "ffmpeg not
+    found" for all of them:
+
+    - **No Pillow.** `Pillow>=10.0; sys_platform == 'darwin'` in pyproject, so
+      on Linux a core install reaches this command with no PIL and used to get
+      a raw ImportError traceback.
+    - **No ffmpeg.** `face_match._frames` shells out to it once per clip and a
+      missing executable raises `FileNotFoundError` rather than returning a
+      nonzero exit - the same shape `_face()` guards around `open`/Chrome.
+    - **Any other OS error**, kept apart from that one: a `FileNotFoundError`
+      is not always a missing binary. `write_table`'s own `write_text` raised
+      exactly that on a fresh install with no `<data_dir>/face/`, and the
+      daemon told the owner to go install ffmpeg. `write_table` creates the
+      directory now, so this branch is for the ones left.
+    - **A corrupt clip**, which is `CalledProcessError` (`ffmpeg` ran and
+      exited nonzero, per `_frames`'s own `check=True`) - a different failure
+      with a different message.
+
+    Unlike `_face()` this genuinely cannot proceed past any of them, so it
+    reports the problem and stops rather than falling back to anything.
+    """
+    try:
+        from daemon.face_match import write_table
+    except ImportError as exc:
+        # `Pillow>=10.0; sys_platform == 'darwin'` in pyproject: it is a core
+        # dependency on macOS only, so on Linux a core install reaches this
+        # command with no PIL at all and used to get a raw traceback - against
+        # this file's own docstring.
+        print(f"daemon: face-transitions needs Pillow and numpy - {exc}", file=sys.stderr)
+        return PROBLEM
+    from daemon.face_routes import face_dir
+
+    try:
+        path = write_table(face_dir(settings))
+    except FileNotFoundError:
+        print("daemon: ffmpeg not found - install it and try again", file=sys.stderr)
+        return PROBLEM
+    except OSError as exc:
+        # Anything else the filesystem or the process layer raises. Kept apart
+        # from the branch above because `except OSError` alone reported every
+        # write failure as a missing ffmpeg: on a fresh install with no
+        # `<data_dir>/face/`, `write_table`'s own `write_text` raised
+        # `FileNotFoundError` and the daemon said to go install ffmpeg. That
+        # write now creates the directory, so this is only ever a real one.
+        print(f"daemon: could not write the table - {exc}", file=sys.stderr)
+        return PROBLEM
+    except subprocess.CalledProcessError as exc:
+        print(f"daemon: ffmpeg could not read a clip - {exc}", file=sys.stderr)
+        return PROBLEM
+    # Re-read rather than re-run build_table: writing already computed it once,
+    # and ffmpeg per clip is the expensive part.
+    table = json.loads(path.read_text(encoding="utf-8"))
+    pairs = sum(len(dests) for dests in table["match"].values())
+    print(f"{path} ({pairs} pair(s))")
+    return OK
+
+
 def _admin_url(settings: Settings) -> str:
     """The admin console's *connect* URL. `DAEMON_HOST` is a bind address, so
     `0.0.0.0`/`::` is not something a browser connects to - fall back to loopback,
@@ -801,12 +898,19 @@ def _serve(settings: Settings) -> int:
     import uvicorn
 
     from daemon.app import create_app
+    from daemon.ollama_process import LocalOllama
 
     # Printed before uvicorn takes the terminal (its own logging is off,
     # log_config=None): the admin web has no other way to announce where it is, and
     # "how do I open the console" should not need reading the source.
     print(f"admin console: {_admin_url(settings)}")
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
+    uvicorn.run(
+        create_app(settings, local_ollama=LocalOllama(settings.ollama_base_url)),
+        host=settings.host,
+        port=settings.port,
+        log_config=None,
+        timeout_graceful_shutdown=SHUTDOWN_GRACE_SECONDS,
+    )
     return OK
 
 
@@ -1207,7 +1311,15 @@ async def _reflect(settings: Settings, *, date: str | None, force: bool) -> int:
         await closing()
 
     if not results:
-        print("nothing to reflect on: no day has a log without a reflection already.")
+        # True whether nothing is pending at all or only today is: `catch_up`
+        # (daemon/reflection.py) drops today from its backlog unconditionally,
+        # since that day is still being written to. Naming the escape hatch
+        # here is what tells the two cases apart.
+        print(
+            "nothing to reflect on: every day before today already has a reflection - "
+            "today's log reflects after midnight, or run `daemon reflect --date "
+            "<date>` to force it now."
+        )
         return OK
     for result in results:
         print(
@@ -1547,18 +1659,48 @@ def _proactivity_check(settings: Settings) -> Check:
             "proactivity",
             False,
             f"on, but {seed} is empty or missing. Every candidate will be declined "
-            "rather than spoken in a generic voice - run `daemon setup` to write a "
-            "persona seed.",
+            "rather than spoken in a generic voice - write a persona seed in the "
+            "admin console's Persona tab, or run `daemon setup`. (The console is "
+            "the shorter trip on an install that is already configured; re-running "
+            "setup walks the provider, keys and pairing again.)",
         )
 
     speaker = "speaker on" if settings.voice_enabled else "telegram only"
     quiet = settings.proactive_quiet_hours or "no quiet window"
+    # `topic` (ADR 0015) deliberately has no entry in `proactive_kind_budgets`
+    # (see that field's docstring: the owner rejected a per-kind quota for it as
+    # artificial) - appended by hand so `daemon doctor` names all six kinds, not
+    # just the five capped ones, which used to leave the uncapped kind invisible
+    # here (whole-branch review).
     kinds = ", ".join(
         f"{kind} {cap}" for kind, cap in settings.proactive_kind_budgets.items()
     )
+    if "topic" not in settings.proactive_kind_budgets:
+        # Only when the owner has not set one. `topic` is a legal key in
+        # `DAEMON_PROACTIVE_KIND_BUDGETS` (`config.py` puts it in `PROACTIVE_KINDS`
+        # deliberately) and `Gate._kind_budget` honours it, so an unconditional
+        # append named the kind twice and told the owner the opposite of what the
+        # gate would do - in the one line this block cites CONTRACTS 12 to justify
+        # (PR #113 review).
+        kinds = f"{kinds}, topic uncapped"
+    # `topic` (ADR 0015) is the one candidate kind that reaches the network - one
+    # read-only search per gate-passed candidate, via the MCP bridge, bypassing
+    # `tools/policy.py` entirely (it never goes through ToolRunner). `app.py`'s
+    # `build_proactive_tick` withholds that bridge when tools are off or
+    # `tools_mode == "off"`, on the reasoning written there; this line is what
+    # makes the resulting state visible rather than a capability nobody was
+    # asked about (CONTRACTS 12).
+    if not settings.tools_enabled:
+        topic_search = "off (DAEMON_TOOLS_ENABLED)"
+    elif settings.tools_mode == "off":
+        topic_search = "off (DAEMON_TOOLS_MODE=off)"
+    elif not settings.mcp_enabled:
+        topic_search = "on, but DAEMON_MCP_ENABLED is off so no server can answer it"
+    else:
+        topic_search = "on"
     detail = (
         f"on, {speaker} · budget {settings.proactive_daily_budget}/day "
-        f"({kinds}) · quiet {quiet}"
+        f"({kinds}) · quiet {quiet} · topic search {topic_search}"
     )
 
     path = settings.data_dir / DB_FILENAME

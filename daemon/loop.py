@@ -25,7 +25,7 @@ from datetime import datetime
 from daemon import clock, timesense
 from daemon.channels.base import Channel, InboundMessage, OutboundMessage
 from daemon.companion import Companion
-from daemon.face import FaceBus, split_mood
+from daemon.face import MOOD_INSTRUCTION, FaceBus, split_mood
 from daemon.llm.base import Message, ProviderError, ToolCall
 from daemon.llm.gateway import LLMGateway
 from daemon.memory.base import LoggedMessage
@@ -300,11 +300,19 @@ class ConversationLoop:
         """
         text, mood = split_mood(text)
         if self._face is not None:
-            if mood is not None:
-                # Before the activity flips to speaking, not after: a face
-                # moves just ahead of the words it is reacting to.
-                self._face.one_shot(mood)
+            # `speaking` FIRST, then the shot - the opposite of what spec 3.6
+            # originally said, and the spec now says this. 3.6 was written for
+            # voice, where the audio arrives after the tag and the expression can
+            # genuinely land ahead of the words. On the text path there is no
+            # audio for the mouth to lag: the two publishes are one synchronous
+            # block, so `speaking` follows the shot into the same event, and
+            # `speaking` is the one transition allowed to cut a one-shot - the
+            # mood was on screen for about 0ms. Published this way round the page
+            # plays the mood over the speaking loop and `advance()` hands back to
+            # it when the arc finishes.
             self._face.set_activity("speaking")
+            if mood is not None:
+                self._face.one_shot(mood)
         return text
 
     async def _answer(
@@ -546,6 +554,23 @@ class ConversationLoop:
         # same "looks like it works" gap `handle` argues against above.
         await self._companion.index_recorded()
 
+    def _mood_rule(self) -> list[Message]:
+        """Ask for the mood tag, but only when something can draw it.
+
+        Gated on the face because an ungated instruction is a tax with no return:
+        every turn of a text-only install would carry it, and `_speak` would strip
+        a tag nothing was ever going to render. Both assemblers call this - the
+        ordinary turn and the `/approve` resume - because both end in a
+        `gateway.complete` whose reply goes through `_speak`.
+
+        Last, nearest the turn being written, for the reason `Companion.context`
+        puts its tic block last: an instruction about *this* sentence outranks the
+        blocks above it that merely describe the world.
+        """
+        if self._face is None:
+            return []
+        return [Message(role="system", content=MOOD_INSTRUCTION)]
+
     async def _assemble_after_tool(
         self, preview: str, output: str, *, said: str
     ) -> list[Message]:
@@ -581,6 +606,7 @@ class ConversationLoop:
                 ),
             )
         )
+        messages.extend(self._mood_rule())
         messages.append(Message(role="user", content=said))
         return messages
 
@@ -608,6 +634,7 @@ class ConversationLoop:
             now=moment,
         )
         messages = [Message(role="system", content=block) for block in blocks]
+        messages.extend(self._mood_rule())
         turns = [Message(role=item.role, content=item.content) for item in history]
         # Descending, so an earlier insertion does not shift a later index.
         for index, line in reversed(_session_breaks_or_empty(history, moment)):

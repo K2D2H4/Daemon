@@ -81,6 +81,10 @@ class FakeAudio:
         self.sample_rate = sample_rate
         self._fail = fail
         self.closed = False
+        self.log: list[str] = []
+        """What happened to the device, in order - so a test can assert the handover
+        rather than only its end state."""
+        self.release_finishes = True
         if block_bytes is None:
             self.blocks = list(blocks)
         else:
@@ -93,17 +97,25 @@ class FakeAudio:
             ]
 
     async def record(self) -> AsyncIterator[bytes]:
-        for block in self.blocks:
-            yield block
-        if self._fail is not None:
-            raise self._fail
+        try:
+            for block in self.blocks:
+                yield block
+            if self._fail is not None:
+                raise self._fail
+        finally:
+            self.log.append("mic finalised")
 
     async def play(self, chunk: bytes) -> None: ...
 
     async def stop_playback(self) -> None: ...
 
+    async def wait_for_input_release(self, within: float | None = None) -> bool:
+        self.log.append("release waited")
+        return self.release_finishes
+
     async def close(self) -> None:
         self.closed = True
+        self.log.append("speaker closed")
 
 
 class FakeVad:
@@ -891,6 +903,251 @@ async def test_the_app_seam_passes_the_tuning_settings_through(
     assert gate.counters.skipped_short == 1
 
 
+async def test_a_wake_round_hands_the_residents_own_bus_to_the_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first hop of the face's five-hop keyword chain, and the one that
+    decides whether a spoken turn moves the face at all: `_wake_round` reads the
+    resident's bus off `app.state` and passes it to `run_voice`. Deleting that
+    argument passed the whole suite - `tests/test_reachable.py` can see that
+    something calls `run_voice`, never with what.
+
+    Asserted on the call rather than through a conversation, because everything
+    past this hop needs a live session and real audio;
+    `tests/test_voice_conversation.py::test_the_face_reaches_the_conversation_
+    through_voice_attempts` covers the far end of the same chain for real.
+    """
+    fake_machine(monkeypatch)
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+    app = app_module()
+    seen: dict[str, Any] = {}
+
+    async def fake_run_voice(_settings: Any, **kwargs: Any) -> int:
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(app, "run_voice", fake_run_voice)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    from daemon.face import FaceBus
+
+    class State:
+        face = FaceBus()
+        wake_gate: Any = None
+
+    state = State()
+    await app._wake_round(settings, state=state)
+
+    assert seen.get("face") is state.face, (
+        "the round ran a conversation that could not move the face"
+    )
+
+
+async def test_a_wake_round_lets_the_microphone_go_before_the_session_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadlock, as an ordering rule.
+
+    The round breaks out of `gate.listen()` and calls `run_voice`, and the session's
+    first act is to build a macOS VoiceProcessing engine on the microphone the gate
+    was just using. Nothing made the gate finish letting go first: breaking out of an
+    `async for` leaves the generator to the garbage collector, so `record`'s `finally`
+    - and the detached thread it hands the stream to - were still to come while the
+    engine was already querying the device's hardware format. The two took CoreAudio's
+    HAL mutex and the AudioUnit's recursive mutex in opposite orders and neither
+    returned. On the resident (2026-08-26 15:07) that printed `opening a voice
+    session` and then nothing ever again: Telegram kept answering, `/health` kept
+    saying `wake_gate: running`, and the daemon never heard another word until it was
+    killed.
+
+    So the property is not "the microphone is closed eventually" - it always was -
+    but that it is closed *before* the second client is built."""
+    _, microphone = fake_machine(monkeypatch)
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+    app = app_module()
+
+    async def fake_run_voice(_settings: Any, **kwargs: Any) -> int:
+        microphone.log.append("voice session opened")
+        return 0
+
+    monkeypatch.setattr(app, "run_voice", fake_run_voice)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    await app._wake_round(settings)
+
+    assert microphone.log == [
+        "mic finalised",
+        "speaker closed",
+        "release waited",
+        "voice session opened",
+    ], "the session was built on a microphone the gate had not finished releasing"
+
+
+async def test_a_closer_that_raises_is_not_read_as_a_released_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed, because the alternative is the silent one.
+
+    `released` starts True so that the ordinary path reads well, which means any
+    swallowed error - a closer that raises, a backend with no
+    `wait_for_input_release` at all - leaves it True and the protection quietly
+    gone, with the log saying nothing. A daemon that opens no sessions is noticed on
+    the first wake word; a daemon that raced again is noticed weeks later, if ever.
+    """
+    _, microphone = fake_machine(monkeypatch)
+    app = app_module()
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+
+    real_build = app.build_wake_gate  # captured before the patch, or this recurses
+
+    async def exploding_build(_settings: Any) -> tuple[Any, Any]:
+        gate, _close = await real_build(_settings)
+
+        async def close_gate() -> bool:
+            raise RuntimeError("the closer is broken")
+
+        return gate, close_gate
+
+    async def fake_run_voice(_settings: Any, **kwargs: Any) -> int:
+        microphone.log.append("voice session opened")
+        return 0
+
+    monkeypatch.setattr(app, "build_wake_gate", exploding_build)
+    monkeypatch.setattr(app, "run_voice", fake_run_voice)
+    monkeypatch.setattr(app, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    await app._wake_round(settings)
+
+    assert "voice session opened" not in microphone.log
+
+
+async def test_a_dropped_wake_word_says_it_was_dropped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The gate logs `wake: heard ...` from `daemon.voice.wake` before the round
+    decides anything, so a round that then throws the event away in silence leaves a
+    log that reads as a matched wake word followed by an unrelated device error -
+    the "went deaf with nothing saying why" shape `_wake_forever` exists to remove."""
+    _, microphone = fake_machine(monkeypatch)
+    microphone.release_finishes = False
+    app = app_module()
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+    monkeypatch.setattr(app, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    with caplog.at_level("ERROR"):
+        await app._wake_round(settings)
+
+    assert "루시" in caplog.text, "the log never says which wake word went unanswered"
+
+
+async def test_a_wedged_microphone_answers_a_waiting_proactive_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`mic_floor.take`'s contract is that the taker owes the future exactly one
+    answer, and its docstring says a dropped one "turns a fallback into a
+    two-and-a-half-minute stall". Returning early on a wedged device skipped the
+    take entirely, so the line sat out its own timeout instead of being told at once
+    that the microphone is gone and it should go to Telegram."""
+    from daemon import mic_floor
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    _, microphone = fake_machine(monkeypatch)
+    microphone.blocks = []
+    microphone.release_finishes = False
+    app = app_module()
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+    monkeypatch.setattr(app, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+    await app._wake_round(settings)
+
+    async with asyncio.timeout(1):
+        assert await asked == "not-spoken", "the waiting line was left to time out"
+
+
+async def test_a_proactive_line_also_waits_for_the_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other consumer of the device the gate just let go.
+
+    A stood-down gate ends without firing and `_wake_round` hands the floor to
+    `_speak_unprompted`, which opens its own audio on the same microphone. That is
+    the same handover the wake word takes and it arrived after the deadlock did, so
+    it is asserted rather than assumed - `tests/CLAUDE.md`'s standing complaint is
+    that the reachability checks see *that* something is called, never *when*.
+
+    What this pins is the *wait*, checked by removing it: a stood-down gate's stream
+    ends on its own, so its generator finalises without help and this case cannot
+    also speak for the explicit `aclose()`. That half is
+    `test_a_wake_round_lets_the_microphone_go_before_the_session_opens`, where the
+    round breaks out of a stream that has not ended."""
+    from daemon import mic_floor
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    _, microphone = fake_machine(monkeypatch)
+    # A gate that stands down: the stream ends with no wake word, as it does when
+    # proactivity has asked for the floor.
+    microphone.blocks = []
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+    app = app_module()
+
+    async def fake_speak(_settings: Any, taken: Any, _shared: Any) -> None:
+        microphone.log.append("proactive line spoken")
+        mic_floor.answer(taken[1], True)
+
+    monkeypatch.setattr(app, "_speak_unprompted", fake_speak)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+    await app._wake_round(settings)
+    await asked
+
+    assert microphone.log == [
+        "mic finalised",
+        "speaker closed",
+        "release waited",
+        "proactive line spoken",
+    ], "proactivity spoke into a microphone the gate had not finished releasing"
+
+
+async def test_a_wake_round_does_not_open_a_session_on_a_wedged_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the release will not finish, the device is already lost - and stacking a
+    VoiceProcessing engine on top of it is exactly how the wedge became permanent.
+    Better to lose the round, say so, and let the loop come back around."""
+    _, microphone = fake_machine(monkeypatch)
+    microphone.release_finishes = False
+    settings = voice_settings(DAEMON_WAKE_ENABLED="true", DAEMON_WAKE_ALIASES="루시")
+    app = app_module()
+
+    async def fake_run_voice(_settings: Any, **kwargs: Any) -> int:
+        microphone.log.append("voice session opened")
+        return 0
+
+    monkeypatch.setattr(app, "run_voice", fake_run_voice)
+    monkeypatch.setattr(app, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+    # Small rather than zero: the floor itself is asserted below, and the real 5 s is
+    # not worth spending to prove a `>=`.
+    monkeypatch.setattr(app, "WAKE_RETRY_SECONDS", 0.05)
+
+    started = asyncio.get_running_loop().time()
+    await app._wake_round(settings)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert "voice session opened" not in microphone.log
+    # And paced on the way out. Without the floor `_wake_forever` comes straight back
+    # around, opens a fresh capture on the same wedged device and parks another
+    # `voice-mic-open` thread on the mutex that is already stuck. Asserted because
+    # deleting that sleep looks exactly like removing a redundant line.
+    assert elapsed >= 0.05, "a lost round returned unpaced"
+
+
 # --- configuration a person can actually write --------------------------------
 
 
@@ -1090,3 +1347,49 @@ def test_being_called_by_name_does_not_ask_for_the_owners_business() -> None:
         )
     for solicitation in ("wait for what they want", "how can i help", "what they need"):
         assert solicitation not in lowered
+
+
+@pytest.mark.asyncio
+async def test_the_gate_stands_down_when_a_proactive_line_wants_the_microphone() -> None:
+    """The daemon cannot listen and talk at once, and until 2026-08-26 the two
+    halves had no way to say so: the first proactive utterance this project ever
+    produced went to Telegram alone, with the speaker refusing because the gate
+    held the capture stream (`daemon/mic_floor.py`).
+
+    Ending the iteration is the gate's existing way of handing the microphone
+    back - the dead-stream watchdog returns exactly like this - so this asserts on
+    the *effect* a caller sees: the generator finishes, with no event, while there
+    is still audio left that would have fired it. Anything less would pass on a
+    gate that simply ran out of blocks."""
+    wanted = False
+
+    def floor_wanted() -> bool:
+        return wanted
+
+    blocks, probabilities = script(*(ONE_PHRASE * 2))
+    rig = build(blocks, probabilities, FakeRecognizer("헤이 대문"), floor_wanted=floor_wanted)
+
+    events: list[WakeEvent] = []
+    stream = rig.gate.listen()
+    async for event in stream:
+        events.append(event)
+        wanted = True  # asked for between blocks, the way the tick asks
+        break
+    assert events, "the first phrase should still have fired"
+
+    # A fresh listen with the request already standing must not consume the rest.
+    blocks2, probabilities2 = script(*(ONE_PHRASE * 2))
+    rig2 = build(blocks2, probabilities2, FakeRecognizer("헤이 대문"), floor_wanted=lambda: True)
+    assert await rig2.collect() == [], "the gate kept listening while a line waited"
+    assert rig2.gate.counters.frames_seen == 0, "it must stand down before consuming audio"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_mailbox_leaves_the_gate_alone() -> None:
+    """The check runs once per audio block on the hot path, so the case that must
+    not regress is the ordinary one: nobody is asking, and the gate behaves exactly
+    as it did before the seam existed."""
+    blocks, probabilities = script(*ONE_PHRASE)
+    rig = build(blocks, probabilities, FakeRecognizer("헤이 대문"), floor_wanted=lambda: False)
+
+    assert len(await rig.collect()) == 1

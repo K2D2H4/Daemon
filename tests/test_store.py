@@ -258,3 +258,147 @@ def test_owner_id_names_the_approved_owner(tmp_path):
         assert store.owner_id("slack") is None, "another channel's owner is not this one's"
     finally:
         store.close()
+
+
+def test_a_v7_database_gains_the_topic_kind_without_losing_its_candidates(
+    tmp_path: Path,
+) -> None:
+    """The CHECK on `proactive_candidates.kind` lists its kinds by name, and SQLite
+    cannot alter a CHECK in place - the table has to be rebuilt. A rebuild that
+    forgets to copy is indistinguishable from a working migration until someone
+    looks for a candidate that is no longer there, so this asserts the old row
+    survives, not merely that the new kind inserts."""
+    path = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL) STRICT;
+        INSERT INTO schema_version (version, applied_at) VALUES (7, '2026-08-01T00:00:00Z');
+        CREATE TABLE proactive_candidates (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN
+                ('open_loop','emotional','silence','pattern_time','association')),
+            reason TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
+            created_at TEXT NOT NULL,
+            due_at TEXT, expires_at TEXT,
+            state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN (
+                'pending', 'armed', 'fired', 'done', 'cancelled', 'expired'
+            )),
+            fire_count INTEGER NOT NULL DEFAULT 0,
+            fire_budget INTEGER NOT NULL DEFAULT 1,
+            cooldown_secs INTEGER NOT NULL DEFAULT 86400,
+            last_fired_at TEXT
+        ) STRICT;
+        INSERT INTO proactive_candidates (kind, reason, created_at)
+            VALUES ('open_loop', '08월 01일에 시험 이야기를 했다', '2026-08-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store.open(path)
+    assert store.schema_version() == SCHEMA_VERSION
+
+    kept = store.conn.execute(
+        "SELECT kind, reason FROM proactive_candidates"
+    ).fetchall()
+    assert [(r["kind"], r["reason"]) for r in kept] == [
+        ("open_loop", "08월 01일에 시험 이야기를 했다")
+    ], "the rebuild dropped the rows it was supposed to carry over"
+
+    store.conn.execute(
+        "INSERT INTO proactive_candidates (kind, reason, created_at) VALUES (?, ?, ?)",
+        ("topic", "Sendbird 이야기를 한 지 12일 됐다", "2026-08-25T00:00:00Z"),
+    )
+    store.conn.commit()
+
+
+def test_an_interrupted_v8_migration_leaves_the_original_table_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The create-copy-drop-rename in `_migrate` is only as crash-safe as its
+    comment claims if the four statements run in one real transaction.
+    `sqlite3.Connection.executescript` does not provide that - it issues an
+    implicit COMMIT up front and each statement lands as it runs - so this
+    interrupts the migration between DROP and RENAME (the worst point: the old
+    table is already gone) and asserts a *fresh* connection, opened after the
+    interruption the way a restart would, still sees the original table and its
+    row rather than an empty rebuilt table or an orphaned `_v8` copy nothing
+    reads."""
+    path = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL) STRICT;
+        INSERT INTO schema_version (version, applied_at) VALUES (7, '2026-08-01T00:00:00Z');
+        CREATE TABLE proactive_candidates (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN
+                ('open_loop','emotional','silence','pattern_time','association')),
+            reason TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
+            created_at TEXT NOT NULL,
+            due_at TEXT, expires_at TEXT,
+            state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN (
+                'pending', 'armed', 'fired', 'done', 'cancelled', 'expired'
+            )),
+            fire_count INTEGER NOT NULL DEFAULT 0,
+            fire_budget INTEGER NOT NULL DEFAULT 1,
+            cooldown_secs INTEGER NOT NULL DEFAULT 86400,
+            last_fired_at TEXT
+        ) STRICT;
+        INSERT INTO proactive_candidates (kind, reason, created_at)
+            VALUES ('open_loop', '08월 01일에 시험 이야기를 했다', '2026-08-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # sqlite3.Connection is a C-level type - it cannot take a monkeypatched
+    # attribute directly ("immutable type"). A subclass can override the method,
+    # and sqlite3.connect(..., factory=...) is the documented way to get one back
+    # from Store.open, which calls plain sqlite3.connect(path) and does not know
+    # about the substitution.
+    class ExplodingConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if isinstance(sql, str) and "RENAME TO proactive_candidates" in sql:
+                raise RuntimeError("simulated crash between DROP and RENAME")
+            return super().execute(sql, *args, **kwargs)
+
+    real_connect = sqlite3.connect
+
+    def connect_with_exploding_execute(*args, **kwargs):
+        kwargs.setdefault("factory", ExplodingConnection)
+        return real_connect(*args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(sqlite3, "connect", connect_with_exploding_execute)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            Store.open(path)
+
+    # Unpatched, as a restart's first connection would be. If the rebuild were
+    # not atomic, this would see either no proactive_candidates at all (schema.sql
+    # would then recreate it empty) or an orphaned proactive_candidates_v8 holding
+    # the row nothing reads again.
+    conn2 = sqlite3.connect(path)
+    conn2.row_factory = sqlite3.Row
+    tables = {
+        r["name"]
+        for r in conn2.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert "proactive_candidates" in tables
+    assert "proactive_candidates_v8" not in tables
+
+    rows = conn2.execute("SELECT kind, reason FROM proactive_candidates").fetchall()
+    assert [(r["kind"], r["reason"]) for r in rows] == [
+        ("open_loop", "08월 01일에 시험 이야기를 했다")
+    ], "the interrupted rebuild lost or orphaned the original row"
+
+    version = conn2.execute("SELECT version FROM schema_version").fetchone()["version"]
+    assert version == 7, (
+        "the crash happened before _migrate's own commit; a real restart must see "
+        "found=7 and retry the rebuild, not believe v8 already landed"
+    )
+    conn2.close()

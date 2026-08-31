@@ -174,12 +174,26 @@ class VoiceSession(Protocol):
     async def send_text(self, text: str) -> None:
         """Send text as a turn, with no user audio.
 
-        **Not verbatim text-to-speech.** `realtimeInput.text` is a prompt: the
-        model answers it rather than reading it out, and Live API has no
-        verbatim path at all (`clientContent` is restricted to seeding history on
-        current models). Say-this-exactly belongs to `AudioIO`'s local speaker,
-        which is also the path a proactive utterance takes when the user is at
-        the machine (docs/PLAN.md 6.3) - and which never leaves the device."""
+        **Not verbatim text-to-speech**, as a mechanism: this is a prompt, the
+        model answers it rather than reading it out, and Live API has no verbatim
+        path at all (`clientContent` is restricted to seeding history on current
+        models).
+
+        What that used to conclude here - "say-this-exactly belongs to `AudioIO`'s
+        local speaker, which never leaves the device" - is **retracted** (PR #126,
+        and this is a protocol file, so it is retracted out loud). The mechanism
+        does not have to be verbatim for the *sentence* to come back unchanged:
+        asked for that in the prompt, it does. `evals/proactive_verbatim_spike.py`,
+        8 live sessions per cell on the shipping model, puts a plain instruction at
+        exact 0/8 - the line survives and the model adds a question of its own -
+        and `conversation.SPEAK_VERBATIM` at 8/8. So a proactive line at the machine
+        now goes out through this method, in the voice the owner chose, and
+        `/usr/bin/say` is the fallback (`daemon/app.py:_speak_unprompted`).
+
+        Which is a measurement about wording, not a guarantee from the transport:
+        nothing in this protocol makes a model comply, so a caller that needs the
+        sentence back intact owes it a measured instruction and a fence, and owes
+        the measurement a re-run on every model it ships against."""
         ...
 
     async def send_tool_response(self, results: Sequence[ToolResult]) -> None:
@@ -229,6 +243,20 @@ class VoiceSession(Protocol):
         in voice mode: transcripts are how anything is remembered from a spoken
         turn, and a cancel between the last delta and the turn boundary otherwise
         loses the utterance from both the markdown and the mirror.
+
+        **An implementation must flush what it has before `receive()` returns or
+        raises**, so this drain is reached only on cancellation. Both shipped
+        sessions do; it is written down here because something now depends on it.
+        `VoiceConversation` skips recording the *first* assistant turn of a session
+        whose opening was already logged elsewhere - a proactive line, which
+        `ProactiveDelivery` writes as `session_kind='proactive'` - and it disarms
+        that skip at the turn boundary. A transcript that reached memory through
+        this drain instead would therefore be filed as an ordinary `voice` turn,
+        and `daemon/memory/store.py` states what that costs: the daemon's own
+        unprompted line resets the silence clock, "and speaking becomes its own
+        excuse to stop noticing the silence". A conforming implementation that
+        holds its last transcript back until cancellation reopens that with the
+        suite green (PR #126 review, found against the suite's own fake).
         """
         ...
 

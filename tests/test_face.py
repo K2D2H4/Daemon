@@ -53,15 +53,45 @@ async def test_level_is_coalesced_not_queued():
     await agen.aclose()
 
 
-async def test_one_shots_are_queued_and_arrive_before_state():
+async def test_one_shots_are_queued_and_arrive_after_state():
+    """A one-shot is still queued (a dropped laugh is a missing expression), but
+    it is delivered *after* the state it shares a wake with, not before.
+
+    The two are published in one synchronous block by `ConversationLoop._speak`,
+    so they always arrive together and only this order can separate them. Sent
+    shot-first the page starts the mood and the `speaking` right behind it cuts
+    it - spec 3.2 lets `speaking` cut a one-shot - and the expression was on
+    screen for about 0ms. Spec 3.6's original ordering was written for voice,
+    where the audio really does arrive after the tag; the text path has no audio
+    for the mouth to lag, and 3.6 now says so.
+    """
+    bus = FaceBus()
+    agen = bus.subscribe()
+    await _drain(agen, 1)  # snapshot
+    bus.set_activity("speaking")
+    bus.one_shot("amused")
+    first, second = await _drain(agen, 2)
+    assert first.activity == "speaking"
+    assert second == OneShot(clip="amused")
+    await agen.aclose()
+
+
+async def test_the_order_within_a_wake_does_not_depend_on_publish_order():
+    """Same wake, published the other way round: still state, then the shot.
+
+    Both land in the subscriber's mailbox before it runs, so `one_shot` before
+    `set_activity` and `set_activity` before `one_shot` are the same event as far
+    as the bus is concerned - and the delivery order has to be the bus's own
+    decision rather than a side effect of where its generator was suspended.
+    """
     bus = FaceBus()
     agen = bus.subscribe()
     await _drain(agen, 1)  # snapshot
     bus.one_shot("amused")
     bus.set_activity("speaking")
     first, second = await _drain(agen, 2)
-    assert first == OneShot(clip="amused")
-    assert second.activity == "speaking"
+    assert first.activity == "speaking"
+    assert second == OneShot(clip="amused")
     await agen.aclose()
 
 
@@ -88,6 +118,27 @@ async def test_two_subscribers_both_get_events():
     await b.aclose()
 
 
+async def test_an_unchanged_level_is_not_republished():
+    """Design spec §2: the socket stays open and the traffic is zero when nothing
+    is happening. `SpeechClock.pump` runs at 25Hz for the whole of a voice
+    conversation and hands `set_level` the same 0.0 on every tick once the
+    speaker is empty - forty identical events a second down every open stream
+    unless the bus stops them here, the way it already stops a repeated
+    activity."""
+    bus = FaceBus()
+    agen = bus.subscribe()
+    await _drain(agen, 1)  # snapshot, level 0.0
+    # A real change gets through first, so this is a filter and not a mute.
+    bus.set_level(0.4)
+    (changed,) = await _drain(agen, 1)
+    assert changed.level == 0.4
+    for _ in range(5):
+        bus.set_level(0.4)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(agen.__anext__(), 0.05)
+    await agen.aclose()
+
+
 def test_level_is_clamped():
     bus = FaceBus()
     bus.set_level(-1.0)
@@ -109,16 +160,24 @@ class RecordingBus(FaceBus):
         super().__init__()
         self.activities: list[str] = []
         self.shots: list[str] = []
+        self.order: list[str] = []
+        """Both kinds interleaved, because the order between them is load-bearing on
+        its own: a mood published before `speaking` is cut by it and spends about 0ms
+        on screen (spec 3.2), so "both happened" is not the same assertion as "in this
+        order". `tests/test_loop.py` grows its own subclass for this and could use
+        this list instead."""
 
     def set_activity(self, activity):  # type: ignore[override]
         before = self.state.activity
         super().set_activity(activity)
         if activity != before:
             self.activities.append(activity)
+            self.order.append(f"activity:{activity}")
 
     def one_shot(self, clip):  # type: ignore[override]
         super().one_shot(clip)
         self.shots.append(clip)
+        self.order.append(f"shot:{clip}")
 
 
 def test_a_recording_bus_sees_transitions_a_subscriber_may_coalesce_away():
@@ -178,6 +237,65 @@ def test_level_is_published_for_when_the_chunk_is_audible_not_when_it_arrived():
     assert loud > 0.5, "by now the loud chunk is audible"
 
 
+def test_a_short_first_chunk_does_not_flicker_the_face_to_idle():
+    """The start-of-answer flicker, measured off a live session's own stream.
+
+    A turn's first chunk is routinely shorter than the 40ms pump interval, so the
+    tick right after it finds the queue dry while the model is still producing.
+    Published as a falling edge that reads `speaking -> idle -> speaking` inside one
+    second, and the page turns each of those into a clip switch.
+    """
+    bus = RecordingBus()
+    clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
+    clock.fed(_pcm(0.02), at=100.0)            # 20ms - shorter than one tick
+    clock.pump(100.0, generating=True)
+    clock.pump(100.04, generating=True)        # queue dry, turn still producing
+    clock.fed(_pcm(0.5), at=100.05)
+    clock.pump(100.08, generating=True)
+
+    assert bus.state.activity == "speaking"
+    assert bus.activities == ["speaking"], "one rising edge, and no dip through idle"
+
+
+def test_the_gap_is_silent_but_still_speaking():
+    """Holding the edge must not also hold the mouth open on stale loudness."""
+    bus = RecordingBus()
+    clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
+    clock.fed(_pcm(0.02, amplitude=32000), at=100.0)
+    clock.pump(100.0, generating=True)
+    assert bus.state.level > 0.5
+    clock.pump(100.04, generating=True)
+    assert bus.state.activity == "speaking"
+    assert bus.state.level == 0.0, "a gap is silence, even though the turn goes on"
+
+
+def test_the_falling_edge_lands_on_the_callers_resting_state():
+    """`idle` is only right for the text path. In an open voice conversation the
+    microphone is live, so an answer ending means `listening` - and publishing `idle`
+    put a zero-length blip in front of the `listening` the next microphone chunk set
+    microseconds later, at the end of every single turn of a live session.
+    """
+    bus = RecordingBus()
+    clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
+    clock.fed(_pcm(0.2), at=100.0)
+    clock.pump(100.0)
+    clock.pump(100.5, resting="listening")
+    assert bus.activities == ["speaking", "listening"], "no idle blip in between"
+
+
+def test_the_falling_edge_is_still_exact_once_the_turn_is_over():
+    """The hold is a flag, not a debounce: with the turn done, the end of speech is
+    the same instant it always was - no lateness bought for the flicker fix."""
+    bus = RecordingBus()
+    clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
+    clock.fed(_pcm(0.5), at=100.0)
+    clock.pump(100.0, generating=True)
+    clock.pump(100.49, generating=False)
+    assert bus.state.activity == "speaking"
+    clock.pump(100.51, generating=False)
+    assert bus.state.activity == "idle"
+
+
 def test_level_returns_to_zero_once_playback_is_over():
     bus = RecordingBus()
     clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
@@ -201,6 +319,48 @@ def test_level_returns_to_zero_once_playback_is_over():
 )
 def test_split_mood(raw, text, mood):
     assert split_mood(raw) == (text, mood)
+
+
+async def test_close_ends_an_open_subscription():
+    """`close()` is what lets an SSE response finish, so the generator must actually
+    stop - not just go quiet. `admin/restart.py` calls it before the SIGTERM because
+    a stream that never ends is a connection uvicorn cannot close."""
+    bus = FaceBus()
+    agen = bus.subscribe()
+    await _drain(agen, 1)  # the snapshot
+
+    bus.close()
+
+    async with asyncio.timeout(1.0):
+        with pytest.raises(StopAsyncIteration):
+            await agen.__anext__()
+
+
+async def test_close_delivers_what_is_already_queued_before_it_stops():
+    """A close must not swallow an expression that was already published. The check
+    sits after the batch is yielded, not before it."""
+    bus = FaceBus()
+    agen = bus.subscribe()
+    await _drain(agen, 1)  # the snapshot
+    bus.one_shot("amused")
+    bus.close()
+
+    (event,) = await _drain(agen, 1)
+    assert isinstance(event, OneShot)
+    assert event.clip == "amused"
+    async with asyncio.timeout(1.0):
+        with pytest.raises(StopAsyncIteration):
+            await agen.__anext__()
+
+
+def test_close_with_nobody_subscribed_is_a_no_op():
+    """`daemon run` with no face page open is the common case, and a restart there
+    must not depend on there being a subscriber."""
+    bus = FaceBus()
+    bus.close()
+    bus.close()
+    bus.set_activity("speaking")
+    assert bus.state.activity == "speaking"
 
 
 # --- the lip-sync PCM sink ---------------------------------------------------

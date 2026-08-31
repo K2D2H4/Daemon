@@ -30,7 +30,7 @@ from daemon.memory.log import from_iso, local_date, utc_iso
 logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _INSERT_MESSAGE = """
 INSERT INTO messages
@@ -129,6 +129,72 @@ class Store:
             # The index over external_id is left to schema.sql, which runs next
             # now that the column exists.
         # v3 to v7 add only new tables, which schema.sql creates on its own.
+        has_candidates = (
+            self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'proactive_candidates'"
+            ).fetchone()
+            is not None
+        )
+        if found < 8 and has_candidates:
+            # A file older than M3 has no proactive_candidates table at all, and
+            # schema.sql's CREATE TABLE IF NOT EXISTS creates it fresh - already
+            # with 'topic' allowed - right after this method returns, so there is
+            # nothing here to rebuild.
+            #
+            # For a file that does have the table: the kind CHECK names its kinds,
+            # so widening it is a table rebuild - `ALTER TABLE ... ADD CONSTRAINT`
+            # does not exist in SQLite. Copying first and renaming last means a
+            # crash mid-migration leaves the original table intact - but only
+            # because these four statements run inside one explicit transaction.
+            # `executescript` does NOT give that: it issues its own implicit COMMIT
+            # before the script starts and each statement lands as it runs, so a
+            # crash between DROP and RENAME would leave no proactive_candidates at
+            # all and an orphaned _v8 copy nothing ever reads again - the silent
+            # degradation non-negotiable 1 exists to rule out. Explicit BEGIN and
+            # per-statement execute() is what actually makes the ordering matter:
+            # a failure anywhere in the loop rolls every statement back, so the
+            # original table is either fully replaced or not touched at all.
+            statements = (
+                """
+                CREATE TABLE proactive_candidates_v8 (
+                    id            INTEGER PRIMARY KEY,
+                    kind          TEXT    NOT NULL CHECK (kind IN (
+                                      'open_loop', 'emotional', 'silence',
+                                      'pattern_time', 'association', 'topic'
+                                  )),
+                    reason        TEXT    NOT NULL,
+                    payload       TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
+                    created_at    TEXT    NOT NULL,
+                    due_at        TEXT,
+                    expires_at    TEXT,
+                    state         TEXT    NOT NULL DEFAULT 'pending' CHECK (state IN (
+                                      'pending', 'armed', 'fired', 'done', 'cancelled', 'expired'
+                                  )),
+                    fire_count    INTEGER NOT NULL DEFAULT 0,
+                    fire_budget   INTEGER NOT NULL DEFAULT 1,
+                    cooldown_secs INTEGER NOT NULL DEFAULT 86400,
+                    last_fired_at TEXT
+                ) STRICT
+                """,
+                """
+                INSERT INTO proactive_candidates_v8
+                    SELECT id, kind, reason, payload, created_at, due_at, expires_at,
+                           state, fire_count, fire_budget, cooldown_secs, last_fired_at
+                    FROM proactive_candidates
+                """,
+                "DROP TABLE proactive_candidates",
+                "ALTER TABLE proactive_candidates_v8 RENAME TO proactive_candidates",
+            )
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in statements:
+                    self.conn.execute(statement)
+            except BaseException:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
         self.conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_iso(datetime.now(UTC))),
@@ -934,9 +1000,29 @@ class Store:
             (limit,),
         ).fetchall()
 
+    def recent_entries(self, limit: int = 100) -> list[sqlite3.Row]:
+        """Every curated fact, retired ones included, most important first.
+
+        `active_entries` is what gets injected and deliberately hides the retired
+        rows. This is the admin's read: a fact that was superseded is the evidence
+        that supersession works, and dropping it makes a wrong fact look like it
+        was never there.
+        """
+        return self.conn.execute(
+            "SELECT * FROM memory_entries "
+            "ORDER BY importance DESC, updated_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
     def count_entries(self) -> int:
         row = self.conn.execute(
             "SELECT COUNT(*) AS n FROM memory_entries WHERE status = 'active'"
+        ).fetchone()
+        return int(row["n"])
+
+    def count_retired_entries(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_entries WHERE status = 'retired'"
         ).fetchone()
         return int(row["n"])
 
@@ -982,6 +1068,10 @@ class Store:
             "SELECT * FROM entities ORDER BY mention_count DESC, name ASC LIMIT ?",
             (limit,),
         ).fetchall()
+
+    def count_entities(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM entities").fetchone()
+        return int(row["n"])
 
     def link_entities(self, src_id: int, dst_id: int) -> None:
         """Record that two entities appeared together. Undirected in meaning, so
@@ -1044,6 +1134,38 @@ class Store:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()
         return int(row["n"])
 
+    def count_consumed_observations(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM observations WHERE consumed_by IS NOT NULL"
+        ).fetchone()
+        return int(row["n"])
+
+    def recent_observations(self, limit: int = 200) -> list[sqlite3.Row]:
+        """Every observation, newest first, with whichever rule consumed it.
+
+        The opposite order from `unconsumed_observations`: that one feeds M4 and
+        wants the oldest evidence first, this one is read top-down as "the most
+        recent thing she noticed about me".
+        """
+        return self.conn.execute(
+            "SELECT * FROM observations ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def observations_by_ids(self, ids: Sequence[int]) -> dict[int, sqlite3.Row]:
+        """Rows for a set of observation ids, keyed by id - the same shape as
+        `messages_by_ids`. A persona rule's evidence names ids from whenever the
+        rule was created, which can predate `recent_observations`' own display
+        cap; resolving evidence against this instead of that capped list is what
+        keeps old evidence from reading as a row that no longer exists."""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM observations WHERE id IN ({placeholders})", tuple(ids)
+        ).fetchall()
+        return {int(row["id"]): row for row in rows}
+
     # --- M4: persona rules ---------------------------------------------------
     # Body lives in persona/learned.md (docs/CONTRACTS.md non-negotiable 5);
     # these columns are the metadata a model must not be able to forge in prose
@@ -1094,6 +1216,19 @@ class Store:
             "SELECT COUNT(*) AS n FROM persona_rules WHERE status = 'active'"
         ).fetchone()
         return int(row["n"])
+
+    def retired_persona_rules(self, limit: int = 50) -> list[sqlite3.Row]:
+        """Retired rules, most recently retired first - with `retired_why`.
+
+        `learned.md` is rewritten whole on every change, so a rule that vanished
+        leaves no trace in the file. This is the only place "what did she stop
+        believing, and why" can be read.
+        """
+        return self.conn.execute(
+            "SELECT * FROM persona_rules WHERE status = 'retired' "
+            "ORDER BY retired_at DESC, id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
 
     def persona_rules_created_since(self, ts: str) -> int:
         """How many rules (any status) were created at or after `ts` - the
@@ -1314,6 +1449,30 @@ class Store:
         ).fetchall()
         return [from_iso(row["ts"]) for row in rows]
 
+    def stale_entities(
+        self, limit: int, quiet_since: datetime, raised_since: datetime
+    ) -> list[sqlite3.Row]:
+        """Entities gone quiet, quietest first - what a `topic` candidate rotates
+        through. `updated_at` moves whenever reflection touches the note, but the
+        proactive path itself never writes it, so an entity already raised as a
+        `topic` inside `raised_since` is excluded here, in SQL, anchored to *its
+        own* most recent row in `proactive_candidates` - not to a shared clock
+        every entity would otherwise share, and not to a Python-side dedup key
+        that cannot remove it from `ORDER BY ... LIMIT` before a later entity
+        gets a chance at the slot."""
+        return self.conn.execute(
+            "SELECT e.name, e.updated_at FROM entities e "
+            "WHERE e.updated_at < ? "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM proactive_candidates c "
+            "  WHERE c.kind = 'topic' "
+            "  AND json_extract(c.payload, '$.entity') = e.name "
+            "  AND c.created_at >= ?"
+            ") "
+            "ORDER BY e.updated_at ASC LIMIT ?",
+            (utc_iso(quiet_since), utc_iso(raised_since), limit),
+        ).fetchall()
+
     # --- M3: what was actually said -----------------------------------------
 
     def insert_utterance(
@@ -1514,6 +1673,25 @@ class Store:
         return self.conn.execute(
             "SELECT * FROM reflection_runs ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
+
+    def reflection_runs_by_dates(self, dates: Sequence[str]) -> dict[str, sqlite3.Row]:
+        """Reflection-run rows for a set of dates, keyed by date - the same
+        shape as `observations_by_ids`. The admin Memory tab's day list comes
+        from the reflection artifacts on disk, which outlive any row-count
+        window on this table; resolving by the exact dates being rendered
+        instead of `recent_reflection_runs`'s capped window is what keeps an
+        old day from reading as artifact-only when its row is still here.
+        Ordered by id ASC so a date with two passes (a re-run) has its later
+        row win the dict assignment, not its first."""
+        if not dates:
+            return {}
+        placeholders = ",".join("?" * len(dates))
+        rows = self.conn.execute(
+            f"SELECT * FROM reflection_runs WHERE date IN ({placeholders}) "
+            "ORDER BY id ASC",
+            tuple(dates),
+        ).fetchall()
+        return {row["date"]: row for row in rows}
 
     # --- M2: what reflection reads ------------------------------------------
 

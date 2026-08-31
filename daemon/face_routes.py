@@ -1,4 +1,4 @@
-"""The face's four endpoints: a page, a stream, clip bytes, and lip-sync frames.
+"""The face's five endpoints: a page, a stream, clip bytes, transitions, and lip-sync frames.
 
 Read-only, side-effect free, and it carries no conversation. What goes out is an
 activity name and a float - never text the daemon said or heard. That is the same
@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -222,8 +223,19 @@ def _payload(event: Event) -> dict[str, Any]:
 
 @router.get("/face", response_class=HTMLResponse)
 async def page() -> HTMLResponse:
-    """Serve the face page."""
-    return HTMLResponse(PAGE.read_text(encoding="utf-8"))
+    """Serve the face page.
+
+    `Cache-Control: no-store`, matching `/face/stream`'s own header - a browser
+    caching this shell means a shipped fix needs a hard refresh to actually
+    take effect, which is exactly what cost the owner and the coordinator time
+    chasing this follow-up. `/face/clips/{name}` and `/face/transitions` keep
+    whatever caching FastAPI/Starlette's `FileResponse` already gives them by
+    default (no header added here): both are content that changes rarely (a
+    new clip, a rebuilt table) rather than something that changes underneath a
+    page already open, so a stale cache there costs far less than a stale page
+    shell does, and touching them wasn't part of what broke.
+    """
+    return HTMLResponse(PAGE.read_text(encoding="utf-8"), headers={"Cache-Control": "no-store"})
 
 
 @router.get("/face/clips/{name}")
@@ -248,6 +260,21 @@ async def manifest(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/face/transitions")
+async def transitions(request: Request) -> Response:
+    """Serve `daemon face-transitions`' pose-match table if it has been built,
+    404 otherwise - same posture as `/face/clips/{name}`: check, then serve,
+    never guess. Task 9 rule 4: the page's own fallback to `currentTime = 0`
+    depends on a fresh install (no table yet) getting a clean 404 here, not an
+    error - the table is derived from the owner's own clips, so it is never
+    checked into the repo.
+    """
+    path = face_dir(request.app.state.settings) / "transitions.json"
+    if not path.is_file():
+        return Response(status_code=404)
+    return FileResponse(path, media_type="application/json")
+
+
 @router.get("/face/stream")
 async def stream(request: Request) -> StreamingResponse:
     """Server-sent events: the current state (snapshot on open), then all future
@@ -258,17 +285,39 @@ async def stream(request: Request) -> StreamingResponse:
 
     async def events() -> AsyncIterator[bytes]:
         agen = bus.subscribe()
+        # One `__anext__` that OUTLIVES a keepalive tick, waited on rather than
+        # raced. `asyncio.wait_for(agen.__anext__(), ...)` *cancels* the pending
+        # call on timeout, and the bus generator is suspended inside
+        # `await sub.wake.wait()` (daemon/face.py), so that cancellation runs its
+        # `finally` - unsubscribing this client and ending the generator. The
+        # next `__anext__` then raised StopAsyncIteration and the stream simply
+        # stopped after the first quiet 20 seconds. `EventSource` reconnects, so
+        # the face survived it, but a one-shot published in the gap is gone for
+        # good: the reconnect's snapshot re-sends state and nothing else.
+        pending: asyncio.Future[Event] = asyncio.ensure_future(agen.__anext__())
         try:
             while True:
-                try:
-                    event = await asyncio.wait_for(agen.__anext__(), keepalive)
-                except TimeoutError:
+                done, _ = await asyncio.wait({pending}, timeout=keepalive)
+                if not done:
                     yield b":\n\n"
                     continue
+                try:
+                    event = pending.result()
                 except StopAsyncIteration:
                     return
+                pending = asyncio.ensure_future(agen.__anext__())
                 yield f"data: {json.dumps(_payload(event))}\n\n".encode()
         finally:
+            pending.cancel()
+            # Awaited, not merely cancelled. Delivering the cancellation is what
+            # runs the bus generator's own `finally` and discards this subscriber,
+            # and until it lands the generator still counts as running - which
+            # makes the `aclose()` below raise `RuntimeError: aclose():
+            # asynchronous generator is already running` instead (measured on the
+            # client-disconnect path). Once it has landed the generator is
+            # finished and `aclose()` is the no-op that says so.
+            with suppress(asyncio.CancelledError, StopAsyncIteration):
+                await pending
             await agen.aclose()
 
     return StreamingResponse(

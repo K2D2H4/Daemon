@@ -15,6 +15,9 @@ daemon/
   app.py              single-process entrypoint (FastAPI + APScheduler)
   companion.py        what the daemon can do, for both endpoints. Read this before
                       adding a capability to loop.py or voice/conversation.py.
+  ollama_process.py   the local Ollama the daemon starts for embeddings. Only
+                      app.py and daemon run's call site in cli.py import it
+                      (rule 4).
   llm/
     base.py           Provider protocol, Message, Completion. FROZEN.
     gateway.py        LLMGateway: routes Task -> Provider
@@ -79,9 +82,24 @@ live-share pump's transport, which has no tool round in it.
    Nothing outside `daemon/channels/` imports a channel implementation.
    Callers use `LLMGateway.complete(task, ...)` and the `Channel` protocol.
 
-5. **`data/persona/seed.md` is human-owned. Code must never write to it.**
-   That asymmetry is the anchor that prevents personality collapse.
-   `data/persona/learned.md` is AI-owned; humans only read it or request deletion.
+5. **`data/persona/seed.md` is human-owned. Nothing the daemon produces may be
+   written into it.** That asymmetry is the anchor that prevents personality
+   collapse. `data/persona/learned.md` is AI-owned; humans only read it or
+   request deletion.
+
+   **Restated 2026-08-26** (docs/adr/0019-the-seed-is-authored-not-unreachable.md):
+   this used to read "code must never write to it", and that was never quite the
+   rule — `daemon/setup.py` has always composed the seed from the wizard's
+   answers. The rule is about *authorship*. Exactly two writers exist, and both
+   carry only characters a person typed: `daemon/setup.py` (creates it, never
+   overwrites) and `daemon/admin/seed_io.py` (the admin form's `PUT
+   /admin/api/persona/seed`). A third one is not forbidden because three is too
+   many — it is forbidden if anything that *thinks* is on the other end of it. No
+   button that drafts a persona, no evolution pass that edits the anchor, no tool
+   the model may call. `tests/test_admin_seed.py` fails if a second write route
+   appears; the ADR also records, measured, that `write_file` under the default
+   `DAEMON_TOOLS_ROOTS=~` can still reach the file, which is a gap that ADR names
+   rather than closes.
 
 6. **`observations` is append-only.** No UPDATE, no DELETE. Only `consumed_by`
    may be set later.
@@ -90,7 +108,11 @@ live-share pump's transport, which has no tool round in it.
    make zero *LLM* calls - same distinction non-negotiable 2 draws, and the same
    allowance: type E's `association_candidates` awaits the embedder every tick,
    which is not a call that thinks. Exactly one LLM call, and only for candidates
-   that already passed the gate.
+   that already passed the gate. (This headline names the call *count*, not what
+   the one call answers when it runs - [ADR 0016](adr/0016-proactive-default-flips-to-speaking.md)
+   changed the judge's own default from declining to speaking without touching
+   this rule's shape: stages 1-2 are still zero calls, stage 3 is still exactly
+   one, only for a candidate the gate already passed.)
 
 8. **Timestamps** are ISO-8601 UTC with `Z`, stored as TEXT. Use one helper,
    do not scatter `datetime.now()` calls.
@@ -110,6 +132,38 @@ live-share pump's transport, which has no tool round in it.
     second endpoint getting tools cannot get them ungated. If you find yourself
     needing an exception, stop and flag it.
 
+    **Split 2026-08-25** (docs/adr/0015-code-may-search-where-the-model-may-not.md):
+    the model still may not choose or run a tool on a non-owner turn - that half is
+    unchanged. What changed is that **deterministic code**, never the model, may
+    issue exactly one read-only search on the proactive path, for a `topic`
+    candidate that already passed the gate (`daemon/proactivity/judge.py` calling
+    `daemon/proactivity/topics.py:search_titles`). The model is offered zero tools
+    either way - `tests/test_judge.py::test_the_judge_is_offered_no_tools` fails if
+    that ever stops being true - and it does not choose the query at call time: the
+    query is `entities.name`, read by code with no model call in between to pick it.
+    That is not a claim that `entities.name` is safe text, and round 4 of this
+    task's own review corrected an earlier draft of this sentence that implied it
+    was: `daemon/reflection.py` writes the column from the reflection model's own reading
+    of the day's conversation log, so it **is** a prior model reply, one level
+    removed. What actually bounds the risk is `daemon/proactivity/judge.py:has_url`
+    running twice: once on the entity name itself, before any search or model
+    call, dropping a `topic` candidate whose entity reads as a pointer right
+    there (round 5, after three rounds tried and failed to build a safe
+    exemption for it); and once on the model's reply, the output check ADR 0015
+    names as its load-bearing defence, because that is the choke point between
+    attacker-controlled search results and something the owner hears. Neither is
+    an assumption that the query is trustworthy because code read it out of a
+    column, and neither is a carve-out that lets a domain-shaped entity be
+    spoken anyway. This path
+    calls `daemon/tools/mcp.py:MCPBridge.call` directly, **bypassing
+    `tools/policy.py:decide` entirely** - it is not subject to `mode=off`, the
+    allowlist, or a standing grant, because it never goes through `ToolRunner` or
+    the policy at all. That is not an oversight to close here: whether the bridge
+    is even passed to the judge when the owner has tools switched off is a decision
+    the wiring task (not this rule) makes explicitly, and it must be made in the
+    open, not discovered later by someone assuming `mode=off` covers every call to
+    the machine.
+
 11. **The tool policy makes no model calls.** Same rule as recall Lane 1 and for a
     different reason: a gate that asks a model whether to open the gate is not a
     gate. OpenClaw's `auto` mode (an LLM reviewer for edge cases) was deliberately
@@ -118,7 +172,22 @@ live-share pump's transport, which has no tool round in it.
 12. **Every executed tool call leaves a `tool_calls` audit row.** That row is the
     owner's ground-truth record of what touched the machine, readable with `daemon
     tools log`; a tool that ran without one is a defect, which is why `ToolRunner`
-    owns decide, execute and audit together instead of exposing them separately. The
+    owns decide, execute and audit together instead of exposing them separately.
+    **Split 2026-08-26** ([ADR 0018](adr/0018-a-declared-expression-is-not-a-tool-call.md)):
+    that sentence is unchanged, and what is carved out is what counts as a tool call.
+    **A value the model declares which touches nothing outside this process is not
+    one** - today exactly `set_mood`, which changes the face's expression and nothing
+    else, so it has nothing to put in the row this rule exists to write. The boundary
+    is mechanical, not a promise: it is absent from the registry, so no execution path
+    exists to skip a row on; `daemon/voice/conversation.py` answers it before
+    `ToolRunner` is reached, so the exemption is that the runner never sees it rather
+    than a runner that sometimes omits a row; its argument is validated against the
+    `Mood` type rather than trusted; and it is declared only when a face is attached.
+    `tests/test_voice_conversation.py` fails if a `set_mood` call ever reaches
+    `run_tools` and `tests/test_tool_loop.py` fails if it appears in the registry -
+    **those tests are the rule, not coverage of it.** Anything else wanting on this
+    list needs its own ADR and its own measurement; "every" having one named exception
+    is a door, and that is the cost this split accepted. The
     reply the owner reads carries **only the model's answer** - the raw
     `run`/`write`/`rm` lines are not folded into it, in text or spoken aloud in
     voice, because narrating every call reads as clutter and the audit is the record

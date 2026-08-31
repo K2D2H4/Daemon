@@ -13,7 +13,9 @@ import logging
 import os
 import sqlite3
 import subprocess
-from collections.abc import Callable
+import sys
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -436,6 +438,165 @@ def test_update_reports_a_failed_install(monkeypatch: pytest.MonkeyPatch) -> Non
     assert cli.main(["update"]) == 1
 
 
+# --- the restart bound: SIGTERM must not wait forever on an SSE stream --------
+
+
+def test_serve_bounds_the_graceful_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_serve` must hand uvicorn a finite `timeout_graceful_shutdown`.
+
+    Without it the default is `None`, which means "wait for every response to
+    finish, forever" - and `/face/stream` is a response that never finishes. A
+    settings save then left the admin console spinning on "applying..." because the
+    process it was waiting for was still sitting in shutdown. The mechanism is
+    pinned by the test below; this one pins that the product actually passes it.
+    """
+    import uvicorn
+
+    calls: list[dict[str, Any]] = []
+    # `**_` rather than a bare `settings`: `_serve` also hands `create_app` the
+    # `local_ollama` it built, and a stub narrower than the real signature fails
+    # on the argument rather than on the thing this test is about.
+    monkeypatch.setattr(daemon_app, "create_app", lambda settings, **_: object())
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append(kw))
+
+    assert cli.main(["run"]) == 0
+
+    assert calls, "uvicorn.run was never called"
+    grace = calls[0]["timeout_graceful_shutdown"]
+    assert grace is not None, "an unbounded graceful shutdown is the hang"
+    assert grace == cli.SHUTDOWN_GRACE_SECONDS
+    # A floor, not just "finite". The constant's own reason for being 3s is that
+    # `GET /admin/api/settings` takes ~1.5s, so a bound under that cancels a real
+    # request on every restart - and every assertion here would still pass.
+    assert 2.0 <= grace <= 30.0
+
+
+@dataclass
+class _Shutdown:
+    """What a shutdown attempt did: did it finish, and did the lifespan tear down?"""
+
+    finished: bool
+    torn_down: bool
+
+
+async def _shutdown_finishes(
+    tmp_path: Path, grace: float | None, wait: float, *, release: bool = False
+) -> _Shutdown:
+    """Drive real uvicorn holding a real `/face/stream` client, then ask it to exit.
+
+    `should_exit` is exactly what uvicorn's SIGTERM handler sets, so this is the
+    path `daemon/admin/restart.py` takes. `release=True` also closes the face bus
+    the way `schedule_exit` does, before the signal.
+
+    The app carries a lifespan that records its own teardown, because that is the
+    property the restart actually depends on: `admin/restart.py` sends a signal
+    rather than `sys.exit` so the channel, the sqlite handle and the MCP children
+    close. A shutdown that exits without running it is not the fix.
+    """
+    import uvicorn
+    from fastapi import FastAPI
+
+    from daemon.face import FaceBus
+    from daemon.face_routes import router as face_router
+
+    torn_down: list[bool] = []
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            torn_down.append(True)
+
+    api = FastAPI(lifespan=lifespan)
+    api.state.settings = Settings(_env_file=None, provider="ollama", data_dir=tmp_path)
+    bus = FaceBus()
+    api.state.face = bus
+    api.include_router(face_router)
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            api,
+            host="127.0.0.1",
+            port=0,
+            log_config=None,
+            timeout_graceful_shutdown=grace,
+        )
+    )
+    serving = asyncio.ensure_future(server.serve())
+    try:
+        for _ in range(500):
+            if server.started:
+                break
+            if serving.done():  # a bind failure: re-raise it now, not in 5s
+                await serving
+            await asyncio.sleep(0.01)
+        else:  # pragma: no cover - a server that never binds is a broken test
+            raise AssertionError("uvicorn never started")
+        port = server.servers[0].sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(b"GET /face/stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            await writer.drain()
+            assert b"200 OK" in await reader.readline()
+
+            if release:
+                bus.close()
+            server.should_exit = True
+            try:
+                await asyncio.wait_for(asyncio.shield(serving), wait)
+            except TimeoutError:
+                return _Shutdown(finished=False, torn_down=bool(torn_down))
+            return _Shutdown(finished=True, torn_down=bool(torn_down))
+        finally:
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
+    finally:
+        server.force_exit = True
+        serving.cancel()
+        with suppress(asyncio.CancelledError):
+            await serving
+
+
+def test_an_open_face_stream_blocks_an_unbounded_shutdown(tmp_path: Path) -> None:
+    """The hang, reproduced. `/face/stream` is an SSE response that by design never
+    completes, and uvicorn's `connection.shutdown()` cannot close a connection whose
+    response is still open - it only clears `keep_alive` and waits. With no bound the
+    wait is `while self.server_state.connections: await sleep(0.1)`, forever.
+
+    **This asserts a third-party behaviour, so read a failure here carefully.**
+    Measured against uvicorn 0.52.4. If a later uvicorn learns to close a streaming
+    response on shutdown, this goes red while the product is fine - that is uvicorn
+    improving, not `SHUTDOWN_GRACE_SECONDS` breaking, and the fix is to retire this
+    test rather than to chase it.
+    """
+    assert asyncio.run(_shutdown_finishes(tmp_path, grace=None, wait=0.6)).finished is False
+
+
+def test_a_bounded_shutdown_exits_with_the_stream_still_open(tmp_path: Path) -> None:
+    """The backstop: past the bound uvicorn cancels the stream's task, the connection
+    closes, and the lifespan teardown still runs - so the supervisor gets its exit
+    and the console's poll finds a daemon to reconnect to. This is the path a
+    `launchctl` or logout SIGTERM takes, where no endpoint got to release anything.
+    """
+    result = asyncio.run(_shutdown_finishes(tmp_path, grace=0.1, wait=5.0))
+    assert result.finished is True
+    assert result.torn_down is True, "exiting without the lifespan teardown is not the fix"
+
+
+def test_releasing_the_face_bus_exits_with_no_bound_at_all(tmp_path: Path) -> None:
+    """And the mechanism `schedule_exit` uses, which is the stronger statement: with
+    the bus closed the stream *ends*, so the response completes, the connection
+    closes on its own and the process leaves even with `timeout_graceful_shutdown`
+    still `None`. That is why the admin's restart is prompt and logs no error - the
+    bound above is only ever reached by a SIGTERM no endpoint saw coming.
+    """
+    result = asyncio.run(_shutdown_finishes(tmp_path, grace=None, wait=5.0, release=True))
+    assert result.finished is True
+    assert result.torn_down is True
+
+
 # --- .env secrets reach os.environ so MCP keys survive a restart -------------
 
 
@@ -755,6 +916,119 @@ def test_face_prints_the_url_when_open_is_not_on_path(
     monkeypatch.setattr("daemon.cli.subprocess.run", missing)
     assert cli.main(["face"]) == 0
     assert "127.0.0.1:8787/face" in capsys.readouterr().out
+
+
+def test_face_transitions_reports_the_path_and_pair_count(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    written = tmp_path / "transitions.json"
+    written.write_text(
+        json.dumps({"match": {"idle1": {"idle2": [0.1]}, "idle2": {"idle1": [0.2, 0.3]}}})
+    )
+    # face_match.write_table is the expensive (ffmpeg-shelling) part; the command
+    # re-reads its output for the pair count rather than re-running it.
+    monkeypatch.setattr("daemon.face_match.write_table", lambda face_dir: written)
+
+    assert cli.main(["face-transitions"]) == 0
+    out = capsys.readouterr().out
+    assert str(written) in out
+    # Pair count is ordered (A, B) entries - idle1->idle2 and idle2->idle1 - not
+    # the number of per-bucket seek values inside either one.
+    assert "2 pair(s)" in out
+
+
+def test_face_transitions_reports_a_problem_when_ffmpeg_is_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`face_match._frames` shells out to ffmpeg; a missing binary raises
+    `FileNotFoundError` - an `OSError`, not a nonzero exit (same shape as the two
+    `face` tests above). Raising it directly from `write_table`, not from a
+    `subprocess.run` stand-in that merely returns a failure code, is the point:
+    a mocked nonzero exit would never exercise this path at all."""
+
+    def missing(face_dir: Path) -> Path:
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr("daemon.face_match.write_table", missing)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    assert "ffmpeg" in capsys.readouterr().err
+
+
+def test_face_transitions_creates_the_face_dir_rather_than_blaming_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The real `write_table`, on an install where nobody has made
+    `<data_dir>/face/` yet - which is every install until the owner drops clips
+    in, since nothing else creates it.
+
+    `write_text` raised `FileNotFoundError` there, and the command's blanket
+    `except OSError` reported it as "ffmpeg not found": wrong, and unactionable.
+    No ffmpeg is needed to reach it - with no clips present `build_table`
+    iterates nothing and never shells out - so this test is the real path, not
+    a stand-in for it.
+    """
+    monkeypatch.setenv("DAEMON_DATA_DIR", str(tmp_path / "fresh"))
+    assert not (tmp_path / "fresh" / "face").exists()
+
+    assert cli.main(["face-transitions"]) == 0
+    out, err = capsys.readouterr()
+    assert (tmp_path / "fresh" / "face" / "transitions.json").is_file()
+    assert "ffmpeg" not in err
+    assert "0 pair(s)" in out
+
+
+def test_face_transitions_says_it_needs_pillow_rather_than_raising(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`Pillow>=10.0; sys_platform == 'darwin'` in pyproject: it is core on macOS
+    only, so on Linux a core install reaches this command with no PIL at all and
+    got a raw ImportError traceback - against this module's own docstring. A
+    `None` in `sys.modules` is what makes `from ... import` raise ImportError
+    without needing an install that lacks the package."""
+    monkeypatch.setitem(sys.modules, "daemon.face_match", None)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    err = capsys.readouterr().err
+    assert "Pillow" in err
+    assert "ffmpeg" not in err, "a missing dependency is not a missing binary"
+
+
+def test_face_transitions_does_not_call_every_write_failure_a_missing_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half of the blanket-`except OSError` defect: an OS error that is
+    genuinely about writing must not be reported as an absent binary."""
+
+    def unwritable(face_dir: Path) -> Path:
+        raise PermissionError(f"{face_dir}/transitions.json")
+
+    monkeypatch.setattr("daemon.face_match.write_table", unwritable)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    err = capsys.readouterr().err
+    assert "ffmpeg" not in err
+    assert "transitions.json" in err
+
+
+def test_face_transitions_reports_a_problem_when_a_clip_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A different failure from a missing binary: ffmpeg is present and runs,
+    but a present-on-disk clip it cannot decode makes it exit nonzero, which
+    `_frames`'s own `check=True` turns into `CalledProcessError` - not an
+    `OSError`, so it needs its own except clause rather than falling through
+    the missing-ffmpeg one (which would print a misleading "not found")."""
+
+    def corrupt(face_dir: Path) -> Path:
+        raise subprocess.CalledProcessError(1, ["ffmpeg"], stderr=b"invalid data found")
+
+    monkeypatch.setattr("daemon.face_match.write_table", corrupt)
+
+    assert cli.main(["face-transitions"]) == cli.PROBLEM
+    err = capsys.readouterr().err
+    assert "ffmpeg" in err
+    assert "not found" not in err, "a corrupt clip is not the same failure as a missing binary"
 
 
 def test_a_broken_config_stops_a_command_that_needs_it(
@@ -1143,6 +1417,30 @@ def test_reflect_with_nothing_to_do_says_so(
 
     assert cli.main(["reflect"]) == 0
     assert "nothing to reflect on" in capsys.readouterr().out
+
+
+def test_reflect_names_the_escape_hatch_when_only_today_is_pending(
+    data_dir: Path,
+    reflection_seam: Callable[..., FakeProvider],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`catch_up()` drops today unconditionally (still being written to), so a
+    day with only today's log also returns no results - the same empty list as
+    the "nothing logged at all" case above. The old message ("no day has a log
+    without a reflection already") was false on exactly this common day; the
+    fix names why today does not count and how to force it anyway.
+    """
+    from daemon import clock
+    from daemon.memory import log
+
+    reflection_seam()
+    _logged_day(data_dir, log.local_date(clock.now()))
+
+    assert cli.main(["reflect"]) == 0
+    out = capsys.readouterr().out
+    assert "nothing to reflect on" in out
+    assert "no day has a log without a reflection already" not in out
+    assert "daemon reflect --date" in out
 
 
 @pytest.mark.parametrize(
@@ -1842,3 +2140,21 @@ def test_reflect_says_how_much_came_off_a_tool_rather_than_the_conversation(
     assert cli.main(["reflect", "--date", "2026-08-03", "--force"]) == 0
 
     assert "1 from tool(s)" in capsys.readouterr().out
+
+
+def test_doctor_names_topic_as_the_uncapped_sixth_kind(data_dir: Path) -> None:
+    """Whole-branch review: `_proactivity_check` used to build `kinds` only from
+    `settings.proactive_kind_budgets.items()`, which has no `topic` entry by
+    design (`config.py`: the owner rejected a per-kind quota for it as
+    artificial) - so `daemon doctor` showed five capped kinds and never
+    mentioned the uncapped sixth, leaving a real capability invisible
+    (CONTRACTS rule 12)."""
+    (data_dir / "persona").mkdir()
+    (data_dir / "persona" / "seed.md").write_text("씨앗", encoding="utf-8")
+    settings = Settings(
+        _env_file=None, DAEMON_DATA_DIR=str(data_dir), DAEMON_PROACTIVE_ENABLED=True
+    )
+
+    check = cli._proactivity_check(settings)
+
+    assert "topic uncapped" in check.detail

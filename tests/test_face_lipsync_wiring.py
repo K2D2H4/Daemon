@@ -722,8 +722,13 @@ async def test_a_wake_round_hands_the_process_s_own_sink_to_the_voice_call(monke
             yield SimpleNamespace(heard="\ubca8\ub77c", matched="\ubca8\ub77c", pcm=b"\x00\x01")
 
     async def fake_build(settings):
-        async def close() -> None:
-            return None
+        async def close() -> bool:
+            # `-> bool`, not `None`: `_wake_round` drops the round when the release
+            # reports failure rather than opening a session on a wedged device, so a
+            # fake that returns None reads as "the microphone never came back" and
+            # `run_voice` is never reached. Main's own fakes use the same shape
+            # (tests/test_wake.py).
+            return True
 
         return FakeGate(), close
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import sys
 import time
 from collections import deque
@@ -28,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
 
-from daemon import __version__
+from daemon import __version__, mic_floor
 from daemon.channels.base import Channel
 from daemon.clock import now_iso
 from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
@@ -42,13 +43,15 @@ from daemon.config import (
     ConfigError,
     Settings,
 )
-from daemon.llm.base import Provider
+from daemon.face import MOOD_TOOL, MOOD_VOICE_INSTRUCTION
+from daemon.llm.base import Provider, ToolSpec
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
 from daemon.memory.base import MemoryWriter, Recall
-from daemon.persona.evolve import PersonaEvolution
+from daemon.ollama_process import LocalOllama
+from daemon.persona.evolve import EvolutionResult, PersonaEvolution
 from daemon.proactivity.tick import ProactiveTick
-from daemon.reflection import Reflection
+from daemon.reflection import Reflection, Result
 from daemon.tasks import Task
 
 if TYPE_CHECKING:  # the wake gate, used only in the signatures below
@@ -115,6 +118,19 @@ PROACTIVE_TICK_MINUTES = 5
 passes the gate - so the cost of the interval is a few sqlite reads and three
 subprocess probes, not a model call."""
 
+# A `PROACTIVE_TOOLS_BUILD_TIMEOUT` used to live here, wrapping this module's own
+# `_build_tools` call in `asyncio.wait_for` so a wedged MCP server could not stop
+# the scheduler (`_proactive_tick` is registered `max_instances=1`, so a tick that
+# never returns is every later tick silently skipped). The PR #113 review showed it
+# made the failure worse, not better: `_build_tools` constructs the bridge *inside*
+# the awaited coroutine, and `McpBridge._bring_up` opens each server in a detached
+# task, so cancelling the caller left every already-connected stdio child running
+# with nothing holding a reference that could ever close it. The ceiling now sits
+# where the task owning the transport can actually be cancelled -
+# `_ServerLink.open` in `daemon/tools/mcp.py`, under `STARTUP_TIMEOUT` - which also
+# bounds the lifespan's own build and every other `_build_tools` caller, not just
+# this one.
+
 REFLECT_HOUR = 4
 """Local hour for the nightly pass. Late enough that the day is over, early enough
 that the morning's first message already sees what it concluded."""
@@ -133,6 +149,7 @@ def create_app(
     memory: MemoryWriter | None = None,
     recall: Recall | None = None,
     wake: WakeRound | None = None,
+    local_ollama: LocalOllama | None = None,
 ) -> FastAPI:
     """Assemble the process. `channel`/`memory`/`recall`/`wake` are injection points
     for tests; normally all four are built from settings during startup.
@@ -140,6 +157,12 @@ def create_app(
     `wake` is one round of "listen until called, then hold a conversation" - see
     `_wake_round`. Injected rather than assembled in tests because the real one
     opens a microphone and then a billed session, and neither belongs in a test.
+
+    `local_ollama` is never built here - `None` means no start task, exactly
+    today's behaviour, so every existing test that does not pass one keeps not
+    touching the network. Only `daemon run` (`daemon/cli.py`) constructs the real
+    one; a test that built its own here would probe localhost and could spawn a
+    real `ollama serve`.
     """
     resolved = settings or Settings()
     app = FastAPI(title="Daemon", version=__version__, lifespan=_lifespan)
@@ -147,6 +170,7 @@ def create_app(
     app.state.channel = channel
     app.state.memory = memory
     app.state.recall = recall
+    app.state.local_ollama = local_ollama
     app.state.recall_status = "injected" if recall is not None else "not started"
     app.state.loop_task = None
     app.state.reflection_boot_task = None
@@ -264,6 +288,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # corrupting the M4 log clock (docs/PLAN.md 8.1). Whoever acquires it second finds
     # the day's artifact/diary already written and skips.
     catchup_lock = asyncio.Lock()
+    # Exposed so the admin's "run now" buttons take the very same lock. Without
+    # this they would be a third writer beside the cron and the boot task, and the
+    # comment above says what two `run(date)` for one day costs.
+    app.state.catchup_lock = catchup_lock
     # Local time, not UTC: "overnight" is a fact about the person asleep next to
     # the machine, and a UTC 04:00 lands mid-afternoon in KST. The 5-minute
     # proactivity tick (M3) lands here too.
@@ -303,11 +331,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Registered only when the user asked for it. A job that wakes every five
         # minutes to decide against speaking is cheap but not free, and its absence
         # is a clearer statement of "off" than a disabled job that still fires.
+        #
+        # `_get_lifespan_bridge` is a closure, not `app.state.mcp` itself:
+        # `scheduler.add_job`'s `args` are captured now, before the rest of this
+        # function has necessarily built `app.state.mcp` (it is set further down,
+        # only once `io` succeeds) - so the job needs something that reads the
+        # attribute fresh on every fire, not its value at registration time. Every
+        # fire after that reuses whatever live bridge the lifespan is currently
+        # holding instead of `_proactive_tick` connecting and tearing down every
+        # configured MCP server itself, every five minutes (whole-branch review;
+        # see `build_proactive_tick`'s `bridge` parameter).
+        def _get_lifespan_bridge() -> Any:
+            return getattr(app.state, "mcp", None)
+
         scheduler.add_job(
             _proactive_tick,
             "interval",
             minutes=PROACTIVE_TICK_MINUTES,
-            args=[settings],
+            args=[settings, _get_lifespan_bridge],
             id="proactivity",
             max_instances=1,
             coalesce=True,
@@ -322,6 +363,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     channel = app.state.channel
     memory = app.state.memory
     recall: Recall | None = app.state.recall
+    local_ollama: LocalOllama | None = app.state.local_ollama
     resolve_id: ResolveId | None = None
     close_io: Callable[[], None] | None = None
     embedder: Any = None
@@ -465,6 +507,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 worker.run(), name="delegation-worker"
             )
 
+    app.state.ollama_task = None
+    if local_ollama is not None:
+        # Not gated on `recall`: `provider=ollama` routes chat here too, and
+        # `recall` is None whenever `_build_recall` failed - exactly the case where
+        # hanging the start off the backfill would leave the daemon with no local
+        # model at all. Not awaited, for the same log-clock reason as the backfill
+        # below. Only `daemon run` passes one; a test passing none gets no start
+        # task, because a test that spawns a server is a broken test.
+        app.state.ollama_task = asyncio.create_task(
+            local_ollama.ensure_running(), name="ollama-start"
+        )
+        # Defense in depth alongside `_probe`'s broad `except`: `ensure_running`
+        # promises never to raise, but if that promise is ever broken again, this
+        # is what stands between the exception and vanishing the same way a dead
+        # conversation loop used to - `app.state` holding the reference is what
+        # keeps asyncio's own "never retrieved" warning from firing either.
+        app.state.ollama_task.add_done_callback(_report_ollama_start_death)
+
     if recall is not None:
         # Backfill after the loop is already serving, and in the background: a
         # rebuilt sqlite file gives every message a new id and drops `embeddings`
@@ -472,9 +532,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # while /health still says recall is ready. Measured on the golden set,
         # that silent state is a 50% ceiling for Korean rather than the hybrid
         # number - a regression where nothing fails. Not awaited, because a cold
-        # embedder must not delay the log clock (docs/PLAN.md 8.1).
+        # embedder must not delay the log clock (docs/PLAN.md 8.1) - and that is
+        # also why `_backfill` waits for Ollama inside itself rather than here.
         app.state.backfill_task = asyncio.create_task(
-            _backfill(recall), name="recall-backfill"
+            _backfill(recall, app.state.ollama_task), name="recall-backfill"
         )
 
     if memory is not None:
@@ -550,6 +611,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # revoked bot token was enough to leak the lot on every restart.
         for name in (
             "backfill_task",
+            "ollama_task",
             "loop_task",
             "wake_task",
             "reflection_boot_task",
@@ -565,6 +627,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if channel is not None:
             with suppress(Exception):
                 await channel.close()
+        local = getattr(app.state, "local_ollama", None)
+        if local is not None:
+            # A child process, like the stdio MCP servers below: an Ollama this
+            # daemon started and did not stop is one more orphan per restart. One
+            # it did *not* start is somebody else's and stays running.
+            with suppress(Exception):
+                await local.aclose()
         mcp = getattr(app.state, "mcp", None)
         if mcp is not None:
             # Before the sqlite close and the scheduler shutdown, because these are
@@ -765,7 +834,15 @@ def _report_loop_death(task: asyncio.Task[None]) -> None:
         )
 
 
-async def _backfill(recall: Recall) -> None:
+def _report_ollama_start_death(task: asyncio.Task[bool]) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("ollama start task died; recall stays keyword-only", exc_info=exc)
+
+
+async def _backfill(recall: Recall, ollama_ready: Awaitable[bool] | None = None) -> None:
     """Embed history the vector lane is missing, to exhaustion.
 
     One call was not enough. It stopped at its default 500 rows and never ran
@@ -774,11 +851,24 @@ async def _backfill(recall: Recall) -> None:
     still reported recall ready. That is the same invisible Korean ceiling the
     protocol change was meant to prevent, just further along.
 
+    The wait for Ollama lives here rather than in `lifespan` on purpose: a cold
+    embedder must not delay the log clock (docs/PLAN.md 8.1), and awaiting
+    readiness before the `yield` would block uvicorn's "startup complete" and
+    /health for as long as a cold start takes. Measured 2026-08-26, skipping the
+    wait entirely is what logged `backfill stopped after 0 message(s)` and left 49
+    messages unembedded until an unrelated restart.
+
     Never fatal: recall degrades to keyword-only, which is worse than the full
     answer and far better than a dead conversation loop.
     """
     total = 0
     try:
+        if ollama_ready is not None and not await ollama_ready:
+            logger.info(
+                "recall backfill skipped: no embedder answered. Recall stays keyword-only "
+                "and the next restart tries again"
+            )
+            return
         while True:
             landed = await recall.backfill(BACKFILL_CHUNK)
             total += landed
@@ -854,7 +944,11 @@ def open_store(settings: Settings) -> Iterator[Any]:
 
 
 async def build_proactive_tick(
-    settings: Settings, *, speak: bool = False
+    settings: Settings,
+    *,
+    speak: bool = False,
+    bridge: Any = None,
+    wake_loop: bool = False,
 ) -> tuple[ProactiveTick, Callable[[], Awaitable[None]]]:
     """A tick and the coroutine that releases what it holds.
 
@@ -866,6 +960,24 @@ async def build_proactive_tick(
 
     The speaker is built only when the user asked for it *and* the platform can do
     it. Everything else degrades to Telegram, which is the safe direction.
+
+    `bridge`, when given, is a live MCP bridge this call does **not** own - the
+    resident's `app.state.mcp`, connected once by `_lifespan` and closed only at
+    shutdown. `_proactive_tick` passes it on every scheduled fire so a tick reuses
+    the connections already up instead of connecting and tearing every configured
+    server down 288 times a day (whole-branch review: `_build_tools` unconditionally
+    called `bridge.start(registry)`, a stdio child process per server, then
+    `bridge.aclose()` at the end of the very same tick). `None` - the default, and
+    what `daemon proactive` passes, since the CLI runs with no lifespan and no
+    `app.state` to reuse at all - falls back to building, and owning, and later
+    closing, a bridge of its own. A wedged MCP server costs this tick rather than
+    the scheduler, but the ceiling is not here: it is in `_ServerLink.open`
+    (`daemon/tools/mcp.py`), per server, where the task that owns the transport
+    can be cancelled. So this call is bounded by roughly the server count times
+    `STARTUP_TIMEOUT` rather than by any one number - on a multi-server install it
+    can outrun `PROACTIVE_TICK_MINUTES`, which `coalesce=True` absorbs by skipping
+    a round. What `max_instances=1` needs is that the job always *returns*, and
+    that is what moving the timeout down a level bought.
     """
     from daemon.fs import harden_existing
     from daemon.memory.store import Store
@@ -895,7 +1007,61 @@ async def build_proactive_tick(
         gateway = LLMGateway(
             providers, settings.routing_table(), fallback=settings.fallback_route()
         )
-        judge = Judge(gateway, data_dir=settings.data_dir)
+
+        # The `topic` candidate's one search (ADR 0015) goes through this bridge,
+        # never through `tools/policy.py:decide` - it calls `MCPBridge.call`
+        # directly, so `tools_mode`'s own handling of `off` (ToolPolicy refusing
+        # every guarded tool) never sees this call and cannot stop it by itself.
+        # Rule 10 forbids the *model* choosing and running a tool on a non-owner
+        # turn; a fixed, code-issued, read-only search is the thing ADR 0015 says
+        # is not that - so `tools_enabled=false` would already be a defensible
+        # place to stop.
+        #
+        # This wiring goes one step further and also withholds the bridge when
+        # `tools_mode == "off"`, even though nothing in ADR 0015 requires it.
+        # Reasoning: `off` is the setting an owner reaches for to mean "nothing
+        # this daemon does reaches outside this conversation without me asking",
+        # and proactivity is the one channel where that promise matters most - an
+        # utterance that was never asked for, arriving in Telegram or out of the
+        # laptop speaker in a voice the owner trusts. Honouring the letter of the
+        # ADR (only `tools_enabled` gates it) while ignoring the mode the owner
+        # actually set because this path is technically outside the policy it
+        # governs is exactly the kind of capability-nobody-was-asked-about state
+        # CONTRACTS rule 12 exists to prevent. `full`, `ask` and `allowlist` all
+        # leave tool use switched on in spirit, so those three still get the
+        # bridge; only `off` (and the master switch) withhold it.
+        #
+        # With no bridge, `Judge` drops every `topic` candidate and the other
+        # four generators are unaffected - the same degrade path a missing or
+        # unconfigured MCP server already takes.
+        tick_bridge = None
+        if settings.tools_enabled and settings.tools_mode != "off":
+            if bridge is not None:
+                # Reused, owned by the caller - never added to `closers`. Closing
+                # a bridge this tick did not build would tear down every MCP
+                # server the rest of the running app depends on the moment this
+                # one tick ends, orphaning `app.state.mcp` for everything else
+                # that reaches for it until the next full restart.
+                tick_bridge = bridge
+            else:
+                # No `wait_for` around this: a server that hangs on connect is
+                # bounded inside `_ServerLink.open`, in the task that owns the
+                # transport and can therefore be cancelled cleanly. Wrapping the
+                # call here instead orphaned the children it had already started
+                # (see the note on the removed `PROACTIVE_TOOLS_BUILD_TIMEOUT`).
+                tools_runner, tick_bridge, _tools_status = await _build_tools(
+                    settings, store
+                )
+                if tools_runner is not None:
+                    closers.append(tools_runner.aclose)
+                if tick_bridge is not None:
+                    # A stdio MCP server is a child process - one left running is
+                    # an orphan per tick, the same reason the app lifespan closes
+                    # its own bridge ahead of the store (see `_lifespan` above).
+                    # Only reached on this, the "this tick built its own" branch -
+                    # a reused bridge is never closed here (see above).
+                    closers.append(tick_bridge.aclose)
+        judge = Judge(gateway, data_dir=settings.data_dir, bridge=tick_bridge)
 
         channel = None
         try:
@@ -912,9 +1078,23 @@ async def build_proactive_tick(
             speaker = LocalSpeaker()
             closers.append(speaker.aclose)
 
+        # The floor, only where a wake round could answer it. `wake_loop` is passed
+        # by `_proactive_tick` and by nothing else, because it is a fact about *this
+        # process* that no setting can stand in for: `daemon proactive --speak` sets
+        # `speak=True` too (`daemon/cli.py`) and has no wake loop at all, and
+        # `settings.wake_enabled` stays true on a resident whose wake task was never
+        # created - no on-device recognizer, a microphone grant this build cannot
+        # use. An earlier version of this comment claimed `speak` told those apart.
+        # It does not (PR #115 review), and the cost of believing it was a ten-second
+        # stall on every line from a command a person is watching run.
+        ask_for_the_floor = None
+        if wake_loop and speak and settings.voice_enabled and settings.wake_enabled:
+            ask_for_the_floor = mic_floor.request
+
         delivery = ProactiveDelivery(
             store,
             FileMemoryWriter(settings.data_dir, store),
+            ask_for_the_floor=ask_for_the_floor,
             channel=channel,
             speaker=speaker,
         )
@@ -1641,7 +1821,9 @@ def release_lipsync_memory() -> None:
     mx.clear_cache()
 
 
-async def _proactive_tick(settings: Settings) -> None:
+async def _proactive_tick(
+    settings: Settings, get_bridge: Callable[[], Any] | None = None
+) -> None:
     """The five-minute round. Catches everything, for the same reason the reflection
     tick does: a job that raises inside APScheduler is logged once and then the
     schedule carries on, which reads as a working loop that has silently decided
@@ -1649,9 +1831,26 @@ async def _proactive_tick(settings: Settings) -> None:
 
     Logged at INFO even when nothing happened, because "it stayed silent" is the
     output people need to be able to check.
+
+    `get_bridge`, when given, is called fresh on every fire to read whatever the
+    lifespan's `app.state.mcp` currently is - a callable rather than the bridge
+    itself, because `scheduler.add_job` captures its `args` once at registration
+    time, before `_lifespan` has necessarily finished building `app.state.mcp`
+    (see `_lifespan`'s own registration call). `None` (the default, and what every
+    test constructing this function directly gets) means `build_proactive_tick`
+    builds its own bridge, exactly as it always has.
     """
+    bridge = get_bridge() if get_bridge is not None else None
     try:
-        tick, close = await build_proactive_tick(settings, speak=True)
+        # `wake_loop=True` because this is the resident, the only process that runs
+        # one. Not conditioned on the task being *alive*: a resident whose wake task
+        # died or was never created answers nothing, `mic_floor.request` reports
+        # `no-listener` after its take timeout, and `ProactiveDelivery._say` uses the
+        # speaker directly - correct, and self-correcting, at the cost of one ten-
+        # second wait per line in a state `daemon doctor` already reports.
+        tick, close = await build_proactive_tick(
+            settings, speak=True, bridge=bridge, wake_loop=True
+        )
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
         logger.error("proactive tick could not start: %s", exc)
         return
@@ -1682,29 +1881,59 @@ async def _proactive_tick(settings: Settings) -> None:
     )
 
 
+async def run_reflection_now(
+    settings: Settings, lock: asyncio.Lock | None
+) -> list[Result]:
+    """Reflect on every unreflected day, and *raise* if it could not.
+
+    The opposite contract from `_reflect_tick`, on purpose. A scheduled job that
+    raises inside APScheduler stops being scheduled, so the tick swallows. A
+    button press has a person waiting for the answer, and swallowing there would
+    report success for a pass that never reached the model.
+
+    `lock` is `app.state.catchup_lock`: the same one the cron and the boot task
+    take, because this is a third writer of the same append-only artifact.
+    """
+    reflection_pass, close = await build_reflection(settings)
+    try:
+        async with lock if lock is not None else nullcontext():
+            return await reflection_pass.catch_up()
+    finally:
+        with suppress(Exception):
+            await close()
+
+
+async def run_persona_evolution_now(
+    settings: Settings, lock: asyncio.Lock | None, *, force: bool = False
+) -> EvolutionResult:
+    """Run the weekly pass now, and raise if it could not. Same split as
+    `run_reflection_now`, same reason.
+
+    `lock` is `app.state.catchup_lock` here too: two `run()` in one week would
+    both write the week's diary and re-consume observations.
+    """
+    evolution, close = await build_persona_evolution(settings)
+    try:
+        async with lock if lock is not None else nullcontext():
+            return await evolution.run(force=force)
+    finally:
+        with suppress(Exception):
+            await close()
+
+
 async def _reflect_tick(settings: Settings, lock: asyncio.Lock | None = None) -> None:
     """The scheduled pass. Catches everything: a job that raises inside
     APScheduler is logged once and then the schedule carries on, which reads as a
     working reflection loop that has silently done nothing for a month.
 
-    `lock`, when passed, serialises the actual `catch_up` against the boot task
-    (`_boot_catchup`) running the same pass: both walk the unreflected days, and two
-    `run(date)` for one day double-write its append-only artifact and observations.
-    A lock-less call (`lock=None`) still works via `nullcontext`."""
+    The work itself is `run_reflection_now`, which raises - the admin's button
+    needs the failure. This wrapper is the swallowing half.
+    """
     try:
-        reflection, close = await build_reflection(settings)
+        results = await run_reflection_now(settings, lock)
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
-        logger.error("reflection tick could not start: %s", exc)
-        return
-    try:
-        async with lock if lock is not None else nullcontext():
-            results = await reflection.catch_up()
-    except Exception as exc:  # noqa: BLE001
         logger.error("reflection tick failed: %s", exc)
         return
-    finally:
-        with suppress(Exception):
-            await close()
     for result in results:
         logger.info(
             "reflection %s: %s (%d message(s) -> %d fact(s), %d entity(ies), %d observation(s))%s",
@@ -1720,34 +1949,17 @@ async def _reflect_tick(settings: Settings, lock: asyncio.Lock | None = None) ->
 
 async def _persona_tick(settings: Settings, lock: asyncio.Lock | None = None) -> None:
     """The weekly persona-evolution pass. Catches everything, same reason as
-    reflection and the proactive tick: a job that raises inside APScheduler is
-    logged once and then the schedule carries on, which reads as a working
-    weekly pass that has silently done nothing for months.
+    reflection and the proactive tick.
 
     Logged at INFO even when the pass was skipped, because "not enough
     observations yet" and "already ran this week" both have to be visible
-    without opening sqlite - the same reasoning as the reflection tick's log
-    line.
-
-    `lock`, when passed, serialises the actual `run` against the boot task the
-    same way the reflection tick does: two `run()` in one week would both write
-    the week's diary and re-consume observations. A lock-less call (`lock=None`)
-    still works via `nullcontext`.
+    without opening sqlite.
     """
     try:
-        evolution, close = await build_persona_evolution(settings)
+        result = await run_persona_evolution_now(settings, lock)
     except Exception as exc:  # noqa: BLE001 - the tick must survive a bad config
-        logger.error("persona evolution tick could not start: %s", exc)
-        return
-    try:
-        async with lock if lock is not None else nullcontext():
-            result = await evolution.run()
-    except Exception as exc:  # noqa: BLE001
         logger.error("persona evolution tick failed: %s", exc)
         return
-    finally:
-        with suppress(Exception):
-            await close()
 
     logger.info(
         "persona evolve %s: %s (%d observation(s) read -> %d proposed, %d added, "
@@ -1867,6 +2079,36 @@ async def _build_voice_runtime(
     )
 
 
+def _mood_declaration() -> ToolSpec:
+    """`set_mood` as the model is told about it. **Declared, never registered.**
+
+    A `ToolSpec` is how a model is offered anything at all, so this rides the
+    function-calling channel - that is transport, not a claim that it is a tool. What
+    makes it not one is that `daemon/tools/` has no entry for it and
+    `daemon/voice/conversation.py` answers it before `ToolRunner` is reached, which is
+    what CONTRACTS 12's exemption rests on (docs/adr/0018).
+
+    Flat on purpose - one enum string. `evals/voice_write_nudge_spike.py` measured that
+    nested argument schemas are what the voice model fakes rather than calls, and
+    `evals/voice_set_mood_spike.py` measured this shape at 24/24 over the live socket.
+    """
+    return ToolSpec(
+        name=MOOD_TOOL,
+        description=(
+            "Set the facial expression shown on the companion's own face. Call this "
+            "when you genuinely feel amused, sulky or curious about what was just "
+            "said. It changes nothing except the expression."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "mood": {"type": "string", "enum": ["amused", "sulky", "curious"]}
+            },
+            "required": ["mood"],
+        },
+    )
+
+
 async def run_voice(
     settings: Settings,
     *,
@@ -1874,6 +2116,8 @@ async def run_voice(
     opening_text: str = "",
     shared: VoiceRuntime | None = None,
     face: FaceBus | None = None,
+    on_spoke: Callable[[], None] | None = None,
+    opening_already_logged: bool = False,
     pcm_sink: Callable[[bytes, float], None] | None = None,
 ) -> int:
     """One spoken conversation at this machine, then exit.
@@ -1881,8 +2125,17 @@ async def run_voice(
     Assembled here rather than inside the daemon's own loop because voice is a
     thing a person starts, not a thing that happens to them: the session is
     billed per minute, so holding one open on the chance of being spoken to is
-    pure cost (docs/PLAN.md 6.5). Proactive speech at the machine is the local
-    speaker's job and belongs to M3.
+    pure cost (docs/PLAN.md 6.5).
+
+    Proactive speech at the machine is one of the things that starts one, though,
+    and it is the caller `on_spoke` and `opening_already_logged` exist for -
+    `_speak_unprompted` is the only one that passes either. `on_spoke` fires on the
+    first chunk of audio the session produces - from `VoiceConversation._on_audio`,
+    the one place that knows, and *not* at the end of the attempt, which is far too
+    late for the caller waiting on it - and is what decides whether the line still
+    needs `/usr/bin/say`; `opening_already_logged` says the opening is
+    already in the conversation log, so the turn that speaks it must not be written
+    down a second time (`VoiceConversation._skip_opening_record`).
 
     Returns a shell exit code, because the caller is a CLI command.
     """
@@ -2003,20 +2256,51 @@ async def run_voice(
         # gate offers tools only to it. Empty when tools are off, which leaves the
         # session declaring none and so never yielding a tool call.
         tool_specs = companion.specs(origin="owner", surface="voice")
+        # `set_mood` is declared here rather than by `Companion.specs`, and only with a
+        # face attached, for two separate reasons. It is not a tool - it never reaches
+        # `ToolRunner` and leaves no audit row (docs/adr/0018, CONTRACTS 12) - so it has
+        # no business in the list a registry builds. And declaring it without a face
+        # would offer the model a switch wired to nothing. This module is the one
+        # allowed to assemble (CONTRACTS 4), and it is the only place that has both.
+        mood_specs = [_mood_declaration()] if face is not None else []
+        tool_specs = (*tool_specs, *mood_specs)
         # The tool contract rides with the persona in the system instruction, so the
         # endpoint getting tools inherits the rules the text path already has instead
         # of being written without them - which is exactly how voice came to have no
         # index() call (daemon/companion.py, TOOL_CONTRACT). Only when there is a tool
         # to use: 200 tokens of rules about a capability the model lacks buys nothing.
+        #
+        # `MOOD_VOICE_INSTRUCTION` only when the switch is actually on offer, same
+        # rule: an instruction about a tool the model does not have is pure tax, and
+        # its "never say this out loud" sentence is load-bearing (0/32 spoken aloud,
+        # `evals/voice_set_mood_spike.py`) rather than decorative.
         instruction_parts = [
-            block for block in (seed, TOOL_CONTRACT if tool_specs else "") if block
+            block
+            for block in (
+                seed,
+                TOOL_CONTRACT if tool_specs else "",
+                MOOD_VOICE_INSTRUCTION if mood_specs else "",
+            )
+            if block
         ]
         system_instruction = "\n\n".join(instruction_parts) or None
         audio = build_voice_audio()
         # Before the handshake, so the acknowledgement is as close to the wake word
         # as it can be. Nothing is feeding the session yet, so the cue cannot be
         # heard as the owner interrupting.
-        await play_ready_cue(audio)
+        #
+        # Not when the daemon is the one about to talk. The cue means "the
+        # microphone is yours", and `on_spoke` is set by exactly one caller:
+        # `_speak_unprompted`, which opens a session to *say* something unprompted.
+        # Playing it there tells the owner to go ahead and then talks over him 1.3 s
+        # later, which is the opposite of what it means. Under `origin/main` the
+        # order was line-then-cue - `/usr/bin/say` spoke first and this ran
+        # afterwards - so routing the line through the session inverted it; caught
+        # in review of PR #126, whose whole subject is how being spoken to first
+        # sounds. The cue comes back on the owner's next turn, in the same session,
+        # because the session stays open to listen.
+        if on_spoke is None:
+            await play_ready_cue(audio)
 
         def new_session() -> Any:
             """A fresh session per attempt. Reconnecting means starting clean: the
@@ -2087,6 +2371,8 @@ async def run_voice(
                 screen_pump_factory=screen_pump_factory,
                 barge_in=settings.voice_barge_in,
                 face=face,
+                on_spoke=on_spoke,
+                opening_already_logged=opening_already_logged,
                 # Where the lip-sync ring is fed, when this process has one. It rides
                 # all the way down to `SpeechClock`, which is the one place that
                 # already computes when a chunk becomes *audible* rather than when it
@@ -2211,6 +2497,8 @@ async def _voice_attempts(
     screen_pump_factory: Callable[[Any], Any] | None = None,
     barge_in: bool = True,
     face: FaceBus | None = None,
+    on_spoke: Callable[[], None] | None = None,
+    opening_already_logged: bool = False,
     pcm_sink: Callable[[bytes, float], None] | None = None,
 ) -> int:
     """Hold a conversation, and pick it back up if the session is cut.
@@ -2240,6 +2528,44 @@ async def _voice_attempts(
     # attempt cut down during the handshake never gets the utterance in front of a
     # model, and the owner is back to saying the wake phrase twice.
     pending_opening = opening_audio
+    # Carried and cleared exactly like `pending_opening` above, and for a sharper
+    # reason: with `CALLED_BY_NAME` a repeat was a redundant "네?", while with
+    # `SPEAK_VERBATIM` it is a second literal delivery of the proactive line, in the
+    # same voice, to an owner who has already answered the first one.
+    pending_text = opening_text
+    reported = False
+
+    def note_first_audio() -> None:
+        """Tell the caller the daemon has started talking, once per call.
+
+        Handed to every attempt's conversation, which fires it on the first chunk of
+        audio it receives - the instant the answer begins, which is the only instant
+        the one caller can use. `_speak_unprompted` is blocked inside
+        `mic_floor.request` under `REPLY_CEILING_SECONDS` while a conversation runs
+        with no total cap of its own, so a report at the end of the attempt is a
+        report after the deadline: the row would record `route='telegram'`,
+        `modality='text'` for a line the owner heard in her voice and answered aloud.
+        PR #126 shipped it in this function's `finally` and had exactly that.
+
+        What the earlier placement was right about is kept for free: a failure that
+        is not a `session_error` leaves `_voice_attempts` entirely, and firing at the
+        first chunk has already reported by the time anything can raise.
+
+        `reported` rather than clearing `on_spoke`, so the guard reads the same on a
+        reconnect: a second attempt that plays audio must not report twice, because
+        the caller uses this to decide whether the line still needs `/usr/bin/say`
+        and it may already have answered a future on the strength of the first one.
+        """
+        nonlocal reported
+        if on_spoke is None or reported:
+            return
+        reported = True
+        # Deliberately not "the room heard it": `_on_audio` counts the chunk one
+        # line before `AudioIO.play` is awaited with it, so a dead output device
+        # reports here too. That is the safe direction - a false positive costs a
+        # line nobody heard, a false negative says the same sentence twice.
+        on_spoke()
+
     for attempt in range(1, VOICE_RECONNECT_ATTEMPTS + 1):
         session = new_session()
         conversation = VoiceConversation(
@@ -2247,7 +2573,12 @@ async def _voice_attempts(
             audio,
             companion,
             opening_audio=pending_opening,
-            opening_text=opening_text,
+            opening_text=pending_text,
+            # Only while the opening is still pending. Once it has been said, a
+            # later attempt's first assistant turn is an answer to the owner and
+            # belongs in the log like any other voice turn.
+            opening_already_logged=opening_already_logged and bool(pending_text),
+            on_first_audio=None if on_spoke is None else note_first_audio,
             screen_share=screen_share,
             screen_pump_factory=screen_pump_factory,
             barge_in=barge_in,
@@ -2280,9 +2611,10 @@ async def _voice_attempts(
         if conversation.stats.played_seconds > 0:
             # Something was said back, so the opening utterance has been answered.
             # Re-sending it on a later attempt would have the daemon answer the same
-            # question twice.
+            # question twice - or, for a proactive opening, say it twice.
             pending_opening = b""
-        elif pending_opening:
+            pending_text = ""
+        elif pending_opening or pending_text:
             logger.info("voice: the opening utterance was not answered; carrying it over")
 
         if failure is None and not getattr(session, "going_away", False):
@@ -2385,22 +2717,73 @@ async def _wake_round(
         # `running` (see WakeGate's dead-stream handling).
         state.wake_gate = gate
     fired = None
+    # Held rather than iterated anonymously, because the handover depends on *when*
+    # this generator is finalised. `async for gate.listen()` leaves that to the
+    # garbage collector: breaking out drops the last reference, CPython schedules the
+    # `aclose()` on a later loop turn, and `record`'s `finally` - the one that hands
+    # the microphone to its release thread - had not run yet by the time the session
+    # below built a second CoreAudio client on the same device. That race deadlocked
+    # the resident (see `close_gate` and daemon/voice/audio.py:wait_for_input_release).
+    listening = gate.listen()
+    released = True
     try:
-        async for event in gate.listen():
+        async for event in listening:
             fired = event
             break
     finally:
         if state is not None:
             state.wake_gate = None
         # Before the conversation, not after: this is what hands the microphone over
-        # and stops the gate hearing what happens next.
+        # and stops the gate hearing what happens next. `aclose()` first, so the
+        # release is under way and `close_gate` has something to wait for.
         with suppress(Exception):
-            await close_gate()
+            await listening.aclose()
+        try:
+            released = await close_gate()
+        except Exception:
+            # Fail closed, and this is the one place in the round that does. Every
+            # other guard here starts from "carry on" because losing a round is worse
+            # than the failure it is guarding; this one is the opposite, because what
+            # a swallowed error costs is not a round but the guarantee - `released`
+            # would stay True, the handover would race exactly as it used to, and
+            # nothing anywhere would say so. A daemon that opens no session is noticed
+            # on the first wake word; a daemon that deadlocks once a day is not.
+            logger.exception("wake: releasing the microphone failed; not opening a session")
+            released = False
+    if not released:
+        # The microphone never came back. Opening a session now means building a
+        # VoiceProcessing engine on a device that is already wedged, which is what
+        # turned a stuck stop into a daemon that never heard another word - so the
+        # round is lost instead, loudly, and the caller comes back around.
+        if fired is not None:
+            # Said here rather than left to `close_gate`'s device error, because the
+            # gate has already logged `wake: heard ...` and a reader would otherwise
+            # see a matched wake word followed by silence with nothing joining them.
+            logger.error(
+                "wake: heard %r but dropping it - the microphone never came back",
+                fired.heard,
+            )
+        # `mic_floor.take` hands over a debt as well as a line: the taker owes the
+        # future exactly one answer, and a line nobody takes sits out its own timeout
+        # instead of falling back to Telegram now, while it is still worth saying.
+        taken = mic_floor.take()
+        if taken is not None:
+            logger.error("wake: not speaking a waiting line - the microphone is wedged")
+            mic_floor.answer(taken[1], False)
+        # Paced on the way out for the reason WAKE_RETRY_SECONDS exists: the next
+        # round opens a fresh capture on the same wedged device and parks another
+        # thread on it, and an unpaced return would do that as fast as the process
+        # can manage.
+        await asyncio.sleep(WAKE_RETRY_SECONDS)
+        return
     if fired is None:
         # The stream ended without a wake word - a closed device, a test's scripted
-        # audio running out, or the gate's own dead-stream watchdog asking to be
-        # rebuilt. Not an error, but not a reason to spin either; the caller's own
-        # guard handles the pacing.
+        # audio running out, the gate's own dead-stream watchdog asking to be
+        # rebuilt, or proactivity asking for the microphone. Not an error, but not a
+        # reason to spin either; the caller's own guard handles the pacing.
+        taken = mic_floor.take()
+        if taken is not None:
+            await _speak_unprompted(settings, taken, shared)
         return
     logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
     # The segment that fired the gate goes with it - but only when it carries more
@@ -2440,6 +2823,144 @@ async def _wake_round(
     )
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
+    await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
+
+
+async def _speak_unprompted(
+    settings: Settings, taken: tuple[str, asyncio.Future[bool]], shared: VoiceRuntime | None
+) -> None:
+    """Say a proactive line at this machine, then listen for the answer.
+
+    Reached only from `_wake_round`, after its `finally` has closed the gate - so
+    the microphone is already free, released by the one sequence in this process
+    that is allowed to release it. Nothing here opens or closes a capture stream.
+
+    **The session says it, in her own voice.** A session was always going to open
+    here - the daemon has just spoken first, and the owner is likeliest to answer
+    in the next few seconds, the one moment a gate rebuild would miss - so letting
+    it deliver the line costs nothing and ends the thing the owner reported on
+    2026-08-27: a proactive line arriving in `/usr/bin/say`'s system voice while
+    every answer he had ever heard came from the one he picked.
+
+    PR #115 built it the other way round and argued that `opening_text` is a prompt
+    the model *answers*, so the line would come out as a paraphrase and the sentence
+    the judge length-capped and refused for URLs would not be the sentence the room
+    heard. That argument was never measured, and it was wrong:
+    `evals/proactive_verbatim_spike.py` (8 live sessions per cell) puts a plain
+    instruction at **exact 0/8** and `SPEAK_VERBATIM` at **8/8**, and the same again
+    after the nonce fence went in - 0/16 against 16/16 over two runs. The 0/8 is not
+    paraphrase either: the model says the line and then adds a question of its own,
+    which `SPEAK_VERBATIM` forbids by name. What that measurement does *not* cover -
+    the far harder prompt production actually sends around it - is written out in
+    `SPEAK_VERBATIM`'s own docstring, and nobody has measured that.
+
+    Note what is *not* at risk, and was overstated in that PR: the search titles
+    never reach a voice session at all (they exist only in the judge's prompt), so
+    the model cannot speak a pointer it has never seen. What was really at risk is
+    that `proactive_utterances.text` - the row the owner's label attaches to - stops
+    being what was said, which is why the wording is measured and pinned.
+
+    `/usr/bin/say` stays as the fallback, for an install with voice off and for a
+    session that never played anything - guarded on whether audio was handed to the
+    player (`on_spoke`, and see what it can and cannot tell in `_voice_attempts`)
+    rather than on whether an exception was raised.
+
+    **The session knows what was said because it said it**, which is what makes the
+    ordering here different from PR #115's. There, `deliver` ran `_say` -> `_send`
+    -> `_log` and the log row raced this function's websocket connect for a place in
+    `continuity_block`. Now the line is this session's own first turn, so nothing
+    has to be carried into its context at all - and `_log` no longer even tries to
+    get there first: `_say` does not return until `note_spoke` answers the future,
+    which happens once the line is playing. The row lands during the conversation
+    rather than before it, and the only thing that depended on the old order - the
+    session knowing what it had just said - is now structural.
+
+    That row is also why the session is opened with `opening_already_logged=True`.
+    `_log` writes the sentence as `session_kind="proactive"`; the transcript of the
+    turn that speaks it would be a second copy, filed as `voice`, and
+    `daemon/memory/store.py`'s three M3 readers select exactly
+    `session_kind IN ('interactive', 'voice')` so that the daemon's own speech does
+    not reset the 12-hour silence clock it is measured against.
+
+    `IDLE_TIMEOUT_SECONDS` bounds the cost at 30 seconds of silence, which is what
+    makes this affordable on a per-minute session that may well go unanswered.
+    """
+    from daemon.voice.conversation import speak_verbatim
+
+    text, future = taken
+    spoke = False
+
+    def note_spoke() -> None:
+        """The room has heard the line. Answer the caller now, not at the end."""
+        nonlocal spoke
+        spoke = True
+        # Here rather than after the conversation, because the conversation has no
+        # total cap: `VoiceConversation._receive` reschedules its idle budget per
+        # audio item, so a real exchange plus the closing 30 s of silence runs past
+        # `mic_floor.REPLY_CEILING_SECONDS`. Waiting would have `request` log a
+        # broken contract and return `not-spoken`, and the row would then record
+        # `route='telegram'`, `modality='text'` for a line the owner heard in her
+        # voice and answered aloud - the same verdict-and-outcome mismatch the
+        # ceiling exists to close. Answering now also lets `deliver` finish while
+        # she is still talking, so the Telegram copy and its label buttons arrive in
+        # seconds rather than minutes, and the proactive tick stops being blocked
+        # for the length of a conversation under `max_instances=1`.
+        mic_floor.answer(future, True)
+
+    try:
+        try:
+            await run_voice(
+                settings,
+                # Fenced under a fresh nonce, not `.format`ted here: this is the
+                # judge's reply, and it is about to enter a model that holds this
+                # install's tools. See `speak_verbatim`.
+                opening_text=speak_verbatim(text, secrets.token_hex(4)),
+                shared=shared,
+                on_spoke=note_spoke,
+                # `deliver` already wrote this sentence down as `proactive`. The
+                # turn that says it must not be written down again as `voice`, or
+                # the daemon speaking resets its own silence clock
+                # (daemon/memory/store.py).
+                opening_already_logged=True,
+            )
+        except Exception:
+            # Never raises into the wake loop. A round is the microphone, so a
+            # failed line costs the utterance its voice and nothing else.
+            logger.exception("wake: the session opened to speak first failed")
+
+        if not spoke:
+            # Nothing reached the room - no voice configured, a socket that never
+            # opened, a session that generated an answer and interrupted itself
+            # before playing any of it. `/usr/bin/say` is the fallback rather than
+            # the first choice because it is a different engine in a different voice
+            # from every answer the owner has ever heard, which is the whole reason
+            # this path changed. Guarded on `spoke` and not on the exception: a
+            # session that played audio and *then* failed has already said the line,
+            # and saying it again is worse than not saying it at all.
+            try:
+                from daemon.proactivity.speaker import LocalSpeaker
+
+                speaker = LocalSpeaker()
+                try:
+                    spoke = await speaker.say(text)
+                finally:
+                    await speaker.aclose()
+            except Exception:
+                logger.exception("wake: could not speak a proactive line")
+    finally:
+        # Owed on *every* path, which is why this is a `finally` and not a statement
+        # after an `except Exception` that cannot catch a `CancelledError` (PR #115;
+        # `daemon/mic_floor.py` says so in three places and this is the code those
+        # sentences are about). A no-op when `note_spoke` already answered it -
+        # `answer` checks. `request` is sitting on this future, and dropping it
+        # turns its fallback into a two-and-a-half-minute stall.
+        mic_floor.answer(future, spoke)
+
+    # Same handover the wake path takes, for the same reason: let the session's
+    # Voice-Processing unit finish releasing the microphone before the next round
+    # opens a fresh capture on it. See WAKE_REARM_SETTLE_SECONDS. Unconditional
+    # because a session is now opened on every path through this function, even the
+    # ones where it never gets as far as the device.
     await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
 
 
@@ -2579,7 +3100,7 @@ def build_voice_audio() -> AudioIO:
 
 async def build_wake_gate(
     settings: Settings,
-) -> tuple[WakeGate, Callable[[], Awaitable[None]]]:
+) -> tuple[WakeGate, Callable[[], Awaitable[bool]]]:
     """The always-on gate and the coroutine that releases the microphone.
 
     A gate rather than a bare stream of events, because `WakeGate.counters` is the
@@ -2612,9 +3133,30 @@ async def build_wake_gate(
         cooldown_seconds=settings.wake_cooldown_seconds,
     )
 
-    async def close() -> None:
+    async def close() -> bool:
+        """Release the device and wait for it to actually be gone. True if it is.
+
+        Two halves, and the second is the one the handover needs. `audio.close()`
+        is the speaker; the microphone is let go by `record`'s `finally`, which hands
+        the stream to a detached thread and returns - so without the wait this
+        returns while `Pa_StopStream` is still inside CoreAudio. Anything that then
+        opens a second client on the same device races it, and the two deadlock
+        (daemon/voice/audio.py:wait_for_input_release). The caller must have closed
+        the gate's stream before calling this, or there is nothing to wait on yet.
+        """
         with suppress(Exception):
             await audio.close()
+        # Not suppressed, unlike the speaker close above: this one's answer is the
+        # whole point of the call, and an error swallowed here reads as "released"
+        # (see `_wake_round`, which fails closed on it).
+        released = await audio.wait_for_input_release()
+        if not released:
+            logger.error(
+                "wake: the microphone did not come back after the gate let it go; "
+                "the capture device is wedged inside CoreAudio and nothing in this "
+                "process can free it - a restart is the only fix"
+            )
+        return released
 
     return gate, close
 

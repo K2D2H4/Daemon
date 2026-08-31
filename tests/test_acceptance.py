@@ -1003,6 +1003,229 @@ def test_switching_tools_on_assembles_them(tmp_path: Path) -> None:
         store.close()
 
 
+def test_proactive_speak_wires_the_bridge_for_topic_search_by_default(
+    tmp_path: Path,
+) -> None:
+    """`build_proactive_tick(..., speak=True)` is where `Judge` gets the MCP
+    bridge `topic` search needs (ADR 0015). Tools on and `full` - the product
+    default - means the bridge reaches the judge."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is not None
+    finally:
+        asyncio.run(closing())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"DAEMON_TOOLS_ENABLED": False},
+        {"DAEMON_TOOLS_MODE": "off"},
+    ],
+    ids=["tools_enabled=false", "tools_mode=off"],
+)
+def test_proactive_speak_withholds_the_bridge_when_tools_are_off(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    """Task 4's tools-off decision, made in `daemon/app.py` next to
+    `Judge(...)`: the topic search bridge calls `MCPBridge.call` directly and
+    bypasses `tools/policy.py` entirely (ADR 0015), so `tools_mode` alone would
+    not naturally stop it - `_build_tools` does not gate the bridge on mode, only
+    on `tools_enabled`. `build_proactive_tick` closes that gap itself, so an
+    owner who turned tools off either way gets no proactive network reach
+    either."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        **overrides,
+    )
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is None
+    finally:
+        asyncio.run(closing())
+
+
+class _FakeReusableBridge:
+    """A bridge `build_proactive_tick` is handed rather than asked to build -
+    stands in for the resident's `app.state.mcp`. Tracks whether anything ever
+    closed it, since that is exactly what must not happen to a bridge this tick
+    does not own."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def call(self, server: str, name: str, arguments: dict) -> str:
+        return "{}"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_a_reused_bridge_is_used_and_never_closed_by_the_tick(tmp_path: Path) -> None:
+    """Whole-branch review: every tick used to call `_build_tools` itself - a
+    stdio child process per configured server, connected and torn down 288 times
+    a day, whether or not a `topic` candidate even existed - while the app
+    lifespan already held a live bridge the whole time. `build_proactive_tick`'s
+    `bridge` parameter is the fix: given one, it is used directly, and it survives
+    `closing()` because this tick never owned it."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    fake = _FakeReusableBridge()
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True, bridge=fake))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is fake
+    finally:
+        asyncio.run(closing())
+    assert fake.closed is False, "a reused bridge must outlive the tick that borrowed it"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"DAEMON_TOOLS_ENABLED": False},
+        {"DAEMON_TOOLS_MODE": "off"},
+    ],
+    ids=["tools_enabled=false", "tools_mode=off"],
+)
+def test_a_reused_bridge_is_still_withheld_when_tools_are_off(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    """The off-withholding rule (task 4) must apply the same way whether the
+    bridge is reused or freshly built - reusing one must not become a second,
+    ungated path to the network for an owner who turned tools off."""
+    from daemon.app import build_proactive_tick
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        **overrides,
+    )
+    fake = _FakeReusableBridge()
+    tick, closing = asyncio.run(build_proactive_tick(settings, speak=True, bridge=fake))
+    try:
+        assert tick._judge is not None
+        assert tick._judge._bridge is None
+    finally:
+        asyncio.run(closing())
+    assert fake.closed is False, "a withheld reused bridge is still not this tick's to close"
+
+
+def test_a_server_that_never_finishes_connecting_is_bounded_and_leaves_no_orphan() -> None:
+    """A pathological MCP server must cost the tick its `topic` candidates, never
+    the scheduler - `_proactive_tick` runs `max_instances=1`, so a tick that never
+    returns is every later tick silently skipped forever, this project's signature
+    defect.
+
+    This asserts at `_ServerLink.open` rather than around `_build_tools`, which is
+    where an earlier version of this test sat. PR #113 review: bounding the caller
+    is worse than not bounding it. `_build_tools` constructs the bridge *inside*
+    the awaited coroutine and `_bring_up` opens each server in a detached task, so
+    cancelling the caller discards the only reference that could ever close the
+    children it already started. The two assertions below are exactly the two
+    halves of that: the wait ends, **and** the transport's own task is finished
+    rather than left running.
+    """
+    from daemon.tools.base import ToolError
+    from daemon.tools.mcp import McpBridge, ServerConfig, _ServerLink
+
+    async def scenario() -> tuple[float, bool]:
+        bridge = McpBridge.__new__(McpBridge)
+        config = ServerConfig(name="wedged", command="/bin/true", args=(), env={})
+        link = _ServerLink(bridge, config, secret=None, auth=None)
+
+        async def _never_connects() -> Any:
+            await asyncio.sleep(3600)
+
+        bridge._connect = lambda *a, **k: _never_connects()  # type: ignore[method-assign]
+
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        with pytest.raises(ToolError, match="did not finish connecting"):
+            await asyncio.wait_for(link.open(), timeout=5.0)
+        return loop.time() - began, link._task is not None and link._task.done()
+
+    import daemon.tools.mcp as mcp_module
+
+    original = mcp_module.STARTUP_TIMEOUT
+    mcp_module.STARTUP_TIMEOUT = 0.05
+    try:
+        elapsed, task_finished = asyncio.run(scenario())
+    finally:
+        mcp_module.STARTUP_TIMEOUT = original
+
+    assert elapsed < 2.0, "the connect wait is unbounded"
+    assert task_finished, "the transport's task outlived the timeout - an orphaned child"
+
+
+def test_the_scheduled_tick_reads_the_bridge_getter_fresh_each_fire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_proactive_tick`'s `get_bridge` is a callable, not the bridge itself,
+    specifically so it can be captured once at `scheduler.add_job` time and still
+    read whatever `app.state.mcp` currently is on every later fire (the lifespan
+    builds that attribute after the job is registered - see `_lifespan`'s own
+    comment). This pins the call-through: whatever `get_bridge()` returns this
+    fire is exactly what reaches `build_proactive_tick`."""
+    import daemon.app as app_module
+    from daemon.app import _proactive_tick
+
+    fake = _FakeReusableBridge()
+    seen: dict[str, Any] = {}
+
+    async def _fake_build_proactive_tick(settings: Settings, **kwargs: Any) -> Any:
+        seen["bridge"] = kwargs.get("bridge")
+
+        class _NullTick:
+            async def run(self) -> Any:
+                from daemon.proactivity.base import Reading
+                from daemon.proactivity.tick import TickResult
+
+                return TickResult(at=datetime.now(UTC), reading=Reading(
+                    at=datetime.now(UTC), idle_seconds=0.0, mic_busy=False, output_busy=False
+                ))
+
+        async def _close() -> None:
+            return None
+
+        return _NullTick(), _close
+
+    monkeypatch.setattr(app_module, "build_proactive_tick", _fake_build_proactive_tick)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asyncio.run(_proactive_tick(settings, get_bridge=lambda: fake))
+
+    assert seen["bridge"] is fake
+
+
 def test_send_message_is_registered_only_where_it_can_deliver(tmp_path: Path) -> None:
     """`send_message` exists so a spoken turn can put a link in writing - and only
     the resident's voice runtime passes it a channel to do that through.
@@ -1761,3 +1984,754 @@ async def test_a_tool_call_flips_the_face_to_working_and_back(tmp_path: Path) ->
         if runner is not None:
             await runner.aclose()
         store.close()
+
+
+async def test_a_spoken_tool_call_flips_the_face_too(tmp_path: Path) -> None:
+    """The same wiring one layer out: the *voice* tool runner is a second
+    `_build_tools` call, made by `_build_voice_runtime` with its own `face=face`,
+    and the wake path's tools come from there rather than from the one above.
+    Dropping that keyword passed the whole suite - a spoken tool call would run
+    with the face frozen wherever the conversation left it.
+
+    Driven against `_build_voice_runtime` itself for the same reason the test
+    above is driven against `_build_tools`: everything past it needs a live
+    session. `writer` and `recall` are only carried into the returned
+    `VoiceRuntime`, so they can be anything.
+    """
+    from daemon.app import _build_voice_runtime
+    from daemon.tools.runner import TurnContext
+    from tests.test_face import RecordingBus
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        TELEGRAM_BOT_TOKEN=TOKEN,
+        DAEMON_TOOLS_ENABLED=True,
+        DAEMON_TOOLS_ROOTS=str(tmp_path),
+        DAEMON_SCREEN_ENABLED=False,
+    )
+    target = tmp_path / "notes.md"
+    target.write_text("발표는 목요일", encoding="utf-8")
+
+    store = Store.open(tmp_path / "daemon.sqlite3")
+    bus = RecordingBus()
+    runtime = None
+    try:
+        runtime = await _build_voice_runtime(settings, store, None, None, face=bus)
+
+        await runtime.tools.execute(
+            [ToolCall(id="1", name="read_file", arguments={"path": str(target)})],
+            TurnContext(origin="owner", channel="voice", sender_id=str(OWNER)),
+        )
+
+        assert bus.activities == ["working", "idle"], (
+            "a spoken tool call must flip the face too - `face=face` was probably "
+            "dropped from the `_build_tools(...)` call `_build_voice_runtime` makes"
+        )
+    finally:
+        if runtime is not None:
+            await runtime.tools.aclose()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_proactive_line_reaches_the_room_through_the_wake_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two halves must actually meet.
+
+    Measured on the owner's machine 2026-08-26, the first time proactivity ever
+    spoke: the gate saw him at the keyboard and chose `both`, and the line went to
+    Telegram alone - `speaker: refusing to speak while this process holds the
+    microphone`. Each half was correct on its own, which is exactly why unit tests
+    on either side would not have caught it, and why this one drives the whole
+    path: delivery asks, the gate stands down, `_wake_round` speaks, and the answer
+    comes back to the caller that asked.
+
+    The **primary** path, since PR #126: the session says it. The fake session
+    signals that by calling `on_spoke`, exactly as `_voice_attempts` does once audio
+    has been handed to the player - without that this test proves the `/usr/bin/say`
+    fallback while its name and its assertions claim otherwise, which is what it did
+    when it was written.
+
+    The speaker and the voice session are faked at the process edge - tests/CLAUDE.md
+    forbids a test that makes the machine talk - but nothing between them is.
+    """
+    from daemon import mic_floor
+    from daemon.app import _speak_unprompted
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+
+    said: list[str] = []
+    openings: list[str] = []
+
+    class FakeSpeaker:
+        async def say(self, text: str) -> bool:
+            said.append(text)
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    import daemon.proactivity.speaker as speaker_module
+
+    monkeypatch.setattr(speaker_module, "LocalSpeaker", FakeSpeaker)
+
+    async def fake_run_voice(settings: Any, **kwargs: Any) -> int:
+        openings.append(kwargs.get("opening_text", ""))
+        kwargs["on_spoke"]()
+        return 0
+
+    import daemon.app as app_module
+
+    monkeypatch.setattr(app_module, "run_voice", fake_run_voice)
+    monkeypatch.setattr(app_module, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    line = "요즘 llm-wiki 쪽은 잘 돼가고 있어요?"
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+
+    asked = asyncio.create_task(mic_floor.request(line, wait_seconds=5.0))
+    await asyncio.sleep(0)
+
+    # What the gate sees between two audio blocks, and what `_wake_round` does with
+    # it once its `finally` has already closed the gate.
+    assert mic_floor.pending() is True, "the gate would never stand down"
+    taken = mic_floor.take()
+    assert taken is not None
+    await _speak_unprompted(settings, taken, None)
+
+    assert await asked == "spoke", "delivery was never told the line was spoken"
+    assert len(openings) == 1 and line in openings[0], (
+        "the judged line must reach the session unchanged"
+    )
+    assert said == [], "the room heard it once already; `say` would be the second time"
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_played_nothing_falls_back_to_the_local_speaker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Voice is the first choice and `/usr/bin/say` is the fallback, because the
+    system voice is not the one the owner picked and a line arriving in it is what
+    he reported on 2026-08-27.
+
+    The fallback is guarded on whether audio actually reached the room - `on_spoke`
+    fires only when `stats.played_seconds > 0` - and not on whether `run_voice`
+    raised. A session that opens, generates an answer and interrupts itself before
+    playing any of it raises nothing and says nothing, which is a state
+    `stats.describe()` exists because it looked like nothing at all from outside."""
+    from daemon import mic_floor
+    from daemon.app import _speak_unprompted
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    said: list[str] = []
+
+    class EdgeSpeaker:
+        async def say(self, text: str) -> bool:
+            said.append(text)
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    async def silent_session(settings: Any, **kwargs: Any) -> int:
+        return 0  # never calls on_spoke
+
+    import daemon.app as app_module
+    import daemon.proactivity.speaker as speaker_module
+
+    monkeypatch.setattr(speaker_module, "LocalSpeaker", EdgeSpeaker)
+    monkeypatch.setattr(app_module, "run_voice", silent_session)
+    monkeypatch.setattr(app_module, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+    taken = mic_floor.take()
+    assert taken is not None
+
+    await _speak_unprompted(settings, taken, None)
+
+    assert said == ["한마디"], "the line was lost when the session played nothing"
+    assert await asked == "spoke"
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_spoke_and_then_failed_is_not_said_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason the fallback is guarded on `on_spoke` rather than on the
+    exception. A session can play the line and *then* be cut - a dropped socket, a
+    `goAway` on the last attempt - and falling back there would say the same
+    sentence into the room a second time, which the repo's own measurement calls
+    "not two messages, it is noise"."""
+    from daemon import mic_floor
+    from daemon.app import _speak_unprompted
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    said: list[str] = []
+
+    class EdgeSpeaker:
+        async def say(self, text: str) -> bool:
+            said.append(text)
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    async def spoke_then_died(settings: Any, **kwargs: Any) -> int:
+        kwargs["on_spoke"]()
+        raise RuntimeError("the socket went away mid-conversation")
+
+    import daemon.app as app_module
+    import daemon.proactivity.speaker as speaker_module
+
+    monkeypatch.setattr(speaker_module, "LocalSpeaker", EdgeSpeaker)
+    monkeypatch.setattr(app_module, "run_voice", spoke_then_died)
+    monkeypatch.setattr(app_module, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+    taken = mic_floor.take()
+    assert taken is not None
+
+    await _speak_unprompted(settings, taken, None)
+
+    assert said == [], "the line was spoken twice"
+    assert await asked == "spoke"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_speaker_still_answers_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owed on *every* path, which is what PR #115 established and what
+    `daemon/mic_floor.py` still asserts in three places.
+
+    A shutdown arriving while the session is open cancels this task, and
+    `except Exception` does not catch a `CancelledError` - so with the answer as a
+    plain statement after the `try`, `request` would sit out its full
+    `REPLY_CEILING_SECONDS` on a daemon that is trying to exit, and `deliver` would
+    hold the tick with it."""
+    from daemon import mic_floor
+    from daemon.app import _speak_unprompted
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    started = asyncio.Event()
+    said: list[str] = []
+
+    class EdgeSpeaker:
+        async def say(self, text: str) -> bool:
+            said.append(text)
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    async def never_returns(settings: Any, **kwargs: Any) -> int:
+        started.set()
+        await asyncio.Event().wait()
+        return 0  # pragma: no cover - the task is cancelled first
+
+    import daemon.app as app_module
+    import daemon.proactivity.speaker as speaker_module
+
+    monkeypatch.setattr(speaker_module, "LocalSpeaker", EdgeSpeaker)
+    monkeypatch.setattr(app_module, "run_voice", never_returns)
+    monkeypatch.setattr(app_module, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+    taken = mic_floor.take()
+    assert taken is not None
+
+    speaking = asyncio.create_task(_speak_unprompted(settings, taken, None))
+    await started.wait()
+    speaking.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await speaking
+
+    assert await asyncio.wait_for(asked, 1.0) == "not-spoken", (
+        "the caller was left waiting out the ceiling on a daemon that is exiting"
+    )
+    assert said == [], "a cancelled round must not start speaking on its way out"
+
+
+@pytest.mark.asyncio
+async def test_the_caller_is_answered_while_the_conversation_is_still_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Half of the ordering question, and only half - read the other half first.
+
+    This covers `_speak_unprompted`'s half: the floor is answered from *inside*
+    `on_spoke`, so it is answered whenever the session says it was spoken rather
+    than after `run_voice` returns. It cannot cover the half that decides in
+    production, because it replaces `run_voice` and therefore chooses the timing it
+    is measuring - PR #126 shipped a build where the real chain fired `on_spoke`
+    only at the end of the attempt, and this test was green against it.
+    `test_run_voice_carries_the_proactive_signals_into_the_conversation`
+    (tests/test_voice_conversation.py) is the one that pins the real ordering,
+    against the audio.
+
+    Why the ordering matters at all: `mic_floor.request` is blocked on this future
+    and gives up at `REPLY_CEILING_SECONDS` (150 s), while the session that says the
+    line has no total cap - `VoiceConversation._receive` reschedules its idle budget
+    per audio item - so a real exchange plus the closing 30 s of silence runs
+    straight past it. The ceiling would then log a broken contract and return
+    `not-spoken` for a line the owner heard in her voice and answered aloud, which is
+    the verdict-and-outcome mismatch the ceiling exists to close, arriving through
+    the ceiling itself. It is also what keeps `deliver` moving: the Telegram copy and
+    its 👍/👎 buttons go out while she is still talking rather than minutes later,
+    and the proactive tick stops being blocked for the length of a conversation
+    under `max_instances=1`.
+    """
+    from daemon import mic_floor
+    from daemon.app import _speak_unprompted
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    answered: list[str] = []
+    said: list[str] = []
+
+    class EdgeSpeaker:
+        async def say(self, text: str) -> bool:
+            said.append(text)
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    async def long_conversation(settings: Any, **kwargs: Any) -> int:
+        kwargs["on_spoke"]()
+        # Still inside `run_voice`: the line is playing and the owner has minutes of
+        # answering ahead of him. The caller must already have its answer.
+        answered.append(await asyncio.wait_for(asyncio.shield(asked), 1.0))
+        return 0
+
+    import daemon.app as app_module
+    import daemon.proactivity.speaker as speaker_module
+
+    monkeypatch.setattr(speaker_module, "LocalSpeaker", EdgeSpeaker)
+    monkeypatch.setattr(app_module, "run_voice", long_conversation)
+    monkeypatch.setattr(app_module, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+    taken = mic_floor.take()
+    assert taken is not None
+
+    await _speak_unprompted(settings, taken, None)
+
+    assert answered == ["spoke"], (
+        "the caller waited for the whole conversation, which outlives its ceiling"
+    )
+    assert said == [], "the session spoke, so `say` would be the second time"
+
+
+@pytest.mark.asyncio
+async def test_a_speaker_that_raises_still_answers_the_waiting_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wake loop's round is the microphone: an exception escaping here would
+    cost the round, and the caller would sit out its full wait for an answer that
+    was never coming."""
+    from daemon import mic_floor
+    from daemon.app import _speak_unprompted
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+
+    class BrokenSpeaker:
+        async def say(self, text: str) -> bool:
+            raise RuntimeError("no synthesiser")
+
+        async def aclose(self) -> None:
+            return None
+
+    import daemon.app as app_module
+    import daemon.proactivity.speaker as speaker_module
+
+    monkeypatch.setattr(speaker_module, "LocalSpeaker", BrokenSpeaker)
+    monkeypatch.setattr(app_module, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+    taken = mic_floor.take()
+    assert taken is not None
+
+    await _speak_unprompted(settings, taken, None)  # must not raise
+
+    assert await asked == "not-spoken"
+
+
+@pytest.mark.asyncio
+async def test_the_wake_round_hands_a_waiting_line_to_the_speaker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring, not the helper.
+
+    `test_a_proactive_line_reaches_the_room_through_the_wake_loop` above calls
+    `_speak_unprompted` directly, so it passes on a build where `_wake_round` never
+    calls it - checked by mutation, and it did. That is this repo's documented
+    blind spot (`tests/CLAUDE.md` on `PENDING_WIRING`: the checks ask whether
+    something calls a name, never with what), so this drives `_wake_round` itself
+    with a gate that ends the way a stood-down gate ends: no event, stream over.
+    """
+    from daemon import mic_floor
+    from daemon.app import _wake_round
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    closed: list[bool] = []
+    spoken: list[str] = []
+
+    class StoodDownGate:
+        async def listen(self) -> Any:
+            # The shape `WakeGate.listen` takes when it stands down for the floor:
+            # the generator returns without yielding, and `_wake_round`'s `finally`
+            # closes the gate before anything else happens.
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+    async def close_gate() -> bool:
+        # True is "the device really came back", which is what `build_wake_gate`'s
+        # closer now answers: the round refuses to open anything on a microphone
+        # whose release never finished (daemon/voice/audio.py:wait_for_input_release).
+        closed.append(True)
+        return True
+
+    async def fake_build(settings: Any) -> tuple[Any, Any]:
+        return StoodDownGate(), close_gate
+
+    async def fake_speak(settings: Any, taken: Any, shared: Any) -> None:
+        text, future = taken
+        spoken.append(text)
+        assert closed, "the gate must be closed before anything speaks"
+        mic_floor.answer(future, True)
+
+    import daemon.app as app_module
+
+    monkeypatch.setattr(app_module, "build_wake_gate", fake_build)
+    monkeypatch.setattr(app_module, "_speak_unprompted", fake_speak)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asked = asyncio.create_task(mic_floor.request("한마디", wait_seconds=5.0))
+    await asyncio.sleep(0)
+
+    await _wake_round(settings)
+
+    assert spoken == ["한마디"], "the round ended without handing the line over"
+    assert await asked == "spoke"
+
+
+@pytest.mark.asyncio
+async def test_a_round_that_ends_with_an_empty_mailbox_speaks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gate ends without an event for reasons that have nothing to do with
+    proactivity - a closed device, the dead-stream watchdog. None of them may put
+    the daemon's voice in the room."""
+    from daemon import mic_floor
+    from daemon.app import _wake_round
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    spoken: list[str] = []
+
+    class EndedGate:
+        async def listen(self) -> Any:
+            return
+            yield  # pragma: no cover
+
+    async def fake_build(settings: Any) -> tuple[Any, Any]:
+        async def close_gate() -> bool:
+            # True is "the device really came back". Returning `None` here read as a
+            # wedged microphone and made `_wake_round` return before `mic_floor.take`
+            # was ever reached - so this test passed while proving nothing.
+            return True
+
+        return EndedGate(), close_gate
+
+    async def fake_speak(settings: Any, taken: Any, shared: Any) -> None:
+        spoken.append(taken[0])
+
+    import daemon.app as app_module
+
+    monkeypatch.setattr(app_module, "build_wake_gate", fake_build)
+    monkeypatch.setattr(app_module, "_speak_unprompted", fake_speak)
+
+    await _wake_round(
+        Settings(
+            _env_file=None,
+            DAEMON_PROVIDER="ollama",
+            DAEMON_OLLAMA_MODEL="gemma3:4b",
+            DAEMON_DATA_DIR=str(tmp_path),
+        )
+    )
+
+    assert spoken == []
+
+
+def test_the_real_gate_reads_the_real_mailbox() -> None:
+    """`build_wake_gate` never passes `floor_wanted`, so the resident depends
+    entirely on the default - and every other test injects its own predicate, so
+    changing that default to `lambda: False` unwires the gate from the mailbox with
+    the whole suite still green (PR #115 review, verified by mutation).
+
+    Asserts identity against `mic_floor.pending` for the same reason
+    `test_e_the_app_exposes_the_catchup_lock` asserts identity rather than type: a
+    different predicate of the right shape would pass a callable check and still
+    leave the daemon unable to speak aloud."""
+    from daemon import mic_floor
+    from daemon.voice.wake import WakeGate
+
+    class Silent:
+        sample_rate = 16_000
+
+        def record(self) -> Any:  # pragma: no cover - never started here
+            raise AssertionError("this test must not open a capture stream")
+
+    class Vad:
+        sample_rate = 16_000
+        frame_samples = 512
+
+    gate = WakeGate(Silent(), Vad(), object(), ("벨라",))
+
+    assert gate._floor_wanted is mic_floor.pending
+
+
+@pytest.mark.asyncio
+async def test_the_resident_tick_wires_delivery_to_the_real_mailbox(
+    tmp_path: Path,
+) -> None:
+    """The other half the suite could not see: deleting the two lines in
+    `build_proactive_tick` that set `ask_for_the_floor` broke nothing, because
+    `test_delivery.py` injects its own fake and `test_reachable.py` cannot help -
+    `mic_floor.request` is a function, so being *named* in `app.py` is all it looks
+    for.
+
+    Also pins the condition itself. `wake_loop` is what separates the resident from
+    `daemon proactive --speak`, which sets `speak=True` too and has no wake round to
+    answer - an earlier comment claimed `speak` told them apart, and it does not."""
+    from daemon import mic_floor
+    from daemon.app import build_proactive_tick
+
+    (tmp_path / "persona").mkdir()
+    (tmp_path / "persona" / "seed.md").write_text("씨앗", encoding="utf-8")
+    overrides = dict(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+        DAEMON_VOICE_ENABLED=True,
+        DAEMON_WAKE_ENABLED=True,
+        DAEMON_WAKE_ALIASES="벨라",
+        GEMINI_API_KEY="k",
+        DAEMON_GEMINI_LIVE_MODEL="gemini-3.1-flash-live-preview",
+    )
+
+    tick, closing = await build_proactive_tick(
+        Settings(**overrides), speak=True, wake_loop=True
+    )
+    try:
+        assert tick._delivery._ask_for_the_floor is mic_floor.request
+    finally:
+        await closing()
+
+    # The CLI's own call, which must not: nobody there could ever take the request.
+    tick2, closing2 = await build_proactive_tick(Settings(**overrides), speak=True)
+    try:
+        assert tick2._delivery._ask_for_the_floor is None
+    finally:
+        await closing2()
+
+
+@pytest.mark.asyncio
+async def test_the_session_is_asked_for_the_judged_line_word_for_word(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The line the room hears has to be the line the row records.
+
+    PR #115 kept the session out of this entirely, arguing it would paraphrase.
+    `evals/proactive_verbatim_spike.py` measured that instead: a plain instruction
+    is **exact 0/8** - the model says the line and then adds a question of its own -
+    and `SPEAK_VERBATIM` is **8/8**. So the session does say it, and what makes that
+    safe is the wording, which is why this pins two things rather than one: the
+    judged text goes over untouched, and it goes over inside the *measured*
+    instruction rather than one written fresh at the call site.
+
+    Without the second half, someone rewording `SPEAK_VERBATIM`'s replacement here
+    would put the 0/8 behaviour back with the suite green, and the row the owner's
+    👍/👎 attaches to would stop being what he heard.
+
+    Three things now, in fact: the line is also **fenced under a per-call nonce**
+    (`speak_verbatim`), because what is being interpolated is the judge's reply -
+    docs/CONTRACTS.md's "choke point between attacker-controlled search results and
+    something the owner hears" - and it is now entering a model that holds this
+    install's tools rather than a pipe into `say`."""
+    import re
+
+    from daemon import mic_floor
+    from daemon.app import _speak_unprompted
+    from daemon.voice.conversation import speak_verbatim
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    openings: list[str] = []
+    opened: dict[str, Any] = {}
+    line = "요즘 llm-wiki 쪽은 잘 돼가고 있어요?"
+
+    async def capture(settings: Any, **kwargs: Any) -> int:
+        openings.append(kwargs.get("opening_text", ""))
+        opened.update(kwargs)
+        kwargs["on_spoke"]()
+        return 0
+
+    import daemon.app as app_module
+
+    monkeypatch.setattr(app_module, "run_voice", capture)
+    monkeypatch.setattr(app_module, "WAKE_REARM_SETTLE_SECONDS", 0.0)
+
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+    asked = asyncio.create_task(mic_floor.request(line, wait_seconds=5.0))
+    await asyncio.sleep(0)
+    taken = mic_floor.take()
+    assert taken is not None
+
+    await _speak_unprompted(settings, taken, None)
+
+    assert await asked == "spoke"
+    assert len(openings) == 1
+    assert line in openings[0], "the judged line did not reach the session intact"
+    nonce = re.search(r"\[say:([0-9a-f]{8})\]", openings[0])
+    assert nonce is not None, "the line was not fenced"
+    assert openings[0] == speak_verbatim(line, nonce.group(1)), (
+        "the session was asked in words the verbatim spike never measured"
+    )
+    assert not opened.get("opening_audio"), (
+        "audio and text are alternatives in `_send_opening`, so opening audio here "
+        "would silently drop the line the session is being opened to say"
+    )
+    assert opened.get("opening_already_logged") is True, (
+        "`deliver` has already logged this sentence as `proactive`; without this the "
+        "turn that speaks it lands again as `voice` and the daemon's own line resets "
+        "the silence clock it is measured against (daemon/memory/store.py)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_real_mailbox_and_the_real_delivery_agree_on_no_listener(
+    tmp_path: Path, db: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two modules agree on three bare strings across a module boundary, and
+    nothing was binding them. PR #115 review renamed `no-listener` in `mic_floor`
+    alone and `test_delivery.py` plus every acceptance test stayed green - only
+    `test_mic_floor.py` failed, which is exactly the file whoever renames it would
+    update. That would have shipped the silence this change exists to fix, with a
+    green suite.
+
+    So this runs the *real* `mic_floor.request` into the *real* `ProactiveDelivery`
+    with no fake between them: nobody takes the line, and the speaker must still
+    end up saying it. Both fakes here are at the process edge - a speaker and a
+    channel - which is where `tests/CLAUDE.md` says fakes belong."""
+    from daemon import mic_floor
+    from daemon.memory.store import Store
+    from daemon.memory.writer import FileMemoryWriter
+    from daemon.proactivity.base import Candidate, Utterance, Verdict
+    from daemon.proactivity.delivery import ProactiveDelivery
+    from daemon.proactivity.presence import Reading
+
+    moment = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(mic_floor, "_waiting", None)
+    said: list[str] = []
+    sent: list[Any] = []
+
+    class EdgeSpeaker:
+        async def say(self, text: str) -> bool:
+            said.append(text)
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    class EdgeChannel:
+        async def send(self, message: Any) -> None:
+            sent.append(message)
+
+    store = Store(db)
+    candidate_id = store.insert_candidate(
+        kind="topic", reason="'llm-wiki' 이야기를 한 지 15일 됐다.", payload="{}", now=moment
+    )
+    delivery = ProactiveDelivery(
+        store,
+        FileMemoryWriter(tmp_path, store),
+        channel=EdgeChannel(),
+        speaker=EdgeSpeaker(),
+        # The real one, with a deadline short enough that the test does not wait.
+        ask_for_the_floor=lambda text: mic_floor.request(text, wait_seconds=0.05),
+    )
+
+    result = await delivery.deliver(
+        Candidate(kind="topic", reason="'llm-wiki' 이야기를 한 지 15일 됐다.", id=candidate_id),
+        Utterance(text="요즘 llm-wiki 쪽은 잘 돼가고 있어요?"),
+        Verdict(
+            allowed=True,
+            why="ok",
+            reading=Reading(
+                at=moment,
+                idle_seconds=5.0,
+                foreground_app="Warp",
+                mic_busy=False,
+                output_busy=False,
+            ),
+            delivery="both",
+        ),
+        now=moment,
+    )
+
+    assert said == ["요즘 llm-wiki 쪽은 잘 돼가고 있어요?"], (
+        "the two modules stopped agreeing on what 'nobody took it' is called"
+    )
+    assert result.route == "both"
