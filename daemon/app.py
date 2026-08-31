@@ -1734,7 +1734,9 @@ async def _lipsync_loop(
     boot, so `due()` found every boundary already past and rolled its own `while` forward
     a million times on the first tick. The pacing tests caught it as a dropped frame."""
     encoded: dict[str, list[bytes]] = {driving.driver.name: driving.frames}
-    """Each clip's stills, encoded on first use and kept - the bytes never change."""
+    """Each clip's stills, encoded before its first use and kept - bytes never change."""
+    encoding: dict[str, asyncio.Future[list[bytes]]] = {}
+    """Encodes in flight, so a boundary that arrives early awaits rather than restarts."""
     shots: deque[str] = deque()
     """One-shots the bus published, waiting for a boundary. A deque and not a slot
     because two moods inside one clip is ordinary, and `ClipQueue` decides which
@@ -1854,9 +1856,30 @@ async def _lipsync_loop(
             ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="face-lipsync-cpu"
             ) as cpu,
+            # A third thread, and the reason is that the second one is the frame rate.
+            # `Renderer.encode` is 8.43ms of the 41.67ms budget and runs on `cpu`;
+            # encoding a clip's ~190 stills is ~470ms. Sharing the executor put that
+            # behind the render queue and the mouth stopped for half a second at every
+            # first-time clip change - which the owner saw as intermittent lag.
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="face-lipsync-stills"
+            ) as stills,
         ):
             pacer = asyncio.create_task(publish(), name="face-lipsync-publish")
             watcher = asyncio.create_task(watch_shots(), name="face-lipsync-shots")
+
+            def prefetch(stem: str) -> None:
+                """Start a clip's stills before its boundary arrives.
+
+                The queue gives up to a whole clip of notice - 8.04s for an idle against
+                ~470ms of encoding - so by the time the switch is due the bytes are
+                usually already there and `switch_to` awaits nothing.
+                """
+                if stem in encoded or stem in encoding:
+                    return
+                encoding[stem] = loop.run_in_executor(
+                    stills, encode_clip, caches[stem][0]
+                )
 
             async def switch_to(stem: str) -> None:
                 """Move the render onto `stem`, from its frame 0.
@@ -1867,14 +1890,15 @@ async def _lipsync_loop(
                 as far as either half can see.
                 """
                 clip_cache, clip_fps = caches[stem]
-                stills = encoded.get(stem)
-                if stills is None:
-                    # On the CPU executor: ~470ms for a 193-frame clip, and this loop
-                    # shares the event loop with the voice websocket. The outgoing clip
-                    # keeps publishing meanwhile, because `driving` is not swapped until
-                    # the stills exist.
-                    stills = await loop.run_in_executor(cpu, encode_clip, clip_cache)
-                    encoded[stem] = stills
+                frames = encoded.get(stem)
+                if frames is None:
+                    # Normally already done by `prefetch`. Awaited here rather than
+                    # assumed, for the boundary that arrives sooner than 470ms - the
+                    # outgoing clip keeps publishing meanwhile, because `driving` is not
+                    # swapped until the stills exist.
+                    prefetch(stem)
+                    frames = await encoding.pop(stem)
+                    encoded[stem] = frames
                 new = Driver(
                     name=stem,
                     cache=clip_cache,
@@ -1886,7 +1910,18 @@ async def _lipsync_loop(
                 )
                 renderer.switch(new)
                 driving.driver = new
-                driving.frames = stills
+                driving.frames = frames
+                # One line per switch, at INFO. The owner judges this by eye and the
+                # first question after "it looked wrong" is always which clip was up -
+                # three of the ten have never had a mouth rendered onto them in any
+                # path, so a report without the clip name cannot be acted on.
+                logger.info(
+                    "face: driving %s (%.2fs, %d frames)%s",
+                    stem,
+                    lengths[stem],
+                    len(clip_cache.boxes),
+                    "" if stem in encoded else " - stills were not ready",
+                )
                 # Frames rendered for the outgoing clip must not be published over the
                 # incoming one - the same reason a turn boundary drains this.
                 while not ready.empty():
@@ -1909,15 +1944,21 @@ async def _lipsync_loop(
                     # arrived - the mid-clip cut ADR 0020 exists to avoid.
                     while shots:
                         clip_queue.want(shots.popleft(), one_shot=True)
-                    clip_queue.want(
-                        wanted(
-                            face.state.activity,
-                            pending_shot=clip_queue.pending_shot,
-                            current=clip_queue.current,
-                            available=available,
-                            pick=random.choice,
-                        )
+                    want = wanted(
+                        face.state.activity,
+                        pending_shot=clip_queue.pending_shot,
+                        current=clip_queue.current,
+                        available=available,
+                        pick=random.choice,
                     )
+                    clip_queue.want(want)
+                    # Before asking for the boundary, not after: both of these are what
+                    # a switch would need, and starting them now is what keeps the
+                    # switch itself free of a half-second encode. Free when the answer
+                    # is the clip already up, which it usually is.
+                    prefetch(want)
+                    if clip_queue.pending_shot:
+                        prefetch(clip_queue.pending_shot)
                     boundary = clip_queue.due(at=loop.time())
                     if boundary is not None:
                         await switch_to(boundary)
