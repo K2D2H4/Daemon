@@ -859,8 +859,10 @@ def test_a_mouth_is_mixed_with_the_one_before_it():
     r = _renderer(engine=_Mouths([0, 200]), cache=cache, ring=ring)
     first, second = _encoded_mouth(r, cache, None)
     assert abs(first - 0) < 20, "the first mouth has nothing to mix with"
-    # 0.55*200 + 0.45*0 = 110, not 200. JPEG is lossy, so allow room - but nowhere
-    # near enough to confuse a blended 110 with an unblended 200.
+    # MOTION_BLEND*200 + (1-MOTION_BLEND)*0, not 200. Derived rather than written out
+    # so a retune of the constant does not leave arithmetic here that is quietly wrong.
+    # JPEG is lossy, so allow room - but nowhere near enough to confuse a blended mouth
+    # with an unblended 200.
     assert abs(second - int(MOTION_BLEND * 200)) < 25, second
 
 

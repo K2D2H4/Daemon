@@ -298,14 +298,36 @@ smoothing how strongly a texture is applied to it, and that strength has no busi
 changing at frame rate. Where the mouth is, and where it is not, moves slowly.
 """
 
-MOTION_BLEND = 0.55
+MOTION_BLEND = 0.48
 """Weight of the new mouth against the one before it, applied before `restore_detail`.
 
 The owner's report was that the mouth "moves too fast" - not that it trembled. Measured
 against real talking footage the generated mouth's per-frame motion really is larger:
 independent per-frame generation has none of the inertia a face has, so every frame is
-free to jump. Three arms were rendered against the same audio and the owner chose this
-one over 0.7 and over no blend at all, calling it natural enough.
+free to jump.
+
+**The first sweep only ever went up.** Its three arms were 0.55, 0.7 and no blend at
+all; the owner picked the lowest one offered and called it natural enough, and "moves
+too fast" came back later against that very value. Measured over `mask > 0` - the 5205
+pixels of a 31824-pixel box that actually reach the screen, and measuring the whole box
+instead is what hid this the first time - the knob is monotonic in both directions at
+once, per-frame motion and sharpness falling together at close to 1:1:
+
+    0.25   motion 2.772   sharpness 30.2      0.48   motion 3.065   sharpness 34.3
+    0.40   motion 2.967   sharpness 33.0      0.55   motion 3.163   sharpness 35.3
+
+The owner ranked the second sweep and chose 0.48 over 0.40, 0.25 and the standing 0.55:
+"이제 입모양이 확실히 보여". Worth writing down, because it is the opposite of what the
+sharpness column predicts - 0.48 measures *blurrier* than the value it replaced, and
+reads as more legible. Frame-to-frame churn, not per-frame detail, is what was costing
+the shapes. So do not tune this against the sharpness number, and do not read a pixel
+distance between two arms as a perceptual one: this filter is recursive, so a small
+change in the coefficient compounds within an utterance and saturates that distance
+early (0.48 against 0.55 measures 1.685, 0.25 against 0.55 only 2.578).
+
+Chosen on the offline path, which holds the whole wav in advance. Live is a different
+regime - feature cosine 0.77 against this one, and a turn's first ~2s normalise against
+less context (`audio.CONTEXT_MS`) - so this number is owed a live re-check.
 
 That is the opposite of an earlier verdict on the same idea, and the difference is
 where it sits in the pipeline rather than the number - see `Renderer._blend`.
