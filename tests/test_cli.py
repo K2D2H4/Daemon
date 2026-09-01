@@ -708,6 +708,66 @@ def test_update_install_command_leaves_python_selection_alone_off_macos(
     assert cmd[-1] == "daemon-ai[mcp] @ https://github.com/x/archive/v1.tar.gz"
 
 
+def _receipt(prefix: Path, extras: list[str] | None) -> None:
+    """uv's own record of what `uv tool install` was asked for, where uv writes it."""
+    body = '[tool]\nrequirements = [{ name = "daemon-ai"'
+    if extras is not None:
+        body += ", extras = [" + ", ".join(f'"{e}"' for e in extras) + "]"
+    body += ' }]\npython = "3.13"\n'
+    (prefix / "uv-receipt.toml").write_text(body, encoding="utf-8")
+
+
+def test_update_keeps_the_extras_this_install_already_has(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--force` replaces the whole tool environment, so an extra the new spec does
+    not name is removed. That is how an update once dropped voice and left the wake
+    gate deaf with /health still saying running. [face] cannot be made core the way
+    voice was - it is ~2.5GB - so update has to carry forward what is installed."""
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli.sys, "prefix", str(tmp_path))
+    _receipt(tmp_path, ["mcp", "face"])
+
+    cmd = cli._update_install_command("https://github.com/x/archive/v1.tar.gz")
+
+    assert cmd[-1] == "daemon-ai[face,mcp] @ https://github.com/x/archive/v1.tar.gz"
+
+
+def test_update_asks_for_mcp_even_when_the_receipt_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP defaults on in config.py, so a spec without it shows the admin's MCP tab
+    and then fails every connect with "No module named 'mcp'" - the reason
+    INSTALL_SPEC carried the extra in the first place. Preserving extras must not
+    become a way to lose that one."""
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli.sys, "prefix", str(tmp_path))
+    _receipt(tmp_path, [])
+
+    cmd = cli._update_install_command("https://github.com/x/archive/v1.tar.gz")
+
+    assert cmd[-1] == "daemon-ai[mcp] @ https://github.com/x/archive/v1.tar.gz"
+
+
+def test_update_falls_back_to_mcp_when_there_is_no_readable_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source install, an older uv, a file we cannot parse. Reading uv's receipt is
+    an improvement on a hardcoded list and must never be a new way for update to
+    fail, so every unreadable case lands on the behaviour that predates it."""
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli.sys, "prefix", str(tmp_path))
+
+    absent = cli._update_install_command("https://github.com/x/archive/v1.tar.gz")
+
+    (tmp_path / "uv-receipt.toml").write_text("this is not toml [[[", encoding="utf-8")
+    malformed = cli._update_install_command("https://github.com/x/archive/v1.tar.gz")
+
+    expected = "daemon-ai[mcp] @ https://github.com/x/archive/v1.tar.gz"
+    assert absent[-1] == expected
+    assert malformed[-1] == expected
+
+
 def test_install_calls_install(service: FakeService) -> None:
     assert cli.main(["install"]) == 0
     assert service.calls == [("install", False)]
