@@ -82,9 +82,27 @@ def _restored(mouth, frame, box, **kw):
     return restore_detail(mouth, frame, box, detail_weight(mouth, frame, box), **kw)
 
 
-def _cache(n=4, height=200):
-    frames = np.zeros((n, height, 160, 3), np.uint8)
-    masks = np.full((n, CROP_H, CROP_W), 255, np.uint8)
+def _cache(n=4, height=200, shared=False):
+    """`shared=True` aliases every frame and mask onto one buffer, read-only.
+
+    For the tests that need a clip long enough that no index wraps, where `n` runs
+    into the thousands and the pixels are never looked at. The honest allocation is
+    not affordable and CI is where that showed: `np.zeros` hands back lazily-zeroed
+    pages, which macOS overcommits happily and Linux refuses outright, so
+    `n=1_000_000` passed here and died on the runner with "Unable to allocate 89.4
+    GiB". The masks were worse and quieter - `np.full` writes every byte, so that
+    line was touching 12.6GB of real memory on both platforms and only ever being
+    read back as 255.
+
+    Off by default because most tests here paint a texture into `cache.frames[i]`,
+    and a broadcast view cannot be written to.
+    """
+    if shared:
+        frames = np.broadcast_to(np.zeros((height, 160, 3), np.uint8), (n, height, 160, 3))
+        masks = np.broadcast_to(np.full((CROP_H, CROP_W), 255, np.uint8), (n, CROP_H, CROP_W))
+    else:
+        frames = np.zeros((n, height, 160, 3), np.uint8)
+        masks = np.full((n, CROP_H, CROP_W), 255, np.uint8)
     return Cache(
         frames=frames,
         boxes=[BOX] * n,
@@ -647,7 +665,7 @@ def test_the_driving_index_follows_the_clip_clock_and_not_the_turn():
     Two turns, one clock: the same audio index has to land on a different driving
     frame, and by exactly the number of frames the clip advanced between them.
     """
-    cache = _cache(n=1_000_000)          # long enough that nothing here wraps
+    cache = _cache(n=1_000_000, shared=True)  # long enough that nothing here wraps
     engine = FakeEngine()
     ring = _distinct_tone_ring(seconds=200.0)
     r = _renderer(engine=engine, cache=cache, ring=ring)
@@ -673,7 +691,7 @@ def test_the_audio_index_stays_relative_to_the_turn():
     """
     ring = _distinct_tone_ring(seconds=200.0)
     engine = FakeEngine()
-    r = _renderer(engine=engine, cache=_cache(n=1_000_000), ring=ring)
+    r = _renderer(engine=engine, cache=_cache(n=1_000_000, shared=True), ring=ring)
 
     r.step(frame_index=0, origin=100.0, fps=24.0)
 
