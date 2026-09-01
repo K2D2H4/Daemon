@@ -24,6 +24,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,14 +44,15 @@ GITHUB_REPO = "K2D2H4/Daemon"
 PACKAGE_NAME = "daemon-ai"
 """The repo and the distributable. `daemon update` and install.sh must agree on
 both, because update re-installs exactly what the one-liner does."""
-INSTALL_SPEC = f"{PACKAGE_NAME}[mcp]"
-"""What `uv tool install` requests, extra included. MCP defaults on (config.py),
-so a plain `daemon-ai` install shows the admin's MCP tab and then fails every
-connect with "No module named 'mcp'". `install.sh` installs this same spec - the
-docstring on `_update` promises the two do not drift, and a bare-name reinstall
-here would silently drop the extra on the next `daemon update`. The version cap
-lives in the extra (pyproject `mcp>=1.9,<2`), so `[mcp]` also keeps `daemon update`
-off the incompatible mcp 2.0."""
+DEFAULT_EXTRA = "mcp"
+"""The extra `uv tool install` always asks for, whatever else is already installed.
+
+MCP defaults on (config.py), so a plain `daemon-ai` install shows the admin's MCP tab
+and then fails every connect with "No module named 'mcp'". `install.sh` names this
+same extra - the docstring on `_update` promises the two do not drift, and a bare-name
+reinstall here would silently drop it on the next `daemon update`. The version cap
+lives in the extra (pyproject `mcp>=1.9,<2`), so this also keeps `daemon update` off
+the incompatible mcp 2.0. Anything beyond it comes from `_installed_extras`."""
 
 _GROUP_ORDER = (
     "the resident",
@@ -948,6 +950,39 @@ def _run(cmd: list[str]) -> int:
     return subprocess.run(cmd, check=False).returncode
 
 
+def _installed_extras() -> frozenset[str]:
+    """The extras this install was actually installed with, read from uv's receipt.
+
+    `daemon update` reinstalls with `--force`, which replaces the whole tool
+    environment - so an extra the new spec does not name is *removed*. That has
+    already cost this project once: the installer asked for a bare `daemon-ai`, an
+    update dropped the recognizer, and the wake gate went deaf while `/health` still
+    said running. Voice was fixed by making those dependencies core on darwin
+    (pyproject), but `[face]` cannot be: it is ~2.5GB, and an install that never turns
+    lip-sync on should not carry it. So the fix on this side is to carry forward
+    whatever is installed instead of hardcoding the list.
+
+    uv writes `uv-receipt.toml` at the root of the tool environment, which is this
+    interpreter's own `sys.prefix` when the command runs from an installed tool - no
+    subprocess, and correct wherever uv keeps its tools. Every failure to read it - a
+    source install, an older uv, a file that will not parse - returns the empty set,
+    which leaves `_update_install_command` the behaviour it had before this existed.
+    Reading the receipt is an improvement on a hardcoded list; it must not become a
+    new way for an update to fail.
+    """
+    try:
+        raw = (Path(sys.prefix) / "uv-receipt.toml").read_bytes()
+        requirements = tomllib.loads(raw.decode("utf-8"))["tool"]["requirements"]
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError):
+        return frozenset()
+    for requirement in requirements:
+        if isinstance(requirement, dict) and requirement.get("name") == PACKAGE_NAME:
+            return frozenset(
+                extra for extra in requirement.get("extras") or () if isinstance(extra, str)
+            )
+    return frozenset()
+
+
 def _update_install_command(source: str) -> list[str]:
     """The `uv tool install` argv `daemon update` runs. Kept in step with install.sh.
 
@@ -960,13 +995,18 @@ def _update_install_command(source: str) -> list[str]:
     uv pick the framework build if it is present, which is exactly what broke.
 
     One requirement string, not `--from <url> <name>`: uv rejects extras on the
-    positional when `--from` is also given, so the extra rides a PEP 508 direct
+    positional when `--from` is also given, so the extras ride a PEP 508 direct
     reference - `daemon-ai[mcp] @ <url>`.
+
+    The extras are `DEFAULT_EXTRA` plus whatever `_installed_extras` finds, so an
+    update reinstalls the capabilities this machine already has rather than the
+    subset install.sh happens to name.
     """
     command = ["uv", "tool", "install", "--force", "--python", "3.13"]
     if sys.platform == "darwin":
         command += ["--python-preference", "only-managed"]
-    command.append(f"{INSTALL_SPEC} @ {source}")
+    extras = ",".join(sorted(_installed_extras() | {DEFAULT_EXTRA}))
+    command.append(f"{PACKAGE_NAME}[{extras}] @ {source}")
     return command
 
 
