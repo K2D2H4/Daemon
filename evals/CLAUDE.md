@@ -21,6 +21,10 @@ automated. This is that one, plus the spike that needed a real key.
 | `face_mood_tag_spike.py` | spec open question 4 — does the configured provider actually attach a leading `[mood:...]` tag, reliably and well-formed? It scores `daemon/face.py:MOOD_INSTRUCTION` **as imported**, not a copy, so it measures the string the text path really sends. Answering yes on one install is what shipped it; re-run it on another provider, another model, or after any edit to that string |
 | `voice_set_mood_spike.py` | whether a flat `set_mood` is callable on the *voice* path at all, asked before anyone edits CONTRACTS 12 — 48 live audio sessions: call rate **24/24**, mood correct **24/24**, false positives **0/8**, spoken aloud **0/32**. The mechanism is not the obstacle, so the remaining question is purely the contract one, and this script does not answer it |
 | `proactive_verbatim_spike.py` | whether the live voice model will say a given sentence **exactly** - the question PR #115 answered by argument and got wrong. Two cells, 8 live sessions each: a plain instruction is exact **0/8** (it says the line, then adds a question of its own), `conversation.speak_verbatim` is **8/8**; re-run after the nonce fence went in, **0/16 against 16/16** over two runs, with no fence marker ever spoken. Scores the constant *as imported* (it held its own copy until PR #126's review noticed this row already claimed otherwise), so it measures the string that ships; re-run it after any edit to that string, or on another model. **Read the number for what it is:** the spike opens a bare session - four-line persona, no tools, nothing before the opening - while production sends `companion.persona()` with its learned rules, `TOOL_CONTRACT`, the voice tool declarations and the time/continuity/tic blocks immediately before it, and the tic block tells the model to reword the very phrases the line may contain. The 8/8 is about the wording in principle; the production prompt is strictly harder and unmeasured |
+| `face_lipsync_prepare.py` | the offline preprocessing step — one driving mp4 in, the cache `daemon/face_lipsync` reads at runtime out. Apple Vision for the landmarks; still needs torch and a MuseTalk checkout for the VAE and the BiSeNet mask, which are deliberately not daemon dependencies |
+| `face_lipsync_live.py` | whether the *assembled* daemon puts a mouth on a real socket — `create_app` + the MLX engine + the prepared cache + uvicorn + `/face/frames`, driven by a wav through the real `SpeechClock`. Writes an mp4 to look at, because the pass mark is a person looking at it |
+| `face_lipsync_idle_spike.py` | whether the idle mouth should be pre-rendered too, so the switch to speech carries no quality step — **no**, and not because of sharpness: over 88 conditioning windows including digital zero, this engine never renders `idle2`'s sealed resting mouth, it parts the lips and shows teeth |
+| `face_lipsync_numerics.py` | whether the product loader keeps real MLX weights in MLX layout, and whether one engine's per-clip latents are selected by the key it is handed — it does now run the model, twice, to prove `idle2` is bit-identical with a second clip's table loaded and that a second clip's mouths differ — the published weights are diffusers-keyed but MLX-laid-out, and a second transpose is silent |
 | `evals/agent-results.json` | the last run as data — score *with* its conditions |
 
 ## golden_set.py
@@ -241,6 +245,121 @@ the real origin gate and the real audit table, against a real endpoint. What
 remains **unproven**: `create_app`, the Telegram channel, `daemon run` as a
 resident process, and any Qwen endpoint at all. Nobody may read the four PASSes
 above as "a real Telegram conversation ran on Qwen".
+
+## face_lipsync_prepare.py
+
+```bash
+python3 -m evals.face_lipsync_prepare /path/to/idle1.mp4 \
+    --out data/face/lipsync/idle1 \
+    --musetalk ~/MuseTalk --weights ~/MuseTalk
+```
+
+The one tool in here that produces an asset rather than a number. It turns one driving
+clip into the five things `daemon/face_lipsync` reads at runtime — the frames, the face
+boxes, the blend regions, the BiSeNet masks, and the reference latents — so that **the
+runtime has no face detector and no torch in it at all.**
+
+It lives here and not in `scripts/` because `scripts/` is CI repo checks, stdlib only,
+importing nothing from `daemon` (see [scripts/CLAUDE.md](../scripts/CLAUDE.md)); this
+needs torch, diffusers, and a MuseTalk checkout, and must never run in CI. The plan
+doc, [docs/superpowers/plans/2026-08-26-face-lipsync-engine.md](../docs/superpowers/plans/2026-08-26-face-lipsync-engine.md),
+files it under `scripts/` and is wrong about that.
+
+Measured 2026-08-26 on `data/face/idle1.mp4` — 193 frames of 1080x1620 at 24fps, M-series
+Mac on MPS: **36.2s** of model work (Vision landmarks 13.1s, sd-vae latents 11.5s,
+BiSeNet masks 11.6s), producing a 966MB frame store and a 3.0MB latents file.
+
+Four things worth knowing before trusting the output:
+
+- **The landmarks are Apple Vision, per spec §4-1, and the mapping onto MuseTalk's box
+  formula is measured.** `faceContour` has 17 points where iBUG-68's jawline has 17, and
+  `lm[29]` — the lower nose bridge the formula indexes — is `noseCrest[2]`: FAN puts
+  iBUG-29 at fraction 0.697 of the 27→30 bridge and Vision's four crest points sit at
+  0, 0.331, 0.671, 1.0. **An earlier revision used FAN and that was wrong**, not a
+  shortcut: torch for one landmarker is what §4-1 exists to refuse.
+- **The substitution costs a stated 12px and it is not corrected.** Against FAN over 193
+  frames the chin and right edge agree (+1.1 and +2.0px) but `min x` is +11.9px inside
+  and `noseCrest[2]` is 12.1px above FAN's `lm[29]`, which the formula doubles into a
+  **~24px higher box top, 5.6% taller**. That is `bbox_shift = -12`, inside the ±20 the
+  spike swept when it found the whole documented range moves lip openness under 10%.
+  Rendered: the mouth moves 1.48× one frame of its own natural motion and reads 122% of
+  the driving frame's lip detail against FAN's 135%. The bias is stable across 7 clips
+  (−11.6 to −13.3px) but all 7 are the **same avatar**, so a constant fitted on it would
+  go silently wrong on another face. Stated, not fudged.
+- **The VAE is `sd-vae-ft-mse`'s encoder, and the spec never named it.** §4 lists UNet /
+  whisper / TAESD only, yet the reference latents are 8 channels — a half-masked encode
+  concatenated with a full one — which needs an encoder. **TAESD's encoder was measured
+  and rejected:** it is free (already in the same weights file, 1.9s against 34.6s) and
+  it costs **−5.7% lip saturation and −8.6% lip contrast on every one of 60 rendered
+  frames** (−5.20 ± 0.64), because its latents clamp into [−3.11, 2.89] where sd-vae
+  reaches [−7.26, 5.89]. Whole-latent cosine 0.980 looked survivable and was not. The
+  noise floor that makes that readable: sd-vae's own `sample()` against a second seed is
+  0.0001 mean abs and 0.00 ± 0.01 on lip saturation.
+- **`composite` on this cache is bit-identical to MuseTalk's own `get_image_blending`**
+  fed the same boxes, crop box and mask — max pixel difference 0 over 5 frames on the
+  Vision geometry. Not a tautology: the same call with the crop box moved 12px differs
+  by up to 117/255.
+
+**Still open, and it is the owner's call.** §4-1 wants no torch in the *build* either,
+and this does not reach that. The VAE is not the blocker — `FaceParsing` (BiSeNet plus a
+torchvision transform) is, and nothing here replaces it. Porting sd-vae's encoder to MLX
+would drop `diffusers` and a 335MB download and leave torch exactly where it is.
+
+## face_lipsync_idle_spike.py
+
+```bash
+python3 -m evals.face_lipsync_idle_spike --data-dir ~/Daemon/data \
+    --wav ~/spikes/musetalk-stage1/in/ko_24k.wav
+```
+
+Needs the weights and a prepared clip cache; never in CI. It renders the whole driving
+clip four times — digital zero, synthetic room tone at −60 and −40 dBFS, and real
+speech — through the real `MlxEngine` and the real `Renderer`, so `restore_detail`, the
+composite and the q85 JPEG are all in the path, and every number is taken on the
+JPEG-decoded frame because that is what the page shows.
+
+The proposal was the owner's and it was the right shape: while idle the page plays the
+raw driving clip, so the instant speech starts a real mouth becomes a generated one in
+one frame. Composite the idle mouth as well and the switch has nothing to give away.
+Silence is deterministic and the clip is a fixed loop, so it can be rendered once,
+offline, at prepare time — no model runs while idle, which spec §7 requires.
+
+**As arithmetic it worked.** Measured 2026-08-27 on `idle2`, on the pixels the paste
+actually rewrites, medians of mean|diff| per frame: the step at the switch is **9.03
+today and would be 4.47**, against **1.88** for one frame of the clip's own motion. It
+halves a jump of 4.8× ordinary motion down to 2.4×.
+
+**It is what it pays for the resting face that kills it.** Over **88** conditioning
+windows — digital zero, both room tones, and 85 windows of real Korean speech — every
+one renders the clip's sealed resting frames with the lips **parted and a sliver of
+teeth showing**. Not one closed the mouth. `idle2` is mostly at rest (frames 104–192 are
+a continuous sealed stretch), so a pre-rendered idle leaves the avatar sitting
+mouth-open the whole time the daemon is not speaking. Looked at, at the size the page
+actually shows, it is not subtle and it is not a sharpness question: the composed,
+faintly smiling resting face becomes a slack one. So the discontinuity would be traded
+for a permanently degraded resting face. **Not built** —
+`evals/face_lipsync_prepare.py` is unchanged and writes no idle frames.
+
+Two measurement traps it had to get past, both of which this project has fallen into
+before:
+
+- **A ratio over a wide box lies.** The blend region is 319×319 and the paste copies
+  most of it back from the original unchanged, so the same generated mouth reads
+  **99.6%** of the original's sharpness there and **56%** over the derived 94×65 lip
+  box. A published 87% for this feature was diluted the same way and its tight box gave
+  48%. `lip_box` derives the box from the renders instead of carrying a constant.
+- **A Laplacian across two mouth poses is not a comparison.** Over all frames the speech
+  render reads 99.2% against the silence render's 78.0%, which looks like silence being
+  the problem and is not — an open mouth has a dark interior and teeth, so it has more
+  contrast to measure. Paired by pose the two are the same thing, **58.6% and 56.0%**.
+  That is the one part of the premise that held: a silence-rendered mouth does not sit
+  *between* the original and the speaking render, it sits *on top of* the speaking
+  render. If the resting pose were right, the switch would carry no quality step at all.
+
+What is not ruled out, and all three are the owner's call: making the engine hold a
+sealed mouth on this avatar (a model question, not a preprocessing one), accepting the
+step and shortening the crossfade, or driving idle from a clip whose mouth is never
+sealed so there is no resting pose to lose.
 
 ## Common changes
 

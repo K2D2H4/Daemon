@@ -94,6 +94,39 @@ mcp = [
     # ported to the v2 surface.
     "mcp>=1.9,<2",
 ]
+face = [
+    # Needed when face lip-sync (MuseTalk) is turned on: `daemon/app.py`'s
+    # `_build_lipsync` constructs the whole render path behind
+    # `DAEMON_FACE_LIPSYNC_ENABLED`, and `daemon/face_lipsync/render.py` imports cv2
+    # directly. CI needs the extra regardless, because the tests import that module
+    # unconditionally.
+    # opencv-python-headless, not opencv-python: this runs on a server with no
+    # display, so the GUI/Qt bindings the non-headless wheel links against are
+    # dead weight neither install nor CI has any use for.
+    #
+    # `<5` is a real bound, not caution. An unbounded floor resolved to 5.0.0 on a
+    # fresh install of this extra, and every judgement the render path has been tuned
+    # against - MOTION_BLEND, RELEASE_FRAMES, the detail transfer - was made on 4.11
+    # against `GaussianBlur`, `resize` and `imencode`. A major bump under the one
+    # thing the owner judges by eye is not a variable to leave open.
+    "opencv-python-headless>=4.10,<5",
+    # Apple-silicon only, and marked as such because CI is ubuntu: mlx publishes no
+    # Linux wheels, so an unmarked entry makes `pip install .[face]` fail there
+    # outright rather than skip. Nothing CI imports pulls these in - test_reachable
+    # reads daemon/*.py as text, and the mlx-only modules are exercised by
+    # evals/face_lipsync_numerics.py by hand.
+    "mlx>=0.22; platform_system=='Darwin' and platform_machine=='arm64'",
+    # For whisper's mel front-end and encoder weights. Verified to reproduce
+    # transformers' own output exactly (mel cosine 1.000000, encoder states
+    # 1.000000/0.999997).
+    #
+    # It does NOT save the torch dependency, and this comment claimed it did.
+    # Measured installing this extra on 2026-08-31: `mlx-whisper 0.4.3` declares a
+    # bare `torch` requirement, so the extra pulls torch in regardless of the mel
+    # front-end being MLX. What the MLX port buys is the encoder running on MLX at
+    # the frame budget; the install is still ~2.5GB heavier than this said.
+    "mlx-whisper>=0.4; platform_system=='Darwin' and platform_machine=='arm64'",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
@@ -121,6 +154,10 @@ addopts = "-q"
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+# Vendored third-party source, byte-identical to upstream on purpose. Linting it
+# would produce a diff we are not allowed to apply - see daemon/face_lipsync/vendor.
+extend-exclude = ["daemon/face_lipsync/vendor/mlx_sd/config.py",
+                  "daemon/face_lipsync/vendor/mlx_sd/unet.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]

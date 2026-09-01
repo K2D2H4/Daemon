@@ -490,3 +490,14 @@ One more route, `/face/transitions`, serves a table the page uses to decide
 and the page falls back to cutting at frame 0. Which of its two mechanisms
 leads is the decision worth knowing:
 [ADR 0017](adr/0017-the-neutral-moment-not-the-matched-pose.md).
+
+The mouth has a second implementation behind `DAEMON_FACE_LIPSYNC_ENABLED`, off by
+default. `daemon/face_lipsync/` renders it from the audio being spoken - MuseTalk's
+UNet, whisper's encoder and TAESD, all in MLX - and imports nothing from `daemon/`,
+so `daemon/app.py` is the only file that names it (CONTRACTS 4). `_build_lipsync`
+assembles the clip cache, the engine, a PCM ring and a renderer when the weights and
+a prepared cache are both present; `SpeechClock` feeds the ring through the
+`pcm_sink` the voice conversation already accepts, an in-process task renders one
+frame per tick while the bus says `speaking`, and `/face/frames` streams the crop
+box the page lays over the driving clip. Anything missing - the switch, the weights,
+the cache - degrades to the pre-rendered clips with one log line.

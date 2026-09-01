@@ -3,7 +3,14 @@
 <title>face</title>
 <!--
   Self-contained, offline, one file - the same posture as the admin shell. It talks to
-  three routes on its own origin and loads nothing else.
+  five routes on its own origin and loads nothing else.
+
+  Two mouths, and only one of them is here. v1's is this file's own: a speaking clip
+  whose playbackRate follows the level (spec 3.4), which cannot make a phoneme. The
+  other is rendered by the daemon and arrives on /face/frames as the WHOLE composited
+  frame, replacing the clip it was cut from rather than laid over it. It is off by
+  default, and everything below treats it as an overlay that can vanish mid-sentence
+  rather than as a mode the page switches into - see mouthReady/mouthLive.
 
   Three details here are the whole difference between "alive" and "wrong", and all
   three were learned by getting them wrong first:
@@ -22,27 +29,54 @@
      is not immune to the browser either, though (spec 3.8 claimed it was, and that
      was wrong): Chrome pauses muted background video to save power even in a
      merely-occluded window, measured live - see ensurePlaying(), below.
+     And "throttles" is generous: in an occluded window rAF stops outright, measured
+     while building the lip-sync overlay. Anything whose LATENESS is a defect rather
+     than a cosmetic lag therefore cannot live in tick() - see refreshMouth().
+     The lip-synced frames themselves DO present from tick(), and that is not a
+     contradiction: a late frame there is a cosmetic lag over a window nobody is
+     looking at, and rAF stopping only holds the last frame that was already up.
+     What must never wait on rAF is the mouth going AWAY, which is still
+     event-driven. See presentMouth() and refreshMouth(), which are separate for
+     exactly this reason.
 -->
 <style>
   :root { --bg: #19191B; }
   html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
-  #stage { position: fixed; inset: 0; }
+  /* z-index 0 makes #stage a stacking context, which is the only way #mouth stays
+     above every clip: show() hands the incoming clip ++z, so a fixed number on a
+     sibling would eventually lose the race. Contained here, it never can. */
+  #stage { position: fixed; inset: 0; z-index: 0; }
   video {
     position: absolute; inset: 0; width: 100%; height: 100%;
     object-fit: contain; opacity: 0; transition: opacity 180ms linear;
   }
+  /* The lip-synced face: the WHOLE composited frame, same geometry as the clips it
+     replaces, so there is nothing to position and nothing to line up. Two earlier
+     versions of this laid a crop of the mouth over the playing clip and both drew a
+     visible rectangle - a JPEG has no alpha, so its edge is hard however small it is,
+     and the clip underneath is never on the frame the renderer drew.
+     A <canvas>, not an <img>, for the reason presentMouth() gives - and object-fit
+     applies to it identically (verified in Chrome: a 1080x1620 canvas letterboxes
+     into a 900x1000 box at 666px wide, against 667px of arithmetic), so this is the
+     same geometry the <img> had and there is still nothing to line up. */
+  #mouth {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; opacity: 0; transition: opacity 180ms linear;
+    z-index: 1; pointer-events: none;
+  }
   #hint {
     position: fixed; inset: 0; display: grid; place-items: center; padding: 2rem;
     color: #8a8a90; font: 13px/1.7 -apple-system, system-ui, sans-serif;
-    text-align: center;
+    text-align: center; z-index: 2;
   }
   #hint code { color: #d8d8dc; }
   @media (prefers-reduced-motion: reduce) {
-    video { transition: none; }
+    video, #mouth { transition: none; }
   }
 </style>
 
 <div id="stage"></div>
+<canvas id="mouth"></canvas>
 <div id="hint" hidden></div>
 
 <script>
@@ -104,6 +138,49 @@ const LOUD_ENTER = 0.27, LOUD_HOLD_MS = 500;
 // one session, one voice, one provider. logEnvelope() below still prints a summary
 // per speaking turn, and that is still the thing to read before moving this.
 const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const MOUTH_STALE_MS = 250;   // How long the last lip-sync frame stays believable.
+                               // Frames arrive every 41.67ms, but a gap of a tick or
+                               // two is normal, not broken: a model step covers two
+                               // frames and cannot start until the second one's audio
+                               // has arrived, so the renderer answers "not yet" on
+                               // some ticks by design (/face/frames). Six frames
+                               // clears that; much longer and a renderer that latched
+                               // failed mid-sentence reads as a frozen face, which is
+                               // the exact thing the fallback exists to prevent.
+const MOUTH_PERIOD_MS = 1000 / 24;  // The renderer's own frame period, and so the rate
+                               // presentMouth() puts frames up at. NOT a running
+                               // estimate of the rate they ARRIVE at: they arrive at
+                               // 23.5-24.0fps and wander, and a clock that chased that
+                               // came out worse (65.4% of frames on the modal dwell
+                               // against 81.7% - simulated over real arrival stamps,
+                               // so treat the gap as the finding and not the figures).
+                               // The reason is not about the source at all: 41.67ms is
+                               // a whole number of refreshes at 120Hz and 2.5 at 60Hz,
+                               // and either repeating pattern reads better than a
+                               // period that beats against the display.
+const MOUTH_CATCH_UP = 2;     // Queue depth presentMouth() will hold before it stops
+                               // waiting for the slot and presents on every tick until
+                               // it is level again. Measured, and the difference
+                               // between a fix and half of one. At 1, a burst of two
+                               // frames inside one slot forced the second out early
+                               // immediately - 42% of frames went up ahead of their
+                               // slot, and the page landed at 51% on the modal dwell
+                               // with 25% of pairs changing duration and a worst dwell
+                               // of 82ms, barely better than the <img> it replaced. At
+                               // 2 a burst pair is absorbed and only a real backlog
+                               // moves the clock: 72.5%, 13.6%, and 51ms.
+                               // Holding an early frame is not added lag, it is the
+                               // correction: the renderer draws for AUDIBLE time, so a
+                               // frame that arrived early is a frame that would have
+                               // led the sound. 3 was tried and the run was void - the
+                               // machine was loaded and the renderer itself fell to
+                               // 15fps - so 2 is where the evidence actually reaches.
+const MOUTH_QUEUE_MAX = 4;    // Decoded frames held at once. A bound, not a buffer:
+                               // presentMouth() drains one per period and the queue
+                               // sits around MOUTH_CATCH_UP, but rAF STOPS in an
+                               // occluded window while the socket keeps delivering,
+                               // and an ImageBitmap of a 1080x1620 frame is ~7MB.
+                               // Four caps that at 28MB.
 
 // activity -> clip, with the fallback chain from spec §3.7 applied at load time.
 const FOR_ACTIVITY = {
@@ -127,6 +204,7 @@ const WAIT_ACTIVITIES = new Set(["listening", "thinking", "working", "idle"]);
 
 const stage = document.getElementById("stage");
 const hint = document.getElementById("hint");
+const mouth = document.getElementById("mouth");
 const els = new Map();        // stem -> <video>
 let have = new Set();
 let showing = null;           // the <video> currently opaque
@@ -136,6 +214,115 @@ let env = 0;                  // smoothed level
 let loudSince = 0;
 let flourishAt = 0;
 let oneShotUntil = 0;
+let queuedActivity = null;    // spec 3.6: a non-speaking activity change held until an
+                               // in-flight one-shot finishes, rather than dropped or
+                               // acted on mid-gesture
+let mouthClip = null;         // driving clip stem from /face/manifest; null = no lip-sync
+let mouthDead = false;        // the frame stream is not coming back: revert to v1
+let mouthShown = false;       // last opacity written, so refreshMouth writes on change
+let mouthCtx = null;          // #mouth's 2d context, taken once on the first frame
+let mouthQueue = [];          // decoded frames waiting for a slot, oldest first
+let mouthDueAt = 0;           // earliest time the next frame may go up (presentMouth)
+let mouthSeq = 0;             // frames handed to the decoder, in arrival order
+let mouthQueuedSeq = 0;       // highest one that reached the queue, so a decode that
+                               // finishes out of order is dropped rather than shown
+                               // after the frame that overtook it
+let mouthFresh = false;       // a frame has been decoded since the stream opened, so
+                               // there is something true to show. No longer cleared per
+                               // turn: the daemon drives every clip now and publishes
+                               // continuously, so there is no such thing as a frame
+                               // belonging to the previous utterance
+let driverEpoch = 0;          // page-clock seconds at which the driving clip's playhead
+                               // read 0, from /face/manifest - see driverAt()
+
+// --- the driving clip's playhead belongs to the daemon --------------------
+// The renderer composites each mouth into the driving frame it believes the page will
+// be showing when that JPEG lands (render.py:DISPLAY_LEAD), so "which frame is the page
+// showing" is a question with one answer and the daemon owns it. It has to: the answer
+// it needs is for a quarter-second in the FUTURE, which only a clock can give, and this
+// page has no channel back to ask on anyway.
+//
+// So the page follows. /face/manifest hands over the clip's position once
+// (render.py:ClipClock.position), the page anchors that to its own performance.now(),
+// and the <video> free-runs from there. Measured before trusting it: a playing muted
+// <video> tracks performance.now() to within 0.002 frames over 8 seconds - flat, not a
+// slow ramp - and idle2's `duration` is 8.041667s against 193/24 to the last digit
+// either side reports, so the loop wraps in the same place on both. All of the drift
+// there is comes from the browser PAUSING the clip (measured: -0.2 to -0.4 frames of
+// playhead lost per pause, permanently, and a hidden tab is paused on every loop).
+// That is not a case for a rate correction, it is a case for re-seeking wherever a
+// pause can have happened - which is show() and ensurePlaying(), both below.
+function driverAt() {
+  const v = els.get(mouthClip);
+  const period = v && v.duration;
+  if (!period || !Number.isFinite(period)) return 0;
+  const at = (performance.now() / 1000 - driverEpoch) % period;
+  return at < 0 ? at + period : at;                // % keeps the sign in JS
+}
+
+// Is `stem` the clip the renderer is drawing on right now? The playhead rule above
+// applies to that clip and no other: every other clip starts at 0 when it is shown,
+// because a clip you are switching TO has no position of its own.
+function isDriver(stem) { return mouthReady() && stem === mouthClip; }
+
+// --- lip-sync mouth: is it this page's speaking path, and is it live? -------
+// Two questions, not one. `mouthReady` decides which clip plays *under* the crop and
+// so must not flicker - a clip switch mid-sentence is worse than a still mouth. Only
+// `mouthLive` gates the crop itself, so a gap of a few frames hides the overlay and
+// leaves the clip alone, and the page never has to choose between a frozen mouth and
+// a clip that changes twice a second.
+function mouthReady() { return !!mouthClip && !mouthDead; }
+// No staleness clock any more, and not for want of one: the page gets no per-frame
+// event to time from. It does not need one - the frames stopping for good is its own
+// signal, because the response ends and `onerror` below fires.
+//
+// `mouthFresh` is now only the first rising edge: an empty canvas must not fade in over
+// a clip before there is anything in it. It used to be cleared on every activity change,
+// to keep the LAST frame of the previous utterance from dissolving over a live head at
+// the start of the next one - a real defect, and one the daemon driving every clip
+// removes at the source. Frames arrive continuously and are always of the clip that is
+// up, so there is no stale frame to hide from; clearing this per turn would only blink
+// the canvas off at each change, which is the flicker this whole task removes.
+function mouthLive() { return mouthReady() && mouthFresh; }
+
+// Whether the crop is on screen, recomputed from state and written only on change.
+// Deliberately NOT called from tick(): rAF does not merely throttle in a backgrounded
+// or occluded window, it stops (measured - see the header note and ensurePlaying), and
+// the one thing that must never wait on it is the mouth going AWAY. A frozen crop over
+// a clip is the exact failure the fallback exists for, so a frame arriving and a frame
+// failing to arrive are both handled where they happen: onmessage, and the timer it
+// re-arms. Measured while getting this wrong: with the visibility toggle inside tick(),
+// killing the renderer left the overlay stuck mid-fade at opacity 0.13 for good.
+function refreshMouth() {
+  // Every activity, and no one-shot exception. This is the colour fix finished.
+  //
+  // Chrome's decode of the untagged mp4 disagrees with its decode of our JPEGs -
+  // measured R +3.0, G +2.1, B +1.2 - so any moment this canvas goes on or off, the
+  // whole picture shifts darker and off-hue. The first fix published idle as frames too,
+  // which closed the idle<->speaking boundary; a real conversation crosses
+  // listening->speaking, where the canvas was still off, and the owner saw the shift
+  // come back on every turn of a live session. It is closed for good here because the
+  // daemon drives every prepared clip, so there is no activity and no mood for which
+  // the frames are not the right picture. The <video> underneath is the fallback and
+  // nothing else - see mouthDead.
+  const on = mouthLive();
+  if (on === mouthShown) return;
+  mouthShown = on;
+  // Single-sided, spec 3.2: only the crop's opacity animates, over a clip that is
+  // already fully opaque underneath - in both directions, so neither the fade in nor
+  // the fall back to clips can dip to the page background.
+  mouth.style.opacity = on ? "1" : "0";
+}
+
+function first(list) { return (list || []).find(s => have.has(s)) || null; }
+
+// Whether a clip shown for `act` should loop, or run once and report `ended`.
+// Idle is the only activity that ever wanted the latter, and only to drive the
+// rotation above: `ended` -> advance() -> a different idle clip. With the rotation
+// pinned there is nothing on the other side of that `ended`, so leaving loop off would
+// park the face on the driving clip's last frame for good.
+function loops(act) { return act !== "idle" || mouthReady(); }
+
 let oneShotIsFlourish = false;  // spec 3.6: a flourish means nothing, so any
                                // activity change cuts it. A mood does not (spec
                                // 3.2) - that is the daemon saying something, and
@@ -143,17 +330,32 @@ let oneShotIsFlourish = false;  // spec 3.6: a flourish means nothing, so any
 let pendingWaitTimer = 0;     // task 9 (3rd follow-up): setTimeout handle for a
                                // pending wait-for-next-neutral-moment delay, if any
                                // is outstanding - see neutralWaitMs()/toActivity()
-let queuedActivity = null;    // spec 3.6: a non-speaking activity change held until an
-                               // in-flight one-shot finishes, rather than dropped or
-                               // acted on mid-gesture
 let transitions = null;       // task 9: the pose-match table from /face/transitions,
                                // or null if none was ever built (rule 4: absent means
                                // frame 0, same as today)
 
-function first(list) { return (list || []).find(s => have.has(s)) || null; }
-
 function clipFor(act) {
+  // While the daemon is driving, it owns this decision for every activity - it
+  // composites onto the frame it believes is up, so the page following anything else
+  // would put a different head under the mouth. The chains below are the v1 fallback
+  // and ADR 0017 still governs them.
+  if (mouthReady()) return mouthClip;
   if (act === "idle") {
+    // While lip-sync is alive, idle IS the driving clip and does not rotate. The
+    // owner's report was that speech "just feels like a different clip starting", and
+    // it literally was one: idle picked at random from idle1/idle2/idle3 while
+    // speaking could only ever be idle2, so four times in five the first word of a
+    // reply swapped the head, the pose and the framing. Returning the same stem here
+    // is what makes the handover a no-op that show() declines to crossfade at all.
+    //
+    // The cost is real and worth stating: idle loses its variety for as long as
+    // lip-sync is on. flourish_arms still fires on its own interval and the mood
+    // one-shots still play, so it is not one clip forever - but it is one loop
+    // between them, where it used to be three. idle2 is the best case for that
+    // (movement 4.77 against idle1's 0.46, which is why it was chosen to drive), and
+    // the fix for the rest is clip linkage rather than a rotation that lands on the
+    // wrong head.
+    if (mouthReady()) return mouthClip;
     const pool = IDLES.filter(s => have.has(s));
     if (!pool.length) return null;
     const cur = showing && showing.dataset.stem;
@@ -161,6 +363,10 @@ function clipFor(act) {
     return (pick.length ? pick : pool)[Math.floor(Math.random() * (pick.length ? pick.length : pool.length))];
   }
   if (act === "speaking") {
+    // Lip-sync drives ONE clip and the crops are that clip's own pixels frame for
+    // frame, so speaking_soft underneath would put a different head around the mouth.
+    // The v1 chain below stays live and is what a dead frame stream falls back to.
+    if (mouthReady()) return mouthClip;
     const loud = loudSince && performance.now() - loudSince > LOUD_HOLD_MS;
     // spec 3.7: speaking_loud -> speaking_soft -> idle. The first two links are
     // this branch's own ordering; reusing FOR_ACTIVITY[act] for the last link keeps
@@ -266,7 +472,13 @@ function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {
   if (!next || next === showing) return;
   const prev = showing;
   next.loop = loop;
-  next.currentTime = poseMatchTime(prev, stem);
+  // The pose-matched moment for an ordinary clip (main's own entry policy). The
+  // driving clip is the exception and it is not this element's to choose: it is
+  // whatever the daemon's clock says (driverAt(), above), because that is the frame
+  // every rendered mouth is being composited into. This element has been sitting
+  // paused since whatever last took the screen off it, so it is stale by exactly that
+  // long, and a stale playhead is a pose the crop was never drawn for.
+  next.currentTime = isDriver(stem) ? driverAt() : poseMatchTime(prev, stem);
   next.style.zIndex = String(++z);       // on top, so fading in covers rather than blends
   if (!REDUCED_MOTION) next.style.transitionDuration = `${fadeMs}ms`; // spec 3.2's fast/slow split
   next.playbackRate = 1;
@@ -293,6 +505,182 @@ function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {
   });
 }
 
+// --- LIP-SYNC OVERLAY: arrival and presentation are two clocks --------------
+// Measured on the assembled stack in a real browser, 120Hz display, and this is the
+// whole reason the transport below is not one line of `mouth.src = "/face/frames"`
+// any more. An <img> fed multipart/x-mixed-replace repaints whenever a PART ARRIVES,
+// and arrival is a socket event: median gap 43.1ms but p90 61.4ms, a quarter of the
+// gaps under 25ms and a quarter over 60ms. The average rate was right - 23.8fps on
+// screen - and the screen was not. 37.4% of frames changed duration by a whole 17ms
+// from the frame before them, and 21% sat there longer than a source frame lasts, up
+// to 83ms. The <video> the page plays at idle never exceeded 41.7ms once, 79.3% of
+// its frames sitting for exactly one source period. Same rate, different regularity,
+// and irregular presentation is what reads as a dropped frame rate - which is exactly
+// what the switch into speech was reported as.
+//
+// So the two clocks are separated: the socket fills a queue, and tick() - which runs
+// on the compositor's own clock - puts ONE frame up per MOUTH_PERIOD_MS. Measured the
+// same way afterwards, on the same stack: 72.5% of frames on the modal dwell against
+// 57.5%, 13.6% of pairs changing duration against 37.4%, the spread of dwell times
+// down from 11.4ms to 4.4ms, and the longest a frame sits down from 83ms to 51ms -
+// 99.9% of them inside a one-refresh band around the source period. Nothing is
+// dropped to get that: 967 of the 968 frames that arrived were drawn.
+//
+// A simulation over the same arrival stamps said this would land at 82% and 16% and
+// that the queue depth below would not matter. Both halves were wrong in the browser
+// and the second one badly - see MOUTH_CATCH_UP. The numbers above are the measured
+// ones; the simulation is recorded here only because it is the reason the queue is
+// shallow and there is no deliberate lead in front of it.
+
+function mouthStream() {
+  // fetch, not an <img>: the parts have to be decoded into something this page can
+  // choose WHEN to draw, and an <img> draws them itself. Everything the <img> was
+  // good at survives - the bytes stay raw (the SSE version this all replaced had to
+  // base64 them, +33% on the wire and a quarter-megabyte JS string 24 times a second)
+  // and createImageBitmap still decodes off the main thread, so the thread running
+  // the crossfades never touches a 180KB JPEG.
+  return readFrames().catch((err) => {
+    console.warn(`face: the frame stream failed - ${err}`);
+  }).finally(() => {
+    // The response ending IS the signal, exactly as the <img>'s `error` was: either
+    // the renderer latched `failed` and the route closed the stream, or it answered
+    // 503. Either way the mouth is not coming back, so clipFor("speaking") goes to
+    // speaking_soft and tick() crossfades to it. No reconnect - the fallback is the
+    // pre-rendered clips, not a retry loop against a latched failure.
+    mouthDead = true;
+    while (mouthQueue.length) mouthQueue.shift().close();
+    // And idle gets its rotation back, which means the clip on screen has to be able
+    // to end again: loops() answers false from here on, but the element it already
+    // set `loop` on will never fire `ended` to ask it. Without this line a renderer
+    // that died at idle leaves the face on idle2 for the rest of the session - not
+    // broken, just quietly stuck on one clip with nothing saying so.
+    if (showing && showing.dataset.stem === mouthClip && activity === "idle") {
+      showing.loop = false;
+    }
+    refreshMouth();
+  });
+}
+
+async function readFrames() {
+  const response = await fetch("/face/frames");
+  if (!response.ok || !response.body) {
+    // Say which of the three reasons it was. /face/frames puts that in the body on
+    // purpose and an <img> could never read it, so this failure used to reach the
+    // owner as a face that quietly stopped lip-syncing and nothing else.
+    const why = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status}: ${why.trim() || "no reason given"}`);
+  }
+  const reader = response.body.getReader();
+  let buf = new Uint8Array(0);
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    const merged = new Uint8Array(buf.length + value.length);
+    merged.set(buf);
+    merged.set(value, buf.length);
+    buf = merged;
+    for (;;) {
+      // By the declared Content-Length, never by scanning for the next boundary: a
+      // JPEG is binary and may contain the boundary bytes, and a scanner would
+      // truncate exactly the frames this exists to show.
+      const head = headerEnd(buf);
+      if (head < 0) break;
+      const length = contentLength(buf, head);
+      if (length === null) return;        // the closing boundary; nothing follows it
+      if (buf.length < head + 4 + length) break;
+      const clip = partClip(buf, head);
+      if (clip && clip !== mouthClip) {
+        // The daemon moved the clip. Follow it so the <video> underneath is the one the
+        // frames are of - it is invisible while the canvas is up, and it is the whole
+        // fallback if the frames stop. No fade: the canvas covers it either way, and a
+        // crossfade here would only cost a decode.
+        mouthClip = clip;
+        if (have.has(clip)) show(clip, { loop: loops(activity), fadeMs: 0 });
+      }
+      decodeFrame(buf.slice(head + 4, head + 4 + length));
+      buf = buf.slice(head + 4 + length);
+    }
+  }
+}
+
+function headerEnd(buf) {
+  // Only the first 256 bytes: a part's headers are short and always sit at offset 0,
+  // because readFrames() drops each part's bytes as it consumes them. Scanning the
+  // whole buffer would mean re-walking a 180KB payload on every socket chunk.
+  const limit = Math.min(buf.length - 3, 256);
+  for (let i = 0; i < limit; i++) {
+    if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function contentLength(buf, head) {
+  const found = /content-length:\s*(\d+)/i.exec(
+    new TextDecoder().decode(buf.subarray(0, head))
+  );
+  return found ? Number(found[1]) : null;
+}
+
+function partClip(buf, head) {
+  // The clip this frame was composited into, off the part's own headers. Travelling
+  // with the frame is the point: an activity event and the frames it implies do not
+  // arrive together, so a second channel would leave the wrong clip under the canvas
+  // for as long as the two disagreed.
+  const found = /x-face-clip:\s*([a-z0-9_]+)/i.exec(
+    new TextDecoder().decode(buf.subarray(0, head))
+  );
+  return found ? found[1] : null;
+}
+
+function decodeFrame(bytes) {
+  const seq = ++mouthSeq;
+  createImageBitmap(new Blob([bytes], { type: "image/jpeg" })).then((bitmap) => {
+    // Decodes run concurrently, so one can finish after a later one. Showing it then
+    // would run the mouth backwards for a frame; dropping it costs 41ms of mouth.
+    // Against mouthQueuedSeq, not mouthSeq: mouthSeq has already counted every frame
+    // still being decoded, so comparing with it would discard all of them.
+    if (seq < mouthQueuedSeq) { bitmap.close(); return; }
+    mouthQueuedSeq = seq;
+    mouthQueue.push(bitmap);
+    while (mouthQueue.length > MOUTH_QUEUE_MAX) mouthQueue.shift().close();
+    // This turn's first frame: the overlay may come up now, and not before
+    // (mouthLive). Here rather than in presentMouth() so refreshMouth() stays off
+    // rAF - a decode callback is a microtask and runs in an occluded window, where
+    // rAF has stopped outright. presentMouth draws this one a frame later, at which
+    // point the fade is a few percent in, so nothing stale is visible on the way.
+    if (!mouthFresh) { mouthFresh = true; refreshMouth(); }
+  }).catch(() => { /* a truncated part; the next one is 41ms away */ });
+}
+
+// One frame per MOUTH_PERIOD_MS, from tick(), so presentation lands on the
+// compositor's clock instead of the socket's. Called from tick() and nowhere else -
+// unlike refreshMouth(), which must NOT be, because a frame arriving late is a
+// cosmetic lag and the mouth failing to leave is a frozen face.
+function presentMouth(now) {
+  if (!mouthQueue.length) return;      // nothing new: hold what is already up
+  // Wait for the slot, unless frames are piling up - a queue past MOUTH_CATCH_UP means
+  // this clock has fallen behind the renderer's, and the way back is to catch up
+  // rather than to drop, which is why nothing here throws a frame away.
+  if (now < mouthDueAt && mouthQueue.length <= MOUTH_CATCH_UP) return;
+  const bitmap = mouthQueue.shift();
+  if (mouth.width !== bitmap.width || mouth.height !== bitmap.height) {
+    // Assigning either dimension clears the canvas, so only on a real change.
+    mouth.width = bitmap.width;
+    mouth.height = bitmap.height;
+  }
+  if (!mouthCtx) mouthCtx = mouth.getContext("2d");
+  mouthCtx.drawImage(bitmap, 0, 0);
+  bitmap.close();                      // ~7MB each; the GC is too slow to be the plan
+  mouthDueAt += MOUTH_PERIOD_MS;
+  // A hole in the stream leaves the slot in the past. Re-anchoring rather than
+  // letting it catch up is the point: without this the frames buffered during the
+  // hole would all go up on consecutive ticks, which is the burst the queue exists
+  // to absorb, arriving on screen instead of in the socket.
+  if (mouthDueAt < now) mouthDueAt = now + MOUTH_PERIOD_MS;
+}
+
 // --- SELF-HEALING PLAYBACK ---------------------------------------------------
 function ensurePlaying() {
   // Two independent ways the browser strands the page (both measured live, not
@@ -312,10 +700,21 @@ function ensurePlaying() {
   // below) calls this every time an ambient window is occluded and shown
   // again, which measured live happens constantly.
   if (!showing) return;
+  // First, and before the paused check rather than inside it. Every route into this
+  // function is a moment the browser may have stopped the clip, and a stopped clip is
+  // the ONLY thing measured to move it off the daemon's clock: between pauses a
+  // playing <video> holds to performance.now() within 0.002 frames over 8 seconds,
+  // while each pause costs 0.2-0.4 frames of playhead that never come back. Doing it
+  // only on the paused branch misses the case this was written for - becoming visible
+  // after the browser has already resumed on its own - and resuming a clip that is a
+  // quarter-second behind the pose the renderer is drawing into is how a backgrounded
+  // tab comes back with the mouth on the wrong face. A redundant seek on an already
+  // correct clip costs a decode; being wrong costs the thing this page is for.
+  if (isDriver(showing.dataset.stem)) showing.currentTime = driverAt();
   if (showing.paused) { showing.play().catch(() => {}); return; }
   if (!oneShotUntil && !pendingWaitTimer) {
     const want = clipFor(activity);
-    if (want && want !== showing.dataset.stem) show(want, { loop: activity !== "idle" });
+    if (want && want !== showing.dataset.stem) show(want, { loop: loops(activity) });
   }
 }
 
@@ -330,6 +729,7 @@ function advance() {
   clearPendingWait();
   oneShotUntil = 0;
   oneShotIsFlourish = false;
+  refreshMouth();               // the gesture is over; the driving clip may be back
   if (queuedActivity !== null) {
     // spec 3.6: a non-speaking activity change arrived mid-one-shot and was held
     // instead of dropped or applied over the gesture; the one-shot has now
@@ -356,7 +756,7 @@ function advance() {
   // entering idle (toActivity arms it) and just after one fired (tick zeroes it).
   if (activity === "idle" && !flourishAt) scheduleFlourish();
   const stem = clipFor(activity);
-  if (stem) show(stem, { loop: activity !== "idle" });
+  if (stem) show(stem, { loop: loops(activity) });
 }
 
 function toActivity(act) {
@@ -385,6 +785,12 @@ function toActivity(act) {
   oneShotIsFlourish = false;
   clearPendingWait();           // any earlier deferred wait is moot now
   scheduleFlourish();
+  // The queue is still dropped at a turn boundary - an ImageBitmap is ~7MB and a frame
+  // for a sentence that has finished is never wanted again - but `mouthFresh` is NOT
+  // cleared with it any more. Clearing it took the canvas off screen until the next
+  // frame decoded, which with the daemon driving every clip is a blink at every
+  // activity change rather than protection from a stale pose. See mouthLive().
+  while (mouthQueue.length) mouthQueue.shift().close();
   const fadeMs = SLOW_FADE_ACTIVITIES.has(act) ? FADE_SLOW_MS : FADE_MS;
   const stem = clipFor(act);
   if (!stem) return;
@@ -402,20 +808,27 @@ function toActivity(act) {
       // NEUTRAL_WAIT_CAP_MS ran out if it timed out first.
       pendingWaitTimer = setTimeout(() => {
         pendingWaitTimer = 0;
-        show(stem, { loop: act !== "idle", fadeMs });
+        show(stem, { loop: loops(act), fadeMs });
       }, waitMs);
       return;
     }
   }
-  show(stem, { loop: act !== "idle", fadeMs });
+  show(stem, { loop: loops(act), fadeMs });
 }
 
 function playOneShot(stem, { flourish = false } = {}) {
   if (!have.has(stem)) return;           // no clip, no expression - never substitute idle
+  // While the daemon is driving, the gesture is ITS clip to play: it queues the mood to
+  // the current clip's own end and the frames arrive already composited onto it, with
+  // the header moving `mouthClip` when they do. Playing it here as well would put a
+  // second, unsynchronised copy of the same expression under the canvas.
+  if (mouthReady()) return;
   oneShotUntil = Infinity;
   oneShotIsFlourish = flourish;  // see toActivity(): only a flourish yields to an
                                  // activity change
   clearPendingWait();            // a fresh one-shot supersedes any pending wait
+  refreshMouth();                // a mood gesture is not the driving clip: a crop cut
+                                 // from idle2 over `amused` is somebody else's mouth
   show(stem, { loop: false });
 }
 
@@ -442,9 +855,20 @@ function scheduleFlourish() {
 }
 
 // --- mouth: envelope -> playbackRate ---------------------------------------
-function tick() {
+function tick(now) {
+  // Re-armed FIRST, so nothing below can end the loop. It used to be re-armed last,
+  // which was safe while the body only nudged playbackRate; presentMouth() draws a
+  // decoded bitmap, and a single throw there would have left a page that looks alive,
+  // never crossfades again and never runs another flourish - permanently frozen, with
+  // no error anyone would go looking for.
+  presentMouth(now);          // early, so the draw has the whole frame budget ahead
   if (showing && activity === "speaking") {
-    const rate = RATE_MIN + (RATE_MAX - RATE_MIN) * env;
+    // 1.0x while lip-sync drives the clip. The crops are frame-for-frame that clip's
+    // own pixels, so modulating its rate slides the pose under the crop away from the
+    // pose the renderer composited into it - v1's envelope IS the mouth, and here it
+    // would be the seam. Pinned rather than skipped so a fallback to speaking_soft
+    // does not inherit whatever rate the driving clip was left on.
+    const rate = mouthReady() ? 1 : RATE_MIN + (RATE_MAX - RATE_MIN) * env;
     if (Math.abs(showing.playbackRate - rate) > 0.01) showing.playbackRate = rate;
     const want = clipFor("speaking");
     if (want && showing.dataset.stem !== want && !oneShotUntil) show(want);
@@ -460,6 +884,12 @@ function tick() {
 // --- wire ------------------------------------------------------------------
 async function boot() {
   const manifest = await fetch("/face/manifest").then(r => r.json()).catch(() => ({ clips: [] }));
+  // Stamped HERE, before the transitions fetch and before priming: `lipsync.position`
+  // is the clip's playhead at the moment the daemon built THAT response, and both of
+  // those take time - priming a dozen clips is hundreds of milliseconds. Anchoring
+  // after them would put the page that far behind the pose every rendered frame is
+  // drawn into.
+  const manifestAt = performance.now() / 1000;
   have = new Set(manifest.clips);
   // 404 (no table built yet) and a network hiccup both leave transitions null,
   // which poseMatchTime() already treats as "fall back to frame 0" (rule 4).
@@ -481,6 +911,22 @@ async function boot() {
     if (!have.size) return;
   }
   await Promise.all([...have].map(prime));
+  // Lip-sync, if the daemon says so. The manifest answers `false` for all three ways
+  // there is no mouth - switch off, no renderer wired, renderer latched failed - so
+  // the page never has to infer it from a failed request, and a driving clip whose
+  // bytes are missing or undecodable is a fourth (videoWidth stays 0 and there is
+  // nothing to lay the crop over). Any of them leaves v1 running, untouched.
+  const ls = manifest.lipsync;
+  const driver = ls && els.get(ls.clip);
+  if (ls && driver && driver.videoWidth) {
+    mouthClip = ls.clip;
+    // The one handover of the daemon's clip clock, and everything downstream of it -
+    // which frame every mouth is composited into, and therefore whether the pose under
+    // the overlay is the pose the crop was drawn for - is measured from here.
+    driverEpoch = manifestAt - (ls.position || 0);
+    mouthStream();
+  }
+
   toActivity("idle");
   requestAnimationFrame(tick);
 
@@ -506,7 +952,9 @@ async function boot() {
   // The other half of self-healing: becoming visible again is exactly when the
   // browser will actually let a previously-withheld play() succeed.
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") ensurePlaying();
+    // refreshMouth too: rAF stopped while hidden, so the clip under the crop may be
+    // the wrong one and the crop itself may be a frame from before the tab was hidden.
+    if (document.visibilityState === "visible") { ensurePlaying(); refreshMouth(); }
   });
 }
 

@@ -44,17 +44,15 @@ PENDING_TASKS = {
 }
 
 PENDING_CLASSES: dict[str, str] = {
-    # Empty. `LocalSpeaker` was the last entry and closing it is what M3b is: the
-    # thing that speaks at the machine now exists and `app.build_proactive_tick`
-    # constructs it.
-    #
-    # And it stays empty through the tool-grant work, which is worth writing down
-    # because that work *is* unreachable and this dict cannot say so: it is not a
-    # class. A grant is rows plus methods on `Store`, which `app.py` already
-    # constructs - so `_constructed` finds it and reports the whole thing wired. The
+    # Empty from `LocalSpeaker` (closed at M3b: the thing that speaks at the
+    # machine now exists and `app.build_proactive_tick` constructs it) through the
+    # tool-grant work below - worth writing down because that work *is*
+    # unreachable and this dict cannot say so on its own: it is not a class. A
+    # grant is rows plus methods on `Store`, which `app.py` already constructs -
+    # so `_constructed` finds it and reports the whole thing wired. The
     # `tool_grant` entries in `PENDING_WIRING` below are the both-directions
-    # declaration instead. Same blind spot `WakeGate`'s comment describes: this file
-    # asks whether something *calls* a name, never with what.
+    # declaration instead. Same blind spot `WakeGate`'s comment describes: this
+    # file asks whether something *calls* a name, never with what.
     #
     # The voice tool frame was the other half of that, until PR-2b. `send_tool_response`
     # was declared in `PENDING_WIRING`, not here, because `GeminiLiveSession(tools=...)`
@@ -63,6 +61,28 @@ PENDING_CLASSES: dict[str, str] = {
     # routes a spoken tool call through `Companion.run_tools` and answers it with
     # `send_tool_response`, and `daemon/app.py`'s `run_voice` offers the session the
     # owner's tool specs, pinned to `allowlist`.
+    #
+    # Empty again, and the four face lip-sync entries that were here are the reason
+    # this direction of the check exists: `Cache`, `PcmRing`, `Slot` and `Renderer`
+    # were built, unit-tested and constructed by nothing, and this file failing on all
+    # four the moment `daemon/app.py` assembled them is what moved them into
+    # WIRED_CLASSES below.
+    #
+    # `LipsyncEngine` was the fifth and is now on neither list, deliberately. It is a
+    # Protocol, so nothing ever constructs it by name: `daemon/app.py` calls
+    # `face_lipsync.engine.load(...)` and gets an `MlxEngine`, and `_constructed`
+    # cannot see either half of that - not a Protocol nobody instantiates, and not a
+    # class reached through a factory function. Same structural blind spot as
+    # `FaceState`/`OneShot` and `CaptureChannel` above, so listing it here would fail
+    # the way a stale PENDING entry does, and listing `MlxEngine` in WIRED_CLASSES
+    # would fail because no file writes `MlxEngine(`. What covers it instead is
+    # `test_the_lipsync_path_is_reachable_from_settings` below, which asserts the two
+    # things a factory-built engine can still be checked for: that `app.py` calls the
+    # loader, and that it reads the switch.
+    #
+    # `ClipQueue` was here until the multi-clip plan's task 4, and this test failing
+    # on it is what said so: `daemon/app.py:_lipsync_loop` builds one per render loop
+    # now. Deleting the entry is the file working.
 }
 
 PENDING_WIRING = {
@@ -111,6 +131,28 @@ Not a "load-bearing seams only" list. The file's whole subject is built-tested-
 unreachable, and picking which unreachable symbols to track by how important they
 feel is how the untracked one turns out to be the one that mattered - here, the
 rule-12 visibility read."""
+
+PENDING_IMPORTS: dict[str, str] = {
+    # `face_clips` was the first and only entry, declared by the multi-clip plan's task
+    # 3 and closed by its task 4: `daemon/app.py` imports `wanted` and `ClipQueue` and
+    # asks them which clip is up once per publish tick. This test failing on it is what
+    # said the gap had closed, which is the whole reason the dict exists - so it stays,
+    # empty, rather than being deleted along with its one entry.
+}
+"""A whole module under `daemon/` that nothing under `daemon/` imports.
+
+The third shape of the same defect, and it needs its own dict because neither of the
+two above can hold it. `PENDING_CLASSES` only holds types, and `PENDING_WIRING` matches
+on a bare substring - which `daemon/face_clips.py:wanted` cannot survive. "wanted" is a
+word this codebase writes in nine other files (a local in `app.py`, prose in
+`timesense.py`), and even narrowing the key to "wanted(" still catches
+`voice/wake.py`'s `self._floor_wanted()`. Widening `allowed` until those pass would put
+`app.py` - the one file whose mention is the thing being waited for - on the list of
+files allowed to mention it, which is the check deleting itself.
+
+A module name collides with nothing, so that is what is tracked. The value is the
+owning milestone, read the same way as every dict above; the module's own file is the
+only place allowed to mention it, and no allowlist is needed to say so."""
 
 WIRED_CLASSES = (
     # What both endpoints do their work through. Named here because a capability
@@ -202,6 +244,17 @@ WIRED_CLASSES = (
     # listing them here would just fail the way a stale PENDING entry does.
     "FaceBus",
 
+    # The face's second mouth. All five were declared pending above until
+    # `daemon/app.py:_build_lipsync` assembled them, which is the shape this file is
+    # for: a render path verified against MuseTalk's own pipeline at cosine 0.999707,
+    # unit-tested against a fake engine, and reachable from nothing. `FrameClock` is
+    # here without ever having been pending - it was written in the same plan and the
+    # declaration missed it, which is the reason to name it now rather than quietly.
+    "Cache",
+    "PcmRing",
+    "Slot",
+    "Renderer",
+    "FrameClock",
     # The local Ollama the daemon starts at boot when nothing else already answers
     # (`daemon/ollama_process.py`). `create_app` only ever takes one by injection -
     # on purpose, so every test that does not pass one stays off the network - so
@@ -395,6 +448,31 @@ def test_declared_wiring_gaps_are_still_gaps(name: str) -> None:
     )
 
 
+@pytest.mark.parametrize("name", sorted(PENDING_IMPORTS))
+def test_declared_module_gaps_are_still_gaps(name: str) -> None:
+    """The other direction for a module nothing imports yet.
+
+    When the plan's task 4 writes `from daemon import face_clips` this fails, which is
+    the reminder to delete the entry rather than leave a closed gap declared open. The
+    module's own file is excluded and nothing else is: a policy module is reachable
+    exactly when some other file under `daemon/` names it.
+    """
+    importers = sorted(
+        path.name for path, text in _sources() if name in text and path.stem != name
+    )
+    assert not importers, (
+        f"daemon/{name}.py is now named in {importers} - remove it from PENDING_IMPORTS. "
+        f"{PENDING_IMPORTS[name]}"
+    )
+
+
+def test_every_declared_module_gap_names_a_real_module() -> None:
+    """Same reason as the seam check below: a gap declared against a module nothing
+    defines cannot close, and would sit here reading as work someone still owes."""
+    for name in PENDING_IMPORTS:
+        assert (DAEMON / f"{name}.py").exists(), f"daemon/{name}.py does not exist"
+
+
 def test_every_declared_wiring_gap_names_a_real_seam() -> None:
     """A gap declared against a name nothing defines is a gap that cannot close,
     and it would sit here reading as work someone still owes."""
@@ -506,10 +584,32 @@ def test_the_tool_layer_is_reachable_from_settings() -> None:
     assert "browser_app" in app
 
 
+def test_the_lipsync_path_is_reachable_from_settings() -> None:
+    """The switch, the loader and the sink, in the one file allowed to assemble them.
+
+    Written the same way as the tool check above and for the same reason - "a setting
+    nothing reads is a setting that lies" - but it also carries what the class checks
+    structurally cannot. The model behind `LipsyncEngine` is built by a *function*
+    (`face_lipsync.engine.load`), so no `_constructed` lookup can see it; a whole
+    render path could sit there with the switch on and nothing would fail. These four
+    lines are what would.
+    """
+    app = (DAEMON / "app.py").read_text(encoding="utf-8")
+    assert "face_lipsync_enabled" in app, "a setting nothing reads is a setting that lies"
+    assert "load_engine" in app, "the MLX engine is built by a factory, not a class"
+    assert "face_frames" in app, "/face/frames reads an injected source; app.py injects it"
+    assert "pcm_sink" in app, "the ring is fed from SpeechClock through the voice path"
+
+
 def test_every_pending_entry_names_its_milestone() -> None:
     """A gap without an owner is just a gap."""
     wiring = {name: reason for name, (reason, _allowed) in PENDING_WIRING.items()}
-    for label, reason in (*PENDING_TASKS.items(), *PENDING_CLASSES.items(), *wiring.items()):
+    for label, reason in (
+        *PENDING_TASKS.items(),
+        *PENDING_CLASSES.items(),
+        *PENDING_IMPORTS.items(),
+        *wiring.items(),
+    ):
         assert re.search(r"M\d", reason), f"{label} is pending with no milestone: {reason!r}"
 
 

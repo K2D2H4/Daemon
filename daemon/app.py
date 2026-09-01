@@ -12,12 +12,18 @@ to keep `import daemon.app` cheap.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import random
 import secrets
 import sys
+import time
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,6 +45,7 @@ from daemon.config import (
     Settings,
 )
 from daemon.face import MOOD_TOOL, MOOD_VOICE_INSTRUCTION
+from daemon.face_clips import ClipQueue, wanted
 from daemon.llm.base import Provider, ToolSpec
 from daemon.llm.gateway import LLMGateway
 from daemon.loop import ConversationLoop
@@ -51,6 +58,9 @@ from daemon.tasks import Task
 
 if TYPE_CHECKING:  # the wake gate, used only in the signatures below
     from daemon.face import FaceBus
+    from daemon.face_lipsync import Cache
+    from daemon.face_lipsync.render import Driver, FrameClock, Renderer
+    from daemon.face_lipsync.ring import PcmRing, Slot
     from daemon.voice.base import AudioIO, SpeechRecognizer
     from daemon.voice.wake import WakeGate
 
@@ -174,6 +184,13 @@ def create_app(
     app.state.voice_runtime = None
     app.state.wake_gate = None
     app.state.mcp = None
+    # The lip-sync renderer and the sink that feeds it, both absent until the
+    # lifespan builds them and both absent for good on an install that never turns
+    # the switch on. Declared here rather than left to `getattr` so that the two
+    # readers - `face_routes._lipsync` and `_wake_round` - see the same "off" whether
+    # or not a lifespan ever ran (tests build the app without one).
+    app.state.face_frames = None
+    app.state.face_pcm_sink = None
     # Serialises the admin's persist-then-(dis)connect MCP routes so two of them
     # cannot interleave the `mcp.json` read-modify-write and lose an update
     # (daemon/admin/routes.py, finding #6). Constructed here, not in the lifespan,
@@ -537,6 +554,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             _boot_catchup(settings, catchup_lock), name="reflection-boot-catchup"
         )
 
+    # The face's second mouth, if it is switched on and assembled. Built before the
+    # wake gate below because that is what opens a spoken conversation, and the sink
+    # has to be on `app.state` before the first one does. Synchronous on purpose: it
+    # realises 1.62GB of weights (measured 693ms), and paying that at startup is
+    # honest where paying it on the first spoken word would land inside the reply the
+    # owner is waiting for. Independent of the channel and the writer - the face is
+    # served whether or not Telegram built.
+    lipsync = _build_lipsync(settings, app.state.face)
+    if lipsync is not None:
+        app.state.face_frames = lipsync.frames
+        app.state.face_pcm_sink = lipsync.sink
+        app.state.lipsync_task = asyncio.create_task(lipsync.run(), name="face-lipsync")
+
     # The always-on gate. This is what makes "it hears me when I call it" a property
     # of the resident process rather than of a command somebody remembered to run -
     # `daemon wake test` proves the gate works, and this is what uses it.
@@ -588,6 +618,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             "wake_task",
             "reflection_boot_task",
             "delegation_task",
+            "lipsync_task",
         ):
             pending = getattr(app.state, name, None)
             if pending is None:
@@ -1157,6 +1188,850 @@ async def build_persona_evolution(
     )
 
 
+# --- the face's second mouth ------------------------------------------------
+#
+# Everything from here to `_build_lipsync` is assembly, which is why it is in this
+# file and not in `daemon/face_lipsync/` (CONTRACTS 4: that package imports nothing
+# from `daemon/` and nothing outside this module imports it). What it assembles is
+# described in docs/superpowers/specs/2026-08-26-face-lipsync-design.md.
+
+LIPSYNC_FIRST_CLIP = "idle2"
+"""Which prepared clip the face starts on, before the first boundary moves it.
+
+`idle2` when it is prepared, else whichever sorts first. It is the best case for a
+driving clip among the idles - movement 4.77 against `idle1`'s 0.46, which is why it was
+the one clip the single-clip build drove - and starting there means the first thing a
+page sees is the clip every earlier judgement was made against. Nothing else depends on
+it: `face_clips.wanted` moves the face at the first clip boundary if the activity says
+otherwise."""
+
+LIPSYNC_ARTEFACTS = ("frames.npy", "masks.npz", "boxes.json", "latents.safetensors")
+"""What `evals/face_lipsync_prepare.py` writes, and all four are required.
+
+A directory under `<data_dir>/face/lipsync/` is a driveable clip when it has all four
+AND `<data_dir>/face/<name>.mp4` exists. Both halves matter. `models/` and a spike's
+output directory have none of them; `idle2-raw-backup/` has three - it is the box
+backup, kept so a re-smooth can be undone without the prep venv - and would otherwise
+become a clip named after a backup. The mp4 requirement keeps the driveable set equal to
+the servable set: `face_routes.py` serves `/face/clips/{name}` off that file, and it is
+what the page falls back to when the renderer latches `failed`.
+
+Ten clips are prepared today. There is no constant naming them here on purpose: which
+caches exist is the owner's data, and rule 4 is omission - a clip that was never
+prepared is absent, never interpolated or substituted."""
+
+LIPSYNC_WHISPER_REPO = "mlx-community/whisper-tiny-mlx"
+"""The audio encoder, by HuggingFace repo id rather than a path.
+
+`mlx_whisper` resolves and caches it itself (~150MB), so unlike the UNet and TAESD
+this one is not something the owner lays out by hand - which is also why a missing
+cache here shows up as a download on first boot rather than as the "no weights"
+degradation below."""
+
+LIPSYNC_CATCHUP_LIMIT = 64
+"""How many frame indices one pass may discard to stay level with the audio.
+
+`FrameClock.due` hands back one frame per call and deliberately never skips - it says
+so, and its reason is that jumping forward after a hitch is worse than a moment of
+catching up. That is right about a hitch and wrong about a **structural** deficit, and
+the first build had one: with the composite and the JPEGs in sequence behind the model
+step, a two-frame step cost 86.6ms against the 83.3ms two frames are worth, so the
+loop sustained 20.4fps where the clock granted 24 and consuming one grant per tick
+drifted the mouth 34 frames - 1.4 seconds - over 9 seconds of speech. Not a mouth
+slightly behind: a different sentence.
+
+That deficit is gone (`render.py:Renderer` splits the model half from the CPU half and
+`_lipsync_loop` runs them on two threads), so this now absorbs a *hitch* rather than a
+structural shortfall and is normally a no-op - the newest grant is the next one in
+sequence. What it still buys is the thing a hitch would otherwise cost permanently:
+the mouth stays at the audio front, and the rendered driving-frame index keeps
+tracking wall-clock elapsed the way the page's own `<video>` playhead does - measured
+at the socket, the overlay now sits a median **0.14 frames** behind that playhead
+where it used to sit 5.81 behind it (`render.py:DISPLAY_LEAD` closed the rest).
+
+The limit is a bound on one pass's work, not a policy: `due` returns None as soon as it
+reaches audio that has not arrived, so the drain ends on its own. 64 is two and a half
+seconds of frames - enough to absorb a long stall, small enough that a wild `origin`
+cannot spin here."""
+
+LIPSYNC_RING_SECONDS = 60.0
+"""How much spoken audio the PCM ring holds, and it is sized by *utterance* length
+rather than by the 2.2s the model reads.
+
+`PcmRing.window` needs `audio.CONTEXT_MS` (2.0s) of lead-in plus the 200ms window, and
+a ring shorter than that truncates the context silently - the features degrade and
+nothing raises. That is the floor. This is 27x the floor because of a second
+interaction that binds much harder: once the ring is full it drops samples on every
+feed, `PcmRing.origin` creeps forward as it does, and `FrameClock.due` treats 0.2s of
+cumulative movement as a new turn and restarts its frame count at 0. Mid-utterance
+that would point the frame index at the oldest audio still held and leave the mouth a
+whole ring-length behind the sound for the rest of the turn. So the ring has to
+outlast a single spoken reply, not a single window.
+
+The cost is a `np.concatenate` of the whole ring per chunk: 60s of 24kHz mono int16 is
+2.9MB, which is ~0.3ms of memcpy against audio chunks that arrive at most a few dozen
+times a second. Cheap enough that buying a wide margin here is better than tuning it.
+
+Flagged rather than fixed: the frame counter restarting on a ring that is merely full
+is a defect in `FrameClock`, which this task may not edit (see the report)."""
+
+
+@dataclass(frozen=True, slots=True)
+class Lipsync:
+    """The assembled lip-sync path: what the transport reads, what the voice path
+    feeds, and the loop that turns one into the other."""
+
+    frames: Any
+    """Satisfies `face_routes.LipsyncFrames`. Goes on `app.state.face_frames`."""
+
+    sink: Callable[[bytes, float], None]
+    """`(chunk, audible_at)`, handed to `VoiceConversation(pcm_sink=...)` and called
+    from `SpeechClock.fed`. Thread-safe by being a `deque.append` and nothing else -
+    see `_build_lipsync`."""
+
+    run: Callable[[], Awaitable[None]]
+    """The render loop, as a coroutine the lifespan turns into one task."""
+
+
+@dataclass
+class _Driving:
+    """What the two halves of the render loop agree is on screen right now.
+
+    Mutable and shared on purpose. `publish` reads it every frame interval to index the
+    clip and to find that clip's encoded stills; the model half writes it when
+    `ClipQueue` says a boundary has been reached. Both run on the event loop, so the
+    swap is never seen half-done - and it is written in ONE place (the model half),
+    because `Renderer.switch` mutates renderer state that the executor threads read.
+    """
+
+    driver: Driver
+    """The only field, and it used to carry this clip's stills as pre-encoded JPEGs too.
+
+    They are encoded on demand now, one per idle tick, because ten clips turned that
+    bill over: a clip's whole strip is a **1051ms** burst, once per clip, and the owner
+    felt it as "첫 발화 시작할 때 아주 잠깐 멈추는 느낌" - measured at the socket as a
+    539.8ms gap. See `render.encode_still`, which carries why the burst and not the disk
+    is what costs."""
+
+
+class _LipsyncFrames:
+    """`face_routes.LipsyncFrames` over a `Renderer`, its `Slot` and its `ClipClock`.
+
+    Four members and no more, which is the protocol's whole point. It exists because
+    the three objects that hold those members are deliberately separate: `Slot` is
+    `put`/`get` with no idea what wrote it, `Renderer` knows whether it has given up,
+    and `ClipClock` knows only where the driving clip is. Joining them is assembly, so
+    it happens here.
+    """
+
+    def __init__(self, *, renderer: Renderer, slot: Slot, driving: _Driving) -> None:
+        self._renderer = renderer
+        self._slot = slot
+        self._driving = driving
+        """The live holder, not a copy of its name: the clip changes while this object
+        is on `app.state.face_frames`, and a page told the wrong one falls back to a
+        `<video>` of a clip the frames are not of."""
+        # No box. Every JPEG is the whole composited frame now, so there is no
+        # rectangle for the page to place - and reading `renderer.frame_box` here after
+        # it was removed would have been an AttributeError on the first real build,
+        # which no test caught because they all inject a fake renderer.
+
+    @property
+    def failed(self) -> bool:
+        """Read through rather than copied: the renderer latches this mid-utterance
+        and the transport has to see it on the next poll, not at the next restart."""
+        return self._renderer.failed
+
+    def get(self) -> bytes | None:
+        return self._slot.get()
+
+    def position(self) -> float:
+        """Where the driving clip is now, in seconds, for the page to seek to.
+
+        Read at the moment the manifest is built rather than cached, and the route is
+        `async`, so `loop.time()` here is the same clock the renderer stepped against
+        a millisecond ago. Over loopback the page stamps its own arrival ~2ms later,
+        which is a twentieth of a frame.
+        """
+        return self._driving.driver.clip.position(asyncio.get_running_loop().time())
+
+    @property
+    def clip(self) -> str:
+        """Which clip the frames are currently of. Read through, never cached."""
+        return self._driving.driver.name
+
+
+def _prepared_clips(root: Path, face_dir: Path) -> list[str]:
+    """Which clips under `root` are driveable, sorted so a log line is stable.
+
+    Both conditions, for the reasons `LIPSYNC_ARTEFACTS` gives. Nothing is loaded here -
+    this only decides what is worth loading, so a directory that fails is never opened.
+    """
+    found = []
+    for entry in sorted(root.iterdir() if root.is_dir() else []):
+        if not entry.is_dir():
+            continue
+        if not all((entry / name).is_file() for name in LIPSYNC_ARTEFACTS):
+            continue
+        if not (face_dir / f"{entry.name}.mp4").is_file():
+            continue
+        found.append(entry.name)
+    return found
+
+
+def _load_lipsync_cache(directory: Path) -> tuple[Cache, float]:
+    """One prepared driving clip off disk, plus the fps it was shot at.
+
+    Written by `evals/face_lipsync_prepare.py`, by hand, once per clip. Two things
+    here are its constraints rather than choices:
+
+    `frames.npy` is memory-mapped. It is 1.01GB for `idle2`'s 193 frames of
+    1080x1620, and the renderer touches one frame per model step - paging it in on
+    demand is the difference between 1GB of resident memory and a few MB.
+
+    `masks.npz` is a pile of differently-shaped arrays, not a stack, because
+    MuseTalk derives each frame's blend region from that frame's own face box (608
+    to 726px square across this clip). `Cache.masks` is annotated `np.ndarray` and
+    gets a list; `composite` indexes it per frame and never treats it as one array.
+    That annotation is in a file this task may not edit, so it is named here rather
+    than corrected.
+    """
+    import numpy as np
+
+    from daemon.face_lipsync import Cache
+
+    meta = json.loads((directory / "boxes.json").read_text(encoding="utf-8"))
+    frames = np.load(directory / "frames.npy", mmap_mode="r")
+    # Read it once, here, so the render path never waits on a disk. Measured: the
+    # per-step CPU tail (two composites, two JPEG encodes, and two 5.2MB frame reads)
+    # is 11ms on frames the page cache already holds and 16-32ms on frames it does
+    # not, and that variance lands straight on a 41.67ms budget. Worse, it compounds -
+    # a slower step drops more frames, which scatters the next reads further apart,
+    # which slows the step again: a 20fps mouth measured 12fps once the access pattern
+    # stopped being sequential. One 1GB sequential read at startup costs a few hundred
+    # milliseconds and takes the disk out of the loop for good.
+    #
+    # `sum` because it is one pass nothing can optimise away, `uint64` so numpy does
+    # not promote per element. The array stays memory-mapped: this warms the page
+    # cache, it does not copy a gigabyte onto the heap.
+    frames.sum(dtype=np.uint64)
+    with np.load(directory / "masks.npz") as archive:
+        # Sorted, not `archive.files` order: the keys are the frame index zero-padded
+        # to six digits, and a mask off by one frame is a paste off by one face.
+        masks = [archive[name] for name in sorted(archive.files)]
+    cache = Cache(
+        frames=frames,
+        boxes=[tuple(box) for box in meta["boxes"]],
+        crop_boxes=[tuple(box) for box in meta["crop_boxes"]],
+        masks=masks,
+    )
+    return cache, float(meta["fps"])
+
+
+def _queue_pcm(queued: deque[tuple[bytes, float]], chunk: bytes, audible_at: float) -> None:
+    """`SpeechClock`'s `pcm_sink`: one chunk and the moment it becomes audible.
+
+    A named two-argument function rather than the `deque.append` this started as -
+    `append` takes exactly one argument, so the sink raised `TypeError` on the very
+    first chunk of the very first spoken turn and the mouth never moved. Nothing in
+    the unit suite could see it: the sink was only ever compared by identity, and the
+    render loop's tests put tuples in the queue themselves. `partial(_queue_pcm, q)`
+    is callable the way the clock calls it, and `tests/test_face_lipsync_wiring.py`
+    now drives a real `SpeechClock` into it.
+    """
+    queued.append((chunk, audible_at))
+
+
+def _build_lipsync(settings: Settings, face: FaceBus) -> Lipsync | None:
+    """Assemble the lip-sync path, or `None` and one log line saying why not.
+
+    Three ways this returns `None` and all three are ordinary installs, not faults:
+    the switch is off (the default), the weights are not laid out, or no clip cache
+    has been prepared. Each leaves the face playing the pre-rendered clips of v1 -
+    which are not a fallback, they are the other half of the face - and
+    `face_routes._lipsync_unavailable` is what tells a human which one it was.
+
+    A *failure* is different from an absence and is handled elsewhere: the renderer
+    latches `failed`, logs once, and the loop below stops. Never a traceback per
+    frame at 24Hz.
+    """
+    if not settings.face_lipsync_enabled:
+        return None
+    root = Path(settings.data_dir) / "face" / "lipsync"
+    models = root / "models"
+    needed = {
+        "the MLX UNet": models / "unet.safetensors",
+        "its config": models / "musetalk.json",
+        "the TAESD decoder": models / "taesd.safetensors",
+    }
+    missing = {what: path for what, path in needed.items() if not path.exists()}
+    if missing:
+        # One line, naming the first thing that is absent and the directory it belongs
+        # in. Not a warning per file: an install that has fetched none of this would
+        # print three, and the owner's question is "where do I put them", once.
+        what, path = next(iter(missing.items()))
+        logger.info(
+            "face: lip-sync is on but not assembled - %s is missing (%s). The face "
+            "will play its pre-rendered clips. Weights go under %s; a driving clip's "
+            "cache is built by `python3 -m evals.face_lipsync_prepare`.",
+            what,
+            path,
+            models,
+        )
+        return None
+    # `root.parent` rather than importing `face_routes.face_dir`: it is the same
+    # `<data_dir>/face`, and this module already computed it one line above.
+    prepared = _prepared_clips(root, root.parent)
+    if not prepared:
+        # Separate from the weights above because the answer is a different command.
+        # Named as its own absence rather than folded into the seven-file list this
+        # used to print: with the weights in place and no cache, the owner has one
+        # thing left to run and it is not a download.
+        logger.info(
+            "face: lip-sync is on and the weights are in place, but no clip under %s "
+            "has a prepared cache with a matching mp4. The face will play its "
+            "pre-rendered clips. A cache is built by `python3 -m "
+            "evals.face_lipsync_prepare <clip>.mp4 --out %s/<clip>`.",
+            root,
+            root,
+        )
+        return None
+
+    started = time.perf_counter()
+    try:
+        # Inside the try, and every one of them: `mlx` has no Linux wheel and `cv2`
+        # comes from an optional extra, so an install with the switch on and the files
+        # in place but the `face` extra missing has to lose the mouth - not the
+        # process. Above the try these were an ImportError out of the lifespan, which
+        # is a daemon that will not start because of a face.
+        from daemon.face_lipsync.audio import CONTEXT_MS
+        from daemon.face_lipsync.engine import load as load_engine
+        from daemon.face_lipsync.render import (
+            ClipClock,
+            Driver,
+            FrameClock,
+            Renderer,
+        )
+        from daemon.face_lipsync.ring import PcmRing, Slot
+        from daemon.voice.audio import OUTPUT_SAMPLE_RATE
+
+        caches = {name: _load_lipsync_cache(root / name) for name in prepared}
+        rates = {fps for _, fps in caches.values()}
+        assert len(rates) == 1, (
+            f"the prepared clips were shot at different rates ({sorted(rates)}), and "
+            "one FrameClock paces them all - reprepare them at one fps"
+        )
+        fps = rates.pop()
+        engine = load_engine(
+            unet_weights=models / "unet.safetensors",
+            unet_config_json=models / "musetalk.json",
+            taesd_weights=models / "taesd.safetensors",
+            whisper_repo=LIPSYNC_WHISPER_REPO,
+            # One engine, one latent table per clip. The UNet, TAESD and whisper
+            # weights are 1.6GB and say nothing about which clip they are drawing; the
+            # latents are 1.25-3.02 MiB measured over these ten, so holding them all
+            # is ~25MB and a switch is a dict lookup rather than a reload.
+            latents={
+                name: root / name / "latents.safetensors" for name in prepared
+            },
+            # The rate the ring holds and therefore the rate the engine has to
+            # resample from - the voice path's playback rate, not whisper's 16kHz.
+            # `resample_to_whisper` refuses anything else rather than stretching the
+            # mouth by 1.5x in silence.
+            sample_rate=OUTPUT_SAMPLE_RATE,
+        )
+        assert LIPSYNC_RING_SECONDS * 1000.0 >= CONTEXT_MS + 200.0, (
+            "the ring is shorter than the window plus its lead-in, which truncates "
+            "the context silently - see LIPSYNC_RING_SECONDS"
+        )
+        ring = PcmRing(
+            sample_rate=OUTPUT_SAMPLE_RATE, width=2, seconds=LIPSYNC_RING_SECONDS
+        )
+        slot = Slot()
+        # The page's playhead, as a function of `loop.time()`. Anchored here, once, so
+        # the clip's position is a small readable number rather than a remainder of
+        # seconds-since-boot; any fixed instant would define the same clock. There is a
+        # running loop - the lifespan is what calls this - and it has to be that loop's
+        # clock, because that is the one the audio is stamped with.
+        first = LIPSYNC_FIRST_CLIP if LIPSYNC_FIRST_CLIP in caches else prepared[0]
+        cache, _ = caches[first]
+        driver = Driver(
+            name=first,
+            cache=cache,
+            clip=ClipClock(
+                fps=fps,
+                frames=len(cache.boxes),
+                epoch=asyncio.get_running_loop().time(),
+            ),
+        )
+        renderer = Renderer(engine=engine, driver=driver, ring=ring)
+        driving = _Driving(driver=driver)
+        # How long each clip runs, which is the only thing `ClipQueue` needs to know
+        # where a boundary is. Read off the caches rather than tabulated: the
+        # durations are the owner's footage, not a constant of this design.
+        lengths = {
+            name: len(clip_cache.boxes) / clip_fps
+            for name, (clip_cache, clip_fps) in caches.items()
+        }
+        clock = FrameClock(fps=fps)
+        # One model step on THIS thread before the render loop ever uses another one,
+        # and it is a requirement rather than a warm-up. **MLX aborts the process** -
+        # `libc++abi: terminating due to uncaught exception of type
+        # std::runtime_error: There is no Stream(gpu, 0) in current thread`, not a
+        # Python exception anything could catch - if the first UNet/TAESD step of the
+        # process runs on a thread other than the one that loaded the weights.
+        # Measured 2026-08-26 on mlx 0.32.2: reproducible on every run, and neither
+        # `mx.default_stream(mx.gpu)`, a trivial `mx.eval`, nor a whisper-encoder pass
+        # on the main thread is enough - only a full `mouths` call is. After it, any
+        # thread works indefinitely.
+        #
+        # `engine.mouths` and not `renderer.render`, deliberately: a render would
+        # publish a silence-conditioned frame into the slot and hold its batch partner
+        # for the first tick of the first real utterance. This leaves both empty. The
+        # window comes from the ring while it is still empty, so it is the right
+        # length and all zeros without inventing a shape here.
+        silent = ring.window(frame_index=0, fps=fps, origin=0.0, context_ms=CONTEXT_MS)
+        engine.mouths([silent, silent], [0, 0], clip=first)
+    except Exception:
+        # Loud and once. A broken cache, a mismapped weight file or a missing extra
+        # must cost the mouth and nothing else: the voice session, the text loop and
+        # the pre-rendered clips all still work, and this process has to keep running
+        # for them.
+        logger.exception("face: lip-sync failed to load; the face will play its clips")
+        return None
+    # The sink queues; the render loop drains. It is called from `SpeechClock.fed` on
+    # the event loop, while `PcmRing.window` is read inside the render thread below,
+    # and the ring has no lock: `feed` rebinds `_samples` and then advances `_start`,
+    # so a reader landing between those two statements gets new samples against a
+    # stale origin - a window off by one chunk, which is a mouth off by one chunk.
+    # Queueing here instead means the ring is only ever touched by the loop that owns
+    # the render, and only while no render is in flight. `deque.append`/`popleft` are
+    # atomic, so the handover needs no lock of its own.
+    queued: deque[tuple[bytes, float]] = deque()
+    height, width = cache.frames[0].shape[:2]
+    logger.info(
+        "face: lip-sync ready - %d clips (%s), starting on %s, %.3ffps, %dx%d, "
+        "loaded in %.0fms",
+        len(prepared),
+        ", ".join(prepared),
+        first,
+        fps,
+        width,
+        height,
+        (time.perf_counter() - started) * 1000.0,
+    )
+
+    async def run() -> None:
+        await _lipsync_loop(
+            face,
+            renderer,
+            clock,
+            ring,
+            queued,
+            slot,
+            driving,
+            caches,
+            lengths,
+            fps=fps,
+        )
+
+    return Lipsync(
+        frames=_LipsyncFrames(renderer=renderer, slot=slot, driving=driving),
+        sink=partial(_queue_pcm, queued),
+        run=run,
+    )
+
+
+async def _lipsync_loop(
+    face: FaceBus,
+    renderer: Renderer,
+    clock: FrameClock,
+    ring: PcmRing,
+    queued: deque[tuple[bytes, float]],
+    slot: Slot,
+    driving: _Driving,
+    caches: dict[str, tuple[Cache, float]],
+    lengths: dict[str, float],
+    *,
+    fps: float,
+) -> None:
+    """One frame into the `Slot` per frame interval while the daemon is speaking.
+
+    In-process, not a subprocess: CONTRACTS 9 allows the former explicitly and the
+    model has to read audio this process is holding.
+
+    **Two halves, because one cannot be both.** Producing a frame takes longer than
+    displaying one - a model step covers `BATCH` frames and costs ~73ms against the
+    83.3ms two frames are worth - so a single loop that both stepped and published
+    could only publish between steps, in pairs. That is what the first build did, and
+    at the socket it measured 20.1fps arriving as pairs at 10Hz (gap median 81.6ms
+    where a frame is 41.67ms): a head moving smoothly over a mouth that stutters,
+    which is what the owner read as the picture getting worse the moment it spoke. So
+    `_step` produces into `ready` and `_publish` drains it on the clock. Nothing
+    serial fixes this - measured, releasing the held frame a whole interval later
+    instead made the cycle 117ms and dropped the socket to 14.2fps.
+
+    **The model step runs in a thread, the decisions do not.** ~73ms of UNet and
+    TAESD run inline would hold the event loop for most of every 83ms - starving the
+    voice websocket, the audio pump and the activity stream, which is the difference
+    between a lip-synced face and a stuttering conversation. Draining `queued` and
+    asking `FrameClock` stay here, on the loop, because `loop.time()` is the clock the
+    audio is stamped with and because it keeps the ring single-threaded (see the
+    sink's comment in `_build_lipsync`).
+
+    **Two single-worker executors, not `asyncio.to_thread`.** Two workers because the
+    CPU tail has to overlap the next model step or the ceiling is 42ms a frame instead
+    of 36.6 (`render.py:Renderer`), and *single*-worker each because `Renderer.encode`
+    reuses one frame buffer and MLX is only safe off the loading thread once
+    `_build_lipsync`'s warm-up step has run - one thread of our own makes that a fact
+    about this loop rather than about whichever pool worker happened to be free. Not
+    the shared default executor either: a 73ms step queued in it delays whatever else
+    the process offloads there (starlette runs sync route handlers and file responses
+    through it).
+
+    **`loop.time()` for `now`, `origin` and the publish grid.**
+    `daemon/voice/conversation.py` stamps every chunk with it deliberately (its
+    `_playback_until` note), and `daemon.clock.now()` here would type-check, run, and
+    put the mouth an arbitrary offset from the sound.
+
+    **Only while `speaking`.** The measured throughput has 13% of headroom on a real
+    duty cycle and none on a continuous run, and the idle windows are also where
+    `release_lipsync_memory` keeps resident memory flat - which the spec's section 7
+    calls a requirement rather than an optimisation, because without it the spike's
+    drift came back.
+
+    **Catches at the top level, once.** A background task that raises is logged by
+    nobody and leaves a schedule reading as healthy forever - the failure this
+    project's own brief names. Both `Renderer` halves already swallow their own
+    failure into `failed`; this is for everything else, and the publisher carries the
+    same guard because a task nobody awaits is exactly the shape that goes unnoticed.
+    """
+    from daemon.face_lipsync.render import (
+        BATCH,
+        RELEASE_FRAMES,
+        ClipClock,
+        Driver,
+        encode_still,
+    )
+
+    loop = asyncio.get_running_loop()
+    interval = 1.0 / fps
+    ready: asyncio.Queue[bytes] = asyncio.Queue()
+    turn = 0
+    available = frozenset(caches)
+    clip_queue = ClipQueue(
+        current=driving.driver.name,
+        ends_at=loop.time()
+        + lengths[driving.driver.name]
+        - driving.driver.clip.position(loop.time()),
+        lengths=lengths,
+    )
+    """When the clip on screen next reaches its own end, on `loop.time()`'s clock.
+
+    The remainder, not the length: the clock was anchored in `_build_lipsync` and this
+    loop starts a moment later, so the first boundary is what is LEFT of the clip.
+    Writing it as `position() + length` types and runs and is wrong by however long this
+    process has been up - `position` is a place inside the clip and `at` is seconds since
+    boot, so `due()` found every boundary already past and rolled its own `while` forward
+    a million times on the first tick. The pacing tests caught it as a dropped frame."""
+    shots: deque[str] = deque()
+    """One-shots the bus published, waiting for a boundary. A deque and not a slot
+    because two moods inside one clip is ordinary, and `ClipQueue` decides which
+    survives rather than this hand-off."""
+
+    async def watch_shots() -> None:
+        """Put every one-shot the bus publishes in front of `clip_queue`.
+
+        An activity is readable as state (`face.state.activity`); a one-shot is not - it
+        is an event, and nothing else in this loop would ever see one. Its own task
+        because `subscribe()` parks on a wake, and awaiting it inline would stop the
+        render between moods.
+        """
+        async for event in face.subscribe():
+            clip = getattr(event, "clip", None)
+            if clip is not None:
+                shots.append(clip)
+    """Bumped on every falling edge. A pair whose encode outlived its own utterance is
+    dropped rather than published into the next one - the last turn's mouth finishing
+    somebody else's sentence, at exactly the moment the page fades the face in."""
+
+    def collect(at: int, encoded: asyncio.Future[list[bytes]]) -> None:
+        """The CPU half's output, back on the event loop, in pair order.
+
+        A callback and not an await, because the whole point of the second worker is
+        that this runs *during* the next model step: awaiting it before starting that
+        step would serialise the two again, and awaiting it after would put every
+        pair's JPEGs a step - 73ms - further behind the sound for nothing.
+        """
+        if at != turn or encoded.cancelled():
+            return
+        for frame in encoded.result():
+            ready.put_nowait(frame)
+
+    async def publish() -> None:
+        """One frame into the slot per interval, and never two inside one.
+
+        `Slot` is latest-wins and never queues, so two puts closer together than the
+        transport's 5ms poll means the first is simply never seen: measured on the
+        build where a step published its own pair, **85 frames published, 47 seen at
+        the socket, 38 lost**, and the mouth advanced two frames at a time. The queue
+        is here rather than in `Slot` for the reason `Slot`'s docstring gives - a
+        transport that queued would show a mouth lagging the sound by however far
+        behind the reader is - and this side is the only place that knows the frame
+        rate the queue should come out at.
+
+        `target` is a grid, not `now + interval`: a put lands on it, so the average
+        gap is exactly one interval and the sleep's own overshoot does not accumulate
+        into 23fps. The floor is what stops a frame that arrived late from following
+        the one before it too closely.
+        """
+        target = loop.time()
+        released = 0
+        """How far into the falling edge's ramp we are. Reset by every speaking pass,
+        so a barge-in mid-ramp starts the next one over."""
+        spoke = False
+        """Whether there has been anything to release yet. Without it the first ticks
+        of a fresh process would each pay an executor hop to be told there is no held
+        mouth."""
+        try:
+            while True:
+                delay = target - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                frame: bytes | None = None
+                if face.state.activity == "speaking":
+                    spoke = True
+                    released = 0
+                    # Checked here and not only at the falling edge: this half can be
+                    # holding a frame it took out of the queue before the turn ended,
+                    # and a frame whose sound has already finished playing is not a
+                    # frame anyone wants to see. An empty queue mid-sentence publishes
+                    # nothing rather than falling through to the clip below - the slot
+                    # holds its last frame, which is a mouth one frame stale instead of
+                    # a mouth that shut mid-word.
+                    try:
+                        frame = ready.get_nowait()
+                    except asyncio.QueueEmpty:
+                        frame = None
+                else:
+                    index = driving.driver.clip.index(loop.time())
+                    if spoke and released < RELEASE_FRAMES:
+                        # The utterance just ended. Speech stops and the frame after it
+                        # is the clip untouched, so a generated mouth is replaced by a
+                        # real one between two frames - measured as a 5.97px step in the
+                        # mouth region against a 2.46px median during speech, and seen
+                        # as the mouth "갑자기 확 닫히는" snap. `release` ramps the paste
+                        # to nothing instead, which takes the step to 2.26px; the
+                        # dissolve is the closing motion, because a closed mouth is what
+                        # shows through. One frame per tick, and on the same executor as
+                        # `encode` because they share the renderer's frame buffer.
+                        released += 1
+                        frame = await loop.run_in_executor(
+                            cpu, partial(renderer.release, index=index, step=released)
+                        )
+                    if frame is None:
+                        # Idle goes out on this same grid, as the clip's own frame. The
+                        # page used to play the clip in a `<video>` here and Chrome's
+                        # decode of it disagrees with its decode of our JPEGs - measured
+                        # R +3.0, G +2.1, B +1.2 - so the whole picture shifted darker
+                        # and off-hue the moment speech started. One decoder, no shift.
+                        #
+                        # Encoded here, one frame per tick, rather than a whole clip
+                        # strip held from its first use. Measured 9.10ms median for a
+                        # 1080x1620 frame at quality 85 - 22% of an idle budget where
+                        # nothing else runs, against a 1051ms burst plus a ~1GB cold
+                        # read per clip the other way. On this executor and not inline
+                        # because a voice session can be open while the face is idle
+                        # (activity `listening`), and that websocket shares this loop.
+                        cache = driving.driver.cache
+                        frame = await loop.run_in_executor(
+                            cpu, encode_still, cache.frames[index % len(cache.boxes)]
+                        )
+                if frame is not None:
+                    slot.put(frame)
+                target = max(target + interval, loop.time() + interval / 2)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("face: the lip-sync publisher failed")
+
+    try:
+        with (
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="face-lipsync"
+            ) as model,
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="face-lipsync-cpu"
+            ) as cpu,
+        ):
+            pacer = asyncio.create_task(publish(), name="face-lipsync-publish")
+            watcher = asyncio.create_task(watch_shots(), name="face-lipsync-shots")
+
+            async def switch_to(stem: str) -> None:
+                """Move the render onto `stem`, from its frame 0.
+
+                Called only from this half. `Renderer.switch` mutates state the executor
+                threads read and `publish` is its own task, so doing it here - between
+                awaits, with nothing of ours in flight - is what makes the swap atomic
+                as far as either half can see.
+                """
+                clip_cache, clip_fps = caches[stem]
+                new = Driver(
+                    name=stem,
+                    cache=clip_cache,
+                    clip=ClipClock(
+                        fps=clip_fps,
+                        frames=len(clip_cache.boxes),
+                        epoch=loop.time(),
+                    ),
+                )
+                renderer.switch(new)
+                driving.driver = new
+                # One line per switch, at INFO. The owner judges this by eye and the
+                # first question after "it looked wrong" is always which clip was up -
+                # three of the ten have never had a mouth rendered onto them in any
+                # path, so a report without the clip name cannot be acted on.
+                logger.info(
+                    "face: driving %s (%.2fs, %d frames)",
+                    stem,
+                    lengths[stem],
+                    len(clip_cache.boxes),
+                )
+                # Frames rendered for the outgoing clip must not be published over the
+                # incoming one - the same reason a turn boundary drains this.
+                while not ready.empty():
+                    ready.get_nowait()
+            try:
+                speaking = False
+                sent: int | None = None
+                wait = interval
+                while not renderer.failed:
+                    await asyncio.sleep(wait)
+                    # Every path below sets its own next wait. An absolute tick grid
+                    # is what this replaced: a step overruns one interval, so the grid
+                    # is permanently behind and every later sleep collapses to zero.
+                    while queued:
+                        chunk, audible_at = queued.popleft()
+                        ring.feed(chunk, audible_at)
+                    # Clip policy, every iteration and not only while speaking:
+                    # `ClipQueue.due` is also what notices the current clip looping, and
+                    # a queue that missed a loop would apply the next want wherever it
+                    # arrived - the mid-clip cut ADR 0020 exists to avoid.
+                    while shots:
+                        clip_queue.want(shots.popleft(), one_shot=True)
+                    want = wanted(
+                        face.state.activity,
+                        pending_shot=clip_queue.pending_shot,
+                        current=clip_queue.current,
+                        available=available,
+                        pick=random.choice,
+                    )
+                    clip_queue.want(want)
+                    boundary = clip_queue.due(at=loop.time())
+                    if boundary is not None:
+                        await switch_to(boundary)
+                    if face.state.activity != "speaking":
+                        if speaking:
+                            speaking = False
+                            sent = None
+                            turn += 1
+                            while not ready.empty():
+                                ready.get_nowait()
+                            release_lipsync_memory()
+                        wait = interval
+                        continue
+                    speaking = True
+                    if ready.qsize() >= BATCH:
+                        # Backpressure, and the only thing that bounds the queue: a
+                        # whole pair still unpublished means the publisher is the slow
+                        # half, and another step would buy latency rather than motion.
+                        wait = interval / 4
+                        continue
+                    # Read `origin` once and pass the same value to the clock and the
+                    # renderer: it moves, and asking twice would let the frame the
+                    # clock allowed be windowed against a different one.
+                    origin = ring.origin
+                    # The newest frame whose audio is already here, not the next one in
+                    # sequence - see LIPSYNC_CATCHUP_LIMIT. `None` is normal rather
+                    # than a fault: a step covers `BATCH` frames and cannot start until
+                    # the last of them has its audio, so the first passes of a turn are
+                    # a wait by design.
+                    found = None
+                    for _ in range(LIPSYNC_CATCHUP_LIMIT):
+                        due = clock.due(now=loop.time(), origin=origin)
+                        if due is None:
+                            break
+                        found = due
+                    if found is None:
+                        # A quarter of a frame, not a whole one: the next grant is less
+                        # than an interval away and sleeping a full one overshoots it.
+                        wait = interval / 4
+                        continue
+                    if sent is not None and found < sent:
+                        # The count went backwards, so the clock re-anchored under us -
+                        # a new turn inside one speaking stretch, or a barge-in. The
+                        # contiguity below is measured from the new count, not the old
+                        # one, or the loop would wait for a grant that will never come.
+                        sent = None
+                    if sent is not None and found < sent + BATCH:
+                        # A pair has to start where the last one ended. `due` hands out
+                        # one grant per call and a step covers `BATCH` of them, so this
+                        # half is now *faster* than the clock it is paced by - 27.3fps
+                        # of capacity against 24fps of grants - and a pass that gained
+                        # only one grant has nothing new to render. Stepping anyway
+                        # would render `found + 1` a second time and publish it twice:
+                        # a mouth that pauses for a frame three times a second, which
+                        # is a stutter rather than a frame rate. The first build could
+                        # not reach this - it ran at 20fps, behind the grants, always
+                        # skipping forward.
+                        wait = interval / 4
+                        continue
+                    sent = found
+                    # Awaited, and that is what keeps the ring lock-free: the drain
+                    # above is the only writer and it cannot run while this is in
+                    # flight. `Renderer.step` reads the ring inside the thread.
+                    step = await loop.run_in_executor(
+                        model,
+                        partial(
+                            renderer.step, frame_index=found, origin=origin, fps=fps
+                        ),
+                    )
+                    if step is None:
+                        continue        # latched; the `while` above ends the loop
+                    encoding = loop.run_in_executor(cpu, renderer.encode, step)
+                    encoding.add_done_callback(partial(collect, turn))
+                    # Straight on: the next step's 73ms is the window this pair's
+                    # 11ms of compositing and JPEG has to finish inside.
+                    wait = 0.0
+            finally:
+                pacer.cancel()
+                watcher.cancel()
+    except asyncio.CancelledError:
+        # Shutdown, not a failure. Explicit because the clause below would not catch
+        # it anyway and a reader should not have to know that.
+        raise
+    except Exception:
+        logger.exception("face: the lip-sync render loop failed")
+    logger.warning(
+        "face: the lip-sync render loop has stopped; the face is back on its clips"
+    )
+
+
+def release_lipsync_memory() -> None:
+    """Hand MLX's buffer cache back between utterances.
+
+    Two lines in their own function because they are the only `mlx` in this module and
+    `mlx` has no Linux wheel: the render loop above has to be exercisable in CI, and a
+    function-scoped import inside that loop would make it importable but not runnable.
+    Spec section 7 calls this a requirement rather than an optimisation - running MLX
+    without it is what let the spike's cache grow until frame drift reached +41.2% and
+    the dev machine stalled once.
+    """
+    import mlx.core as mx
+
+    mx.clear_cache()
+
+
 async def _proactive_tick(
     settings: Settings, get_bridge: Callable[[], Any] | None = None
 ) -> None:
@@ -1454,6 +2329,7 @@ async def run_voice(
     face: FaceBus | None = None,
     on_spoke: Callable[[], None] | None = None,
     opening_already_logged: bool = False,
+    pcm_sink: Callable[[bytes, float], None] | None = None,
 ) -> int:
     """One spoken conversation at this machine, then exit.
 
@@ -1708,6 +2584,12 @@ async def run_voice(
                 face=face,
                 on_spoke=on_spoke,
                 opening_already_logged=opening_already_logged,
+                # Where the lip-sync ring is fed, when this process has one. It rides
+                # all the way down to `SpeechClock`, which is the one place that
+                # already computes when a chunk becomes *audible* rather than when it
+                # was queued - a second tap would have to repeat that arithmetic, and
+                # the copy that drifts is the one that makes the mouth look dubbed.
+                pcm_sink=pcm_sink,
             )
         finally:
             with suppress(Exception):
@@ -1828,6 +2710,7 @@ async def _voice_attempts(
     face: FaceBus | None = None,
     on_spoke: Callable[[], None] | None = None,
     opening_already_logged: bool = False,
+    pcm_sink: Callable[[bytes, float], None] | None = None,
 ) -> int:
     """Hold a conversation, and pick it back up if the session is cut.
 
@@ -1911,6 +2794,11 @@ async def _voice_attempts(
             screen_pump_factory=screen_pump_factory,
             barge_in=barge_in,
             face=face,
+            # Handed to every attempt, like `face`. A reconnect builds a fresh
+            # conversation and therefore a fresh `SpeechClock`; the ring behind this
+            # sink is the process's one ring, and it re-anchors on the discontinuity
+            # the new turn's timestamps make (daemon/face_lipsync/ring.py).
+            pcm_sink=pcm_sink,
         )
         failure: Exception | None = None
         try:
@@ -2138,6 +3026,11 @@ async def _wake_round(
         # injected-round tests pass none) - the same bus the text loop publishes
         # to, so the face reflects a spoken turn exactly as it does a typed one.
         face=getattr(state, "face", None),
+        # And the same state's lip-sync sink, `None` unless `_lifespan` assembled a
+        # renderer. Read here rather than captured when the wake loop started, so
+        # that the switch is a property of the process rather than of the moment the
+        # gate came up.
+        pcm_sink=getattr(state, "face_pcm_sink", None),
     )
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.

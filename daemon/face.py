@@ -20,12 +20,14 @@ import asyncio
 import math
 import re
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Literal
 
 Activity = Literal["idle", "listening", "thinking", "speaking", "working"]
 Mood = Literal["amused", "sulky", "curious"]
+
+MOODS: tuple[Mood, ...] = ("amused", "sulky", "curious")
 
 SHOT_BACKLOG = 4
 """One-shots queue, unlike `level`, because a dropped laugh is a missing expression
@@ -208,14 +210,29 @@ class SpeechClock:
     is what closes that, and its docstring carries the rest.
     """
 
-    __slots__ = ("_bus", "_pending", "_rate", "_until", "_width")
+    __slots__ = ("_bus", "_pending", "_rate", "_sink", "_until", "_width")
 
-    def __init__(self, bus: FaceBus, *, sample_rate: int, bytes_per_frame: int) -> None:
+    def __init__(
+        self,
+        bus: FaceBus,
+        *,
+        sample_rate: int,
+        bytes_per_frame: int,
+        pcm_sink: Callable[[bytes, float], None] | None = None,
+    ) -> None:
         self._bus = bus
         self._rate = sample_rate
         self._width = bytes_per_frame
         self._until = 0.0
         self._pending: deque[tuple[float, float]] = deque()
+        self._sink = pcm_sink
+        """Where the lip-sync ring is fed, when there is one.
+
+        This class already does the one piece of arithmetic that seam needs - the
+        moment a chunk becomes *audible* rather than the moment it was queued - and
+        doing it twice in two places is how the mouth ends up dubbed. `None` when
+        lip-sync is off, which is the default.
+        """
 
     def fed(self, chunk: bytes, at: float) -> None:
         """One chunk handed to the speaker at wall-clock `at`."""
@@ -225,6 +242,10 @@ class SpeechClock:
         starts = max(self._until, at)
         self._until = starts + seconds
         self._pending.append((self._until, _rms(chunk)))
+        if self._sink is not None:
+            # `starts`, not `self._until`: the sink wants the moment this chunk's
+            # FIRST sample is heard. `_until` is now its last, one chunk later.
+            self._sink(chunk, starts)
 
     def pump(self, at: float, *, generating: bool = False, resting: Activity = "idle") -> None:
         """Publish whatever is audible at `at`. Call this on a timer.

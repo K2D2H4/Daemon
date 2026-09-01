@@ -155,7 +155,7 @@ def test_a_mood_can_only_be_cut_by_speaking_but_a_flourish_yields_to_anything():
 
     # And the flourish has to be *marked* as one where it is started, or the
     # exemption above can never fire.
-    start = PAGE.index("function tick() {")
+    start = PAGE.index("function tick(now) {")
     end = PAGE.index("\n}\n", start)
     tick_body = _without_line_comments(PAGE[start:end])
     assert "{ flourish: true }" in tick_body, (
@@ -454,3 +454,373 @@ def test_a_partial_set_with_no_idle_clip_still_explains_itself():
     assert 'clipFor("idle")' in body, (
         "the hint must also cover a set that has clips but no idle clip"
     )
+
+
+# --- the lip-synced mouth ---------------------------------------------------
+# Static-text guards, and they stop there for the reason the file already says: this
+# suite has no JS runtime (no node step in .github/workflows/ci.yml), so it can pin
+# the shape of the mechanism and not that it works. What it works or fails at is a
+# window with a face in it, which is where §8 of the lip-sync design puts the pass
+# mark anyway.
+
+
+def _body(signature):
+    """A named function's own body, comments stripped, so a guard answers to the code
+    rather than to prose that happens to mention the same identifier."""
+    start = PAGE.index(signature)
+    return _without_line_comments(PAGE[start : PAGE.index("\n}\n", start)])
+
+
+def test_the_mouth_is_an_overlay_that_is_allowed_to_die():
+    # The failure this exists for: the renderer can latch `failed` mid-sentence and
+    # then publish nothing. An <img> fed a stream that stopped keeps showing its last
+    # frame and fires no event, so a page that treated lip-sync as a mode it had
+    # switched into would hold a frozen mouth over a face that is still talking.
+    assert "function mouthReady()" in PAGE
+
+    # The per-frame staleness clock this used to require is gone with the transport.
+    # What replaces it is narrower and does not need one: the overlay is gated on
+    # `activity === "speaking"` from the activity stream, and the renderer only draws
+    # while speaking.
+    #
+    # This used to check for the <img>'s `onerror`, which was the right check for a
+    # transport the page no longer uses: presentation now has to be timed separately
+    # from arrival (see test_the_frame_is_presented_on_a_clock_of_its_own), and an
+    # <img> draws its own parts the moment they land. The property being pinned is
+    # unchanged - the response ENDING is what falls back - so what moved is only where
+    # the signal comes from: a rejected or exhausted fetch instead of an `error` event.
+    stream = _body("function mouthStream() {")
+    assert "finally" in stream, (
+        "the response ending is the fallback signal whether it ended by failing or by "
+        "running out, so the record of it cannot hang off the failure path alone"
+    )
+    assert "mouthDead" in stream, "giving up has to be recorded, or nothing falls back"
+    assert "close()" in stream, (
+        "and the frames still queued have to be released - an ImageBitmap is ~7MB and "
+        "nothing will ever come to draw them"
+    )
+    assert "fetch" in stream or 'fetch("/face/frames")' in _body("async function readFrames() {"), (
+        "the page has to be reading the stream itself now; it is the only way to "
+        "decide WHEN each frame is drawn rather than let the transport decide"
+    )
+
+
+def test_a_dead_mouth_falls_back_to_the_v1_speaking_clip():
+    # clipFor() is the one place the fallback can live: tick() already re-asks it every
+    # frame while speaking, so flipping mouthDead crossfades to speaking_soft through
+    # the existing single-sided crossfade rather than through a second code path.
+    start = PAGE.index('if (act === "speaking")')
+    branch = _without_line_comments(PAGE[start : PAGE.index("\n  }\n", start)])
+    assert "mouthReady()" in branch and "mouthClip" in branch, (
+        "the driving clip has to be the speaking clip while lip-sync is alive - the "
+        "crops are that clip's own pixels, so speaking_soft under them is a different head"
+    )
+    assert "speaking_soft" in branch, (
+        "and the v1 chain must still be there underneath, unreachable only while the "
+        "mouth is alive"
+    )
+
+
+def test_idle_does_not_rotate_while_lip_sync_is_alive():
+    """The owner's report, in one line of code.
+
+    `clipFor("idle")` picked at random out of idle1/idle2/idle3 and `clipFor("speaking")`
+    could only ever answer `mouthClip` (idle2), so four times in five the first word of
+    a reply crossfaded to a different head, a different pose and a different framing.
+    "그냥 새로운 클립이 재생되는 느낌" was not a feeling about the render - a new clip
+    was being played.
+
+    Pinned inside the idle branch, comments stripped, so the prose above the code
+    cannot satisfy it. And the branch has to keep its rotation underneath: a renderer
+    that dies mid-session leaves `mouthReady()` false, and idle going back to three
+    clips is the v1 face rather than a degraded one.
+    """
+    start = PAGE.index('if (act === "idle")')
+    branch = _without_line_comments(PAGE[start : PAGE.index("\n  }\n", start)])
+    assert "mouthReady()" in branch and "return mouthClip" in branch, (
+        "while lip-sync drives a clip, idle has to BE that clip - anything else means "
+        "speech begins by swapping the head"
+    )
+    assert "IDLES" in branch and "Math.random" in branch, (
+        "and the rotation must still be there for a dead or absent renderer"
+    )
+
+    # The rotation used to be what ended an idle clip: show() left `loop` off for idle
+    # so `ended` fired and advance() picked another. With nothing on the other side of
+    # that `ended`, leaving it off parks the face on the last frame for good.
+    body = _without_line_comments(_body("function loops(act) {"))
+    assert 'act !== "idle"' in body and "mouthReady()" in body
+
+
+def test_speech_begins_on_the_clip_that_is_already_playing():
+    """The second half of the same report, and the one a matching clip still had.
+
+    `toActivity` used to rewind the driving clip to frame 0 on `speaking`, because the
+    renderer indexed that clip from 0 at every turn. So even idle2 -> idle2 - the one
+    case where nothing needed to change - threw the playhead back to the top, which is
+    a pose jump on its own. The renderer follows the page's free-running playhead now
+    (`render.py:ClipClock`), so there is nothing left to move and `show()`'s own
+    `next === showing` guard makes the whole handover a no-op.
+    """
+    body = _body("function toActivity(act) {")
+    assert not re.search(r"currentTime\s*=[^=]", body), (
+        "moving a playhead here is the pose jump this was reported as; the driving "
+        "clip's is the daemon's, not this function's. Reading one is fine and the "
+        "WAIT_MS window does - what must not come back is an assignment"
+    )
+
+    # show() still rewinds a clip it is genuinely switching TO - that one has no
+    # position of its own - but must not rewind the driving clip, which does.
+    body = _body("function show(stem, { loop = true, fadeMs = FADE_MS } = {}) {")
+    assert "isDriver(stem) ? driverAt() : poseMatchTime(prev, stem)" in body, (
+        "an ordinary clip starts at 0; the driving clip starts wherever the daemon's "
+        "clock says it is, or the pose under the overlay is not the pose it was drawn "
+        "for"
+    )
+
+
+def test_the_page_follows_the_daemons_clip_clock_rather_than_its_own():
+    """Which frame the page is showing has one answer and the daemon owns it.
+
+    It has to: the renderer needs that answer for a quarter-second in the FUTURE
+    (`render.py:DISPLAY_LEAD`), which only a clock can give, and this page has no
+    channel back to be asked on. So `/face/manifest` hands the position over once and
+    the page anchors it to its own `performance.now()`.
+
+    The stamp has to be taken when the manifest ARRIVES. Priming a dozen clips takes
+    hundreds of milliseconds, and anchoring after them would put the page that many
+    frames away from every pose the renderer draws into.
+    """
+    body = _body("async function boot() {")
+    manifest_at = body.index("manifestAt = performance.now()")
+    assert manifest_at < body.index("prime"), (
+        "the position is as of the response, so it has to be stamped before priming, "
+        "not after it"
+    )
+    assert "driverEpoch = manifestAt - (ls.position || 0)" in body, (
+        "the anchor is the manifest's position against the page's own clock"
+    )
+
+    # And the one thing measured to move the <video> off that clock has to put it
+    # back: between pauses a playing clip holds to performance.now() within 0.002
+    # frames over 8s, and every pause costs 0.2-0.4 frames that never return.
+    heal = _body("function ensurePlaying() {")
+    assert "isDriver" in heal and "driverAt()" in heal, (
+        "resuming a clip that is a quarter-second behind the pose the renderer is "
+        "drawing into is a backgrounded tab coming back with the mouth on the wrong face"
+    )
+
+
+def test_the_overlay_waits_only_for_its_first_frame():
+    """An empty canvas must not fade in over a clip, and that is now the whole gate.
+
+    It used to be cleared at every activity change, because a frame arriving after
+    `speaking` could be the LAST utterance's - a pose from wherever that sentence ended.
+    The daemon driving every prepared clip removes that at the source: frames arrive
+    continuously and are always of the clip that is up, so there is no stale frame to
+    hide from, and clearing the gate per turn would only blink the canvas off at each
+    change - the flicker ADR 0020's task set out to remove.
+
+    The queue is still dropped at a boundary, for the reason it always was: an
+    ImageBitmap is ~7MB and a mouth for a finished sentence is never wanted again.
+    """
+    assert "function mouthLive() { return mouthReady() && mouthFresh; }" in PAGE
+
+    turn = _body("function toActivity(act) {")
+    assert "mouthQueue.shift().close()" in turn, "the boundary still drops the queue"
+    assert "mouthFresh = false" not in turn, (
+        "clearing the gate per turn takes the canvas off screen until the next frame "
+        "decodes, which with every clip driven is a blink rather than protection"
+    )
+
+    # Lifted from the decode callback and not from presentMouth(), because rAF stops
+    # outright in an occluded window and a microtask does not - the same split
+    # test_the_crop_is_not_taken_off_the_screen_by_rAF pins from the other side.
+    decode = _body("function decodeFrame(bytes) {")
+    assert "mouthFresh = true" in decode and "refreshMouth()" in decode
+
+
+def test_the_driving_clip_is_never_rate_modulated():
+    # v1's mouth IS playbackRate (spec 3.4). Left on while lip-sync drives the clip it
+    # slides the pose under the crop away from the pose the renderer composited into
+    # it, which is a seam at the crop border rather than a mouth.
+    body = _body("function tick(now) {")
+    assert "mouthReady()" in body and "playbackRate" in body, (
+        "tick() must pin the driving clip to 1.0x while the lip-synced mouth is the "
+        "speaking path, not modulate it as v1 does"
+    )
+
+
+def test_the_crop_is_not_taken_off_the_screen_by_rAF():
+    # Measured, by getting it wrong first: with the visibility toggle inside tick(),
+    # killing the renderer left the overlay stuck mid-fade at opacity 0.13 and it never
+    # came off - rAF does not throttle in an occluded window, it stops. Header note 3
+    # tolerates that for playbackRate because being late there is cosmetic; being late
+    # here is a frozen mouth over a talking face, which is the whole failure the
+    # fallback exists for. So the crop's visibility must be event-driven.
+    #
+    # tick() does now DRAW the lip-synced frames, and that is the opposite case rather
+    # than a loosening of this one: a frame drawn late is a cosmetic lag in a window
+    # nobody is looking at, and rAF stopping leaves the frame that was already up. The
+    # two must stay separate functions, which is what the pair of assertions below pins.
+    body = _body("function tick(now) {")
+    assert "refreshMouth" not in body, (
+        "the overlay's visibility must not depend on rAF running"
+    )
+    assert "presentMouth" in body, (
+        "and the frames themselves must, or presentation is back on the socket's clock"
+    )
+    # No timer here, and a shorter list of callers than this test used to carry. The
+    # answer is `mouthLive()` and nothing else can move it now: the activity cannot
+    # (`refreshMouth` no longer reads it) and a one-shot cannot (the daemon plays those
+    # as its own clip). What is left is the first frame decoding, and correcting a write
+    # that rAF may have left mid-fade.
+    assert "refreshMouth" in _body("function decodeFrame(bytes) {"), (
+        "the first frame arriving is what lifts the gate, and it has to say so"
+    )
+    start = PAGE.index('addEventListener("visibilitychange"')
+    handler = _without_line_comments(PAGE[start : PAGE.index("});", start)])
+    assert "refreshMouth" in handler, (
+        "becoming visible is when a stale overlay has to be corrected"
+    )
+
+
+def test_the_canvas_is_on_for_every_activity_and_every_mood():
+    """The colour fix, finished - and the assertion is a negative on purpose.
+
+    Chrome's decode of the untagged mp4 disagrees with its decode of our JPEGs (measured
+    R +3.0, G +2.1, B +1.2), so every moment this canvas goes on or off shifts the whole
+    picture. The first fix published idle as frames, closing idle<->speaking; a real
+    conversation crosses listening->speaking, where the canvas was still off, and the
+    owner watched the shift come back on every turn of a live session. Anything that
+    reintroduces a gate here reintroduces that, so the gate's absence is what is pinned.
+    """
+    body = _body("function refreshMouth() {")
+    assert "const on = mouthLive();" in body
+    assert "activity ===" not in body, "an activity gate is the colour shift coming back"
+    assert "oneShotUntil" not in body, "so is a mood exception - the daemon drives those"
+
+
+def test_the_page_does_not_play_a_gesture_the_daemon_is_already_playing():
+    """A mood is queued to the current clip's end and arrives already composited, with
+    the frame's own header moving `mouthClip`. Playing it here as well would put a
+    second, unsynchronised copy of the same expression under the canvas."""
+    body = _body("function playOneShot(stem, { flourish = false } = {}) {")
+    assert "if (mouthReady()) return;" in body
+
+
+def test_the_page_learns_the_clip_from_the_frame_that_is_of_it():
+    """Off the part's own header, not a second channel. An activity event and the frames
+    it implies do not arrive together, so a page told over `/face/stream` would hold the
+    wrong clip under the canvas for as long as the two disagreed - and that clip is the
+    entire fallback when the frames stop. A part header cannot disagree with its body.
+    """
+    assert "function partClip(buf, head)" in PAGE
+    assert "x-face-clip" in PAGE.lower()
+    reader = _body("async function readFrames() {")
+    assert "partClip(buf, head)" in reader and "mouthClip = clip" in reader
+
+
+def test_while_the_daemon_drives_it_chooses_the_clip_for_every_activity():
+    """It composites onto the frame it believes is up, so the page following anything
+    else puts a different head under the mouth. The chains below it are the v1 fallback
+    and ADR 0017 still governs them, which is why they are still here."""
+    body = _body("function clipFor(act) {")
+    assert "if (mouthReady()) return mouthClip;" in body
+    assert "FOR_ACTIVITY" in body, "the fallback chain must survive for a dead renderer"
+
+
+def test_the_frame_is_presented_on_a_clock_of_its_own():
+    """Measured in a real browser against the assembled stack, and the reason the
+    overlay is a <canvas> rather than an <img>.
+
+    Fed straight into an <img>, the frames were repainted whenever a part ARRIVED, and
+    arrival is a socket event: median gap 43.1ms but p90 61.4ms, a quarter of the gaps
+    under 25ms and a quarter over 60ms. The rate was fine - 23.8fps on screen - and the
+    cadence was not: 37.4% of frames changed duration by a whole 17ms from the frame
+    before, and 21% stayed up longer than a source frame lasts, to 83ms. The <video>
+    the page plays at idle never exceeded 41.7ms once. Same rate, different regularity,
+    and that is what got reported as the frame rate dropping when speech starts.
+
+    So arrival must not be allowed to decide presentation. Three things carry that and
+    none of them is inferable from the others: something to draw into on the page's own
+    schedule, a queue between the socket and the draw, and a due time that the draw
+    waits for.
+
+    Re-measuring this needs a real browser and there is no eval for it - Playwright is
+    not a dependency of this project and adding one for a page guard was not thought
+    worth it. Two traps if you write one anyway. Fingerprinting the presented frame by
+    drawImage()-ing the element into a scratch canvas is accurate for an <img> and NOT
+    for a <canvas> or a <video>: those are GPU-backed, and the copy invented 1939
+    transitions out of 968 frames. Read a canvas through its OWN context's
+    getImageData, take a video's cadence from requestVideoFrameCallback, and check
+    every method against the arrival count, because nothing can be presented more
+    often than it arrived. And check the renderer's own fps first: under machine load
+    it fell to 15fps here, which looks exactly like a page that got worse.
+    """
+    assert "<canvas id=\"mouth\">" in PAGE, (
+        "an <img> repaints itself when a part lands; only a canvas lets the page pick "
+        "the moment"
+    )
+    body = _body("function presentMouth(now) {")
+    assert "mouthQueue" in body, "arrival has to be able to run ahead of presentation"
+    assert "mouthDueAt" in body and "MOUTH_PERIOD_MS" in body, (
+        "and presentation has to be paced by the renderer's frame period rather than "
+        "by whenever the socket happened to deliver"
+    )
+    assert "drawImage" in body, "something has to actually reach the screen"
+    # Nothing may be discarded on the way: the complaint is about cadence, and a fix
+    # that evened it out by throwing frames away would be a real drop in frame rate
+    # rather than an apparent one.
+    assert "mouthQueue.shift()" in body and "MOUTH_CATCH_UP" in body, (
+        "a queue past MOUTH_CATCH_UP means this clock is behind the renderer's, and "
+        "the way back has to be catching up, never dropping"
+    )
+    # Off the main thread. The thread that draws is the thread that runs the clip
+    # crossfades, and a 180KB JPEG decoded on it 24 times a second is the cost the
+    # multipart <img> was chosen over SSE to avoid in the first place.
+    assert "createImageBitmap" in _body("function decodeFrame(bytes) {"), (
+        "decoding has to stay off the thread that composites"
+    )
+    assert "data:image" not in PAGE, "and the base64 path must not come back"
+
+
+def test_the_frame_stream_is_only_opened_when_the_daemon_offers_one():
+    # /face/manifest answers `false` for all three ways there is no mouth (switch off,
+    # no renderer, latched failed), so the page never has to infer it from a failed
+    # request - and must not open a connection that is going to 503.
+    body = _body("async function boot() {")
+    assert "manifest.lipsync" in body, "the switch is read from the manifest, not guessed"
+    assert "mouthStream()" in body and "videoWidth" in body, (
+        "the stream opens only behind the manifest AND a driving clip that actually "
+        "decoded - there is nothing to lay a crop over otherwise"
+    )
+
+
+def test_the_rendered_frame_needs_no_placing_at_all():
+    """This replaced a test that checked the crop was scaled through object-fit's own
+    letterboxing, which was the right check for the wrong design.
+
+    Two versions of this page laid a crop of the mouth over the playing clip, and both
+    drew a visible rectangle across the head: a JPEG has no alpha, so its edge is hard
+    however small the crop is, and the clip underneath is never on the frame the
+    renderer drew. The payload is the whole composited frame now, so it takes the same
+    geometry as the clips it replaces and there is nothing left to line up - which is
+    the property to pin, because re-introducing any positioning maths would mean the
+    crop is back.
+    """
+    assert "layoutMouth" not in PAGE, "positioning the overlay means it is a crop again"
+    assert "mouthBox" not in PAGE, "and so does carrying a box to position it with"
+    start = PAGE.index("#mouth {")
+    css = PAGE[start : PAGE.index("}", start)]
+    assert "inset: 0" in css and "object-fit: contain" in css, (
+        "the frame has to be drawn exactly where the clips are, by the same fit"
+    )
+
+
+def test_the_mouth_overlay_cannot_fall_behind_a_clip():
+    # show() hands each incoming clip ++z, so a fixed z-index on a sibling of #stage
+    # would eventually lose. #stage carrying its own z-index makes it a stacking
+    # context, which contains that counter for good.
+    assert "#stage { position: fixed; inset: 0; z-index: 0; }" in PAGE
+    assert "#mouth" in PAGE and "z-index: 1" in PAGE

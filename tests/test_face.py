@@ -319,6 +319,8 @@ def test_level_returns_to_zero_once_playback_is_over():
 )
 def test_split_mood(raw, text, mood):
     assert split_mood(raw) == (text, mood)
+
+
 async def test_close_ends_an_open_subscription():
     """`close()` is what lets an SSE response finish, so the generator must actually
     stop - not just go quiet. `admin/restart.py` calls it before the SIGTERM because
@@ -358,4 +360,63 @@ def test_close_with_nobody_subscribed_is_a_no_op():
     bus.close()
     bus.close()
     bus.set_activity("speaking")
+    assert bus.state.activity == "speaking"
+
+
+# --- the lip-sync PCM sink ---------------------------------------------------
+#
+# The lip-sync ring is addressed by when audio is HEARD, and this class already does
+# that arithmetic for `speaking`. Feeding the ring anywhere else would mean doing it
+# twice, which is how a mouth ends up dubbed.
+
+
+def test_the_sink_receives_every_chunk_with_the_moment_it_becomes_audible():
+    got: list[tuple[int, float]] = []
+    clock = SpeechClock(
+        FaceBus(),
+        sample_rate=RATE,
+        bytes_per_frame=WIDTH,
+        pcm_sink=lambda chunk, at: got.append((len(chunk), at)),
+    )
+    one = b"\x00\x01" * (RATE // 2)          # 0.5s
+    clock.fed(one, at=10.0)
+    clock.fed(one, at=10.0)                  # queued while the first is still playing
+    assert [n for n, _ in got] == [len(one), len(one)]
+    assert got[0][1] == 10.0
+    assert got[1][1] == 10.5, (
+        "the second chunk is heard when the first finishes, not when it was queued"
+    )
+
+
+def test_the_sink_gets_the_chunks_start_not_its_end():
+    """`starts`, not `_until`. Handing over the end stamps every chunk one chunk
+    late, and the whole mouth runs behind the sound by however long a chunk is -
+    which is exactly the dubbing this class exists to prevent."""
+    got: list[float] = []
+    clock = SpeechClock(
+        FaceBus(),
+        sample_rate=RATE,
+        bytes_per_frame=WIDTH,
+        pcm_sink=lambda chunk, at: got.append(at),
+    )
+    clock.fed(b"\x00\x01" * RATE, at=4.0)    # 1.0s of audio
+    assert got == [4.0], "a chunk queued into silence is audible immediately"
+
+
+def test_empty_chunks_reach_neither_the_clock_nor_the_sink():
+    got: list[float] = []
+    clock = SpeechClock(
+        FaceBus(), sample_rate=RATE, bytes_per_frame=WIDTH,
+        pcm_sink=lambda chunk, at: got.append(at),
+    )
+    clock.fed(b"", at=1.0)
+    assert got == []
+
+
+def test_no_sink_is_the_default_and_changes_nothing():
+    """Lip-sync is off by default, and the class must behave exactly as before."""
+    bus = FaceBus()
+    clock = SpeechClock(bus, sample_rate=RATE, bytes_per_frame=WIDTH)
+    clock.fed(b"\x00\x01" * RATE, at=0.0)
+    clock.pump(at=0.5)
     assert bus.state.activity == "speaking"

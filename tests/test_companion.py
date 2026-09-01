@@ -12,7 +12,7 @@ the other, which is what happened to `recall.index()` and voice.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -272,11 +272,19 @@ async def test_a_failing_search_costs_the_memory_and_not_the_turn(data_dir: Path
 
 
 async def test_context_reports_an_expired_commitment_from_the_window(data_dir: Path) -> None:
-    """The block only annotates what the model can see, so the window has to reach it."""
+    """The block only annotates what the model can see, so the window has to reach it.
+
+    `ts` is relative to the live clock on purpose. `commitment_block` drops anything
+    older than `timesense.COMMITMENT_LOOKBACK_DAYS`, so a pinned date is a time bomb:
+    this test was written with 2026-08-14 and began failing on 2026-08-28, when the
+    real clock walked past the cutoff and the block came back empty. A day back is
+    inside the window, and "오늘 오후 4시40분" then falls on yesterday - past at every
+    hour the suite can run.
+    """
     companion = Companion(FakeMemory(), data_dir=data_dir)
     window = [
         LoggedMessage(
-            ts=datetime(2026, 8, 14, 7, 32, tzinfo=UTC),
+            ts=clock.now() - timedelta(days=1),
             role="user",
             content="오늘 오후 4시40분에 회의있어 5분전에 알려줘",
             origin="owner",
