@@ -974,6 +974,24 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   flow that exists) and impossible to render in a one-line note, so the route
   summarises it to one sentence at 409 and logs the link. **A button labelled Test
   that can open a sign-in page has to say so**, which the card's caption now does.
+- **A wrong calendar address would have opened a browser window every five
+  minutes, forever, and only code review caught it.** Same live finding as the
+  entry above, one layer down: the consent-required reply is not merely a failure,
+  it is `workspace-mcp` *launching* Google's sign-in page. The admin Test button
+  triggers that once, by a person, on purpose. The proactive tick triggers it every
+  `PROACTIVE_TICK_MINUTES`, by a background resident, forever - and the likelier
+  cause is not a typo the Test button would have caught but a consent that simply
+  lapsed months later. Nothing client-side can stop the server doing it except not
+  calling again, so `agenda._CONSENT_PENDING` latches the address for the life of
+  the process. **Process-lifetime and not persisted on purpose:** every remedy the
+  owner has - fixing the address in the console, finishing the sign-in - ends in a
+  restart, and a restart is exactly when this should try again. Persisting it would
+  turn a self-clearing annoyance into state somebody has to find and delete.
+
+  The general shape, since this is the third time a proactive generator has needed
+  it: **a per-tick call whose failure has a side effect needs a latch, not just a
+  log line.** `topics.search_titles` does not, because a failed Tavily search does
+  nothing to the machine. This one does.
 - **A settings field that renders as two different elements needs driving, not
   reading.** The calendar account control is a `<select>` when there are accounts to
   suggest and an `<input>` when there are none. The Test button's handler looked for

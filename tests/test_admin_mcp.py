@@ -959,3 +959,23 @@ def test_an_unauthorised_address_is_summarised_not_dumped(tmp_path: Path) -> Non
     assert "accounts.google.com" not in detail, "the authorize url reached the page"
     assert "code_challenge" not in detail
     assert len(detail) < 300, "the markdown wall reached the page"
+
+
+def test_a_calendar_name_containing_a_quote_is_not_truncated(tmp_path: Path) -> None:
+    """The non-greedy first draft reported `He said "hi"` as `He said ` - a name
+    the owner does not recognise, which reads as the check having found the wrong
+    account. Greedy against a required literal suffix, like `agenda._EVENT_RE`."""
+    reply = json.dumps(
+        {
+            "result": (
+                "Successfully listed 2 calendars for x@y.com:\n"
+                '- "He said "hi"" (ID: weird@group.calendar.google.com)\n'
+                '- "x@y.com" (Primary) (ID: x@y.com)'
+            )
+        }
+    )
+    client = TestClient(_enabled_app(tmp_path, _CalendarBridge(reply)), base_url=LOOPBACK)
+
+    body = client.post("/admin/api/calendar/check", json={"email": "x@y.com"}).json()
+
+    assert body["calendars"] == ['He said "hi"', "x@y.com"]

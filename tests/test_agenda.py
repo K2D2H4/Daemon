@@ -373,3 +373,85 @@ def test_an_abbreviation_with_a_dot_is_refused_and_that_cost_is_accepted() -> No
     owner-typed allowlist - never a rule derived from data an attacker can write.
     """
     assert has_url("Sr.Lead Engineer- Seoul - DAEHYUN KIM and Gabriela Guerrero")
+
+
+# --- the consent-required reply, and why it must not be retried ---------------
+
+CONSENT_REPLY = (
+    "**ACTION REQUIRED: Google Authentication Needed for Google Calendar for "
+    "'x@y.com'**\n\n1. The authorization page has been **automatically opened in "
+    "your browser**. Please complete the authorization there.\n   Authorization "
+    "URL: https://accounts.google.com/o/oauth2/auth?response_type=code&"
+    "code_challenge=l8rhq7l9BVnz5UQsszjrJLkvA0nIsNl0&state=7d4992b8&scope="
+    + "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly+" * 12
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_consent_latch() -> None:
+    """The latch is process-lifetime by design, so a test that sets it would
+    otherwise silence every test after it."""
+    agenda._CONSENT_PENDING.clear()
+
+
+async def test_a_second_read_is_not_attempted_once_consent_is_pending() -> None:
+    """The highest-severity thing this module can get wrong.
+
+    Measured live 2026-09-02: `get_events` for an address the server holds no
+    credential for does not merely fail - `workspace-mcp` **opens Google's consent
+    page in the owner's browser**. The tick runs every five minutes, so without a
+    latch a typo'd or lapsed `DAEMON_CALENDAR_EMAIL` means a browser window every
+    five minutes, 288 a day, until somebody notices. Nothing client-side can stop
+    the server doing that except not calling it again.
+    """
+    bridge = FakeBridge(error=ToolError(CONSENT_REPLY))
+
+    first = await agenda.fetch(bridge, "x@y.com", _now(), _now())
+    second = await agenda.fetch(bridge, "x@y.com", _now(), _now())
+    third = await agenda.fetch(bridge, "x@y.com", _now(), _now())
+
+    assert len(bridge.calls) == 1, (
+        "the server was asked again, which is what reopens the browser"
+    )
+    assert all("consent" in read.note for read in (first, second, third)), (
+        "the tick must keep saying why it is silent, just without asking again"
+    )
+
+
+async def test_a_different_address_is_not_latched_by_the_first() -> None:
+    """The latch is per address: fixing the typo and restarting is the documented
+    remedy, and a second account must not inherit the first one's state."""
+    bridge = FakeBridge(error=ToolError(CONSENT_REPLY))
+    await agenda.fetch(bridge, "wrong@y.com", _now(), _now())
+
+    await agenda.fetch(bridge, "right@y.com", _now(), _now())
+
+    assert [call[2]["user_google_email"] for call in bridge.calls] == [
+        "wrong@y.com",
+        "right@y.com",
+    ]
+
+
+async def test_the_consent_note_carries_no_authorize_url() -> None:
+    """That reply is ~1.2KB of markdown wrapping an authorize URL with a PKCE
+    challenge and the full Gmail/Calendar/Drive scope set. The note is printed by
+    `daemon proactive` as one line, so none of it may travel."""
+    read = await agenda.fetch(
+        FakeBridge(error=ToolError(CONSENT_REPLY)), "x@y.com", _now(), _now()
+    )
+
+    assert "accounts.google.com" not in read.note
+    assert "code_challenge" not in read.note
+    assert len(read.note) <= agenda.MAX_NOTE_CHARS
+    assert "x@y.com" in read.note and "restart" in read.note
+
+
+async def test_every_note_is_bounded_however_long_the_server_is() -> None:
+    """Not only the consent case: any reply reaches `TickResult.notes` and is
+    printed on one line."""
+    read = await agenda.fetch(
+        FakeBridge(error=ToolError("boom " * 500)), "x@y.com", _now(), _now()
+    )
+
+    assert len(read.note) <= agenda.MAX_NOTE_CHARS + 32
+    assert "\n" not in read.note

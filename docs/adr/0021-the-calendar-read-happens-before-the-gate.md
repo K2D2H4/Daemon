@@ -162,6 +162,22 @@ check for the one kind whose raw material is 100% urls. The lever, if this ever
 becomes intolerable, is the owner-typed allowlist ADR 0015 already names - never a
 rule derived from data an attacker can also write.
 
+## The cost of the placement that only review found
+
+Stage 1 runs on a timer with nobody watching, and that changes what a *failure*
+costs. `get_events` for an address the server holds no credential for opens
+Google's consent page in the owner's browser - so at 288 ticks a day, a lapsed
+consent is a browser window every five minutes until somebody notices. A stage-3
+call could not have done that: it only runs for a gate-passed candidate, behind a
+cooldown, a handful of times a day at most.
+
+So the placement carries one obligation stage 3 would not have: **a per-tick call
+whose failure has a side effect needs a latch, not just a log line.**
+`agenda._CONSENT_PENDING` is that latch, process-lifetime because every remedy
+ends in a restart. Anyone adding a third generator that reads something on every
+tick inherits this obligation, and it is the part of this ADR most likely to be
+skipped.
+
 ## What this does not touch
 
 `topic` keeps 0015's placement exactly. This ADR adds a second shape beside it; it

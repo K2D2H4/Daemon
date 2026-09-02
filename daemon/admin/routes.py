@@ -804,13 +804,19 @@ raw text still reaches the page as a 502.
 """
 
 
-_CALENDAR_LINE_RE = re.compile(r'^-\s+"(?P<name>.*?)"')
+_CALENDAR_LINE_RE = re.compile(r'^-\s+"(?P<name>.*)"\s+\((?:Primary\)\s+\()?ID:')
 r"""One rendered `list_calendars` line, matching what to keep.
 
 Measured shape, 2026-09-01: `- "owner@gmail.com" (Primary) (ID: ...)`. The
 id is dropped for the same reason `agenda._EVENT_RE` drops the `Link:` tail -
 nothing downstream needs it, and every string that reaches a page is one more
-thing to have to reason about. Non-greedy so `(Primary)` stays outside the name.
+thing to have to reason about.
+
+Greedy against a required literal suffix, not non-greedy up to the first quote:
+a calendar named `He said "hi"` renders as `- "He said "hi"" (ID: ...)`, and the
+non-greedy form reported it as `He said ` - a name the owner does not recognise,
+which reads as the check having found the wrong account. Same shape, and the same
+reasoning, as `agenda._EVENT_RE`.
 """
 
 

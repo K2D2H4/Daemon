@@ -1158,3 +1158,44 @@ async def test_no_configured_address_is_reported_rather_than_guessed(
     assert found == []
     assert "DAEMON_CALENDAR_EMAIL" in note
     assert bridge.calls == [], "the calendar was read before the address was checked"
+
+
+async def test_a_spent_soonest_event_does_not_hide_the_next_one(
+    db: sqlite3.Connection, reader: SqlReader
+) -> None:
+    """Dedup is applied before the soonest event is picked, not after.
+
+    Filtering afterwards meant the soonest event, once raised, occupied the slot on
+    every later tick until it actually started - so a second event four minutes
+    behind it could fall in the gap between two five-minute ticks and never be
+    raised at all.
+    """
+    bridge = _CalendarBridge(
+        [
+            ("First thing", NOW + timedelta(minutes=6)),
+            ("Second thing", NOW + timedelta(minutes=10)),
+        ]
+    )
+    first, _ = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+    assert [c.payload["title"] for c in first] == ["First thing"]
+    store_candidate(db, first[0], now=NOW)
+
+    second, note = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+
+    assert [c.payload["title"] for c in second] == ["Second thing"]
+    assert note == ""
+
+
+async def test_the_payload_carries_no_second_copy_of_the_start(
+    reader: SqlReader,
+) -> None:
+    """`Candidate.expires_at` already holds the event's start, in the format the
+    store round-trips. A second copy written with `clock.to_iso` looked like every
+    other stored timestamp and `from_iso` could not parse it."""
+    starts = NOW + timedelta(minutes=25)
+    bridge = _CalendarBridge([("Interview with UJET", starts)])
+
+    found, _ = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+
+    assert set(found[0].payload) == {"dedup", "title"}
+    assert found[0].expires_at == starts

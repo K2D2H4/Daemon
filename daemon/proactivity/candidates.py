@@ -791,9 +791,18 @@ async def calendar_candidates(
     if not upcoming:
         return [], ""
 
-    event = min(upcoming, key=lambda e: e.starts_at)
+    # Spent keys are removed *before* `min()`, not after. Filtering afterwards
+    # meant the soonest event, once raised, hid every later one in the window
+    # until it actually started - and two events four minutes apart can have no
+    # tick between them, so the second was never raised at all.
+    keyed = [(f"calendar:{to_iso(e.starts_at)}:{_title_key(e.title)}", e) for e in upcoming]
+    spent = reader.existing_dedup_keys([key for key, _ in keyed])
+    fresh = [(key, e) for key, e in keyed if key not in spent]
+    if not fresh:
+        return [], ""
+
+    key, event = min(fresh, key=lambda pair: pair[1].starts_at)
     minutes = max(1, round((event.starts_at - moment).total_seconds() / 60))
-    key = f"calendar:{to_iso(event.starts_at)}:{_title_key(event.title)}"
     candidate = Candidate(
         kind="calendar",
         # Lexicon words and a number. The title is in `payload`, fenced later.
@@ -801,12 +810,14 @@ async def calendar_candidates(
             f"{minutes}분 뒤에 유저의 캘린더에 적힌 일정이 하나 시작된다. "
             "유저가 아직 이 일정 이야기를 꺼내지 않았다."
         ),
-        payload={"dedup": key, "title": event.title, "starts_at": to_iso(event.starts_at)},
+        # No `starts_at`: `Candidate.expires_at` already carries the event's start,
+        # in the format the store round-trips (`utc_iso`/`from_iso`). A second copy
+        # written with `clock.to_iso` looked like every other stored timestamp and
+        # `from_iso` could not parse it - a trap for the first caller to try.
+        payload={"dedup": key, "title": event.title},
         due_at=moment,
         expires_at=event.starts_at,
     )
-    if reader.existing_dedup_keys([key]):
-        return [], ""
     return [candidate], ""
 
 

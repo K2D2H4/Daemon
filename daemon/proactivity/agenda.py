@@ -196,6 +196,10 @@ async def fetch(bridge: Bridge, email: str, start: datetime, end: datetime) -> F
     gate-passed candidate; the state stays visible through `Fetch.note`, which
     reaches `daemon proactive` and does not depend on anyone tailing the log.
     """
+    if email in _CONSENT_PENDING:
+        # Checked before the call, which is the whole point: calling again is what
+        # reopens the browser (see `_CONSENT_PENDING`).
+        return _consent_pending(email, "")
     try:
         raw = await bridge.call(
             SERVER,
@@ -208,12 +212,81 @@ async def fetch(bridge: Bridge, email: str, start: datetime, end: datetime) -> F
             },
         )
     except ToolError as exc:
+        if _NEEDS_CONSENT in str(exc):
+            return _consent_pending(email, str(exc))
         logger.debug("agenda: calendar unavailable: %s", exc)
-        return Fetch(note=f"calendar unavailable: {exc}")
+        return Fetch(note=f"calendar unavailable: {_short(exc)}")
     except Exception as exc:  # noqa: BLE001 - reported, never fatal to the tick
         logger.exception("agenda: the calendar read failed")
-        return Fetch(note=f"calendar read failed: {type(exc).__name__}: {exc}")
+        return Fetch(note=f"calendar read failed: {type(exc).__name__}: {_short(exc)}")
     return Fetch(events=tuple(parse_events(raw)))
+
+
+MAX_NOTE_CHARS = 200
+"""Bound on anything from the server that reaches `TickResult.notes`.
+
+That note is printed by `daemon proactive` as a single `  ! ...` line, and the
+server's replies are not sized for one: the consent-required one alone is ~1.2KB
+of markdown. A truncated note still names the problem; an untruncated one buries
+the rest of the tick's output."""
+
+
+def _short(exc: object) -> str:
+    text = " ".join(str(exc).split())
+    return text if len(text) <= MAX_NOTE_CHARS else text[: MAX_NOTE_CHARS - 1] + "\u2026"
+
+
+_NEEDS_CONSENT = "Authentication Needed"
+"""The marker in `workspace-mcp`'s consent-required reply, matched as a substring.
+
+One short phrase rather than the whole sentence: the surrounding markdown carries
+the service name and the address, so a longer match would be version- and
+service-specific. A miss costs the latch below, not correctness - the ordinary
+truncated note still goes out."""
+
+_CONSENT_PENDING: set[str] = set()
+"""Addresses this process has already been told need consent.
+
+**The one piece of state in the proactive path, and it exists to stop a browser
+storm.** Measured live 2026-09-02: `get_events` for an address the server holds no
+credential for does not merely fail - `workspace-mcp` opens Google's consent page
+in the owner's browser and answers ACTION REQUIRED. The tick runs every five
+minutes, so a typo in `DAEMON_CALENDAR_EMAIL`, or a consent that has simply
+lapsed, means a browser window every five minutes until somebody notices. Nothing
+client-side can stop the server doing that except not calling it again.
+
+Deliberately process-lifetime and not persisted. The owner's fix - correcting the
+address in the admin console, or completing the consent - ends in a restart
+either way (`Save & restart`, or `daemon install`'s supervisor reviving it), and a
+restart is exactly the event that should make this daemon try again. Persisting it
+would turn a self-clearing annoyance into a state somebody has to find and delete.
+
+`tick.py` is otherwise stateless by design, which is why this sits here, next to
+the call it guards, rather than on `ProactiveTick`."""
+
+
+def _consent_pending(email: str, detail: str) -> Fetch:
+    """Latch the address and report it once, loudly, then quietly.
+
+    First time: WARNING with the full reply, so `daemon log` has the authorize URL
+    if the browser did not actually open. Afterwards: the same short note with no
+    call made at all, so the tick keeps saying why it is silent without asking the
+    server to open another window.
+    """
+    if email not in _CONSENT_PENDING:
+        _CONSENT_PENDING.add(email)
+        logger.warning(
+            "agenda: %s needs Google consent; not reading the calendar again until "
+            "this process restarts. Full reply: %s",
+            email,
+            " ".join(detail.split()),
+        )
+    return Fetch(
+        note=(
+            f"calendar needs Google consent for {email} - finish the sign-in, then "
+            "restart the daemon. Not retrying until then (it reopens the browser)."
+        )
+    )
 
 
 def _rfc3339(moment: datetime) -> str:
