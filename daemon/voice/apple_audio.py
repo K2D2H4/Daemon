@@ -65,7 +65,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -165,6 +165,27 @@ class VoiceProcessingAudio:
         self._guard = threading.Lock()
         self.dropped_blocks = 0
         """Microphone blocks thrown away because the consumer fell behind."""
+
+        self.on_playback_idle: Callable[[], None] | None = None
+        """Called on the event loop the moment the last scheduled buffer has actually
+        been *played back* - the engine's own word, not arithmetic.
+
+        Optional, duck-typed, and the reason it exists is a measurement: `play`
+        returns the moment a buffer is handed to the engine, so the only estimate of
+        when the speaker falls silent was bytes / sample rate, computed from
+        arrival. Half-duplex holds the microphone on that estimate. Measured
+        2026-09-02 through the real loop, the estimate outran the speaker by
+        1.5-3.0 s on every turn - a dropped or late buffer plays shorter than its
+        byte count says - and the owner's reply, begun the instant she fell silent,
+        lost its first 1.3-2.2 s (0/178 frames once): the server heard tails like
+        "대답해 줘." and answered nothing. `daemon/voice/conversation.py` clamps its
+        estimate to this callback."""
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._scheduled = 0
+        """Buffers handed to the engine and not yet reported played back."""
+        self._playback_generation = 0
+        """Bumped by `stop_playback`, so a completion for a buffer that was
+        discarded cannot count against the generation that came after it."""
 
         self.echo_cancellation = False
         """Whether voice processing is actually on.
@@ -413,6 +434,10 @@ class VoiceProcessingAudio:
         """
         if not chunk or self._closed:
             return
+        # The completion handler runs on an engine thread and has to find its way
+        # back here; captured on every call because a device can outlive the loop
+        # that first used it (the wake gate hands it across sessions).
+        self._loop = asyncio.get_running_loop()
         try:
             # Off the event loop, like every other call into this engine - see
             # `close`. Ordering is preserved because callers await each chunk
@@ -437,7 +462,36 @@ class VoiceProcessingAudio:
                 # `stop_playback` leaves the player stopped, so this is also
                 # how the next answer starts.
                 player.play()
-            player.scheduleBuffer_completionHandler_(buffer, None)
+            self._scheduled += 1
+            generation = self._playback_generation
+            avf = self._frameworks.avfoundation  # type: ignore[union-attr]
+
+            def played_back(_kind: Any = None) -> None:
+                # Engine thread: hop, never touch state here. Same rule as the
+                # microphone tap's `on_buffer` - nothing on this path may raise.
+                loop = self._loop
+                if loop is not None and not loop.is_closed():
+                    loop.call_soon_threadsafe(self._buffer_played_back, generation)
+
+            # `DataPlayedBack`, not the default `DataConsumed`: consumed means the
+            # engine has pulled the samples off our buffer, which is well before a
+            # listener hears the end of them. Played back is the moment the
+            # microphone gate cares about.
+            player.scheduleBuffer_completionCallbackType_completionHandler_(
+                buffer, avf.AVAudioPlayerNodeCompletionDataPlayedBack, played_back
+            )
+
+    def _buffer_played_back(self, generation: int) -> None:
+        """Event-loop side of a completion. The last one of a generation is the
+        speaker falling silent, and that is the only one anybody is told about."""
+        if generation != self._playback_generation:
+            return  # a buffer `stop_playback` had already discarded
+        self._scheduled = max(0, self._scheduled - 1)
+        if self._scheduled == 0 and self.on_playback_idle is not None:
+            try:
+                self.on_playback_idle()
+            except Exception:
+                logger.exception("apple audio: the playback-idle callback raised")
 
     def _playback_buffer(self, chunk: bytes) -> Any:
         avf = self._frameworks.avfoundation  # type: ignore[union-attr]
@@ -464,6 +518,8 @@ class VoiceProcessingAudio:
 
     def _stop_playback_blocking(self) -> None:
         with self._guard:
+            self._playback_generation += 1
+            self._scheduled = 0
             if self._player is not None and self._started:
                 self._player.stop()
 

@@ -3760,6 +3760,98 @@ async def test_two_turn_boundaries_before_the_first_answer_are_not_a_dead_sessio
     assert conv.ended != "the session stopped producing turns"
 
 
+async def test_the_speaker_saying_it_ran_dry_reopens_the_microphone_early() -> None:
+    """`_playback_until` is bytes / sample rate, computed from arrival, and it outran
+    the real speaker by 1.5-3.0 s on every turn measured 2026-09-02: a dropped or
+    late buffer plays shorter than its byte count says. The owner, replying the
+    instant the daemon fell silent, lost the first 1.3-2.2 s of every sentence - once
+    all of it - and the server heard "대답해 줘." and answered nothing.
+
+    A device that can report the last buffer *played back* is asked to, and the
+    estimate is clamped to what it says.
+    """
+    from daemon.voice.conversation import PLAYBACK_BYTES_PER_FRAME
+
+    audio = FakeAudio()
+    audio.on_playback_idle = None  # the device grows the hook; the conversation must fill it
+    session = FakeSession()
+    conv = conversation(session, audio, barge_in=False)
+    loop = asyncio.get_running_loop()
+    conv._audio.on_playback_idle = conv._speaker_ran_dry  # what run() does beside record()
+    twenty_eight_seconds = audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME * 28
+
+    async def mic() -> Any:
+        conv._generating = True
+        conv._on_audio(loop.time(), twenty_eight_seconds)
+        conv._generating = False  # the whole answer has arrived; 28 s still "queued"
+        yield b"held"  # the estimate says the speaker is busy
+        audio.on_playback_idle()  # the engine says it is not
+        yield b"owner"  # so this is the owner, and it must cross
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"owner"], (
+        "the microphone stayed shut on an estimate the speaker had already disproved"
+    )
+    assert conv._playback_until <= loop.time()
+
+
+async def test_a_momentary_gap_mid_answer_does_not_reopen_the_microphone() -> None:
+    """The speaker also empties between two chunks of one answer, while more is
+    still arriving. Reopening into that gap is the 2026-08-19 echo leak: the room
+    it records is the daemon's own next chunk. So the clamp applies only once the
+    answer has fully arrived."""
+    from daemon.voice.conversation import PLAYBACK_BYTES_PER_FRAME
+
+    audio = FakeAudio()
+    audio.on_playback_idle = None
+    session = FakeSession()
+    conv = conversation(session, audio, barge_in=False)
+    loop = asyncio.get_running_loop()
+    conv._audio.on_playback_idle = conv._speaker_ran_dry
+    one_second = audio.playback_sample_rate * PLAYBACK_BYTES_PER_FRAME
+
+    async def mic() -> Any:
+        conv._generating = True  # chunks still arriving
+        conv._on_audio(loop.time(), one_second)
+        audio.on_playback_idle()  # a gap, not the end
+        yield b"gap"  # must still be held
+        conv._generating = False
+        conv._playback_until = loop.time() - 1.0
+        yield b"after"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"after"], "a mid-answer gap reopened the microphone"
+
+
+async def test_run_registers_the_speaker_hook_and_clears_it_afterwards() -> None:
+    """The device outlives the conversation (the wake gate hands it across
+    sessions), so a hook left pointing at a finished conversation would clamp the
+    next one's clock from the grave."""
+    audio = FakeAudio(b"\x00" * 640)
+    audio.on_playback_idle = None
+    # One real item in the script, so the receive loop actually suspends: a script
+    # that only ends the turn returns without ever yielding, and `run()` then cancels
+    # the microphone pump before it has taken a single step - the spy below would
+    # never run, and the assertion would be about the fake, not the product.
+    session = FakeSession(Says("assistant", "응"), b"\x01", Turn())
+    conv = conversation(session, audio)
+    seen: list[Any] = []
+
+    original = conv._forward_microphone
+
+    async def spy(sess: Any, mic: Any) -> None:
+        seen.append(audio.on_playback_idle)
+        await original(sess, mic)
+
+    conv._forward_microphone = spy  # type: ignore[method-assign]
+    await conv.run()
+
+    assert seen and seen[0] == conv._speaker_ran_dry, "run() never registered the hook"
+    assert audio.on_playback_idle is None, "the hook outlived the conversation"
+
+
 async def test_an_opening_nobody_answers_still_ends_rather_than_hanging() -> None:
     """The other direction, which is why the patience is bounded rather than removed.
 
