@@ -347,13 +347,45 @@ Applied before `restore_detail`, and that ordering is why the same alpha got the
 verdict when smoothing was the last thing to touch the pixels - see `Renderer._blend`. It
 is also the most likely reason the four-arm afterimage A/B (this knob, `DETAIL_CUTOFF`,
 and `restore_detail` removed entirely) read as "다 거기서 거기" at 800px: the texture
-goes back on top and covers much of what the mix changed."""
+goes back on top and covers much of what the mix changed.
+
+**Judgement 4 (2026-09-01): an adaptive alpha was built, measured, and rejected.** The
+fixed alpha has a defect at both ends, so a One Euro filter (Casiez, Roussel, Vogel 2012)
+was put over the same state - alpha rising with each pixel's own speed. Its first
+parameterisation never adapted (alpha p50 0.47, 0% of pixels above 0.85: a fixed 0.47 in
+disguise, caught only by probing the alpha itself), so it was retuned by sweeping 24
+parameterisations over a recorded raw mouth sequence. The best arm measured genuinely
+bimodal - alpha p50 0.64, 12.9% of pixels above 0.85 - and on the mouth pixels it left
+articulation almost as the model drew it (3.68% of pixels moving >15 units, mean 31.2,
+against raw 4.05%/30.9 and this knob's 2.90%/27.7) while stilling the resting shimmer
+(63.3% of pixels changing at all, against 71.1% here). Side by side with this value at
+3x nearest, 1x and half speed, the owner: **"눈으로 보기에는 사실 별차이없어보여."** Same
+arms in downstream metrics tied within 3% (motion 2.18 against 2.26, sharpness 3.43
+against 3.47) - `restore_detail` re-textures on top, and the rest is below what the eye
+resolves at this size. 0.75 stays. The filter is not in the tree; it is on the branch
+`face/pause-closure-and-one-euro` (commits 9d223d9, 7edcc86) with its tests and the
+sweep table, should a larger mouth ever make the difference visible."""
 
 RELEASE_FRAMES = 10
 """How many frames the mouth takes to hand itself back to the driving clip.
 
 417ms at 24fps. Ranked by the owner against 0 and 5 on a 2.4x side-by-side of the
-falling edge; 10 was "제일 자연스럽네". See `Renderer.release`."""
+falling edge; 10 was "제일 자연스럽네". See `Renderer.release`.
+
+**This happens once per utterance, and that is the reason it survives where its
+per-pause sibling did not.** On 2026-09-01 the same hand-back was built for pauses
+*inside* an utterance: `step` reported the dBFS of each mouth's 200ms window, and after
+4 quiet windows (167ms) the paste ramped out over 6 frames and back over 2 on the first
+loud one - so she would close her mouth between sentences instead of holding the parted
+one this engine always draws (88/88 windows). It worked as designed: on a 14s render with
+three 650ms pauses the mouth region sat 2.7 from the clip's own frame during pauses
+against 6-9 without it, identical during speech. Side by side, the owner chose without
+it: **"입이 닫힐때 입이 원본 영상 입으로 돌아가는데 퀄리티 차이가 나다보니 좀 이질감이 느껴져."**
+The generated mouth is TAESD-soft and the clip's is the camera's; every hand-back puts
+the two next to each other in time, and once per sentence that reads as a jolt where
+once per turn does not. The condition for retrying it is a smaller quality gap - a
+re-shoot that brings the mouth box under 256px, or a better decoder - not a different
+ramp. The code is on the branch `face/pause-closure-and-one-euro` (9d223d9) with tests."""
 
 
 DISPLAY_LEAD = 6

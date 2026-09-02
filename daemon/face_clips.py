@@ -87,6 +87,10 @@ LIPSYNC_CLIPS: frozenset[str] = frozenset(
 )
 """The ten clips the owner prepared caches for, under `<data_dir>/face/lipsync/`.
 
+All ten have now been judged by the owner with lip-sync on them (the last four -
+`thinking`, `sulky`, `curious`, `flourish_arms` - on 2026-09-01: "다 괜찮은듯"). A clip
+that turns bad is removed here and nowhere else.
+
 `speaking_loud` and `speaking_soft` are absent deliberately (see the module docstring).
 This is what was prepared, not what is loaded: `daemon/app.py` scans for the cache
 artefacts and passes the set it actually found as `available`, because rule 4 is omission
