@@ -1303,7 +1303,14 @@ class Settings(BaseSettings):
                 "DAEMON_VOICE_PROVIDER=gemini but DAEMON_GEMINI_LIVE_MODEL is empty; "
                 "the native-audio endpoint needs its own id"
             )
-        if self.voice_provider == "gemini":
+        # The *resolved* voice route, not the axis. `route_overrides` can send
+        # chat_voice to gemini while DAEMON_VOICE_PROVIDER says openai (see
+        # `routing`), and `run_voice` builds a Gemini session for whatever the route
+        # resolves to - so reading the axis here left exactly that combination
+        # unvalidated, and the missing project then surfaced as a ValueError raised
+        # inside the reconnect loop rather than as a setting that failed to load.
+        voice_route = self.routing.get(Task.CHAT_VOICE, self.voice_provider)
+        if voice_route == "gemini":
             if self.gemini_live_transport not in GEMINI_LIVE_TRANSPORTS:
                 problems.append(
                     f"DAEMON_GEMINI_LIVE_TRANSPORT is {self.gemini_live_transport!r}; "
@@ -1323,6 +1330,20 @@ class Settings(BaseSettings):
                         "DAEMON_GEMINI_LIVE_TRANSPORT=vertex but DAEMON_VERTEX_LOCATION "
                         "is empty; live models are served from specific regions only"
                     )
+            # The model and the endpoint are one decision, and the admin console
+            # makes them two clicks apart: switching to vertex rewrites the model
+            # id, and switching back leaves it. Only this direction is refused,
+            # because it is the only one we are certain about - VERTEX_LIVE_MODELS
+            # goes stale the day Google ships another Vertex live model, and a
+            # config that refuses to load over a *new* id would be worse than the
+            # 1008. `daemon doctor` reports the uncertain direction instead.
+            elif self.gemini_live_model in VERTEX_LIVE_MODELS:
+                problems.append(
+                    f"DAEMON_GEMINI_LIVE_MODEL is {self.gemini_live_model!r}, which only "
+                    "the vertex transport serves - the API-key endpoint closes 1008 "
+                    '"is not found" for it. Set DAEMON_GEMINI_LIVE_TRANSPORT=vertex, or '
+                    "choose a model that endpoint lists"
+                )
         if self.voice_provider == "openai":
             if not self.openai_realtime_model:
                 problems.append(

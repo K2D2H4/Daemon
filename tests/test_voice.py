@@ -419,6 +419,32 @@ async def test_a_bearer_token_never_appears_in_an_error() -> None:
     assert "<key>" in str(caught.value)
 
 
+async def test_an_absent_api_key_scrubs_nothing_rather_than_everything() -> None:
+    """The Vertex transport constructs with `api_key=""`, and `str.replace("", ...)`
+    matches between every character.
+
+    Without the empty-drop in `_KeyFilter`, every error message on that transport
+    would come back as `<key>`-per-character noise - a TLS failure unreadable
+    exactly when it needs reading. Nothing else in the suite looks at a redacted
+    message with no key present, so this is the only thing holding that guard down.
+    """
+    live = GeminiLiveSession(
+        "",
+        VERTEX_PATH,
+        auth=lambda: {"Authorization": f"Bearer {TOKEN}"},
+        connect=connector(OSError("no route to host")),
+        max_attempts=1,
+    )
+    with pytest.raises(GeminiLiveError) as caught:
+        async with live:
+            pass  # pragma: no cover
+
+    message = str(caught.value)
+    assert "could not connect" in message
+    assert "no route to host" in message
+    assert "<key>" not in message, "an empty credential was substituted into the text"
+
+
 def test_the_log_filter_scrubs_a_credential_it_learned_after_construction() -> None:
     """websockets logs the handshake headers at DEBUG, so the scrub has to cover a
     credential that did not exist when the filter was built. Asserted on the filter

@@ -2377,15 +2377,6 @@ async def run_voice(
     from daemon.voice.gemini_live import WS_URL, GeminiLiveError, GeminiLiveSession
     from daemon.voice.openai_realtime import OpenAIRealtimeError, OpenAIRealtimeSession
 
-    # One provider for the whole voice mode, not one per session: it caches the
-    # credential and refreshes it as it expires, and a fresh provider per
-    # reconnect would fetch a new token for every attempt.
-    vertex_auth = (
-        vertex.auth_headers(settings.vertex_credentials_path)
-        if settings.voice_provider == "gemini" and settings.gemini_live_transport == "vertex"
-        else None
-    )
-
     if not settings.voice_enabled:
         logger.error("voice is off; set DAEMON_VOICE_ENABLED=true (see `daemon setup`)")
         return PROBLEM
@@ -2402,6 +2393,20 @@ async def run_voice(
     # route_for raises with the specific reason - voice disabled, no live model
     # id - which is more use than anything this function could say about it.
     route = settings.route_for(Task.CHAT_VOICE)
+
+    # One provider for the whole voice mode, not one per session: it caches the
+    # credential and refreshes it as it expires, and a fresh provider per reconnect
+    # would fetch a new token for every attempt.
+    #
+    # Built from the *resolved* route rather than `voice_provider`, and the session
+    # below branches on this object rather than re-reading the setting: two
+    # conditions for one decision is how a `route_overrides` entry pointing
+    # chat_voice at gemini got a Vertex URI with no credential behind it.
+    vertex_auth = (
+        vertex.auth_headers(settings.vertex_credentials_path)
+        if route.provider == "gemini" and settings.gemini_live_transport == "vertex"
+        else None
+    )
 
     harden_existing(settings.data_dir)
     # `shared` is the resident's boot-once voice runtime (VoiceRuntime): store,
@@ -2560,11 +2565,10 @@ async def run_voice(
             # way - the protocol does not change with the endpoint
             # (daemon/voice/vertex.py, docs/design/vertex-live-transport.md).
             url = WS_URL
-            auth = None
+            auth = vertex_auth
             model = route.model
-            if settings.gemini_live_transport == "vertex":
+            if auth is not None:
                 url = vertex.ws_url(settings.vertex_location)
-                auth = vertex_auth
                 model = vertex.model_path(
                     settings.vertex_project, settings.vertex_location, route.model
                 )

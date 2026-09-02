@@ -291,14 +291,27 @@ class _KeyFilter(logging.Filter):
         self._secrets: list[str] = [secret for secret in secrets if secret]
 
     def remember(self, secret: str) -> None:
-        """Scrub this too from here on. Short-lived credentials rotate, so the
-        newest replaces the previous one rather than piling up."""
+        """Scrub this too from here on.
+
+        Keeps the last `_MAX_REMEMBERED_SECRETS` distinct credentials, oldest
+        dropped first - not one at a time: a reconnect can be in flight against a
+        token the previous attempt is still quoting in an error string.
+
+        Empty is dropped rather than stored, and that is load-bearing:
+        `"".replace()` matches between every character, so one empty credential in
+        the list would rewrite every message it touched into `<key>`-per-character
+        noise. The API-key transport hands its key here at construction; the Vertex
+        one has no key and hands nothing.
+        """
         if not secret or secret in self._secrets:
             return
         self._secrets.append(secret)
         del self._secrets[:-_MAX_REMEMBERED_SECRETS]
 
-    def _scrub(self, text: str) -> str:
+    def scrub(self, text: str) -> str:
+        """Every credential this filter knows, replaced. Public because the session
+        redacts its own error strings through it - one list, so what is scrubbed
+        from a log record and what is scrubbed from an exception cannot drift."""
         for secret in self._secrets:
             text = text.replace(secret, "<key>")
         return text
@@ -314,18 +327,18 @@ class _KeyFilter(logging.Filter):
         if isinstance(record.args, dict):
             record.args = {
                 name: (
-                    self._scrub(str(value)) if self._has_secret(str(value)) else value
+                    self.scrub(str(value)) if self._has_secret(str(value)) else value
                 )
                 for name, value in record.args.items()
             }
         if record.exc_text and self._has_secret(record.exc_text):
-            record.exc_text = self._scrub(record.exc_text)
+            record.exc_text = self.scrub(record.exc_text)
         message = str(record.msg)
         if self._has_secret(message):
-            record.msg = self._scrub(message)
+            record.msg = self.scrub(message)
         if isinstance(record.args, tuple):
             record.args = tuple(
-                self._scrub(str(arg)) if self._has_secret(str(arg)) else arg
+                self.scrub(str(arg)) if self._has_secret(str(arg)) else arg
                 for arg in record.args
             )
         return True
@@ -479,10 +492,10 @@ class GeminiLiveSession:
         """Why `receive()` finished, set as it finishes. Without it a session
         ending looks exactly like a turn ending, and the caller keeps talking into
         a socket that is gone."""
-        self._secrets: list[str] = []
-        """Credentials seen since construction, for `_redact`. Empty on the
-        API-key transport, where `_api_key` is the only one and is already known."""
         self._log_filter = _KeyFilter(api_key)
+        """Holds every credential this session has used, and is the single source
+        `_redact` scrubs from - a second list on the session drifted from it and
+        stored the same token once per connect attempt."""
         self._filtered: list[logging.Logger | logging.Handler] = [logging.getLogger("websockets")]
         # Handler-level too: logging runs the originating logger's filters, never
         # an ancestor's, so a child logger such as websockets.client would walk
@@ -1242,12 +1255,7 @@ class GeminiLiveSession:
             ) from None
         for value in headers.values():
             self._log_filter.remember(value)
-            self._secrets.append(value)
-        del self._secrets[:-_MAX_REMEMBERED_SECRETS]
         return headers
 
     def _redact(self, text: str) -> str:
-        for secret in (self._api_key, *self._secrets):
-            if secret:
-                text = text.replace(secret, "<key>")
-        return text
+        return self._log_filter.scrub(text)

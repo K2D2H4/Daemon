@@ -31,7 +31,14 @@ from pathlib import Path
 from typing import Any
 
 from daemon import __version__
-from daemon.config import ENV_FILE, OLLAMA, OPENAI_COMPATIBLE, ConfigError, Settings
+from daemon.config import (
+    ENV_FILE,
+    OLLAMA,
+    OPENAI_COMPATIBLE,
+    VERTEX_LIVE_MODELS,
+    ConfigError,
+    Settings,
+)
 from daemon.fs import DIR_MODE
 from daemon.proactivity.base import Reading
 from daemon.service import Service, ServiceAction, ServiceError, ServiceStatus, service_for
@@ -1516,11 +1523,23 @@ def _doctor() -> int:
         # it is not the default, so an unchanged install reads exactly as before.
         if settings.voice_enabled and settings.voice_provider == "gemini":
             if settings.gemini_live_transport == "vertex":
-                credentials = settings.vertex_credentials_path or "ADC"
                 endpoint += (
                     f" voice-transport=vertex project={settings.vertex_project or '<unset>'}"
-                    f" region={settings.vertex_location} credentials={credentials}"
+                    f" region={settings.vertex_location}"
+                    f" credentials={_vertex_credentials_note(settings)}"
                 )
+                # The half `Settings` deliberately does not refuse: VERTEX_LIVE_MODELS
+                # goes stale the day Google ships another Vertex live model, so a
+                # config that would not load over a new id is worse than the close
+                # code. Said out loud here instead.
+                if settings.gemini_live_model not in VERTEX_LIVE_MODELS and not (
+                    settings.gemini_live_model.startswith(("projects/", "publishers/"))
+                ):
+                    endpoint += (
+                        f" model={settings.gemini_live_model}"
+                        " (not in the known Vertex catalogue - if it is not new, the"
+                        " session will close 1008)"
+                    )
         checks = [
             Check(
                 "config",
@@ -1554,6 +1573,24 @@ def _doctor() -> int:
         sys.stdout.flush()
         print(f"\n{failed} check(s) failed.", file=sys.stderr)
     return PROBLEM if failed else OK
+
+
+def _vertex_credentials_note(settings: Settings) -> str:
+    """The credential the Vertex transport will present, and whether it exists.
+
+    Printing the configured path alone let a typo read as configured: the session
+    only fails when the owner says the wake word, and it fails permanently, with the
+    reason in the resident's log rather than here. Rule 12 - a capability reported
+    nowhere is the silent state this project keeps being bitten by.
+    """
+    path = settings.vertex_credentials_path
+    if not path:
+        return "ADC"
+    if not os.path.exists(path):
+        return f"{path} (MISSING)"
+    if not os.access(path, os.R_OK):
+        return f"{path} (unreadable)"
+    return path
 
 
 def _env_override_check(settings: Settings) -> Check:

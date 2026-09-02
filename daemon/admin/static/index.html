@@ -1434,15 +1434,20 @@ function voiceField(provider,e,o,chosenTransport){
   const tOpts=(o.gemini_live_transports||[]).map(
     x=>`<option ${x===transport?'selected':''}>${esc(x)}</option>`).join('');
   const head=isO?'':`<label class="field">${nameCell('gemini_live_transport')}<select data-f="gemini_live_transport">${tOpts}</select></label>`;
-  const model=(!isO&&transport==='vertex')
-    ? fieldStr(modelName,e[modelName],o.vertex_live_models||[''])
+  // No `||['']` fallback: an empty catalogue there would render one blank option,
+  // read as an edit, and save DAEMON_GEMINI_LIVE_MODEL= - refused by the validator
+  // with a message about an empty model rather than about an empty list. Free text
+  // is the honest degradation, and it is what the other transport uses anyway.
+  const vertexModels=(!isO&&transport==='vertex')?(o.vertex_live_models||[]):[];
+  const model=vertexModels.length
+    ? fieldStr(modelName,e[modelName],vertexModels)
     : fieldStr(modelName,e[modelName]);
-  const vertex=(!isO&&transport==='vertex')
+  const vertexFields=(!isO&&transport==='vertex')
     ? fieldStr('vertex_project',e.vertex_project)
       +fieldStr('vertex_location',e.vertex_location,o.vertex_locations)
       +fieldStr('vertex_credentials_path',e.vertex_credentials_path)
     : '';
-  return `<div id="voice-field" style="display:contents">${head}${model}${vertex}<div class="field">${nameCell(name)}<select data-f="${name}">${os}</select>
+  return `<div id="voice-field" style="display:contents">${head}${model}${vertexFields}<div class="field">${nameCell(name)}<select data-f="${name}">${os}</select>
     <div class="voice-preview"><button type="button" class="btn" id="voice-play">▶ preview</button>
     <span class="cap" id="voice-preview-msg"></span><audio id="voice-sample" preload="none"></audio></div></div>${sens}</div>`;
 }
@@ -1620,8 +1625,10 @@ $('#settings-form').addEventListener('change',ev=>{
   }
   // Switching transport changes which model ids are reachable, so the whole
   // Gemini block is redrawn - the same surgery the provider select does, one
-  // level down. `val()` reads the live form, so the new transport is what the
-  // re-render sees.
+  // level down. The picked value is passed in, because `val()` cannot see it: it
+  // reads the running value and the pending-restart one, never the form. Without
+  // that argument the select would snap back to the saved transport on every
+  // change.
   if(ev.target.dataset && ev.target.dataset.f==='gemini_live_transport'){
     const vf=$('#voice-field');
     const prov=$('[data-f="voice_provider"]');

@@ -70,6 +70,13 @@ def model_path(project: str, location: str, model: str) -> str:
         return model
     if not project:
         raise ValueError("a Vertex project is required (DAEMON_VERTEX_PROJECT)")
+    # Both halves, for the reason `ws_url` gives about one of them: an empty region
+    # here does not fail, it builds `locations//` and comes back as a close naming a
+    # model nobody configured. Nothing reaches this today because `app.py` calls
+    # `ws_url` first and it raises - that is call ordering, not this function's
+    # contract, and the next caller that needs only a path would lose it.
+    if not location:
+        raise ValueError("a Vertex location is required (DAEMON_VERTEX_LOCATION)")
     if model.startswith("publishers/"):
         return f"projects/{project}/locations/{location}/{model}"
     return f"projects/{project}/locations/{location}/publishers/google/models/{model}"
@@ -143,10 +150,29 @@ def _load_credentials(credentials_path: str) -> object:
 
 
 def _refresh(credentials: object) -> None:
-    try:
-        from google.auth.transport.requests import Request
+    """Renew the access token, and classify the failure honestly.
 
+    The two halves are not the same failure. An expired login or a revoked key
+    needs a person, and retrying it is the mute-but-healthy daemon this project
+    keeps meeting. A token endpoint that could not be reached needs nothing but the
+    next attempt - and a resident reconnects for its own reasons all day, so
+    calling that permanent means one DNS blip ends voice mode until a restart.
+    google-auth raises a distinguishable class for each, so this does not have to
+    guess.
+    """
+    from google.auth import exceptions as auth_exceptions
+    from google.auth.transport.requests import Request
+
+    try:
         credentials.refresh(Request())  # type: ignore[attr-defined]
+    except auth_exceptions.TransportError as exc:
+        # Not permanent: `_enter`'s backoff is exactly the right response, and the
+        # attempt after it asks for a token again.
+        raise GeminiLiveError(
+            f"Vertex credentials could not be refreshed: {type(exc).__name__}: {exc}. "
+            "Google's token endpoint was unreachable, which is usually transient.",
+            permanent=False,
+        ) from None
     except Exception as exc:
         raise GeminiLiveError(
             f"Vertex credentials could not be refreshed: {type(exc).__name__}: {exc}. "
