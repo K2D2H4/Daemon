@@ -3873,3 +3873,133 @@ async def test_an_opening_nobody_answers_still_ends_rather_than_hanging() -> Non
     assert elapsed >= ANSWER_PATIENCE_SECONDS, (
         "it gave up before the patience it was given, so the waiting is not what ended it"
     )
+
+
+# --- the speech gate in the loop (daemon/voice/speech_gate.py) -------------------
+
+from daemon.voice.vad import FRAME_BYTES as _VAD_FRAME_BYTES  # noqa: E402
+
+
+class _GateVad:
+    """Speech is whatever starts with 0x10; the room is anything else."""
+
+    sample_rate = 16_000
+    frame_samples = _VAD_FRAME_BYTES // 2
+
+    def probability(self, frame: bytes) -> float:
+        return 0.9 if frame[0] == 0x10 else 0.1
+
+    def reset(self) -> None:
+        pass
+
+
+def _room_frames(n: int) -> list[bytes]:
+    return [bytes([0x01, i]) * (_VAD_FRAME_BYTES // 2) for i in range(n)]
+
+
+_SPEECH_FRAME = b"\x10\x00" * (_VAD_FRAME_BYTES // 2)
+
+
+def _frames(sent: list[bytes]) -> list[bytes]:
+    joined = b"".join(sent)
+    return [joined[i:i + _VAD_FRAME_BYTES] for i in range(0, len(joined), _VAD_FRAME_BYTES)]
+
+
+async def test_the_speech_gate_sends_silence_for_the_room_and_speech_as_recorded() -> None:
+    """Measured 2026-09-02: the echo-cancelled microphone carries the room at about
+    -57 dBFS and Vertex 2.5 answers it as if the owner had spoken (`Ay.`, `da`,
+    `what 2 3 4` in one session). With a VAD handed in, the room goes out as zeros
+    and a sustained run of speech opens the gate with its pre-roll."""
+    session = FakeSession()
+    conv = conversation(session, vad=_GateVad())
+    room = _room_frames(40)
+    speech = [_SPEECH_FRAME] * 12
+
+    async def mic() -> Any:
+        for frame in room + speech:
+            yield frame
+
+    await conv._forward_microphone(session, mic())
+
+    frames = _frames(session.sent)
+    # forty room frames and the first eleven speech frames: silence, same length -
+    # eleven, because the measured echo leak ran to eight and the gate must not open
+    # inside it
+    assert frames[:51] == [bytes(_VAD_FRAME_BYTES)] * 51
+    # the twelfth opens the gate and flushes the 31-frame pre-roll: the room just
+    # before speech began, then the speech itself, verbatim
+    assert frames[51:] == room[-19:] + speech
+
+
+async def test_dropped_room_sound_is_not_the_head_of_the_next_utterance() -> None:
+    """The pre-roll must not carry sound from before the daemon spoke across the
+    stretch where the microphone was held: that audio is a different moment."""
+    session = FakeSession()
+    conv = conversation(session, barge_in=False, vad=_GateVad())
+    room = _room_frames(3)
+    speech = [_SPEECH_FRAME] * 12
+
+    async def mic() -> Any:
+        for frame in room:
+            yield frame  # shut: goes out as zeros, sits in the pre-roll
+        conv._generating = True
+        yield room[0]  # the daemon is speaking: dropped, and the pre-roll with it
+        conv._generating = False
+        for frame in speech:
+            yield frame
+
+    await conv._forward_microphone(session, mic())
+
+    sent = b"".join(session.sent)
+    assert not any(frame in sent for frame in room)
+    assert _frames(session.sent)[-12:] == speech
+
+
+async def test_without_a_vad_the_microphone_reaches_the_model_as_before() -> None:
+    session = FakeSession()
+    conv = conversation(session)
+
+    async def mic() -> Any:
+        yield b"room"
+        yield b"more room"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == [b"room", b"more room"]
+
+
+async def test_with_a_speech_gate_an_owed_answer_does_not_mute_the_microphone() -> None:
+    """2.5 finalises the owner's transcript mid-utterance. The old hold then dropped
+    every frame for up to six seconds: the rest of the sentence never left, and the
+    server, receiving nothing at all, could not hear the silence that ends a turn -
+    measured 7.0 s to the first word. With the gate, frames keep flowing: room as
+    zeros, speech as recorded, so the turn can end and the sentence arrives whole."""
+    session = FakeSession()
+    conv = conversation(session, vad=_GateVad())
+    conv._answer_hold_until = asyncio.get_running_loop().time() + 60.0
+    speech = [_SPEECH_FRAME] * 12
+
+    async def mic() -> Any:
+        for frame in _room_frames(2) + speech:
+            yield frame
+
+    await conv._forward_microphone(session, mic())
+
+    frames = _frames(session.sent)
+    # nothing was dropped: two room frames and eleven shut speech frames as zeros,
+    # then the flush - the pre-roll (those thirteen) and the twelfth speech frame
+    assert len(frames) == 2 + 11 + 13 + 1
+    assert frames[-12:] == speech
+
+
+async def test_without_a_speech_gate_an_owed_answer_still_holds_the_microphone() -> None:
+    session = FakeSession()
+    conv = conversation(session)
+    conv._answer_hold_until = asyncio.get_running_loop().time() + 60.0
+
+    async def mic() -> Any:
+        yield b"room"
+
+    await conv._forward_microphone(session, mic())
+
+    assert session.sent == []

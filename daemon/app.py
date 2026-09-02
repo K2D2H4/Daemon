@@ -2830,6 +2830,7 @@ async def _voice_attempts(
         # line nobody heard, a false negative says the same sentence twice.
         on_spoke()
 
+    speech_vad = _speech_vad()
     for attempt in range(1, VOICE_RECONNECT_ATTEMPTS + 1):
         session = new_session()
         conversation = VoiceConversation(
@@ -2852,6 +2853,7 @@ async def _voice_attempts(
             # sink is the process's one ring, and it re-anchors on the discontinuity
             # the new turn's timestamps make (daemon/face_lipsync/ring.py).
             pcm_sink=pcm_sink,
+            vad=speech_vad,
         )
         failure: Exception | None = None
         try:
@@ -3332,6 +3334,23 @@ def build_wake_audio() -> AudioIO:
     from daemon.voice.audio import SoundDeviceAudio
 
     return SoundDeviceAudio()
+
+
+def _speech_vad() -> Any:
+    """The conversation's own VAD, for `daemon/voice/speech_gate.py`.
+
+    Its own instance, not the wake gate's: Silero is stateful and one instance
+    belongs to one stream of frames (daemon/voice/vad.py). None when onnxruntime is
+    not installed, and the microphone then reaches the model ungated - the shape
+    every session had before 2026-09-02, which 3.1 tolerates and 2.5 does not.
+    """
+    try:
+        from daemon.voice.vad import SileroVad
+
+        return SileroVad()
+    except Exception as exc:  # noqa: BLE001 - a missing optional dependency is not a crash
+        logger.warning("voice: no local VAD (%s); the room reaches the model ungated", exc)
+        return None
 
 
 def build_voice_audio() -> AudioIO:

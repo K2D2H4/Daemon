@@ -75,8 +75,15 @@ from daemon.face import MOOD_TOOL, FaceBus, Mood, SpeechClock
 from daemon.llm.base import ToolCall
 from daemon.memory.base import LoggedMessage, RecalledItem
 from daemon.tools.base import ToolResult
-from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
+from daemon.voice.base import (
+    AudioIO,
+    Interrupted,
+    Transcript,
+    VoiceActivityDetector,
+    VoiceSession,
+)
 from daemon.voice.screen_share import ScreenShareController, ScreenSharePump
+from daemon.voice.speech_gate import SpeechGate
 
 logger = logging.getLogger(__name__)
 
@@ -378,6 +385,7 @@ class VoiceConversation:
         barge_in: bool = True,
         face: FaceBus | None = None,
         pcm_sink: Callable[[bytes, float], None] | None = None,
+        vad: VoiceActivityDetector | None = None,
     ) -> None:
         self._session = session
         self._audio = audio
@@ -487,6 +495,10 @@ class VoiceConversation:
         self._started_at: float | None = None
         self._first_audio_at: float | None = None
         self._played_bytes = 0
+        self._speech_gate = SpeechGate(vad) if vad is not None else None
+        """Only a person talking reaches the model; the room goes out as digital
+        silence (daemon/voice/speech_gate.py). None when no local VAD was handed in,
+        and the microphone then reaches the model ungated, as it did before."""
         self._playback_until = 0.0
         """Loop-clock instant the speaker runs dry, so the idle budget can start
         counting silence when the room actually falls silent (see `_on_audio`)."""
@@ -921,12 +933,30 @@ class VoiceConversation:
                     # queued. The moment audio flows, `_generating` is set and the
                     # microphone resumes - barge-in over the spoken result works
                     # exactly as before.
+                    if self._speech_gate is not None:
+                        self._speech_gate.reset()
                     continue
-                if self._answer_hold_until and not self._generating:
+                if (
+                    self._answer_hold_until
+                    and not self._generating
+                    and self._speech_gate is None
+                ):
+                    # Only without a speech gate. The hold exists so the room cannot
+                    # reach the server and be read as a new turn while an answer is
+                    # owed; with the gate the room goes out as zeros, which cannot.
+                    # And the hold does harm here that it never could before: 2.5
+                    # finalises the owner's transcript *mid-utterance* (measured
+                    # 2026-09-02, 11.1 s into a 5.3 s utterance that ended at 12.5),
+                    # so arming on it muted the microphone before the owner had
+                    # finished - the rest of the sentence never left, and with no
+                    # frames at all the server could not hear the silence that ends
+                    # a turn: the answer came 7.0 s late, when frames resumed.
                     if asyncio.get_running_loop().time() < self._answer_hold_until:
                         # The model owes an answer and has not begun it; see
                         # `_answer_hold_until`. Dropped, not queued - stale room
                         # audio helps nobody once the answer is under way.
+                        if self._speech_gate is not None:
+                            self._speech_gate.reset()
                         continue
                     # Bound reached: the model is not answering, so the microphone
                     # goes back to the owner rather than staying held.
@@ -956,6 +986,8 @@ class VoiceConversation:
                     # parroted its own last sentence back. `_playback_until` already
                     # tracked when the speaker runs dry for the idle budget; the
                     # microphone gate needed the same number.
+                    if self._speech_gate is not None:
+                        self._speech_gate.reset()
                     continue
                 if self._face is not None and not (
                     asyncio.get_running_loop().time() < self._playback_until
@@ -978,6 +1010,15 @@ class VoiceConversation:
                     # back is exactly what `ToolRunner.execute` already does to
                     # restore it (daemon/tools/runner.py), not a new pattern.
                     self._face.set_activity("listening")
+                if self._speech_gate is not None:
+                    # The room is not the owner. Frames the local VAD does not call
+                    # speech go out as zeros of the same length; the model's own
+                    # activity detection then sees silence instead of -57 dBFS of
+                    # room and the canceller's leaks, which 2.5 answers as if the
+                    # owner had spoken (daemon/voice/speech_gate.py).
+                    chunk = self._speech_gate.feed(chunk)
+                    if not chunk:
+                        continue
                 await session.send_audio(chunk)
         except asyncio.CancelledError:
             raise

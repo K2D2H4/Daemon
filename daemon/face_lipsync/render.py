@@ -662,7 +662,8 @@ class Renderer:
         if self.failed:
             return None
         try:
-            n = len(self._driver.cache.boxes)
+            driver = self._driver  # one clip per call, as in `encode`
+            n = len(driver.cache.boxes)
             audio = [frame_index + offset for offset in range(BATCH)]
             windows = [
                 self._ring.window(
@@ -681,14 +682,14 @@ class Renderer:
             # turn's origin. `index(origin) + k` and `index(origin + k/fps)` are the
             # same integer, which is why one reading of the clock per step is enough
             # and the pair still advances by exactly one frame.
-            began = self._driver.clip.nearest(origin)
+            began = driver.clip.nearest(origin)
             shown = [began + index + DISPLAY_LEAD for index in audio]
             return Step(
                 indices=shown,
                 mouths=self._engine.mouths(
                     windows,
                     [index % n for index in shown],
-                    clip=self._driver.name,
+                    clip=driver.name,
                 ),
             )
         except Exception:
@@ -696,8 +697,14 @@ class Renderer:
             self.failed = True
             return None
 
-    def _weight(self, mouth: np.ndarray, clip_index: int, index: int) -> np.ndarray:
+    def _weight(
+        self, mouth: np.ndarray, clip_index: int, index: int, cache: Cache
+    ) -> np.ndarray:
         """This frame's injection weight, averaged with the frames before it.
+
+        `cache` is passed rather than read off `self._driver`: the caller binds one
+        clip for the whole call, because the field can change underneath it (see
+        `encode`).
 
         Averaged because the un-averaged version pulsed: recomputed per frame, the
         borrowed texture's strength moved every frame and the owner read that as a
@@ -706,9 +713,7 @@ class Renderer:
 
         Restarts with `_blend` on a turn boundary: the average is over one utterance.
         """
-        current = detail_weight(
-            mouth, self._driver.cache.frames[clip_index], self._driver.cache.boxes[clip_index]
-        )
+        current = detail_weight(mouth, cache.frames[clip_index], cache.boxes[clip_index])
         if self._smoothed is None or index != self._weight_at:
             self._smoothed = current
         else:
@@ -789,21 +794,22 @@ class Renderer:
         if step < 1 or step > count:
             return None
         try:
-            i = index % len(self._driver.cache.boxes)
-            box = self._driver.cache.boxes[i]
+            cache = self._driver.cache  # one clip per call, as in `encode`
+            i = index % len(cache.boxes)
+            box = cache.boxes[i]
             x1, y1, x2, y2 = box
             sized = restore_detail(
                 cv2.resize(np.clip(self._previous, 0, 255).astype(np.uint8), (x2 - x1, y2 - y1)),
-                self._driver.cache.frames[i],
+                cache.frames[i],
                 box,
                 self._smoothed,
             )
             out = composite(
-                self._driver.cache.frames[i],
+                cache.frames[i],
                 sized,
                 box,
-                self._driver.cache.crop_boxes[i],
-                self._driver.cache.masks[i],
+                cache.crop_boxes[i],
+                cache.masks[i],
                 out=self._buffer,
                 # Ends one step short of zero, because the frame after the last of
                 # these is the clip itself - which is strength 0 already.
@@ -824,27 +830,38 @@ class Renderer:
             return None
 
     def encode(self, step: Step) -> list[bytes]:
-        """One whole-frame JPEG per mouth, in the pair's own order. Never raises."""
+        """One whole-frame JPEG per mouth, in the pair's own order. Never raises.
+
+        **The clip is bound once, here.** `switch` runs on the event loop while this
+        runs on the executor thread (daemon/app.py), so `self._driver` can change
+        between two reads inside one call - and did, on the owner's machine
+        2026-09-02: the modulo taken against a 193-frame clip's boxes, the frame
+        looked up in the 131-frame clip that had just arrived, `IndexError`, and the
+        render loop dead for the rest of the session. Three times in one day. A
+        frame composited from the clip that was up when the call began is right; a
+        frame composited from two clips is not a frame.
+        """
         if self.failed:
             return []
         try:
+            cache = self._driver.cache
             encoded: list[bytes] = []
-            n = len(self._driver.cache.boxes)
+            n = len(cache.boxes)
             for index, mouth in zip(step.indices, step.mouths, strict=True):
                 i = index % n
-                box = self._driver.cache.boxes[i]
+                box = cache.boxes[i]
                 x1, y1, x2, y2 = box
                 blended = self._blend(mouth, index)
                 sized = cv2.resize(blended, (x2 - x1, y2 - y1))
                 sized = restore_detail(
-                    sized, self._driver.cache.frames[i], box, self._weight(blended, i, index)
+                    sized, cache.frames[i], box, self._weight(blended, i, index, cache)
                 )
                 out = composite(
-                    self._driver.cache.frames[i],
+                    cache.frames[i],
                     sized,
                     box,
-                    self._driver.cache.crop_boxes[i],
-                    self._driver.cache.masks[i],
+                    cache.crop_boxes[i],
+                    cache.masks[i],
                     out=self._buffer,
                 )
                 # Encode inside the loop: `out` is one reusable buffer, so the second
