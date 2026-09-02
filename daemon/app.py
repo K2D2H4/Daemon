@@ -33,7 +33,7 @@ from fastapi import FastAPI
 from daemon import __version__, mic_floor
 from daemon.channels.base import Channel
 from daemon.clock import now_iso
-from daemon.companion import TOOL_CONTRACT, Companion, ResolveId
+from daemon.companion import Companion, ResolveId
 from daemon.config import (
     ANTHROPIC,
     ENV_FILE,
@@ -2523,7 +2523,11 @@ async def run_voice(
             block
             for block in (
                 seed,
-                TOOL_CONTRACT if tool_specs else "",
+                # Through `Companion.tool_rules`, not the bare constant: the method is
+                # what carries the Google account hint, and the constant is how voice
+                # spent 11 of 18 tool calls failing on an invented `user_google_email`
+                # (2026-09-02, daemon/companion.py `tool_rules`).
+                companion.tool_rules(origin="owner", surface="voice") if tool_specs else "",
                 MOOD_VOICE_INSTRUCTION if mood_specs else "",
             )
             if block

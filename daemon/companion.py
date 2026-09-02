@@ -308,12 +308,24 @@ class Companion:
         return tuple(block for block in blocks if block)
 
     def _tool_rules(self, *, origin: str) -> str:
+        return self.tool_rules(origin=origin)
+
+    def tool_rules(self, *, origin: str, surface: str = "text") -> str:
         """The tool contract, or nothing on a turn that will be offered no tools.
 
         Skipped for the same reason the tools themselves are (see `specs`): it is two
         hundred tokens of rules about a capability the model does not have this turn.
+
+        Public, and taking `surface`, because the voice path has to call *this* and
+        not the bare `TOOL_CONTRACT` constant. It did the latter for as long as it had
+        tools, and so never got the Google account hint below - the text path did.
+        Measured on the owner's session of 2026-09-02 14:51: the voice model, offered
+        Google tools and told nothing about the account, passed the literal string
+        `$OWNER_EMAIL` as `user_google_email` and got 11 authentication failures in 18
+        tool calls, retrying the same search seven times and repeating the same
+        sentence between attempts. The text path, given this hint, does not do that.
         """
-        specs = self.specs(origin=origin)
+        specs = self.specs(origin=origin, surface=surface)
         if not specs:
             return ""
         # Read the credential dir only when a Google tool is actually on offer - most
