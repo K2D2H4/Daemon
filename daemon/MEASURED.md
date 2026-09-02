@@ -1002,3 +1002,23 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   browser found it immediately. The same lesson `daemon/CLAUDE.md` records for the
   product as a whole, restated for the admin page: reading the markup is not
   exercising the handler.
+
+- **The endpoint, not the model, was the four seconds.** Measured 2026-09-02 with one
+  3.56 s Korean utterance streamed at 1x realtime into a real session, timed from the
+  last speech sample to the first audio byte, 5 trials per arm, interleaved:
+  Vertex `gemini-live-2.5-flash-native-audio` **1430 ms** (41 ms spread), API-key
+  `gemini-3.1-flash-live-preview` 1723 ms, API-key
+  `gemini-2.5-flash-native-audio-preview-12-2025` 3137 ms (772 ms spread). Before
+  finding that, every knob on the slow arm was swept - `silence_duration_ms` at
+  1500/800/300, a shorter system instruction, the `-09-2025` and `-latest` builds, the
+  TTS model as a cascade - and **every one came back worse than the default**, which is
+  what "nothing configurable changes it" felt like being true. It was not: the fast id
+  does not exist on the API-key endpoint at all.
+
+  Two more things belonged to the *preview builds* rather than to 2.5 native audio:
+  `DAEMON_VOICE_START_SENSITIVITY=low` made the API-key arm completely deaf (12/12
+  turns silent, input transcript empty) while Vertex answered in 1420 ms with it set,
+  and 98 tool declarations cost the API-key arm +1380 ms against Vertex's +127 ms.
+
+  **The tell, for next time: a latency number without an endpoint and a region is not a
+  measurement.** Both arms were "gemini 2.5 native audio" by name. ADR 0020.

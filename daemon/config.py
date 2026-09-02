@@ -114,6 +114,31 @@ any other kind's cap alongside `topic` would have that whole setting rejected as
 naming an unknown kind - two task reports flagged exactly this gap before it was
 closed."""
 
+GEMINI_LIVE_TRANSPORTS = ("api_key", "vertex")
+"""Which endpoint serves the Gemini Live session. Two, because neither is a
+superset of the other: the faster and steadier native-audio model is Vertex-only,
+and the newer generation is API-key-only (docs/design/vertex-live-transport.md).
+
+Named here rather than imported from `daemon/voice/vertex.py` for the reason
+SENSITIVITIES gives below: this module is foundation."""
+
+VERTEX_LIVE_MODELS = ("gemini-live-2.5-flash-native-audio",)
+"""Conversational live models the `vertex` transport can serve, checked on
+2026-09-02 across every region that serves any. Exactly one, and it is the reason
+the transport exists: measured 1430 ms to first audio against the API-key
+endpoint's 3137 ms for the same model family.
+
+A constant rather than a probe: the admin's model lists authenticate with an API
+key, and this catalogue is not visible to one. `gemini-3.5-transcribe-live-preview`
+is deliberately absent - it transcribes and does not speak."""
+
+VERTEX_LIVE_LOCATIONS = ("us-central1", "us-east1", "us-east4", "us-west1", "europe-west4")
+"""Regions that listed a live model on 2026-09-02. asia-northeast1,
+asia-northeast3 (Seoul) and asia-southeast1 listed none, so a Korean self-hoster's
+nearest region cannot serve this at all - and from Seoul us-west1 measured
+identical to us-central1 (1441 ms both), so the delay is serving rather than
+distance and there is nothing to buy by moving closer."""
+
 SENSITIVITIES = ("low", "high")
 """What the two speech-sensitivity settings accept, plus empty for "the server
 decides".
@@ -347,6 +372,36 @@ class Settings(BaseSettings):
     GEMINI_LIVE_VOICES, or empty to leave it to the server. Checked at construction,
     not on the wire: an unknown name comes back as a 1007 close the session treats as
     permanent, so a typo would end voice mode rather than fail the setting."""
+
+    gemini_live_transport: str = Field(
+        default="api_key", alias="DAEMON_GEMINI_LIVE_TRANSPORT"
+    )
+    """Which endpoint the Gemini Live session dials: one of GEMINI_LIVE_TRANSPORTS.
+
+    `api_key` is the default and needs nothing but GEMINI_API_KEY. `vertex` needs a
+    GCP project and credentials, and buys two things measured 2026-09-02
+    (docs/design/vertex-live-transport.md): `gemini-live-2.5-flash-native-audio`,
+    which exists on no other endpoint, and 1430 ms to first audio against the
+    API-key endpoint's 3137 ms for the same model family. It is not a strict
+    upgrade - the newer generation (3.1 live) exists only on `api_key` - which is
+    why this is an axis rather than a migration."""
+
+    vertex_project: str = Field(default="", alias="DAEMON_VERTEX_PROJECT")
+    """GCP project for the `vertex` transport. Required by it, unused otherwise."""
+
+    vertex_location: str = Field(default="us-central1", alias="DAEMON_VERTEX_LOCATION")
+    """Region for the `vertex` transport. Not every region serves live models: the
+    Seoul region serves none, and from Seoul us-west1 measured identical to
+    us-central1 (1441 ms both), so proximity buys nothing and the default stays
+    where the models are."""
+
+    vertex_credentials_path: str = Field(
+        default="", alias="GOOGLE_APPLICATION_CREDENTIALS"
+    )
+    """Service-account key file for the `vertex` transport, or empty for
+    Application Default Credentials. Named after the environment variable Google's
+    own libraries read, because a self-hoster who already has one set should not
+    have to set it twice."""
 
     voice_provider: str = Field(default="gemini", alias="DAEMON_VOICE_PROVIDER")
     """Which native-audio backend voice mode uses: one of VOICE_PROVIDERS. Not derived
@@ -1248,6 +1303,26 @@ class Settings(BaseSettings):
                 "DAEMON_VOICE_PROVIDER=gemini but DAEMON_GEMINI_LIVE_MODEL is empty; "
                 "the native-audio endpoint needs its own id"
             )
+        if self.voice_provider == "gemini":
+            if self.gemini_live_transport not in GEMINI_LIVE_TRANSPORTS:
+                problems.append(
+                    f"DAEMON_GEMINI_LIVE_TRANSPORT is {self.gemini_live_transport!r}; "
+                    f"expected one of {', '.join(GEMINI_LIVE_TRANSPORTS)}"
+                )
+            # Checked here rather than at the handshake: the Vertex URI is built
+            # from the project and region, and a missing one is a 404 mid-sentence
+            # instead of a setting that failed to load.
+            if self.gemini_live_transport == "vertex":
+                if not self.vertex_project:
+                    problems.append(
+                        "DAEMON_GEMINI_LIVE_TRANSPORT=vertex but DAEMON_VERTEX_PROJECT "
+                        "is empty; the Vertex endpoint addresses models by project"
+                    )
+                if not self.vertex_location:
+                    problems.append(
+                        "DAEMON_GEMINI_LIVE_TRANSPORT=vertex but DAEMON_VERTEX_LOCATION "
+                        "is empty; live models are served from specific regions only"
+                    )
         if self.voice_provider == "openai":
             if not self.openai_realtime_model:
                 problems.append(

@@ -32,7 +32,7 @@ import json
 import logging
 import os
 import ssl
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from typing import Any
 
 import certifi
@@ -56,7 +56,16 @@ WS_URL = (
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 )
 """v1beta is the current version for API-key auth; v1alpha exists only for
-ephemeral tokens, which need a different method name entirely."""
+ephemeral tokens, which need a different method name entirely.
+
+The default, not the only one: `daemon/voice/vertex.py` supplies the regional
+Vertex URI, its bearer-token `auth` provider and its model path, and this class
+takes all three as arguments. The protocol below is unchanged by that choice."""
+
+_MAX_REMEMBERED_SECRETS = 4
+"""How many rotated credentials the log filter keeps scrubbing. A bearer token
+lives about an hour and a session reconnects, so the set has to grow a little -
+but unbounded it would be a list of every token this process ever held."""
 
 INPUT_SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
@@ -265,16 +274,37 @@ class GeminiLiveError(Exception):
 
 
 class _KeyFilter(logging.Filter):
-    """Scrubs the API key out of other libraries' log records.
+    """Scrubs the session's credentials out of other libraries' log records.
 
     websockets logs the handshake request - headers included - at DEBUG, so the
     leak happens in someone else's logger and has to be stopped there. Same
     lesson as telegram.py's `_TokenFilter`, which caught a real leak.
+
+    Plural, and mutable through `remember`, because the Vertex transport's
+    credential is a bearer token fetched per connect attempt rather than a key
+    known at construction: a filter that could only hold the constructor's
+    argument would scrub nothing on that path.
     """
 
-    def __init__(self, key: str) -> None:
+    def __init__(self, *secrets: str) -> None:
         super().__init__()
-        self._key = key
+        self._secrets: list[str] = [secret for secret in secrets if secret]
+
+    def remember(self, secret: str) -> None:
+        """Scrub this too from here on. Short-lived credentials rotate, so the
+        newest replaces the previous one rather than piling up."""
+        if not secret or secret in self._secrets:
+            return
+        self._secrets.append(secret)
+        del self._secrets[:-_MAX_REMEMBERED_SECRETS]
+
+    def _scrub(self, text: str) -> str:
+        for secret in self._secrets:
+            text = text.replace(secret, "<key>")
+        return text
+
+    def _has_secret(self, text: str) -> bool:
+        return any(secret in text for secret in self._secrets)
 
     def filter(self, record: logging.LogRecord) -> bool:
         # Mapping-style args and a pre-formatted traceback both bypass a
@@ -284,20 +314,18 @@ class _KeyFilter(logging.Filter):
         if isinstance(record.args, dict):
             record.args = {
                 name: (
-                    str(value).replace(self._key, "<key>")
-                    if self._key in str(value)
-                    else value
+                    self._scrub(str(value)) if self._has_secret(str(value)) else value
                 )
                 for name, value in record.args.items()
             }
-        if record.exc_text and self._key in record.exc_text:
-            record.exc_text = record.exc_text.replace(self._key, "<key>")
+        if record.exc_text and self._has_secret(record.exc_text):
+            record.exc_text = self._scrub(record.exc_text)
         message = str(record.msg)
-        if self._key in message:
-            record.msg = message.replace(self._key, "<key>")
+        if self._has_secret(message):
+            record.msg = self._scrub(message)
         if isinstance(record.args, tuple):
             record.args = tuple(
-                str(arg).replace(self._key, "<key>") if self._key in str(arg) else arg
+                self._scrub(str(arg)) if self._has_secret(str(arg)) else arg
                 for arg in record.args
             )
         return True
@@ -363,17 +391,30 @@ class GeminiLiveSession:
         tool_scheduling: str = "",
         connect: Any = None,
         url: str = WS_URL,
+        auth: Callable[[], dict[str, str]] | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
-        if not api_key:
+        # `auth` is the Vertex transport's credential: a provider called per
+        # connect attempt, because its bearer token expires while a resident
+        # process keeps reconnecting (daemon/voice/vertex.py). With one supplied
+        # there is no API key to require - that endpoint does not take one.
+        if not api_key and auth is None:
             raise ValueError("GEMINI_API_KEY is empty")
         if not model:
             raise ValueError("DAEMON_GEMINI_LIVE_MODEL is empty")
         self._api_key = api_key
+        self._auth = auth
         # The wire format is `models/{id}`; accept either so a config value
-        # copied straight from the docs works.
-        self._model = model if model.startswith("models/") else f"models/{model}"
+        # copied straight from the docs works. A Vertex path
+        # (`projects/../publishers/google/models/..`) is already fully qualified
+        # and prefixing it would produce `models/projects/...`, which comes back
+        # as a 1008 naming a model nobody configured.
+        self._model = (
+            model
+            if model.startswith(("models/", "projects/", "publishers/"))
+            else f"models/{model}"
+        )
         self._system_instruction = system_instruction
         # No language code: the native-audio models pick the language themselves
         # and reject being told, which matters for a Korean-first user.
@@ -438,6 +479,9 @@ class GeminiLiveSession:
         """Why `receive()` finished, set as it finishes. Without it a session
         ending looks exactly like a turn ending, and the caller keeps talking into
         a socket that is gone."""
+        self._secrets: list[str] = []
+        """Credentials seen since construction, for `_redact`. Empty on the
+        API-key transport, where `_api_key` is the only one and is already known."""
         self._log_filter = _KeyFilter(api_key)
         self._filtered: list[logging.Logger | logging.Handler] = [logging.getLogger("websockets")]
         # Handler-level too: logging runs the originating logger's filters, never
@@ -846,12 +890,17 @@ class GeminiLiveSession:
     async def _open(self) -> Any:
         error: GeminiLiveError | None = None
         bundle = _ca_bundle()
+        # Outside the try: a credential failure is not a connect failure, and the
+        # broad handler below would reclassify a permanent one as retryable -
+        # which is how a daemon ends up retrying a revoked credential forever
+        # while /health still says running.
+        headers = await self._auth_headers()
         try:
             # Header rather than the documented `?key=` query param: a key in a
             # URL ends up in every error string that quotes the URI.
             return await self._connect(
                 self._url,
-                additional_headers={"x-goog-api-key": self._api_key},
+                additional_headers=headers,
                 # Explicit, never the library default - see `_ssl_context`.
                 ssl=self._ssl_context or _ssl_context(bundle),
             )
@@ -1169,5 +1218,36 @@ class GeminiLiveSession:
             permanent=_permanent_close(code, reason),
         )
 
+    async def _auth_headers(self) -> dict[str, str]:
+        """The handshake's credential headers, fetched per attempt.
+
+        In a thread because the Vertex provider refreshes a token over the
+        network, and this runs on the loop that is also draining the microphone.
+        Every value goes to the log filter and to `_redact` before it reaches
+        `websockets`, which logs the handshake headers at DEBUG.
+        """
+        if self._auth is None:
+            return {"x-goog-api-key": self._api_key}
+        try:
+            headers = await asyncio.to_thread(self._auth)
+        except GeminiLiveError:
+            raise
+        except Exception as exc:
+            # Permanent: every credential failure this can reach - no
+            # credentials, an expired login, an unreadable key file - needs a
+            # person, and a retry loop around it is a silently mute daemon.
+            raise GeminiLiveError(
+                f"credentials for the voice session failed: {type(exc).__name__}: {exc}",
+                permanent=True,
+            ) from None
+        for value in headers.values():
+            self._log_filter.remember(value)
+            self._secrets.append(value)
+        del self._secrets[:-_MAX_REMEMBERED_SECRETS]
+        return headers
+
     def _redact(self, text: str) -> str:
-        return text.replace(self._api_key, "<key>")
+        for secret in (self._api_key, *self._secrets):
+            if secret:
+                text = text.replace(secret, "<key>")
+        return text

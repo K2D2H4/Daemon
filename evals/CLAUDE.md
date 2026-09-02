@@ -13,6 +13,7 @@ automated. This is that one, plus the spike that needed a real key.
 | `m1c_voice_tools_spike.py` | whether answering a voice tool call costs the answer — it does not |
 | `voice_send_message_spike.py` | whether a spoken "텔레그램으로 보내줘" reaches the new `send_message` — 0/4 without the tool, 4/4 with it |
 | `voice_write_nudge_spike.py` | why voice fakes a write it never performs — the wall is nested tool-argument **schema**, not crowding or the contract wording |
+| `vertex_live_spike.py` | whether *this repo's* hand-built websocket reaches the Vertex endpoint, not just the SDK's — the regional URI, the bearer token and the project-qualified model path, each of which fails at the handshake rather than at startup ([ADR 0020](../docs/adr/0020-two-endpoints-serve-gemini-live.md)) |
 | `m1c_text_tools_spike.py` | whether our provider survives a real Gemini 3 tool round-trip — the `thoughtSignature` contract |
 | `openai_compatible_spike.py` | whether a real OpenAI-compatible endpoint answers `/models`, a Korean turn, and a tool round-trip |
 | `openai_compatible_loop_spike.py` | whether the *assembled* app survives a real turn on that endpoint — loop, recall, tool policy, audit table |

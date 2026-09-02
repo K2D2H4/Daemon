@@ -1510,6 +1510,17 @@ def _doctor() -> int:
             # The provider name is one word for many services, so the config line
             # would otherwise not say which one is answering.
             endpoint = f" endpoint={vendor_label(settings.openai_compatible_base_url)}"
+        # Same reasoning one axis over (rule 12): with two endpoints serving Gemini
+        # Live under one provider name, "voice=True provider=gemini" no longer says
+        # which one, and they differ in both catalogue and latency. Named only when
+        # it is not the default, so an unchanged install reads exactly as before.
+        if settings.voice_enabled and settings.voice_provider == "gemini":
+            if settings.gemini_live_transport == "vertex":
+                credentials = settings.vertex_credentials_path or "ADC"
+                endpoint += (
+                    f" voice-transport=vertex project={settings.vertex_project or '<unset>'}"
+                    f" region={settings.vertex_location} credentials={credentials}"
+                )
         checks = [
             Check(
                 "config",
