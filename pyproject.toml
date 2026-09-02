@@ -29,7 +29,17 @@ dependencies = [
     # the wake gate went deaf while /health still said running. Making these core
     # on darwin removes the extra that kept getting stripped. Linux keeps the lean
     # core and reaches voice through the `[voice]` extra below.
+    #
+    # `google-auth` is here for the same reason, one feature later: the admin console
+    # offers DAEMON_GEMINI_LIVE_TRANSPORT=vertex on every install where voice is on, so
+    # an install that cannot mint a bearer token can select an endpoint it will then
+    # fail to reach - at the first voice turn, permanently, with the reason in a log.
+    # Measured on the owner's own machine the day v0.1.79 shipped: the uv receipt read
+    # extras ["mcp", "face"], `google.auth` was absent, and `daemon update` would have
+    # carried that forward. It stays in `[voice]` below as well, which is how Linux
+    # reaches it (ADR 0020).
     "websockets>=14.0; sys_platform == 'darwin'",
+    "google-auth>=2.0; sys_platform == 'darwin'",
     "sounddevice>=0.5; sys_platform == 'darwin'",
     "certifi>=2024.0; sys_platform == 'darwin'",
     "onnxruntime>=1.20; sys_platform == 'darwin'",
