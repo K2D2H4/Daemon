@@ -32,6 +32,7 @@ says "measured" was checked against the real thing, and the number is in the fil
 | [0018](0018-a-declared-expression-is-not-a-tool-call.md) | A declared expression is not a tool call; rule 12 splits rather than weakens | accepted, measured |
 | [0019](0019-the-seed-is-authored-not-unreachable.md) | The seed is authored by the owner, not unreachable by code | accepted, measured, refines 0003 |
 | [0020](0020-lip-sync-makes-a-clip-ambient.md) | Lip-sync makes a clip ambient; a clip runs to its own end | accepted, measured, scopes 0017 |
+| [0021](0021-the-calendar-read-happens-before-the-gate.md) | The calendar read happens before the gate, not after it | accepted, measured, extends 0015 |
 
 ## Format
 

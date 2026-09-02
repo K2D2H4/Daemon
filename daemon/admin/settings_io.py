@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from daemon.admin.google_accounts import authenticated_accounts
 from daemon.config import (
     GEMINI_LIVE_VOICES,
     HOSTED_PROVIDERS,
@@ -73,6 +74,12 @@ STR_FIELDS: dict[str, str] = {
     # reason a reader could infer.
     "voice_start_sensitivity": "DAEMON_VOICE_START_SENSITIVITY",
     "voice_end_sensitivity": "DAEMON_VOICE_END_SENSITIVITY",
+    # Which account's calendar the `calendar` proactive kind reads (ADR 0021).
+    # A plain string field rather than a choice: `options.calendar_accounts`
+    # below suggests the ones already authenticated, but an owner may name one
+    # that is not yet, so the page offers a datalist and not a select. Empty is
+    # a real value - it is how the kind is switched off.
+    "calendar_email": "DAEMON_CALENDAR_EMAIL",
 }
 BOOL_FIELDS: dict[str, str] = {
     "voice_enabled": "DAEMON_VOICE_ENABLED",
@@ -203,6 +210,11 @@ def current_settings_payload(settings: Settings, env_path: Path | None = None) -
             "openai_realtime_voices": ["", *sorted(OPENAI_REALTIME_VOICES)],
             # Empty is a real choice - "leave it to the server" (config.py).
             "sensitivities": ["", *SENSITIVITIES],
+            # Suggestions, not a closed set - see `calendar_email` above and
+            # `daemon/admin/google_accounts.py` for why this cannot come from the
+            # server itself. An empty list is the ordinary state on an install
+            # with no google server and renders as a plain text field.
+            "calendar_accounts": authenticated_accounts(),
         },
     }
 

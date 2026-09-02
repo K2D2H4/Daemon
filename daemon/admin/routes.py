@@ -27,6 +27,7 @@ Endpoints (docs/design/2026-08-07-m5-admin-web-design.md, "JSON API"):
     DELETE /admin/api/mcp/servers/{name}   unregister + disconnect (idempotent)
     POST   /admin/api/mcp/oauth/start      {name} -> {authorize_url}
     GET    /admin/api/mcp/oauth/callback   code+state -> finish connect, persist token
+    POST   /admin/api/calendar/check       {email} -> {calendars: [...]}; read-only probe
 
 The chat test is the load-bearing one. It calls the gateway directly with
 `Task.CHAT_TEXT` and **no tools**, records nothing, embeds nothing, and never
@@ -45,7 +46,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -86,8 +89,10 @@ from daemon.config import GEMINI_LIVE_VOICES, OPENAI_REALTIME_VOICES, VOICE_PROV
 from daemon.llm.base import Message, ProviderError
 from daemon.mcp_catalog import CATALOG, lookup
 from daemon.persona.rules import LearnedFileDiverged, LearnedRules
+from daemon.proactivity import agenda
 from daemon.setup import check_anthropic, check_gemini, check_openai
 from daemon.tasks import Task
+from daemon.tools.base import ToolError
 from daemon.tools.mcp import (
     load_config,
     missing_passthrough_env,
@@ -171,6 +176,8 @@ async def _loopback_only(request: Request) -> None:
             detail="cross-origin request refused; the Origin is not a loopback address.",
         )
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(_loopback_only)])
 
@@ -694,6 +701,140 @@ async def mcp_catalog(request: Request) -> JSONResponse:
             ]
         }
     )
+
+
+CALENDAR_CHECK_TIMEOUT = 30.0
+"""Seconds to wait for `list_calendars`. Longer than a chat test's because the
+first call after a restart also pays a stdio server launch and a token refresh
+(measured on the live install: an OAuth refresh plus the Calendar round trip).
+Bounded at all because a hung MCP server would otherwise hold this request open
+forever - the same finding that put a timeout on the chat test."""
+
+
+@router.post("/api/calendar/check")
+async def calendar_check(request: Request) -> JSONResponse:
+    """Does this address actually reach a calendar? Read-only, and the answer is
+    the calendar names.
+
+    The settings page's `calendar_email` field is a datalist over
+    `daemon/admin/google_accounts.py`'s suggestions, which are filenames rather
+    than a promise - the address may be stale, mistyped, or for an account whose
+    consent has lapsed. `get_events` requires the address (ADR 0021) and there is
+    no way to discover it from the server, so the substitute for a picker that
+    cannot exist is being able to *check* before saving.
+
+    **Why calling `list_calendars` here is not the shape ADR 0015 forbids.** That
+    rule is about the unprompted proactive path, where no person is present and a
+    lookup result would silently become the next lookup's argument. Here the owner
+    typed the address, pressed a button, and reads the result; nothing this returns
+    is fed to another call, and the proactive path still reads only the fixed
+    `DAEMON_CALENDAR_EMAIL` the owner then saves. A human in the loop is the whole
+    difference, and it is the difference that rule is drawn around.
+
+    Calls the bridge directly, like the other MCP routes, so it reports the live
+    connection rather than one this request built and tore down.
+    """
+    if not request.app.state.settings.mcp_enabled:
+        return _mcp_off()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"detail": "body must be valid JSON"}, status_code=400)
+    email = str(body.get("email", "")).strip() if isinstance(body, dict) else ""
+    if not email:
+        return JSONResponse({"detail": "email is required"}, status_code=400)
+
+    bridge = request.app.state.mcp
+    if bridge is None:
+        return JSONResponse({"detail": "the MCP bridge is not running"}, status_code=409)
+    if not bridge.is_connected(agenda.SERVER):
+        return JSONResponse(
+            {
+                "detail": (
+                    f"the {agenda.SERVER!r} MCP server is not connected - add it on "
+                    "the MCP tab first"
+                )
+            },
+            status_code=409,
+        )
+    try:
+        raw = await asyncio.wait_for(
+            bridge.call(agenda.SERVER, "list_calendars", {"user_google_email": email}),
+            timeout=CALENDAR_CHECK_TIMEOUT,
+        )
+    except TimeoutError:
+        return JSONResponse(
+            {"detail": "the calendar did not answer in time"}, status_code=504
+        )
+    except ToolError as exc:
+        # The diagnostic is the point: a wrong address, a lapsed consent and a dead
+        # server all land here and all say something the owner can act on.
+        detail = str(exc)
+        if _NEEDS_CONSENT in detail:
+            # Measured on the live server: an address it has no credential for makes
+            # it *open Google's consent page in the owner's browser* and answer with
+            # ~1.2KB of markdown wrapping the authorize URL. That is genuinely useful
+            # - it is how you authorise a second account - but the raw text is
+            # unreadable in a one-line note, and the URL carries a code challenge and
+            # the full workspace scope, neither of which belongs on a page. Summarised
+            # here and logged whole, so `daemon log` still has the link if the browser
+            # did not actually open.
+            logger.info("calendar check: consent needed for %s: %s", email, detail)
+            return JSONResponse(
+                {
+                    "detail": (
+                        f"{email} is not authorised yet - a Google sign-in page has "
+                        "been opened in your browser. Finish it, then press Test "
+                        "again. (The full link is in `daemon log`.)"
+                    )
+                },
+                status_code=409,
+            )
+        return JSONResponse({"detail": detail}, status_code=502)
+    return JSONResponse({"calendars": _calendar_names(raw)})
+
+
+_NEEDS_CONSENT = "Authentication Needed"
+"""The marker in `workspace-mcp`'s auth-required reply, matched as a substring.
+
+Deliberately one short phrase rather than the whole sentence: the surrounding
+markdown carries the service name and the address, so any longer match would be
+version- and service-specific. A miss costs the summary, not correctness - the
+raw text still reaches the page as a 502.
+"""
+
+
+_CALENDAR_LINE_RE = re.compile(r'^-\s+"(?P<name>.*?)"')
+r"""One rendered `list_calendars` line, matching what to keep.
+
+Measured shape, 2026-09-01: `- "owner@gmail.com" (Primary) (ID: ...)`. The
+id is dropped for the same reason `agenda._EVENT_RE` drops the `Link:` tail -
+nothing downstream needs it, and every string that reaches a page is one more
+thing to have to reason about. Non-greedy so `(Primary)` stays outside the name.
+"""
+
+
+def _calendar_names(raw: str) -> list[str]:
+    """The calendar names in a `list_calendars` reply, or `[]`.
+
+    Tolerant on purpose: the reply is a human-readable string wrapped in
+    `{"result": ...}`, and an unparseable one still means the call *succeeded*,
+    which is the question the button is asking. An empty list renders as "reached
+    it, no calendars listed" rather than as a failure.
+    """
+    try:
+        payload = json.loads(raw)
+        text = payload.get("result") if isinstance(payload, dict) else None
+    except (TypeError, ValueError):
+        text = None
+    if not isinstance(text, str):
+        text = raw
+    names = []
+    for line in text.splitlines():
+        match = _CALENDAR_LINE_RE.match(line.strip())
+        if match is not None:
+            names.append(match.group("name")[:120])
+    return names
 
 
 @router.get("/api/mcp/servers")

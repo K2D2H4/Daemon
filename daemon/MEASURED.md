@@ -866,3 +866,121 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   in every terminal test and returns `None` in the service the code actually runs
   in - a soft dependency that then degrades silently instead of failing.
   `ollama_process.py:BINARY_FALLBACKS` is the consequence.
+- **The proactive loop's problem stopped being "it never speaks" and became "it
+  never says anything", and the live database is what says so.** Measured
+  2026-09-01, all time: **9 utterances, 7 of them `topic`**, 👍4 / 👎1 / 4
+  unlabeled. Before quoting ADR 0015's headline numbers, note which one it tells
+  you to carry forward - not 6/30-vs-0/30 (the first run, on a prompt ADR 0016
+  then replaced) but the hand-audited **two of six**. The seven real `topic` lines
+  agree with the smaller number: `요즘 키위 작업은 잘 돼가고 있어요?`, `요즘 데몬
+  작업은 잘 진행돼가고 있어요?`, `ReadyTalk 소식 안 본 지 좀 됐네요. 요즘은 어떻게
+  돼가요?` - one sentence with the noun swapped. Anyone reading "572 judge calls,
+  0 utterances" as the current state is a release behind: ADR 0016 fixed the
+  speaking, and what is left is the material.
+- **Google's `timeMax` is exclusive, and a window that ends exactly when the event
+  starts returns nothing.** Measured 2026-09-01 against the live `google` MCP
+  server while building the `calendar` generator (docs/adr/0021). Replaying all 13
+  of the owner's real events at exactly `start - CALENDAR_LEAD_MINUTES` produced
+  **13/13 "no candidate"** from a calendar that plainly had them; the same window
+  extended by one second returns the event (`Interview with UJET`, 13:00 KST:
+  `timeMax=13:00:00` -> `[]`, `timeMax=13:00:01` -> the event). `agenda.fetch` now
+  adds that second, and the replay is **13/13** candidates.
+
+  **The reason this is worth an entry rather than a commit message** is that in
+  production it was nearly invisible: `now` is whatever the clock says, an
+  exact-microsecond collision essentially never happens, and the next 5-minute
+  tick catches the event at 25 minutes out. It only became a 100% failure because
+  a *replay* constructs the boundary case every time. A test harness that builds
+  its windows off the data it is testing will find edge cases production hides -
+  and will also make them look catastrophic. Both halves of that are true here.
+- **One in thirteen of the owner's real meeting titles is permanently unspeakable,
+  and `has_url` is right to refuse it.** Measured 2026-09-01 over the same 13
+  events: `Sr.Lead Engineer- Seoul - DAEHYUN KIM and Gabriela Guerrero` satisfies
+  `judge._BARE_DOMAIN_RE` (a word, a dot, 2+ TLD-shaped letters) exactly as
+  `Node.js` and `report.docx` do, so `Judge.decide` drops the candidate before the
+  model call. The other 12 pass, including `[BEN] Fullstack Engineer Interview
+  Invitation_1st Round (Candidate: Daehyun Kim)` and `Mistral | Applied AI -
+  Hiring Manager`.
+
+  **What is new is not the false positive - that regex's docstring already lists
+  the class - it is who can fix it.** ADR 0015's remedy for a refused `topic`
+  entity is that the owner renames the entity note. Nobody can rename someone
+  else's meeting invitation, and `Sr.`/`Dr.`/`Mr.`/`vs.` before a word is an
+  ordinary way to title one, so this is a recurring loss rather than a freak one.
+  Accepted rather than narrowed: `has_url` is the single check bounding what
+  leaves this daemon's mouth, five rounds of narrowing it produced no safe
+  exemption, and the `calendar` kind is the one whose raw material is **100%**
+  urls - every `get_events` line carries a `Link:` and usually a `Meeting:`. The
+  named lever if it ever becomes intolerable is an owner-typed allowlist, never a
+  rule derived from data an attacker can also write.
+- **The calendar generator's paired run: 36/39 against 0/39, hand-audited, and the
+  heuristic that said 32 was undercounting.** `evals/proactive_calendar_spike.py`,
+  2026-09-01, `gemini-3.6-flash` via the real `PROACTIVE_JUDGE` route, the owner's
+  13 real past events replayed x3 through the real `google` MCP server, arms
+  interleaved trial by trial:
+
+  | | arm A (reason only) | arm B (reason + fenced title) |
+  |---|---|---|
+  | names the event (scored) | 0/39 | 32/39 (p < 0.0001, Fisher exact) |
+  | names the event (hand-audited) | 0/39 | **36/39** |
+  | declined | 3/39 | 0/39 |
+  | wrong time | 0/39 | 0/39 |
+  | url leaked | 0/39 | 0/39 |
+
+  ADR 0021's pre-registered bar was arm B >= 20/39, arm A <= 2/39, zero leaks,
+  zero wrong times. Met on every axis, so the placement stands.
+
+  **The hand audit moved the number up, not down, and the direction is the
+  finding.** `_names_event` requires a literal token of the title in the line, and
+  the model routinely *translates* instead: `The Monkey Forest Ubud` came back as
+  `몽키 포레스트 우붓` (twice), `FE Coding` as `FE 코딩 테스트`, `[BEN] Fullstack
+  Engineer Interview...` as `엔지니어 면접`. All four name the event and all four
+  scored False. Anyone re-running this should expect the heuristic to read low on a
+  Korean-speaking persona with Latin-scripted titles, which is most of this
+  owner's calendar.
+
+  **All three genuine misses are the same event, and production never reaches
+  it.** `Sr.Lead Engineer- Seoul - ...` produced `인터뷰 30분 남았네` / `미팅 있네`
+  three times - a category, not the event. That is the title `judge.has_url`
+  refuses as pointer-shaped (see the entry above), and the spike assembles its
+  messages directly rather than through `Judge.decide`, so it measured an event the
+  shipped path drops before the model call. On the production-reachable 12 events
+  the figure is **36/36**.
+
+  Two cautions for the next run. The heuristic cannot separate "named the event"
+  from "said the generic word" when the title *is* the generic word - `회의`
+  scores as named and the line `30분 뒤에 회의 있네` is both readings at once.
+  And arm A is not a straw man: after ADR 0016 an elapsed-time-only reason is one
+  the prompt says to answer, and arm A duly answered it 36/39 times - with
+  `30분 뒤에 일정 있던데, 잊지 않았지?`, which is a fine sentence that tells the
+  owner nothing they did not know.
+- **`workspace-mcp` cannot be asked who it is authenticated as, so the settings
+  page reads its filenames instead.** Measured 2026-09-02 against the live server
+  while making `DAEMON_CALENDAR_EMAIL` settable in the admin console. All 27 of its
+  tools require `user_google_email`, except `start_google_auth` - whose body is
+  `if not user_google_email: raise ValueError(...)` and whose only default is a
+  `USER_GOOGLE_EMAIL` environment variable you would have to already know. Even the
+  OAuth flow is "consent as *this* address", not "pick one", and the verified
+  identity goes to the server's own `localhost:8001/oauth2callback` page rather than
+  back to the MCP client. There is no API answer at any price, which is why
+  `daemon/admin/google_accounts.py` reads credential *filenames* and why that is a
+  suggestion the owner confirms rather than a value anything trusts.
+- **Pressing "Test calendar" on an unauthorised address opens a Google consent page
+  on the owner's machine.** Measured live, 2026-09-02: `list_calendars` for an
+  address with no stored credential does not simply fail - `workspace-mcp` launches
+  the browser and answers with ~1.2KB of markdown wrapping an authorize URL carrying
+  a PKCE challenge and the full Gmail/Calendar/Drive scope set. Useful (it is how a
+  second account gets authorised, and it is the closest thing to the account-picker
+  flow that exists) and impossible to render in a one-line note, so the route
+  summarises it to one sentence at 409 and logs the link. **A button labelled Test
+  that can open a sign-in page has to say so**, which the card's caption now does.
+- **A settings field that renders as two different elements needs driving, not
+  reading.** The calendar account control is a `<select>` when there are accounts to
+  suggest and an `<input>` when there are none. The Test button's handler looked for
+  `input[data-f="calendar_email"]`, so on the install that actually has an account -
+  the only one where the picker appears - the button silently did nothing. Six unit
+  tests over the served HTML passed, because they assert on the page's *text* and the
+  defect was in which element the running handler found. Clicking it once in a real
+  browser found it immediately. The same lesson `daemon/CLAUDE.md` records for the
+  product as a whole, restated for the admin page: reading the markup is not
+  exercising the handler.

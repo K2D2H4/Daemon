@@ -1378,6 +1378,18 @@ function fieldStr(name,running,opts){
   return `<label class="field">${nameCell(name)}<input type="text" data-f="${name}" value="${esc(v??'')}"></label>`;
 }
 function fieldNum(name,running){return `<label class="field">${nameCell(name)}<input type="number" step="any" data-f="${name}" value="${esc(val(name,running)??'')}"></label>`;}
+// Pick-or-type, built on the same `data-combo` select the model fields use rather
+// than a <datalist>: a datalist does not open on click and reads as empty/broken,
+// which is measured, reported, and what `test_the_chat_model_field_is_a_click_open
+// _select_not_a_datalist` exists to keep out. With no suggestions to offer it falls
+// back to a plain text box - a two-option select whose only real choice is "type
+// something" is worse than the input it replaced, and an empty list is the ordinary
+// state on an install with no google server.
+function fieldCombo(name,running,opts){
+  const list=opts||[];
+  if(!list.length)return fieldStr(name,running);
+  return `<label class="field">${nameCell(name)}${modelSelect(name,val(name,running),list)}</label>`;
+}
 function fieldSecret(name,val){const set=val==='set';
   return `<label class="field"><span class="n">${name} ${set?'· set':'· unset'}</span>
     <input type="password" data-f="${name}" placeholder="${set?'leave blank to keep':'not set'}"></label>`;}
@@ -1430,6 +1442,12 @@ function fieldModel(name,running,liveList,suggestions){
   return `<label class="field">${nameCell(name)}${inner}</label>`;
 }
 const MODEL_CUSTOM='__custom__';
+// Per-field wording for the shared combo. Looked up by field name inside
+// `modelSelect`/`modelText` rather than passed in, because the "↩ list" handler
+// rebuilds a select from the field name alone and would otherwise redraw a
+// calendar account picker labelled "choose a model…".
+const COMBO_LABELS={calendar_email:{empty:'choose an account\u2026',
+  custom:'\u270e enter another address\u2026',placeholder:'name@gmail.com'}};
 function modelSelect(name,v,opts){
   const cur=v??'';
   // The head option carries `selected`, because a <select> with no selected option
@@ -1438,14 +1456,16 @@ function modelSelect(name,v,opts){
   // whose model is still unset. So: empty value -> an empty placeholder stays selected
   // (Save then treats it as "no value", same as the old empty text field); a saved id
   // the account no longer lists -> prepend it, selected, so it is never silently dropped.
-  const head=!cur?'<option value="" selected>choose a model…</option>'
+  const L=COMBO_LABELS[name]||{};
+  const head=!cur?`<option value="" selected>${esc(L.empty||'choose a model…')}</option>`
     :(!opts.includes(cur)?`<option value="${esc(cur)}" selected>${esc(cur)}</option>`:'');
   const os=opts.map(x=>`<option value="${esc(x)}" ${x===cur?'selected':''}>${esc(x)}</option>`).join('');
-  return `<select data-f="${name}" data-combo="${name}">${head}${os}<option value="${MODEL_CUSTOM}">✎ enter a custom id…</option></select>`;
+  return `<select data-f="${name}" data-combo="${name}">${head}${os}<option value="${MODEL_CUSTOM}">${esc(L.custom||'✎ enter a custom id…')}</option></select>`;
 }
 function modelText(name,v){
+  const L=COMBO_LABELS[name]||{};
   return `<span class="combo-text" style="display:flex;gap:6px;align-items:center">`
-    +`<input type="text" data-f="${name}" value="${esc(v??'')}" placeholder="model id" style="flex:1">`
+    +`<input type="text" data-f="${name}" value="${esc(v??'')}" placeholder="${esc(L.placeholder||'model id')}" style="flex:1">`
     +`<button type="button" class="btn" data-combo-back="${name}">↩ list</button></span>`;
 }
 // Options for one model field, for rebuilding its <select> when the user backs out of
@@ -1453,6 +1473,11 @@ function modelText(name,v){
 function modelOptsFor(name){
   const o=SETTINGS.options||{};
   if(name==='openai_compatible_base_url')return COMPAT_VENDOR_URLS;
+  // Not a model list at all - the accounts the google MCP server has signed in
+  // (daemon/admin/google_accounts.py). Named here for the same reason the line
+  // above is: the `_model` suffix rule below cannot derive it, and the "↩ list"
+  // handler rebuilds this select from the field name alone.
+  if(name==='calendar_email')return o.calendar_accounts||[];
   const prov=name.replace(/_model$/,'');
   return (o.model_lists&&o.model_lists[prov])||(o.model_suggestions&&o.model_suggestions[prov])||[];
 }
@@ -1494,7 +1519,14 @@ function renderSettings(){
   let h='';
   h+=card('MODEL','<div class="grid2">'+brainField(val('provider',e.provider),e,o)+'</div>');
   h+=card('CAPABILITIES',toggles(['tools_enabled','browser_enabled','screen_enabled','mcp_enabled','proactive_enabled'])
-    +'<div class="grid2" style="margin-top:16px">'+fieldStr('tools_mode',e.tools_mode,o.tool_modes)+'</div>');
+    +'<div class="grid2" style="margin-top:16px">'+fieldStr('tools_mode',e.tools_mode,o.tool_modes)
+    +fieldCombo('calendar_email',e.calendar_email,o.calendar_accounts)+'</div>'
+    +'<div style="margin-top:12px"><button class="btn" id="cal-test" type="button">Test calendar</button>'
+    +'<span class="note" id="cal-note" style="margin-left:12px"></span></div>'
+    +'<p class="cap" style="margin:12px 0 0">Which account\u2019s calendar it may read, 30 minutes before an event. '
+    +'The list is the accounts the google MCP server has already signed in \u2014 it cannot be asked directly, '
+    +'so Test is how you confirm one before saving. Testing an address it has <em>not</em> signed in opens '
+    +'Google\u2019s sign-in page in your browser; finish that and press Test again.</p>');
   h+=card('VOICE',toggles(['voice_enabled','wake_enabled','voice_barge_in'])
     +'<div class="grid2" style="margin-top:16px">'
     +fieldStr('voice_provider',e.voice_provider,o.voice_providers)
@@ -1591,6 +1623,7 @@ $('#settings-form').addEventListener('click',ev=>{
     span.outerHTML=modelSelect(back,typed,modelOptsFor(back));
     updateDirty();return;
   }
+  if(ev.target.id==='cal-test'){calendarTest();return;}
   if(ev.target.id!=='voice-play')return;
   const prov=$('[data-f="voice_provider"]');
   const sel=$('#voice-field select');
@@ -1601,6 +1634,31 @@ $('#settings-form').addEventListener('click',ev=>{
   a.src='/admin/api/voice-sample/'+encodeURIComponent(prov.value)+'/'+encodeURIComponent(sel.value);
   a.play().catch(()=>{if(msg)msg.textContent='no preview available yet';});
 });
+// Reads the field rather than the saved setting, so it checks what you are about
+// to save. The address cannot be discovered from the server (ADR 0021), so this is
+// the only way to find out you mistyped it before a restart.
+async function calendarTest(){
+  // `[data-f=...]`, not `input[data-f=...]`: with suggestions to offer the field is
+  // a <select> and with none it is an <input>, and the first draft only matched the
+  // input - so on the install that has an account to pick, the button silently did
+  // nothing. Every HTML-text assertion passed; only clicking it found this.
+  const input=$('#settings-form [data-f="calendar_email"]');
+  const note=$('#cal-note'), btn=$('#cal-test');
+  if(!input||!note)return;
+  const email=input.value.trim();
+  if(!email){note.className='note err';note.textContent='enter an address first';return;}
+  btn.disabled=true;note.className='note';note.textContent='checking\u2026';
+  try{
+    const r=await api('/admin/api/calendar/check',{method:'POST',
+      headers:{'content-type':'application/json'},body:JSON.stringify({email})});
+    const names=r.calendars||[];
+    note.className='note ok';
+    note.textContent=names.length
+      ? `${names.length} calendar(s): ${names.join(', ')}`
+      : 'reached it, but no calendars were listed';
+  }catch(e){note.className='note err';note.textContent=e.message;}
+  btn.disabled=false;
+}
 $('#settings-form').addEventListener('keydown',ev=>{
   const sw=ev.target.closest('.sw');if(!sw)return;
   if(ev.key===' '||ev.key==='Enter'){ev.preventDefault();sw.click();}

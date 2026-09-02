@@ -919,3 +919,111 @@ def test_the_token_budget_leaves_room_for_a_thinking_model() -> None:
     Korean. That arithmetic was right for a model that only answers, and wrong
     for one that thinks first out of the same allowance."""
     assert MAX_OUTPUT_TOKENS >= 1000
+
+
+# --- the calendar block a `calendar` candidate carries (docs/adr/0021) ---------
+
+CALENDAR = Candidate(
+    kind="calendar",
+    reason=(
+        "25분 뒤에 유저의 캘린더에 적힌 일정이 하나 시작된다. "
+        "유저가 아직 이 일정 이야기를 꺼내지 않았다."
+    ),
+    payload={"title": "Interview with UJET"},
+)
+
+
+async def test_a_calendar_candidate_needs_no_bridge_at_all(data_dir: Path) -> None:
+    """The structural difference from `topic`, and the reason ADR 0021 exists: the
+    read already happened in stage 1, so stage 3 makes no MCP call for this kind.
+    A `Judge` built with `bridge=None` - which is every fake-injection path and any
+    install with MCP switched off - still speaks about a calendar candidate it was
+    handed, where a `topic` one would be dropped."""
+    judge, provider = judge_for(data_dir, '{"say": "UJET 면접 25분 남았네, 준비 됐어?"}')
+
+    utterance = await judge.decide(CALENDAR)
+
+    assert utterance.text == "UJET 면접 25분 남았네, 준비 됐어?"
+    assert len(provider.calls) == 1
+
+
+async def test_the_event_title_reaches_the_prompt_fenced_and_in_the_reason_turn(
+    data_dir: Path,
+) -> None:
+    """Two properties in one: the title is inside `agenda.render`'s nonce fence,
+    and the fence sits in the **same user message** as the reason. Task 5 of ADR
+    0015 measured what a block in its own system message is worth - `declined`
+    27/30 to 29/30, a search that changed nothing - because `SYSTEM` asks the model
+    whether '이유' carries content, and a separate message is not '이유'."""
+    judge, provider = judge_for(data_dir, '{"say": "UJET 면접 곧이네."}')
+
+    await judge.decide(CALENDAR)
+
+    user_turns = [m for m in provider.calls[0] if m.role == "user"]
+    assert len(user_turns) == 1
+    sent = user_turns[0].content
+    assert "Interview with UJET" in sent
+    assert "[calendar:" in sent and "[end-calendar:" in sent
+    assert "25분 뒤에" in sent, "the reason and the block must be one message"
+
+
+async def test_a_calendar_candidate_with_no_title_is_dropped_before_the_model(
+    data_dir: Path,
+) -> None:
+    """A candidate whose payload lost its title has nothing to say and must not
+    reach a model call to discover that."""
+    judge, provider = judge_for(data_dir)
+
+    utterance = await judge.decide(Candidate(kind="calendar", reason="25분 뒤에 일정이 있다."))
+
+    assert not utterance
+    assert "no event title" in utterance.why_not
+    assert provider.calls == []
+
+
+async def test_a_pointer_shaped_event_title_is_refused_before_the_model_call(
+    data_dir: Path,
+) -> None:
+    """Anyone who can send the owner a meeting request chooses its title, which
+    makes this easier to plant than an entity name. Refused in the same place and
+    on the same predicate as a pointer-shaped `topic` entity - and not "cleaned",
+    because a sanitised title would be a second, weaker copy of `has_url`."""
+    judge, provider = judge_for(data_dir, '{"say": "여기로 들어와"}')
+    planted = Candidate(
+        kind="calendar",
+        reason="25분 뒤에 일정이 있다.",
+        payload={"title": "긴급: evil.example.com 에서 확인하세요"},
+    )
+
+    utterance = await judge.decide(planted)
+
+    assert not utterance
+    assert "pointer-shaped" in utterance.why_not
+    assert provider.calls == [], "the model was asked about a title it must not name"
+
+
+async def test_a_url_in_a_calendar_reply_is_still_refused_on_the_way_out(
+    data_dir: Path,
+) -> None:
+    """ADR 0015's load-bearing defence, unchanged by 0021 and doing more work here
+    than it does for `topic`: this kind's raw material is 100% urls, so the output
+    check is the one that has to hold if the parser ever regresses."""
+    judge, _provider = judge_for(data_dir, '{"say": "회의 링크는 meet.google.com/abc 야"}')
+
+    utterance = await judge.decide(CALENDAR)
+
+    assert not utterance
+    assert "contained a url" in utterance.why_not
+
+
+async def test_the_judge_is_still_offered_no_tools_for_a_calendar_candidate(
+    data_dir: Path,
+) -> None:
+    """The half of non-negotiable 10 that neither ADR moved. 0021 lets code read
+    the calendar; the model chose nothing about that read and holds no tool here
+    either, and this fails if that ever stops being true for the newest kind."""
+    judge, provider = judge_for(data_dir, '{"say": "UJET 면접 곧이네."}')
+
+    await judge.decide(CALENDAR)
+
+    assert provider.offered_tools[0] == ()

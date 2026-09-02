@@ -33,10 +33,12 @@ from daemon.memory.log import local_date, utc_iso
 from daemon.memory.store import Store
 from daemon.proactivity.base import Candidate
 from daemon.proactivity.candidates import (
+    CALENDAR_LEAD_MINUTES,
     MAX_PER_KIND,
     TOPIC_TTL_HOURS,
     CandidateReader,
     association_candidates,
+    calendar_candidates,
     dedup_key,
     emotional_candidates,
     generate_candidates,
@@ -971,3 +973,188 @@ def test_one_tick_cannot_write_forty_rows_of_one_kind(store: Store, reader: SqlR
     loops = [candidate for candidate in found if candidate.kind == "open_loop"]
     assert len(loops) == MAX_PER_KIND
     assert [candidate.payload["message_id"] for candidate in loops] == [1, 2, 3]
+
+
+# --- type G: the calendar (docs/adr/0021) -------------------------------------
+#
+# The generator that reads off the machine. Its tests are about three things the
+# other six do not have to answer: that the untrusted event title never reaches
+# `Candidate.reason`, that a failed read is distinguishable from an empty
+# calendar, and that the window is a window rather than "the next thing whenever
+# it is".
+
+
+class _CalendarBridge:
+    """One canned `get_events` reply, in the shape the live server produces."""
+
+    def __init__(
+        self,
+        events: Sequence[tuple[str, datetime]] = (),
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.events = list(events)
+        self.error = error
+        self.calls: list[dict] = []
+
+    async def call(self, server: str, name: str, arguments: dict) -> str:
+        self.calls.append(dict(arguments))
+        if self.error is not None:
+            raise self.error
+        if not self.events:
+            return json.dumps({"result": "No events found in calendar 'primary' for x."})
+        lines = "\n".join(
+            f'- "{title}" (Starts: {start.isoformat()} [Asia/Seoul; weekday: Monday; '
+            f"ISO weekday: 1], Ends: x) Meeting: https://meet.google.com/abc-defg-hij "
+            f"ID: evt{i} | Link: https://www.google.com/calendar/event?eid=zzz{i}"
+            for i, (title, start) in enumerate(self.events)
+        )
+        return json.dumps(
+            {"result": f"Successfully retrieved {len(self.events)} events:\n{lines}"}
+        )
+
+
+async def test_a_calendar_candidate_carries_the_minutes_in_words_and_the_title_in_payload(
+    reader: SqlReader,
+) -> None:
+    """The rule this generator has to keep: the title is somebody else's writing,
+    so it travels in `payload` and reaches the model only through
+    `agenda.render`'s fence. `reason` is this module's own words plus a number,
+    like types A-D - which is what keeps the docstring's exception list at two."""
+    bridge = _CalendarBridge([("Interview with UJET", NOW + timedelta(minutes=25))])
+
+    found, note = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+
+    assert note == ""
+    assert len(found) == 1
+    candidate = found[0]
+    assert candidate.kind == "calendar"
+    assert "25분" in candidate.reason
+    assert "UJET" not in candidate.reason, (
+        "the invitation's own words reached the reason, which goes to the model "
+        "unfenced - the whole point of routing it through payload"
+    )
+    assert candidate.payload["title"] == "Interview with UJET"
+
+
+async def test_a_calendar_candidate_expires_when_the_event_starts(reader: SqlReader) -> None:
+    """The only kind whose material carries its own deadline. Every other kind
+    expires on a fixed number of hours; a reminder that arrives after the meeting
+    began is worse than no reminder."""
+    starts = NOW + timedelta(minutes=25)
+    bridge = _CalendarBridge([("Interview with UJET", starts)])
+
+    found, _ = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+
+    assert found[0].expires_at == starts
+    assert found[0].due_at == NOW
+
+
+async def test_an_event_outside_the_lead_window_is_not_yet_a_candidate(
+    reader: SqlReader,
+) -> None:
+    """`CALENDAR_LEAD_MINUTES` is the whole timing design: one line, close to the
+    event. A meeting tomorrow is not news now, and firing on it is how this kind
+    becomes the notification stack the owner already has."""
+    bridge = _CalendarBridge(
+        [("Interview with UJET", NOW + timedelta(minutes=CALENDAR_LEAD_MINUTES + 5))]
+    )
+
+    found, note = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+
+    assert found == []
+    assert note == "", "nothing due is not a failure"
+
+
+async def test_an_event_that_already_started_is_not_a_candidate(reader: SqlReader) -> None:
+    """`time_min` is inclusive and the server may expand a recurring instance that
+    began a moment ago, so the strict comparison is re-applied on our side rather
+    than trusted from the query."""
+    bridge = _CalendarBridge([("Interview with UJET", NOW)])
+
+    found, _ = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+
+    assert found == []
+
+
+async def test_the_soonest_event_wins_when_two_start_inside_the_window(
+    reader: SqlReader,
+) -> None:
+    """One candidate per tick, not one per event. The second becomes the soonest
+    on its own once the first has started, so the rotation costs nothing."""
+    bridge = _CalendarBridge(
+        [
+            ("Later thing", NOW + timedelta(minutes=28)),
+            ("Sooner thing", NOW + timedelta(minutes=6)),
+        ]
+    )
+
+    found, _ = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+
+    assert [c.payload["title"] for c in found] == ["Sooner thing"]
+    assert "6분" in found[0].reason
+
+
+async def test_the_same_event_is_raised_once_however_many_ticks_see_it(
+    db: sqlite3.Connection, reader: SqlReader
+) -> None:
+    """The window is 30 minutes and the tick is 5, so roughly six ticks see the
+    same event. The dedup key is what makes that one candidate."""
+    starts = NOW + timedelta(minutes=25)
+    bridge = _CalendarBridge([("Interview with UJET", starts)])
+
+    first, _ = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+    store_candidate(db, first[0], now=NOW)
+    later, _ = await calendar_candidates(
+        bridge, reader, "x@y.com", now=NOW + timedelta(minutes=5)
+    )
+
+    assert later == []
+
+
+async def test_two_events_starting_in_the_same_minute_do_not_collide(
+    db: sqlite3.Connection, reader: SqlReader
+) -> None:
+    """The dedup key is the start plus a digest of the title, and the digest is
+    why: keying on the start alone would silence the second of two things booked
+    for the same minute."""
+    starts = NOW + timedelta(minutes=25)
+    first_bridge = _CalendarBridge([("Interview with UJET", starts)])
+    second_bridge = _CalendarBridge([("Dentist", starts)])
+
+    first, _ = await calendar_candidates(first_bridge, reader, "x@y.com", now=NOW)
+    store_candidate(db, first[0], now=NOW)
+    second, _ = await calendar_candidates(second_bridge, reader, "x@y.com", now=NOW)
+
+    assert [c.payload["title"] for c in second] == ["Dentist"]
+
+
+async def test_a_dead_server_says_so_instead_of_reading_as_a_clear_calendar(
+    reader: SqlReader,
+) -> None:
+    """The failure shape this module's docstring forbids. `generated: 0` with no
+    note is indistinguishable from a quiet day, and that is the defect this
+    project keeps shipping."""
+    from daemon.tools.base import ToolError
+
+    bridge = _CalendarBridge(error=ToolError("the MCP server 'google' is not connected"))
+
+    found, note = await calendar_candidates(bridge, reader, "x@y.com", now=NOW)
+
+    assert found == []
+    assert "not connected" in note
+
+
+async def test_no_configured_address_is_reported_rather_than_guessed(
+    reader: SqlReader,
+) -> None:
+    """`get_events` requires `user_google_email` and there is nothing to guess it
+    from. Asking `list_calendars` first would be a lookup result becoming the next
+    lookup's argument - the shape ADR 0015 spent four rounds removing."""
+    bridge = _CalendarBridge([("Interview with UJET", NOW + timedelta(minutes=25))])
+
+    found, note = await calendar_candidates(bridge, reader, "", now=NOW)
+
+    assert found == []
+    assert "DAEMON_CALENDAR_EMAIL" in note
+    assert bridge.calls == [], "the calendar was read before the address was checked"

@@ -1144,3 +1144,72 @@ def test_get_settings_includes_live_model_lists_for_configured_providers(
 
     assert got["options"]["model_lists"]["gemini"] == ["gemini-2.5-flash"]
     assert "anthropic" not in got["options"]["model_lists"]
+
+
+# --- the calendar account field (docs/adr/0021) -------------------------------
+
+
+def test_the_calendar_email_is_editable_and_suggested(tmp_path: Path) -> None:
+    """The field the owner would otherwise have to hand-edit `.env` for, plus the
+    suggestion list. `calendar_accounts` is always present - empty on an install
+    with no google server - because the page branches on its length."""
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app, base_url=LOOPBACK)
+
+    body = client.get("/admin/api/settings").json()
+
+    assert "calendar_email" in body["editable"]
+    assert isinstance(body["options"]["calendar_accounts"], list)
+
+
+def test_saving_a_calendar_email_writes_it_to_env(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PROVIDER=ollama\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    reply = client.patch("/admin/api/settings", json={"calendar_email": "x@y.com"})
+
+    assert reply.status_code == 200, reply.json()
+    assert reply.json()["restart_required"] is True
+    assert "DAEMON_CALENDAR_EMAIL=x@y.com" in env.read_text(encoding="utf-8")
+
+
+def test_clearing_the_calendar_email_is_how_the_kind_is_switched_off(tmp_path: Path) -> None:
+    """Empty is a real value here, unlike a secret (where blank means "keep the
+    working one"). Emptying the field has to actually turn the calendar kind off,
+    or the only way back would be a hand edit - the thing this field removes."""
+    env = tmp_path / ".env"
+    env.write_text("DAEMON_PROVIDER=ollama\nDAEMON_CALENDAR_EMAIL=x@y.com\n", encoding="utf-8")
+    app = create_app(_settings(tmp_path, calendar_email="x@y.com"))
+    app.state.env_path = env
+    client = TestClient(app, base_url=LOOPBACK)
+
+    reply = client.patch("/admin/api/settings", json={"calendar_email": ""})
+
+    assert reply.status_code == 200, reply.json()
+    assert "DAEMON_CALENDAR_EMAIL=\n" in env.read_text(encoding="utf-8")
+
+
+def test_the_calendar_field_is_a_click_open_select_not_a_datalist(tmp_path: Path) -> None:
+    """The same finding as the model field's: a <datalist> does not open on click
+    and reads as empty/broken. The first draft of this field used one; it reuses
+    `modelSelect`'s combo now, with its own wording so an account picker does not
+    say "choose a model…"."""
+    html = _served_index(tmp_path)
+
+    start = html.index("function fieldCombo(")
+    body = html[start : html.index("\nfunction ", start + 1)]
+    assert "modelSelect(" in body
+    # The element form, the same way the model field's test matches it - a naive
+    # `"list=" not in body` trips on this function's own `const list=opts||[]`.
+    assert "<datalist" not in body and 'list="dl-' not in body
+    # With nothing to suggest it must fall back to a plain text field, not a
+    # two-option select whose only real choice is "type something".
+    assert "fieldStr(name,running)" in body
+    assert "COMBO_LABELS={calendar_email" in html.replace(" ", "")
+    # The "↩ list" handler rebuilds a select from the field name alone, so
+    # `modelOptsFor` has to know this field or the list comes back empty.
+    opts = html.index("function modelOptsFor(")
+    assert "calendar_accounts" in html[opts : html.index("\nfunction ", opts + 1)]

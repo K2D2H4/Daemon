@@ -38,12 +38,20 @@ from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
 
 CandidateKind = Literal[
-    "open_loop", "emotional", "silence", "pattern_time", "association", "topic"
+    "open_loop", "emotional", "silence", "pattern_time", "association", "topic", "calendar"
 ]
 """The five in `daemon/memory/schema.sql` - PLAN 6.1's types A-E, in the same
 order - plus `topic`, added after 572 judge calls produced 0 utterances and only
-`open_loop` ever fired at all (docs/adr/0015). Its generator is a later task;
-this only makes room for the kind."""
+`open_loop` ever fired at all (docs/adr/0015), plus `calendar`.
+
+`calendar` (type G, docs/adr/0021) exists because `topic` shipped, spoke, and
+said nothing: the seven `topic` lines in the live database are the same sentence
+with a different noun in it, because `entities.name` against the open web asks
+what a word means, not what happened to this person. An event on the owner's own
+calendar is the first material this loop has had that is first-party, dated and
+true. It is the one kind whose network read happens in stage 1 rather than after
+the gate, for the reason ADR 0021 gives: nothing else can tell stage 1 whether
+there is a subject at all."""
 
 Delivery = Literal["local_speaker", "telegram", "both"]
 """Where an utterance went. Matches `proactive_utterances.route`."""

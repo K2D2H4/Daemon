@@ -119,7 +119,8 @@ Every rule is a setting, and these are the shipped defaults:
 | `DAEMON_PROACTIVE_QUIET_HOURS` | `23:00-09:00` | local time, never interrupted |
 | `DAEMON_PROACTIVE_COOLDOWN_MINUTES` | `90` | minimum gap between two things it says |
 | `DAEMON_PROACTIVE_DAILY_BUDGET` | `5` | most it will ever say in one day, of any kind |
-| per-kind ceiling | 1–3 | five of the six kinds also have their own daily cap on top of the total, so the cheap-to-generate ones cannot spend the whole budget by themselves - `topic` has none by design (ADR 0015) and is bound only by the daily total |
+| `DAEMON_CALENDAR_EMAIL` | *(empty)* | the Google account whose calendar it may read, 30 minutes before an event. Empty means the calendar kind is off; it needs the `google` MCP server connected too, and `daemon doctor` says which of the two is missing (ADR 0021). **Set it in the admin console** (Settings → CAPABILITIES): it offers the accounts already signed in and a Test button that reads the calendar back before you save |
+| per-kind ceiling | 1–3 | six of the seven kinds also have their own daily cap on top of the total, so the cheap-to-generate ones cannot spend the whole budget by themselves - `topic` has none by design (ADR 0015) and is bound only by the daily total |
 | 👎 on a message | 6h / 24h / day | rests that one kind for 6h; two in 24h rests it for 24h; three in one day stops everything until tomorrow |
 
 The speaker is not a second switch: `DAEMON_VOICE_ENABLED` (default `false`)

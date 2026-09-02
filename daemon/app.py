@@ -998,6 +998,73 @@ async def build_proactive_tick(
         if closer is not None:
             closers.append(closer)
 
+    # Hoisted out of `if speak:` when type G arrived (ADR 0021), and the move is
+    # the point rather than tidying. `topic`'s search happens in stage 3, so a
+    # tick with no judge had no use for a bridge; `calendar`'s read happens in
+    # stage 1, so without one here `daemon proactive` - the command that exists to
+    # show what the deterministic half found before anything is allowed to speak -
+    # would be structurally unable to show the one kind whose material lives off
+    # the machine. Same argument the comment above `_build_recall` makes for type
+    # E, and the cost is the same shape: `daemon proactive` now starts the
+    # configured MCP servers, so it takes seconds where it used to be instant. The
+    # resident pays nothing extra - `_proactive_tick` passes the live
+    # `app.state.mcp` and this branch reuses it.
+    #
+    # The `topic` candidate's one search (ADR 0015) and the `calendar` read go
+    # through this bridge,
+    # never through `tools/policy.py:decide` - it calls `MCPBridge.call`
+    # directly, so `tools_mode`'s own handling of `off` (ToolPolicy refusing
+    # every guarded tool) never sees this call and cannot stop it by itself.
+    # Rule 10 forbids the *model* choosing and running a tool on a non-owner
+    # turn; a fixed, code-issued, read-only search is the thing ADR 0015 says
+    # is not that - so `tools_enabled=false` would already be a defensible
+    # place to stop.
+    #
+    # This wiring goes one step further and also withholds the bridge when
+    # `tools_mode == "off"`, even though nothing in ADR 0015 requires it.
+    # Reasoning: `off` is the setting an owner reaches for to mean "nothing
+    # this daemon does reaches outside this conversation without me asking",
+    # and proactivity is the one channel where that promise matters most - an
+    # utterance that was never asked for, arriving in Telegram or out of the
+    # laptop speaker in a voice the owner trusts. Honouring the letter of the
+    # ADR (only `tools_enabled` gates it) while ignoring the mode the owner
+    # actually set because this path is technically outside the policy it
+    # governs is exactly the kind of capability-nobody-was-asked-about state
+    # CONTRACTS rule 12 exists to prevent. `full`, `ask` and `allowlist` all
+    # leave tool use switched on in spirit, so those three still get the
+    # bridge; only `off` (and the master switch) withhold it.
+    #
+    # With no bridge, `Judge` drops every `topic` candidate, `ProactiveTick`
+    # produces no `calendar` one, and the other five generators are unaffected -
+    # the same degrade path a missing or unconfigured MCP server already takes.
+    tick_bridge = None
+    if settings.tools_enabled and settings.tools_mode != "off":
+        if bridge is not None:
+            # Reused, owned by the caller - never added to `closers`. Closing
+            # a bridge this tick did not build would tear down every MCP
+            # server the rest of the running app depends on the moment this
+            # one tick ends, orphaning `app.state.mcp` for everything else
+            # that reaches for it until the next full restart.
+            tick_bridge = bridge
+        else:
+            # No `wait_for` around this: a server that hangs on connect is
+            # bounded inside `_ServerLink.open`, in the task that owns the
+            # transport and can therefore be cancelled cleanly. Wrapping the
+            # call here instead orphaned the children it had already started
+            # (see the note on the removed `PROACTIVE_TOOLS_BUILD_TIMEOUT`).
+            tools_runner, tick_bridge, _tools_status = await _build_tools(
+                settings, store
+            )
+            if tools_runner is not None:
+                closers.append(tools_runner.aclose)
+            if tick_bridge is not None:
+                # A stdio MCP server is a child process - one left running is
+                # an orphan per tick, the same reason the app lifespan closes
+                # its own bridge ahead of the store (see `_lifespan` above).
+                # Only reached on this, the "this tick built its own" branch -
+                # a reused bridge is never closed here (see above).
+                closers.append(tick_bridge.aclose)
+
     judge = None
     delivery = None
     if speak:
@@ -1009,60 +1076,6 @@ async def build_proactive_tick(
         gateway = LLMGateway(
             providers, settings.routing_table(), fallback=settings.fallback_route()
         )
-
-        # The `topic` candidate's one search (ADR 0015) goes through this bridge,
-        # never through `tools/policy.py:decide` - it calls `MCPBridge.call`
-        # directly, so `tools_mode`'s own handling of `off` (ToolPolicy refusing
-        # every guarded tool) never sees this call and cannot stop it by itself.
-        # Rule 10 forbids the *model* choosing and running a tool on a non-owner
-        # turn; a fixed, code-issued, read-only search is the thing ADR 0015 says
-        # is not that - so `tools_enabled=false` would already be a defensible
-        # place to stop.
-        #
-        # This wiring goes one step further and also withholds the bridge when
-        # `tools_mode == "off"`, even though nothing in ADR 0015 requires it.
-        # Reasoning: `off` is the setting an owner reaches for to mean "nothing
-        # this daemon does reaches outside this conversation without me asking",
-        # and proactivity is the one channel where that promise matters most - an
-        # utterance that was never asked for, arriving in Telegram or out of the
-        # laptop speaker in a voice the owner trusts. Honouring the letter of the
-        # ADR (only `tools_enabled` gates it) while ignoring the mode the owner
-        # actually set because this path is technically outside the policy it
-        # governs is exactly the kind of capability-nobody-was-asked-about state
-        # CONTRACTS rule 12 exists to prevent. `full`, `ask` and `allowlist` all
-        # leave tool use switched on in spirit, so those three still get the
-        # bridge; only `off` (and the master switch) withhold it.
-        #
-        # With no bridge, `Judge` drops every `topic` candidate and the other
-        # four generators are unaffected - the same degrade path a missing or
-        # unconfigured MCP server already takes.
-        tick_bridge = None
-        if settings.tools_enabled and settings.tools_mode != "off":
-            if bridge is not None:
-                # Reused, owned by the caller - never added to `closers`. Closing
-                # a bridge this tick did not build would tear down every MCP
-                # server the rest of the running app depends on the moment this
-                # one tick ends, orphaning `app.state.mcp` for everything else
-                # that reaches for it until the next full restart.
-                tick_bridge = bridge
-            else:
-                # No `wait_for` around this: a server that hangs on connect is
-                # bounded inside `_ServerLink.open`, in the task that owns the
-                # transport and can therefore be cancelled cleanly. Wrapping the
-                # call here instead orphaned the children it had already started
-                # (see the note on the removed `PROACTIVE_TOOLS_BUILD_TIMEOUT`).
-                tools_runner, tick_bridge, _tools_status = await _build_tools(
-                    settings, store
-                )
-                if tools_runner is not None:
-                    closers.append(tools_runner.aclose)
-                if tick_bridge is not None:
-                    # A stdio MCP server is a child process - one left running is
-                    # an orphan per tick, the same reason the app lifespan closes
-                    # its own bridge ahead of the store (see `_lifespan` above).
-                    # Only reached on this, the "this tick built its own" branch -
-                    # a reused bridge is never closed here (see above).
-                    closers.append(tick_bridge.aclose)
         judge = Judge(gateway, data_dir=settings.data_dir, bridge=tick_bridge)
 
         channel = None
@@ -1115,7 +1128,13 @@ async def build_proactive_tick(
 
     return (
         ProactiveTick(
-            store, settings, MachinePresence(), judge=judge, delivery=delivery, recall=recall
+            store,
+            settings,
+            MachinePresence(),
+            judge=judge,
+            delivery=delivery,
+            recall=recall,
+            bridge=tick_bridge,
         ),
         close,
     )
