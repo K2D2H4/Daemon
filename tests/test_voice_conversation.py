@@ -37,7 +37,7 @@ from daemon.tools.policy import ToolPolicy
 from daemon.tools.runner import ToolRunner
 from daemon.voice import conversation as conversation_module
 from daemon.voice.base import AudioIO, Interrupted, Transcript, VoiceSession
-from daemon.voice.conversation import VoiceConversation
+from daemon.voice.conversation import ANSWER_PATIENCE_SECONDS, VoiceConversation
 from daemon.voice.gemini_live import GeminiLiveSession
 from tests.test_face import RecordingBus
 
@@ -3736,4 +3736,48 @@ async def test_face_pump_ticks_the_falling_edge_on_a_real_clock() -> None:
     # own monotonic clock.
     assert bus.activities == ["speaking", "listening"], (
         "the timer never ticked the falling edge on its own real clock"
+    )
+
+
+
+async def test_two_turn_boundaries_before_the_first_answer_are_not_a_dead_session() -> None:
+    """The race that made a wake word do nothing.
+
+    Two empty turns in a row mean a finished session - once a session has spoken.
+    Before that they can simply be the protocol's boundaries arriving while the
+    endpoint is still working: measured 2026-09-02, first audio through this loop is
+    3.8-4.3s on `gemini-live-2.5-flash-native-audio` against ~1.7s on
+    `gemini-3.1-flash-live-preview`, so on the slower one the boundaries won the race
+    and the conversation ended itself at 4s with nothing said. The owner heard
+    silence.
+    """
+    session = FakeSession(Turn(), Turn(), Says("assistant", "응, 말해."), b"\x01", Turn())
+    audio = FakeAudio()
+    conv = conversation(session, audio, opening_text="네, 여기 있어요.")
+    await conv.run()
+
+    assert audio.played, "the answer that arrived after two boundaries was never heard"
+    assert conv.ended != "the session stopped producing turns"
+
+
+async def test_an_opening_nobody_answers_still_ends_rather_than_hanging() -> None:
+    """The other direction, which is why the patience is bounded rather than removed.
+
+    The opening is sent, so an answer is outstanding and the boundaries below are not
+    a verdict - but nothing ever comes back, so the loop must still conclude on its
+    own, before the idle timeout, and without spinning on a `receive()` that never
+    awaits.
+    """
+    session = FakeSession(*[Turn() for _ in range(400)])
+    conv = conversation(session, FakeAudio(), opening_text="네, 여기 있어요.")
+    conv._idle_timeout = 60.0  # so the *patience* is what ends this, not the budget
+
+    started = asyncio.get_running_loop().time()
+    await conv.run()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert conv.ended == "the session stopped producing turns"
+    assert elapsed < 30.0, f"took {elapsed:.1f}s to give up on a session saying nothing"
+    assert elapsed >= ANSWER_PATIENCE_SECONDS, (
+        "it gave up before the patience it was given, so the waiting is not what ended it"
     )
