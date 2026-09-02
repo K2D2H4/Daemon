@@ -43,6 +43,7 @@ from daemon.clock import now as clock_now
 from daemon.config import Settings
 from daemon.memory.log import from_iso
 from daemon.memory.store import Store
+from daemon.proactivity import agenda
 from daemon.proactivity.base import (
     Candidate,
     Judgement,
@@ -54,6 +55,7 @@ from daemon.proactivity.base import (
 from daemon.proactivity.candidates import (
     AssociativeRecall,
     association_candidates,
+    calendar_candidates,
     generate_candidates,
 )
 from daemon.proactivity.delivery import Delivered, ProactiveDelivery
@@ -96,6 +98,20 @@ class TickResult:
     separately because it is the healthy case: docs/CONTRACTS.md 7 makes silence
     the default, and a judge that never declines is one nobody should trust."""
 
+    notes: tuple[str, ...] = ()
+    """Why a generator produced nothing, when it can tell the difference.
+
+    `generated: 0` has two readings - "there was nothing to say" and "the thing
+    this generator reads is not answering" - and `candidates.py`'s module
+    docstring is explicit that the second one looking like the first is the defect
+    this project keeps shipping. Every generator that can distinguish them says so
+    here, and `daemon proactive` prints it. Today that is `calendar` alone: the
+    other six read sqlite or the local embedder, where "unreachable" is either
+    impossible or already an exception this file lets propagate.
+
+    Not an error channel. A note is a fact about this tick, and a tick with notes
+    is not a failed tick."""
+
     @property
     def allowed(self) -> tuple[Considered, ...]:
         return tuple(item for item in self.considered if item.verdict.allowed)
@@ -128,6 +144,7 @@ class ProactiveTick:
         judge: Judgement | None = None,
         delivery: ProactiveDelivery | None = None,
         recall: AssociativeRecall | None = None,
+        bridge: agenda.Bridge | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -141,6 +158,13 @@ class ProactiveTick:
         # broken embedder must not cost the four generators that need nothing
         # but sqlite. `None` here means type E simply produces nothing.
         self._recall = recall
+        # Type G's only route to the calendar (ADR 0021). `None` - the default,
+        # and what every test that does not care about it gets - means type G
+        # produces nothing and says so in `TickResult.notes`, rather than being
+        # indistinguishable from a clear calendar. `app.py` decides whether to
+        # hand one over at all; the reasoning about `tools_mode == "off"` lives
+        # there, beside the same decision for the topic search.
+        self._bridge = bridge
 
     async def run(self, *, now: datetime | None = None) -> TickResult:
         moment = now or clock_now()
@@ -156,6 +180,9 @@ class ProactiveTick:
         expired = self._store.expire_candidates(now=moment)
         fresh = generate_candidates(self._store, self._settings, now=moment)
         fresh += await self._association(moment)
+        calendar, note = await self._calendar(moment)
+        fresh += calendar
+        notes = (note,) if note else ()
         for candidate in fresh:
             self._store.insert_candidate(
                 kind=candidate.kind,
@@ -215,6 +242,7 @@ class ProactiveTick:
             considered=tuple(considered),
             spoke=spoke,
             declined=declined,
+            notes=notes,
         )
         # The round goes into the audit whether or not anything came of it. A tick
         # that decided against speaking leaves no other trace - no utterance row, no
@@ -283,6 +311,43 @@ class ProactiveTick:
         """
         rest = timedelta(minutes=self._settings.proactive_cooldown_minutes)
         self._store.push_candidate_due(candidate.id, due_at=moment + rest)
+
+    async def _calendar(self, moment: datetime) -> tuple[list[Candidate], str]:
+        """Type G, or nothing plus a reason. Never raises.
+
+        The second deliberate exception to the module docstring's "nothing here
+        catches its own exceptions", and it is narrower than `_association`'s
+        rather than wider: `calendar_candidates` already answers a dead or absent
+        MCP server with a note instead of an exception (`agenda.fetch`), so this
+        wrapper exists only for what that cannot foresee - a parse bug here, an
+        exception the bridge did not wrap. An unreachable Google must not cost the
+        six generators that need nothing but sqlite and the local embedder.
+
+        The difference from `_association` is the reason the note exists at all.
+        A failed type E is invisible in the result and lives only in the log; a
+        failed type G names itself in `TickResult.notes`, so `daemon proactive`
+        can tell the owner which of "your calendar is clear" and "your calendar is
+        unreachable" this tick meant. Type E should probably grow the same thing;
+        it is not being changed here, because a generator this task did not touch
+        is not this task's to rewrite.
+        """
+        if self._bridge is None:
+            # Not a note. No bridge is a decision `app.py` made on purpose (tools
+            # off, or `tools_mode == "off"`), already reported by `daemon doctor`
+            # for the topic search and now for this too - repeating it on every
+            # tick of `daemon proactive` would be noise about a setting the owner
+            # chose, not news.
+            return [], ""
+        try:
+            return await calendar_candidates(
+                self._bridge, self._store, self._settings.calendar_email, now=moment
+            )
+        except Exception as exc:  # noqa: BLE001 - a note, never a dead tick
+            logger.warning(
+                "proactive: type G generator failed; the other six still ran",
+                exc_info=True,
+            )
+            return [], f"calendar generator failed: {type(exc).__name__}: {exc}"
 
     async def _association(self, moment: datetime) -> list[Candidate]:
         """Type E, or nothing. Never raises.

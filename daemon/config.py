@@ -99,8 +99,9 @@ PROACTIVE_KINDS = (
     "pattern_time",
     "association",
     "topic",
+    "calendar",
 )
-"""The six candidate kinds - `daemon/proactivity/base.py`'s `CandidateKind`,
+"""The seven candidate kinds - `daemon/proactivity/base.py`'s `CandidateKind`,
 repeated here for the same reason `GEMINI_LIVE_VOICES` below is: this module is
 foundation and `daemon/proactivity/` sits above it, so importing would invert the
 layering. Validates the keys of `DAEMON_PROACTIVE_KIND_BUDGETS` - a name check
@@ -477,6 +478,7 @@ class Settings(BaseSettings):
             "association": 3,
             "emotional": 2,
             "open_loop": 2,
+            "calendar": 2,
             "silence": 1,
             "pattern_time": 1,
         },
@@ -506,7 +508,17 @@ class Settings(BaseSettings):
     and the sentence above already says these are ceilings while the daily total
     is what binds - `topic` is bound by that total and by
     `proactive_daily_budget` moving 8 -> 5 for exactly this reason, not by a
-    ceiling of its own. Do not add one."""
+    ceiling of its own. Do not add one.
+
+    `calendar` (ADR 0021) does get one, and gets `open_loop`'s number rather than
+    `topic`'s absence, because it is the same kind of thing `open_loop` is: PLAN
+    6.2's cheap-to-satisfy, transactional kind that turns a companion into a
+    reminder app if it competes on equal terms. Two rather than one because the
+    owner's measured calendar runs to two events on a busy day (2026-09-01: 7
+    events in 30 days, never more than two dated the same day), and a ceiling of
+    one would mean the second interview of the day is structurally unmentionable.
+    Two is also still below `association`'s three, so the businessless kind keeps
+    the most room, which is the shape PLAN 6.2 asks for."""
 
     proactive_cooldown_minutes: int = Field(default=90, alias="DAEMON_PROACTIVE_COOLDOWN_MINUTES")
     """Minimum gap between two proactive utterances, whatever their kind. Raised
@@ -521,6 +533,23 @@ class Settings(BaseSettings):
 
     proactive_silence_hours: float = Field(default=12.0, alias="DAEMON_PROACTIVE_SILENCE_HOURS")
     """Hours without conversation before the `silence` kind becomes a candidate."""
+
+    calendar_email: str = Field(default="", alias="DAEMON_CALENDAR_EMAIL")
+    """The Google account whose calendar the `calendar` kind reads. Empty = off.
+
+    A setting rather than something the code discovers, and that is the whole
+    point of it. `get_events` requires `user_google_email` (measured against the
+    live server: omitting it is a validation error, not a default), and the
+    obvious way to find it - call `list_calendars` first and read the primary id
+    off the reply - is precisely the shape ADR 0015 spent four review rounds
+    removing: a lookup result becoming the next lookup's argument. So the owner
+    types it once, code passes it verbatim, and nothing the server says can
+    change what the next call asks for.
+
+    Empty is the honest default. There is no address to guess, and a generator
+    that silently reads nothing is the failure `daemon/proactivity/candidates.py`
+    exists not to have - so `daemon doctor` names this state and
+    `daemon proactive` prints it (docs/CONTRACTS.md 12)."""
 
     # `DAEMON_PROACTIVE_SPEAKER_ENABLED` used to live here as a second switch.
     # Removed: `voice_enabled` above now governs the speaker path too, and

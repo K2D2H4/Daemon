@@ -442,3 +442,124 @@ async def test_the_one_per_tick_stop_is_load_bearing_at_zero_cooldown(
 
     assert result.spoke == 1
     assert len(channel.sent) == 1
+
+
+# --- type G's note, and why a count alone will not do (docs/adr/0021) ---------
+
+
+class _CalendarBridge:
+    """One canned `get_events` reply, or one failure."""
+
+    def __init__(self, title: str = "", *, error: Exception | None = None) -> None:
+        self.title = title
+        self.error = error
+
+    async def call(self, server: str, name: str, arguments: dict) -> str:
+        import json
+
+        if self.error is not None:
+            raise self.error
+        if not self.title:
+            return json.dumps({"result": "No events found in calendar 'primary' for x."})
+        starts = (NOW + timedelta(minutes=25)).isoformat()
+        return json.dumps(
+            {
+                "result": (
+                    "Successfully retrieved 1 events:\n"
+                    f'- "{self.title}" (Starts: {starts} [Asia/Seoul; weekday: Tuesday; '
+                    "ISO weekday: 2], Ends: x) ID: a | Link: https://www.google.com/x"
+                )
+            }
+        )
+
+
+async def test_a_calendar_candidate_is_generated_from_the_bridge(
+    store: Store, data_dir: Path
+) -> None:
+    tick = ProactiveTick(
+        store,
+        settings(calendar_email="x@y.com"),
+        FakePresence(),
+        bridge=_CalendarBridge("Interview with UJET"),
+    )
+
+    result = await tick.run(now=NOW)
+
+    kinds = [item.candidate.kind for item in result.considered]
+    assert "calendar" in kinds
+    assert result.notes == (), "a successful read has nothing to report"
+
+
+async def test_an_unreachable_calendar_is_named_rather_than_counted_as_quiet(
+    store: Store, data_dir: Path
+) -> None:
+    """`generated: 0` reads as "there was nothing to say". For every other kind
+    that is true; for this one it can also mean the calendar is unreachable, and
+    `candidates.py`'s docstring is explicit that the second looking like the first
+    is the defect this project keeps shipping. The note is what `daemon proactive`
+    prints so the two are distinguishable without tailing a log."""
+    from daemon.tools.base import ToolError
+
+    tick = ProactiveTick(
+        store,
+        settings(calendar_email="x@y.com"),
+        FakePresence(),
+        bridge=_CalendarBridge(error=ToolError("the MCP server 'google' is not connected")),
+    )
+
+    result = await tick.run(now=NOW)
+
+    assert result.notes and "not connected" in result.notes[0]
+
+
+async def test_a_calendar_generator_that_raises_does_not_kill_the_tick(
+    store: Store, data_dir: Path
+) -> None:
+    """The narrow exception `_calendar` exists for.
+
+    `agenda.fetch` already answers a dead server with a note, so it is not the
+    thing that escapes - what escapes is a failure *after* the fetch, in
+    `calendar_candidates` itself. The dedup read is the realistic one, so that is
+    what this breaks, and the assertion is that it costs this generator rather
+    than the six that need nothing but sqlite and the local embedder.
+    """
+
+    class _BrokenReader:
+        """Everything `Store` does, except the one read type G makes."""
+
+        def __init__(self, real: Store) -> None:
+            self._real = real
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._real, name)
+
+        def existing_dedup_keys(self, keys: Any) -> set[str]:
+            raise RuntimeError("the mirror is wedged")
+
+    add_candidate(store)
+    tick = ProactiveTick(
+        store,
+        settings(calendar_email="x@y.com"),
+        FakePresence(),
+        bridge=_CalendarBridge("Interview with UJET"),
+    )
+    tick._store = _BrokenReader(store)  # type: ignore[assignment]
+
+    result = await tick.run(now=NOW)  # must not raise
+
+    assert result.disabled is False
+    assert result.notes and "the mirror is wedged" in result.notes[0]
+
+
+async def test_no_bridge_produces_no_calendar_candidate_and_no_note(
+    store: Store, data_dir: Path
+) -> None:
+    """No bridge is a decision `app.py` made on purpose - tools off, or
+    `tools_mode == "off"` - and `daemon doctor` already reports it. Repeating it
+    on every tick would be noise about a setting the owner chose."""
+    tick = ProactiveTick(store, settings(calendar_email="x@y.com"), FakePresence())
+
+    result = await tick.run(now=NOW)
+
+    assert result.notes == ()
+    assert [item.candidate.kind for item in result.considered] == []

@@ -107,7 +107,11 @@ live-share pump's transport, which has no tool round in it.
 7. **Proactivity: silence is the default.** Candidate generation and the gate
    make zero *LLM* calls - same distinction non-negotiable 2 draws, and the same
    allowance: type E's `association_candidates` awaits the embedder every tick,
-   which is not a call that thinks. Exactly one LLM call, and only for candidates
+   and type G's `calendar_candidates` awaits one read-only MCP call every tick
+   ([ADR 0021](adr/0021-the-calendar-read-happens-before-the-gate.md)), neither of
+   which is a call that thinks. Type G is the one that widens what "before the
+   gate" costs - 288 read-only calls a day rather than zero - and that ADR states
+   the number rather than leaving it to be discovered. Exactly one LLM call, and only for candidates
    that already passed the gate. (This headline names the call *count*, not what
    the one call answers when it runs - [ADR 0016](adr/0016-proactive-default-flips-to-speaking.md)
    changed the judge's own default from declining to speaking without touching
@@ -131,6 +135,19 @@ live-share pump's transport, which has no tool round in it.
     The offering side lives with the capability rather than in an endpoint so that a
     second endpoint getting tools cannot get them ungated. If you find yourself
     needing an exception, stop and flag it.
+
+    **Extended 2026-09-01** ([ADR 0021](adr/0021-the-calendar-read-happens-before-the-gate.md)):
+    a second kind, `calendar`, reads the owner's Google Calendar the same way -
+    deterministic code, fixed read-only call, arguments chosen by code
+    (`DAEMON_CALENDAR_EMAIL` plus a clock-derived window), zero tools offered to
+    the model, and `judge.has_url` still the check that bounds what gets out. One
+    thing about the shape below changes and only one: **the call happens in stage
+    1, before the gate, not in stage 3 after it.** It has to, because unlike a
+    `topic` candidate - whose subject `stale_entities` already found in sqlite -
+    nothing but the calendar can tell stage 1 whether there is an event to speak
+    about at all. Read that ADR before citing the paragraph below as "one search,
+    after the gate": for `topic` that is still exactly right, and for `calendar`
+    the placement, the cost shape and the retry behaviour all differ.
 
     **Split 2026-08-25** (docs/adr/0015-code-may-search-where-the-model-may-not.md):
     the model still may not choose or run a tool on a non-owner turn - that half is

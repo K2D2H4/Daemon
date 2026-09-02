@@ -1310,6 +1310,12 @@ async def _proactive(settings: Settings, *, speak: bool = False) -> int:
         return OK
 
     print(f"\ngenerated {result.generated} new candidate(s), expired {result.expired}")
+    for note in result.notes:
+        # A generator that read nothing and a generator that found nothing look
+        # identical in the count above. `TickResult.notes` is what tells them
+        # apart, and printing it here is the whole reason it exists - the state
+        # would otherwise be a log line nobody is tailing (CONTRACTS 12).
+        print(f"  ! {note}")
     if not result.considered:
         print("nothing is due. That is the default and usually the right answer.")
         return OK
@@ -1731,16 +1737,26 @@ def _proactivity_check(settings: Settings) -> Check:
     # makes the resulting state visible rather than a capability nobody was
     # asked about (CONTRACTS 12).
     if not settings.tools_enabled:
-        topic_search = "off (DAEMON_TOOLS_ENABLED)"
+        topic_search = calendar_read = "off (DAEMON_TOOLS_ENABLED)"
     elif settings.tools_mode == "off":
-        topic_search = "off (DAEMON_TOOLS_MODE=off)"
+        topic_search = calendar_read = "off (DAEMON_TOOLS_MODE=off)"
     elif not settings.mcp_enabled:
-        topic_search = "on, but DAEMON_MCP_ENABLED is off so no server can answer it"
+        topic_search = calendar_read = (
+            "on, but DAEMON_MCP_ENABLED is off so no server can answer it"
+        )
     else:
         topic_search = "on"
+        # The one gate `calendar` has that `topic` does not: `get_events` requires
+        # `user_google_email` and there is nothing to guess it from
+        # (`config.calendar_email`). An unset address means the generator is off,
+        # and a capability that is off for a reason nobody was told is exactly the
+        # silent state rule 12 exists to stop - the same argument the two lines
+        # above make for the switches.
+        calendar_read = "on" if settings.calendar_email else "off (DAEMON_CALENDAR_EMAIL unset)"
     detail = (
         f"on, {speaker} · budget {settings.proactive_daily_budget}/day "
-        f"({kinds}) · quiet {quiet} · topic search {topic_search}"
+        f"({kinds}) · quiet {quiet} · topic search {topic_search} "
+        f"· calendar {calendar_read}"
     )
 
     path = settings.data_dir / DB_FILENAME

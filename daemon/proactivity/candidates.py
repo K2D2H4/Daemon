@@ -20,7 +20,7 @@ below list surface variants rather than dictionary forms. A morphological
 analyser would do this properly and was declined for the same reason PLAN 4.3
 declined it for recall: too heavy a dependency for a self-hoster.
 
-## Six generators
+## Seven generators
 
 Type E (association) was **deliberately not implemented** until now, because
 `MemoryRecall.search` - the recall index's only entry point at the time - was
@@ -53,7 +53,20 @@ is async and awaits the two separately, then merges their output.
 Type D's guards mean it produces nothing for the first two weeks of history. That
 is correct, not a bug: "the hour this person usually talks" is not a fact yet.
 
-Type F (topic) arrived later still, in
+Type G (calendar) is the newest and the one that departs furthest from this
+file's shape, in docs/adr/0021-the-calendar-read-happens-before-the-gate.md:
+`calendar_candidates` awaits an MCP read **before** the gate, where type F's
+search happens after it. The reason is that a `topic` candidate's subject comes
+out of `stale_entities` and the search only supplies what to say about it, while
+the calendar is the only thing that knows whether there is a subject at all - so
+reading after the gate would mean emitting a blind candidate every tick. It is
+also the only generator that returns a *reason it produced nothing*, for the
+reason the paragraph on silent failure below gives. What it does not depart from:
+the reason is built from this file's own words and a number, like A-D, and the
+event title (untrusted - written by whoever sent the invitation) travels in
+`payload` to be fenced after the gate, so the exception list below stays at two.
+
+Type F (topic) arrived earlier, in
 docs/adr/0015-code-may-search-where-the-model-may-not.md, and is the odd one
 structurally: `topic_candidates` below names an entity that has
 gone quiet but carries no material of its own about *why* it is worth raising -
@@ -75,6 +88,8 @@ the natural unit of the reason is what gets deduplicated:
     pattern_time  the local date              - one per day
     topic         the entity name + this raise's timestamp - unique per raise,
                   not a rearm mechanism (see below)
+    calendar      the event's start plus a digest of its title - one reminder
+                  per event, permanently, since an event happens once
 
 The `silence` key has a consequence worth stating: a silence that was generated
 and then blocked all the way through its expiry window never comes back, because
@@ -102,7 +117,7 @@ minutes, each honouring its own cooldown.
 
 ## What ends up in the LLM prompt
 
-`Candidate.reason` is fed to the model verbatim, so **for four of the six kinds,
+`Candidate.reason` is fed to the model verbatim, so **for five of the seven kinds,
 no user text is put in it** - only words from the lexicons in this file, plus
 numbers and clock times. A follow-up therefore cannot be steered by what a
 forwarded message said, and A and B additionally only read rows with
@@ -144,6 +159,7 @@ content.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import sqlite3
 from collections.abc import Sequence
@@ -155,6 +171,7 @@ from daemon.clock import now as clock_now
 from daemon.clock import parse_iso, to_iso
 from daemon.config import Settings
 from daemon.memory.base import RecalledItem
+from daemon.proactivity import agenda
 from daemon.proactivity.base import Candidate, CandidateKind
 from daemon.timesense import (
     EVENT_CANCELLED,
@@ -325,6 +342,24 @@ moment an entity requalifies as stale would be the same nagging
 `TOPIC_QUIET_DAYS` exists to stop. 14 days against roughly a dozen entities and a
 few utterances a day gives each one a turn every couple of weeks rather than
 monopolising the slot."""
+
+CALENDAR_LEAD_MINUTES = 30
+"""How far ahead of an event the `calendar` kind speaks, and the only timing
+number this generator has.
+
+Half an hour is the gap where the line is still useful and not yet noise: long
+enough to finish what you are doing and open the meeting link yourself, short
+enough that "곧" is honest. There is no second lead (a day before, an hour
+before): each one multiplies the candidates per event by one and turns the kind
+into the notification stack the owner already has (docs/adr/0021).
+
+It is also the fetch window. `agenda.fetch` asks for `[now, now +
+CALENDAR_LEAD_MINUTES]`, so widening this widens the read; nothing else needs to
+change together with it.
+
+At `PROACTIVE_TICK_MINUTES` (5) the window is crossed by ~6 ticks, and the dedup
+key is what makes that one candidate rather than six."""
+
 
 TOPIC_TTL_HOURS = 24
 """How long an unfired `topic` candidate stays live before `expire_candidates`
@@ -686,6 +721,117 @@ def topic_candidates(reader: CandidateReader, now: datetime) -> list[Candidate]:
             )
         )
     return found
+
+
+async def calendar_candidates(
+    bridge: agenda.Bridge,
+    reader: CandidateReader,
+    email: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[list[Candidate], str]:
+    """Type G: an event on the owner's own calendar, about to start.
+
+    Returns `(candidates, note)`. The note is `""` when the calendar was read -
+    including when it was read and found empty - and carries the reason otherwise.
+    Two return values rather than one because an empty list means two different
+    things and this module's docstring is explicit that a generator which stops
+    producing silently is indistinguishable from a quiet day; `tick.py` puts the
+    note where `daemon proactive` prints it.
+
+    `async` and outside `generate_candidates` for the same structural reason
+    `association_candidates` is: it awaits the network and `generate_candidates`
+    is synchronous. Unlike type E's embedder, this one is a *thinking-free* read
+    over MCP that happens **before** the gate - the one place this generator
+    departs from ADR 0015's shape, argued in docs/adr/0021. The short version: a
+    `topic` candidate's subject comes out of `stale_entities`, so the search only
+    supplies what to say about it, while here the calendar is the only thing that
+    knows whether there is a subject at all. Reading after the gate would mean
+    emitting a blind candidate every tick and giving the gate nothing to filter on.
+
+    **The reason is built from this file's own words and a number, like four of
+    the other six generators.** The event title is untrusted text - written by
+    whoever sent the invitation, not by the owner - so it travels in `payload` and
+    reaches the prompt only through `agenda.render`'s nonce fence, which
+    `daemon/proactivity/judge.py` folds in after the gate. That keeps the
+    "no user text in a reason" exception count at two (E and F) rather than three,
+    and it keeps the clock in code's hands: the model is given the minutes and no
+    timestamp to restate.
+
+    One candidate per tick, the soonest event, not one per event in the window.
+    Two events inside `CALENDAR_LEAD_MINUTES` of each other would produce two
+    lines the 90-minute cooldown blocks anyway, and the second event becomes the
+    soonest on its own once the first has started - so the natural rotation costs
+    nothing and needs no pool constant.
+
+    `expires_at` is the event's own start. Every other kind expires on a fixed
+    number of hours; this one is the only kind whose material has a deadline in
+    it, and a reminder that arrives after the meeting began is worse than none.
+    `tick._rest` pushing a declined or gate-blocked candidate 90 minutes forward
+    therefore usually retires it - which that method records as a cost for the
+    other kinds and is the intended behaviour here.
+    """
+    moment = now or clock_now()
+    if not email:
+        # Not an error and not a silent zero: the owner has not said whose
+        # calendar this is, and `get_events` has no default for it (measured -
+        # see `agenda`'s module docstring). Reported the same way a dead server
+        # is, so `daemon proactive` can say which of the two it is.
+        return [], "calendar off: DAEMON_CALENDAR_EMAIL is not set"
+
+    horizon = moment + timedelta(minutes=CALENDAR_LEAD_MINUTES)
+    read = await agenda.fetch(bridge, email, moment, horizon)
+    if read.note:
+        return [], read.note
+
+    # `time_min` is inclusive and the server may expand a recurring instance that
+    # began a moment ago, so the strict `> moment` is re-applied here rather than
+    # trusted from the query.
+    upcoming = [e for e in read.events if moment < e.starts_at <= horizon]
+    if not upcoming:
+        return [], ""
+
+    # Spent keys are removed *before* `min()`, not after. Filtering afterwards
+    # meant the soonest event, once raised, hid every later one in the window
+    # until it actually started - and two events four minutes apart can have no
+    # tick between them, so the second was never raised at all.
+    keyed = [(f"calendar:{to_iso(e.starts_at)}:{_title_key(e.title)}", e) for e in upcoming]
+    spent = reader.existing_dedup_keys([key for key, _ in keyed])
+    fresh = [(key, e) for key, e in keyed if key not in spent]
+    if not fresh:
+        return [], ""
+
+    key, event = min(fresh, key=lambda pair: pair[1].starts_at)
+    minutes = max(1, round((event.starts_at - moment).total_seconds() / 60))
+    candidate = Candidate(
+        kind="calendar",
+        # Lexicon words and a number. The title is in `payload`, fenced later.
+        reason=(
+            f"{minutes}분 뒤에 유저의 캘린더에 적힌 일정이 하나 시작된다. "
+            "유저가 아직 이 일정 이야기를 꺼내지 않았다."
+        ),
+        # No `starts_at`: `Candidate.expires_at` already carries the event's start,
+        # in the format the store round-trips (`utc_iso`/`from_iso`). A second copy
+        # written with `clock.to_iso` looked like every other stored timestamp and
+        # `from_iso` could not parse it - a trap for the first caller to try.
+        payload={"dedup": key, "title": event.title},
+        due_at=moment,
+        expires_at=event.starts_at,
+    )
+    return [candidate], ""
+
+
+def _title_key(title: str) -> str:
+    """A short stable digest of the title, for the dedup key.
+
+    Hashed rather than interpolated so the key stays one length and one shape
+    whatever an invitation is called - a title with a colon in it would otherwise
+    make `calendar:<ts>:<title>` ambiguous to read, and the key is a value an
+    operator reads out of `payload` while working out why the daemon did or did
+    not speak. Collision risk is irrelevant at one calendar's event rate; what it
+    has to do is separate two different events that start in the same minute.
+    """
+    return hashlib.sha256(title.encode("utf-8")).hexdigest()[:8]
 
 
 _KIND_ORDER: tuple[CandidateKind, ...] = (

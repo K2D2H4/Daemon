@@ -808,3 +808,174 @@ def test_connect_refuses_a_variable_the_entry_does_not_declare(tmp_path: Path) -
     assert resp.status_code == 400
     assert env.read_text(encoding="utf-8") == original
     assert "DAEMON_HOST" not in env.read_text(encoding="utf-8")
+
+
+# --- the calendar account check (docs/adr/0021) ------------------------------
+#
+# The settings page cannot offer a real account picker: `get_events` needs the
+# address and no google tool will reveal it (see `daemon/admin/google_accounts.py`
+# for the measurement). So the page suggests, and this endpoint is how the owner
+# confirms a suggestion is actually reachable before saving it.
+
+
+class _CalendarBridge(FakeBridge):
+    """A live `google` server that answers `list_calendars` and nothing else."""
+
+    def __init__(self, reply: str | None = None, *, error: Exception | None = None) -> None:
+        super().__init__()
+        self.live.add("google")
+        self.reply = reply
+        self.error = error
+        self.calls: list[tuple[str, str, dict]] = []
+
+    async def call(self, server: str, name: str, arguments: dict) -> str:
+        self.calls.append((server, name, dict(arguments)))
+        if self.error is not None:
+            raise self.error
+        return self.reply or json.dumps({"result": "Successfully listed 0 calendars:"})
+
+
+# The live reply, verbatim (2026-09-01).
+_LIVE_CALENDARS = json.dumps(
+    {
+        "result": (
+            "Successfully listed 2 calendars for x@y.com:\n"
+            '- "Holidays in South Korea" (ID: en.south_korea#holiday@group.v.calendar.google.com)\n'
+            '- "x@y.com" (Primary) (ID: x@y.com)'
+        )
+    }
+)
+
+
+def test_the_calendar_check_reports_the_calendar_names(tmp_path: Path) -> None:
+    bridge = _CalendarBridge(_LIVE_CALENDARS)
+    client = TestClient(_enabled_app(tmp_path, bridge), base_url=LOOPBACK)
+
+    body = client.post("/admin/api/calendar/check", json={"email": "x@y.com"}).json()
+
+    assert body["calendars"] == ["Holidays in South Korea", "x@y.com"]
+    assert bridge.calls == [("google", "list_calendars", {"user_google_email": "x@y.com"})]
+
+
+def test_the_calendar_check_drops_the_calendar_ids(tmp_path: Path) -> None:
+    """Same discipline as `agenda._EVENT_RE`: keep the name, drop everything after
+    it. The id is an address-shaped string nothing downstream needs, and every
+    string that reaches the page is one more to have to reason about."""
+    client = TestClient(
+        _enabled_app(tmp_path, _CalendarBridge(_LIVE_CALENDARS)), base_url=LOOPBACK
+    )
+
+    body = client.post("/admin/api/calendar/check", json={"email": "x@y.com"}).json()
+
+    assert not any("group.v.calendar.google.com" in name for name in body["calendars"])
+    assert not any("ID:" in name for name in body["calendars"])
+
+
+def test_the_calendar_check_needs_an_address(tmp_path: Path) -> None:
+    """There is nothing to fall back to - the whole point of the field is that the
+    address cannot be discovered."""
+    client = TestClient(_enabled_app(tmp_path, _CalendarBridge()), base_url=LOOPBACK)
+
+    assert client.post("/admin/api/calendar/check", json={}).status_code == 400
+    assert client.post("/admin/api/calendar/check", json={"email": "  "}).status_code == 400
+
+
+def test_the_calendar_check_says_which_thing_is_missing(tmp_path: Path) -> None:
+    """A wrong address, a lapsed consent and an absent server are three different
+    fixes, so they must not all read as "it didn't work"."""
+    app = create_app(_settings(tmp_path, mcp_enabled=True))
+    app.state.env_path = tmp_path / ".env"
+    app.state.mcp = FakeBridge()  # running, but no google server connected
+    client = TestClient(app, base_url=LOOPBACK)
+
+    unconnected = client.post("/admin/api/calendar/check", json={"email": "x@y.com"})
+    assert unconnected.status_code == 409
+    assert "google" in unconnected.json()["detail"]
+
+    from daemon.tools.base import ToolError
+
+    refused = TestClient(
+        _enabled_app(tmp_path, _CalendarBridge(error=ToolError("invalid_grant"))),
+        base_url=LOOPBACK,
+    ).post("/admin/api/calendar/check", json={"email": "x@y.com"})
+    assert refused.status_code == 502
+    assert "invalid_grant" in refused.json()["detail"]
+
+
+def test_the_calendar_check_is_gated_on_the_mcp_switch(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path, mcp_enabled=False))
+    app.state.env_path = tmp_path / ".env"
+    client = TestClient(app, base_url=LOOPBACK)
+
+    reply = client.post("/admin/api/calendar/check", json={"email": "x@y.com"})
+
+    assert reply.status_code == 409
+    assert "DAEMON_MCP_ENABLED" in reply.json()["detail"]
+
+
+def test_an_unparseable_reply_still_counts_as_reached(tmp_path: Path) -> None:
+    """The button asks "does this address reach a calendar", and a reply we cannot
+    parse still answers yes. Reporting a 502 here would send the owner hunting for
+    an auth problem that does not exist."""
+    client = TestClient(
+        _enabled_app(tmp_path, _CalendarBridge("(no output)")), base_url=LOOPBACK
+    )
+
+    reply = client.post("/admin/api/calendar/check", json={"email": "x@y.com"})
+
+    assert reply.status_code == 200
+    assert reply.json()["calendars"] == []
+
+
+def test_an_unauthorised_address_is_summarised_not_dumped(tmp_path: Path) -> None:
+    """Measured on the live server: an address it holds no credential for makes it
+    open Google's consent page in the owner's browser and answer with ~1.2KB of
+    markdown wrapping the authorize URL - a code challenge and the full workspace
+    scope included. Useful behaviour (it is how a second account gets authorised)
+    and unreadable in a one-line note, so the page gets a sentence and the log gets
+    the link.
+
+    409, not 502: nothing is broken, an action is pending.
+    """
+    long_reply = (
+        "**ACTION REQUIRED: Google Authentication Needed for Google Calendar for "
+        "'nobody@example.com'**\n\n1. The authorization page has been "
+        "**automatically opened in your browser**.\n   Authorization URL: "
+        "https://accounts.google.com/o/oauth2/auth?response_type=code&code_challenge=X"
+        + "&scope=" + "x" * 900
+    )
+    from daemon.tools.base import ToolError
+
+    client = TestClient(
+        _enabled_app(tmp_path, _CalendarBridge(error=ToolError(long_reply))),
+        base_url=LOOPBACK,
+    )
+
+    reply = client.post("/admin/api/calendar/check", json={"email": "nobody@example.com"})
+
+    assert reply.status_code == 409
+    detail = reply.json()["detail"]
+    assert "nobody@example.com" in detail and "sign-in" in detail
+    assert "accounts.google.com" not in detail, "the authorize url reached the page"
+    assert "code_challenge" not in detail
+    assert len(detail) < 300, "the markdown wall reached the page"
+
+
+def test_a_calendar_name_containing_a_quote_is_not_truncated(tmp_path: Path) -> None:
+    """The non-greedy first draft reported `He said "hi"` as `He said ` - a name
+    the owner does not recognise, which reads as the check having found the wrong
+    account. Greedy against a required literal suffix, like `agenda._EVENT_RE`."""
+    reply = json.dumps(
+        {
+            "result": (
+                "Successfully listed 2 calendars for x@y.com:\n"
+                '- "He said "hi"" (ID: weird@group.calendar.google.com)\n'
+                '- "x@y.com" (Primary) (ID: x@y.com)'
+            )
+        }
+    )
+    client = TestClient(_enabled_app(tmp_path, _CalendarBridge(reply)), base_url=LOOPBACK)
+
+    body = client.post("/admin/api/calendar/check", json={"email": "x@y.com"}).json()
+
+    assert body["calendars"] == ['He said "hi"', "x@y.com"]

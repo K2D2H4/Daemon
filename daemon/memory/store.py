@@ -30,7 +30,7 @@ from daemon.memory.log import from_iso, local_date, utc_iso
 logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _INSERT_MESSAGE = """
 INSERT INTO messages
@@ -136,11 +136,17 @@ class Store:
             ).fetchone()
             is not None
         )
-        if found < 8 and has_candidates:
+        if found < 9 and has_candidates:
             # A file older than M3 has no proactive_candidates table at all, and
             # schema.sql's CREATE TABLE IF NOT EXISTS creates it fresh - already
-            # with 'topic' allowed - right after this method returns, so there is
-            # nothing here to rebuild.
+            # with every kind allowed - right after this method returns, so there
+            # is nothing here to rebuild.
+            #
+            # One block, not one per version. v8 widened the kind CHECK to admit
+            # 'topic' and v9 widens it again to admit 'calendar'; a file at v7
+            # would otherwise be rebuilt twice in a row to reach the same shape.
+            # The condition is `found < 9` and the DDL below is the *current*
+            # shape, so any older file lands on it in a single rebuild.
             #
             # For a file that does have the table: the kind CHECK names its kinds,
             # so widening it is a table rebuild - `ALTER TABLE ... ADD CONSTRAINT`
@@ -150,18 +156,19 @@ class Store:
             # `executescript` does NOT give that: it issues its own implicit COMMIT
             # before the script starts and each statement lands as it runs, so a
             # crash between DROP and RENAME would leave no proactive_candidates at
-            # all and an orphaned _v8 copy nothing ever reads again - the silent
+            # all and an orphaned _v9 copy nothing ever reads again - the silent
             # degradation non-negotiable 1 exists to rule out. Explicit BEGIN and
             # per-statement execute() is what actually makes the ordering matter:
             # a failure anywhere in the loop rolls every statement back, so the
             # original table is either fully replaced or not touched at all.
             statements = (
                 """
-                CREATE TABLE proactive_candidates_v8 (
+                CREATE TABLE proactive_candidates_v9 (
                     id            INTEGER PRIMARY KEY,
                     kind          TEXT    NOT NULL CHECK (kind IN (
                                       'open_loop', 'emotional', 'silence',
-                                      'pattern_time', 'association', 'topic'
+                                      'pattern_time', 'association', 'topic',
+                                      'calendar'
                                   )),
                     reason        TEXT    NOT NULL,
                     payload       TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
@@ -178,13 +185,13 @@ class Store:
                 ) STRICT
                 """,
                 """
-                INSERT INTO proactive_candidates_v8
+                INSERT INTO proactive_candidates_v9
                     SELECT id, kind, reason, payload, created_at, due_at, expires_at,
                            state, fire_count, fire_budget, cooldown_secs, last_fired_at
                     FROM proactive_candidates
                 """,
                 "DROP TABLE proactive_candidates",
-                "ALTER TABLE proactive_candidates_v8 RENAME TO proactive_candidates",
+                "ALTER TABLE proactive_candidates_v9 RENAME TO proactive_candidates",
             )
             self.conn.execute("BEGIN IMMEDIATE")
             try:

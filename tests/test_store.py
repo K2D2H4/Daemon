@@ -308,9 +308,71 @@ def test_a_v7_database_gains_the_topic_kind_without_losing_its_candidates(
         ("open_loop", "08월 01일에 시험 이야기를 했다")
     ], "the rebuild dropped the rows it was supposed to carry over"
 
+    for kind, reason in (
+        ("topic", "Sendbird 이야기를 한 지 12일 됐다"),
+        # v9 (docs/adr/0021). A v7 file reaches the current shape in ONE rebuild -
+        # `_migrate`'s condition is `found < 9` and its DDL is the current table -
+        # so this asserts the single rebuild admitted both widenings, not just the
+        # older one it was originally written for.
+        ("calendar", "25분 뒤에 유저의 캘린더에 적힌 일정이 하나 시작된다"),
+    ):
+        store.conn.execute(
+            "INSERT INTO proactive_candidates (kind, reason, created_at) VALUES (?, ?, ?)",
+            (kind, reason, "2026-09-01T00:00:00Z"),
+        )
+    store.conn.commit()
+
+
+def test_a_v8_database_gains_the_calendar_kind_without_losing_its_candidates(
+    tmp_path: Path,
+) -> None:
+    """The live install is at v8, so this is the migration that actually runs on
+    the owner's machine - the v7 case above is the older path kept working.
+
+    Same reasoning as that test: a rebuild that forgets to copy looks exactly like
+    a working migration until someone goes looking for a candidate that is not
+    there, so the surviving row is asserted rather than only the new insert.
+    """
+    path = tmp_path / "v8.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at TEXT NOT NULL) STRICT;
+        INSERT INTO schema_version (version, applied_at) VALUES (8, '2026-08-26T00:00:00Z');
+        CREATE TABLE proactive_candidates (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN
+                ('open_loop','emotional','silence','pattern_time','association','topic')),
+            reason TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
+            created_at TEXT NOT NULL,
+            due_at TEXT, expires_at TEXT,
+            state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN (
+                'pending', 'armed', 'fired', 'done', 'cancelled', 'expired'
+            )),
+            fire_count INTEGER NOT NULL DEFAULT 0,
+            fire_budget INTEGER NOT NULL DEFAULT 1,
+            cooldown_secs INTEGER NOT NULL DEFAULT 86400,
+            last_fired_at TEXT
+        ) STRICT;
+        INSERT INTO proactive_candidates (kind, reason, created_at)
+            VALUES ('topic', 'Sendbird 이야기를 한 지 12일 됐다', '2026-08-26T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store.open(path)
+    assert store.schema_version() == SCHEMA_VERSION
+
+    kept = store.conn.execute("SELECT kind, reason FROM proactive_candidates").fetchall()
+    assert [(r["kind"], r["reason"]) for r in kept] == [
+        ("topic", "Sendbird 이야기를 한 지 12일 됐다")
+    ], "the rebuild dropped the rows it was supposed to carry over"
+
     store.conn.execute(
         "INSERT INTO proactive_candidates (kind, reason, created_at) VALUES (?, ?, ?)",
-        ("topic", "Sendbird 이야기를 한 지 12일 됐다", "2026-08-25T00:00:00Z"),
+        ("calendar", "25분 뒤에 일정이 하나 시작된다", "2026-09-01T00:00:00Z"),
     )
     store.conn.commit()
 
@@ -380,7 +442,7 @@ def test_an_interrupted_v8_migration_leaves_the_original_table_intact(
 
     # Unpatched, as a restart's first connection would be. If the rebuild were
     # not atomic, this would see either no proactive_candidates at all (schema.sql
-    # would then recreate it empty) or an orphaned proactive_candidates_v8 holding
+    # would then recreate it empty) or an orphaned proactive_candidates_v9 holding
     # the row nothing reads again.
     conn2 = sqlite3.connect(path)
     conn2.row_factory = sqlite3.Row
@@ -389,7 +451,7 @@ def test_an_interrupted_v8_migration_leaves_the_original_table_intact(
         for r in conn2.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     assert "proactive_candidates" in tables
-    assert "proactive_candidates_v8" not in tables
+    assert "proactive_candidates_v9" not in tables
 
     rows = conn2.execute("SELECT kind, reason FROM proactive_candidates").fetchall()
     assert [(r["kind"], r["reason"]) for r in rows] == [
@@ -399,6 +461,6 @@ def test_an_interrupted_v8_migration_leaves_the_original_table_intact(
     version = conn2.execute("SELECT version FROM schema_version").fetchone()["version"]
     assert version == 7, (
         "the crash happened before _migrate's own commit; a real restart must see "
-        "found=7 and retry the rebuild, not believe v8 already landed"
+        "found=7 and retry the rebuild, not believe the new version already landed"
     )
     conn2.close()
