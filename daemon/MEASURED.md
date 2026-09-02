@@ -1049,3 +1049,71 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
   layer in between is the suspect, not the endpoint.** `evals/vertex_live_spike.py`
   now drives the real loop with a microphone that hears nothing, and fails when
   nothing is spoken.
+
+## The room is not the owner, and 2.5 answers it
+
+2026-09-02. The owner, on `gemini-live-2.5-flash-native-audio`: "혼자 말하고 혼자
+대답하고 난리도 아니야". The conversation log says it exactly. Of 27 user turns that
+day, 5 are the **suffix of the reply just played** - "무슨 생각해?" answered 0.4 s
+after the daemon said "너는 무슨 생각해?" - and in the next session 5 of 7 are room
+sound rendered as `Ay.`, `da`, `what 2 3 4`. Every one got an answer, which is what
+"talking to herself" is. The same build, room, speaker and settings on
+`gemini-3.1-flash-live-preview`: **0 such turns.**
+
+**What the microphone actually carries**, measured through the product's own
+echo-cancelled device with the product's own Silero VAD, counted by frame index
+(32 ms a frame):
+
+| | speech frames | longest run | densest 25 |
+|---|---|---|---|
+| the room, nothing playing | 0 of 18 | 0 | 0 |
+| our own voice, 9.3 s of it, out of the speaker | 8 of 290 | **8** | 8 |
+| a voice in the room | 161 of 224 | 68 | 25 |
+
+So echo cancellation is not the hole - it leaks a quarter of a second at a time,
+0.5% of the time - and the room is quiet. **What differs is what the two models do
+with it.** `daemon/voice/speech_gate.py` therefore sends the server digital silence
+for every frame that is not part of a sustained run of speech: the stream stays
+continuous, which is what the server's own end-of-speech detection keys on, and
+there is nothing there for 2.5 to answer.
+
+Three numbers in that file are fitted to the table above, and the first attempt got
+the first one wrong: **4 consecutive frames is inside the leak** (8). It is 12 now,
+or 18 speech frames of the last 25, both well clear.
+
+**Two things it took a live loop to see, neither visible to a fake microphone.**
+A rig that plays a person through the built-in speakers, answers through the owner's
+own output, and scores what the server transcribes:
+
+- **A 300 ms pre-roll is not enough.** The VAD noticed a sentence spoken across the
+  room 2.1 s late, so the server got its tail, transcribed `ランチョンマット で`, and
+  the model answered nonsense. The pre-roll is 1 s.
+- **`ANSWER_HOLD_SECONDS` and this gate cannot both be on.** 2.5 finalises the
+  owner's transcript *mid-utterance* - 11.1 s into a sentence that ended at 12.5 -
+  and the hold then muted the microphone before they had finished: the rest never
+  left, and with no frames at all the server could not hear the silence that ends a
+  turn. First audio came **7.0 s** late, when frames resumed. The hold exists to
+  keep the room from being read as a new turn, which is this gate's whole job, so
+  with a gate it is skipped.
+
+**Live, three utterances a session, answers counted only as a fresh burst of audio:**
+
+| | answered | first audio |
+|---|---|---|
+| no gate, server's own end-of-speech timer | 5 of 6 | ~1.0 s, and it talked over the person |
+| gate, same timer | 5 of 6 | 0.9-1.6 s, one at 20 s |
+| **gate + `DAEMON_VOICE_SILENCE_DURATION_MS=1000`** | **6 of 6** | **1.6-1.9 s** |
+| that timer without the gate | 2 of 4, sessions died early | 1.9 s |
+
+The last row is the attribution: the timer alone is not the fix.
+
+## A clip change during a render is not a frame
+
+Same day, same session: `IndexError: index 142 is out of bounds for axis 0 with
+size 131`, three times, and each time the face fell back to its clips for the rest
+of the session. `Renderer.encode` runs on the executor thread; `switch` is called
+straight from the event loop. The modulo was taken against a 193-frame clip's boxes
+and the frame looked up in the 131-frame clip that had arrived in between. Each
+render call now binds one clip and uses it throughout - a frame composited from two
+clips would not have been a frame anyway.
+

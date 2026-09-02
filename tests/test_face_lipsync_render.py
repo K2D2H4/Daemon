@@ -1009,7 +1009,7 @@ def test_the_injection_weight_is_averaged_over_the_utterance():
     second = step.mouths[1]
     i = step.indices[1] % len(cache.boxes)
     alone = detail_weight(second, cache.frames[i], cache.boxes[i])
-    running = r._weight(second, i, step.indices[1] + 1)
+    running = r._weight(second, i, step.indices[1] + 1, cache)
     assert not np.allclose(running, alone), (
         "the second frame's weight must carry the first frame's, not be recomputed"
     )
@@ -1030,7 +1030,7 @@ def test_the_injection_weight_restarts_at_a_turn_boundary():
     r.encode(r.step(frame_index=0, origin=0.0, fps=24.0))
 
     far = np.full((256, 256, 3), 250, np.uint8)
-    fresh = r._weight(far, 0, 900)          # a jump: new turn
+    fresh = r._weight(far, 0, 900, cache)  # a jump: new turn
     assert np.allclose(fresh, detail_weight(far, cache.frames[0], cache.boxes[0])), (
         "a new turn must not inherit the previous utterance's weight"
     )
@@ -1153,3 +1153,37 @@ def test_the_mouth_after_a_switch_is_generated_for_the_new_clip():
     r.switch(_driver("listening"))
     _jpegs(r, frame_index=0)
     assert engine.clips == ["idle2", "listening"]
+
+
+async def test_a_clip_change_during_encode_cannot_index_the_new_clip_with_the_old_length() -> None:
+    """`switch` runs on the event loop while `encode` runs on the executor thread
+    (daemon/app.py submits `encode` there and calls `switch` directly), so the field
+    can change between two reads inside one call. It did, on the owner's machine
+    2026-09-02: `IndexError: index 142 is out of bounds for axis 0 with size 131` -
+    the modulo taken against a 193-frame clip's box list, the lookup landing in a
+    131-frame clip's frames - and the render loop died for the rest of the session,
+    three times in one day. One clip per call, whichever it is.
+    """
+    engine = FakeEngine()
+    long_clip = _driver("idle2", n=193)
+    short_clip = _driver("amused", n=131)
+    r = _renderer(engine=engine, driver=long_clip, ring=_silent_ring())
+    step = r.step(frame_index=142, origin=0.0, fps=24.0)
+    assert step is not None
+
+    switched = False
+    original = r._blend
+
+    def blend_then_switch(mouth, index):
+        nonlocal switched
+        if not switched:
+            switched = True
+            r.switch(short_clip)  # mid-encode, exactly as the event loop does
+        return original(mouth, index)
+
+    r._blend = blend_then_switch  # type: ignore[method-assign]
+
+    frames = r.encode(step)
+
+    assert frames, "the clip change must not cost the frames"
+    assert r.failed is False
