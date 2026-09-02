@@ -26,7 +26,7 @@ from websockets.frames import Close
 
 from daemon.llm.base import ToolCall, ToolSpec, call_name
 from daemon.tools.base import ToolResult
-from daemon.voice import gemini_live
+from daemon.voice import gemini_live, vertex
 from daemon.voice.base import Interrupted, Transcript, VoiceSession
 from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
 
@@ -299,6 +299,172 @@ async def test_api_key_travels_as_a_header_not_in_the_url() -> None:
     (url, headers, _ssl) = connect.calls[0]
     assert headers == {"x-goog-api-key": KEY}
     assert KEY not in url
+
+
+# --- the Vertex transport (daemon/voice/vertex.py) ---------------------------
+
+VERTEX_MODEL = "gemini-live-2.5-flash-native-audio"
+VERTEX_PATH = f"projects/p/locations/us-central1/publishers/google/models/{VERTEX_MODEL}"
+TOKEN = "ya29.fake-access-token"  # fake shape; no test may need a real one
+
+
+def test_the_vertex_uri_and_model_path_are_built_from_project_and_region() -> None:
+    """A wrong region is a handshake 404 and a bare model id is a 1008, so neither
+    is defaulted quietly."""
+    assert vertex.ws_url("us-central1") == (
+        "wss://us-central1-aiplatform.googleapis.com/ws/"
+        "google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent"
+    )
+    assert vertex.model_path("p", "us-central1", VERTEX_MODEL) == VERTEX_PATH
+    # Already-qualified values pass through, so an id copied from the console works
+    # as typed rather than becoming projects/p/.../projects/p/...
+    assert vertex.model_path("p", "us-central1", VERTEX_PATH) == VERTEX_PATH
+    assert (
+        vertex.model_path("p", "us-east4", "publishers/google/models/x")
+        == "projects/p/locations/us-east4/publishers/google/models/x"
+    )
+    with pytest.raises(ValueError, match="location"):
+        vertex.ws_url("")
+    with pytest.raises(ValueError, match="project"):
+        vertex.model_path("", "us-central1", VERTEX_MODEL)
+
+
+async def test_a_vertex_model_path_is_not_prefixed_with_models() -> None:
+    """`models/projects/...` comes back as a 1008 naming a model nobody configured."""
+    connection = FakeConnection(SETUP_COMPLETE)
+    connect = connector(connection)
+    live = GeminiLiveSession(
+        "",  # the Vertex endpoint takes no API key
+        VERTEX_PATH,
+        url=vertex.ws_url("us-central1"),
+        auth=lambda: {"Authorization": f"Bearer {TOKEN}"},
+        connect=connect,
+    )
+    async with live:
+        pass
+
+    assert connection.sent[0]["setup"]["model"] == VERTEX_PATH
+    (url, headers, _ssl) = connect.calls[0]
+    assert headers == {"Authorization": f"Bearer {TOKEN}"}
+    assert "aiplatform" in url
+
+
+async def test_the_bearer_token_is_fetched_per_connect_attempt() -> None:
+    """An access token lives about an hour while a resident process reconnects for
+    its own reasons, so a token fetched once at startup dies at a later handshake.
+    """
+    fetched: list[str] = []
+
+    def auth() -> dict[str, str]:
+        fetched.append(f"{TOKEN}-{len(fetched)}")
+        return {"Authorization": f"Bearer {fetched[-1]}"}
+
+    connect = connector(OSError("no route to host"), FakeConnection(SETUP_COMPLETE))
+    async with GeminiLiveSession("", VERTEX_PATH, auth=auth, connect=connect):
+        pass
+
+    assert len(fetched) == 2, "the second attempt reused the first attempt's token"
+    assert connect.calls[1][1] == {"Authorization": f"Bearer {fetched[1]}"}
+
+
+async def test_a_credential_failure_is_permanent_and_never_reaches_the_socket() -> None:
+    """Retrying a credential nobody will fix is a daemon that stays mute while
+    looking healthy - the same failure a revoked key would cause."""
+
+    def auth() -> dict[str, str]:
+        raise GeminiLiveError("Vertex credentials could not be loaded", permanent=True)
+
+    connect = connector(FakeConnection(SETUP_COMPLETE))
+    with pytest.raises(GeminiLiveError, match="credentials") as caught:
+        async with GeminiLiveSession("", VERTEX_PATH, auth=auth, connect=connect):
+            pass  # pragma: no cover
+
+    assert caught.value.permanent
+    assert connect.calls == [], "a session was opened despite having no credential"
+
+
+async def test_an_unexpected_credential_error_is_still_permanent() -> None:
+    """Anything the provider raises that is not already ours - a missing package, an
+    unreadable file - must not be reclassified as a retryable connect failure."""
+
+    def auth() -> dict[str, str]:
+        raise RuntimeError("google-auth exploded")
+
+    with pytest.raises(GeminiLiveError) as caught:
+        async with GeminiLiveSession("", VERTEX_PATH, auth=auth, connect=connector()):
+            pass  # pragma: no cover
+
+    assert caught.value.permanent
+    assert "RuntimeError" in str(caught.value)
+
+
+async def test_a_bearer_token_never_appears_in_an_error() -> None:
+    """`_redact` knew one credential - the API key, given at construction. The
+    token is not known until the provider is called, and the handshake error is
+    where it would surface."""
+    leaky = OSError(f"handshake failed, sent Authorization: Bearer {TOKEN}")
+    live = GeminiLiveSession(
+        "",
+        VERTEX_PATH,
+        auth=lambda: {"Authorization": f"Bearer {TOKEN}"},
+        connect=connector(leaky),
+        max_attempts=1,
+    )
+    with pytest.raises(GeminiLiveError) as caught:
+        async with live:
+            pass  # pragma: no cover
+
+    assert TOKEN not in str(caught.value)
+    assert TOKEN not in repr(caught.value)
+    assert "<key>" in str(caught.value)
+
+
+async def test_an_absent_api_key_scrubs_nothing_rather_than_everything() -> None:
+    """The Vertex transport constructs with `api_key=""`, and `str.replace("", ...)`
+    matches between every character.
+
+    Without the empty-drop in `_KeyFilter`, every error message on that transport
+    would come back as `<key>`-per-character noise - a TLS failure unreadable
+    exactly when it needs reading. Nothing else in the suite looks at a redacted
+    message with no key present, so this is the only thing holding that guard down.
+    """
+    live = GeminiLiveSession(
+        "",
+        VERTEX_PATH,
+        auth=lambda: {"Authorization": f"Bearer {TOKEN}"},
+        connect=connector(OSError("no route to host")),
+        max_attempts=1,
+    )
+    with pytest.raises(GeminiLiveError) as caught:
+        async with live:
+            pass  # pragma: no cover
+
+    message = str(caught.value)
+    assert "could not connect" in message
+    assert "no route to host" in message
+    assert "<key>" not in message, "an empty credential was substituted into the text"
+
+
+def test_the_log_filter_scrubs_a_credential_it_learned_after_construction() -> None:
+    """websockets logs the handshake headers at DEBUG, so the scrub has to cover a
+    credential that did not exist when the filter was built. Asserted on the filter
+    itself rather than through caplog: a filter installed by an earlier test that
+    never closed its session would make a log-based assertion pass for the wrong
+    reason."""
+    scrub = gemini_live._KeyFilter("")
+    record = logging.LogRecord(
+        "websockets.client", logging.DEBUG, __file__, 1, "> authorization: %s", (TOKEN,), None
+    )
+    scrub.filter(record)
+    assert TOKEN in str(record.args), "nothing was remembered, so nothing should change"
+
+    scrub.remember(TOKEN)
+    again = logging.LogRecord(
+        "websockets.client", logging.DEBUG, __file__, 1, "> authorization: %s", (TOKEN,), None
+    )
+    scrub.filter(again)
+    assert TOKEN not in str(again.args)
+    assert "<key>" in str(again.args)
 
 
 async def test_no_setup_complete_means_no_usable_session() -> None:

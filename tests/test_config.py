@@ -190,6 +190,128 @@ def test_voice_on_needs_its_own_model_under_the_offline_preset_too() -> None:
         make_settings(provider="ollama", voice_enabled=True, gemini_api_key="k")
 
 
+def _voice_settings(**kwargs: Any) -> Settings:
+    kwargs.setdefault("gemini_live_model", "gemini-3.1-flash-live-preview")
+    return make_settings(
+        provider="anthropic",
+        anthropic_api_key="k",
+        anthropic_model="claude-x",
+        voice_enabled=True,
+        gemini_api_key="k",
+        **kwargs,
+    )
+
+
+def test_the_api_key_transport_is_the_default_and_asks_for_nothing_new() -> None:
+    """A self-hoster with a key and no GCP project must keep working untouched: the
+    Vertex endpoint is faster for one model family but has no newer generation, so
+    it is an axis and not a migration."""
+    settings = _voice_settings()
+    assert settings.gemini_live_transport == "api_key"
+    assert settings.voice_session_problems() == []
+    # A default even though it is unused here, because the URI is built from it and
+    # an empty region is a handshake 404 rather than a setting that failed.
+    assert settings.vertex_location == "us-central1"
+
+
+def test_the_vertex_transport_needs_a_project_before_it_needs_a_handshake() -> None:
+    """The project is half the URI. Left empty it fails mid-sentence at the first
+    voice turn, which is the late failure config.py exists to move earlier."""
+    with pytest.raises(ConfigError, match="DAEMON_VERTEX_PROJECT is empty"):
+        _voice_settings(gemini_live_transport="vertex")
+
+    with pytest.raises(ConfigError, match="DAEMON_VERTEX_LOCATION is empty"):
+        _voice_settings(
+            gemini_live_transport="vertex", vertex_project="p", vertex_location=""
+        )
+
+    ok = _voice_settings(
+        gemini_live_transport="vertex",
+        vertex_project="p",
+        gemini_live_model="gemini-live-2.5-flash-native-audio",
+    )
+    assert ok.voice_session_problems() == []
+
+
+def test_an_unknown_transport_is_named_rather_than_dialled() -> None:
+    with pytest.raises(ConfigError, match="DAEMON_GEMINI_LIVE_TRANSPORT is 'vertexai'"):
+        _voice_settings(gemini_live_transport="vertexai")
+
+
+def test_the_transport_is_not_checked_when_voice_runs_on_openai() -> None:
+    """`gemini_live_transport` keeps its default under DAEMON_VOICE_PROVIDER=openai,
+    and validating it there would fail a configuration nothing reads."""
+    settings = make_settings(
+        provider="anthropic",
+        anthropic_api_key="k",
+        anthropic_model="claude-x",
+        voice_enabled=True,
+        voice_provider="openai",
+        openai_api_key="k",
+        openai_realtime_model="gpt-realtime",
+        gemini_live_transport="nonsense",
+    )
+    assert settings.voice_session_problems() == []
+
+
+def test_a_route_override_to_gemini_is_still_checked() -> None:
+    """The axis is not the last word on which provider answers a voice turn.
+
+    `route_overrides` is folded over it (`Settings.routing`), so chat_voice can
+    resolve to gemini while DAEMON_VOICE_PROVIDER says openai - and `run_voice`
+    builds a Gemini session for whatever the route resolves to. Reading the axis
+    here left that combination unvalidated, and the missing project then arrived as
+    a ValueError raised inside the reconnect loop instead of a setting that failed
+    to load.
+    """
+    common = dict(
+        provider="anthropic",
+        anthropic_api_key="k",
+        anthropic_model="claude-x",
+        voice_enabled=True,
+        voice_provider="openai",
+        openai_api_key="k",
+        openai_realtime_model="gpt-realtime",
+        gemini_api_key="k",
+        gemini_live_model="gemini-live-2.5-flash-native-audio",
+        route_overrides={Task.CHAT_VOICE.value: "gemini"},
+    )
+    with pytest.raises(ConfigError, match="DAEMON_VERTEX_PROJECT is empty"):
+        make_settings(**common, gemini_live_transport="vertex")
+
+    ok = make_settings(**common, gemini_live_transport="vertex", vertex_project="p")
+    assert ok.voice_session_problems() == []
+
+
+def test_a_vertex_only_model_on_the_api_key_transport_is_refused() -> None:
+    """The two endpoints carry different catalogues, and the admin console puts the
+    mismatch two clicks apart: switching to vertex rewrites the model id, switching
+    back leaves it. Without this the config loads, `daemon doctor` says ok, and the
+    first voice turn closes 1008 naming a model nobody thought they had chosen.
+
+    Only this direction is refused. `VERTEX_LIVE_MODELS` goes stale the day Google
+    ships another Vertex live model, so refusing an *unknown* id would be worse than
+    the close code - `daemon doctor` reports that half instead.
+    """
+    with pytest.raises(ConfigError, match="only the vertex transport serves"):
+        _voice_settings(gemini_live_model="gemini-live-2.5-flash-native-audio")
+
+    vertex_ok = _voice_settings(
+        gemini_live_model="gemini-live-2.5-flash-native-audio",
+        gemini_live_transport="vertex",
+        vertex_project="p",
+    )
+    assert vertex_ok.voice_session_problems() == []
+
+    # An id this constant has never heard of stays loadable on either transport.
+    unknown = _voice_settings(
+        gemini_live_model="gemini-live-9.9-flash-native-audio",
+        gemini_live_transport="vertex",
+        vertex_project="p",
+    )
+    assert unknown.voice_session_problems() == []
+
+
 def test_providers_for_asks_for_the_voice_key_under_the_offline_preset() -> None:
     assert providers_for(
         provider="ollama", proactive_judge_local=True, voice_enabled=True, voice_provider="gemini"

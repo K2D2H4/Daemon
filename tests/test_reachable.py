@@ -473,6 +473,34 @@ def test_every_declared_module_gap_names_a_real_module() -> None:
         assert (DAEMON / f"{name}.py").exists(), f"daemon/{name}.py does not exist"
 
 
+def test_the_vertex_transport_is_reachable_from_the_assembled_app() -> None:
+    """The blind spot this file's header describes, in its newest form: the Vertex
+    endpoint is three *arguments* to a class `app.py` already builds - `url`, `auth`
+    and a model path - so `daemon/voice/vertex.py` could be complete, unit-tested
+    and dialled by nobody with every other assertion here green. The setting would
+    then be a select in the admin console that changes which endpoint a comment
+    describes.
+    """
+    seams = ("ws_url", "model_path", "auth_headers")
+    callers = {
+        seam: sorted(
+            path.name
+            for path, text in _sources()
+            if path.name != "vertex.py" and f"vertex.{seam}" in text
+        )
+        for seam in seams
+    }
+    unreached = [seam for seam, files in callers.items() if not files]
+    assert not unreached, (
+        f"daemon/voice/vertex.py defines {unreached} and nothing under daemon/ calls "
+        "them - the transport cannot be selected, whatever the config says"
+    )
+    assert "app.py" in callers["ws_url"], (
+        "the transport is chosen somewhere other than app.py, which is the only "
+        "file allowed to pick an implementation (CONTRACTS rule 4)"
+    )
+
+
 def test_every_declared_wiring_gap_names_a_real_seam() -> None:
     """A gap declared against a name nothing defines is a gap that cannot close,
     and it would sit here reading as work someone still owes."""

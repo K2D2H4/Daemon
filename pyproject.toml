@@ -56,6 +56,12 @@ voice = [
     # text-only install does not need PortAudio.
     "websockets>=14.0",
     "sounddevice>=0.5",
+    # DAEMON_GEMINI_LIVE_TRANSPORT=vertex only, and imported lazily inside
+    # daemon/voice/vertex.py so the API-key transport never loads it. That endpoint
+    # authenticates with a bearer token rather than a key (ADR 0020); the
+    # alternative was signing service-account JWTs here, which trades this
+    # dependency for an RSA one.
+    "google-auth>=2.0",
     # screen-share only — resize + perceptual-hash dedup; capture itself is
     # dependency-free.
     "Pillow>=10.0",

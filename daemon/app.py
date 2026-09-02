@@ -2373,7 +2373,8 @@ async def run_voice(
     from daemon.memory.reindex import reindex
     from daemon.memory.store import Store
     from daemon.memory.writer import FileMemoryWriter
-    from daemon.voice.gemini_live import GeminiLiveError, GeminiLiveSession
+    from daemon.voice import vertex
+    from daemon.voice.gemini_live import WS_URL, GeminiLiveError, GeminiLiveSession
     from daemon.voice.openai_realtime import OpenAIRealtimeError, OpenAIRealtimeSession
 
     if not settings.voice_enabled:
@@ -2392,6 +2393,20 @@ async def run_voice(
     # route_for raises with the specific reason - voice disabled, no live model
     # id - which is more use than anything this function could say about it.
     route = settings.route_for(Task.CHAT_VOICE)
+
+    # One provider for the whole voice mode, not one per session: it caches the
+    # credential and refreshes it as it expires, and a fresh provider per reconnect
+    # would fetch a new token for every attempt.
+    #
+    # Built from the *resolved* route rather than `voice_provider`, and the session
+    # below branches on this object rather than re-reading the setting: two
+    # conditions for one decision is how a `route_overrides` entry pointing
+    # chat_voice at gemini got a Vertex URI with no credential behind it.
+    vertex_auth = (
+        vertex.auth_headers(settings.vertex_credentials_path)
+        if route.provider == "gemini" and settings.gemini_live_transport == "vertex"
+        else None
+    )
 
     harden_existing(settings.data_dir)
     # `shared` is the resident's boot-once voice runtime (VoiceRuntime): store,
@@ -2544,9 +2559,24 @@ async def run_voice(
                     tools=tool_specs,
                     voice_name=settings.openai_realtime_voice,
                 )
+            # The Vertex transport, when it is the one configured: a regional URI,
+            # a bearer-token provider called per connect attempt, and the model
+            # named as a project resource. Everything below is identical either
+            # way - the protocol does not change with the endpoint
+            # (daemon/voice/vertex.py, docs/design/vertex-live-transport.md).
+            url = WS_URL
+            auth = vertex_auth
+            model = route.model
+            if auth is not None:
+                url = vertex.ws_url(settings.vertex_location)
+                model = vertex.model_path(
+                    settings.vertex_project, settings.vertex_location, route.model
+                )
             return GeminiLiveSession(
                 api_key=settings.gemini_api_key,
-                model=route.model,
+                model=model,
+                url=url,
+                auth=auth,
                 # The persona, plus the tool contract when tools are on offer. Without
                 # the persona the model answers as a generic assistant, which is the
                 # one voice PLAN 5 says this product must not have.

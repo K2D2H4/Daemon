@@ -27,12 +27,15 @@ from typing import Any
 
 from daemon.admin.google_accounts import authenticated_accounts
 from daemon.config import (
+    GEMINI_LIVE_TRANSPORTS,
     GEMINI_LIVE_VOICES,
     HOSTED_PROVIDERS,
     MODEL_SUGGESTIONS,
     OLLAMA,
     OPENAI_REALTIME_VOICES,
     SENSITIVITIES,
+    VERTEX_LIVE_LOCATIONS,
+    VERTEX_LIVE_MODELS,
     VOICE_PROVIDERS,
     Settings,
 )
@@ -59,6 +62,17 @@ STR_FIELDS: dict[str, str] = {
     # The realtime endpoint does not take the text endpoint's id (config.py), which
     # is why voice has its own.
     "gemini_live_model": "DAEMON_GEMINI_LIVE_MODEL",
+    # Which endpoint serves that model. Web-configurable because the two endpoints
+    # carry *different model catalogues* - the fast native-audio id is Vertex-only,
+    # the newer generation is API-key-only - so choosing a live model and choosing a
+    # transport are one decision, and leaving half of it in a text editor would mean
+    # picking a model this page cannot reach (docs/design/vertex-live-transport.md).
+    "gemini_live_transport": "DAEMON_GEMINI_LIVE_TRANSPORT",
+    "vertex_project": "DAEMON_VERTEX_PROJECT",
+    "vertex_location": "DAEMON_VERTEX_LOCATION",
+    # A path, not a secret: the file it names is the credential, and this only says
+    # where to look. Empty means Application Default Credentials.
+    "vertex_credentials_path": "GOOGLE_APPLICATION_CREDENTIALS",
     "openai_compatible_model": "DAEMON_OPENAI_COMPATIBLE_MODEL",
     # The endpoint belongs beside the model for the same reason the model ids do:
     # a page that lets you choose `openai_compatible` without letting you name its
@@ -206,6 +220,14 @@ def current_settings_payload(settings: Settings, env_path: Path | None = None) -
             "model_suggestions": {k: list(v) for k, v in MODEL_SUGGESTIONS.items()},
             "tool_modes": list(TOOL_MODES),
             "gemini_live_voices": ["", *sorted(GEMINI_LIVE_VOICES)],
+            "gemini_live_transports": list(GEMINI_LIVE_TRANSPORTS),
+            # What each transport can actually serve. The API-key list is probed
+            # live in routes.py (`model_lists`); Vertex's cannot be, because that
+            # probe authenticates with an API key and the Vertex catalogue is not
+            # visible to one - so its ids are named, as measured across every
+            # region that serves them.
+            "vertex_live_models": list(VERTEX_LIVE_MODELS),
+            "vertex_locations": list(VERTEX_LIVE_LOCATIONS),
             "voice_providers": list(VOICE_PROVIDERS),
             "openai_realtime_voices": ["", *sorted(OPENAI_REALTIME_VOICES)],
             # Empty is a real choice - "leave it to the server" (config.py).

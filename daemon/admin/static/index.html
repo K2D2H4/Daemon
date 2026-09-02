@@ -1410,7 +1410,7 @@ function fieldToggle(name,running){
 // replaceable #voice-field, so changing the provider re-renders the whole block at
 // once (display:contents keeps its children as direct .grid2 items, same as before
 // this wrapper existed).
-function voiceField(provider,e,o){
+function voiceField(provider,e,o,chosenTransport){
   const isO=provider==='openai';
   const modelName=isO?'openai_realtime_model':'gemini_live_model';
   const name=isO?'openai_realtime_voice':'gemini_live_voice';
@@ -1419,7 +1419,35 @@ function voiceField(provider,e,o){
   const os=opts.map(x=>`<option ${x===v?'selected':''}>${esc(x)}</option>`).join('');
   const sens=isO?'':fieldStr('voice_start_sensitivity',e.voice_start_sensitivity,o.sensitivities)
     +fieldStr('voice_end_sensitivity',e.voice_end_sensitivity,o.sensitivities);
-  return `<div id="voice-field" style="display:contents">${fieldStr(modelName,e[modelName])}<div class="field">${nameCell(name)}<select data-f="${name}">${os}</select>
+  // Gemini only: which endpoint serves the session, and - when that is Vertex -
+  // where. The two endpoints carry different model catalogues, so the transport
+  // select sits *above* the model field and re-renders it: on `vertex` the model
+  // is a list (the server names what that endpoint serves, since an API key cannot
+  // probe it), on `api_key` it stays free text as before. Same principle as the
+  // provider selects: every control shown is a control currently in force, so the
+  // project/region/credentials fields appear only under the transport that reads
+  // them (docs/design/vertex-live-transport.md).
+  // `chosenTransport` is what the user just picked, which `val()` cannot see: it
+  // reads the running value and the pending-restart value, never the live form.
+  // Omitting it (the first render, and a provider switch) falls back to those.
+  const transport=isO?'':(chosenTransport??val('gemini_live_transport',e.gemini_live_transport));
+  const tOpts=(o.gemini_live_transports||[]).map(
+    x=>`<option ${x===transport?'selected':''}>${esc(x)}</option>`).join('');
+  const head=isO?'':`<label class="field">${nameCell('gemini_live_transport')}<select data-f="gemini_live_transport">${tOpts}</select></label>`;
+  // No `||['']` fallback: an empty catalogue there would render one blank option,
+  // read as an edit, and save DAEMON_GEMINI_LIVE_MODEL= - refused by the validator
+  // with a message about an empty model rather than about an empty list. Free text
+  // is the honest degradation, and it is what the other transport uses anyway.
+  const vertexModels=(!isO&&transport==='vertex')?(o.vertex_live_models||[]):[];
+  const model=vertexModels.length
+    ? fieldStr(modelName,e[modelName],vertexModels)
+    : fieldStr(modelName,e[modelName]);
+  const vertexFields=(!isO&&transport==='vertex')
+    ? fieldStr('vertex_project',e.vertex_project)
+      +fieldStr('vertex_location',e.vertex_location,o.vertex_locations)
+      +fieldStr('vertex_credentials_path',e.vertex_credentials_path)
+    : '';
+  return `<div id="voice-field" style="display:contents">${head}${model}${vertexFields}<div class="field">${nameCell(name)}<select data-f="${name}">${os}</select>
     <div class="voice-preview"><button type="button" class="btn" id="voice-play">▶ preview</button>
     <span class="cap" id="voice-preview-msg"></span><audio id="voice-sample" preload="none"></audio></div></div>${sens}</div>`;
 }
@@ -1594,6 +1622,20 @@ $('#settings-form').addEventListener('change',ev=>{
   if(ev.target.dataset && ev.target.dataset.f==='voice_provider'){
     const vf=$('#voice-field');
     if(vf){vf.outerHTML=voiceField(ev.target.value,SETTINGS.editable,SETTINGS.options);updateDirty();}
+  }
+  // Switching transport changes which model ids are reachable, so the whole
+  // Gemini block is redrawn - the same surgery the provider select does, one
+  // level down. The picked value is passed in, because `val()` cannot see it: it
+  // reads the running value and the pending-restart one, never the form. Without
+  // that argument the select would snap back to the saved transport on every
+  // change.
+  if(ev.target.dataset && ev.target.dataset.f==='gemini_live_transport'){
+    const vf=$('#voice-field');
+    const prov=$('[data-f="voice_provider"]');
+    if(vf){
+      vf.outerHTML=voiceField(prov?prov.value:'gemini',SETTINGS.editable,SETTINGS.options,ev.target.value);
+      updateDirty();
+    }
   }
   if(ev.target.dataset && ev.target.dataset.brain==='provider'){
     const bf=$('#brain-field');
