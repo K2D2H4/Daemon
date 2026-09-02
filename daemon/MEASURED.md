@@ -1022,3 +1022,30 @@ that is already here. Orientation: [CLAUDE.md](CLAUDE.md).
 
   **The tell, for next time: a latency number without an endpoint and a region is not a
   measurement.** Both arms were "gemini 2.5 native audio" by name. ADR 0020.
+
+- **A spike that does not run the loop cannot see a loop bug, and that is how a mute
+  voice mode shipped.** `evals/vertex_live_spike.py` opened a bare session - no
+  tools, one text turn - got audio, and passed; v0.1.79 went out on it. The owner
+  said the wake word and heard nothing. The session was never the problem: measured
+  2026-09-02 through `VoiceConversation` itself, first audio on
+  `gemini-live-2.5-flash-native-audio` (Vertex) arrives at **2.5-4.4s** against
+  ~1.7s on `gemini-3.1-flash-live-preview`, and turn boundaries arrive inside that
+  gap - 1 of them in 4 of 6 runs. `EMPTY_TURNS_ALLOWED = 1` reads two in a row as a
+  finished session, so on the slower endpoint the loop ended the conversation at ~4s
+  having said nothing. `ANSWER_PATIENCE_SECONDS` is the fix: while something is
+  outstanding - the opening, a finalised user utterance, a tool response - boundaries
+  are a race rather than a verdict.
+
+  Two things this cost, both worth keeping:
+
+  **The direct-session probes all passed, 30/30 across 0-70 declared tools, and they
+  were measuring the wrong layer.** Two of my own probes also *reproduced* silence
+  that I had caused: one never answered the blocking tool call the model made, and
+  another opened the session twice (`VoiceConversation.run` opens it itself), which
+  added a second handshake and pushed first audio past the window. Both looked like
+  the endpoint failing.
+
+  **The tell, for next time: when a session works and the product does not, the
+  layer in between is the suspect, not the endpoint.** `evals/vertex_live_spike.py`
+  now drives the real loop with a microphone that hears nothing, and fails when
+  nothing is spoken.

@@ -102,6 +102,27 @@ One, because one is expected: a turn that ends on `generationComplete` leaves th
 `receive()` is returning without ever awaiting anything, and looping on that would
 spin the event loop hard enough that even the idle timeout could not fire."""
 
+ANSWER_PATIENCE_SECONDS = 10.0
+"""How long turn boundaries may keep arriving *while an answer is outstanding*
+before the session is treated as over.
+
+Two empty turns in a row mean a finished session - `EMPTY_TURNS_ALLOWED` explains
+why - and that is true right up until something has been asked and not yet
+answered. Then the same two boundaries are a race: measured 2026-09-02 through this
+loop, first audio arrives at 3.8-4.3s on `gemini-live-2.5-flash-native-audio`
+(Vertex) against ~1.7s on `gemini-3.1-flash-live-preview`, and a tool round pushed
+one run to 5.9s. On the slower endpoint the boundaries won, the conversation ended
+itself at 4s having said nothing, and the owner heard a wake word do nothing.
+
+Ten seconds, from whenever the outstanding thing was sent. Bounded on purpose: a
+session that will never answer still ends here rather than waiting out
+`IDLE_TIMEOUT_SECONDS`, and a session nobody has asked anything of does not wait at
+all."""
+
+EMPTY_TURN_PAUSE_SECONDS = 0.2
+"""Breathing room between turn boundaries while waiting for that first answer, so
+the wait cannot become the busy loop `EMPTY_TURNS_ALLOWED` warns about."""
+
 PREFETCH_MIN_CHARS = 4
 """Below this a query is mostly noise, and one embedder call per syllable buys
 nothing."""
@@ -506,6 +527,12 @@ class VoiceConversation:
         moment the request is fully made and the answer is not yet on its way."""
 
         self._answering_tool = False
+        self._awaiting_since: float | None = None
+        """When the last thing that deserves an answer was sent - the opening, a
+        finalised user utterance, or a tool response. Cleared by the first audio that
+        answers it. Read only by `_awaiting_answer`, which is what stops two turn
+        boundaries from being mistaken for a finished session while the endpoint is
+        still working."""
         """Whether a tool call is between "the model asked" and "the model spoke".
 
         The blind spot `_generating` alone had: a blocking tool call arrives before
@@ -665,6 +692,17 @@ class VoiceConversation:
             if self._screen_share is not None:
                 await self._screen_share.stop_and_unbind()
 
+    def _awaiting_answer(self, loop: asyncio.AbstractEventLoop) -> bool:
+        """Is an answer outstanding, and recently enough to keep waiting for?
+
+        False when nothing has been asked, which is the case
+        `test_a_session_that_stops_producing_turns_is_not_looped_on` pins: a session
+        that produces nothing and was asked nothing gets the old fast verdict.
+        """
+        if self._awaiting_since is None:
+            return False
+        return loop.time() - self._awaiting_since < ANSWER_PATIENCE_SECONDS
+
     async def _send_opening(self, session: VoiceSession) -> None:
         """Hand over what was already said, if anything was.
 
@@ -680,6 +718,7 @@ class VoiceConversation:
                 await session.send_text(self._opening_text)
                 loop = asyncio.get_running_loop()
                 self._answer_hold_until = loop.time() + ANSWER_HOLD_SECONDS
+                self._awaiting_since = loop.time()
         except Exception:
             logger.exception("voice: could not hand over the utterance that opened the session")
 
@@ -756,6 +795,7 @@ class VoiceConversation:
         it is spent on nothing.
         """
         empty = 0
+        loop = asyncio.get_running_loop()
         try:
             async with asyncio.timeout(self._idle_timeout) as budget:
                 while self.ended is None:
@@ -764,6 +804,17 @@ class VoiceConversation:
                         continue
                     empty += 1
                     if empty > EMPTY_TURNS_ALLOWED and self.ended is None:
+                        # Something was asked and has not been answered yet, so these
+                        # boundaries are a race rather than a verdict - see
+                        # ANSWER_PATIENCE_SECONDS. The pause is what makes waiting
+                        # safe: the failure EMPTY_TURNS_ALLOWED documents is a loop
+                        # spinning on a `receive()` that never awaits, hard enough
+                        # that the idle timeout cannot fire, and 200 ms per boundary
+                        # bounds that to nothing while `budget` stays free to end a
+                        # session that really is dead.
+                        if self._awaiting_answer(loop):
+                            await asyncio.sleep(EMPTY_TURN_PAUSE_SECONDS)
+                            continue
                         self.ended = "the session stopped producing turns"
                         logger.info("voice: %s", self.ended)
         except TimeoutError:
@@ -790,6 +841,9 @@ class VoiceConversation:
                 produced = True
                 if isinstance(item, bytes):
                     self._generating = True
+                    # Answered. Anything after this is the ordinary empty-turn rule's
+                    # business again.
+                    self._awaiting_since = None
                     at = loop.time()
                     self._on_audio(at, len(item))
                     if self._speech is not None:
@@ -1004,6 +1058,9 @@ class VoiceConversation:
         # also the signal that this turn's audio is done.
         self._generating = False
         if transcript.role == "user":
+            # The owner has finished saying something, so an answer is owed from here
+            # (`_awaiting_answer`).
+            self._awaiting_since = asyncio.get_running_loop().time()
             # Whether the answer to this turn is already being heard. Read once and
             # used twice: it decides the hold immediately below for one reason and
             # the face publisher under it for another, and they must agree - both are
@@ -1406,6 +1463,9 @@ class VoiceConversation:
         # entered the prompt at all. So the call is unblocked first and the image
         # follows as its own turn, which is also the turn that carries its framing.
         await session.send_tool_response(_caption_only(outcome.results))
+        # The answer to a tool round arrives in a later turn, with boundaries in
+        # between (ANSWER_PATIENCE_SECONDS).
+        self._awaiting_since = asyncio.get_running_loop().time()
         await self._deliver_images(session, outcome.results)
 
     async def _deliver_images(
