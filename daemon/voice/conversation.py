@@ -634,6 +634,15 @@ class VoiceConversation:
                 # the first thing the model hears rather than racing live audio for
                 # its place in the turn.
                 await self._send_opening(session)
+                # A device that can say when its speaker has actually fallen silent
+                # (daemon/voice/apple_audio.py `on_playback_idle`) is asked to. The
+                # half-duplex gate otherwise runs on `_playback_until`, an estimate
+                # from bytes that outran the real speaker by 1.5-3.0 s a turn and ate
+                # the head of every reply the owner began as soon as the daemon
+                # stopped talking (measured 2026-09-02). Duck-typed: the protocol in
+                # base.py is frozen and a device without the hook keeps the estimate.
+                if hasattr(self._audio, "on_playback_idle"):
+                    self._audio.on_playback_idle = self._speaker_ran_dry
                 microphone = self._audio.record()
                 # The microphone keeps feeding the session while the model talks. It
                 # has to: server-side activity detection is what notices a barge-in,
@@ -686,6 +695,11 @@ class VoiceConversation:
                     with contextlib.suppress(asyncio.CancelledError):
                         await asyncio.shield(self._record_pending(session))
         finally:
+            # `==`, not `is`: a bound method is a fresh object on every attribute
+            # access, so an identity check here is always False and the hook would
+            # outlive the conversation - which is the thing this line exists to stop.
+            if getattr(self._audio, "on_playback_idle", None) == self._speaker_ran_dry:
+                self._audio.on_playback_idle = None  # the device outlives this conversation
             # A share must never outlive its session: reached on every exit path,
             # including cancellation and a session that never finished opening (in
             # which case `bind` never ran and this is a no-op).
@@ -972,6 +986,23 @@ class VoiceConversation:
             # is already reporting which. Logged rather than raised so this task
             # dying does not replace the error the caller needs to see.
             logger.exception("voice: stopped feeding the session")
+
+    def _speaker_ran_dry(self) -> None:
+        """The engine says the last buffer has been played back: clamp the estimate.
+
+        Only the estimate moves *earlier*, never later, and only while nothing more
+        is arriving: a gap between two chunks of one answer also empties the speaker
+        for a moment, and reopening the microphone into that gap is the echo leak
+        the gate exists to stop. Once the answer has fully arrived (`_generating`
+        cleared) an empty speaker means what it says - the daemon is done talking
+        and the room is the owner's again, however many bytes the arithmetic still
+        had on the clock.
+        """
+        if self._generating:
+            return
+        now = asyncio.get_running_loop().time()
+        if self._playback_until > now:
+            self._playback_until = now
 
     def _on_audio(self, at: float, size: int) -> None:
         """Note one chunk on its way to the speaker, and when it will finish playing.

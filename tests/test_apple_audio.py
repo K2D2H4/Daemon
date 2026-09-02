@@ -186,6 +186,9 @@ class FakeNode:
         self.removed_taps = 0
         self.playing = False
         self.scheduled: list[FakeBuffer] = []
+        self.completions: list[tuple[int, Any]] = []
+        """(callback type, handler) per buffer scheduled with a completion, so a test
+        can be the engine and report them played back."""
         self.stops = 0
 
     # input node
@@ -235,6 +238,15 @@ class FakeNode:
     def scheduleBuffer_completionHandler_(self, buffer: FakeBuffer, handler: Any) -> None:  # noqa: N802
         assert self.playing, "a buffer was scheduled on a player that is not playing"
         self.scheduled.append(buffer)
+
+    def scheduleBuffer_completionCallbackType_completionHandler_(  # noqa: N802
+        self, buffer: FakeBuffer, kind: int, handler: Any
+    ) -> None:
+        """The variant the product uses now: the engine reports when a buffer has
+        been *played back*. The handler is kept so a test can play the engine."""
+        assert self.playing, "a buffer was scheduled on a player that is not playing"
+        self.scheduled.append(buffer)
+        self.completions.append((kind, handler))
 
 
 class FakeEngine:
@@ -297,6 +309,9 @@ class FakeAVFoundation:
 
     AVAudioPCMFormatFloat32 = 1
     AVAudioPCMFormatInt16 = 2
+    AVAudioPlayerNodeCompletionDataConsumed = 0
+    AVAudioPlayerNodeCompletionDataRendered = 1
+    AVAudioPlayerNodeCompletionDataPlayedBack = 2
 
     def __init__(self) -> None:
         self.refuse_voice_processing = False
@@ -581,6 +596,85 @@ async def test_a_missing_converter_is_reported_not_ignored(
 
     with pytest.raises(AudioUnavailable, match="will not convert"):
         await anext(audio.record())  # type: ignore[arg-type]
+
+
+# --- the speaker reports when it has actually fallen silent -------------------
+
+
+def _player(framework: FakeAVFoundation) -> FakeNode:
+    """The one attached node that had buffers scheduled with a completion."""
+    nodes = [n for n in framework.engines[-1].attached if n.completions]
+    assert len(nodes) == 1, "expected exactly one node to have scheduled completions"
+    return nodes[0]
+
+
+async def test_the_last_buffer_played_back_is_what_fires_the_idle_hook(
+    audio: VoiceProcessingAudio, framework: FakeAVFoundation
+) -> None:
+    """`play` returns when a buffer is *handed over*; the only estimate of when the
+    speaker falls silent used to be bytes / sample rate. Measured 2026-09-02, that
+    estimate outran the real speaker by 1.5-3.0 s a turn and the half-duplex gate
+    ate the head of every reply the owner began the moment the daemon stopped
+    talking. The engine knows the truth - `DataPlayedBack` - so it is asked, and
+    only the *last* buffer of an answer counts as the speaker going quiet."""
+    fired: list[int] = []
+    audio.on_playback_idle = lambda: fired.append(1)
+
+    await audio.play(b"\x01\x02")
+    await audio.play(b"\x03\x04")
+    player = _player(framework)
+    kinds = {kind for kind, _ in player.completions}
+    assert kinds == {framework.AVAudioPlayerNodeCompletionDataPlayedBack}, (
+        "scheduled with the wrong callback type - consumed/rendered fire before the "
+        "listener has heard the end"
+    )
+
+    first, second = (handler for _, handler in player.completions)
+    first()  # engine thread says: buffer one played back
+    await asyncio.sleep(0)  # the hop to the loop
+    assert fired == [], "the hook fired with a buffer still to play"
+
+    second()
+    await asyncio.sleep(0)
+    assert fired == [1], "the last buffer played back and nobody was told"
+
+
+async def test_a_stop_discards_pending_completions_rather_than_counting_them(
+    audio: VoiceProcessingAudio, framework: FakeAVFoundation
+) -> None:
+    """A barge-in stops the player and throws its queue away. A completion for one
+    of those discarded buffers must not be counted against the answer that comes
+    next - it would report *that* speaker silent while it was still talking, which
+    is the echo leak the gate exists to prevent."""
+    fired: list[int] = []
+    audio.on_playback_idle = lambda: fired.append(1)
+
+    await audio.play(b"\x01\x02")
+    stale = _player(framework).completions[0][1]
+    await audio.stop_playback()
+
+    await audio.play(b"\x05\x06")  # the next answer: one buffer pending
+    stale()  # the discarded buffer reports in late
+    await asyncio.sleep(0)
+    assert fired == [], "a discarded buffer's completion was counted against the next answer"
+
+    fresh = _player(framework).completions[-1][1]
+    fresh()
+    await asyncio.sleep(0)
+    assert fired == [1]
+
+
+async def test_a_raising_idle_hook_does_not_take_the_engine_thread_with_it(
+    audio: VoiceProcessingAudio, framework: FakeAVFoundation
+) -> None:
+    def explode() -> None:
+        raise RuntimeError("the conversation is gone")
+
+    audio.on_playback_idle = explode
+    await audio.play(b"\x01\x02")
+    handler = _player(framework).completions[0][1]
+    handler()
+    await asyncio.sleep(0)  # logged, not raised - the render path may not raise
 
 
 # --- voice processing being refused must be visible --------------------------
