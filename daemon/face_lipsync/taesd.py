@@ -35,6 +35,32 @@ segment - matching "key" as a substring rewrites unrelated paths. The measuremen
 was throwaway; it needs the spike's vendored `mlxsd/` and its 334MB `sd-vae` weights,
 neither of which is in this repo.
 
+**The other place to run it is closed too.** The GPU is shared with the UNet, so the
+obvious escape was the Neural Engine: convert the sd-vae decoder to CoreML, run it on
+the ANE *concurrently* with the MLX UNet, and hide its cost behind the UNet's 71.86ms
+per pair. Measured 2026-09-01 on this M4 Max (coremltools 9.0, fp16 mlprogram, the
+`torch.export` frontend - `torch.jit.trace` fails on diffusers' tensor-valued
+`height*width`; warm-up 10, 50 timed runs, `(2, 4, 32, 32)` in, `(2, 3, 256, 256)` out):
+
+    CPU_AND_NE   median  98.46ms/pair   p95 102.12   (re-runs 95.70, 94.76)
+    CPU_AND_GPU  median 180.84ms/pair   p95 307.73
+    CPU_ONLY     median 235.07ms/pair   p95 294.61
+
+The ANE genuinely ran - `MLComputePlan` placed 404 of 404 ops on it, and the timing is
+2.4x off CPU_ONLY, so no silent fallback - and the overlap holds: under a GPU load shaped
+like the UNet's duty cycle its latency did not move (96.07 / p95 97.08). Numerics are fine
+(mean abs error 0.003, worst pixel 7/255, PSNR 47dB against fp32). **It is simply too
+slow: ~96ms per pair against the ~72ms it had to hide behind**, so the pipeline would
+run at max(72, 96) = 48ms/frame, 20.8fps, over the 41.67ms budget by 15%. None of the
+cheap levers move it more than 3%: a newer opset (fused SDPA) 94.80, fp16 I/O 95.36, a
+batch-1 model exactly half (48.15 - compute-bound, not per-call overhead), two concurrent
+requests 81.4 effective with unfair latency. Closing a 33% gap is a different decoder
+(an ANE-shaped layout, or a smaller network), not a tuning of this one. The machine was
+busy during the runs (the resident with MLX loaded, and renders), which taints the
+CPU and GPU rows - the ANE row was stable to +-2ms over five runs and nothing else on
+the machine uses the ANE, so it is the one to trust. The spike's scripts (`convert2.py`,
+`bench.py`, `compute_plan.py`, `ane_under_gpu.py`) were throwaway, like the MLX one.
+
 The detail gap is what `render.restore_detail` was meant to pay back - though see its own
 docstring for how little of that it is measured to actually do.
 
