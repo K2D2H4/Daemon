@@ -234,6 +234,29 @@ async def test_tool_rules_carry_the_google_account_when_one_is_authenticated(
     assert "owner@gmail.com" in rules
 
 
+async def test_the_voice_surface_gets_the_same_tool_rules_and_the_account(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_voice` used to prepend the bare `TOOL_CONTRACT` constant, so the voice
+    model was offered Google tools and told nothing about the account. On the owner's
+    2026-09-02 14:51 session it passed the literal `$OWNER_EMAIL` as
+    `user_google_email` and failed 11 of 18 tool calls, retrying the same search seven
+    times. The method the text path uses carries the hint; voice has to call it too.
+    """
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    (creds / "owner@gmail.com.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("WORKSPACE_MCP_CREDENTIALS_DIR", str(creds))
+    companion = Companion(
+        FakeMemory(), data_dir=data_dir, tools=FakeTools("google__list_calendars")
+    )
+
+    rules = companion.tool_rules(origin="owner", surface="voice")
+
+    assert rules.startswith(TOOL_CONTRACT)
+    assert "owner@gmail.com" in rules, "voice was handed the contract without the account"
+
+
 async def test_a_non_owner_turn_never_carries_the_google_account(
     data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

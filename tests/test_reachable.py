@@ -501,6 +501,24 @@ def test_the_vertex_transport_is_reachable_from_the_assembled_app() -> None:
     )
 
 
+def test_the_voice_path_reads_its_tool_rules_through_the_companion() -> None:
+    """A unit test on `Companion.tool_rules` cannot see this: `run_voice` had the
+    bare `TOOL_CONTRACT` constant in its system instruction, so the voice model was
+    offered Google tools with no account hint and spent 11 of 18 tool calls on an
+    invented `user_google_email` (2026-09-02). Text used the method; voice used the
+    constant; both passed every test. The constant's only legitimate reader outside
+    companion.py is a test."""
+    app = (DAEMON / "app.py").read_text(encoding="utf-8")
+    assert "companion.tool_rules(" in app, "run_voice no longer asks the Companion for its rules"
+    # The *import* is the tell, not a mention: comments may name the constant to
+    # explain its history, but code that can reach it can put it back in the prompt.
+    imports = [line for line in app.splitlines() if line.startswith("from daemon.companion import")]
+    assert imports and not any("TOOL_CONTRACT" in line for line in imports), (
+        "app.py imports TOOL_CONTRACT - the voice path is one edit from the bare "
+        "constant again, which is how it lost the Google account hint"
+    )
+
+
 def test_every_declared_wiring_gap_names_a_real_seam() -> None:
     """A gap declared against a name nothing defines is a gap that cannot close,
     and it would sit here reading as work someone still owes."""
