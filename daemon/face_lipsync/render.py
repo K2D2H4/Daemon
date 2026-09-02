@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from daemon.face_lipsync import Cache, LipsyncEngine, composite
-from daemon.face_lipsync.audio import CONTEXT_MS, latest_audio_ms
+from daemon.face_lipsync.audio import CONTEXT_MS, MS_PER_INDEX, WINDOW, latest_audio_ms
 from daemon.face_lipsync.ring import PcmRing
 
 logger = logging.getLogger(__name__)
@@ -355,6 +355,71 @@ RELEASE_FRAMES = 10
 417ms at 24fps. Ranked by the owner against 0 and 5 on a 2.4x side-by-side of the
 falling edge; 10 was "제일 자연스럽네". See `Renderer.release`."""
 
+MOTION_FILTER = "euro"
+"""Which filter `_blend` runs the mouth through: `"euro"` or `"ema"`.
+
+Two arms on purpose, for the owner's side-by-side. `"ema"` is `MOTION_BLEND` exactly as
+judged three times above. `"euro"` is the One Euro filter (Casiez, Roussel, Vogel 2012)
+over the same state: an EMA whose alpha is not fixed but rises with the speed of the
+signal, per pixel. The owner has reported a defect at BOTH ends of `MOTION_BLEND` - 0.48
+ghosts, 0.75 jumps - and a fixed alpha cannot satisfy both because a still mouth wants
+inertia and a moving one wants none. The adaptive one is built to give each what it
+asks for. The loser is deleted after the judgement, the way the median and FIR arms were.
+"""
+
+EURO_MIN_CUTOFF = 3.0
+"""Hz. The cutoff a still mouth is filtered at - its inertia at rest.
+
+At 24fps this is an alpha of 0.44, a little more inertia than the 0.48 the owner chose
+when the complaint was "너무 빨리 움직인다". A jittering mouth's speed keeps changing sign,
+so the speed estimate averages toward zero and the cutoff sits here."""
+
+EURO_BETA = 0.02
+"""Cutoff gained per unit of speed, in Hz per (intensity unit / second).
+
+A lip-edge pixel that moves 100 units between frames is doing 2400/s. Filtered through
+`EURO_D_CUTOFF` on its first frame that is ~500/s, +10Hz - an alpha of 0.77, close to
+the 0.75 the owner picked when the complaint was ghosting. Sustained over two or three
+frames it approaches 2400/s and an alpha above 0.9: a mouth that is actually moving is
+barely filtered at all. A one-frame blip gets the 0.75 treatment; real motion gets less."""
+
+EURO_D_CUTOFF = 1.0
+"""Hz. How fast the speed estimate itself may change.
+
+The paper's default. Lower makes the filter slower to notice motion has started (and
+slower to believe it has stopped); higher lets single-frame noise read as motion."""
+
+QUIET_DBFS = -45.0
+"""Below this the model's window is a pause rather than speech.
+
+dBFS of the 200ms tail the model actually reads. Spoken TTS sits around -13 to -25;
+the gaps between its sentences are digital zero (-180 by this arithmetic). Generous
+room on both sides, and hysteresis comes from `QUIET_FRAMES` rather than from a second
+threshold."""
+
+QUIET_FRAMES = 4
+"""How many quiet windows in a row before the mouth starts to close - 167ms at 24fps.
+
+A breath between two words must not start closing anything; a sentence boundary
+should. TTS gaps between sentences run 400-800ms, and this plus `CLOSE_FRAMES` has to
+finish inside the short ones or the closure never lands."""
+
+CLOSE_FRAMES = 6
+"""How many frames the paste ramps out over once a pause is confirmed - 250ms.
+
+Shorter than `RELEASE_FRAMES`, which is the end of an utterance and can afford 417ms:
+a pause has a sentence coming after it. The mechanism is the one `release` uses - the
+paste's `strength` falls and the clip's own sealed mouth shows through - because this
+engine cannot render a closed mouth (all 88 conditioning windows measured, none do),
+so the only closed mouth available is the artist's."""
+
+OPEN_FRAMES = 2
+"""How many frames the paste takes to come back when speech resumes - 83ms.
+
+Closing is slow because a closing mouth should be seen to close. Opening cannot be:
+the first voiced window after a pause is the start of a sentence, and playing it on
+the clip's sealed mouth is the defect this exists to remove."""
+
 
 DISPLAY_LEAD = 6
 """How many driving frames AHEAD of its own audio a mouth is composited onto.
@@ -430,6 +495,24 @@ class Step:
 
     mouths: list[np.ndarray]
     """256x256 BGR, straight out of `LipsyncEngine.mouths`, one per index."""
+
+    energy: list[float]
+    """dBFS of the 200ms the model read for each mouth - what `Renderer._close` decides
+    from. Travels with the pair for the same reason `indices` does."""
+
+
+def _dbfs(samples: np.ndarray) -> float:
+    """Level of `samples` (float32, -1..1) in dBFS; digital zero is -180."""
+    if samples.size == 0:
+        return -180.0
+    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+    return 20.0 * math.log10(rms + 1e-9)
+
+
+def _euro_alpha(cutoff: float | np.ndarray, rate: float) -> float | np.ndarray:
+    """One Euro's smoothing factor for a `cutoff` in Hz at `rate` samples per second."""
+    tau = 1.0 / (2.0 * math.pi * cutoff)
+    return 1.0 / (1.0 + tau * rate)
 
 
 def encode_still(frame: np.ndarray) -> bytes:
@@ -562,6 +645,15 @@ class Renderer:
         """The display index the next mouth must carry to count as continuous. A turn
         restarts at 0, so a jump here is a turn boundary and the blend starts over
         rather than mixing in a pose from the previous utterance."""
+        self._speed: np.ndarray | None = None
+        """One Euro's filtered speed estimate, per pixel. Reset with `_previous`."""
+        self._fps = 24.0
+        """The frame rate the last `step` was asked for - the One Euro filter's clock."""
+        self._quiet = 0
+        """Consecutive quiet windows so far - see `_close`."""
+        self._closure = 1.0
+        """How much of the paste is showing, 0..1. Falls through a pause, comes back
+        when speech does, and is where `release` starts its ramp from."""
         self.failed = False
         """Latched on the first failure in either half. The caller drops back to v1
         clips and logs once; retrying per frame would fill the log at 24Hz."""
@@ -596,6 +688,9 @@ class Renderer:
         self._smoothed = None
         self._weight_at = -1
         self._continues_at = -1
+        self._speed = None
+        self._quiet = 0
+        self._closure = 1.0
 
     def step(self, *, frame_index: int, origin: float, fps: float) -> Step | None:
         """`BATCH` mouths from `frame_index` on, or `None`. Never raises.
@@ -627,6 +722,10 @@ class Renderer:
             # and the pair still advances by exactly one frame.
             began = self._driver.clip.nearest(origin)
             shown = [began + index + DISPLAY_LEAD for index in audio]
+            # The level of the 200ms the model reads, which is the TAIL of each window
+            # (`PcmRing.window`): the context before it is whisper's, not the frame's.
+            tail = int(self._ring.sample_rate * WINDOW * MS_PER_INDEX / 1000.0)
+            self._fps = fps
             return Step(
                 indices=shown,
                 mouths=self._engine.mouths(
@@ -634,6 +733,7 @@ class Renderer:
                     [index % n for index in shown],
                     clip=self._driver.name,
                 ),
+                energy=[_dbfs(window[-tail:]) for window in windows],
             )
         except Exception:
             logger.exception("face: lip-sync engine failed, falling back to clips")
@@ -674,10 +774,54 @@ class Renderer:
         """
         current = mouth.astype(np.float32)
         if self._previous is not None and index == self._continues_at:
-            current = MOTION_BLEND * current + (1.0 - MOTION_BLEND) * self._previous
+            if MOTION_FILTER == "euro":
+                current = self._euro(current)
+            else:
+                current = MOTION_BLEND * current + (1.0 - MOTION_BLEND) * self._previous
+        else:
+            # A turn boundary: no momentum and no pause carried across it. The paste
+            # opens in full on the first frame, as it always has.
+            self._speed = None
+            self._quiet = 0
+            self._closure = 1.0
         self._previous = current
         self._continues_at = index + 1
         return current.astype(np.uint8)
+
+    def _euro(self, current: np.ndarray) -> np.ndarray:
+        """One Euro over `current` against `_previous`, per pixel - see `MOTION_FILTER`.
+
+        `_previous` is the last filtered output, exactly as the EMA leaves it, so the
+        two arms share their state and swap cleanly. `_speed` is the paper's dx-hat: the
+        raw per-pixel speed, itself low-passed at `EURO_D_CUTOFF` so a single noisy
+        frame does not read as motion. The cutoff, and so the alpha, is then per pixel:
+        the lips get one alpha and the cheek beside them another.
+        """
+        rate = self._fps
+        speed = (current - self._previous) * rate
+        if self._speed is None:
+            self._speed = np.zeros_like(speed)
+        a_d = _euro_alpha(EURO_D_CUTOFF, rate)
+        self._speed = a_d * speed + (1.0 - a_d) * self._speed
+        alpha = _euro_alpha(EURO_MIN_CUTOFF + EURO_BETA * np.abs(self._speed), rate)
+        return alpha * current + (1.0 - alpha) * self._previous
+
+    def _close(self, dbfs: float) -> float:
+        """This frame's paste `strength`, after hearing how loud its window was.
+
+        `QUIET_FRAMES` quiet windows in a row start the paste ramping out over
+        `CLOSE_FRAMES`; the first loud one brings it back over `OPEN_FRAMES`. The
+        asymmetry is the point (see both constants), and the count is the hysteresis:
+        one quiet window between two words moves nothing.
+        """
+        if dbfs < QUIET_DBFS:
+            self._quiet += 1
+            if self._quiet >= QUIET_FRAMES:
+                self._closure = max(0.0, self._closure - 1.0 / CLOSE_FRAMES)
+        else:
+            self._quiet = 0
+            self._closure = min(1.0, self._closure + 1.0 / OPEN_FRAMES)
+        return self._closure
 
     def release(
         self, *, index: int, step: int, count: int = RELEASE_FRAMES
@@ -750,8 +894,11 @@ class Renderer:
                 self._driver.cache.masks[i],
                 out=self._buffer,
                 # Ends one step short of zero, because the frame after the last of
-                # these is the clip itself - which is strength 0 already.
-                strength=1.0 - step / (count + 1),
+                # these is the clip itself - which is strength 0 already. Starts from
+                # wherever `_close` left the paste: a pause may already have taken it
+                # to 0, and ramping from 1 would paint the mouth back for a tenth of a
+                # second before closing it again.
+                strength=self._closure * (1.0 - step / (count + 1)),
             )
             ok, buf = cv2.imencode(
                 ".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
@@ -761,6 +908,9 @@ class Renderer:
                 # against it and so a repeated call cannot render a stale frame.
                 self._previous = None
                 self._smoothed = None
+                self._speed = None
+                self._quiet = 0
+                self._closure = 1.0
             return buf.tobytes() if ok else None
         except Exception:
             logger.exception("face: lip-sync release failed, falling back to clips")
@@ -774,11 +924,14 @@ class Renderer:
         try:
             encoded: list[bytes] = []
             n = len(self._driver.cache.boxes)
-            for index, mouth in zip(step.indices, step.mouths, strict=True):
+            for index, mouth, loud in zip(step.indices, step.mouths, step.energy, strict=True):
                 i = index % n
                 box = self._driver.cache.boxes[i]
                 x1, y1, x2, y2 = box
                 blended = self._blend(mouth, index)
+                # After `_blend`: a turn boundary resets the closure there, and this
+                # frame's own window then has the first say.
+                strength = self._close(loud)
                 sized = cv2.resize(blended, (x2 - x1, y2 - y1))
                 sized = restore_detail(
                     sized, self._driver.cache.frames[i], box, self._weight(blended, i, index)
@@ -790,6 +943,7 @@ class Renderer:
                     self._driver.cache.crop_boxes[i],
                     self._driver.cache.masks[i],
                     out=self._buffer,
+                    strength=strength,
                 )
                 # Encode inside the loop: `out` is one reusable buffer, so the second
                 # composite overwrites the first frame's pixels.

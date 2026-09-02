@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import pytest
 
-from daemon.face_lipsync import Cache, composite
+from daemon.face_lipsync import Cache, composite, render
 from daemon.face_lipsync.audio import latest_audio_ms
 from daemon.face_lipsync.render import (
     BATCH,
@@ -1153,3 +1153,176 @@ def test_the_mouth_after_a_switch_is_generated_for_the_new_clip():
     r.switch(_driver("listening"))
     _jpegs(r, frame_index=0)
     assert engine.clips == ["idle2", "listening"]
+
+
+# --- the motion filter: One Euro against the fixed EMA ---------------------------------
+
+
+def _filtered(monkeypatch, name, values, *, steps):
+    """The mouth value each published frame carries under one motion filter.
+
+    `values` is what the engine hands over, one per frame; `steps` pairs are rendered
+    from frame 0 over a voiced ring, so the only thing moving is the mouth colour.
+    """
+    monkeypatch.setattr(render, "MOTION_FILTER", name)
+    cache = _cache()
+    # Tone, not silence: on silence the pause closure would ramp the paste out after
+    # QUIET_FRAMES and the reading would be the closure, not the filter.
+    r = _renderer(engine=_Mouths(values), cache=cache, ring=_distinct_tone_ring(seconds=4.0))
+    got = []
+    for first in range(0, steps * BATCH, BATCH):
+        got.extend(_encoded_mouth(r, cache, None, first=first))
+    return got
+
+
+def test_the_adaptive_filter_lets_a_real_step_through_faster_than_the_ema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owner reported both ends of MOTION_BLEND as defects - 0.48 ghosts, 0.75
+    jumps - which is what a fixed alpha looks like. One Euro raises its cutoff with
+    the speed of the signal, so a mouth that is actually moving is not held back."""
+    ema = _filtered(monkeypatch, "ema", [0, 200, 200, 200], steps=2)
+    euro = _filtered(monkeypatch, "euro", [0, 200, 200, 200], steps=2)
+
+    assert euro[1] > ema[1] + 8, (euro, ema)
+    assert euro[2] > ema[2], (euro, ema)
+
+
+def test_the_adaptive_filter_holds_a_still_mouth_stiller_than_the_ema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """And the other half: a mouth that is only jittering gets *more* inertia than
+    0.75 gives it, because a speed that keeps changing sign averages to nothing and
+    the cutoff falls to its floor."""
+    jitter = [200, 240] * 6
+    ema = _filtered(monkeypatch, "ema", jitter, steps=6)
+    euro = _filtered(monkeypatch, "euro", jitter, steps=6)
+
+    settled = slice(6, None)
+    ema_p2p = max(ema[settled]) - min(ema[settled])
+    euro_p2p = max(euro[settled]) - min(euro[settled])
+    assert euro_p2p < ema_p2p * 0.85, (euro_p2p, ema_p2p, euro, ema)
+
+
+def test_the_adaptive_filter_starts_over_at_a_turn_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same rule as the EMA, and it has one more piece of state to forget: the speed
+    estimate. A stale one would open the next turn with the previous one's momentum."""
+    monkeypatch.setattr(render, "MOTION_FILTER", "euro")
+    cache = _cache()
+    r = _renderer(
+        engine=_Mouths([0, 0, 200, 200]), cache=cache, ring=_distinct_tone_ring(seconds=6.0)
+    )
+    _encoded_mouth(r, cache, None, first=0)
+    fresh, _ = _encoded_mouth(r, cache, None, first=90)
+    assert abs(fresh - 200) < 20, fresh
+
+
+# --- a pause closes the mouth -----------------------------------------------------------
+
+
+def _pause_ring(*, voiced, quiet, voiced_again=0.0, value=1000):
+    """`voiced` seconds of tone, `quiet` seconds of digital zero, then tone again."""
+    total = voiced + quiet + voiced_again
+    ring = PcmRing(sample_rate=24_000, width=2, seconds=total + 4.0)
+    ring.feed(_tone(int(voiced * 1000), value=value), audible_at=0.0)
+    ring.feed(b"\x00\x00" * int(24_000 * quiet), audible_at=voiced)
+    if voiced_again:
+        ring.feed(_tone(int(voiced_again * 1000), value=value), audible_at=voiced + quiet)
+    return ring
+
+
+def _paste_distances(r, cache, *, frames):
+    """Per frame: how far the published crop box sits from the untouched clip frame.
+
+    Full paste is far (the engine's flat 200 against the frame's own level); a mouth
+    handed back to the clip is 0. Measured over the crop box only, so the frame's
+    untouched majority does not dilute it.
+    """
+    xs, ys, xe, ye = CROP_BOX
+    out = []
+    for first in range(0, frames, BATCH):
+        step = r.step(frame_index=first, origin=0.0, fps=24.0)
+        assert step is not None
+        for index, payload in zip(step.indices, r.encode(step), strict=True):
+            got = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
+            plain = cache.frames[index % len(cache.boxes)]
+            diff = got[ys:ye, xs:xe].astype(int) - plain[ys:ye, xs:xe].astype(int)
+            out.append(float(np.abs(diff).mean()))
+    return out
+
+
+def test_step_reports_how_loud_each_window_was():
+    """The closure needs to know whether the audio under a mouth was speech or a
+    pause, and `step` already holds the window - so it answers, in dBFS of the
+    model's own 200ms tail, one per mouth."""
+    quiet = _renderer(engine=FakeEngine(), cache=_cache(), ring=_silent_ring(seconds=4.0))
+    loud = _renderer(engine=FakeEngine(), cache=_cache(), ring=_distinct_tone_ring(seconds=4.0))
+
+    a = quiet.step(frame_index=10, origin=0.0, fps=24.0)
+    b = loud.step(frame_index=10, origin=0.0, fps=24.0)
+
+    assert a is not None and b is not None
+    assert len(a.energy) == BATCH and len(b.energy) == BATCH
+    assert all(e < render.QUIET_DBFS - 10 for e in a.energy), a.energy
+    assert all(e > render.QUIET_DBFS + 10 for e in b.energy), b.energy
+
+
+def test_a_pause_in_the_speech_hands_the_mouth_back_to_the_clip():
+    """Between sentences the model keeps drawing a parted mouth - all 88 measured
+    conditioning windows do, digital zero included - so she looks open-mouthed
+    through every pause. Once the audio has been quiet for QUIET_FRAMES, the paste
+    ramps out over CLOSE_FRAMES, and what shows through is the clip's own closed
+    mouth. Not before: a breath between two words must not start closing anything."""
+    cache = _cache()
+    r = _renderer(engine=FakeEngine(), cache=cache, ring=_pause_ring(voiced=1.0, quiet=1.5))
+
+    d = _paste_distances(r, cache, frames=60)
+
+    full = d[10]
+    assert full > 40, full
+    # The tail of the model's window clears the tone at about frame 27; QUIET_FRAMES
+    # quiet ones must pass before anything moves.
+    first_drop = next(i for i, v in enumerate(d) if v < full * 0.9)
+    expected = 27 + render.QUIET_FRAMES
+    assert expected - 2 <= first_drop <= expected + 2, (first_drop, d)
+    assert all(d[i] >= full * 0.9 for i in range(20, first_drop)), d[20:first_drop]
+    ramp = d[first_drop : first_drop + render.CLOSE_FRAMES + 1]
+    assert all(a >= b - 0.5 for a, b in zip(ramp, ramp[1:], strict=False)), ramp
+    assert d[first_drop + render.CLOSE_FRAMES + 1] < 3.0, d[first_drop:]
+
+
+def test_speech_resuming_brings_the_mouth_back_within_two_frames():
+    """Closing is slow on purpose; opening cannot be. The first voiced window after a
+    pause must have most of the paste back, or the start of every sentence plays on
+    the clip's sealed mouth."""
+    cache = _cache()
+    ring = _pause_ring(voiced=1.0, quiet=0.7, voiced_again=1.0)
+    r = _renderer(engine=FakeEngine(), cache=cache, ring=ring)
+
+    d = _paste_distances(r, cache, frames=60)
+
+    full = d[10]
+    closed = min(d[30:44])
+    assert closed < 3.0, d[30:44]
+    reopened = next(i for i in range(36, 60) if d[i] > full * 0.9)
+    first_voiced = next(i for i in range(36, 60) if d[i] > closed + 3.0)
+    assert reopened - first_voiced <= render.OPEN_FRAMES, (first_voiced, reopened, d[34:48])
+
+
+def test_release_after_a_pause_does_not_flash_the_mouth_back_open():
+    """`release` ramps `strength` from 1 - but if a pause already closed the mouth,
+    starting from 1 paints it back for a tenth of a second and then closes it again.
+    The ramp starts from wherever the closure left it."""
+    cache = _cache()
+    r = _renderer(engine=FakeEngine(), cache=cache, ring=_pause_ring(voiced=1.0, quiet=1.5))
+    d = _paste_distances(r, cache, frames=60)
+    assert d[-1] < 3.0, d[-6:]
+
+    payload = r.release(index=1, step=1)
+    assert payload is not None
+    got = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_COLOR)
+    xs, ys, xe, ye = CROP_BOX
+    plain = cache.frames[1]
+    assert np.abs(got[ys:ye, xs:xe].astype(int) - plain[ys:ye, xs:xe].astype(int)).mean() < 3.0
