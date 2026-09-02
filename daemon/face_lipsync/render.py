@@ -94,6 +94,30 @@ def restore_detail(
     which is a vibration source in its own right. The owner picked the smoothed one
     over it. `Renderer` keeps that average; `detail_weight` computes one frame's.
 
+    **Super-resolution in front of this was tried on 2026-09-02 and is closed.** The idea:
+    keep TAESD, run its 256 tile through Real-ESRGAN on the Neural Engine (concurrent with
+    the GPU UNet), and paste a *downscaled* result into the 311x422 face box instead of
+    the 1.65x vertical upscale the box costs today. Measured on 168 recorded raw mouths
+    over `mask > 0`, detail relative to the camera's own frame: TAESD alone 75.9%, TAESD
+    + this function 94.3% (ships), `RealESRGAN_x2plus` alone 84.7% and + this 101.4%,
+    `realesr-general-x4v3` (compact) alone 86.5% and + this 105.0%. Flicker moved at most
+    +7%. So SR adds ~10 points of structure on its own and, on top of the borrowed
+    texture, pushes past the camera - which is invented detail. The owner, at 3x: x2plus
+    + texture looked best; compact + texture "선명하긴한데 약간 억지로 선명도를 높힌 느낌이라
+    이빨 사이틈새만 되게 선명해서 좀 어색해보여". On the ANE (CoreML fp16, real tiles, 50
+    runs after warm-up, per BATCH=2 pair): x2plus **74.7ms** alone - already over the
+    ~72ms it had to hide behind the UNet, compute-bound (batch-1 is exactly half), and
+    slower beside a GPU load (75.6 cool, 86 warm at 40% duty, 93-139 saturated); compact
+    36.7 alone and under 72 in every condition (worst hot p95 58). Only the one the owner
+    found artificial fits, and it would still cost two frames of display latency, a
+    CoreML runtime and a model load; the owner: "성능적으로 원본보다 손해가 있으면 안하는게
+    나을듯". Nothing ships. Two things learned that outlive this: the ANE slows beside
+    the GPU in proportion to GPU *power*, not busy fraction (a 1024^2 matmul at the same
+    duty had no effect where a 4096^2 one did), building over tens of seconds and
+    releasing in a few; and the one SR path left open is a compact net trained on this
+    face against x2plus's output, which might reach its look at compact's cost. That, or
+    a re-shoot that brings the box under 256px, is where the next attempt starts.
+
     `mouth` must already be `box`-sized, as `composite` requires.
     """
     x1, y1, x2, y2 = box
