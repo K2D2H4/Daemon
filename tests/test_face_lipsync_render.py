@@ -901,9 +901,14 @@ def _encoded_mouth(renderer, cache, values, *, first=0):
     return got
 
 
-def test_a_mouth_is_mixed_with_the_one_before_it():
+def test_a_mouth_is_mixed_with_the_one_before_it(monkeypatch: pytest.MonkeyPatch):
     """The owner's report was that the mouth moves too fast - each frame free to jump,
-    because independent per-frame generation has none of a face's inertia."""
+    because independent per-frame generation has none of a face's inertia.
+
+    Pinned to the EMA arm: this is the arithmetic of `MOTION_BLEND`. The adaptive arm
+    reads a 0-to-200 jump as articulation and lets nearly all of it through on purpose
+    - its inertia is tested where it applies, on a shimmering mouth, further down."""
+    monkeypatch.setattr(render, "MOTION_FILTER", "ema")
     cache = _cache()
     ring = PcmRing(sample_rate=24_000, width=2, seconds=2.0)
     ring.feed(b"\x00\x00" * 24_000, audible_at=0.0)
@@ -1158,21 +1163,20 @@ def test_the_mouth_after_a_switch_is_generated_for_the_new_clip():
 # --- the motion filter: One Euro against the fixed EMA ---------------------------------
 
 
-def _filtered(monkeypatch, name, values, *, steps):
-    """The mouth value each published frame carries under one motion filter.
+def _blend_trace(monkeypatch, name, values):
+    """`_previous` - the filter's own float32 state - after each `_blend` call.
 
-    `values` is what the engine hands over, one per frame; `steps` pairs are rendered
-    from frame 0 over a voiced ring, so the only thing moving is the mouth colour.
+    Straight into `_blend`, not through `step`/`encode`: this is a test of the filter,
+    and a JPEG on the far side quantises a two-unit shimmer out of existence. `values`
+    is one flat mouth level per frame, so the tile's mean IS the filtered value.
     """
     monkeypatch.setattr(render, "MOTION_FILTER", name)
-    cache = _cache()
-    # Tone, not silence: on silence the pause closure would ramp the paste out after
-    # QUIET_FRAMES and the reading would be the closure, not the filter.
-    r = _renderer(engine=_Mouths(values), cache=cache, ring=_distinct_tone_ring(seconds=4.0))
-    got = []
-    for first in range(0, steps * BATCH, BATCH):
-        got.extend(_encoded_mouth(r, cache, None, first=first))
-    return got
+    r = _renderer(engine=FakeEngine(), cache=_cache())
+    out = []
+    for index, value in enumerate(values):
+        r._blend(np.full((256, 256, 3), value, np.uint8), index)
+        out.append(float(r._previous.mean()))
+    return out
 
 
 def test_the_adaptive_filter_lets_a_real_step_through_faster_than_the_ema(
@@ -1180,28 +1184,32 @@ def test_the_adaptive_filter_lets_a_real_step_through_faster_than_the_ema(
 ) -> None:
     """The owner reported both ends of MOTION_BLEND as defects - 0.48 ghosts, 0.75
     jumps - which is what a fixed alpha looks like. One Euro raises its cutoff with
-    the speed of the signal, so a mouth that is actually moving is not held back."""
-    ema = _filtered(monkeypatch, "ema", [0, 200, 200, 200], steps=2)
-    euro = _filtered(monkeypatch, "euro", [0, 200, 200, 200], steps=2)
+    the speed of the signal, so a mouth that is actually moving is not held back:
+    a 200-unit step is articulation, and most of it has to land on the next frame."""
+    ema = _blend_trace(monkeypatch, "ema", [0, 200, 200])
+    euro = _blend_trace(monkeypatch, "euro", [0, 200, 200])
 
-    assert euro[1] > ema[1] + 8, (euro, ema)
+    assert abs(ema[1] - 200 * MOTION_BLEND) < 1.0, ema
+    assert euro[1] > ema[1] + 20, (euro, ema)
     assert euro[2] > ema[2], (euro, ema)
 
 
 def test_the_adaptive_filter_holds_a_still_mouth_stiller_than_the_ema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """And the other half: a mouth that is only jittering gets *more* inertia than
-    0.75 gives it, because a speed that keeps changing sign averages to nothing and
-    the cutoff falls to its floor."""
-    jitter = [200, 240] * 6
-    ema = _filtered(monkeypatch, "ema", jitter, steps=6)
-    euro = _filtered(monkeypatch, "euro", jitter, steps=6)
+    """And the other half. A resting mouth is not still: TAESD's output shimmers by
+    about a unit or two per frame, with the sign flipping. That speed averages toward
+    nothing, the cutoff falls to its floor, and the shimmer gets *more* inertia than
+    0.75 gives it. Two units, not twenty - twenty is articulation and must pass."""
+    shimmer = [200, 202] * 8
+    ema = _blend_trace(monkeypatch, "ema", shimmer)
+    euro = _blend_trace(monkeypatch, "euro", shimmer)
 
-    settled = slice(6, None)
+    settled = slice(8, None)
     ema_p2p = max(ema[settled]) - min(ema[settled])
     euro_p2p = max(euro[settled]) - min(euro[settled])
-    assert euro_p2p < ema_p2p * 0.85, (euro_p2p, ema_p2p, euro, ema)
+    assert ema_p2p > 1.0, ema  # the reference visibly passes the shimmer
+    assert euro_p2p < ema_p2p * 0.85, (euro_p2p, ema_p2p)
 
 
 def test_the_adaptive_filter_starts_over_at_a_turn_boundary(

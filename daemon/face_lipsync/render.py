@@ -363,31 +363,59 @@ judged three times above. `"euro"` is the One Euro filter (Casiez, Roussel, Voge
 over the same state: an EMA whose alpha is not fixed but rises with the speed of the
 signal, per pixel. The owner has reported a defect at BOTH ends of `MOTION_BLEND` - 0.48
 ghosts, 0.75 jumps - and a fixed alpha cannot satisfy both because a still mouth wants
-inertia and a moving one wants none. The adaptive one is built to give each what it
-asks for. The loser is deleted after the judgement, the way the median and FIR arms were.
+inertia and a moving one wants none. The loser is deleted after the judgement, the way
+the median and FIR arms were.
+
+**The first parameterisation of this did not adapt at all, and only a probe of the
+alpha itself showed it.** With `EURO_MIN_CUTOFF=3, EURO_BETA=0.02, EURO_D_CUTOFF=1`, on
+167 real frames: alpha p50 0.47, p90 0.58, 0.0% of pixels ever above 0.85 - a fixed EMA
+of about 0.47, the arm the owner had already rejected. The assumption behind it was that
+a moving lip pixel does ~2400 intensity units/s; the filtered speed actually measured
+p50 23, p90 118, p99 330. Downstream metrics tied with the EMA, which is what a
+mechanism that never engaged looks like (see MEMORY: "if an A/B ties, suspect the
+mechanism"). The values below come from sweeping the filter over that recorded raw
+mouth sequence, where it costs nothing to try 24 of them:
+
+    min_cut beta d_cut | alpha p50  <.55   >=.85 | still px%  moving px%  moving mean
+    EMA 0.75 (ref)     |   0.75      -      -    |   71.1       2.90        27.7
+    EMA 0.48 (ref)     |   0.48      -      -    |   61.7       1.70        23.8
+    raw, no filter     |    -        -      -    |   77.1       4.05        30.9
+    2.0  0.05  1.0  A  |   0.43    83.5%   0.4%  |   58.0       2.52        29.8
+    2.0  0.20  6.0  B  |   0.64    31.5%  12.9%  |   63.3       3.68        31.2
+
+"still px%" is the share of mouth pixels that change at all frame to frame (the shimmer
+on a resting mouth); "moving" is the share and mean size of changes over 15 units (the
+articulation). B is the shipped default: articulation passes through nearly as the model
+drew it (3.68/31.2 against raw 4.05/30.9, where the EMA at 0.75 damps it to 2.90/27.7)
+while the resting mouth is stiller than 0.75 leaves it. A is the hedge - stiller than
+0.48 at rest, but with the old complaint's risk. Both are in the side-by-side.
 """
 
-EURO_MIN_CUTOFF = 3.0
+EURO_MIN_CUTOFF = 2.0
 """Hz. The cutoff a still mouth is filtered at - its inertia at rest.
 
-At 24fps this is an alpha of 0.44, a little more inertia than the 0.48 the owner chose
-when the complaint was "너무 빨리 움직인다". A jittering mouth's speed keeps changing sign,
-so the speed estimate averages toward zero and the cutoff sits here."""
+At 24fps an alpha of 0.34 for a pixel with no speed at all. A resting mouth's pixels are
+not at zero speed - TAESD's output shimmers at about one unit per frame, and that shimmer
+is exactly what this floor is for - so the effective resting alpha lands around 0.5-0.6
+(the "alpha p50" column above), not here."""
 
-EURO_BETA = 0.02
+EURO_BETA = 0.20
 """Cutoff gained per unit of speed, in Hz per (intensity unit / second).
 
-A lip-edge pixel that moves 100 units between frames is doing 2400/s. Filtered through
-`EURO_D_CUTOFF` on its first frame that is ~500/s, +10Hz - an alpha of 0.77, close to
-the 0.75 the owner picked when the complaint was ghosting. Sustained over two or three
-frames it approaches 2400/s and an alpha above 0.9: a mouth that is actually moving is
-barely filtered at all. A one-frame blip gets the 0.75 treatment; real motion gets less."""
+Sized to the speeds that actually occur (p50 23, p99 330 units/s after `EURO_D_CUTOFF`),
+not to the ones a first guess imagined. At 330 this adds 66Hz - an alpha of 0.95, the
+mouth drawn as the model drew it; at the median 23 it adds 4.6Hz - alpha 0.63, a little
+more inertia than 0.75 gives. 0.05 (arm A) puts almost every pixel under 0.55."""
 
-EURO_D_CUTOFF = 1.0
+EURO_D_CUTOFF = 6.0
 """Hz. How fast the speed estimate itself may change.
 
-The paper's default. Lower makes the filter slower to notice motion has started (and
-slower to believe it has stopped); higher lets single-frame noise read as motion."""
+The paper's default is 1Hz, for input sampled at 60-120Hz. At 24fps that is a smoothing
+factor of 0.21 per frame: a lip that starts moving is not believed to be moving for
+three or four frames, and the whole articulation is over by then - which is half of why
+the first parameterisation never left the resting regime. 6Hz is 0.61 per frame: motion
+is credited within one or two frames, and single-frame noise is still averaged down
+because its sign keeps flipping."""
 
 QUIET_DBFS = -45.0
 """Below this the model's window is a pause rather than speech.
