@@ -4003,3 +4003,104 @@ async def test_without_a_speech_gate_an_owed_answer_still_holds_the_microphone()
     await conv._forward_microphone(session, mic())
 
     assert session.sent == []
+
+
+class _Budget:
+    """Records what the idle budget was rescheduled to.
+
+    `deadline` makes it answer `when()` like `asyncio.Timeout` does, which is how a
+    caller can tell whether it is about to move the deadline *earlier*.
+    """
+
+    def __init__(self, deadline: float | None = None) -> None:
+        self.whens: list[float] = []
+        self.deadline = deadline
+
+    def when(self) -> float | None:
+        return self.deadline
+
+    def reschedule(self, when: float) -> None:
+        self.whens.append(when)
+        self.deadline = when
+
+
+async def test_the_owner_talking_keeps_the_session_alive() -> None:
+    """The 30 s budget is only rescheduled by what arrives on `receive()`, and this
+    provider delivers the owner's transcript at the *end* of their utterance. So a
+    request that took longer to say than the budget had left closed the session
+    while it was being made - measured on the owner's machine 2026-09-04: the last
+    answer ended 11:03:19, "구글에서 이미지 검색으로 강아지 사진 좀 검색해 줄래?" finalised
+    11:03:50, and `nothing heard for 30s` fired in the same second. The request was
+    recorded and never answered.
+
+    Speech reaching the model is the signal that somebody is still talking."""
+    session = FakeSession()
+    conv = conversation(session, vad=_GateVad())
+    budget = _Budget()
+    conv._budget = budget  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+
+    async def mic() -> Any:
+        for frame in _room_frames(6) + [_SPEECH_FRAME] * 12:
+            yield frame
+
+    await conv._forward_microphone(session, mic())
+
+    assert budget.whens, "the owner talking did not touch the idle budget"
+    assert budget.whens[-1] >= loop.time() + conv._idle_timeout - 1.0
+
+
+async def test_the_room_alone_does_not_keep_the_session_alive() -> None:
+    """The other half of it: a session nobody is talking to still has to close, or
+    the daemon bills per minute for an empty room."""
+    session = FakeSession()
+    conv = conversation(session, vad=_GateVad())
+    budget = _Budget()
+    conv._budget = budget  # type: ignore[assignment]
+
+    async def mic() -> Any:
+        for frame in _room_frames(40):
+            yield frame
+
+    await conv._forward_microphone(session, mic())
+
+    assert budget.whens == []
+
+
+async def test_without_a_gate_a_partial_transcript_keeps_the_session_alive() -> None:
+    """No local VAD, so the only sign the owner is mid-utterance is the provider's
+    own partial."""
+    session = FakeSession()
+    conv = conversation(session)
+    budget = _Budget()
+    conv._budget = budget  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+    session._partials.put_nowait(Transcript(text="강아지 사진", role="user", final=False))
+    session._partials.put_nowait(None)  # ends the stream, as `__aexit__` does
+
+    await conv._watch_partials(session)
+
+    assert budget.whens
+    assert budget.whens[-1] >= loop.time() + conv._idle_timeout - 1.0
+
+
+async def test_the_owner_talking_never_shortens_a_budget_the_answer_already_extended() -> None:
+    """`_on_audio` pushes the deadline past the speaker's own playing time, because
+    an answer that arrives in 19 s and plays for 28 s used to spend the silence
+    budget while it was still being heard. The owner speaking mid-answer must not
+    undo that: this may only ever extend."""
+    session = FakeSession()
+    conv = conversation(session, vad=_GateVad())
+    loop = asyncio.get_running_loop()
+    far = loop.time() + conv._idle_timeout + 60.0  # a long answer still playing
+    budget = _Budget(deadline=far)
+    conv._budget = budget  # type: ignore[assignment]
+
+    async def mic() -> Any:
+        for frame in [_SPEECH_FRAME] * 12:
+            yield frame
+
+    await conv._forward_microphone(session, mic())
+
+    assert budget.whens == [], "the deadline was pulled back in under the answer"
+    assert budget.deadline == far

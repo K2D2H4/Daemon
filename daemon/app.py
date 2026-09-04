@@ -81,6 +81,26 @@ that fails instantly - no microphone, a revoked permission - would otherwise
 retry as fast as the process can manage."""
 
 WAKE_REARM_SETTLE_SECONDS = 1.0
+
+WAKE_DEAF_ROUNDS_BEFORE_RESTART = 3
+"""Consecutive rounds with a dead capture stream before asking the supervisor for a
+new process.
+
+Rounds rather than seconds, because a round already *is* the unit: the gate's
+dead-stream watchdog gives up after `DAEMON_WAKE_DEAD_STREAM_MS` (45 s by default)
+and `_wake_forever` immediately rebuilds it. One such round is ordinary - the device
+was being handed over, or another client had it for a moment. Three in a row is the
+wedge `daemon/voice/audio.py` describes and says nothing in this process can undo.
+
+Measured cost of not having this: on 2026-09-04 the owner's resident logged that
+pair of lines **1048 times** between 23:54 and 11:01 - eleven hours deaf, `/health`
+green the whole time - and one `launchctl kickstart` fixed it in a second.
+"""
+
+WAKE_RESTART_COOLDOWN_SECONDS = 600.0
+"""Minimum gap between two such restarts. If a new process does not fix it either -
+the device wedged below us, in coreaudiod - then this bounds the damage to one
+restart every ten minutes instead of a loop, and the log says so each time."""
 """Pause after a spoken conversation before the next wake round opens a fresh
 microphone stream.
 
@@ -2960,8 +2980,12 @@ def _only_the_wake_word(fired: Any) -> bool:
 
 async def _wake_round(
     settings: Settings, shared: VoiceRuntime | None = None, state: Any = None
-) -> None:
+) -> bool:
     """Listen until called, hold one spoken conversation, release the microphone.
+
+    Returns whether the microphone was alive this round - any frame reaching the VAD,
+    or a wake word, counts. `_wake_forever` keeps the tally, because a dead capture
+    stream is only diagnosable across rounds (`WAKE_DEAF_ROUNDS_BEFORE_RESTART`).
 
     One round, because the caller loops: keeping this a single round is what makes
     the gate stop listening while the conversation runs. Two recording streams do
@@ -3041,7 +3065,7 @@ async def _wake_round(
         # thread on it, and an unpaced return would do that as fast as the process
         # can manage.
         await asyncio.sleep(WAKE_RETRY_SECONDS)
-        return
+        return False  # the release never finished: this device is not alive
     if fired is None:
         # The stream ended without a wake word - a closed device, a test's scripted
         # audio running out, the gate's own dead-stream watchdog asking to be
@@ -3050,7 +3074,12 @@ async def _wake_round(
         taken = mic_floor.take()
         if taken is not None:
             await _speak_unprompted(settings, taken, shared)
-        return
+        # Whether the microphone was *working* is the frame count, which is the one
+        # number that separates a quiet room from a dead capture stream
+        # (daemon/voice/wake.py:WakeCounters). A gate without counters - a test's
+        # stand-in - reads as alive, because a fake is never the thing being
+        # diagnosed.
+        return bool(getattr(getattr(gate, "counters", None), "frames_seen", 1))
     logger.info("wake: heard %r matching %r; opening a voice session", fired.heard, fired.matched)
     # The segment that fired the gate goes with it - but only when it carries more
     # than the name. Without it the session opens deaf to the question it was opened
@@ -3090,6 +3119,7 @@ async def _wake_round(
     # Let the conversation's Voice-Processing unit finish releasing the microphone
     # before the next round opens a fresh capture on it - see WAKE_REARM_SETTLE_SECONDS.
     await asyncio.sleep(WAKE_REARM_SETTLE_SECONDS)
+    return True  # it heard a wake word, so the microphone is beyond doubt
 
 
 async def _speak_unprompted(
@@ -3270,16 +3300,73 @@ async def _wake_forever(
     fails immediately - no microphone, a revoked device permission - would otherwise
     spin as fast as the process can retry it.
     """
+    deaf_rounds = 0
+    restarted_at = 0.0
     while True:
         try:
-            await _wake_round(settings, shared, state)
+            alive = await _wake_round(settings, shared, state)
         except asyncio.CancelledError:
             raise  # BaseException, so the clause below would not have caught it
         except Exception:
             logger.exception("wake: round failed; listening again shortly")
             await asyncio.sleep(WAKE_RETRY_SECONDS)
         else:
+            # A dead capture stream is only diagnosable across rounds: one is a
+            # handover, three in a row is the wedge nothing here can undo.
+            deaf_rounds = 0 if alive else deaf_rounds + 1
+            if deaf_rounds >= WAKE_DEAF_ROUNDS_BEFORE_RESTART:
+                deaf_rounds = 0
+                restarted_at = await _ask_for_a_working_microphone(restarted_at)
             await asyncio.sleep(0)  # yield, so a stream that ends instantly cannot pin the loop
+
+
+async def _ask_for_a_working_microphone(restarted_at: float) -> float:
+    """The capture stream has been dead for several rounds: ask for a new process.
+
+    Rebuilding the gate is all `_wake_forever` can do and it is not enough -
+    `daemon/voice/audio.py` says outright that a device wedged inside CoreAudio
+    cannot be freed from here. On 2026-09-04 that cost the owner eleven hours of a
+    resident that was running, green on `/health`, and deaf: 1048 dead-stream
+    rebuilds between 23:54 and 11:01, while they called and called. One
+    `launchctl kickstart` fixed it in a second. So the daemon now does for itself
+    what the owner had to do for it.
+
+    Only where something will revive us - `restart.is_supervised`, the same gate the
+    admin's settings-apply passes through (daemon/admin/restart.py). Unsupervised,
+    exiting would replace a deaf daemon with no daemon, so it says what it would
+    have done and carries on.
+
+    Returns the moment of the request, so the caller can hold
+    `WAKE_RESTART_COOLDOWN_SECONDS` between two: if a fresh process is deaf too, the
+    wedge is below us and a restart loop helps nobody.
+    """
+    from daemon.admin import restart
+
+    now = asyncio.get_running_loop().time()
+    if not restart.is_supervised():
+        logger.error(
+            "wake: the microphone has been dead for %d rounds and nothing in this "
+            "process can free it. Nothing supervises this one, so it cannot restart "
+            "itself - restart it by hand, or `daemon install` to run it as a service",
+            WAKE_DEAF_ROUNDS_BEFORE_RESTART,
+        )
+        return restarted_at
+    if restarted_at and now - restarted_at < WAKE_RESTART_COOLDOWN_SECONDS:
+        logger.error(
+            "wake: still deaf %.0fs after restarting for it, so the device is wedged "
+            "below this process - `sudo killall coreaudiod` is the next step and it "
+            "needs a password. Not restarting again for %.0fs",
+            now - restarted_at,
+            WAKE_RESTART_COOLDOWN_SECONDS - (now - restarted_at),
+        )
+        return restarted_at
+    logger.error(
+        "wake: the microphone has delivered nothing for %d rounds and cannot be freed "
+        "from here; restarting so the next process opens a fresh device",
+        WAKE_DEAF_ROUNDS_BEFORE_RESTART,
+    )
+    restart.schedule_exit()
+    return now
 
 
 async def _claim_microphone(settings: Settings) -> None:

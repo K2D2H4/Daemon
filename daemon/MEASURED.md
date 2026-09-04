@@ -1117,3 +1117,56 @@ and the frame looked up in the 131-frame clip that had arrived in between. Each
 render call now binds one clip and uses it throughout - a frame composited from two
 clips would not have been a frame anyway.
 
+## Eleven hours deaf, 1048 times, and nothing in the process could fix it
+
+2026-09-04. The owner: "지금 계속 부르고있는데 wake가 발화안되네". The log, from **23:54
+to 11:01**, two lines 45 s apart, **1048 times**:
+
+    wake: the microphone has delivered nothing at all for 45s; the capture stream is
+      dead - ending the gate so it is rebuilt
+    wake: the microphone did not come back after the gate let it go; the capture
+      device is wedged inside CoreAudio and nothing in this process can free it
+
+The gate's watchdog worked, the rebuild worked, and the rebuild is not a fix -
+`daemon/voice/audio.py` says outright that a device wedged in CoreAudio cannot be
+freed from here. `/health` was green the whole time. One `launchctl kickstart` fixed
+it in a second, and the wake word matched at 0.95 confidence 60 s later.
+
+So `_wake_forever` now counts consecutive rounds where the microphone delivered
+nothing and, after `WAKE_DEAF_ROUNDS_BEFORE_RESTART`, asks the supervisor for a new
+process through the mechanism the admin's settings-apply already uses. **Rounds, not
+seconds:** one dead round is a device changing hands, three in a row is the wedge. A
+quiet room is not one of them - `WakeCounters.frames_seen` is what separates "nobody
+spoke" from "no audio at all", and that distinction is the whole safety of this.
+Unsupervised (`daemon run` in a terminal) it says what it would have done, because
+exiting there replaces a deaf daemon with no daemon.
+
+**What triggered the wedge was a probe of mine**, which is worth writing down: a
+process recording `eqMac Export` (the output loopback) beside an open
+`AVAudioEngine` **segfaults**, and the device did not survive it. That is also why
+the end-of-reply click the owner reported is still unmeasured.
+
+## The idle budget spent itself while the owner was still talking
+
+Same day, same session, and it is why "묵묵부답" came back one minute after the
+restart. `_receive`'s 30 s budget is rescheduled by what arrives on `receive()`, and
+this provider delivers the owner's transcript at the **end** of their utterance. So a
+request that takes longer to say than the budget has left closes the session while it
+is being made:
+
+| | |
+|---|---|
+| 11:03:19 | the daemon's answer ends ("네가 시키는 건 바로 해줘야지") |
+| 11:03:50 | `구글에서 이미지 검색으로 강아지 사진 좀 검색해 줄래?` finalises |
+| 11:03:50 | `voice: nothing heard for 30s; closing a session that bills per minute` |
+
+The request reached the conversation log and no tool ever ran for it - the audit has
+`open_path` and nothing after. From the outside the daemon had simply stopped
+answering.
+
+`_note_owner_speaking` fixes it from two signals, whichever exists: the speech gate
+opening (the local VAD knows ~30 frames before the transcript does) and the
+provider's own partial transcripts. It only ever *extends* the deadline - during a
+long answer `_on_audio` has already pushed it past the speaker's playing time, and
+resetting to `now + 30 s` there would undo that fix.
+

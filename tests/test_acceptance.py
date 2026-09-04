@@ -2735,3 +2735,172 @@ async def test_the_real_mailbox_and_the_real_delivery_agree_on_no_listener(
         "the two modules stopped agreeing on what 'nobody took it' is called"
     )
     assert result.route == "both"
+
+
+@pytest.mark.asyncio
+async def test_a_microphone_that_stays_dead_restarts_a_supervised_resident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure this cost the owner a morning to.
+
+    2026-09-04: from 23:54 to 11:01 the resident logged `the capture stream is dead`
+    and `the capture device is wedged inside CoreAudio` **1048 times**, 45 s apart,
+    rebuilding the gate every time and never recovering - `daemon/voice/audio.py`
+    says so itself, nothing in the process can free the device. The owner called and
+    called and nothing heard them; one `launchctl kickstart` fixed it instantly.
+
+    So a gate that has been deaf for round after round asks the supervisor for a new
+    process, which is the same mechanism the admin's settings-apply uses. Rounds, not
+    seconds: one dead round is a device being handed over, three in a row is a wedge.
+    """
+    from daemon.app import WAKE_DEAF_ROUNDS_BEFORE_RESTART, _wake_forever
+    from daemon.voice.wake import WakeCounters
+
+    exits: list[str] = []
+
+    class DeafGate:
+        """Ends the way the dead-stream watchdog ends it: no event, no frames."""
+
+        counters = WakeCounters()  # frames_seen == 0
+
+        async def listen(self) -> Any:
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+    async def close_gate() -> bool:
+        return True
+
+    async def fake_build(settings: Any) -> tuple[Any, Any]:
+        return DeafGate(), close_gate
+
+    import daemon.app as app_module
+    from daemon.admin import restart as restart_module
+
+    monkeypatch.setattr(app_module, "build_wake_gate", fake_build)
+    monkeypatch.setattr(app_module, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(restart_module, "is_supervised", lambda: True)
+    monkeypatch.setattr(
+        restart_module, "schedule_exit", lambda face=None: exits.append("asked")
+    )
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+
+    loop = asyncio.create_task(_wake_forever(settings))
+    for _ in range(400):
+        await asyncio.sleep(0)
+        if exits:
+            break
+    loop.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop
+
+    assert exits == ["asked"], (
+        f"a microphone dead for {WAKE_DEAF_ROUNDS_BEFORE_RESTART} rounds did not ask "
+        "for a restart"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_gate_that_hears_the_room_never_restarts_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: a quiet room delivers frames and must never be read as a dead
+    device. Restarting the resident because nobody spoke would be a daemon that
+    reboots itself all night."""
+    from daemon.app import _wake_forever
+    from daemon.voice.wake import WakeCounters
+
+    exits: list[str] = []
+
+    class QuietRoomGate:
+        counters = WakeCounters(frames_seen=1400)  # audio arriving, nobody talking
+
+        async def listen(self) -> Any:
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+    async def close_gate() -> bool:
+        return True
+
+    async def fake_build(settings: Any) -> tuple[Any, Any]:
+        return QuietRoomGate(), close_gate
+
+    import daemon.app as app_module
+    from daemon.admin import restart as restart_module
+
+    monkeypatch.setattr(app_module, "build_wake_gate", fake_build)
+    monkeypatch.setattr(app_module, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(restart_module, "is_supervised", lambda: True)
+    monkeypatch.setattr(
+        restart_module, "schedule_exit", lambda face=None: exits.append("asked")
+    )
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+
+    loop = asyncio.create_task(_wake_forever(settings))
+    for _ in range(400):
+        await asyncio.sleep(0)
+    loop.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop
+
+    assert exits == []
+
+
+@pytest.mark.asyncio
+async def test_an_unsupervised_daemon_says_so_instead_of_exiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`daemon run` in a terminal has nothing to revive it, so exiting would replace
+    a deaf daemon with no daemon. It says what it would have done instead - the same
+    direction `daemon/admin/restart.py:is_supervised` takes for the admin button."""
+    from daemon.app import _wake_forever
+    from daemon.voice.wake import WakeCounters
+
+    exits: list[str] = []
+
+    class DeafGate:
+        counters = WakeCounters()  # frames_seen == 0
+
+        async def listen(self) -> Any:
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+    async def close_gate() -> bool:
+        return True
+
+    async def fake_build(settings: Any) -> tuple[Any, Any]:
+        return DeafGate(), close_gate
+
+    import daemon.app as app_module
+    from daemon.admin import restart as restart_module
+
+    monkeypatch.setattr(app_module, "build_wake_gate", fake_build)
+    monkeypatch.setattr(app_module, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(restart_module, "is_supervised", lambda: False)
+    monkeypatch.setattr(
+        restart_module, "schedule_exit", lambda face=None: exits.append("asked")
+    )
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+
+    loop = asyncio.create_task(_wake_forever(settings))
+    for _ in range(400):
+        await asyncio.sleep(0)
+    loop.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop
+
+    assert exits == [], "a daemon nothing supervises must not exit itself"
