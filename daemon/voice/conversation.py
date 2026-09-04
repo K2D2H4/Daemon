@@ -59,7 +59,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
-from typing import get_args
+from typing import Any, get_args
 
 from daemon import clock
 
@@ -294,6 +294,11 @@ measured over repeated trials, this wording never leaked into the reply, while a
 Korean-language variant of it leaked the word "context" into one.
 """
 
+IDLE_DEFER_GRANULARITY_SECONDS = 1.0
+"""How much closer than the full budget the deadline must be before
+`_defer_idle_close` moves it. One second, so a microphone delivering 50 frames a
+second re-arms the loop's timer once rather than fifty times."""
+
 ANSWER_HOLD_SECONDS = 6.0
 """How long the microphone is held while the model owes an answer.
 
@@ -495,6 +500,9 @@ class VoiceConversation:
         self._started_at: float | None = None
         self._first_audio_at: float | None = None
         self._played_bytes = 0
+        self._budget: Any = None
+        """The live idle-budget handle while `_receive` is running, so the owner
+        talking can extend it (`_note_owner_speaking`). None outside that."""
         self._speech_gate = SpeechGate(vad) if vad is not None else None
         """Only a person talking reaches the model; the room goes out as digital
         silence (daemon/voice/speech_gate.py). None when no local VAD was handed in,
@@ -824,6 +832,7 @@ class VoiceConversation:
         loop = asyncio.get_running_loop()
         try:
             async with asyncio.timeout(self._idle_timeout) as budget:
+                self._budget = budget
                 while self.ended is None:
                     if await self._one_turn(session, budget):
                         empty = 0
@@ -847,6 +856,7 @@ class VoiceConversation:
             self.ended = f"nothing heard for {self._idle_timeout:.0f}s"
             logger.info("voice: %s; closing a session that bills per minute", self.ended)
         finally:
+            self._budget = None
             if self.ended is None:
                 self.ended = "the session stream ended"
 
@@ -1016,7 +1026,16 @@ class VoiceConversation:
                     # activity detection then sees silence instead of -57 dBFS of
                     # room and the canceller's leaks, which 2.5 answers as if the
                     # owner had spoken (daemon/voice/speech_gate.py).
+                    was_open = self._speech_gate.open
                     chunk = self._speech_gate.feed(chunk)
+                    if self._speech_gate.open:
+                        # A person is talking, whether or not the server has said so
+                        # yet: the local VAD knows 30 frames before the transcript
+                        # does. Called while it stays open too, which costs one
+                        # comparison a frame and keeps a long request alive.
+                        if not was_open:
+                            logger.debug("voice: speech gate open; the owner is talking")
+                        self._defer_idle_close()
                     if not chunk:
                         continue
                 await session.send_audio(chunk)
@@ -1027,6 +1046,45 @@ class VoiceConversation:
             # is already reporting which. Logged rather than raised so this task
             # dying does not replace the error the caller needs to see.
             logger.exception("voice: stopped feeding the session")
+
+    def _defer_idle_close(self) -> None:
+        """Something is happening, so the silence budget starts over.
+
+        Two things count and both were invisible to it. The owner talking, and the
+        daemon *working*: a tool the model asked for is awaited inside the receive
+        loop, and the budget is only rescheduled once the item has been handled - so
+        a tool that runs longer than the budget's remainder is cancelled by it, with
+        no audit row and nothing said. Measured on the owner's machine 2026-09-04:
+        last server event 11:03:20.698, a tool began at 11:03:33 (the face went to
+        `working`), and `nothing heard for 30s` fired at 11:03:50.698 - to the
+        millisecond, 30 s after that last event. The image search they had asked for
+        was cancelled mid-flight.
+
+        The budget is otherwise only rescheduled by what arrives on `receive()`, and
+        this provider delivers the owner's transcript at the *end* of their
+        utterance - so a request that took longer to say than the budget had left
+        closed the session while it was being made. Measured on the owner's machine
+        2026-09-04: the last answer ended 11:03:19, "구글에서 이미지 검색으로 강아지 사진
+        좀 검색해 줄래?" finalised at 11:03:50, and `nothing heard for 30s` fired in
+        the same second. The request was written to the log and never answered, and
+        from the outside the daemon had simply stopped replying.
+
+        Only ever extends. During a long answer `_on_audio` has already pushed the
+        deadline out past the speaker's own playing time, and moving it back to
+        `now + idle` would undo exactly the fix that comment describes.
+        """
+        budget = self._budget
+        if budget is None:
+            return
+        target = asyncio.get_running_loop().time() + self._idle_timeout
+        when = getattr(budget, "when", None)
+        current = when() if callable(when) else None
+        if current is not None and current >= target - IDLE_DEFER_GRANULARITY_SECONDS:
+            # Already far enough out. Also what keeps this cheap while the gate is
+            # open: the microphone hands over 50 frames a second and each one would
+            # otherwise cancel and re-arm the loop's timer for a 20 ms gain.
+            return
+        budget.reschedule(target)
 
     def _speaker_ran_dry(self) -> None:
         """The engine says the last buffer has been played back: clamp the estimate.
@@ -1268,6 +1326,10 @@ class VoiceConversation:
                 if said == seen:
                     continue
                 seen = said
+                # The provider says the owner is mid-utterance. Without a local VAD
+                # this is the only such signal there is, and the idle budget needs
+                # one - see `_defer_idle_close`.
+                self._defer_idle_close()
                 self._prefetch(session, said)
         finally:
             # Cancelled at the end of every conversation, so the stream is closed
@@ -1489,6 +1551,11 @@ class VoiceConversation:
     async def _run_tool_call(self, session: VoiceSession, call: ToolCall) -> None:
         """Run one tool the model asked for and hand the result back on the socket.
 
+        The idle budget is deferred first, before anything is awaited: the reschedule
+        in `_one_turn` happens *after* an item has been handled, and handling this one
+        means running the tool - so a tool slower than the budget's remainder used to
+        be cancelled by the silence timer (`_defer_idle_close`).
+
         `set_mood` is intercepted first and never reaches the runner - it is not a
         tool (`daemon/face.py:MOOD_TOOL`, docs/adr/0018).
 
@@ -1510,6 +1577,7 @@ class VoiceConversation:
         `send_tool_response`). The runner returns one result per call it was given,
         so there is always something to send.
         """
+        self._defer_idle_close()
         # From this moment until the model has spoken (or the turn ends), a
         # `send_context` would land in the middle of the tool exchange and the
         # server cancels the call - see `_answering_tool`. Set before running the
