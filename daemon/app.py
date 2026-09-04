@@ -3343,6 +3343,19 @@ async def _ask_for_a_working_microphone(restarted_at: float) -> float:
     from daemon.admin import restart
 
     now = asyncio.get_running_loop().time()
+    granted = _mic_health()
+    if granted not in ("authorized", "n/a"):
+        # A revoked or never-granted microphone also delivers no frames, and a new
+        # process would be just as deaf - so this would become a restart every ten
+        # minutes forever, each one costing the channel its poll. The wizard's own
+        # message is the fix here, not a restart.
+        logger.error(
+            "wake: the microphone has been dead for %d rounds and its permission "
+            "reads %r - a restart cannot help. Run `daemon install` and click Allow",
+            WAKE_DEAF_ROUNDS_BEFORE_RESTART,
+            granted,
+        )
+        return restarted_at
     if not restart.is_supervised():
         logger.error(
             "wake: the microphone has been dead for %d rounds and nothing in this "

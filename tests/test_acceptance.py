@@ -2904,3 +2904,55 @@ async def test_an_unsupervised_daemon_says_so_instead_of_exiting(
         await loop
 
     assert exits == [], "a daemon nothing supervises must not exit itself"
+
+
+@pytest.mark.asyncio
+async def test_a_microphone_without_permission_is_not_restarted_into(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A revoked microphone delivers no frames either, and a new process would be
+    just as deaf - so this would be a restart every ten minutes forever, each one
+    costing the channel its poll. The wizard's message is the fix there."""
+    from daemon.app import _wake_forever
+    from daemon.voice.wake import WakeCounters
+
+    exits: list[str] = []
+
+    class DeafGate:
+        counters = WakeCounters()  # frames_seen == 0
+
+        async def listen(self) -> Any:
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+    async def close_gate() -> bool:
+        return True
+
+    async def fake_build(settings: Any) -> tuple[Any, Any]:
+        return DeafGate(), close_gate
+
+    import daemon.app as app_module
+    from daemon.admin import restart as restart_module
+
+    monkeypatch.setattr(app_module, "build_wake_gate", fake_build)
+    monkeypatch.setattr(app_module, "WAKE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(app_module, "_mic_health", lambda: "denied")
+    monkeypatch.setattr(restart_module, "is_supervised", lambda: True)
+    monkeypatch.setattr(
+        restart_module, "schedule_exit", lambda face=None: exits.append("asked")
+    )
+    settings = Settings(
+        _env_file=None,
+        DAEMON_PROVIDER="ollama",
+        DAEMON_OLLAMA_MODEL="gemma3:4b",
+        DAEMON_DATA_DIR=str(tmp_path),
+    )
+
+    loop = asyncio.create_task(_wake_forever(settings))
+    for _ in range(400):
+        await asyncio.sleep(0)
+    loop.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop
+
+    assert exits == []

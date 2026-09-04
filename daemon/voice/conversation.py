@@ -294,6 +294,11 @@ measured over repeated trials, this wording never leaked into the reply, while a
 Korean-language variant of it leaked the word "context" into one.
 """
 
+IDLE_DEFER_GRANULARITY_SECONDS = 1.0
+"""How much closer than the full budget the deadline must be before
+`_defer_idle_close` moves it. One second, so a microphone delivering 50 frames a
+second re-arms the loop's timer once rather than fifty times."""
+
 ANSWER_HOLD_SECONDS = 6.0
 """How long the microphone is held while the model owes an answer.
 
@@ -1074,7 +1079,10 @@ class VoiceConversation:
         target = asyncio.get_running_loop().time() + self._idle_timeout
         when = getattr(budget, "when", None)
         current = when() if callable(when) else None
-        if current is not None and current >= target:
+        if current is not None and current >= target - IDLE_DEFER_GRANULARITY_SECONDS:
+            # Already far enough out. Also what keeps this cheap while the gate is
+            # open: the microphone hands over 50 frames a second and each one would
+            # otherwise cancel and re-arm the loop's timer for a 20 ms gain.
             return
         budget.reschedule(target)
 
