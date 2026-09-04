@@ -1164,9 +1164,20 @@ The request reached the conversation log and no tool ever ran for it - the audit
 `open_path` and nothing after. From the outside the daemon had simply stopped
 answering.
 
-`_note_owner_speaking` fixes it from two signals, whichever exists: the speech gate
-opening (the local VAD knows ~30 frames before the transcript does) and the
-provider's own partial transcripts. It only ever *extends* the deadline - during a
-long answer `_on_audio` has already pushed it past the speaker's playing time, and
-resetting to `now + 30 s` there would undo that fix.
+**And the tool it asked for was cancelled by the same timer, which is what actually
+lost the request.** `_one_turn` reschedules the budget *after* an item has been
+handled, and handling a `ToolCall` means awaiting the whole tool. The evidence is
+exact: the last thing to arrive on `receive()` landed at **11:03:20.698**, a tool
+began at 11:03:33 (the face went to `working`, which `ToolRunner.execute` publishes
+*before* it runs anything), and the close fired at **11:03:50.698** - 30.000 s after
+that last event. `record_tool_call` runs *after* a tool returns, so the audit table
+has `open_path` and nothing else: the search was cancelled mid-flight and left no
+row. From the outside, the daemon heard the request and said nothing.
+
+`_defer_idle_close` fixes both from whichever signal exists: the speech gate opening
+(the local VAD knows ~30 frames before the transcript does), the provider's own
+partial transcripts, and the start of a tool call - before it is awaited, not after
+it returns. It only ever *extends* the deadline: during a long answer `_on_audio` has
+already pushed it past the speaker's playing time, and resetting to `now + 30 s`
+there would undo that fix.
 

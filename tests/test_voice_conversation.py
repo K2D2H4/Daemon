@@ -4104,3 +4104,26 @@ async def test_the_owner_talking_never_shortens_a_budget_the_answer_already_exte
 
     assert budget.whens == [], "the deadline was pulled back in under the answer"
     assert budget.deadline == far
+
+
+async def test_a_tool_the_model_asked_for_is_not_cancelled_by_the_silence_timer(
+    db: Any, tmp_path: pathlib.Path
+) -> None:
+    """The rest of the owner's 2026-09-04 session, and the part that actually lost the
+    request. `_one_turn` reschedules the budget *after* an item has been handled, and
+    handling a `ToolCall` means running the tool - so a tool slower than the budget's
+    remainder was cancelled by the silence timer, with no audit row and nothing said.
+    Measured: last server event 11:03:20.698, the face went to `working` at 11:03:33,
+    `nothing heard for 30s` at 11:03:50.698 - exactly 30 s after that last event.
+    Deferring has to happen before the tool is awaited, not after it returns."""
+    session = FakeSession()
+    runner, _ = tool_runner(db, tmp_path)
+    conv = conversation(session, tools=runner)
+    budget = _Budget()
+    conv._budget = budget  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+
+    await conv._run_tool_call(session, ToolCall(id="c1", name="list_dir", arguments={}))
+
+    assert budget.whens, "the tool ran on a budget that was still counting down"
+    assert budget.whens[0] >= loop.time() + conv._idle_timeout - 1.0

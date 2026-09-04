@@ -1030,7 +1030,7 @@ class VoiceConversation:
                         # comparison a frame and keeps a long request alive.
                         if not was_open:
                             logger.debug("voice: speech gate open; the owner is talking")
-                        self._note_owner_speaking()
+                        self._defer_idle_close()
                     if not chunk:
                         continue
                 await session.send_audio(chunk)
@@ -1042,8 +1042,18 @@ class VoiceConversation:
             # dying does not replace the error the caller needs to see.
             logger.exception("voice: stopped feeding the session")
 
-    def _note_owner_speaking(self) -> None:
-        """Somebody is talking to us, so the silence budget starts over.
+    def _defer_idle_close(self) -> None:
+        """Something is happening, so the silence budget starts over.
+
+        Two things count and both were invisible to it. The owner talking, and the
+        daemon *working*: a tool the model asked for is awaited inside the receive
+        loop, and the budget is only rescheduled once the item has been handled - so
+        a tool that runs longer than the budget's remainder is cancelled by it, with
+        no audit row and nothing said. Measured on the owner's machine 2026-09-04:
+        last server event 11:03:20.698, a tool began at 11:03:33 (the face went to
+        `working`), and `nothing heard for 30s` fired at 11:03:50.698 - to the
+        millisecond, 30 s after that last event. The image search they had asked for
+        was cancelled mid-flight.
 
         The budget is otherwise only rescheduled by what arrives on `receive()`, and
         this provider delivers the owner's transcript at the *end* of their
@@ -1310,8 +1320,8 @@ class VoiceConversation:
                 seen = said
                 # The provider says the owner is mid-utterance. Without a local VAD
                 # this is the only such signal there is, and the idle budget needs
-                # one - see `_note_owner_speaking`.
-                self._note_owner_speaking()
+                # one - see `_defer_idle_close`.
+                self._defer_idle_close()
                 self._prefetch(session, said)
         finally:
             # Cancelled at the end of every conversation, so the stream is closed
@@ -1533,6 +1543,11 @@ class VoiceConversation:
     async def _run_tool_call(self, session: VoiceSession, call: ToolCall) -> None:
         """Run one tool the model asked for and hand the result back on the socket.
 
+        The idle budget is deferred first, before anything is awaited: the reschedule
+        in `_one_turn` happens *after* an item has been handled, and handling this one
+        means running the tool - so a tool slower than the budget's remainder used to
+        be cancelled by the silence timer (`_defer_idle_close`).
+
         `set_mood` is intercepted first and never reaches the runner - it is not a
         tool (`daemon/face.py:MOOD_TOOL`, docs/adr/0018).
 
@@ -1554,6 +1569,7 @@ class VoiceConversation:
         `send_tool_response`). The runner returns one result per call it was given,
         so there is always something to send.
         """
+        self._defer_idle_close()
         # From this moment until the model has spoken (or the turn ends), a
         # `send_context` would land in the middle of the tool exchange and the
         # server cancels the call - see `_answering_tool`. Set before running the
